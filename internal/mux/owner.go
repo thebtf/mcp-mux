@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/bitswan-space/mcp-mux/internal/control"
 	"github.com/bitswan-space/mcp-mux/internal/ipc"
 	"github.com/bitswan-space/mcp-mux/internal/jsonrpc"
 	"github.com/bitswan-space/mcp-mux/internal/remap"
@@ -31,6 +34,10 @@ type Owner struct {
 	initResp []byte // cached InitializeResult for replaying to new sessions
 	toolList []byte // cached tools/list response
 
+	pendingRequests atomic.Int64
+	startTime       time.Time
+	controlServer   *control.Server
+
 	done chan struct{}
 }
 
@@ -47,6 +54,9 @@ type OwnerConfig struct {
 
 	// IPCPath for the Unix domain socket listener.
 	IPCPath string
+
+	// ControlPath for the control plane socket. If empty, control plane is disabled.
+	ControlPath string
 
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
@@ -74,13 +84,25 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	}
 
 	o := &Owner{
-		upstream: proc,
-		ipcPath:  cfg.IPCPath,
-		cwd:      cfg.Cwd,
-		listener: ln,
-		logger:   logger,
-		sessions: make(map[int]*Session),
-		done:     make(chan struct{}),
+		upstream:  proc,
+		ipcPath:   cfg.IPCPath,
+		cwd:       cfg.Cwd,
+		listener:  ln,
+		logger:    logger,
+		sessions:  make(map[int]*Session),
+		startTime: time.Now(),
+		done:      make(chan struct{}),
+	}
+
+	// Start control plane if configured
+	if cfg.ControlPath != "" {
+		ctlSrv, err := control.NewServer(cfg.ControlPath, o, logger)
+		if err != nil {
+			logger.Printf("warning: control server failed to start: %v", err)
+		} else {
+			o.controlServer = ctlSrv
+			logger.Printf("control socket: %s", cfg.ControlPath)
+		}
 	}
 
 	// Start reading from upstream
@@ -138,23 +160,20 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
-	// Check for mux control commands
-	if msg.Method == "mux/shutdown" {
-		o.logger.Printf("received shutdown command from session %d", s.ID)
-		go o.Shutdown() // async to not block the session reader
-		return nil
-	}
-
 	switch {
 	case msg.IsNotification():
 		// Forward notifications as-is to upstream
 		return o.upstream.WriteLine(msg.Raw)
 
 	case msg.IsRequest():
+		// Track pending requests
+		o.pendingRequests.Add(1)
+
 		// Remap ID and forward to upstream
 		newID := remap.Remap(s.ID, msg.ID)
 		remapped, err := jsonrpc.ReplaceID(msg.Raw, newID)
 		if err != nil {
+			o.pendingRequests.Add(-1) // undo increment on error
 			return fmt.Errorf("remap request: %w", err)
 		}
 		return o.upstream.WriteLine(remapped)
@@ -203,6 +222,9 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	if !msg.IsResponse() {
 		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
 	}
+
+	// Decrement pending counter before routing (handles disconnected sessions too)
+	o.pendingRequests.Add(-1)
 
 	// Deremap the ID to find the target session
 	result, err := remap.Deremap(msg.ID)
@@ -357,6 +379,52 @@ func (o *Owner) acceptLoop() {
 	}
 }
 
+// HandleShutdown implements control.CommandHandler.
+// It performs a graceful drain: stops accepting new connections,
+// waits for pending requests to complete (up to timeout), then shuts down.
+func (o *Owner) HandleShutdown(drainTimeoutMs int) string {
+	if drainTimeoutMs <= 0 {
+		// Force shutdown — no drain
+		go o.Shutdown()
+		return "force shutdown initiated"
+	}
+
+	go func() {
+		// Close IPC listener to stop new connections
+		o.listener.Close()
+
+		timeout := time.Duration(drainTimeoutMs) * time.Millisecond
+		deadline := time.After(timeout)
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-deadline:
+				pending := o.pendingRequests.Load()
+				if pending > 0 {
+					o.logger.Printf("drain timeout: %d requests still pending, forcing shutdown", pending)
+				}
+				o.Shutdown()
+				return
+			case <-ticker.C:
+				if o.pendingRequests.Load() <= 0 {
+					o.logger.Printf("drain complete, shutting down")
+					o.Shutdown()
+					return
+				}
+			}
+		}
+	}()
+
+	return fmt.Sprintf("draining (timeout %dms)", drainTimeoutMs)
+}
+
+// HandleStatus implements control.CommandHandler.
+func (o *Owner) HandleStatus() map[string]any {
+	return o.Status()
+}
+
 // Shutdown stops the owner, closing all sessions and the upstream.
 func (o *Owner) Shutdown() {
 	select {
@@ -365,6 +433,13 @@ func (o *Owner) Shutdown() {
 	default:
 	}
 	close(o.done)
+
+	// Close control server first and clean up its socket
+	if o.controlServer != nil {
+		socketPath := o.controlServer.SocketPath()
+		o.controlServer.Close()
+		ipc.Cleanup(socketPath)
+	}
 
 	o.listener.Close()
 	ipc.Cleanup(o.ipcPath)
@@ -393,8 +468,13 @@ func (o *Owner) SessionCount() int {
 	return len(o.sessions)
 }
 
+// PendingRequests returns the number of in-flight requests.
+func (o *Owner) PendingRequests() int64 {
+	return o.pendingRequests.Load()
+}
+
 // Status returns a JSON-serializable status summary.
-func (o *Owner) Status() map[string]interface{} {
+func (o *Owner) Status() map[string]any {
 	o.mu.RLock()
 	sessionIDs := make([]int, 0, len(o.sessions))
 	for id := range o.sessions {
@@ -402,11 +482,13 @@ func (o *Owner) Status() map[string]interface{} {
 	}
 	o.mu.RUnlock()
 
-	return map[string]interface{}{
-		"upstream_pid": o.upstream.PID(),
-		"ipc_path":     o.ipcPath,
-		"sessions":     sessionIDs,
-		"session_count": len(sessionIDs),
+	return map[string]any{
+		"upstream_pid":     o.upstream.PID(),
+		"ipc_path":         o.ipcPath,
+		"sessions":         sessionIDs,
+		"session_count":    len(sessionIDs),
+		"pending_requests": o.pendingRequests.Load(),
+		"uptime_seconds":   time.Since(o.startTime).Seconds(),
 	}
 }
 
