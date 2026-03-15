@@ -38,7 +38,8 @@ type Owner struct {
 	startTime       time.Time
 	controlServer   *control.Server
 
-	done chan struct{}
+	shutdownOnce sync.Once
+	done         chan struct{}
 }
 
 // OwnerConfig holds parameters for creating an Owner.
@@ -426,34 +427,34 @@ func (o *Owner) HandleStatus() map[string]any {
 }
 
 // Shutdown stops the owner, closing all sessions and the upstream.
+// Cleanup completes before Done() is signaled, ensuring sockets are removed
+// before the process exits.
 func (o *Owner) Shutdown() {
-	select {
-	case <-o.done:
-		return // already shut down
-	default:
-	}
-	close(o.done)
+	o.shutdownOnce.Do(func() {
+		// Close control server first and clean up its socket
+		if o.controlServer != nil {
+			socketPath := o.controlServer.SocketPath()
+			o.controlServer.Close()
+			ipc.Cleanup(socketPath)
+		}
 
-	// Close control server first and clean up its socket
-	if o.controlServer != nil {
-		socketPath := o.controlServer.SocketPath()
-		o.controlServer.Close()
-		ipc.Cleanup(socketPath)
-	}
+		o.listener.Close()
+		ipc.Cleanup(o.ipcPath)
 
-	o.listener.Close()
-	ipc.Cleanup(o.ipcPath)
+		o.mu.Lock()
+		for _, s := range o.sessions {
+			s.Close()
+		}
+		o.sessions = make(map[int]*Session)
+		o.mu.Unlock()
 
-	o.mu.Lock()
-	for _, s := range o.sessions {
-		s.Close()
-	}
-	o.sessions = make(map[int]*Session)
-	o.mu.Unlock()
+		o.upstream.Close()
 
-	o.upstream.Close()
+		o.logger.Printf("owner shut down")
 
-	o.logger.Printf("owner shut down")
+		// Signal done AFTER cleanup, so main goroutine doesn't exit early
+		close(o.done)
+	})
 }
 
 // Done returns a channel closed when the owner has shut down.

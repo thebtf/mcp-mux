@@ -36,10 +36,31 @@ import (
 )
 
 func main() {
+	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "status":
+			runStatus()
+			return
+		case "stop":
+			stopFlags := flag.NewFlagSet("stop", flag.ExitOnError)
+			drainTimeout := stopFlags.Duration("drain-timeout", 30*time.Second, "Drain timeout before force kill")
+			force := stopFlags.Bool("force", false, "Force immediate shutdown (no drain)")
+			stopFlags.Parse(os.Args[2:])
+			runStop(*drainTimeout, *force)
+			return
+		case "upgrade":
+			upgradeFlags := flag.NewFlagSet("upgrade", flag.ExitOnError)
+			drainTimeout := upgradeFlags.Duration("drain-timeout", 30*time.Second, "Drain timeout before force kill")
+			force := upgradeFlags.Bool("force", false, "Force immediate shutdown (no drain)")
+			upgradeFlags.Parse(os.Args[2:])
+			runUpgrade(*drainTimeout, *force)
+			return
+		}
+	}
+
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
-	drainTimeout := flag.Duration("drain-timeout", 30*time.Second, "Drain timeout for stop command")
-	force := flag.Bool("force", false, "Force immediate shutdown (no drain)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -49,19 +70,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       mcp-mux status")
 		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
 		os.Exit(1)
-	}
-
-	// Handle subcommands
-	switch args[0] {
-	case "status":
-		runStatus()
-		return
-	case "stop":
-		runStop(*drainTimeout, *force)
-		return
-	case "upgrade":
-		runUpgrade(*drainTimeout, *force)
-		return
 	}
 
 	// Determine sharing mode
