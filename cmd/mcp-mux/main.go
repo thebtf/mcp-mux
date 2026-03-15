@@ -4,6 +4,7 @@
 //
 //	mcp-mux [flags] <command> [args...]
 //	mcp-mux status
+//	mcp-mux stop [--drain-timeout 30s] [--force]
 //
 // mcp-mux wraps any MCP server command. The first instance for a given server
 // becomes the "owner" (spawns the real process, listens on IPC). Subsequent
@@ -23,9 +24,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/bitswan-space/mcp-mux/internal/control"
 	"github.com/bitswan-space/mcp-mux/internal/ipc"
 	"github.com/bitswan-space/mcp-mux/internal/mux"
 	"github.com/bitswan-space/mcp-mux/internal/serverid"
@@ -34,12 +38,16 @@ import (
 func main() {
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
+	drainTimeout := flag.Duration("drain-timeout", 30*time.Second, "Drain timeout for stop command")
+	force := flag.Bool("force", false, "Force immediate shutdown (no drain)")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: mcp-mux [flags] <command> [args...]")
+		fmt.Fprintln(os.Stderr, "       mcp-mux stop [--drain-timeout 30s] [--force]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux status")
+		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
 		os.Exit(1)
 	}
 
@@ -49,10 +57,10 @@ func main() {
 		runStatus()
 		return
 	case "stop":
-		runStop()
+		runStop(*drainTimeout, *force)
 		return
 	case "upgrade":
-		runUpgrade()
+		runUpgrade(*drainTimeout, *force)
 		return
 	}
 
@@ -72,19 +80,19 @@ func main() {
 		os.Exit(1)
 	}
 
-
 	// Compute server identity
 	command := args[0]
 	cmdArgs := args[1:]
 	sid := serverid.GenerateContextKey(mode, command, cmdArgs, nil, cwd)
 	ipcPath := serverid.IPCPath(sid)
+	controlPath := serverid.ControlPath(sid)
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags)
 
 	// In isolated mode, always become owner (skip IPC check)
 	if *isolated {
 		logger.Printf("isolated mode: starting dedicated upstream")
-		runOwner(args, cwd, ipcPath, logger, true)
+		runOwner(args, cwd, ipcPath, controlPath, logger, true)
 		return
 	}
 
@@ -100,10 +108,10 @@ func main() {
 
 	// No owner found — become one
 	logger.Printf("becoming owner for %s (cwd: %s, mode: %s)", serverid.DescribeArgs(args), cwd, mode)
-	runOwner(args, cwd, ipcPath, logger, *isolated)
+	runOwner(args, cwd, ipcPath, controlPath, logger, *isolated)
 }
 
-func runOwner(args []string, cwd string, ipcPath string, logger *log.Logger, isolated bool) {
+func runOwner(args []string, cwd, ipcPath, controlPath string, logger *log.Logger, isolated bool) {
 	command := args[0]
 	cmdArgs := args[1:]
 
@@ -114,18 +122,22 @@ func runOwner(args []string, cwd string, ipcPath string, logger *log.Logger, iso
 	// via upstream.Start which uses os.Environ().
 
 	effectiveIPCPath := ipcPath
+	effectiveControlPath := controlPath
 	if isolated {
 		// In isolated mode, use a unique path that won't be found by other instances
-		effectiveIPCPath = ipcPath + fmt.Sprintf("-%d", os.Getpid())
+		suffix := fmt.Sprintf("-%d", os.Getpid())
+		effectiveIPCPath = ipcPath + suffix
+		effectiveControlPath = controlPath + suffix
 	}
 
 	owner, err := mux.NewOwner(mux.OwnerConfig{
-		Command: command,
-		Args:    cmdArgs,
-		Env:     env,
-		Cwd:     cwd,
-		IPCPath: effectiveIPCPath,
-		Logger:  logger,
+		Command:     command,
+		Args:        cmdArgs,
+		Env:         env,
+		Cwd:         cwd,
+		IPCPath:     effectiveIPCPath,
+		ControlPath: effectiveControlPath,
+		Logger:      logger,
 	})
 	if err != nil {
 		logger.Fatalf("failed to start owner: %v", err)
@@ -152,7 +164,7 @@ func runOwner(args []string, cwd string, ipcPath string, logger *log.Logger, iso
 	}
 }
 
-func runStop() {
+func runStop(drainTimeout time.Duration, force bool) {
 	fmt.Fprintln(os.Stderr, "Stopping all mcp-mux instances...")
 
 	tmpDir := os.TempDir()
@@ -160,36 +172,97 @@ func runStop() {
 	stopped := 0
 	stale := 0
 
+	drainMs := int(drainTimeout.Milliseconds())
+	if force {
+		drainMs = 0
+	}
+
+	// Track which server IDs we've already handled via control socket
+	handled := make(map[string]bool)
+
+	// Phase 1: Stop instances with control sockets (new protocol)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
+			continue
+		}
+
+		path := filepath.Join(tmpDir, name)
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
+		shortID := id
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+
+		handled[id] = true
+
+		clientTimeout := drainTimeout + 5*time.Second
+		if force {
+			clientTimeout = 5 * time.Second
+		}
+
+		resp, err := control.SendWithTimeout(path, control.Request{
+			Cmd:            "shutdown",
+			DrainTimeoutMs: drainMs,
+		}, clientTimeout)
+		if err != nil {
+			_ = os.Remove(path)
+			dataPath := filepath.Join(tmpDir, fmt.Sprintf("mcp-mux-%s.sock", id))
+			_ = os.Remove(dataPath)
+			stale++
+			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", shortID)
+			continue
+		}
+
+		if resp.OK {
+			fmt.Fprintf(os.Stderr, "  [%s] %s\n", shortID, resp.Message)
+			stopped++
+		} else {
+			fmt.Fprintf(os.Stderr, "  [%s] shutdown failed: %s\n", shortID, resp.Message)
+		}
+	}
+
+	// Phase 2: Fallback for old instances without control sockets
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
-
-		path := tmpDir + string(os.PathSeparator) + name
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
-
-		// Try graceful shutdown via IPC
-		conn, err := ipc.Dial(path)
-		if err != nil {
-			// Socket exists but owner is dead — clean up stale file
-			_ = os.Remove(path)
-			stale++
-			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", id[:8])
+		// Skip control sockets (already handled) and lock files
+		if strings.HasSuffix(name, ".ctl.sock") || strings.HasSuffix(name, ".lock") {
 			continue
 		}
 
-		// Send shutdown command
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+		if handled[id] {
+			continue // already stopped via control socket
+		}
+
+		shortID := id
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+
+		path := filepath.Join(tmpDir, name)
+		conn, err := ipc.Dial(path)
+		if err != nil {
+			_ = os.Remove(path)
+			stale++
+			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed (legacy)\n", shortID)
+			continue
+		}
+
+		// Send legacy mux/shutdown via data socket
 		shutdownMsg := `{"jsonrpc":"2.0","method":"mux/shutdown"}` + "\n"
 		_, err = conn.Write([]byte(shutdownMsg))
 		conn.Close()
 
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  [%s] failed to send shutdown: %v\n", id[:8], err)
 			_ = os.Remove(path)
 			stale++
+			fmt.Fprintf(os.Stderr, "  [%s] failed to send shutdown (legacy): %v\n", shortID, err)
 		} else {
-			fmt.Fprintf(os.Stderr, "  [%s] shutdown signal sent\n", id[:8])
+			fmt.Fprintf(os.Stderr, "  [%s] shutdown signal sent (legacy)\n", shortID)
 			stopped++
 		}
 	}
@@ -197,12 +270,12 @@ func runStop() {
 	if stopped == 0 && stale == 0 {
 		fmt.Fprintln(os.Stderr, "No mcp-mux instances found.")
 	} else {
-		fmt.Fprintf(os.Stderr, "Done: %d stopped gracefully, %d stale cleaned.\n", stopped, stale)
+		fmt.Fprintf(os.Stderr, "Done: %d stopped, %d stale cleaned.\n", stopped, stale)
 	}
 }
 
-func runUpgrade() {
-	runStop()
+func runUpgrade(drainTimeout time.Duration, force bool) {
+	runStop(drainTimeout, force)
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "All instances stopped. Binary unlocked. Rebuild with:")
 	fmt.Fprintln(os.Stderr, "  go build -o mcp-mux.exe ./cmd/mcp-mux")
@@ -211,7 +284,6 @@ func runUpgrade() {
 }
 
 func runStatus() {
-	// Scan temp directory for mcp-mux socket files
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
@@ -219,35 +291,78 @@ func runStatus() {
 		os.Exit(1)
 	}
 
-	type serverStatus struct {
-		ID      string `json:"id"`
-		Path    string `json:"path"`
-		Active  bool   `json:"active"`
+	var results []json.RawMessage
+	handled := make(map[string]bool)
+
+	// Phase 1: Query instances with control sockets (rich status)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
+			continue
+		}
+
+		path := filepath.Join(tmpDir, name)
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
+		shortID := id
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+
+		handled[id] = true
+
+		resp, err := control.Send(path, control.Request{Cmd: "status"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] unreachable (stale socket)\n", shortID)
+			continue
+		}
+
+		if resp.OK && resp.Data != nil {
+			var data map[string]any
+			if err := json.Unmarshal(resp.Data, &data); err == nil {
+				data["server_id"] = id
+				enriched, _ := json.Marshal(data)
+				results = append(results, enriched)
+			}
+		}
 	}
 
-	var servers []serverStatus
+	// Phase 2: Fallback for old instances (basic active/stale check)
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
+		if strings.HasSuffix(name, ".ctl.sock") || strings.HasSuffix(name, ".lock") {
+			continue
+		}
 
-		path := tmpDir + string(os.PathSeparator) + name
 		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+		if handled[id] {
+			continue
+		}
 
+		shortID := id
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+
+		path := filepath.Join(tmpDir, name)
 		active := ipc.IsAvailable(path)
-		servers = append(servers, serverStatus{
-			ID:     id,
-			Path:   path,
-			Active: active,
-		})
+		status := map[string]any{
+			"server_id": id,
+			"ipc_path":  path,
+			"active":    active,
+			"legacy":    true,
+		}
+		data, _ := json.Marshal(status)
+		results = append(results, data)
 	}
 
-	if len(servers) == 0 {
+	if len(results) == 0 {
 		fmt.Println("No active mcp-mux instances found.")
 		return
 	}
 
-	data, _ := json.MarshalIndent(servers, "", "  ")
+	data, _ := json.MarshalIndent(results, "", "  ")
 	fmt.Println(string(data))
 }
