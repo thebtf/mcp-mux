@@ -1,58 +1,48 @@
-# ADR-002: Named Pipes as Downstream Transport
+# ADR-002: Named Pipes as IPC Transport (Revised)
 
 ## Status
 
-Accepted
+Superseded — revised 2026-03-15
 
 ## Date
 
-2026-03-14
+2026-03-14 (original), 2026-03-15 (revised)
 
 ## Context
 
-mcp-mux needs to accept connections from multiple CC sessions. Standard stdio is 1:1 (one stdin/stdout per process). We need a mechanism for multiple clients to connect to a single mux process.
+mcp-mux needs IPC between mux instances. The original design had a separate daemon + client wrapper with named pipes for downstream CC→mux communication.
 
-Options considered:
+The 2026-03-15 brainstorm revised the architecture to a **self-coordinating wrapper pattern**: mcp-mux is the command prefix, first instance becomes the "owner" (spawns upstream, listens on IPC), subsequent instances connect as clients.
 
-1. **Named pipes** (Windows: `\\.\pipe\mcp-mux`, Unix: `/tmp/mcp-mux.sock`) — each client opens a new pipe connection
-2. **TCP localhost** — listen on a local port, clients connect via TCP
-3. **Wrapper script per session** — spawn mux as a child of each CC session, mux internally shares upstreams
+Named pipes (Windows) / Unix domain sockets remain the IPC transport, but their role has changed: they now connect mux instances to each other, not CC sessions to a daemon.
 
 ## Decision
 
-**Named pipes** (option 1) as primary, with wrapper script (option 3) as Phase 1 MVP.
+**Named pipes/Unix sockets for inter-instance IPC**, with self-coordination (no separate daemon).
 
-### Phase 1 (MVP): Wrapper Script
+### How it works
 
-CC config points to a wrapper script instead of the real MCP server. The wrapper:
-1. Connects to a running mux daemon (or starts one)
-2. Bridges CC's stdio to the mux's named pipe
-3. CC sees standard stdio, mux sees a new client
+1. CC launches `mcp-mux uvx ... serena` — mcp-mux checks if IPC endpoint exists for this server identity
+2. No endpoint → become owner: spawn upstream, listen on `\\.\pipe\mcp-mux-{server_id}` (Windows) or `/tmp/mcp-mux-{server_id}.sock` (Unix)
+3. Endpoint exists → become client: connect to owner via IPC, bridge CC stdio ↔ IPC
 
-```json
-{
-  "mcpServers": {
-    "mux": {
-      "command": "mcp-mux-client",
-      "args": ["--pipe", "\\\\.\\pipe\\mcp-mux"]
-    }
-  }
-}
+### Server Identity
+
 ```
-
-### Phase 2: Native Named Pipe
-
-If CC gains support for custom transports or pipe connections directly, the wrapper becomes unnecessary.
+server_id = hash(command + args + selected_env_keys)
+ipc_path  = \\.\pipe\mcp-mux-{server_id}    # Windows
+          = /tmp/mcp-mux-{server_id}.sock    # Unix
+```
 
 ## Rationale
 
-- Named pipes are the standard IPC mechanism on both Windows and Unix
-- TCP adds unnecessary network stack overhead for local-only communication
-- Named pipes support multiple simultaneous connections (Windows `CreateNamedPipe` with `PIPE_UNLIMITED_INSTANCES`)
-- The wrapper script approach works with unmodified CC — it just sees a stdio command
+- No separate daemon to manage — the system is self-organizing
+- Named pipes remain the best IPC mechanism (low latency, multi-connection, OS-native)
+- Server identity derived from command+args means zero configuration
+- Owner election is deterministic: first to create the pipe wins
 
 ## Consequences
 
-- Windows and Unix have different pipe APIs — need platform abstraction
-- Named pipe security: restrict to current user (Windows: DACL, Unix: file permissions)
-- Need a daemon management strategy (auto-start on first client, auto-shutdown on last disconnect)
+- Need robust owner crash detection: clients must detect broken IPC, one becomes new owner
+- Race condition on startup: two simultaneous first instances — use create-or-connect with OS-level atomicity
+- Platform abstraction still needed (Windows named pipes vs Unix domain sockets)

@@ -3,7 +3,7 @@
 ## STACKS
 
 ```yaml
-STACKS: [TYPESCRIPT]
+STACKS: [GO]
 ```
 
 ## PROJECT OVERVIEW
@@ -16,21 +16,29 @@ Each Claude Code session spawns its own copy of every configured MCP server (std
 
 ### Solution
 
-A single `mcp-mux` process sits between CC sessions and upstream MCP servers. Each CC session connects to mcp-mux via stdio (standard MCP transport). mcp-mux maintains one shared upstream connection per MCP server and multiplexes requests via JSON-RPC id remapping.
+`mcp-mux` is a transparent command wrapper. User prefixes their MCP server command with `mcp-mux`:
+
+```json
+{ "command": "mcp-mux", "args": ["uvx", "--from", "...", "serena", ...] }
+```
+
+First mcp-mux instance for a given server becomes the "owner" (spawns upstream, listens on IPC). Subsequent instances connect as clients.
 
 ```
-CC Session 1 ──stdio──┐
-CC Session 2 ──stdio──┤──> mcp-mux ──stdio──> 1× engram
-CC Session 3 ──stdio──┤               ──stdio──> 1× tavily
-CC Session 4 ──stdio──┘               ──stdio──> 1× context7
+CC 1 ──stdio──> mcp-mux ──IPC──┐
+CC 2 ──stdio──> mcp-mux ──IPC──┤──> mcp-mux (owner) ──stdio──> engram (1×)
+CC 3 ──stdio──> mcp-mux ──IPC──┤
+CC 4 ──stdio──> mcp-mux ──IPC──┘
 ```
 
 ### Key Concepts
 
 - **Upstream**: A real MCP server process (e.g., engram, tavily)
-- **Downstream**: A CC session connecting to mcp-mux
-- **Shareable**: Server whose requests are stateless (safe to multiplex)
-- **Isolated**: Server that requires per-session state (SSH connections, browser sessions)
+- **Downstream**: A CC session connecting via mcp-mux wrapper
+- **Owner**: First mcp-mux instance — spawns upstream, accepts IPC connections
+- **Client**: Subsequent mcp-mux instances — connect to owner via IPC
+- **Shared** (default): One upstream serves all clients
+- **Isolated** (`--isolated`): Each client gets its own upstream
 
 ## CONVENTIONS
 

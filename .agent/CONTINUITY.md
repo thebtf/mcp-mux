@@ -1,54 +1,64 @@
 # Continuity State
 
-**Last Updated:** 2026-03-14
-**Session:** Project genesis — specification and architecture
+**Last Updated:** 2026-03-15
+**Session:** Architecture brainstorm — revised spec
 
 ## Done
 - Project created at D:\Dev\mcp-mux, git initialized
 - .agent directory structure created (data, plans, reports, specs, arch/decisions)
 - CLAUDE.md + AGENTS.md bootstrap
-- Full specification: `.agent/specs/mcp-mux.md`
-- 4 ADRs written:
-  - ADR-001: stdio proxy over HTTP conversion
-  - ADR-002: named pipes downstream transport (Phase 1: wrapper script MVP)
-  - ADR-003: session-prefixed id remapping strategy
-  - ADR-004: server categorization — shared vs isolated
+- Full specification v1: `.agent/specs/mcp-mux.md`
+- 4 ADRs written (001-004)
+- **Architecture brainstorm session** — major design revisions:
+  - Wrapper pattern (mcp-mux as command prefix, not daemon+client)
+  - Go instead of TypeScript
+  - Self-coordinating instances (first = owner, rest = clients via IPC)
+  - One code path for shared/isolated
+  - cwd sandbox with symlink checking
+  - CLI monitoring (status/ps/restart)
+  - Transport abstraction (future: any-to-any)
+- Spec v2 updated with all brainstorm decisions
 
 ## Now
-- Nothing active — project ready for implementation planning
+- Nothing active — spec finalized, ready for implementation planning
 
 ## Next
-- Create implementation plan (`/deep-planning` with spec as input)
-- Phase 1 MVP: wrapper script + mux daemon with shared mode only
-  - Downstream: wrapper bridges CC stdio → named pipe
-  - Upstream: spawn + manage shared MCP servers
-  - Core: JSON-RPC parse, id remap, tool→upstream routing
+- Update ADRs to reflect new decisions (wrapper pattern, Go stack, self-coordination)
+- Create implementation plan (`/deep-planning` with spec v2 as input)
+- Phase 1 MVP:
+  - Go binary: mcp-mux wrapper + owner/client coordination
+  - IPC via named pipes (Windows) / Unix sockets
+  - JSON-RPC parse, id remap, tool routing
+  - Shared mode only (isolated = Phase 2)
+  - `mcp-mux status` basic command
   - Test: 2 mock CC sessions, 2 mock MCP servers, concurrent requests
-- Phase 2: Isolated mode for stateful servers
-- Phase 3: Health monitoring, auto-restart, status endpoint
-- Phase 4: Config generation from existing .mcp.json / .claude.json
+- Phase 2: Isolated mode, `mcp-mux setup` CLI helper
+- Phase 3: Health monitoring, restart, diagnostics
+- Phase 4: Transport adapters (stdio ↔ Streamable HTTP)
+- Research: Remote workers feasibility for stateless servers
 
 ## Architecture Summary
 
 ```
-CC 1 ──stdio──> mcp-mux-client ──pipe──┐
-CC 2 ──stdio──> mcp-mux-client ──pipe──┤──> mcp-mux daemon
-CC 3 ──stdio──> mcp-mux-client ──pipe──┤    ├── engram (shared, 1 process)
-CC 4 ──stdio──> mcp-mux-client ──pipe──┘    ├── tavily (shared, 1 process)
-                                            ├── context7 (shared, 1 process)
-                                            ├── nvmd-ssh (isolated, 4 processes)
-                                            └── aimux (isolated, 4 processes)
+CC 1 ──stdio──> mcp-mux ──IPC──┐
+CC 2 ──stdio──> mcp-mux ──IPC──┤──> mcp-mux (owner) ──stdio──> engram (1×)
+CC 3 ──stdio──> mcp-mux ──IPC──┤
+CC 4 ──stdio──> mcp-mux ──IPC──┘
 ```
 
-Without mux: 4 × 12 = 48 processes (~4.8 GB)
-With mux: 8 shared + 8 isolated + 4 clients + 1 daemon = 21 processes (~2 GB)
+First instance = owner (spawns upstream, listens on IPC).
+Subsequent instances = clients (connect to owner).
+Server ID = hash(command + args + selected env).
 
 ## Key Decisions
-- TypeScript, Node.js >= 20, zero npm deps for core
-- JSON-RPC id remapping: session prefix "s{N}:{id}"
-- Named pipes (Windows \\.\pipe\, Unix socket) for downstream IPC
-- Phase 1 MVP uses wrapper script (mcp-mux-client) to bridge CC stdio → pipe
-- Servers categorized as shared (default) or isolated in config
+- **Go** — single binary, goroutines, zero runtime deps
+- **Wrapper pattern** — `mcp-mux <original-command> [args...]`
+- **Self-coordination** — no separate daemon, first instance becomes owner
+- **One code path** — shared/isolated differ only in policy, not logic
+- **cwd sandbox** — strict, path traversal blocked, symlinks verified
+- **No remote fs mounts** — too fragile; remote workers only for network-only MCP
+- **No web dashboard** — CLI monitoring (status/ps/restart) sufficient
+- **No separate mux config** — server identity derived from command+args hash
 
 ## Context
 - Motivation: 4 parallel CC sessions × 12 MCP servers = 48 node processes, 4.8 GB RAM
@@ -56,4 +66,4 @@ With mux: 8 shared + 8 isolated + 4 clients + 1 daemon = 21 processes (~2 GB)
 - MCP spec version: 2025-06-18 (JSON-RPC 2.0 over stdio)
 
 ## Blockers
-- None — ready for implementation planning
+- None — ready for ADR update + implementation planning

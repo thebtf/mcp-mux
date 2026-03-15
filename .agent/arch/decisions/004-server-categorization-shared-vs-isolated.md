@@ -1,32 +1,45 @@
-# ADR-004: Server Categorization — Shared vs Isolated
+# ADR-004: Server Categorization — Shared vs Isolated (Revised)
 
 ## Status
 
-Accepted
+Accepted (revised 2026-03-15)
 
 ## Date
 
-2026-03-14
+2026-03-14 (original), 2026-03-15 (revised)
 
 ## Context
 
 Not all MCP servers are safe to share across sessions. Servers that maintain per-session state (SSH connections, browser sessions, file locks) would produce incorrect behavior if requests from different sessions were interleaved.
 
+The 2026-03-15 brainstorm added a key architectural principle: **one code path** for both modes. The proxy logic is identical — only the policy differs.
+
 ## Decision
 
-Two modes per upstream server, configured explicitly:
+Two modes per server, specified via CLI flag:
 
 ### `shared` (default)
 
 - Single upstream process serves all downstream clients
-- Requests are multiplexed via id remapping
-- Safe for: stateless request/response servers (engram, tavily, context7, litellm, proxmox, k8sgpt)
+- Requests multiplexed via id remapping
+- First mcp-mux instance becomes owner, others connect as clients via IPC
 
-### `isolated`
+### `isolated` (opt-in: `mcp-mux --isolated <command> [args...]`)
 
-- One upstream process spawned per downstream client
-- No multiplexing — dedicated 1:1 pipe per session
-- Required for: servers with per-session state (nvmd-ssh, playwright, aimux)
+- Each mcp-mux instance spawns its own dedicated upstream
+- No IPC coordination — each instance is its own owner
+- Same proxy code path — policy is simply "don't share"
+
+## One Code Path Principle
+
+The proxy engine (JSON-RPC parse, id remap, routing, lifecycle management) is identical in both modes. The only difference:
+
+| Aspect | Shared | Isolated |
+|--------|--------|----------|
+| Upstream instances | 1 per server identity | 1 per downstream client |
+| IPC coordination | Yes (owner/client) | No (every instance is owner) |
+| Resource savings | High | None (equivalent to no mux) |
+| Benefit | Process deduplication | Centralized management, CLI monitoring |
 
 ## Categorization of Current Servers
 
@@ -37,24 +50,21 @@ Two modes per upstream server, configured explicitly:
 | context7 | shared | Stateless doc lookup |
 | litellm | shared | Stateless LLM proxy |
 | context-please | shared | Stateless code search |
-| proxmox | shared | Stateless API proxy (REST calls to Proxmox) |
+| proxmox | shared | Stateless API proxy |
 | kubernetes | shared | Stateless kubectl proxy |
 | k8sgpt | shared | Stateless cluster analysis |
 | memory | shared | Stateless memory store/recall |
-| nvmd-ssh | **isolated** | SSH connections are per-session (session_id state) |
+| openrouter | shared | Stateless model routing |
+| nvmd-ssh | **isolated** | SSH connections are per-session |
 | aimux | **isolated** | Session management, process state per client |
 | playwright | **isolated** | Browser instance per session |
 | desktop-commander | **isolated** | Process management per session |
 | pencil | **isolated** | Editor state per session |
-
-## Rationale
-
-- Explicit configuration avoids runtime errors from incorrectly sharing stateful servers
-- Default `shared` maximizes resource savings (most servers are stateless)
-- `isolated` mode degrades gracefully to current behavior (no multiplexing benefit, but no breakage)
+| serena | **isolated** | Project activation state per session |
 
 ## Consequences
 
-- Operator must correctly categorize servers — miscategorizing a stateful server as `shared` causes data corruption
-- `isolated` servers still benefit from centralized management (single config, health monitoring)
-- Memory savings come primarily from `shared` servers — if most servers are `isolated`, benefit is minimal
+- Operator specifies `--isolated` flag when needed — miscategorizing a stateful server as shared causes data corruption
+- Default shared maximizes resource savings
+- Isolated servers still benefit from CLI monitoring (`mcp-mux status`)
+- Future: auto-detection of stateful servers (known list or heuristic)
