@@ -22,9 +22,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
 
@@ -157,40 +155,50 @@ func runOwner(args []string, cwd string, ipcPath string, logger *log.Logger, iso
 func runStop() {
 	fmt.Fprintln(os.Stderr, "Stopping all mcp-mux instances...")
 
-	// Clean up socket files and count active instances
 	tmpDir := os.TempDir()
 	entries, _ := os.ReadDir(tmpDir)
-	cleaned := 0
+	stopped := 0
+	stale := 0
+
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
-		path := tmpDir + string(os.PathSeparator) + name
-		_ = os.Remove(path)
-		cleaned++
-	}
 
-	// Kill all mcp-mux processes (except ourselves)
-	myPID := os.Getpid()
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		// taskkill on Windows — /FI filter excludes our own PID
-		cmd = exec.Command("taskkill", "/IM", "mcp-mux.exe", "/F")
-	} else {
-		// pkill on Unix — exclude our own PID
-		cmd = exec.Command("pkill", "-f", "mcp-mux")
-	}
-	_ = myPID // taskkill can't easily exclude self, but we exit right after anyway
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// taskkill returns error if no processes found — that's fine
-		if !strings.Contains(string(output), "not found") && !strings.Contains(string(output), "No tasks") {
-			fmt.Fprintf(os.Stderr, "kill output: %s\n", strings.TrimSpace(string(output)))
+		path := tmpDir + string(os.PathSeparator) + name
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+
+		// Try graceful shutdown via IPC
+		conn, err := ipc.Dial(path)
+		if err != nil {
+			// Socket exists but owner is dead — clean up stale file
+			_ = os.Remove(path)
+			stale++
+			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", id[:8])
+			continue
+		}
+
+		// Send shutdown command
+		shutdownMsg := `{"jsonrpc":"2.0","method":"mux/shutdown"}` + "\n"
+		_, err = conn.Write([]byte(shutdownMsg))
+		conn.Close()
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] failed to send shutdown: %v\n", id[:8], err)
+			_ = os.Remove(path)
+			stale++
+		} else {
+			fmt.Fprintf(os.Stderr, "  [%s] shutdown signal sent\n", id[:8])
+			stopped++
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "Cleaned %d socket files. All mcp-mux instances stopped.\n", cleaned)
+	if stopped == 0 && stale == 0 {
+		fmt.Fprintln(os.Stderr, "No mcp-mux instances found.")
+	} else {
+		fmt.Fprintf(os.Stderr, "Done: %d stopped gracefully, %d stale cleaned.\n", stopped, stale)
+	}
 }
 
 func runUpgrade() {

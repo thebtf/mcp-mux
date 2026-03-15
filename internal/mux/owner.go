@@ -138,6 +138,13 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
+	// Check for mux control commands
+	if msg.Method == "mux/shutdown" {
+		o.logger.Printf("received shutdown command from session %d", s.ID)
+		go o.Shutdown() // async to not block the session reader
+		return nil
+	}
+
 	switch {
 	case msg.IsNotification():
 		// Forward notifications as-is to upstream
