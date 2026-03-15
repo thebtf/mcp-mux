@@ -100,7 +100,7 @@ func main() {
 	// In isolated mode, always become owner (skip IPC check)
 	if *isolated {
 		logger.Printf("isolated mode: starting dedicated upstream")
-		runOwner(args, cwd, ipcPath, controlPath, logger, true)
+		runOwner(args, cwd, ipcPath, controlPath, sid, logger, true)
 		return
 	}
 
@@ -116,10 +116,10 @@ func main() {
 
 	// No owner found — become one
 	logger.Printf("becoming owner for %s (cwd: %s, mode: %s)", serverid.DescribeArgs(args), cwd, mode)
-	runOwner(args, cwd, ipcPath, controlPath, logger, *isolated)
+	runOwner(args, cwd, ipcPath, controlPath, sid, logger, *isolated)
 }
 
-func runOwner(args []string, cwd, ipcPath, controlPath string, logger *log.Logger, isolated bool) {
+func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.Logger, isolated bool) {
 	command := args[0]
 	cmdArgs := args[1:]
 
@@ -132,10 +132,11 @@ func runOwner(args []string, cwd, ipcPath, controlPath string, logger *log.Logge
 	effectiveIPCPath := ipcPath
 	effectiveControlPath := controlPath
 	if isolated {
-		// In isolated mode, use a unique path that won't be found by other instances
-		suffix := fmt.Sprintf("-%d", os.Getpid())
-		effectiveIPCPath = ipcPath + suffix
-		effectiveControlPath = controlPath + suffix
+		// In isolated mode, embed PID into the server ID portion (before extension)
+		// so suffix matching (.sock, .ctl.sock) still works for stop/status commands.
+		pidSuffix := fmt.Sprintf("-%d", os.Getpid())
+		effectiveIPCPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.sock", sid, pidSuffix))
+		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.ctl.sock", sid, pidSuffix))
 	}
 
 	owner, err := mux.NewOwner(mux.OwnerConfig{
