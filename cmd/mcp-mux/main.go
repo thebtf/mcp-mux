@@ -77,13 +77,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Determine sharing mode
+	// Determine sharing mode — env vars take precedence over flags
 	mode := serverid.ModeCwd
-	if *stateless {
+	if *stateless || os.Getenv("MCP_MUX_STATELESS") == "1" {
 		mode = serverid.ModeGlobal
 	}
-	if *isolated {
+	if *isolated || os.Getenv("MCP_MUX_ISOLATED") == "1" {
 		mode = serverid.ModeIsolated
+	}
+	if os.Getenv("MCP_MUX_ISOLATED") == "1" {
+		*isolated = true
+	}
+	if os.Getenv("MCP_MUX_DAEMON") == "1" {
+		*daemon = true
 	}
 
 	// Get current working directory
@@ -184,7 +190,7 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 
 // runDaemon starts an owner without a stdio session (headless).
 // Used by mux_restart to spawn a new owner in the background.
-func runDaemon(args []string, cwd, ipcPath, controlPath, sid string, logger *log.Logger) {
+func runDaemon(args []string, cwd, ipcPath, controlPath, _ string, logger *log.Logger) {
 	command := args[0]
 	cmdArgs := args[1:]
 
