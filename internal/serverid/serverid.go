@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -29,10 +28,10 @@ func Compute(args []string) string {
 }
 
 // IPCPath returns the platform-specific IPC endpoint path for a given server ID.
+// On all platforms, uses Unix domain sockets in the temp directory.
+// Windows 10 1803+ supports Unix domain sockets natively via filesystem paths
+// (NOT \\.\pipe\ namespace — that requires different Windows API).
 func IPCPath(id string) string {
-	if runtime.GOOS == "windows" {
-		return fmt.Sprintf(`\\.\pipe\mcp-mux-%s`, id)
-	}
 	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.sock", id))
 }
 

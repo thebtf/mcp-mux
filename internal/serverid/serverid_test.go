@@ -1,7 +1,6 @@
 package serverid
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -53,23 +52,7 @@ func TestComputeLength(t *testing.T) {
 	}
 }
 
-func TestIPCPathWindows(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("Windows-only test")
-	}
-	path := IPCPath("abc123def456")
-	if !strings.HasPrefix(path, `\\.\pipe\mcp-mux-`) {
-		t.Errorf("IPCPath = %q, want prefix \\\\?\\pipe\\mcp-mux-", path)
-	}
-	if !strings.Contains(path, "abc123def456") {
-		t.Errorf("IPCPath = %q, missing server ID", path)
-	}
-}
-
-func TestIPCPathUnix(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Unix-only test")
-	}
+func TestIPCPath(t *testing.T) {
 	path := IPCPath("abc123def456")
 	if !strings.HasSuffix(path, ".sock") {
 		t.Errorf("IPCPath = %q, want .sock suffix", path)
