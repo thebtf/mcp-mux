@@ -31,6 +31,7 @@ import (
 
 	"github.com/bitswan-space/mcp-mux/internal/control"
 	"github.com/bitswan-space/mcp-mux/internal/ipc"
+	"github.com/bitswan-space/mcp-mux/internal/mcpserver"
 	"github.com/bitswan-space/mcp-mux/internal/mux"
 	"github.com/bitswan-space/mcp-mux/internal/serverid"
 )
@@ -56,11 +57,15 @@ func main() {
 			upgradeFlags.Parse(os.Args[2:])
 			runUpgrade(*drainTimeout, *force)
 			return
+		case "serve":
+			runServe()
+			return
 		}
 	}
 
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
+	daemon := flag.Bool("daemon", false, "Run as headless owner (no stdio session, for restart)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -116,7 +121,11 @@ func main() {
 
 	// No owner found — become one
 	logger.Printf("becoming owner for %s (cwd: %s, mode: %s)", serverid.DescribeArgs(args), cwd, mode)
-	runOwner(args, cwd, ipcPath, controlPath, sid, logger, *isolated)
+	if *daemon {
+		runDaemon(args, cwd, ipcPath, controlPath, sid, logger)
+	} else {
+		runOwner(args, cwd, ipcPath, controlPath, sid, logger, *isolated)
+	}
 }
 
 func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.Logger, isolated bool) {
@@ -170,6 +179,50 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 		// Our own session ended (stdin closed)
 		logger.Printf("stdin closed, shutting down")
 		owner.Shutdown()
+	}
+}
+
+// runDaemon starts an owner without a stdio session (headless).
+// Used by mux_restart to spawn a new owner in the background.
+func runDaemon(args []string, cwd, ipcPath, controlPath, sid string, logger *log.Logger) {
+	command := args[0]
+	cmdArgs := args[1:]
+
+	env := make(map[string]string)
+
+	owner, err := mux.NewOwner(mux.OwnerConfig{
+		Command:     command,
+		Args:        cmdArgs,
+		Env:         env,
+		Cwd:         cwd,
+		IPCPath:     ipcPath,
+		ControlPath: controlPath,
+		Logger:      logger,
+	})
+	if err != nil {
+		logger.Fatalf("failed to start daemon owner: %v", err)
+	}
+
+	logger.Printf("daemon owner started (no stdio session)")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigCh:
+		logger.Printf("received signal %v, shutting down", sig)
+		owner.Shutdown()
+	case <-owner.Done():
+		// Owner shut down (upstream exited)
+	}
+}
+
+// runServe starts as an MCP server on stdio, providing control plane tools.
+func runServe() {
+	logger := log.New(os.Stderr, "[mcp-mux:serve] ", log.LstdFlags)
+	srv := mcpserver.NewServer(os.Stdin, os.Stdout, logger)
+	if err := srv.Run(); err != nil {
+		logger.Printf("serve error: %v", err)
 	}
 }
 
