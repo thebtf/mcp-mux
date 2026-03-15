@@ -50,6 +50,16 @@ func TestIPCPath(t *testing.T) {
 	}
 }
 
+func TestControlPath(t *testing.T) {
+	path := ControlPath("abc123def456")
+	if !strings.HasSuffix(path, ".ctl.sock") {
+		t.Errorf("ControlPath = %q, want .ctl.sock suffix", path)
+	}
+	if !strings.Contains(path, "mcp-mux-abc123def456") {
+		t.Errorf("ControlPath = %q, missing server ID", path)
+	}
+}
+
 func TestLockPath(t *testing.T) {
 	path := LockPath("test123")
 	if !strings.Contains(path, "mcp-mux-test123.lock") {

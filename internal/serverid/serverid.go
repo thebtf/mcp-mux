@@ -120,6 +120,11 @@ func IPCPath(id string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.sock", id))
 }
 
+// ControlPath returns the control socket path for a given server ID.
+func ControlPath(id string) string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", id))
+}
+
 // LockPath returns the lock file path used for owner election.
 func LockPath(id string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.lock", id))
