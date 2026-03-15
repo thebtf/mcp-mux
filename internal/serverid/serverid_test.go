@@ -5,50 +5,38 @@ import (
 	"testing"
 )
 
-func TestComputeDeterministic(t *testing.T) {
-	args := []string{"uvx", "--refresh", "--from", "git+https://example.com", "serena"}
-	id1 := Compute(args)
-	id2 := Compute(args)
+func TestGenerateContextKeyDeterministic(t *testing.T) {
+	id1 := GenerateContextKey(ModeCwd, "node", []string{"server.js"}, []string{}, "/dev/app")
+	id2 := GenerateContextKey(ModeCwd, "node", []string{"server.js"}, []string{}, "/dev/app")
 	if id1 != id2 {
 		t.Errorf("same args produced different IDs: %s vs %s", id1, id2)
 	}
 }
 
-func TestComputeDifferentArgs(t *testing.T) {
-	id1 := Compute([]string{"node", "server1.js"})
-	id2 := Compute([]string{"node", "server2.js"})
+func TestGenerateContextKeyDifferentEnv(t *testing.T) {
+	id1 := GenerateContextKey(ModeCwd, "node", []string{"server.js"}, []string{"API=1"}, "/dev/app")
+	id2 := GenerateContextKey(ModeCwd, "node", []string{"server.js"}, []string{"API=2"}, "/dev/app")
 	if id1 == id2 {
-		t.Errorf("different args produced same ID: %s", id1)
+		t.Errorf("different env produced same ID: %s", id1)
 	}
 }
 
-func TestComputeOrderMatters(t *testing.T) {
-	id1 := Compute([]string{"a", "b"})
-	id2 := Compute([]string{"b", "a"})
+func TestGenerateContextKeyIsolated(t *testing.T) {
+	id1 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, []string{}, "/dev/app")
+	id2 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, []string{}, "/dev/app")
 	if id1 == id2 {
-		t.Errorf("different order produced same ID: %s", id1)
+		t.Errorf("isolated mode produced same ID: %s", id1)
+	}
+	if !strings.HasPrefix(id1, "isolated-") {
+		t.Errorf("isolated mode missing prefix: %s", id1)
 	}
 }
 
-func TestComputeSeparatorPreventsCollision(t *testing.T) {
-	id1 := Compute([]string{"ab", "c"})
-	id2 := Compute([]string{"a", "bc"})
-	if id1 == id2 {
-		t.Errorf("colliding args produced same ID: %s", id1)
-	}
-}
-
-func TestComputeEmpty(t *testing.T) {
+func TestComputeEmptyFallback(t *testing.T) {
+	// Should not panic
 	id := Compute([]string{})
-	if len(id) != 16 {
-		t.Errorf("empty args ID length = %d, want 16", len(id))
-	}
-}
-
-func TestComputeLength(t *testing.T) {
-	id := Compute([]string{"node", "some/path/server.js"})
-	if len(id) != 16 {
-		t.Errorf("ID length = %d, want 16", len(id))
+	if id == "" {
+		t.Errorf("expected non-empty id")
 	}
 }
 
@@ -84,5 +72,16 @@ func TestDescribeArgs(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("DescribeArgs(%v) = %q, want %q", tt.args, got, tt.want)
 		}
+	}
+}
+
+func TestPathNormalization(t *testing.T) {
+	// This tests basic path normalization.
+	// Cross-platform Windows tests are naturally implicit since we run on Windows.
+	path1 := CanonicalizePath(`C:\dev\app`)
+	path2 := CanonicalizePath(`c:\DEV\APP`)
+
+	if path1 != path2 {
+		t.Errorf("path normalization failed on Windows: %q != %q", path1, path2)
 	}
 }

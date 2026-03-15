@@ -19,7 +19,7 @@ func TestStartAndClose(t *testing.T) {
 		args = []string{"hello"}
 	}
 
-	p, err := Start(cmd, args, nil)
+	p, err := Start(cmd, args, nil, "")
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestStartAndClose(t *testing.T) {
 func TestWriteAndRead(t *testing.T) {
 	// Use 'go run' with a simple cat-like program
 	// For cross-platform, we use Go itself
-	p, err := Start("go", []string{"run", "../../testdata/echo_pipe.go"}, nil)
+	p, err := Start("go", []string{"run", "../../testdata/echo_pipe.go"}, nil, "")
 	if err != nil {
 		t.Skipf("Skipping: cannot start echo_pipe: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestProcessDone(t *testing.T) {
 		args = []string{"done"}
 	}
 
-	p, err := Start(cmd, args, nil)
+	p, err := Start(cmd, args, nil, "")
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestProcessPID(t *testing.T) {
 		args = []string{"pid"}
 	}
 
-	p, err := Start(cmd, args, nil)
+	p, err := Start(cmd, args, nil, "")
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestCloseTerminatesProcess(t *testing.T) {
 		args = []string{"30"}
 	}
 
-	p, err := Start(cmd, args, nil)
+	p, err := Start(cmd, args, nil, "")
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestReadLineAfterClose(t *testing.T) {
 		args = []string{"line1"}
 	}
 
-	p, err := Start(cmd, args, nil)
+	p, err := Start(cmd, args, nil, "")
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestEnvironmentPassing(t *testing.T) {
 		"TEST_MUX_VAR": "mux_value_123",
 	}
 
-	p, err := Start(cmd, args, env)
+	p, err := Start(cmd, args, env, "")
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}

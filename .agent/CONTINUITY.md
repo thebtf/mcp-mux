@@ -1,69 +1,60 @@
 # Continuity State
 
 **Last Updated:** 2026-03-15
-**Session:** Architecture brainstorm — revised spec
+**Session:** Phase 1 PoC implementation
 
 ## Done
-- Project created at D:\Dev\mcp-mux, git initialized
-- .agent directory structure created (data, plans, reports, specs, arch/decisions)
-- CLAUDE.md + AGENTS.md bootstrap
-- Full specification v1: `.agent/specs/mcp-mux.md`
-- 4 ADRs written (001-004)
-- **Architecture brainstorm session** — major design revisions:
-  - Wrapper pattern (mcp-mux as command prefix, not daemon+client)
-  - Go instead of TypeScript
-  - Self-coordinating instances (first = owner, rest = clients via IPC)
-  - One code path for shared/isolated
-  - cwd sandbox with symlink checking
-  - CLI monitoring (status/ps/restart)
-  - Transport abstraction (future: any-to-any)
-- Spec v2 updated with all brainstorm decisions
+- Project created, git initialized, .agent/ structure
+- Full specification v2 with brainstorm decisions
+- 7 ADRs (001-007)
+- **Phase 1 PoC COMPLETE:**
+  - `internal/jsonrpc` — JSON-RPC 2.0 parser + scanner (12 tests)
+  - `internal/remap` — session-prefixed ID remapping with type preservation (14 tests)
+  - `internal/serverid` — deterministic server identity hash + IPC path (8 tests)
+  - `internal/ipc` — cross-platform IPC via Unix domain sockets (6 tests)
+  - `internal/upstream` — process spawning + stdio bridge (7 tests)
+  - `internal/mux/owner` — multiplexer core: session routing, ID remap, upstream bridge, IPC listener
+  - `internal/mux/client` — dumb stdio↔IPC bridge for client mode
+  - `internal/mux/session` — per-downstream session abstraction
+  - `internal/mux` — integration tests (5 tests: single, multi, IPC, disconnect)
+  - `cmd/mcp-mux/main.go` — entry point with owner/client auto-detection, --isolated, status
+  - `testdata/mock_server.go` — mock MCP server for testing
+  - **E2E verified:** initialize → tools/list → tools/call → ping all work through mux
 
 ## Now
-- Nothing active — spec finalized, ready for implementation planning
+- PoC is functional — mcp-mux binary works end-to-end
 
 ## Next
-- Update ADRs to reflect new decisions (wrapper pattern, Go stack, self-coordination)
-- Create implementation plan (`/deep-planning` with spec v2 as input)
-- Phase 1 MVP:
-  - Go binary: mcp-mux wrapper + owner/client coordination
-  - IPC via named pipes (Windows) / Unix sockets
-  - JSON-RPC parse, id remap, tool routing
-  - Shared mode only (isolated = Phase 2)
-  - `mcp-mux status` basic command
-  - Test: 2 mock CC sessions, 2 mock MCP servers, concurrent requests
-- Phase 2: Isolated mode, `mcp-mux setup` CLI helper
-- Phase 3: Health monitoring, restart, diagnostics
-- Phase 4: Transport adapters (stdio ↔ Streamable HTTP)
-- Research: Remote workers feasibility for stateless servers
+- [ ] E2E test with TWO concurrent mcp-mux instances (owner + IPC client)
+- [ ] `mcp-mux status` scan for Windows (currently Unix socket scan only)
+- [ ] `mcp-mux setup` CLI helper for rewriting .mcp.json
+- [ ] Isolated mode testing
+- [ ] Error handling hardening (upstream crash → reconnect, client errors)
+- [ ] Real-world test with actual MCP server (engram, tavily, etc.)
+- [ ] Phase 2: `mcp-mux setup` command, isolated mode polish
+- [ ] Phase 3: Health monitoring, auto-restart, diagnostics
 
 ## Architecture Summary
 
 ```
 CC 1 ──stdio──> mcp-mux ──IPC──┐
-CC 2 ──stdio──> mcp-mux ──IPC──┤──> mcp-mux (owner) ──stdio──> engram (1×)
+CC 2 ──stdio──> mcp-mux ──IPC──┤──> mcp-mux (owner) ──stdio──> server (1×)
 CC 3 ──stdio──> mcp-mux ──IPC──┤
 CC 4 ──stdio──> mcp-mux ──IPC──┘
 ```
 
-First instance = owner (spawns upstream, listens on IPC).
-Subsequent instances = clients (connect to owner).
-Server ID = hash(command + args + selected env).
-
 ## Key Decisions
-- **Go** — single binary, goroutines, zero runtime deps
-- **Wrapper pattern** — `mcp-mux <original-command> [args...]`
-- **Self-coordination** — no separate daemon, first instance becomes owner
-- **One code path** — shared/isolated differ only in policy, not logic
-- **cwd sandbox** — strict, path traversal blocked, symlinks verified
-- **No remote fs mounts** — too fragile; remote workers only for network-only MCP
-- **No web dashboard** — CLI monitoring (status/ps/restart) sufficient
-- **No separate mux config** — server identity derived from command+args hash
+- Go, single binary, zero runtime deps
+- Wrapper pattern: `mcp-mux <original-command> [args...]`
+- Self-coordination: first instance = owner, others = IPC clients
+- Unix domain sockets for IPC (works on Windows 10 1803+, not \\.\pipe\)
+- One code path for shared/isolated (policy only)
+- ID remap format: `s{N}:n:{num}` / `s{N}:s:{str}` / `s{N}:null`
 
-## Context
-- Motivation: 4 parallel CC sessions × 12 MCP servers = 48 node processes, 4.8 GB RAM
-- Primary platform: Windows 11 (named pipes), secondary: Linux (AI Harbour)
-- MCP spec version: 2025-06-18 (JSON-RPC 2.0 over stdio)
+## Stats
+- 52 unit/integration tests, all passing
+- E2E test verified
+- 4 commits on master
 
 ## Blockers
-- None — ready for ADR update + implementation planning
+- None

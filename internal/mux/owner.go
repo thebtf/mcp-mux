@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/bitswan-space/mcp-mux/internal/ipc"
@@ -19,6 +21,7 @@ import (
 type Owner struct {
 	upstream *upstream.Process
 	ipcPath  string
+	cwd      string // working directory for this owner instance
 	listener net.Listener
 	logger   *log.Logger
 
@@ -38,6 +41,10 @@ type OwnerConfig struct {
 	Args    []string
 	Env     map[string]string
 
+	// Cwd is the working directory for the upstream process.
+	// If empty, inherits from the current process.
+	Cwd string
+
 	// IPCPath for the Unix domain socket listener.
 	IPCPath string
 
@@ -53,8 +60,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger = log.Default()
 	}
 
-	// Spawn upstream
-	proc, err := upstream.Start(cfg.Command, cfg.Args, cfg.Env)
+	// Spawn upstream with the client's cwd
+	proc, err := upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd)
 	if err != nil {
 		return nil, fmt.Errorf("owner: start upstream: %w", err)
 	}
@@ -69,6 +76,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	o := &Owner{
 		upstream: proc,
 		ipcPath:  cfg.IPCPath,
+		cwd:      cfg.Cwd,
 		listener: ln,
 		logger:   logger,
 		sessions: make(map[int]*Session),
@@ -99,6 +107,9 @@ func (o *Owner) AddSession(s *Session) {
 	o.mu.Unlock()
 
 	o.logger.Printf("session %d connected", s.ID)
+
+	// Notify upstream that roots may have changed (new client = new potential root)
+	o.sendRootsListChanged()
 
 	go o.readSession(s)
 }
@@ -170,14 +181,20 @@ func (o *Owner) readUpstream() {
 }
 
 // handleUpstreamMessage routes a message from the upstream to the correct session.
+// It also intercepts server→client requests like roots/list.
 func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	if msg.IsNotification() {
 		// Broadcast to all sessions
 		return o.broadcast(msg.Raw)
 	}
 
+	if msg.IsRequest() {
+		// Server→client request (e.g., roots/list, sampling/createMessage)
+		return o.handleUpstreamRequest(msg)
+	}
+
 	if !msg.IsResponse() {
-		return fmt.Errorf("unexpected non-response from upstream: %s", msg.Type)
+		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
 	}
 
 	// Deremap the ID to find the target session
@@ -203,6 +220,79 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	}
 
 	return session.WriteRaw(restored)
+}
+
+// handleUpstreamRequest handles server→client requests from the upstream.
+// The most important one is roots/list — the server asks what filesystem
+// boundaries are available. We respond with the owner's cwd as a file:// URI.
+func (o *Owner) handleUpstreamRequest(msg *jsonrpc.Message) error {
+	switch msg.Method {
+	case "roots/list":
+		o.logger.Printf("upstream requested roots/list, responding with cwd: %s", o.cwd)
+		return o.respondToRootsList(msg.ID)
+	default:
+		// Unknown server→client request — log and ignore
+		o.logger.Printf("upstream sent unhandled request: %s (ignoring)", msg.Method)
+		return nil
+	}
+}
+
+// respondToRootsList sends a roots/list response to the upstream with the owner's cwd.
+func (o *Owner) respondToRootsList(id json.RawMessage) error {
+	cwd := o.cwd
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+
+	// Convert to file:// URI
+	uri := pathToFileURI(cwd)
+
+	resp := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  struct {
+			Roots []struct {
+				URI  string `json:"uri"`
+				Name string `json:"name,omitempty"`
+			} `json:"roots"`
+		} `json:"result"`
+	}{
+		JSONRPC: "2.0",
+		ID:      id,
+	}
+	resp.Result.Roots = []struct {
+		URI  string `json:"uri"`
+		Name string `json:"name,omitempty"`
+	}{
+		{URI: uri, Name: filepath.Base(cwd)},
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("marshal roots response: %w", err)
+	}
+
+	return o.upstream.WriteLine(data)
+}
+
+// sendRootsListChanged notifies the upstream that roots have changed.
+func (o *Owner) sendRootsListChanged() {
+	notification := `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`
+	if err := o.upstream.WriteLine([]byte(notification)); err != nil {
+		o.logger.Printf("failed to send roots/list_changed: %v", err)
+	}
+}
+
+// pathToFileURI converts a filesystem path to a file:// URI.
+func pathToFileURI(p string) string {
+	// Normalize path separators
+	p = filepath.ToSlash(p)
+	// Windows paths like C:/foo → file:///C:/foo
+	if len(p) >= 2 && p[1] == ':' {
+		return "file:///" + p
+	}
+	// Unix paths like /home/user → file:///home/user
+	return "file://" + p
 }
 
 // broadcast sends a message to all connected sessions.
@@ -234,6 +324,11 @@ func (o *Owner) removeSession(s *Session) {
 	o.mu.Unlock()
 
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
+
+	// Notify upstream that roots may have changed (client left)
+	if remaining > 0 {
+		o.sendRootsListChanged()
+	}
 }
 
 // acceptLoop accepts new IPC connections and creates sessions for them.
@@ -308,5 +403,3 @@ func (o *Owner) Status() map[string]interface{} {
 	}
 }
 
-// Ensure json import is used
-var _ = json.RawMessage{}

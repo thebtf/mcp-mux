@@ -33,6 +33,7 @@ import (
 
 func main() {
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
+	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -48,8 +49,26 @@ func main() {
 		return
 	}
 
+	// Determine sharing mode
+	mode := serverid.ModeCwd
+	if *stateless {
+		mode = serverid.ModeGlobal
+	}
+	if *isolated {
+		mode = serverid.ModeIsolated
+	}
+
+	// Get current working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error getting cwd: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Compute server identity
-	sid := serverid.Compute(args)
+	command := args[0]
+	cmdArgs := args[1:]
+	sid := serverid.GenerateContextKey(mode, command, cmdArgs, nil, cwd)
 	ipcPath := serverid.IPCPath(sid)
 
 	logger := log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags)
@@ -57,7 +76,7 @@ func main() {
 	// In isolated mode, always become owner (skip IPC check)
 	if *isolated {
 		logger.Printf("isolated mode: starting dedicated upstream")
-		runOwner(args, ipcPath, logger, true)
+		runOwner(args, cwd, ipcPath, logger, true)
 		return
 	}
 
@@ -72,11 +91,11 @@ func main() {
 	}
 
 	// No owner found — become one
-	logger.Printf("becoming owner for %s", serverid.DescribeArgs(args))
-	runOwner(args, ipcPath, logger, false)
+	logger.Printf("becoming owner for %s (cwd: %s, mode: %s)", serverid.DescribeArgs(args), cwd, mode)
+	runOwner(args, cwd, ipcPath, logger, *isolated)
 }
 
-func runOwner(args []string, ipcPath string, logger *log.Logger, isolated bool) {
+func runOwner(args []string, cwd string, ipcPath string, logger *log.Logger, isolated bool) {
 	command := args[0]
 	cmdArgs := args[1:]
 
@@ -96,6 +115,7 @@ func runOwner(args []string, ipcPath string, logger *log.Logger, isolated bool) 
 		Command: command,
 		Args:    cmdArgs,
 		Env:     env,
+		Cwd:     cwd,
 		IPCPath: effectiveIPCPath,
 		Logger:  logger,
 	})

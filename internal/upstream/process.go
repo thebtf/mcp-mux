@@ -32,10 +32,16 @@ type Process struct {
 	ExitErr error
 }
 
-// Start spawns an upstream process with the given command, args, and environment.
+// Start spawns an upstream process with the given command, args, environment, and working directory.
 // The env map is merged with the current process environment.
-func Start(command string, args []string, env map[string]string) (*Process, error) {
+// If cwd is non-empty, the child process runs in that directory.
+func Start(command string, args []string, env map[string]string, cwd string) (*Process, error) {
 	cmd := exec.Command(command, args...)
+
+	// Set working directory if specified
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
 
 	// Merge environment
 	cmd.Env = os.Environ()
