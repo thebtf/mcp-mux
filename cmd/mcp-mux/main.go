@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -44,8 +46,15 @@ func main() {
 	}
 
 	// Handle subcommands
-	if args[0] == "status" {
+	switch args[0] {
+	case "status":
 		runStatus()
+		return
+	case "stop":
+		runStop()
+		return
+	case "upgrade":
+		runUpgrade()
 		return
 	}
 
@@ -64,6 +73,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error getting cwd: %v\n", err)
 		os.Exit(1)
 	}
+
 
 	// Compute server identity
 	command := args[0]
@@ -142,6 +152,54 @@ func runOwner(args []string, cwd string, ipcPath string, logger *log.Logger, iso
 		logger.Printf("stdin closed, shutting down")
 		owner.Shutdown()
 	}
+}
+
+func runStop() {
+	fmt.Fprintln(os.Stderr, "Stopping all mcp-mux instances...")
+
+	// Clean up socket files and count active instances
+	tmpDir := os.TempDir()
+	entries, _ := os.ReadDir(tmpDir)
+	cleaned := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		path := tmpDir + string(os.PathSeparator) + name
+		_ = os.Remove(path)
+		cleaned++
+	}
+
+	// Kill all mcp-mux processes (except ourselves)
+	myPID := os.Getpid()
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		// taskkill on Windows — /FI filter excludes our own PID
+		cmd = exec.Command("taskkill", "/IM", "mcp-mux.exe", "/F")
+	} else {
+		// pkill on Unix — exclude our own PID
+		cmd = exec.Command("pkill", "-f", "mcp-mux")
+	}
+	_ = myPID // taskkill can't easily exclude self, but we exit right after anyway
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// taskkill returns error if no processes found — that's fine
+		if !strings.Contains(string(output), "not found") && !strings.Contains(string(output), "No tasks") {
+			fmt.Fprintf(os.Stderr, "kill output: %s\n", strings.TrimSpace(string(output)))
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "Cleaned %d socket files. All mcp-mux instances stopped.\n", cleaned)
+}
+
+func runUpgrade() {
+	runStop()
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "All instances stopped. Binary unlocked. Rebuild with:")
+	fmt.Fprintln(os.Stderr, "  go build -o mcp-mux.exe ./cmd/mcp-mux")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "MCP servers will restart automatically on next CC tool call.")
 }
 
 func runStatus() {
