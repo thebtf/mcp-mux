@@ -25,6 +25,8 @@ type Owner struct {
 	upstream *upstream.Process
 	ipcPath  string
 	cwd      string // working directory for this owner instance
+	command  string // upstream command (for status/restart)
+	args     []string // upstream args (for status/restart)
 	listener net.Listener
 	logger   *log.Logger
 
@@ -88,6 +90,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		upstream:  proc,
 		ipcPath:   cfg.IPCPath,
 		cwd:       cfg.Cwd,
+		command:   cfg.Command,
+		args:      cfg.Args,
 		listener:  ln,
 		logger:    logger,
 		sessions:  make(map[int]*Session),
@@ -486,6 +490,8 @@ func (o *Owner) Status() map[string]any {
 	return map[string]any{
 		"upstream_pid":     o.upstream.PID(),
 		"ipc_path":         o.ipcPath,
+		"command":          o.command,
+		"args":             o.args,
 		"sessions":         sessionIDs,
 		"session_count":    len(sessionIDs),
 		"pending_requests": o.pendingRequests.Load(),
