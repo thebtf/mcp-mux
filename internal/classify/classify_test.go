@@ -247,6 +247,18 @@ func TestClassifyCapabilities(t *testing.T) {
 			wantOK:   false,
 		},
 		{
+			name:     "x-mux in experimental (TypeScript SDK)",
+			json:     `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{},"experimental":{"x-mux":{"sharing":"shared","stateless":true}}}}}`,
+			wantMode: ModeShared,
+			wantOK:   true,
+		},
+		{
+			name:     "session-aware in experimental",
+			json:     `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"experimental":{"x-mux":{"sharing":"session-aware"}}}}}`,
+			wantMode: ModeSessionAware,
+			wantOK:   true,
+		},
+		{
 			name:     "invalid sharing value",
 			json:     `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"x-mux":{"sharing":"bogus"}}}}`,
 			wantMode: "",

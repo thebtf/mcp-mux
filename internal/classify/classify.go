@@ -49,12 +49,14 @@ func ClassifyTools(toolsListJSON []byte) (SharingMode, []string) {
 // Returns the declared mode and true if x-mux was found, or ("", false) if absent.
 // This takes priority over tool-name classification when present.
 func ClassifyCapabilities(initJSON []byte) (SharingMode, bool) {
+	// Try direct x-mux capability first
 	var resp struct {
 		Result struct {
 			Capabilities struct {
 				XMux *struct {
 					Sharing string `json:"sharing"`
 				} `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
 			} `json:"capabilities"`
 		} `json:"result"`
 	}
@@ -62,11 +64,26 @@ func ClassifyCapabilities(initJSON []byte) (SharingMode, bool) {
 		return "", false
 	}
 
-	if resp.Result.Capabilities.XMux == nil {
+	// Check direct x-mux capability
+	xmux := resp.Result.Capabilities.XMux
+
+	// Fallback: check experimental.x-mux (TypeScript SDK puts custom capabilities here)
+	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
+		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
+			xmux = &struct {
+				Sharing string `json:"sharing"`
+			}{}
+			if err := json.Unmarshal(raw, xmux); err != nil {
+				xmux = nil
+			}
+		}
+	}
+
+	if xmux == nil {
 		return "", false
 	}
 
-	mode := SharingMode(resp.Result.Capabilities.XMux.Sharing)
+	mode := SharingMode(xmux.Sharing)
 	switch mode {
 	case ModeShared, ModeIsolated, ModeSessionAware:
 		return mode, true
