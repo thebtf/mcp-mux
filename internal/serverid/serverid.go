@@ -130,6 +130,16 @@ func LockPath(id string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.lock", id))
 }
 
+// DaemonControlPath returns the control socket path for the global daemon.
+func DaemonControlPath() string {
+	return filepath.Join(os.TempDir(), "mcp-muxd.ctl.sock")
+}
+
+// DaemonLockPath returns the lock file path for daemon startup coordination.
+func DaemonLockPath() string {
+	return filepath.Join(os.TempDir(), "mcp-muxd.lock")
+}
+
 // DescribeArgs returns a human-readable summary of the command + args
 func DescribeArgs(args []string) string {
 	if len(args) == 0 {

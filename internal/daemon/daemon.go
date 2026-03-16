@@ -1,0 +1,326 @@
+// Package daemon implements a global daemon that manages all upstream MCP server
+// processes. CC sessions connect as thin shims via IPC; the daemon handles
+// lifecycle, GC, reaping, health monitoring, and persistence.
+package daemon
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/bitswan-space/mcp-mux/internal/control"
+	"github.com/bitswan-space/mcp-mux/internal/mux"
+	"github.com/bitswan-space/mcp-mux/internal/serverid"
+)
+
+// OwnerEntry tracks a single managed owner and its metadata.
+type OwnerEntry struct {
+	Owner       *mux.Owner
+	ServerID    string
+	Command     string
+	Args        []string
+	Cwd         string
+	Mode        string
+	Env         map[string]string
+	Persistent  bool
+	LastSession time.Time
+	GracePeriod time.Duration
+}
+
+// Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
+type Daemon struct {
+	mu      sync.RWMutex
+	owners  map[string]*OwnerEntry
+	logger  *log.Logger
+	ctlSrv  *control.Server
+	done    chan struct{}
+
+	gracePeriod time.Duration
+	idleTimeout time.Duration
+
+	shutdownOnce sync.Once
+}
+
+// Config holds daemon startup parameters.
+type Config struct {
+	// ControlPath is the daemon's control socket path.
+	ControlPath string
+
+	// GracePeriod is how long non-persistent owners survive with zero sessions.
+	// Default: 30s. Overridden by MCP_MUX_GRACE env var.
+	GracePeriod time.Duration
+
+	// IdleTimeout is how long the daemon waits with zero owners before auto-exiting.
+	// Default: 5 minutes.
+	IdleTimeout time.Duration
+
+	Logger *log.Logger
+}
+
+// New creates and starts a new Daemon with a control server.
+func New(cfg Config) (*Daemon, error) {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
+	}
+
+	gracePeriod := cfg.GracePeriod
+	if gracePeriod == 0 {
+		gracePeriod = 30 * time.Second
+	}
+	idleTimeout := cfg.IdleTimeout
+	if idleTimeout == 0 {
+		idleTimeout = 5 * time.Minute
+	}
+
+	d := &Daemon{
+		owners:      make(map[string]*OwnerEntry),
+		logger:      logger,
+		done:        make(chan struct{}),
+		gracePeriod: gracePeriod,
+		idleTimeout: idleTimeout,
+	}
+
+	ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
+	if err != nil {
+		return nil, fmt.Errorf("daemon: control server: %w", err)
+	}
+	d.ctlSrv = ctlSrv
+	logger.Printf("daemon started, control socket: %s", cfg.ControlPath)
+
+	return d, nil
+}
+
+// Spawn creates or returns an existing owner for the given server identity.
+func (d *Daemon) Spawn(req control.Request) (string, string, error) {
+	mode := serverid.ModeCwd
+	switch req.Mode {
+	case "global":
+		mode = serverid.ModeGlobal
+	case "isolated":
+		mode = serverid.ModeIsolated
+	case "cwd", "":
+		mode = serverid.ModeCwd
+	}
+
+	// Build env slice for hashing
+	var envSlice []string
+	for k, v := range req.Env {
+		envSlice = append(envSlice, k+"="+v)
+	}
+
+	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, envSlice, req.Cwd)
+	ipcPath := serverid.IPCPath(sid)
+
+	d.mu.Lock()
+	if entry, ok := d.owners[sid]; ok {
+		entry.LastSession = time.Now()
+		d.mu.Unlock()
+		d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
+		return entry.Owner.IPCPath(), sid, nil
+	}
+	d.mu.Unlock()
+
+	// Create a new owner
+	controlPath := serverid.ControlPath(sid)
+
+	owner, err := mux.NewOwner(mux.OwnerConfig{
+		Command:     req.Command,
+		Args:        req.Args,
+		Env:         req.Env,
+		Cwd:         req.Cwd,
+		IPCPath:     ipcPath,
+		ControlPath: controlPath,
+		ServerID:    sid,
+		OnZeroSessions: func(serverID string) {
+			d.onZeroSessions(serverID)
+		},
+		OnUpstreamExit: func(serverID string) {
+			d.onUpstreamExit(serverID)
+		},
+		OnPersistentDetected: func(serverID string) {
+			d.SetPersistent(serverID, true)
+		},
+		Logger: log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags),
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
+	}
+
+	entry := &OwnerEntry{
+		Owner:       owner,
+		ServerID:    sid,
+		Command:     req.Command,
+		Args:        req.Args,
+		Cwd:         req.Cwd,
+		Mode:        req.Mode,
+		Env:         req.Env,
+		LastSession: time.Now(),
+		GracePeriod: d.gracePeriod,
+	}
+
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	d.logger.Printf("spawned owner %s for %s %v", sid[:8], req.Command, req.Args)
+	return ipcPath, sid, nil
+}
+
+// Remove shuts down and removes an owner by server ID.
+func (d *Daemon) Remove(serverID string) error {
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if !ok {
+		d.mu.Unlock()
+		return fmt.Errorf("server %s not found", serverID)
+	}
+	delete(d.owners, serverID)
+	d.mu.Unlock()
+
+	entry.Owner.Shutdown()
+	d.logger.Printf("removed owner %s", serverID[:8])
+	return nil
+}
+
+// HandleSpawn implements control.DaemonHandler.
+func (d *Daemon) HandleSpawn(req control.Request) (string, string, error) {
+	return d.Spawn(req)
+}
+
+// HandleRemove implements control.DaemonHandler.
+func (d *Daemon) HandleRemove(serverID string) error {
+	return d.Remove(serverID)
+}
+
+// HandleShutdown implements control.CommandHandler.
+func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
+	go d.Shutdown()
+	return "daemon shutting down"
+}
+
+// HandleStatus implements control.CommandHandler.
+func (d *Daemon) HandleStatus() map[string]any {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	servers := make([]map[string]any, 0, len(d.owners))
+	for sid, entry := range d.owners {
+		s := entry.Owner.Status()
+		s["server_id"] = sid
+		s["persistent"] = entry.Persistent
+		s["last_session"] = entry.LastSession.Format(time.RFC3339)
+		s["grace_period_s"] = entry.GracePeriod.Seconds()
+		servers = append(servers, s)
+	}
+
+	return map[string]any{
+		"daemon":       true,
+		"owner_count":  len(d.owners),
+		"servers":      servers,
+		"grace_period": d.gracePeriod.String(),
+		"idle_timeout": d.idleTimeout.String(),
+	}
+}
+
+// SetPersistent marks an owner as persistent (survives zero-session periods).
+func (d *Daemon) SetPersistent(serverID string, persistent bool) {
+	d.mu.Lock()
+	if entry, ok := d.owners[serverID]; ok {
+		entry.Persistent = persistent
+		d.logger.Printf("owner %s persistent=%v", serverID[:8], persistent)
+	}
+	d.mu.Unlock()
+}
+
+// Shutdown gracefully stops all owners and the daemon.
+func (d *Daemon) Shutdown() {
+	d.shutdownOnce.Do(func() {
+		d.logger.Printf("daemon shutting down...")
+
+		// Close control server
+		if d.ctlSrv != nil {
+			d.ctlSrv.Close()
+		}
+
+		// Shutdown all owners
+		d.mu.Lock()
+		entries := make([]*OwnerEntry, 0, len(d.owners))
+		for _, e := range d.owners {
+			entries = append(entries, e)
+		}
+		d.owners = make(map[string]*OwnerEntry)
+		d.mu.Unlock()
+
+		for _, e := range entries {
+			e.Owner.Shutdown()
+		}
+
+		d.logger.Printf("daemon stopped (%d owners shut down)", len(entries))
+		close(d.done)
+	})
+}
+
+// Done returns a channel closed when the daemon has shut down.
+func (d *Daemon) Done() <-chan struct{} {
+	return d.done
+}
+
+// OwnerCount returns the number of managed owners.
+func (d *Daemon) OwnerCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.owners)
+}
+
+// Entry returns the OwnerEntry for the given server ID, or nil.
+func (d *Daemon) Entry(serverID string) *OwnerEntry {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.owners[serverID]
+}
+
+// onZeroSessions is called by an owner when its last session disconnects.
+func (d *Daemon) onZeroSessions(serverID string) {
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if ok {
+		entry.LastSession = time.Now()
+	}
+	d.mu.Unlock()
+
+	if ok {
+		d.logger.Printf("owner %s: zero sessions (grace period starts)", serverID[:8])
+	}
+	// Reaper will handle cleanup after grace period
+}
+
+// onUpstreamExit is called by an owner when its upstream process exits.
+func (d *Daemon) onUpstreamExit(serverID string) {
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if ok {
+		if entry.Persistent {
+			d.mu.Unlock()
+			d.logger.Printf("owner %s: upstream exited, will re-spawn (persistent)", serverID[:8])
+			// Reaper handles re-spawn for persistent owners
+			return
+		}
+		delete(d.owners, serverID)
+	}
+	d.mu.Unlock()
+
+	if ok {
+		entry.Owner.Shutdown()
+		d.logger.Printf("owner %s: upstream exited, removed", serverID[:8])
+	}
+}
+
+// StatusJSON returns the daemon status as a JSON-encoded byte slice.
+func (d *Daemon) StatusJSON() (json.RawMessage, error) {
+	status := d.HandleStatus()
+	return json.Marshal(status)
+}

@@ -90,6 +90,27 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		return Response{OK: true, Data: data}
 
+	case "spawn":
+		dh, ok := s.handler.(DaemonHandler)
+		if !ok {
+			return Response{OK: false, Message: "spawn not supported (not a daemon)"}
+		}
+		ipcPath, serverID, err := dh.HandleSpawn(req)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}
+		}
+		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID}
+
+	case "remove":
+		dh, ok := s.handler.(DaemonHandler)
+		if !ok {
+			return Response{OK: false, Message: "remove not supported (not a daemon)"}
+		}
+		if err := dh.HandleRemove(req.Command); err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("remove: %v", err)}
+		}
+		return Response{OK: true, Message: "removed"}
+
 	default:
 		return Response{OK: false, Message: fmt.Sprintf("unknown command: %s", req.Cmd)}
 	}

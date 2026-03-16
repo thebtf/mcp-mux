@@ -60,6 +60,9 @@ func main() {
 		case "serve":
 			runServe()
 			return
+		case "daemon":
+			runGlobalDaemon()
+			return
 		}
 	}
 
@@ -115,7 +118,7 @@ func main() {
 		return
 	}
 
-	// Try to connect as client first
+	// Fast path: per-server IPC socket exists → connect as client (works with both legacy and daemon)
 	if ipc.IsAvailable(ipcPath) {
 		logger.Printf("connecting to existing owner at %s", ipcPath)
 		if err := mux.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
@@ -125,10 +128,31 @@ func main() {
 		return
 	}
 
-	// No owner found — become one
+	// Daemon mode (default): shim → daemon → spawn → connect
+	// Disable with MCP_MUX_NO_DAEMON=1 to fall back to legacy per-session owner.
+	if os.Getenv("MCP_MUX_NO_DAEMON") != "1" {
+		if err := ensureDaemon(logger); err != nil {
+			logger.Printf("daemon unavailable: %v, falling back to legacy owner", err)
+		} else {
+			modeStr := string(mode)
+			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, nil, logger)
+			if err != nil {
+				logger.Printf("daemon spawn failed: %v, falling back to legacy owner", err)
+			} else {
+				logger.Printf("connecting via daemon to %s", daemonIPC)
+				if err := mux.RunClient(daemonIPC, os.Stdin, os.Stdout); err != nil {
+					logger.Printf("client error: %v", err)
+					os.Exit(1)
+				}
+				return
+			}
+		}
+	}
+
+	// Legacy fallback: become owner directly (MCP_MUX_NO_DAEMON=1)
 	logger.Printf("becoming owner for %s (cwd: %s, mode: %s)", serverid.DescribeArgs(args), cwd, mode)
 	if *daemon {
-		runDaemon(args, cwd, ipcPath, controlPath, sid, logger)
+		runLegacyDaemon(args, cwd, ipcPath, controlPath, sid, logger)
 	} else {
 		runOwner(args, cwd, ipcPath, controlPath, sid, logger, *isolated)
 	}
@@ -188,9 +212,9 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 	}
 }
 
-// runDaemon starts an owner without a stdio session (headless).
+// runLegacyDaemon starts an owner without a stdio session (headless).
 // Used by mux_restart to spawn a new owner in the background.
-func runDaemon(args []string, cwd, ipcPath, controlPath, _ string, logger *log.Logger) {
+func runLegacyDaemon(args []string, cwd, ipcPath, controlPath, _ string, logger *log.Logger) {
 	command := args[0]
 	cmdArgs := args[1:]
 
@@ -233,6 +257,30 @@ func runServe() {
 }
 
 func runStop(drainTimeout time.Duration, force bool) {
+	// Try stopping daemon first
+	ctlPath := serverid.DaemonControlPath()
+	if isDaemonRunning(ctlPath) {
+		fmt.Fprintln(os.Stderr, "Stopping daemon...")
+		drainMs := int(drainTimeout.Milliseconds())
+		if force {
+			drainMs = 0
+		}
+		clientTimeout := drainTimeout + 5*time.Second
+		if force {
+			clientTimeout = 5 * time.Second
+		}
+		resp, err := control.SendWithTimeout(ctlPath, control.Request{
+			Cmd:            "shutdown",
+			DrainTimeoutMs: drainMs,
+		}, clientTimeout)
+		if err == nil && resp.OK {
+			fmt.Fprintf(os.Stderr, "  daemon: %s\n", resp.Message)
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "  daemon: error: %v\n", err)
+		}
+	}
+
+	// Also stop any legacy per-server instances
 	fmt.Fprintln(os.Stderr, "Stopping all mcp-mux instances...")
 
 	tmpDir := os.TempDir()
@@ -343,15 +391,72 @@ func runStop(drainTimeout time.Duration, force bool) {
 }
 
 func runUpgrade(drainTimeout time.Duration, force bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot resolve executable path: %v\n", err)
+		os.Exit(1)
+	}
+
+	pendingPath := exe + "~"
+
+	// Check if a new binary is waiting (built with: go build -o mcp-mux.exe~ ./cmd/mcp-mux)
+	if _, err := os.Stat(pendingPath); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "No pending update found. Build the new binary first:")
+		fmt.Fprintf(os.Stderr, "  go build -o %s ./cmd/mcp-mux\n", pendingPath)
+		fmt.Fprintln(os.Stderr, "Then run: mcp-mux upgrade")
+		os.Exit(1)
+	}
+
+	// Step 1: Stop all instances (unlocks the binary for rename)
 	runStop(drainTimeout, force)
+
+	// Step 2: Atomic swap — rename running exe to .old, pending to current
+	// On Windows, a running exe can be renamed but not overwritten.
+	// By the time we get here, all mcp-mux processes are stopped, so we can
+	// safely overwrite. But we use rename-dance for robustness.
+	oldPath := exe + ".old"
+	_ = os.Remove(oldPath) // clean up any previous .old
+
+	// Rename current → .old
+	if err := os.Rename(exe, oldPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", exe, oldPath, err)
+		fmt.Fprintln(os.Stderr, "Hint: ensure all mcp-mux processes are stopped.")
+		os.Exit(1)
+	}
+
+	// Rename pending → current
+	if err := os.Rename(pendingPath, exe); err != nil {
+		// Rollback: restore old binary
+		_ = os.Rename(oldPath, exe)
+		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", pendingPath, exe, err)
+		os.Exit(1)
+	}
+
+	// Cleanup old binary (best-effort)
+	_ = os.Remove(oldPath)
+
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "All instances stopped. Binary unlocked. Rebuild with:")
-	fmt.Fprintln(os.Stderr, "  go build -o mcp-mux.exe ./cmd/mcp-mux")
-	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintf(os.Stderr, "Upgrade complete: %s replaced.\n", filepath.Base(exe))
 	fmt.Fprintln(os.Stderr, "MCP servers will restart automatically on next CC tool call.")
 }
 
 func runStatus() {
+	// Try daemon first
+	ctlPath := serverid.DaemonControlPath()
+	if isDaemonRunning(ctlPath) {
+		resp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
+		if err == nil && resp.OK && resp.Data != nil {
+			var pretty json.RawMessage
+			if json.Valid(resp.Data) {
+				pretty = resp.Data
+			}
+			formatted, _ := json.MarshalIndent(pretty, "", "  ")
+			fmt.Println(string(formatted))
+			return
+		}
+	}
+
+	// Fallback: legacy per-server scan
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {

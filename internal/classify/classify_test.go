@@ -290,3 +290,51 @@ func TestClassifyCapabilities(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePersistent(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want bool
+	}{
+		{
+			name: "persistent true via x-mux",
+			json: `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"x-mux":{"sharing":"shared","persistent":true}}}}`,
+			want: true,
+		},
+		{
+			name: "persistent false via x-mux",
+			json: `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"x-mux":{"sharing":"shared","persistent":false}}}}`,
+			want: false,
+		},
+		{
+			name: "persistent missing",
+			json: `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"x-mux":{"sharing":"shared"}}}}`,
+			want: false,
+		},
+		{
+			name: "persistent true via experimental",
+			json: `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"experimental":{"x-mux":{"sharing":"shared","persistent":true}}}}}`,
+			want: true,
+		},
+		{
+			name: "no x-mux at all",
+			json: `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{}}}}`,
+			want: false,
+		},
+		{
+			name: "invalid json",
+			json: `not json`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParsePersistent([]byte(tt.json))
+			if got != tt.want {
+				t.Errorf("ParsePersistent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

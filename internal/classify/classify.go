@@ -91,3 +91,41 @@ func ClassifyCapabilities(initJSON []byte) (SharingMode, bool) {
 		return "", false
 	}
 }
+
+// ParsePersistent extracts x-mux.persistent from a cached initialize response.
+// Returns true if the server declares itself as persistent.
+func ParsePersistent(initJSON []byte) bool {
+	// Try direct x-mux capability
+	var resp struct {
+		Result struct {
+			Capabilities struct {
+				XMux *struct {
+					Persistent bool `json:"persistent"`
+				} `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(initJSON, &resp); err != nil {
+		return false
+	}
+
+	xmux := resp.Result.Capabilities.XMux
+
+	// Fallback: check experimental.x-mux
+	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
+		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
+			xmux = &struct {
+				Persistent bool `json:"persistent"`
+			}{}
+			if err := json.Unmarshal(raw, xmux); err != nil {
+				return false
+			}
+		}
+	}
+
+	if xmux == nil {
+		return false
+	}
+	return xmux.Persistent
+}

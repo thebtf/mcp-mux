@@ -1,7 +1,8 @@
 // Package mcpserver implements a minimal MCP server for the control plane.
 //
-// It runs on stdio and exposes tools for managing mcp-mux instances:
-// mux_list, mux_stop, mux_restart.
+// It runs on stdio and exposes tools for managing mcp-mux instances
+// (mux_list, mux_stop, mux_restart) and a built-in prompt ("mux-guide")
+// that teaches connecting agents what mcp-mux is and how to use it.
 package mcpserver
 
 import (
@@ -20,7 +21,25 @@ import (
 	"github.com/bitswan-space/mcp-mux/internal/ipc"
 )
 
-// Server is a minimal MCP server that provides control plane tools.
+// instructions is injected into the initialize response so the connecting agent
+// immediately understands what this server is and how to interact with it.
+const instructions = `You are connected to mcp-mux, a transparent stdio multiplexer for MCP servers.
+
+mcp-mux allows multiple Claude Code sessions to share a single upstream MCP server process,
+reducing memory usage by ~3x. This control-plane server lets you monitor and manage all
+running mcp-mux instances.
+
+Available tools:
+- mux_list: Show all running MCP server instances (PID, sessions, classification, caches).
+- mux_stop: Gracefully stop an instance by server_id (with optional drain or force).
+- mux_restart: Restart an instance — stops the old one, spawns a new daemon, clients auto-reconnect.
+
+Available prompts:
+- mux-guide: Full reference on mcp-mux architecture, classification, and management.
+
+Quick start: call mux_list to see what's running, then use server_id from the output for stop/restart.`
+
+// Server is a minimal MCP server that provides control plane tools and prompts.
 type Server struct {
 	reader *bufio.Scanner
 	writer io.Writer
@@ -70,6 +89,10 @@ func (s *Server) Run() error {
 			s.handleToolsList(msg.ID)
 		case "tools/call":
 			s.handleToolsCall(msg.ID, msg.Params)
+		case "prompts/list":
+			s.handlePromptsList(msg.ID)
+		case "prompts/get":
+			s.handlePromptsGet(msg.ID, msg.Params)
 		case "ping":
 			s.sendResult(msg.ID, map[string]any{})
 		default:
@@ -82,41 +105,216 @@ func (s *Server) Run() error {
 
 func (s *Server) handleInitialize(id json.RawMessage) {
 	result := map[string]any{
-		"protocolVersion": "2024-11-05",
+		"protocolVersion": "2025-11-25",
 		"capabilities": map[string]any{
-			"tools": map[string]any{},
+			"tools":   map[string]any{},
+			"prompts": map[string]any{},
 		},
 		"serverInfo": map[string]any{
-			"name":    "mcp-mux-control",
-			"version": "1.0.0",
+			"name":    "mcp-mux",
+			"version": "2.0.0",
 		},
+		"instructions": instructions,
 	}
 	s.sendResult(id, result)
 }
 
+// --- Prompts ---
+
+func (s *Server) handlePromptsList(id json.RawMessage) {
+	prompts := []map[string]any{
+		{
+			"name":        "mux-guide",
+			"description": "Full reference guide for mcp-mux: architecture, sharing modes, auto-classification, daemon management, and troubleshooting.",
+		},
+		{
+			"name":        "mux-status-summary",
+			"description": "Get a human-readable summary of all running mcp-mux instances. Calls mux_list internally and formats the output.",
+		},
+	}
+	s.sendResult(id, map[string]any{"prompts": prompts})
+}
+
+func (s *Server) handlePromptsGet(id json.RawMessage, params json.RawMessage) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		s.sendError(id, -32602, fmt.Sprintf("invalid params: %v", err))
+		return
+	}
+
+	switch req.Name {
+	case "mux-guide":
+		s.sendResult(id, map[string]any{
+			"description": "Full reference guide for mcp-mux",
+			"messages": []map[string]any{
+				{
+					"role": "user",
+					"content": map[string]any{
+						"type": "text",
+						"text": muxGuidePrompt,
+					},
+				},
+			},
+		})
+	case "mux-status-summary":
+		s.sendResult(id, map[string]any{
+			"description": "Summarize running mcp-mux instances",
+			"messages": []map[string]any{
+				{
+					"role": "user",
+					"content": map[string]any{
+						"type": "text",
+						"text": "Call the mux_list tool and provide a concise human-readable summary of all running MCP server instances. Group them by classification (shared/isolated/session-aware). For each, show: server name (from command+args), PID, session count, and whether caches are warm. Highlight any issues (zero sessions, high pending requests, stale instances).",
+					},
+				},
+			},
+		})
+	default:
+		s.sendError(id, -32602, fmt.Sprintf("unknown prompt: %s", req.Name))
+	}
+}
+
+// muxGuidePrompt is the full reference guide returned by the "mux-guide" prompt.
+const muxGuidePrompt = `# mcp-mux Reference Guide
+
+## What is mcp-mux?
+
+mcp-mux is a transparent stdio multiplexer for MCP (Model Context Protocol) servers.
+It allows multiple Claude Code sessions to share a single instance of each MCP server,
+reducing process count and memory by ~3x.
+
+## How It Works
+
+When you configure an MCP server with mcp-mux as a wrapper:
+
+` + "```" + `json
+{ "command": "mcp-mux", "args": ["uvx", "engram-mcp-server"] }
+` + "```" + `
+
+The first invocation becomes the "owner" — it spawns the real upstream server and listens
+for IPC connections. Subsequent invocations connect as clients through the same upstream.
+
+` + "```" + `
+CC Session 1 ──stdio──> mcp-mux (client) ──IPC──┐
+CC Session 2 ──stdio──> mcp-mux (client) ──IPC──┤──> mcp-mux (owner) ──stdio──> upstream
+CC Session 3 ──stdio──> mcp-mux (client) ──IPC──┘
+` + "```" + `
+
+## Sharing Modes
+
+| Mode | When | Behavior |
+|------|------|----------|
+| **shared** (default) | Stateless servers (engram, tavily, context7) | One upstream, all sessions share it |
+| **isolated** | Stateful servers (playwright, desktop-commander) | Each session gets its own upstream |
+| **session-aware** | Servers declaring x-mux.sharing: "session-aware" | One upstream, sessions identified via _meta.muxSessionId |
+
+## Auto-Classification
+
+mcp-mux automatically classifies servers by two methods (priority order):
+
+1. **x-mux capability** (highest priority): Server declares ` + "`" + `x-mux.sharing` + "`" + ` in its initialize response capabilities.
+2. **Tool-name heuristics**: Tools matching patterns like ` + "`" + `browser_*` + "`" + `, ` + "`" + `session_*` + "`" + `, ` + "`" + `editor_*` + "`" + ` trigger isolation.
+
+## Response Caching
+
+mcp-mux caches these responses from the first session and replays them instantly to later sessions:
+- ` + "`" + `initialize` + "`" + ` (with protocolVersion fingerprint matching)
+- ` + "`" + `tools/list` + "`" + `
+- ` + "`" + `prompts/list` + "`" + `
+- ` + "`" + `resources/list` + "`" + `
+- ` + "`" + `resources/templates/list` + "`" + `
+
+Caches auto-invalidate on ` + "`" + `notifications/**/list_changed` + "`" + `.
+
+## Global Daemon (experimental)
+
+Set ` + "`" + `MCP_MUX_GLOBAL_DAEMON=1` + "`" + ` to enable a single daemon process that manages ALL upstreams:
+
+- Upstreams survive CC session disconnects (30s grace period by default)
+- Persistent servers (x-mux.persistent: true) survive indefinitely
+- Auto-respawn of crashed persistent servers
+- Daemon auto-exits after 5min idle (no owners, no sessions)
+
+Control: ` + "`" + `mcp-mux daemon` + "`" + ` (start), ` + "`" + `mcp-mux stop` + "`" + ` (stop all), ` + "`" + `mcp-mux status` + "`" + ` (inspect).
+
+## Management Tools
+
+Use the tools exposed by this control-plane server:
+
+### mux_list
+Returns JSON array of all running instances with:
+- ` + "`" + `server_id` + "`" + `: 16-char hex ID (use first 8 chars as shorthand)
+- ` + "`" + `command` + "`" + ` + ` + "`" + `args` + "`" + `: what upstream is running
+- ` + "`" + `upstream_pid` + "`" + `: OS process ID of the upstream
+- ` + "`" + `session_count` + "`" + `: how many CC sessions are connected
+- ` + "`" + `pending_requests` + "`" + `: in-flight requests to upstream
+- ` + "`" + `auto_classification` + "`" + `: shared/isolated/session-aware
+- ` + "`" + `cached_init` + "`" + `/` + "`" + `cached_tools` + "`" + `: whether caches are warm
+
+### mux_stop
+Gracefully drain and stop an instance:
+- ` + "`" + `server_id` + "`" + ` (required): from mux_list output
+- ` + "`" + `force` + "`" + ` (optional): skip drain, kill immediately
+
+### mux_restart
+Stop + re-spawn as daemon. Existing CC clients reconnect on next tool call:
+- ` + "`" + `server_id` + "`" + ` (required): from mux_list output
+- ` + "`" + `force` + "`" + ` (optional): force-stop before restart
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| MCP_MUX_ISOLATED | 0 | Force isolated mode for this server |
+| MCP_MUX_STATELESS | 0 | Ignore cwd in server identity hash |
+| MCP_MUX_GLOBAL_DAEMON | 0 | Enable global daemon mode |
+| MCP_MUX_GRACE | 30s | Grace period before reaping idle owners (daemon mode) |
+| MCP_MUX_IDLE_TIMEOUT | 5m | Daemon auto-exit after this idle period |
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "stale socket" in status | Crashed owner left socket file | ` + "`" + `mcp-mux stop` + "`" + ` cleans stale sockets |
+| Server classified as isolated unexpectedly | Tool names match isolation patterns | Add x-mux capability to server |
+| High pending_requests | Upstream is slow or stuck | Check upstream logs, consider restart |
+| Session count = 0 but server alive | All CC sessions disconnected | Will be reaped after grace period (daemon) or stays alive (legacy) |
+`
+
+// --- Tools ---
+
 func (s *Server) handleToolsList(id json.RawMessage) {
 	tools := []map[string]any{
 		{
-			"name":        "mux_list",
-			"description": "List all running mcp-mux instances with their status, command, args, PID, sessions, and pending requests.",
+			"name": "mux_list",
+			"description": "List all running mcp-mux managed MCP server instances. " +
+				"Returns a JSON array with each server's ID, command, args, upstream PID, " +
+				"connected session count, pending requests, auto-classification (shared/isolated/session-aware), " +
+				"and cache status. Use server_id from the output to target mux_stop or mux_restart.",
 			"inputSchema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
 			},
 		},
 		{
-			"name":        "mux_stop",
-			"description": "Stop a specific mcp-mux instance by server_id. Use force=true for immediate shutdown without drain.",
+			"name": "mux_stop",
+			"description": "Gracefully stop a running mcp-mux instance by its server_id. " +
+				"By default, drains pending requests (up to 30s) before shutdown. " +
+				"Set force=true for immediate termination. " +
+				"The upstream MCP server process is killed and the IPC socket is cleaned up. " +
+				"Connected CC sessions will get an error on next tool call and can trigger auto-restart.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"server_id": map[string]any{
 						"type":        "string",
-						"description": "Server ID from mux_list output",
+						"description": "The 16-character hex server ID from mux_list output (e.g., '03017faad92416e6')",
 					},
 					"force": map[string]any{
 						"type":        "boolean",
-						"description": "Force immediate shutdown without waiting for pending requests",
+						"description": "Skip drain and kill immediately. Use when the server is stuck or unresponsive.",
 						"default":     false,
 					},
 				},
@@ -124,18 +322,21 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 			},
 		},
 		{
-			"name":        "mux_restart",
-			"description": "Restart a specific mcp-mux instance. Stops the server and spawns a new daemon owner. CC clients reconnect automatically on next tool call.",
+			"name": "mux_restart",
+			"description": "Restart a mcp-mux instance: stop the current upstream, then spawn a fresh one " +
+				"as a background daemon with the same command and args. " +
+				"Existing CC sessions reconnect automatically on their next tool call. " +
+				"Useful when an upstream server is in a bad state or after updating server code.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"server_id": map[string]any{
 						"type":        "string",
-						"description": "Server ID from mux_list output",
+						"description": "The 16-character hex server ID from mux_list output",
 					},
 					"force": map[string]any{
 						"type":        "boolean",
-						"description": "Force stop before restart (no drain)",
+						"description": "Force-stop the old instance before spawning a new one (no drain wait)",
 						"default":     false,
 					},
 				},

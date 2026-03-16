@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,16 +21,51 @@ import (
 	"github.com/bitswan-space/mcp-mux/internal/upstream"
 )
 
+// Version is the mcp-mux build version, included in status output.
+// Auto-detected from Go build info (vcs.revision + vcs.modified).
+// Override at build time via: -ldflags "-X github.com/bitswan-space/mcp-mux/internal/mux.Version=..."
+var Version = initVersion()
+
+func initVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	var rev, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return "dev"
+	}
+	if len(rev) > 8 {
+		rev = rev[:8]
+	}
+	return rev + dirty
+}
+
 // Owner is the multiplexer core. It manages a single upstream process and
 // routes requests from multiple downstream sessions through it.
 type Owner struct {
 	upstream *upstream.Process
 	ipcPath  string
-	cwd      string // working directory for this owner instance
-	command  string // upstream command (for status/restart)
+	cwd      string   // working directory for this owner instance
+	command  string   // upstream command (for status/restart)
 	args     []string // upstream args (for status/restart)
+	serverID string   // server identity hash
 	listener net.Listener
 	logger   *log.Logger
+
+	onZeroSessions       func(serverID string)
+	onUpstreamExit       func(serverID string)
+	onPersistentDetected func(serverID string)
 
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
@@ -76,6 +112,22 @@ type OwnerConfig struct {
 	// ControlPath for the control plane socket. If empty, control plane is disabled.
 	ControlPath string
 
+	// ServerID is the server identity hash. Used in callbacks to identify this owner.
+	ServerID string
+
+	// OnZeroSessions is called when the last session disconnects.
+	// If nil, the owner does not auto-shutdown on zero sessions (legacy behavior
+	// shuts down only on upstream exit or signal).
+	OnZeroSessions func(serverID string)
+
+	// OnUpstreamExit is called when the upstream process exits.
+	// If nil, the owner auto-shuts down (legacy behavior).
+	OnUpstreamExit func(serverID string)
+
+	// OnPersistentDetected is called when the upstream declares x-mux.persistent: true.
+	// Used by the daemon to mark the owner entry as persistent.
+	OnPersistentDetected func(serverID string)
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -102,13 +154,17 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	}
 
 	o := &Owner{
-		upstream:  proc,
-		ipcPath:   cfg.IPCPath,
-		cwd:       cfg.Cwd,
-		command:   cfg.Command,
-		args:      cfg.Args,
-		listener:  ln,
-		logger:    logger,
+		upstream:       proc,
+		ipcPath:        cfg.IPCPath,
+		cwd:            cfg.Cwd,
+		command:        cfg.Command,
+		args:           cfg.Args,
+		serverID:       cfg.ServerID,
+		listener:       ln,
+		logger:         logger,
+		onZeroSessions:       cfg.OnZeroSessions,
+		onUpstreamExit:       cfg.OnUpstreamExit,
+		onPersistentDetected: cfg.OnPersistentDetected,
 		sessions:           make(map[int]*Session),
 		cachedInitSessions: make(map[int]bool),
 		progressOwners:     make(map[string]int),
@@ -138,7 +194,11 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	go func() {
 		<-proc.Done
 		logger.Printf("upstream exited: %v", proc.ExitErr)
-		o.Shutdown()
+		if o.onUpstreamExit != nil {
+			o.onUpstreamExit(o.serverID)
+		} else {
+			o.Shutdown()
+		}
 	}()
 
 	return o, nil
@@ -572,9 +632,11 @@ func (o *Owner) removeSession(s *Session) {
 
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
 
-	// Notify upstream that roots may have changed (client left)
 	if remaining > 0 {
+		// Notify upstream that roots may have changed (client left)
 		o.sendRootsListChanged()
+	} else if o.onZeroSessions != nil {
+		o.onZeroSessions(o.serverID)
 	}
 }
 
@@ -690,6 +752,26 @@ func (o *Owner) Done() <-chan struct{} {
 	return o.done
 }
 
+// ServerID returns the server identity hash for this owner.
+func (o *Owner) ServerID() string {
+	return o.serverID
+}
+
+// IPCPath returns the IPC socket path for this owner.
+func (o *Owner) IPCPath() string {
+	return o.ipcPath
+}
+
+// Command returns the upstream command.
+func (o *Owner) Command() string {
+	return o.command
+}
+
+// Args returns the upstream command arguments.
+func (o *Owner) Args() []string {
+	return o.args
+}
+
 // SessionCount returns the number of connected sessions.
 func (o *Owner) SessionCount() int {
 	o.mu.RLock()
@@ -719,6 +801,7 @@ func (o *Owner) Status() map[string]any {
 	o.mu.RUnlock()
 
 	status := map[string]any{
+		"mux_version":      Version,
 		"upstream_pid":      o.upstream.PID(),
 		"ipc_path":          o.ipcPath,
 		"command":           o.command,
@@ -809,6 +892,7 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 
 	if method == "initialize" {
 		o.classifyFromCapabilities(cached)
+		o.checkPersistent(cached)
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
@@ -972,6 +1056,18 @@ func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 		o.closeListener()
 	} else {
 		o.logger.Printf("auto-classification: SHARED")
+	}
+}
+
+// checkPersistent checks if the upstream declares x-mux.persistent: true
+// and notifies the daemon via callback.
+func (o *Owner) checkPersistent(initJSON []byte) {
+	if !classify.ParsePersistent(initJSON) {
+		return
+	}
+	o.logger.Printf("x-mux capability: persistent=true")
+	if o.onPersistentDetected != nil {
+		o.onPersistentDetected(o.serverID)
 	}
 }
 
