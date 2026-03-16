@@ -120,13 +120,18 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	}
 	d.mu.Unlock()
 
+	// Compute env diff: only vars that the shim has but daemon doesn't (CC-configured vars).
+	// upstream.Start merges these on top of os.Environ() (daemon's env), so only the diff
+	// needs to be passed — avoids sending ~100 duplicate vars through the control socket.
+	envDiff := diffEnv(req.Env)
+
 	// Create a new owner
 	controlPath := serverid.ControlPath(sid)
 
 	owner, err := mux.NewOwner(mux.OwnerConfig{
 		Command:     req.Command,
 		Args:        req.Args,
-		Env:         req.Env,
+		Env:         envDiff,
 		Cwd:         req.Cwd,
 		IPCPath:     ipcPath,
 		ControlPath: controlPath,
@@ -230,6 +235,25 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 		d.logger.Printf("owner %s persistent=%v", serverID[:8], persistent)
 	}
 	d.mu.Unlock()
+}
+
+// diffEnv returns only the env vars from shim that differ from daemon's own env.
+// This extracts CC-configured vars (API keys, config paths) without duplicating
+// the ~100 standard OS vars that daemon already has.
+func diffEnv(shimEnv map[string]string) map[string]string {
+	if len(shimEnv) == 0 {
+		return nil
+	}
+	diff := make(map[string]string)
+	for k, v := range shimEnv {
+		if daemonVal, ok := os.LookupEnv(k); !ok || daemonVal != v {
+			diff[k] = v
+		}
+	}
+	if len(diff) == 0 {
+		return nil
+	}
+	return diff
 }
 
 // Shutdown gracefully stops all owners and the daemon.
