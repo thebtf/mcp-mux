@@ -45,7 +45,8 @@ type Owner struct {
 	classificationSource string   // "capability" or "tools" — what determined classification
 	classificationReason []string // tool names that triggered isolation
 
-	lastActiveSessionID int // ID of the session that last sent a request to upstream
+	lastActiveSessionID int            // ID of the session that last sent a request to upstream
+	progressOwners      map[string]int // progressToken → session ID for targeted routing
 
 	methodTags      sync.Map // remapped request ID (string) -> method name
 	pendingRequests atomic.Int64
@@ -110,6 +111,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger:    logger,
 		sessions:           make(map[int]*Session),
 		cachedInitSessions: make(map[int]bool),
+		progressOwners:     make(map[string]int),
 		startTime:          time.Now(),
 		listenerDone:       make(chan struct{}),
 		done:               make(chan struct{}),
@@ -248,6 +250,9 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			}
 		}
 
+		// Track progressToken ownership for targeted notification routing
+		o.trackProgressToken(s.ID, msg.Raw)
+
 		// Record the active session so server→client requests can be routed back
 		o.mu.Lock()
 		o.lastActiveSessionID = s.ID
@@ -293,7 +298,13 @@ func (o *Owner) readUpstream() {
 // It also intercepts server→client requests like roots/list.
 func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	if msg.IsNotification() {
-		// Broadcast to all sessions
+		// Route progress notifications to owning session instead of broadcast
+		if msg.Method == "notifications/progress" {
+			if err := o.routeProgressNotification(msg.Raw); err == nil {
+				return nil
+			}
+			// Fallback to broadcast if routing fails
+		}
 		return o.broadcast(msg.Raw)
 	}
 
@@ -455,6 +466,57 @@ func (o *Owner) respondWithError(id json.RawMessage, code int, message string) e
 		return fmt.Errorf("marshal error response: %w", err)
 	}
 	return o.upstream.WriteLine(data)
+}
+
+// routeProgressNotification sends a notifications/progress to the session that
+// owns the progressToken, instead of broadcasting to all sessions.
+func (o *Owner) routeProgressNotification(raw []byte) error {
+	var notif struct {
+		Params struct {
+			ProgressToken json.RawMessage `json:"progressToken"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &notif); err != nil {
+		return fmt.Errorf("parse progress notification: %w", err)
+	}
+	if notif.Params.ProgressToken == nil {
+		return fmt.Errorf("no progressToken in notification")
+	}
+
+	token := string(notif.Params.ProgressToken)
+
+	o.mu.RLock()
+	sessionID, ok := o.progressOwners[token]
+	session := o.sessions[sessionID]
+	o.mu.RUnlock()
+
+	if !ok || session == nil {
+		return fmt.Errorf("no owner for progressToken %s", token)
+	}
+
+	return session.WriteRaw(raw)
+}
+
+// trackProgressToken extracts _meta.progressToken from a request and records
+// which session owns it, enabling targeted progress notification routing.
+func (o *Owner) trackProgressToken(sessionID int, raw []byte) {
+	var req struct {
+		Params struct {
+			Meta struct {
+				ProgressToken json.RawMessage `json:"progressToken"`
+			} `json:"_meta"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return
+	}
+	if req.Params.Meta.ProgressToken == nil {
+		return
+	}
+	token := string(req.Params.Meta.ProgressToken)
+	o.mu.Lock()
+	o.progressOwners[token] = sessionID
+	o.mu.Unlock()
 }
 
 // sendRootsListChanged notifies the upstream that roots have changed.
