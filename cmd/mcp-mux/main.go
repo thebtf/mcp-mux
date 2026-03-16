@@ -135,7 +135,10 @@ func main() {
 			logger.Printf("daemon unavailable: %v, falling back to legacy owner", err)
 		} else {
 			modeStr := string(mode)
-			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, nil, logger)
+			// Pass current process env to daemon so upstream inherits CC-configured vars
+			// (e.g., CCLSP_CONFIG_PATH, NIA_API_KEY, TAVILY_API_KEY).
+			// env is NOT used in server ID hash — only command+args+cwd determine identity.
+			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, collectEnv(), logger)
 			if err != nil {
 				logger.Printf("daemon spawn failed: %v, falling back to legacy owner", err)
 			} else {
@@ -438,6 +441,18 @@ func runUpgrade(drainTimeout time.Duration, force bool) {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s replaced.\n", filepath.Base(exe))
 	fmt.Fprintln(os.Stderr, "MCP servers will restart automatically on next CC tool call.")
+}
+
+// collectEnv returns the current process environment as a map.
+// Used to forward CC-configured env vars (API keys, config paths) to daemon spawn.
+func collectEnv() map[string]string {
+	env := make(map[string]string)
+	for _, e := range os.Environ() {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			env[e[:i]] = e[i+1:]
+		}
+	}
+	return env
 }
 
 func runStatus() {

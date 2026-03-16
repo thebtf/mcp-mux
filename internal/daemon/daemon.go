@@ -106,13 +106,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 		mode = serverid.ModeCwd
 	}
 
-	// Build env slice for hashing
-	var envSlice []string
-	for k, v := range req.Env {
-		envSlice = append(envSlice, k+"="+v)
-	}
-
-	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, envSlice, req.Cwd)
+	// Server identity is based on command+args+cwd only, NOT env.
+	// Env vars are forwarded to upstream but don't affect which owner handles the server.
+	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
 	ipcPath := serverid.IPCPath(sid)
 
 	d.mu.Lock()
