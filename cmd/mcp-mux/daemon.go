@@ -67,10 +67,32 @@ func runGlobalDaemon() {
 
 // ensureDaemon checks if the global daemon is running. If not, starts it
 // as a detached background process. Returns nil when daemon is ready.
+// Uses a file lock to prevent multiple shims from spawning concurrent daemons.
 func ensureDaemon(logger *log.Logger) error {
 	ctlPath := serverid.DaemonControlPath()
 
-	// Fast path: daemon already running
+	// Fast path: daemon already running (no lock needed)
+	if isDaemonRunning(ctlPath) {
+		return nil
+	}
+
+	// Acquire lock to prevent multiple shims from starting daemon simultaneously
+	lockPath := serverid.DaemonLockPath()
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lock.Close()
+	defer os.Remove(lockPath)
+
+	if err := lockFile(lock); err != nil {
+		// Another shim is starting the daemon — just wait for it
+		logger.Printf("another shim is starting daemon, waiting...")
+		return waitForDaemon(ctlPath, 5*time.Second)
+	}
+	defer unlockFile(lock)
+
+	// Re-check after acquiring lock (another shim may have started it)
 	if isDaemonRunning(ctlPath) {
 		return nil
 	}
@@ -81,18 +103,21 @@ func ensureDaemon(logger *log.Logger) error {
 		return fmt.Errorf("start daemon: %w", err)
 	}
 
-	// Poll until daemon is ready (up to 5s)
-	deadline := time.After(5 * time.Second)
+	return waitForDaemon(ctlPath, 5*time.Second)
+}
+
+// waitForDaemon polls until the daemon control socket responds (up to timeout).
+func waitForDaemon(ctlPath string, timeout time.Duration) error {
+	deadline := time.After(timeout)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-deadline:
-			return fmt.Errorf("daemon did not start within 5s")
+			return fmt.Errorf("daemon did not start within %s", timeout)
 		case <-ticker.C:
 			if isDaemonRunning(ctlPath) {
-				logger.Printf("daemon ready")
 				return nil
 			}
 		}
