@@ -121,11 +121,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	d.mu.Unlock()
 
 	// Compute env diff: only vars that the shim has but daemon doesn't (CC-configured vars).
-	// upstream.Start merges these on top of os.Environ() (daemon's env), so only the diff
-	// needs to be passed — avoids sending ~100 duplicate vars through the control socket.
 	envDiff := diffEnv(req.Env)
+	d.logger.Printf("spawn %s: env diff has %d vars", sid[:8], len(envDiff))
 
 	// Create a new owner
+	t0 := time.Now()
 	controlPath := serverid.ControlPath(sid)
 
 	owner, err := mux.NewOwner(mux.OwnerConfig{
@@ -148,8 +148,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 		Logger: log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags),
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
+		return "", "", fmt.Errorf("spawn %s (%.1fs): %w", req.Command, time.Since(t0).Seconds(), err)
 	}
+	d.logger.Printf("spawn %s: NewOwner took %.1fs", sid[:8], time.Since(t0).Seconds())
 
 	entry := &OwnerEntry{
 		Owner:       owner,
