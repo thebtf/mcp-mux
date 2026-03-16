@@ -3,6 +3,8 @@ package mux
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,22 +19,34 @@ var sessionCounter atomic.Int32
 // Session represents one downstream client connection.
 // It reads JSON-RPC requests and writes responses.
 type Session struct {
-	ID     int
-	reader *jsonrpc.Scanner
-	writer io.Writer
-	mu     sync.Mutex // protects writer
-	done   chan struct{}
-	closed atomic.Bool
+	ID           int
+	MuxSessionID string // unique session identifier for _meta injection (e.g., "sess_a1b2c3d4")
+	reader       *jsonrpc.Scanner
+	writer       io.Writer
+	mu           sync.Mutex // protects writer
+	done         chan struct{}
+	closed       atomic.Bool
 }
 
 // NewSession creates a session from a reader/writer pair.
 func NewSession(r io.Reader, w io.Writer) *Session {
 	return &Session{
-		ID:     int(sessionCounter.Add(1)),
-		reader: jsonrpc.NewScanner(r),
-		writer: bufio.NewWriter(w),
-		done:   make(chan struct{}),
+		ID:           int(sessionCounter.Add(1)),
+		MuxSessionID: generateMuxSessionID(),
+		reader:       jsonrpc.NewScanner(r),
+		writer:       bufio.NewWriter(w),
+		done:         make(chan struct{}),
 	}
+}
+
+// generateMuxSessionID creates a unique session identifier: "sess_" + 8 hex chars.
+func generateMuxSessionID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to counter-based ID if crypto/rand fails
+		return fmt.Sprintf("sess_%08x", sessionCounter.Load())
+	}
+	return "sess_" + hex.EncodeToString(b)
 }
 
 // ReadMessage reads the next JSON-RPC message from the downstream client.

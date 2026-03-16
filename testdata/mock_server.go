@@ -93,6 +93,20 @@ func main() {
 							},
 						},
 					},
+					{
+						"name":        "trigger_ping",
+						"description": "Sends a server→client ping before responding",
+						"inputSchema": map[string]interface{}{
+							"type": "object",
+						},
+					},
+					{
+						"name":        "request_sampling",
+						"description": "Sends a sampling/createMessage to the client and uses the result",
+						"inputSchema": map[string]interface{}{
+							"type": "object",
+						},
+					},
 				},
 			})
 
@@ -104,12 +118,59 @@ func main() {
 			if req.Params != nil {
 				_ = json.Unmarshal(req.Params, &params)
 			}
-			writeResult(req.ID, map[string]interface{}{
-				"content": []map[string]interface{}{
-					{
-						"type": "text",
-						"text": fmt.Sprintf("Tool %s called with args: %s", params.Name, string(params.Arguments)),
+
+			switch params.Name {
+			case "trigger_ping":
+				// Send a server→client ping before responding; the mux owner handles it locally
+				fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"ping-1","method":"ping","params":{}}`)
+				// Read the ping response (owner will respond; we consume it here)
+				if scanner.Scan() {
+					// ping response consumed — proceed
+				}
+				writeResult(req.ID, map[string]interface{}{
+					"content": []map[string]interface{}{
+						{"type": "text", "text": "ping acknowledged"},
 					},
+				})
+
+			case "request_sampling":
+				// Send sampling/createMessage to client and wait for response
+				fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"s1","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"sample this"}}],"maxTokens":100}}`)
+				// Read the sampling response from client (forwarded by mux)
+				sampledText := "no response"
+				if scanner.Scan() {
+					var samplingResp struct {
+						Result struct {
+							Content struct {
+								Text string `json:"text"`
+							} `json:"content"`
+						} `json:"result"`
+					}
+					if err := json.Unmarshal(scanner.Bytes(), &samplingResp); err == nil {
+						sampledText = samplingResp.Result.Content.Text
+					}
+				}
+				writeResult(req.ID, map[string]interface{}{
+					"content": []map[string]interface{}{
+						{"type": "text", "text": fmt.Sprintf("sampled: %s", sampledText)},
+					},
+				})
+
+			default:
+				writeResult(req.ID, map[string]interface{}{
+					"content": []map[string]interface{}{
+						{
+							"type": "text",
+							"text": fmt.Sprintf("Tool %s called with args: %s", params.Name, string(params.Arguments)),
+						},
+					},
+				})
+			}
+
+		case "prompts/list":
+			writeResult(req.ID, map[string]interface{}{
+				"prompts": []map[string]interface{}{
+					{"name": "greeting", "description": "A greeting prompt"},
 				},
 			})
 
