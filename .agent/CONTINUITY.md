@@ -1,41 +1,57 @@
 # Continuity State
 
-**Last Updated:** 2026-03-15
-**Session:** Phase 1 PoC implementation
+**Last Updated:** 2026-03-16
+**Session:** MCP Protocol Full Coverage — ALL P0/P1/P2 DONE
 
 ## Done
-- Project created, git initialized, .agent/ structure
-- Full specification v2 with brainstorm decisions
-- 7 ADRs (001-007)
-- **Phase 1 PoC COMPLETE:**
-  - `internal/jsonrpc` — JSON-RPC 2.0 parser + scanner (12 tests)
-  - `internal/remap` — session-prefixed ID remapping with type preservation (14 tests)
-  - `internal/serverid` — deterministic server identity hash + IPC path (8 tests)
-  - `internal/ipc` — cross-platform IPC via Unix domain sockets (6 tests)
-  - `internal/upstream` — process spawning + stdio bridge (7 tests)
-  - `internal/mux/owner` — multiplexer core: session routing, ID remap, upstream bridge, IPC listener
-  - `internal/mux/client` — dumb stdio↔IPC bridge for client mode
-  - `internal/mux/session` — per-downstream session abstraction
-  - `internal/mux` — integration tests (5 tests: single, multi, IPC, disconnect)
-  - `cmd/mcp-mux/main.go` — entry point with owner/client auto-detection, --isolated, status
-  - `testdata/mock_server.go` — mock MCP server for testing
-  - **E2E verified:** initialize → tools/list → tools/call → ping all work through mux
 
-## Now
-- PoC is functional — mcp-mux binary works end-to-end
+### Phase 1 PoC (2026-03-15)
+- Full multiplexer: jsonrpc, remap, serverid, ipc, upstream, mux, client
+- E2E verified, 52 tests
+
+### Transparent Multiplexing H1 (2026-03-16)
+- Cache + replay: initialize, tools/list, prompts/list, resources/list, resources/templates/list
+- Tool name auto-classifier + auto-enforce (close IPC listener)
+- .mcp.json: removed --isolated from playwright, DC, pencil
+
+### MCP Protocol Full Coverage (2026-03-16) — COMPLETE
+**P0 (broken functionality → fixed):**
+- sampling/createMessage routing via lastActiveSessionID ✅
+- elicitation/create routing (cancel fallback when no session) ✅
+- ping (server→client) handled locally ✅
+
+**P1 (incorrect behavior → fixed):**
+- notifications/cancelled ID remapping ✅
+- notifications/initialized suppression for cached replays ✅
+- Extended caching: prompts/list, resources/list, resources/templates/list ✅
+- Cache invalidation on *_changed notifications ✅
+- Initialize fingerprint validation (protocolVersion match) ✅
+
+**P2 (protocol extension → implemented):**
+- x-mux capability parsing from initialize response ✅
+- ClassifyCapabilities() with priority over tool classification ✅
+- ModeSessionAware added to SharingMode ✅
+- _meta.muxSessionId injection for session-aware servers ✅
+- Session.MuxSessionID generated with crypto/rand ✅
+- classification_source in Status() (capability vs tools) ✅
+
+**Deferred (P2, quality-of-life):**
+- Progress notification targeted routing (broadcast works, just noisy)
+- resources/subscribe per-session tracking
+
+### Spec & Plan
+- .agent/specs/mux-server-protocol.md — 3-level protocol (x-mux, _meta, native)
+- .agent/plans/mux-server-protocol.md — phased implementation plan
+- Deep analysis: 13 gaps identified, 12 implemented
 
 ## Next
-- [ ] E2E test with TWO concurrent mcp-mux instances (owner + IPC client)
-- [ ] `mcp-mux status` scan for Windows (currently Unix socket scan only)
-- [ ] `mcp-mux setup` CLI helper for rewriting .mcp.json
-- [ ] Isolated mode testing
-- [ ] Error handling hardening (upstream crash → reconnect, client errors)
-- [ ] Real-world test with actual MCP server (engram, tavily, etc.)
-- [ ] Phase 2: `mcp-mux setup` command, isolated mode polish
-- [ ] Phase 3: Health monitoring, auto-restart, diagnostics
+- Phase 4: SDK helpers (docs/mux-protocol.md, examples/)
+- Phase 5: Migrate user's MCP servers (aimux → session-aware)
+- Commit all changes
+- Progress notification routing (P2, low priority)
+- resources/subscribe per-session tracking (P2, low priority)
 
-## Architecture Summary
-
+## Architecture
 ```
 CC 1 ──stdio──> mcp-mux ──IPC──┐
 CC 2 ──stdio──> mcp-mux ──IPC──┤──> mcp-mux (owner) ──stdio──> server (1×)
@@ -43,18 +59,21 @@ CC 3 ──stdio──> mcp-mux ──IPC──┤
 CC 4 ──stdio──> mcp-mux ──IPC──┘
 ```
 
-## Key Decisions
-- Go, single binary, zero runtime deps
-- Wrapper pattern: `mcp-mux <original-command> [args...]`
-- Self-coordination: first instance = owner, others = IPC clients
-- Unix domain sockets for IPC (works on Windows 10 1803+, not \\.\pipe\)
-- One code path for shared/isolated (policy only)
-- ID remap format: `s{N}:n:{num}` / `s{N}:s:{str}` / `s{N}:null`
+## Key Files Modified This Session
+- internal/mux/owner.go — cache/replay, classify, auto-enforce, routing, fingerprint, injection
+- internal/mux/session.go — MuxSessionID field
+- internal/mux/mux_test.go — 15 tests total
+- internal/classify/classify.go — ClassifyCapabilities, ModeSessionAware
+- internal/classify/patterns.go — isolation prefixes + substrings
+- internal/classify/classify_test.go — 24 test cases
+- internal/jsonrpc/meta.go — InjectMeta function (NEW)
+- testdata/mock_server.go — trigger_ping, request_sampling, prompts/list
+- .mcp.json — removed 3x --isolated flags
+- .agent/specs/mux-server-protocol.md
+- .agent/plans/mux-server-protocol.md
 
-## Stats
-- 52 unit/integration tests, all passing
-- E2E test verified
-- 4 commits on master
+## Branch
+master (uncommitted — ready to commit)
 
 ## Blockers
-- None
+None

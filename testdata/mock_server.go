@@ -55,7 +55,7 @@ func main() {
 		switch req.Method {
 		case "initialize":
 			writeResult(req.ID, map[string]interface{}{
-				"protocolVersion": "2025-06-18",
+				"protocolVersion": "2025-11-25",
 				"capabilities": map[string]interface{}{
 					"tools": map[string]interface{}{},
 				},
