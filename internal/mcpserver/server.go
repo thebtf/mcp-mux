@@ -300,47 +300,55 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 		},
 		{
 			"name": "mux_stop",
-			"description": "Gracefully stop a running mcp-mux instance by its server_id. " +
-				"By default, drains pending requests (up to 30s) before shutdown. " +
-				"Set force=true for immediate termination. " +
-				"The upstream MCP server process is killed and the IPC socket is cleaned up. " +
-				"Connected CC sessions will get an error on next tool call and can trigger auto-restart.",
+			"description": "Gracefully stop a running MCP server instance. " +
+				"Identify the target by server_id (hex hash from mux_list) or by name " +
+				"(substring match against command and args, e.g. 'tavily', 'aimux', 'serena'). " +
+				"Drains pending requests (up to 30s) before shutdown. Set force=true to kill immediately. " +
+				"The upstream process is terminated and the IPC socket cleaned up. " +
+				"Connected sessions will reconnect on next tool call (daemon auto-respawns the server).",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"server_id": map[string]any{
 						"type":        "string",
-						"description": "The 16-character hex server ID from mux_list output (e.g., '03017faad92416e6')",
+						"description": "Hex server ID from mux_list (e.g. '03017faad92416e6'). Provide this OR name.",
+					},
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Substring to match against command+args (e.g. 'tavily', 'aimux', 'engram'). Case-insensitive. Fails if multiple servers match.",
 					},
 					"force": map[string]any{
 						"type":        "boolean",
-						"description": "Skip drain and kill immediately. Use when the server is stuck or unresponsive.",
+						"description": "Skip drain and kill immediately.",
 						"default":     false,
 					},
 				},
-				"required": []string{"server_id"},
 			},
 		},
 		{
 			"name": "mux_restart",
-			"description": "Restart a mcp-mux instance: stop the current upstream, then spawn a fresh one " +
-				"as a background daemon with the same command and args. " +
-				"Existing CC sessions reconnect automatically on their next tool call. " +
-				"Useful when an upstream server is in a bad state or after updating server code.",
+			"description": "Restart an MCP server: stop the current upstream process and spawn a fresh one " +
+				"with the same command and args. All connected CC sessions share the new upstream — " +
+				"the next request from any session goes to the new process. " +
+				"Use after updating server code (git pull, npm install, pip upgrade) or when a server is stuck. " +
+				"Identify by server_id or name (substring match, e.g. 'aimux', 'tavily').",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"server_id": map[string]any{
 						"type":        "string",
-						"description": "The 16-character hex server ID from mux_list output",
+						"description": "Hex server ID from mux_list. Provide this OR name.",
+					},
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Substring to match against command+args (e.g. 'tavily', 'aimux'). Case-insensitive.",
 					},
 					"force": map[string]any{
 						"type":        "boolean",
-						"description": "Force-stop the old instance before spawning a new one (no drain wait)",
+						"description": "Force-stop before restart (no drain).",
 						"default":     false,
 					},
 				},
-				"required": []string{"server_id"},
 			},
 		},
 	}
@@ -412,6 +420,7 @@ func (s *Server) toolMuxList(id json.RawMessage) {
 func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 	var params struct {
 		ServerID string `json:"server_id"`
+		Name     string `json:"name"`
 		Force    bool   `json:"force"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
@@ -419,7 +428,13 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", params.ServerID))
+	serverID, err := s.resolveServerID(params.ServerID, params.Name)
+	if err != nil {
+		s.sendToolError(id, err.Error())
+		return
+	}
+
+	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
 
 	drainMs := 30000
 	timeout := 35 * time.Second
@@ -433,7 +448,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		DrainTimeoutMs: drainMs,
 	}, timeout)
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", params.ServerID, err))
+		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", serverID, err))
 		return
 	}
 
@@ -444,6 +459,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	var params struct {
 		ServerID string `json:"server_id"`
+		Name     string `json:"name"`
 		Force    bool   `json:"force"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
@@ -451,12 +467,18 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", params.ServerID))
+	serverID, err := s.resolveServerID(params.ServerID, params.Name)
+	if err != nil {
+		s.sendToolError(id, err.Error())
+		return
+	}
+
+	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
 
 	// Get current status to learn command + args
 	statusResp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("server %s unreachable: %v", params.ServerID, err))
+		s.sendToolError(id, fmt.Sprintf("server %s unreachable: %v", serverID, err))
 		return
 	}
 
@@ -465,7 +487,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		Args    []string `json:"args"`
 	}
 	if err := json.Unmarshal(statusResp.Data, &status); err != nil || status.Command == "" {
-		s.sendToolError(id, fmt.Sprintf("server %s has no command info", params.ServerID))
+		s.sendToolError(id, fmt.Sprintf("server %s has no command info", serverID))
 		return
 	}
 
@@ -519,6 +541,64 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	go cmd.Wait()
 
 	s.sendToolResult(id, fmt.Sprintf("restarted: stopped (%s), new daemon PID %d", stopResp.Message, cmd.Process.Pid))
+}
+
+// resolveServerID returns a server ID from either an explicit ID or a name substring match.
+// If name is provided, scans all running instances and matches against command+args (case-insensitive).
+// Fails if neither is provided, or if name matches zero or multiple servers.
+func (s *Server) resolveServerID(serverID, name string) (string, error) {
+	if serverID != "" {
+		return serverID, nil
+	}
+	if name == "" {
+		return "", fmt.Errorf("provide either server_id or name")
+	}
+
+	name = strings.ToLower(name)
+	tmpDir := os.TempDir()
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return "", fmt.Errorf("read temp dir: %v", err)
+	}
+
+	var matches []string
+	for _, entry := range entries {
+		fname := entry.Name()
+		if !strings.HasPrefix(fname, "mcp-mux-") || !strings.HasSuffix(fname, ".ctl.sock") {
+			continue
+		}
+
+		path := filepath.Join(tmpDir, fname)
+		sid := strings.TrimPrefix(strings.TrimSuffix(fname, ".ctl.sock"), "mcp-mux-")
+
+		resp, err := control.Send(path, control.Request{Cmd: "status"})
+		if err != nil || !resp.OK || resp.Data == nil {
+			continue
+		}
+
+		var status struct {
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+		}
+		if err := json.Unmarshal(resp.Data, &status); err != nil {
+			continue
+		}
+
+		// Match against command + args concatenated
+		haystack := strings.ToLower(status.Command + " " + strings.Join(status.Args, " "))
+		if strings.Contains(haystack, name) {
+			matches = append(matches, sid)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no server matching '%s' found", name)
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("'%s' matches %d servers — be more specific or use server_id", name, len(matches))
+	}
 }
 
 // --- JSON-RPC response helpers ---
