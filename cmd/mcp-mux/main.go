@@ -131,20 +131,15 @@ func main() {
 	// Daemon mode (default): shim → daemon → spawn → connect
 	// Disable with MCP_MUX_NO_DAEMON=1 to fall back to legacy per-session owner.
 	if os.Getenv("MCP_MUX_NO_DAEMON") != "1" {
-		t0 := time.Now()
 		if err := ensureDaemon(logger); err != nil {
-			logger.Printf("daemon unavailable (%.1fs): %v, falling back to legacy owner", time.Since(t0).Seconds(), err)
+			logger.Printf("daemon unavailable: %v, falling back to legacy owner", err)
 		} else {
-			t1 := time.Now()
-			logger.Printf("daemon ready (%.1fs)", t1.Sub(t0).Seconds())
 			modeStr := string(mode)
 			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, collectEnv(), logger)
-			t2 := time.Now()
 			if err != nil {
-				logger.Printf("daemon spawn failed (%.1fs): %v, falling back to legacy owner", t2.Sub(t1).Seconds(), err)
+				logger.Printf("daemon spawn failed: %v, falling back to legacy owner", err)
 			} else {
-				logger.Printf("daemon spawned (%.1fs), total setup: %.1fs, connecting to %s",
-					t2.Sub(t1).Seconds(), t2.Sub(t0).Seconds(), daemonIPC)
+				logger.Printf("connecting via daemon to %s", daemonIPC)
 				if err := mux.RunClient(daemonIPC, os.Stdin, os.Stdout); err != nil {
 					logger.Printf("client error: %v", err)
 					os.Exit(1)
