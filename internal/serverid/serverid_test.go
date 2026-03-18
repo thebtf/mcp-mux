@@ -1,6 +1,7 @@
 package serverid
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -86,8 +87,9 @@ func TestDescribeArgs(t *testing.T) {
 }
 
 func TestPathNormalization(t *testing.T) {
-	// This tests basic path normalization.
-	// Cross-platform Windows tests are naturally implicit since we run on Windows.
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific path normalization test")
+	}
 	path1 := CanonicalizePath(`C:\dev\app`)
 	path2 := CanonicalizePath(`c:\DEV\APP`)
 
