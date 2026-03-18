@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,9 +19,24 @@ func testLogger(t *testing.T) *log.Logger {
 	return log.New(os.Stderr, "[daemon-test] ", log.LstdFlags)
 }
 
+// shortSocketPath returns a short socket path suitable for all platforms.
+// macOS limits Unix socket paths to 104 bytes; t.TempDir() paths are too long.
+func shortSocketPath(t *testing.T, name string) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "mux-test-*.sock")
+	if err != nil {
+		t.Fatalf("create temp socket path: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	os.Remove(path) // remove file so ipc.Listen can create socket
+	t.Cleanup(func() { os.Remove(path) })
+	return path
+}
+
 func testDaemon(t *testing.T) *Daemon {
 	t.Helper()
-	ctlPath := filepath.Join(t.TempDir(), "daemon.ctl.sock")
+	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	d, err := New(Config{
 		ControlPath: ctlPath,
 		GracePeriod: 1 * time.Second,
@@ -371,7 +385,7 @@ func daemonReadResp(t *testing.T, c *ipcConn) []byte {
 //	  → daemon.New → control.NewServer → ipc.Listen removes stale file, binds
 //	  → daemon is ready and responsive
 func TestDaemonStartAfterCrash(t *testing.T) {
-	ctlPath := filepath.Join(t.TempDir(), "mcp-muxd.ctl.sock")
+	ctlPath := shortSocketPath(t, "mcp-muxd.ctl.sock")
 
 	// Step 1: Simulate a crashed daemon by leaving a stale socket file.
 	f, err := os.Create(ctlPath)

@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -34,7 +33,16 @@ func (m *mockHandler) HandleStatus() map[string]any {
 
 func testSocketPath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "test-ctl.sock")
+	// Use short path — macOS limits Unix socket paths to 104 bytes.
+	f, err := os.CreateTemp("", "mux-ctl-*.sock")
+	if err != nil {
+		t.Fatalf("create temp socket: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	os.Remove(path)
+	t.Cleanup(func() { os.Remove(path) })
+	return path
 }
 
 func testLogger(t *testing.T) *log.Logger {

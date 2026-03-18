@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,10 +20,19 @@ func testLogger(t *testing.T) *log.Logger {
 	return log.New(os.Stderr, "[test] ", log.LstdFlags)
 }
 
-// ipcPath returns a unique IPC socket path for the test.
+// testIPCPath returns a short IPC socket path for tests.
+// macOS limits Unix socket paths to 104 bytes; t.TempDir() is too long.
 func testIPCPath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "test-mux.sock")
+	f, err := os.CreateTemp("", "mux-test-*.sock")
+	if err != nil {
+		t.Fatalf("create temp socket: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	os.Remove(path)
+	t.Cleanup(func() { os.Remove(path) })
+	return path
 }
 
 func TestOwnerSingleSession(t *testing.T) {

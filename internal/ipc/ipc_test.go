@@ -4,13 +4,20 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func socketPath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "test.sock")
+	f, err := os.CreateTemp("", "mux-ipc-*.sock")
+	if err != nil {
+		t.Fatalf("create temp socket: %v", err)
+	}
+	path := f.Name()
+	f.Close()
+	os.Remove(path)
+	t.Cleanup(func() { os.Remove(path) })
+	return path
 }
 
 func TestListenAndDial(t *testing.T) {
@@ -140,7 +147,7 @@ func TestListenRemovesStaleSocket(t *testing.T) {
 }
 
 func TestDialNonExistent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nonexistent.sock")
+	path := "/tmp/mux-test-nonexistent-" + t.Name() + ".sock"
 
 	_, err := Dial(path)
 	if err == nil {

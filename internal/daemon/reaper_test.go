@@ -3,7 +3,6 @@ package daemon
 import (
 	"log"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,7 +11,7 @@ import (
 
 func testDaemonWithReaper(t *testing.T, grace, idle time.Duration) (*Daemon, *Reaper) {
 	t.Helper()
-	ctlPath := filepath.Join(t.TempDir(), "daemon.ctl.sock")
+	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	d, err := New(Config{
 		ControlPath: ctlPath,
 		GracePeriod: grace,
