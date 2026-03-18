@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitswan-space/mcp-mux/internal/control"
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/ipc"
 )
 
 func testLogger(t *testing.T) *log.Logger {

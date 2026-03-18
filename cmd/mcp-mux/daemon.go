@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bitswan-space/mcp-mux/internal/control"
-	"github.com/bitswan-space/mcp-mux/internal/daemon"
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
-	"github.com/bitswan-space/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/daemon"
+	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/serverid"
 )
 
 // runGlobalDaemon starts the global daemon process. This is invoked via

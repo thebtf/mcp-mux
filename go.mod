@@ -1,4 +1,4 @@
-module github.com/bitswan-space/mcp-mux
+module github.com/thebtf/mcp-mux
 
 go 1.25.4
 

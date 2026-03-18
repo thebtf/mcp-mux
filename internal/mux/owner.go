@@ -13,17 +13,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bitswan-space/mcp-mux/internal/classify"
-	"github.com/bitswan-space/mcp-mux/internal/control"
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
-	"github.com/bitswan-space/mcp-mux/internal/jsonrpc"
-	"github.com/bitswan-space/mcp-mux/internal/remap"
-	"github.com/bitswan-space/mcp-mux/internal/upstream"
+	"github.com/thebtf/mcp-mux/internal/classify"
+	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/remap"
+	"github.com/thebtf/mcp-mux/internal/upstream"
 )
 
 // Version is the mcp-mux build version, included in status output.
 // Auto-detected from Go build info (vcs.revision + vcs.modified).
-// Override at build time via: -ldflags "-X github.com/bitswan-space/mcp-mux/internal/mux.Version=..."
+// Override at build time via: -ldflags "-X github.com/thebtf/mcp-mux/internal/mux.Version=..."
 var Version = initVersion()
 
 func initVersion() string {

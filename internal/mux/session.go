@@ -11,7 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/bitswan-space/mcp-mux/internal/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/jsonrpc"
 )
 
 var sessionCounter atomic.Int32

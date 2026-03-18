@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bitswan-space/mcp-mux/internal/control"
-	"github.com/bitswan-space/mcp-mux/internal/mux"
-	"github.com/bitswan-space/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/mux"
+	"github.com/thebtf/mcp-mux/internal/serverid"
 )
 
 // OwnerEntry tracks a single managed owner and its metadata.

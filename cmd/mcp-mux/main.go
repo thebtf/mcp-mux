@@ -29,11 +29,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bitswan-space/mcp-mux/internal/control"
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
-	"github.com/bitswan-space/mcp-mux/internal/mcpserver"
-	"github.com/bitswan-space/mcp-mux/internal/mux"
-	"github.com/bitswan-space/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/mcpserver"
+	"github.com/thebtf/mcp-mux/internal/mux"
+	"github.com/thebtf/mcp-mux/internal/serverid"
 )
 
 func main() {

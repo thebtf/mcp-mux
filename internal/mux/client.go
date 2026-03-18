@@ -5,7 +5,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/ipc"
 )
 
 // RunClient connects to an existing owner via IPC and bridges

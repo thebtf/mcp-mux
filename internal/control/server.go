@@ -7,7 +7,7 @@ import (
 	"net"
 	"sync"
 
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/ipc"
 )
 
 // Server listens on a Unix domain socket for control commands.

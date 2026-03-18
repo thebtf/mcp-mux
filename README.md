@@ -1,58 +1,70 @@
-# mcp-mux — Transparent stdio multiplexer for MCP servers
+[English](README.md) | [Русский](README.ru.md)
 
-Wraps any MCP server command so multiple Claude Code sessions share a single upstream
-process. One line change in `.mcp.json` — no other configuration required.
+![CI](https://github.com/thebtf/mcp-mux/actions/workflows/ci.yml/badge.svg)
+![Go](https://img.shields.io/badge/go-1.25-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-windows%20%7C%20linux%20%7C%20macos-lightgrey)
 
-## Problem
+# mcp-mux
 
-Each Claude Code session spawns its own copy of every configured MCP server (stdio
-transport). With 4 parallel sessions and 12 servers, that is 48 node/Python processes
-consuming roughly 4.8 GB of RAM. Most MCP servers are stateless — they don't need
-per-session isolation.
+Transparent stdio multiplexer that lets multiple Claude Code sessions share a single MCP server process.
 
-## Solution
+One line change in `.mcp.json` — no other configuration required.
 
-Prefix your MCP server command with `mcp-mux`. The first instance to start becomes the
-**owner**: it spawns the real upstream process and listens on a Unix domain socket. All
-subsequent instances connect as **clients** through the owner.
+## The Problem
 
-```
-CC Session 1 ──stdio──> mcp-mux (shim) ──IPC──┐
-CC Session 2 ──stdio──> mcp-mux (shim) ──IPC──┤──> mcp-mux (owner) ──stdio──> upstream (1x)
-CC Session 3 ──stdio──> mcp-mux (shim) ──IPC──┘
-```
-
-A single **daemon** process manages all owners. Upstreams survive CC session restarts and
-are only stopped after a configurable grace period of idle time.
-
-Result: one upstream process per server instead of N, ~3x memory reduction.
+Each Claude Code session spawns its own copy of every configured MCP server (stdio transport). With
+4 parallel sessions and 12 servers, that is 48 node/Python processes consuming roughly 4.8 GB of RAM.
+Most MCP servers are stateless — they don't need per-session isolation.
 
 ## Architecture
 
-```
-                    ┌─────────────────────────────────────────┐
-                    │              mcp-mux daemon              │
-                    │                                          │
-                    │  owner: engram ──stdio──> engram proc    │
-                    │  owner: tavily ──stdio──> tavily proc    │
-                    │  owner: serena ──stdio──> serena proc    │
-                    └────────────────┬────────────────────────┘
-                                     │  IPC (Unix sockets)
-              ┌──────────────────────┼──────────────────────┐
-              │                      │                      │
-    CC Sess 1 │              CC Sess 2│            CC Sess 3 │
-  mcp-mux shim│           mcp-mux shim│         mcp-mux shim│
-  (stdio ──> IPC)        (stdio ──> IPC)       (stdio ──> IPC)
+mcp-mux consists of two components: a thin **shim** (the binary CC invokes) and a long-lived **daemon**
+that owns upstream processes. Shims connect to the daemon via IPC; the daemon spawns and manages
+upstream servers on behalf of all shims.
+
+```mermaid
+graph TB
+  subgraph "CC Sessions"
+    CC1[CC Session 1]
+    CC2[CC Session 2]
+    CC3[CC Session 3]
+  end
+  subgraph "mcp-mux Daemon"
+    D[mcp-muxd]
+    O1[Owner: engram]
+    O2[Owner: tavily]
+    O3[Owner: aimux]
+    R[Reaper/GC]
+  end
+  subgraph "Upstream Servers"
+    U1[engram]
+    U2[tavily]
+    U3[aimux]
+  end
+  CC1 -->|"stdio → shim → IPC"| O1
+  CC2 -->|"stdio → shim → IPC"| O1
+  CC2 -->|"stdio → shim → IPC"| O2
+  CC3 -->|"stdio → shim → IPC"| O3
+  O1 -->|stdio| U1
+  O2 -->|stdio| U2
+  O3 -->|stdio| U3
 ```
 
-Each shim connects to the daemon owner for its upstream. If no daemon is running, the
-shim auto-starts one. If no owner exists for a given server, the daemon spawns it.
+Each shim connects to the daemon owner for its upstream. If no daemon is running, the shim
+auto-starts one. If no owner exists for a given server, the daemon spawns it.
+
+Result: one upstream process per server instead of N — approximately 3x memory reduction.
 
 ## Quick Start
 
 **1. Build**
 
 ```sh
+# Linux / macOS
+go build -o mcp-mux ./cmd/mcp-mux
+
+# Windows
 go build -o mcp-mux.exe ./cmd/mcp-mux
 ```
 
@@ -60,7 +72,7 @@ Place the binary somewhere on your PATH, or reference it by absolute path in `.m
 
 **2. Configure**
 
-Take any MCP server entry in `.mcp.json` and move the `command` into `args`, replacing
+Take any MCP server entry in `.mcp.json` and move the `command` into `args[0]`, replacing
 `command` with `mcp-mux`:
 
 Before:
@@ -87,18 +99,24 @@ After:
 }
 ```
 
-That's it. On the next CC session start, mcp-mux intercepts the stdio channel, connects
-to (or starts) the daemon, and proxies all MCP traffic transparently.
+**3. Verify**
+
+```sh
+mcp-mux status
+```
+
+On the next CC session start, mcp-mux intercepts the stdio channel, connects to (or starts) the
+daemon, and proxies all MCP traffic transparently.
 
 ## Sharing Modes
 
 | Mode | Behavior | Use When |
 |------|----------|----------|
-| `shared` (default) | One upstream serves all sessions. | Stateless servers: search, docs, LLM proxy. |
-| `isolated` | Each session gets its own upstream. | Per-session state: browser, SSH, editor buffers. |
-| `session-aware` | One upstream; sessions identified by injected `_meta.muxSessionId`. | Stateful servers that can partition by session key. |
+| `shared` (default) | One upstream serves all sessions. Responses to `initialize`, `tools/list`, `prompts/list`, and `resources/list` are cached and replayed without a round-trip. | Stateless servers: search, docs, LLM proxy. |
+| `isolated` | Each session gets its own upstream process. | Per-session state: browser automation, SSH, editor buffers. |
+| `session-aware` | One upstream; sessions identified by injected `_meta.muxSessionId`. | Stateful servers that can partition in-process state by session key. |
 
-Override for a specific server:
+Override mode for a specific server:
 
 ```sh
 # Force isolation for one invocation
@@ -110,31 +128,57 @@ mcp-mux --isolated uvx my-server
 
 ## Auto-Classification
 
-When no explicit mode is set, mcp-mux classifies each server automatically using this
-priority order:
+When no explicit mode is set, mcp-mux classifies each server automatically using this priority order:
 
-1. **`x-mux` capability** (highest) — server declares `x-mux.sharing` in its
-   `initialize` response. Authoritative; overrides all heuristics.
-2. **Tool-name heuristics** — tools with prefixes or substrings matching browser, session,
-   editor, navigate, page, tab, process, document, or snapshot patterns trigger isolation.
+1. **`x-mux` capability** (highest) — server declares `x-mux.sharing` in its `initialize` response.
+   Authoritative; overrides all heuristics.
+2. **Tool-name heuristics** — tools with names matching browser, session, editor, navigate, page,
+   tab, process, document, or snapshot patterns trigger isolation.
 3. **Default** — `shared`.
 
+```mermaid
+flowchart TD
+  A[Server starts] --> B{x-mux capability\nin initialize response?}
+  B -->|Yes| C[Use declared mode]
+  B -->|No| D{Tool names match\nisolation patterns?}
+  D -->|Yes| E[Isolated]
+  D -->|No| F[Shared]
+```
+
 If your server is stateless but has tool names that match isolation patterns, add
-`x-mux.sharing: "shared"` to your `initialize` capabilities to fix the classification.
+`"x-mux": { "sharing": "shared" }` to your `initialize` capabilities to fix the classification.
+
+## Response Caching
+
+In shared mode, the owner intercepts and caches the first response for each of these methods:
+
+- `initialize`
+- `tools/list`
+- `prompts/list`
+- `resources/list`
+- `resources/templates/list`
+
+Subsequent sessions receive the cached response immediately without a round-trip to the upstream.
+Cache entries are invalidated when the upstream sends the corresponding `*_changed` notification
+(`notifications/tools/list_changed`, `notifications/prompts/list_changed`,
+`notifications/resources/list_changed`).
+
+For `initialize`, the cache is keyed on `protocolVersion`. A new client using a different protocol
+version bypasses the cache and goes to the upstream directly.
 
 ## Daemon Mode
 
-The daemon is enabled by default. It starts automatically when the first mcp-mux shim
-connects and has no owner to hand off to.
+The daemon is enabled by default. It starts automatically when the first mcp-mux shim connects and
+no daemon is running.
 
 **Lifecycle:**
 
-- Shim connects → daemon starts or is reused
-- CC session exits → grace period begins (default 30s)
-- If no new session reconnects within grace period → owner stops the upstream
-- Servers declaring `x-mux.persistent: true` skip the grace period; they stay alive
-  indefinitely until explicitly stopped
-- Daemon auto-exits after 5 minutes with no owners and no connected sessions
+- Shim connects → daemon starts or is reused.
+- CC session exits → grace period begins (default 30 s).
+- If no new session reconnects within the grace period → daemon stops the upstream process.
+- Servers declaring `x-mux.persistent: true` skip the grace period; they stay alive indefinitely
+  until explicitly stopped or until the daemon exits.
+- Daemon auto-exits after 5 minutes with no owners and no connected sessions.
 
 **Disable daemon mode** (legacy per-session owner behavior):
 
@@ -149,13 +193,13 @@ MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
 mcp-mux status
 
 # Stop all running instances and the daemon
-mcp-mux stop
+mcp-mux stop [--drain-timeout 30s] [--force]
 
 # Atomic binary upgrade (see section below)
 mcp-mux upgrade
 
-# Start a detached daemon owner manually (for scripting)
-mcp-mux daemon uvx my-server --arg value
+# Start a detached daemon process (normally auto-started by shims)
+mcp-mux daemon
 
 # Run as control-plane MCP server (exposes mux_list / mux_stop / mux_restart tools)
 mcp-mux serve
@@ -166,38 +210,37 @@ mcp-mux serve
 Upgrading the mcp-mux binary while sessions are active is safe:
 
 ```sh
-# Build new binary to a staging path
+# 1. Build new binary to a staging path
 go build -o mcp-mux.exe~ ./cmd/mcp-mux
 
-# Atomic rename-swap; daemon and running sessions are unaffected
+# 2. Swap atomically — stops active sessions, replaces binary, leaves upstream processes intact
 mcp-mux upgrade
 ```
 
-`upgrade` performs an atomic file rename. The running daemon process continues using the
-old binary in memory. New shim invocations after the swap use the new binary. No sessions
-are interrupted.
+`upgrade` performs an atomic file rename using a two-step rename dance
+(`current` → `.old`, `pending~` → `current`). If the pending binary is missing or the rename
+fails, `upgrade` exits with an error and the existing binary is untouched.
 
-Rollback: if the staged binary is missing or the rename fails, `upgrade` exits with an
-error and the existing binary is untouched.
+After upgrade, MCP servers restart automatically on the next CC tool call — the shim reconnects
+to a new daemon started by the new binary.
 
 ## Configuration
 
-All configuration is via environment variables. No config file is required for normal
-operation.
+All configuration is via environment variables. No config file is required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_MUX_NO_DAEMON` | `0` | Set to `1` to disable daemon mode (legacy per-session owner) |
-| `MCP_MUX_ISOLATED` | `0` | Set to `1` to force isolated mode for this server |
-| `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global dedup) |
-| `MCP_MUX_GRACE` | `30s` | Grace period before idle owner stops its upstream |
+| `MCP_MUX_ISOLATED` | `0` | Set to `1` to force isolated mode for this invocation |
+| `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global deduplication) |
+| `MCP_MUX_GRACE` | `30s` | Grace period before an idle owner stops its upstream |
 | `MCP_MUX_IDLE_TIMEOUT` | `5m` | Daemon auto-exit after this period with no activity |
 | `MCP_MUX_DAEMON` | `0` | Set to `1` to start this invocation in daemon (headless owner) mode |
 
 ## Control Plane MCP Server
 
-`mcp-mux serve` exposes an MCP server on stdio with management tools. Add it to
-`.mcp.json` like any other server:
+`mcp-mux serve` exposes an MCP server on stdio with management tools. Add it to `.mcp.json` like
+any other server:
 
 ```json
 {
@@ -210,24 +253,24 @@ operation.
 }
 ```
 
-Available tools:
+**Tools:**
 
-- **`mux_list`** — returns all running instances with server ID, PID, session count,
-  pending requests, classification, and cache status.
-- **`mux_stop`** — gracefully drains and stops an instance by `server_id`. Use
-  `force: true` for immediate kill.
-- **`mux_restart`** — stops an instance and spawns a fresh daemon owner with the same
-  command. Connected sessions reconnect automatically on their next tool call.
+| Tool | Description |
+|------|-------------|
+| `mux_list` | Returns all running instances with server ID, PID, session count, pending requests, classification, and cache status. |
+| `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. |
+| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. Connected sessions reconnect automatically on their next tool call. |
 
-Available prompts:
+**Prompts:**
 
-- **`mux-guide`** — full reference on architecture, classification, caching, and
-  troubleshooting.
-- **`mux-status-summary`** — calls `mux_list` and returns a human-readable summary.
+| Prompt | Description |
+|--------|-------------|
+| `mux-guide` | Full reference on architecture, classification, caching, and troubleshooting. |
+| `mux-status-summary` | Calls `mux_list` and returns a human-readable summary. |
 
 ## For MCP Server Authors
 
-Declare your server's sharing preference in the `initialize` response:
+Declare your server's sharing preference in the `initialize` response capabilities:
 
 ```json
 {
@@ -241,23 +284,46 @@ Declare your server's sharing preference in the `initialize` response:
 }
 ```
 
-For stateless servers that don't depend on the client's working directory, add
-`"stateless": true` to enable global deduplication (one upstream instance regardless of
-which directory CC is opened from):
+For stateless servers that don't depend on the client's working directory, add `"stateless": true`
+to enable global deduplication — one upstream instance regardless of which directory CC is opened
+from:
 
 ```json
 { "x-mux": { "sharing": "shared", "stateless": true } }
 ```
 
-For session-aware servers, mcp-mux injects `_meta.muxSessionId` (format: `sess_` +
-8 hex chars) into every request. Use it to partition in-process state by session:
+For session-aware servers, mcp-mux injects `_meta.muxSessionId` (format: `sess_` + 8 hex chars)
+into every request. Use it to partition in-process state by session:
 
 ```json
 { "x-mux": { "sharing": "session-aware" } }
 ```
 
-Full protocol specification including implementation examples (TypeScript, Python, Go)
-and migration path: [`docs/mux-protocol.md`](docs/mux-protocol.md).
+For servers that must stay alive across all session disconnects (e.g., expensive initialization,
+background indexing), declare persistence:
+
+```json
+{ "x-mux": { "sharing": "shared", "persistent": true } }
+```
+
+Full protocol specification including implementation examples (TypeScript, Python, Go) and
+migration path: [`docs/mux-protocol.md`](docs/mux-protocol.md).
+
+## Contributing
+
+```sh
+# Run tests
+go test ./...
+
+# Run vet
+go vet ./...
+
+# Build
+go build ./cmd/mcp-mux
+```
+
+Pull requests are welcome. Please ensure `go test ./...` and `go vet ./...` pass before submitting.
+For significant changes, open an issue first to discuss the approach.
 
 ## License
 

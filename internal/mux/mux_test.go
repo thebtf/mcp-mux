@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bitswan-space/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/ipc"
 )
 
 // testLogger returns a logger that writes to test output.
