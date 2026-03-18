@@ -2,7 +2,10 @@ node_modules/
 dist/
 *.log
 *.exe
+*.exe~
+*.exe.old
 coverage.out
 coverage.html
 .agent/
 .mcp.json
+.mcp.json.bak

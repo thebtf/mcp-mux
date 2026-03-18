@@ -1,4 +1,4 @@
-.PHONY: build test clean lint vet
+.PHONY: build test clean lint vet upgrade
 
 BINARY=mcp-mux
 GOFLAGS=-trimpath
@@ -24,3 +24,7 @@ clean:
 cover:
 	go test -race -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
+
+upgrade:
+	go build $(GOFLAGS) -o $(BINARY).exe~ ./cmd/mcp-mux
+	./$(BINARY).exe upgrade
