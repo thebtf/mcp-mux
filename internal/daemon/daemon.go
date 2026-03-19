@@ -253,20 +253,22 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 	d.mu.Unlock()
 }
 
-// findSharedOwner searches for an existing owner with the same command+args
-// that was classified as shared (not isolated/session-aware).
+// findReusableOwner searches for an existing owner with the same command+args
+// that can be shared (classified as shared or session-aware, not isolated).
 // Must be called with d.mu held.
 func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
 	for _, entry := range d.owners {
 		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
 		if candidate == needle {
-			// Check classification — only reuse if shared
+			// Reuse if shared or session-aware (both can multiplex).
+			// Only isolated servers require per-cwd copies.
 			status := entry.Owner.Status()
 			classification, _ := status["auto_classification"].(string)
-			if classification == "" || classification == "shared" {
-				return entry
+			if classification == "isolated" {
+				continue
 			}
+			return entry
 		}
 	}
 	return nil
