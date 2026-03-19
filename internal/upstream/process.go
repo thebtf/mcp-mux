@@ -86,9 +86,13 @@ func Start(command string, args []string, env map[string]string, cwd string) (*P
 		close(p.Done)
 	}()
 
-	// Drain stderr to avoid blocking
+	// Forward stderr to logger (prefix with [upstream]) so diagnostics are visible.
 	go func() {
-		drainReader(stderr)
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 4096), 4096)
+		for scanner.Scan() {
+			fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", p.cmd.Process.Pid, scanner.Text())
+		}
 	}()
 
 	return p, nil
@@ -163,13 +167,3 @@ func (p *Process) PID() int {
 	return 0
 }
 
-// drainReader reads and discards all data from r until EOF or error.
-func drainReader(r io.Reader) {
-	buf := make([]byte, 4096)
-	for {
-		_, err := r.Read(buf)
-		if err != nil {
-			return
-		}
-	}
-}
