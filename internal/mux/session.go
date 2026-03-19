@@ -23,18 +23,25 @@ type Session struct {
 	MuxSessionID string // unique session identifier for _meta injection (e.g., "sess_a1b2c3d4")
 	reader       *jsonrpc.Scanner
 	writer       io.Writer
+	closer       io.Closer // underlying connection (net.Conn for IPC sessions, nil for stdio)
 	mu           sync.Mutex // protects writer
 	done         chan struct{}
 	closed       atomic.Bool
 }
 
 // NewSession creates a session from a reader/writer pair.
+// For IPC sessions, pass the net.Conn as closer to enable forceful disconnect on shutdown.
 func NewSession(r io.Reader, w io.Writer) *Session {
+	var closer io.Closer
+	if c, ok := r.(io.Closer); ok {
+		closer = c
+	}
 	return &Session{
 		ID:           int(sessionCounter.Add(1)),
 		MuxSessionID: generateMuxSessionID(),
 		reader:       jsonrpc.NewScanner(r),
 		writer:       bufio.NewWriter(w),
+		closer:       closer,
 		done:         make(chan struct{}),
 	}
 }
@@ -105,10 +112,14 @@ func (s *Session) WriteMessage(id json.RawMessage, result interface{}) error {
 	return s.WriteRaw(data)
 }
 
-// Close marks the session as closed.
+// Close marks the session as closed and disconnects the underlying connection.
+// For IPC sessions, this closes the net.Conn, causing shim's io.Copy to return.
 func (s *Session) Close() {
 	if s.closed.CompareAndSwap(false, true) {
 		close(s.done)
+		if s.closer != nil {
+			s.closer.Close()
+		}
 	}
 }
 
