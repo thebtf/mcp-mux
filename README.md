@@ -235,7 +235,6 @@ All configuration is via environment variables. No config file is required.
 | `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global deduplication) |
 | `MCP_MUX_GRACE` | `30s` | Grace period before an idle owner stops its upstream |
 | `MCP_MUX_IDLE_TIMEOUT` | `5m` | Daemon auto-exit after this period with no activity |
-| `MCP_MUX_DAEMON` | `0` | Set to `1` to start this invocation in daemon (headless owner) mode |
 
 ## Control Plane MCP Server
 
