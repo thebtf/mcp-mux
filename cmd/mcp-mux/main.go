@@ -407,37 +407,53 @@ func runUpgrade(drainTimeout time.Duration, force bool) {
 		os.Exit(1)
 	}
 
-	// Step 1: Stop all instances (unlocks the binary for rename)
-	runStop(drainTimeout, force)
+	// Zero-downtime upgrade: rename-swap the binary WITHOUT stopping daemon.
+	// On Windows, a running exe can be renamed (not overwritten).
+	// Daemon continues running from memory with old code.
+	// Existing connections (shim ↔ owner ↔ upstream) are unaffected.
+	// New shim processes will use the new binary.
+	// Daemon updates when it eventually restarts (idle timeout or explicit stop).
 
-	// Step 2: Atomic swap — rename running exe to .old, pending to current
-	// On Windows, a running exe can be renamed but not overwritten.
-	// By the time we get here, all mcp-mux processes are stopped, so we can
-	// safely overwrite. But we use rename-dance for robustness.
 	oldPath := exe + ".old"
-	_ = os.Remove(oldPath) // clean up any previous .old
+	_ = os.Remove(oldPath)
 
-	// Rename current → .old
+	// Rename current → .old (works even while daemon runs from it)
 	if err := os.Rename(exe, oldPath); err != nil {
-		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", exe, oldPath, err)
-		fmt.Fprintln(os.Stderr, "Hint: ensure all mcp-mux processes are stopped.")
-		os.Exit(1)
+		// If rename fails (binary locked), fall back to full stop + swap
+		fmt.Fprintf(os.Stderr, "hot-swap failed (%v), falling back to full restart...\n", err)
+		runStop(drainTimeout, force)
+
+		_ = os.Remove(oldPath)
+		if err := os.Rename(exe, oldPath); err != nil {
+			fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", exe, oldPath, err)
+			os.Exit(1)
+		}
 	}
 
 	// Rename pending → current
 	if err := os.Rename(pendingPath, exe); err != nil {
-		// Rollback: restore old binary
+		// Rollback
 		_ = os.Rename(oldPath, exe)
 		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", pendingPath, exe, err)
 		os.Exit(1)
 	}
 
-	// Cleanup old binary (best-effort)
+	// Cleanup old binary (best-effort, may fail if daemon still runs from it)
 	_ = os.Remove(oldPath)
 
-	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintf(os.Stderr, "Upgrade complete: %s replaced.\n", filepath.Base(exe))
-	fmt.Fprintln(os.Stderr, "MCP servers will restart automatically on next CC tool call.")
+	// Check if daemon is running — report version mismatch
+	ctlPath := serverid.DaemonControlPath()
+	if isDaemonRunning(ctlPath) {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintf(os.Stderr, "Binary upgraded: %s replaced (zero-downtime).\n", filepath.Base(exe))
+		fmt.Fprintln(os.Stderr, "Daemon still running with old code — existing connections preserved.")
+		fmt.Fprintln(os.Stderr, "New shim connections will use the new binary.")
+		fmt.Fprintln(os.Stderr, "To restart daemon with new code: mcp-mux stop && mcp-mux status")
+	} else {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintf(os.Stderr, "Upgrade complete: %s replaced.\n", filepath.Base(exe))
+		fmt.Fprintln(os.Stderr, "MCP servers will restart automatically on next CC tool call.")
+	}
 }
 
 // collectEnv returns the current process environment as a map.
