@@ -135,12 +135,25 @@ func main() {
 			logger.Printf("daemon unavailable: %v, falling back to legacy owner", err)
 		} else {
 			modeStr := string(mode)
-			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, collectEnv(), logger)
+			shimEnv := collectEnv()
+			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 			if err != nil {
 				logger.Printf("daemon spawn failed: %v, falling back to legacy owner", err)
 			} else {
-				logger.Printf("connecting via daemon to %s", daemonIPC)
-				if err := mux.RunClient(daemonIPC, os.Stdin, os.Stdout); err != nil {
+				logger.Printf("connecting via daemon to %s (resilient)", daemonIPC)
+				reconnectFn := func() (string, error) {
+					if err := ensureDaemon(logger); err != nil {
+						return "", err
+					}
+					return spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+				}
+				if err := mux.RunResilientClient(mux.ResilientClientConfig{
+					Stdin:          os.Stdin,
+					Stdout:         os.Stdout,
+					InitialIPCPath: daemonIPC,
+					Reconnect:      reconnectFn,
+					Logger:         logger,
+				}); err != nil {
 					logger.Printf("client error: %v", err)
 					os.Exit(1)
 				}

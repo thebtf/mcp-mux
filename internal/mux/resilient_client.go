@@ -1,0 +1,416 @@
+package mux
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/jsonrpc"
+)
+
+const (
+	defaultReconnectTimeout  = 30 * time.Second
+	defaultKeepaliveInterval = 5 * time.Second
+	reconnectPollInterval    = 500 * time.Millisecond
+	msgFromCCBufferSize      = 1000
+	msgFromIPCBufferSize     = 1000
+)
+
+// ReconnectFunc reconnects to the daemon and returns the new IPC path.
+// Called when the IPC connection to the owner breaks.
+// Must handle: ensureDaemon + spawnViaDaemon + return ipcPath.
+type ReconnectFunc func() (ipcPath string, err error)
+
+// ResilientClientConfig configures the resilient shim proxy.
+type ResilientClientConfig struct {
+	Stdin             io.Reader
+	Stdout            io.Writer
+	InitialIPCPath    string
+	Reconnect         ReconnectFunc
+	ReconnectTimeout  time.Duration // default: 30s
+	KeepaliveInterval time.Duration // default: 5s
+	Logger            *log.Logger
+}
+
+// initCache stores the first initialize request and response for replay on reconnect.
+type initCache struct {
+	mu      sync.Mutex
+	request []byte // raw JSON of the initialize request
+	// response is intentionally not stored here — we only need to replay the request
+	// to warm the new daemon cache; we discard the response and resume normal proxying.
+}
+
+// resilientClient holds the runtime state for RunResilientClient.
+type resilientClient struct {
+	cfg        ResilientClientConfig
+	msgFromCC  chan []byte // stdin → proxy (buffered 1000)
+	msgFromIPC chan []byte // ipc → stdout (buffered 1000)
+	ipcEOF     chan struct{} // closed when IPC reader detects EOF/error
+	initCache  initCache
+	log        *log.Logger
+}
+
+// RunResilientClient proxies CC stdio ↔ IPC with automatic reconnect on IPC failure.
+//
+// State machine:
+//
+//	CONNECTED     — normal proxy: stdin→IPC, IPC→stdout
+//	RECONNECTING  — IPC broken; buffer stdin, keepalive to stdout, poll Reconnect()
+//	EXIT          — reconnect timed out; return error
+//
+// Returns only on: CC stdin EOF (io.EOF), or reconnect timeout (error).
+func RunResilientClient(cfg ResilientClientConfig) error {
+	if cfg.ReconnectTimeout == 0 {
+		cfg.ReconnectTimeout = defaultReconnectTimeout
+	}
+	if cfg.KeepaliveInterval == 0 {
+		cfg.KeepaliveInterval = defaultKeepaliveInterval
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.New(io.Discard, "", 0)
+	}
+
+	rc := &resilientClient{
+		cfg:        cfg,
+		msgFromCC:  make(chan []byte, msgFromCCBufferSize),
+		msgFromIPC: make(chan []byte, msgFromIPCBufferSize),
+		ipcEOF:     make(chan struct{}),
+		log:        logger,
+	}
+
+	// Connect to initial IPC path.
+	conn, err := ipc.Dial(cfg.InitialIPCPath)
+	if err != nil {
+		return fmt.Errorf("resilient client: initial dial %s: %w", cfg.InitialIPCPath, err)
+	}
+
+	// stdinReader: reads CC stdin, sends raw message bytes to msgFromCC.
+	// Runs forever until stdin EOF (i.e., CC disconnected).
+	stdinDone := make(chan error, 1)
+	go rc.runStdinReader(stdinDone)
+
+	// stdoutWriter mu: protects stdout writes shared between ipcReader forward
+	// path and keepalive sender.
+	var stdoutMu sync.Mutex
+
+	// stdoutWriter: drains msgFromIPC to CC stdout.
+	go rc.runStdoutWriter(&stdoutMu)
+
+	// Run the main proxy loop.
+	return rc.runProxy(conn, &stdoutMu, stdinDone)
+}
+
+// runStdinReader reads newline-delimited JSON-RPC messages from CC stdin and
+// puts raw bytes into rc.msgFromCC. On channel full, the oldest message is
+// dropped and a warning is logged (NFR2: capped at 1000 messages).
+// Sends io.EOF to stdinDone when stdin closes.
+func (rc *resilientClient) runStdinReader(done chan<- error) {
+	scanner := jsonrpc.NewScanner(rc.cfg.Stdin)
+	for {
+		msg, err := scanner.Scan()
+		if err != nil {
+			done <- err
+			return
+		}
+
+		// Cache the first initialize request for replay.
+		if msg.IsRequest() && msg.Method == "initialize" {
+			rc.initCache.mu.Lock()
+			if rc.initCache.request == nil {
+				raw := make([]byte, len(msg.Raw))
+				copy(raw, msg.Raw)
+				rc.initCache.request = raw
+				rc.log.Printf("resilient: cached initialize request (%d bytes)", len(raw))
+			}
+			rc.initCache.mu.Unlock()
+		}
+
+		raw := make([]byte, len(msg.Raw))
+		copy(raw, msg.Raw)
+
+		select {
+		case rc.msgFromCC <- raw:
+		default:
+			// Buffer full: drop oldest message to make room.
+			select {
+			case dropped := <-rc.msgFromCC:
+				rc.log.Printf("resilient: msgFromCC buffer full, dropped oldest message (%d bytes)", len(dropped))
+			default:
+			}
+			rc.msgFromCC <- raw
+		}
+	}
+}
+
+// runStdoutWriter drains rc.msgFromIPC and writes each message to CC stdout.
+// Uses stdoutMu to coordinate with keepalive writes.
+func (rc *resilientClient) runStdoutWriter(mu *sync.Mutex) {
+	for data := range rc.msgFromIPC {
+		mu.Lock()
+		_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", data)
+		mu.Unlock()
+		if err != nil {
+			rc.log.Printf("resilient: stdout write error: %v", err)
+		}
+	}
+}
+
+// runProxy is the main state machine loop. It manages the IPC connection,
+// starts/stops the IPC reader and writer goroutines, handles reconnect,
+// and coordinates keepalive during RECONNECTING state.
+func (rc *resilientClient) runProxy(conn interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}, stdoutMu *sync.Mutex, stdinDone <-chan error) error {
+
+	for {
+		// CONNECTED state: start IPC reader and writer for this connection.
+		ipcEOF := make(chan struct{})
+
+		// ipcReader: reads lines from IPC conn, forwards to msgFromIPC.
+		// On EOF/error: closes ipcEOF to trigger reconnect.
+		go rc.runIPCReader(conn, ipcEOF)
+
+		// ipcWriter: drains msgFromCC, writes to IPC conn.
+		// Stops when ipcEOF is closed (conn will be replaced by reconnect).
+		writerDone := make(chan struct{})
+		go rc.runIPCWriter(conn, ipcEOF, writerDone)
+
+		// Wait for: IPC EOF (reconnect needed) or CC stdin EOF (exit).
+		select {
+		case err := <-stdinDone:
+			// CC disconnected — clean up and exit.
+			conn.Close()
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("resilient: stdin: %w", err)
+
+		case <-ipcEOF:
+			// IPC broken — enter RECONNECTING state.
+			conn.Close()
+			<-writerDone // wait for ipcWriter to stop
+
+			rc.log.Printf("resilient: IPC connection lost, reconnecting...")
+
+			newConn, err := rc.reconnect(stdoutMu, stdinDone)
+			if err != nil {
+				return err // timeout or stdin EOF during reconnect
+			}
+			conn = newConn
+			rc.log.Printf("resilient: reconnected, resuming proxy")
+			// Loop back to CONNECTED state.
+		}
+	}
+}
+
+// runIPCReader reads newline-delimited messages from the IPC connection and
+// forwards raw bytes to rc.msgFromIPC. On EOF or error, closes ipcEOF.
+func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) {
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		data := make([]byte, len(line))
+		copy(data, line)
+
+		select {
+		case rc.msgFromIPC <- data:
+		default:
+			// Drop oldest if IPC output buffer is full.
+			select {
+			case dropped := <-rc.msgFromIPC:
+				rc.log.Printf("resilient: msgFromIPC buffer full, dropped %d bytes", len(dropped))
+			default:
+			}
+			rc.msgFromIPC <- data
+		}
+	}
+
+	// EOF or scan error — signal reconnect.
+	close(ipcEOF)
+}
+
+// runIPCWriter reads from rc.msgFromCC and writes to the IPC connection.
+// Stops when ipcEOF is closed (preventing writes to a dead connection).
+// Closes writerDone when it exits.
+func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, writerDone chan<- struct{}) {
+	defer close(writerDone)
+	for {
+		select {
+		case <-ipcEOF:
+			return
+		case data := <-rc.msgFromCC:
+			_, err := fmt.Fprintf(conn, "%s\n", data)
+			if err != nil {
+				rc.log.Printf("resilient: ipc write error: %v", err)
+				return
+			}
+		}
+	}
+}
+
+// reconnectResult carries the result of an async Reconnect() attempt.
+type reconnectResult struct {
+	path string
+	err  error
+}
+
+// reconnect enters the RECONNECTING state: polls cfg.Reconnect every 500ms
+// (asynchronously so the select loop stays responsive), sends keepalive to
+// CC stdout every KeepaliveInterval, and buffers CC stdin via msgFromCC.
+//
+// On success: dials new IPC, replays cached initialize, flushes buffered
+// CC messages, and returns the new connection.
+//
+// Returns error on: reconnect timeout, or CC stdin EOF during reconnect.
+func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan error) (interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}, error) {
+	deadline := time.Now().Add(rc.cfg.ReconnectTimeout)
+	keepaliveTicker := time.NewTicker(rc.cfg.KeepaliveInterval)
+	pollTicker := time.NewTicker(reconnectPollInterval)
+	defer keepaliveTicker.Stop()
+	defer pollTicker.Stop()
+
+	keepaliveN := 0
+	resultCh := make(chan reconnectResult, 1)
+	pending := false // true when an async Reconnect() call is in-flight
+
+	for {
+		// Check timeout.
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("resilient: reconnect timeout after %s", rc.cfg.ReconnectTimeout)
+		}
+
+		select {
+		case err := <-stdinDone:
+			if err == io.EOF {
+				return nil, io.EOF
+			}
+			return nil, fmt.Errorf("resilient: stdin during reconnect: %w", err)
+
+		case <-keepaliveTicker.C:
+			keepaliveN++
+			ka := fmt.Sprintf(
+				`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"mux-reconnect","progress":%d,"total":100}}`,
+				keepaliveN,
+			)
+			stdoutMu.Lock()
+			_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", ka)
+			stdoutMu.Unlock()
+			if err != nil {
+				rc.log.Printf("resilient: keepalive write error: %v", err)
+			} else {
+				rc.log.Printf("resilient: sent keepalive %d", keepaliveN)
+			}
+
+		case <-pollTicker.C:
+			if pending {
+				// Previous Reconnect() call still in flight — skip this tick.
+				continue
+			}
+			pending = true
+			go func() {
+				newPath, err := rc.cfg.Reconnect()
+				resultCh <- reconnectResult{path: newPath, err: err}
+			}()
+
+		case res := <-resultCh:
+			pending = false
+			if res.err != nil {
+				rc.log.Printf("resilient: Reconnect() failed: %v (retrying)", res.err)
+				continue
+			}
+
+			conn, err := ipc.Dial(res.path)
+			if err != nil {
+				rc.log.Printf("resilient: dial %s failed: %v (retrying)", res.path, err)
+				continue
+			}
+
+			// Replay cached initialize request to warm new daemon.
+			if err := rc.replayInit(conn); err != nil {
+				rc.log.Printf("resilient: init replay failed: %v (retrying)", err)
+				conn.Close()
+				continue
+			}
+
+			// Flush buffered CC messages.
+			rc.flushBuffer(conn)
+
+			return conn, nil
+		}
+	}
+}
+
+// replayInit replays the cached initialize request to the new IPC connection
+// and reads (discards) the response. This warms the new daemon's cache so
+// subsequent CC requests get correct responses.
+func (rc *resilientClient) replayInit(conn interface {
+	io.Reader
+	io.Writer
+}) error {
+	rc.initCache.mu.Lock()
+	req := rc.initCache.request
+	rc.initCache.mu.Unlock()
+
+	if req == nil {
+		// No initialize seen yet — nothing to replay.
+		return nil
+	}
+
+	// Send the cached initialize request.
+	_, err := fmt.Fprintf(conn, "%s\n", req)
+	if err != nil {
+		return fmt.Errorf("write init replay: %w", err)
+	}
+	rc.log.Printf("resilient: replayed initialize request")
+
+	// Read and discard the response.
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("read init response: %w", err)
+		}
+		return fmt.Errorf("read init response: EOF")
+	}
+	rc.log.Printf("resilient: discarded init replay response (%d bytes)", len(scanner.Bytes()))
+	return nil
+}
+
+// flushBuffer drains any messages buffered in msgFromCC and writes them to
+// the new IPC connection. This replays CC requests that arrived during
+// the RECONNECTING state.
+func (rc *resilientClient) flushBuffer(conn io.Writer) {
+	flushed := 0
+	for {
+		select {
+		case data := <-rc.msgFromCC:
+			_, err := fmt.Fprintf(conn, "%s\n", data)
+			if err != nil {
+				rc.log.Printf("resilient: flush write error: %v", err)
+				return
+			}
+			flushed++
+		default:
+			if flushed > 0 {
+				rc.log.Printf("resilient: flushed %d buffered messages", flushed)
+			}
+			return
+		}
+	}
+}
