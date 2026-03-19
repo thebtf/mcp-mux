@@ -390,7 +390,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	}
 }
 
-func runUpgrade(drainTimeout time.Duration, force bool) {
+func runUpgrade(_ time.Duration, _ bool) {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot resolve executable path: %v\n", err)
@@ -407,52 +407,53 @@ func runUpgrade(drainTimeout time.Duration, force bool) {
 		os.Exit(1)
 	}
 
-	// Zero-downtime upgrade: rename-swap the binary WITHOUT stopping daemon.
-	// On Windows, a running exe can be renamed (not overwritten).
-	// Daemon continues running from memory with old code.
-	// Existing connections (shim ↔ owner ↔ upstream) are unaffected.
-	// New shim processes will use the new binary.
-	// Daemon updates when it eventually restarts (idle timeout or explicit stop).
+	// Zero-downtime upgrade: rename-swap binary WITHOUT stopping daemon or killing connections.
+	//
+	// On Windows, a running exe CAN be renamed (not deleted/overwritten).
+	// Daemon + owners + shims continue running from memory with old code.
+	// New shim processes launched after swap use the new binary.
+	// Daemon gets new code on next natural restart (idle timeout, CC restart, or explicit stop).
+	//
+	// NEVER call runStop here — it kills daemon, owners, upstreams, and all sessions.
 
-	oldPath := exe + ".old"
-	_ = os.Remove(oldPath)
+	// Use PID-suffixed .old path to avoid conflicts with locked files from previous upgrades
+	oldPath := fmt.Sprintf("%s.old.%d", exe, os.Getpid())
 
-	// Rename current → .old (works even while daemon runs from it)
+	// Rename current → .old
 	if err := os.Rename(exe, oldPath); err != nil {
-		// If rename fails (binary locked), fall back to full stop + swap
-		fmt.Fprintf(os.Stderr, "hot-swap failed (%v), falling back to full restart...\n", err)
-		runStop(drainTimeout, force)
-
-		_ = os.Remove(oldPath)
-		if err := os.Rename(exe, oldPath); err != nil {
-			fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", exe, oldPath, err)
-			os.Exit(1)
-		}
+		fmt.Fprintf(os.Stderr, "error: cannot rename %s → %s: %v\n", filepath.Base(exe), filepath.Base(oldPath), err)
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "The binary is locked. This can happen when another mcp-mux")
+		fmt.Fprintln(os.Stderr, "process holds a file handle. Try:")
+		fmt.Fprintln(os.Stderr, "  1. Close all CC sessions")
+		fmt.Fprintln(os.Stderr, "  2. mcp-mux stop --force")
+		fmt.Fprintln(os.Stderr, "  3. Retry: mcp-mux upgrade")
+		os.Exit(1)
 	}
 
 	// Rename pending → current
 	if err := os.Rename(pendingPath, exe); err != nil {
-		// Rollback
-		_ = os.Rename(oldPath, exe)
-		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", pendingPath, exe, err)
+		_ = os.Rename(oldPath, exe) // rollback
+		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", filepath.Base(pendingPath), filepath.Base(exe), err)
 		os.Exit(1)
 	}
 
-	// Cleanup old binary (best-effort, may fail if daemon still runs from it)
+	// Best-effort cleanup of .old files (may fail if daemon still runs — that's fine)
 	_ = os.Remove(oldPath)
+	matches, _ := filepath.Glob(exe + ".old.*")
+	for _, m := range matches {
+		_ = os.Remove(m)
+	}
 
-	// Check if daemon is running — report version mismatch
+	// Report
 	ctlPath := serverid.DaemonControlPath()
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 	if isDaemonRunning(ctlPath) {
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintf(os.Stderr, "Binary upgraded: %s replaced (zero-downtime).\n", filepath.Base(exe))
-		fmt.Fprintln(os.Stderr, "Daemon still running with old code — existing connections preserved.")
-		fmt.Fprintln(os.Stderr, "New shim connections will use the new binary.")
-		fmt.Fprintln(os.Stderr, "To restart daemon with new code: mcp-mux stop && mcp-mux status")
+		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")
+		fmt.Fprintln(os.Stderr, "New shims use new binary. Daemon updates on next restart.")
 	} else {
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintf(os.Stderr, "Upgrade complete: %s replaced.\n", filepath.Base(exe))
-		fmt.Fprintln(os.Stderr, "MCP servers will restart automatically on next CC tool call.")
+		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
 	}
 }
 
