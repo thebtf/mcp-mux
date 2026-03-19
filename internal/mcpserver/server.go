@@ -290,12 +290,18 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 		{
 			"name": "mux_list",
 			"description": "List all running mcp-mux managed MCP server instances. " +
-				"Returns a JSON array with each server's ID, command, args, upstream PID, " +
-				"connected session count, pending requests, auto-classification (shared/isolated/session-aware), " +
-				"and cache status. Use server_id from the output to target mux_stop or mux_restart.",
+				"Returns compact summary by default: server name, sessions, classification, version. " +
+				"Set verbose=true for full details (PID, IPC path, cache status, classification reason). " +
+				"Use server_id or name from the output to target mux_stop or mux_restart.",
 			"inputSchema": map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
+				"type": "object",
+				"properties": map[string]any{
+					"verbose": map[string]any{
+						"type":        "boolean",
+						"description": "Return full status details for each server (default: compact summary).",
+						"default":     false,
+					},
+				},
 			},
 		},
 		{
@@ -368,7 +374,7 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 
 	switch call.Name {
 	case "mux_list":
-		s.toolMuxList(id)
+		s.toolMuxList(id, call.Arguments)
 	case "mux_stop":
 		s.toolMuxStop(id, call.Arguments)
 	case "mux_restart":
@@ -379,7 +385,14 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 }
 
 // toolMuxList scans all .ctl.sock files and queries status from each.
-func (s *Server) toolMuxList(id json.RawMessage) {
+func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
+	var params struct {
+		Verbose bool `json:"verbose"`
+	}
+	if args != nil {
+		_ = json.Unmarshal(args, &params)
+	}
+
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
@@ -406,8 +419,22 @@ func (s *Server) toolMuxList(id json.RawMessage) {
 		if resp.OK && resp.Data != nil {
 			var data map[string]any
 			if err := json.Unmarshal(resp.Data, &data); err == nil {
-				data["server_id"] = serverID
-				servers = append(servers, data)
+				if params.Verbose {
+					data["server_id"] = serverID
+					servers = append(servers, data)
+				} else {
+					// Compact: only key fields
+					compact := map[string]any{
+						"server_id": serverID,
+						"command":   data["command"],
+						"args":      data["args"],
+						"sessions":  data["session_count"],
+						"pending":   data["pending_requests"],
+						"class":     data["auto_classification"],
+						"version":   data["mux_version"],
+					}
+					servers = append(servers, compact)
+				}
 			}
 		}
 	}
