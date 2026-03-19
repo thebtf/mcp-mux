@@ -186,6 +186,25 @@ no daemon is running.
 MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
 ```
 
+## Resilient Shim
+
+mcp-mux shims automatically reconnect when the daemon restarts. This means:
+
+- `mcp-mux upgrade` swaps the binary without dropping connections
+- `mcp-mux stop --force` triggers automatic reconnect within seconds
+- Daemon crashes are recovered transparently
+
+During reconnect, the shim:
+1. Detects IPC connection loss (daemon shutdown)
+2. Buffers incoming CC requests (up to 1000 messages)
+3. Sends keepalive notifications to prevent CC timeout
+4. Starts a new daemon via `ensureDaemon()`
+5. Re-spawns the upstream server via `spawnViaDaemon()`
+6. Replays cached `initialize` request to warm the new owner
+7. Flushes buffered requests and resumes normal proxy
+
+Reconnect timeout: 30 seconds. If reconnect fails, the shim exits and CC restarts it.
+
 ## Commands
 
 ```sh
