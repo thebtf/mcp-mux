@@ -142,6 +142,12 @@ func main() {
 			} else {
 				logger.Printf("connecting via daemon to %s (resilient)", daemonIPC)
 				reconnectFn := func() (string, error) {
+					// Retry ensureDaemon with jitter to avoid thundering herd.
+					// Multiple shims reconnecting simultaneously compete for lock;
+					// random delay spreads the load.
+					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
+					time.Sleep(jitter)
+
 					if err := ensureDaemon(logger); err != nil {
 						return "", err
 					}

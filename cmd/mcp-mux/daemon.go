@@ -76,19 +76,20 @@ func ensureDaemon(logger *log.Logger) error {
 		return nil
 	}
 
-	// Acquire lock to prevent multiple shims from starting daemon simultaneously
+	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
+	// Lock file is NOT deleted — it persists for coordination across shims.
 	lockPath := serverid.DaemonLockPath()
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
 	}
 	defer lock.Close()
-	defer os.Remove(lockPath)
 
 	if err := lockFile(lock); err != nil {
-		// Another shim is starting the daemon — just wait for it
+		// Another shim holds the lock (starting daemon) — wait longer for it.
+		// 15s covers: daemon startup + upstream spawn + init response.
 		logger.Printf("another shim is starting daemon, waiting...")
-		return waitForDaemon(ctlPath, 5*time.Second)
+		return waitForDaemon(ctlPath, 15*time.Second)
 	}
 	defer unlockFile(lock)
 
@@ -103,7 +104,7 @@ func ensureDaemon(logger *log.Logger) error {
 		return fmt.Errorf("start daemon: %w", err)
 	}
 
-	return waitForDaemon(ctlPath, 5*time.Second)
+	return waitForDaemon(ctlPath, 10*time.Second)
 }
 
 // waitForDaemon polls until the daemon control socket responds (up to timeout).
