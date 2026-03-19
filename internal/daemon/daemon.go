@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +96,8 @@ func New(cfg Config) (*Daemon, error) {
 }
 
 // Spawn creates or returns an existing owner for the given server identity.
+// Deduplication: if a shared owner for the same command+args already exists
+// (from any cwd), it is reused — stateless servers don't need per-project copies.
 func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	mode := serverid.ModeCwd
 	switch req.Mode {
@@ -107,18 +110,33 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	}
 
 	// Server identity is based on command+args+cwd only, NOT env.
-	// Env vars are forwarded to upstream but don't affect which owner handles the server.
 	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
-	ipcPath := serverid.IPCPath(sid)
 
 	d.mu.Lock()
+
+	// 1. Exact match (same command+args+cwd)?
 	if entry, ok := d.owners[sid]; ok {
 		entry.LastSession = time.Now()
 		d.mu.Unlock()
 		d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
 		return entry.Owner.IPCPath(), sid, nil
 	}
+
+	// 2. Global dedup: if a shared owner for same command+args exists (any cwd), reuse it.
+	//    This prevents N copies of stateless servers (tavily, time, nia) across projects.
+	if mode == serverid.ModeCwd {
+		if existing := d.findSharedOwner(req.Command, req.Args); existing != nil {
+			existing.LastSession = time.Now()
+			existingSID := existing.ServerID
+			d.mu.Unlock()
+			d.logger.Printf("dedup: reusing shared owner %s for %s (different cwd)", existingSID[:8], req.Command)
+			return existing.Owner.IPCPath(), existingSID, nil
+		}
+	}
+
 	d.mu.Unlock()
+
+	ipcPath := serverid.IPCPath(sid)
 
 	// Compute env diff: only vars that the shim has but daemon doesn't (CC-configured vars).
 	envDiff := diffEnv(req.Env)
@@ -233,6 +251,25 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 		d.logger.Printf("owner %s persistent=%v", serverID[:8], persistent)
 	}
 	d.mu.Unlock()
+}
+
+// findSharedOwner searches for an existing owner with the same command+args
+// that was classified as shared (not isolated/session-aware).
+// Must be called with d.mu held.
+func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
+	needle := command + " " + strings.Join(args, " ")
+	for _, entry := range d.owners {
+		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
+		if candidate == needle {
+			// Check classification — only reuse if shared
+			status := entry.Owner.Status()
+			classification, _ := status["auto_classification"].(string)
+			if classification == "" || classification == "shared" {
+				return entry
+			}
+		}
+	}
+	return nil
 }
 
 // diffEnv returns only the env vars from shim that differ from daemon's own env.
