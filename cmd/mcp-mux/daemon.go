@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"os/signal"
 	"syscall"
 	"time"
@@ -35,7 +36,17 @@ func runGlobalDaemon() {
 		}
 	}
 
-	logger := log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
+	// Debug log to file — daemon is detached, stderr goes nowhere.
+	// Always log to file so we can trace issues like roots/list routing.
+	debugLogPath := filepath.Join(os.TempDir(), "mcp-muxd-debug.log")
+	logFile, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	var logger *log.Logger
+	if err == nil {
+		logger = log.New(logFile, "[mcp-muxd] ", log.LstdFlags|log.Lmicroseconds)
+		logger.Printf("=== daemon starting, debug log: %s ===", debugLogPath)
+	} else {
+		logger = log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
+	}
 
 	d, err := daemon.New(daemon.Config{
 		ControlPath: ctlPath,

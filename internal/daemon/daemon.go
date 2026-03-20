@@ -165,7 +165,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 		OnPersistentDetected: func(serverID string) {
 			d.SetPersistent(serverID, true)
 		},
-		Logger: log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags),
+		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 	})
 	if err != nil {
 		return "", "", fmt.Errorf("spawn %s: %w", req.Command, err)

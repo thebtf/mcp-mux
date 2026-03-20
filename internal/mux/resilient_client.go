@@ -379,16 +379,25 @@ func (rc *resilientClient) replayInit(conn interface {
 	}
 	rc.log.Printf("resilient: replayed initialize request")
 
-	// Read and discard the response.
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
+	// Read and discard the response — byte-by-byte to avoid bufio buffering.
+	// A bufio.Scanner would read ahead into its internal buffer, consuming
+	// subsequent messages (tools/list, prompts/list) that belong to runIPCReader.
+	buf := make([]byte, 0, 4096)
+	one := make([]byte, 1)
+	for {
+		_, err = conn.Read(one)
+		if err != nil {
 			return fmt.Errorf("read init response: %w", err)
 		}
-		return fmt.Errorf("read init response: EOF")
+		if one[0] == '\n' {
+			break
+		}
+		buf = append(buf, one[0])
+		if len(buf) > 1024*1024 {
+			return fmt.Errorf("read init response: line too long (%d bytes)", len(buf))
+		}
 	}
-	rc.log.Printf("resilient: discarded init replay response (%d bytes)", len(scanner.Bytes()))
+	rc.log.Printf("resilient: discarded init replay response (%d bytes)", len(buf))
 	return nil
 }
 
