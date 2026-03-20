@@ -155,12 +155,12 @@ func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 	ccStdoutR, ccStdoutW := io.Pipe()
 
 	reconnectCalled := make(chan struct{}, 1)
-	reconnectFn := func() (string, error) {
+	reconnectFn := func() (string, string, error) {
 		select {
 		case reconnectCalled <- struct{}{}:
 		default:
 		}
-		return path2, nil
+		return path2, "", nil
 	}
 
 	cfg := ResilientClientConfig{
@@ -298,9 +298,9 @@ func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 
 	// Reconnect delays 500ms to give us time to queue messages.
 	reconnectDelay := 500 * time.Millisecond
-	reconnectFn := func() (string, error) {
+	reconnectFn := func() (string, string, error) {
 		time.Sleep(reconnectDelay)
-		return path2, nil
+		return path2, "", nil
 	}
 
 	cfg := ResilientClientConfig{
@@ -382,8 +382,8 @@ func TestResilientClient_TimeoutExits(t *testing.T) {
 	ccStdinR, ccStdinW := io.Pipe()
 	ccStdoutR, ccStdoutW := io.Pipe()
 
-	reconnectFn := func() (string, error) {
-		return "", fmt.Errorf("daemon not available")
+	reconnectFn := func() (string, string, error) {
+		return "", "", fmt.Errorf("daemon not available")
 	}
 
 	const shortTimeout = 2 * time.Second
@@ -441,9 +441,9 @@ func TestResilientClient_KeepaliveEmitted(t *testing.T) {
 	ccStdoutR, ccStdoutW := io.Pipe()
 
 	reconnectDelay := 3 * time.Second
-	reconnectFn := func() (string, error) {
+	reconnectFn := func() (string, string, error) {
 		time.Sleep(reconnectDelay)
-		return path2, nil
+		return path2, "", nil
 	}
 
 	const keepaliveInterval = 800 * time.Millisecond
@@ -540,8 +540,8 @@ func TestResilientClient_InitReplayOnReconnect(t *testing.T) {
 	ccStdinR, ccStdinW := io.Pipe()
 	ccStdoutR, ccStdoutW := io.Pipe()
 
-	reconnectFn := func() (string, error) {
-		return path2, nil
+	reconnectFn := func() (string, string, error) {
+		return path2, "", nil
 	}
 
 	cfg := ResilientClientConfig{

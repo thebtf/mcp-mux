@@ -136,12 +136,12 @@ func main() {
 		} else {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
-			daemonIPC, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+			daemonIPC, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 			if err != nil {
 				logger.Printf("daemon spawn failed: %v, falling back to legacy owner", err)
 			} else {
 				logger.Printf("connecting via daemon to %s (resilient)", daemonIPC)
-				reconnectFn := func() (string, error) {
+				reconnectFn := func() (string, string, error) {
 					// Retry ensureDaemon with jitter to avoid thundering herd.
 					// Multiple shims reconnecting simultaneously compete for lock;
 					// random delay spreads the load.
@@ -149,7 +149,7 @@ func main() {
 					time.Sleep(jitter)
 
 					if err := ensureDaemon(logger); err != nil {
-						return "", err
+						return "", "", err
 					}
 					return spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 				}
@@ -157,6 +157,7 @@ func main() {
 					Stdin:          os.Stdin,
 					Stdout:         os.Stdout,
 					InitialIPCPath: daemonIPC,
+					Token:          daemonToken,
 					Reconnect:      reconnectFn,
 					Logger:         logger,
 				}); err != nil {

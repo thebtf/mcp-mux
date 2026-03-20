@@ -53,7 +53,7 @@ func testDaemon(t *testing.T) *Daemon {
 func TestDaemonSpawnAndStatus(t *testing.T) {
 	d := testDaemon(t)
 
-	ipcPath, sid, err := d.Spawn(control.Request{
+	ipcPath, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -94,12 +94,12 @@ func TestDaemonSpawnReusesExisting(t *testing.T) {
 		Mode:    "global",
 	}
 
-	ipc1, sid1, err := d.Spawn(req)
+	ipc1, sid1, _, err := d.Spawn(req)
 	if err != nil {
 		t.Fatalf("Spawn() 1 error: %v", err)
 	}
 
-	ipc2, sid2, err := d.Spawn(req)
+	ipc2, sid2, _, err := d.Spawn(req)
 	if err != nil {
 		t.Fatalf("Spawn() 2 error: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestDaemonSpawnReusesExisting(t *testing.T) {
 func TestDaemonRemove(t *testing.T) {
 	d := testDaemon(t)
 
-	_, sid, err := d.Spawn(control.Request{
+	_, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -146,7 +146,7 @@ func TestDaemonShutdownCleansAll(t *testing.T) {
 	d := testDaemon(t)
 
 	for i := 0; i < 3; i++ {
-		_, _, err := d.Spawn(control.Request{
+		_, _, _, err := d.Spawn(control.Request{
 			Cmd:     "spawn",
 			Command: "go",
 			Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -178,7 +178,7 @@ func TestDaemonShutdownCleansAll(t *testing.T) {
 func TestDaemonSetPersistent(t *testing.T) {
 	d := testDaemon(t)
 
-	_, sid, err := d.Spawn(control.Request{
+	_, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -211,7 +211,7 @@ func TestDaemonMultiSessionSharing(t *testing.T) {
 	d := testDaemon(t)
 
 	// 1. Spawn owner for mock_server via daemon.
-	ipcPath, sid, err := d.Spawn(control.Request{
+	ipcPath, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},

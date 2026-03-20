@@ -82,8 +82,9 @@ type Owner struct {
 	classificationSource string   // "capability" or "tools" — what determined classification
 	classificationReason []string // tool names that triggered isolation
 
-	lastActiveSessionID int            // ID of the session that last sent a request to upstream
-	progressOwners      map[string]int // progressToken → session ID for targeted routing
+	sessionMgr       *SessionManager
+	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
+	progressOwners   map[string]int // progressToken → session ID for targeted routing
 
 	methodTags      sync.Map // remapped request ID (string) -> method name
 	pendingRequests atomic.Int64
@@ -129,6 +130,12 @@ type OwnerConfig struct {
 	// Used by the daemon to mark the owner entry as persistent.
 	OnPersistentDetected func(serverID string)
 
+	// TokenHandshake enables reading the shim's handshake token from each new IPC
+	// connection before the MCP session begins. Only set true when the owner is
+	// managed by the global daemon — shims always send a token in that mode.
+	// Legacy and test connections do not send a token; leave this false (default).
+	TokenHandshake bool
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -169,6 +176,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		onPersistentDetected: cfg.OnPersistentDetected,
 		sessions:           make(map[int]*Session),
 		cachedInitSessions: make(map[int]bool),
+		sessionMgr:         NewSessionManager(),
+		tokenHandshake:     cfg.TokenHandshake,
 		progressOwners:     make(map[string]int),
 		startTime:          time.Now(),
 		listenerDone:       make(chan struct{}),
@@ -206,6 +215,40 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	return o, nil
 }
 
+// SessionMgr returns the owner's SessionManager.
+// Used by the daemon to call PreRegister before the shim connects.
+func (o *Owner) SessionMgr() *SessionManager {
+	return o.sessionMgr
+}
+
+// readToken reads the handshake token sent by the shim immediately after connecting.
+// The token is a hex string terminated by '\n'. Uses byte-by-byte reading to avoid
+// consuming subsequent MCP messages that immediately follow the token line.
+// Returns an empty string on timeout or read error — callers treat that as no-token.
+func readToken(conn net.Conn) string {
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return ""
+	}
+	defer conn.SetReadDeadline(time.Time{}) // clear deadline after read
+
+	buf := make([]byte, 0, 32)
+	one := make([]byte, 1)
+	for {
+		_, err := conn.Read(one)
+		if err != nil {
+			return ""
+		}
+		if one[0] == '\n' {
+			break
+		}
+		buf = append(buf, one[0])
+		if len(buf) > 64 { // tokens are 16 hex chars; >64 means something is wrong
+			return ""
+		}
+	}
+	return string(buf)
+}
+
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
@@ -213,7 +256,8 @@ func (o *Owner) AddSession(s *Session) {
 	o.sessions[s.ID] = s
 	o.mu.Unlock()
 
-	o.logger.Printf("session %d connected", s.ID)
+	o.sessionMgr.RegisterSession(s, s.Cwd)
+	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
 
 	// Notify upstream that roots may have changed (new client = new potential root)
 	o.sendRootsListChanged()
@@ -317,9 +361,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		o.trackProgressToken(s.ID, msg.Raw)
 
 		// Record the active session so server→client requests can be routed back
-		o.mu.Lock()
-		o.lastActiveSessionID = s.ID
-		o.mu.Unlock()
+		o.sessionMgr.TrackRequest(string(newID), s.ID)
 
 		return o.upstream.WriteLine(remapped)
 
@@ -383,6 +425,7 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 
 	// Decrement pending counter before routing (handles disconnected sessions too)
 	o.pendingRequests.Add(-1)
+	o.sessionMgr.CompleteRequest(string(msg.ID))
 
 	// Cache response if this was a tagged cacheable request
 	if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
@@ -489,15 +532,12 @@ func (o *Owner) respondToPing(id json.RawMessage) error {
 	return o.upstream.WriteLine([]byte(resp))
 }
 
-// routeToLastActiveSession forwards a server→client request to the last session
-// that sent a request upstream. Used for sampling/createMessage, elicitation/create, etc.
+// routeToLastActiveSession forwards a server→client request to the most recently
+// active session with an in-flight request. Uses SessionManager.ResolveCallback()
+// for causal routing. Falls back to local responses when no session is available.
 func (o *Owner) routeToLastActiveSession(msg *jsonrpc.Message) error {
-	o.mu.RLock()
-	sessionID := o.lastActiveSessionID
-	session, ok := o.sessions[sessionID]
-	o.mu.RUnlock()
-
-	if !ok {
+	ctx := o.sessionMgr.ResolveCallback()
+	if ctx == nil {
 		o.logger.Printf("no active session for server request %s", msg.Method)
 		switch msg.Method {
 		case "roots/list":
@@ -511,12 +551,13 @@ func (o *Owner) routeToLastActiveSession(msg *jsonrpc.Message) error {
 		}
 	}
 
-	o.logger.Printf("[TRACE] routing server request %s (id=%s) to session %d", msg.Method, string(msg.ID), sessionID)
+	session := ctx.Session
+	o.logger.Printf("[TRACE] routing server request %s (id=%s) to session %d", msg.Method, string(msg.ID), session.ID)
 	err := session.WriteRaw(msg.Raw)
 	if err != nil {
-		o.logger.Printf("[TRACE] routing %s to session %d failed: %v", msg.Method, sessionID, err)
+		o.logger.Printf("[TRACE] routing %s to session %d failed: %v", msg.Method, session.ID, err)
 	} else {
-		o.logger.Printf("[TRACE] routing %s to session %d succeeded, waiting for response", msg.Method, sessionID)
+		o.logger.Printf("[TRACE] routing %s to session %d succeeded, waiting for response", msg.Method, session.ID)
 	}
 	return err
 }
@@ -659,6 +700,7 @@ func (o *Owner) removeSession(s *Session) {
 	remaining := len(o.sessions)
 	o.mu.Unlock()
 
+	o.sessionMgr.RemoveSession(s.ID)
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
 
 	if remaining > 0 {
@@ -685,7 +727,14 @@ func (o *Owner) acceptLoop() {
 			}
 		}
 
+		var token string
+		if o.tokenHandshake {
+			token = readToken(conn)
+		}
 		s := NewSession(conn, conn)
+		if token != "" {
+			o.sessionMgr.Bind(token, s) // sets s.Cwd from pre-registered token
+		}
 		o.AddSession(s)
 	}
 }

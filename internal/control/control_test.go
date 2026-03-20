@@ -183,10 +183,10 @@ type mockDaemonHandler struct {
 	removeArg    string
 }
 
-func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, error) {
+func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, error) {
 	m.spawnCalled = true
 	if m.spawnErr != nil {
-		return "", "", m.spawnErr
+		return "", "", "", m.spawnErr
 	}
 	ipcPath := m.spawnIPCPath
 	if ipcPath == "" {
@@ -196,7 +196,7 @@ func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, error) {
 	if srvID == "" {
 		srvID = "test-server-id"
 	}
-	return ipcPath, srvID, nil
+	return ipcPath, srvID, "test-token", nil
 }
 
 func (m *mockDaemonHandler) HandleRemove(serverID string) error {

@@ -175,8 +175,8 @@ func startDaemonProcess() error {
 	return nil
 }
 
-// spawnViaDaemon sends a spawn request to the daemon and returns the IPC path.
-func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, error) {
+// spawnViaDaemon sends a spawn request to the daemon and returns the IPC path and handshake token.
+func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
 	ctlPath := serverid.DaemonControlPath()
 
 	// Spawn may take time — upstream processes like uvx/npx need 5-15s to start.
@@ -190,14 +190,14 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 		Env:     env,
 	}, 30*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("spawn via daemon: %w", err)
+		return "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
-		return "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 
 	logger.Printf("daemon spawned server %s at %s", resp.ServerID[:8], resp.IPCPath)
-	return resp.IPCPath, nil
+	return resp.IPCPath, resp.Token, nil
 }
 
 // setSysProcAttr is defined in platform-specific files:

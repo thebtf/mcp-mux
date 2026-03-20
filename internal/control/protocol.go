@@ -27,6 +27,7 @@ type Response struct {
 	Data     json.RawMessage `json:"data,omitempty"`
 	IPCPath  string          `json:"ipc_path,omitempty"`
 	ServerID string          `json:"server_id,omitempty"`
+	Token    string          `json:"token,omitempty"` // handshake token for session binding
 }
 
 // CommandHandler is implemented by the Owner to handle control commands.
@@ -38,6 +39,6 @@ type CommandHandler interface {
 // DaemonHandler extends CommandHandler with daemon-specific commands.
 type DaemonHandler interface {
 	CommandHandler
-	HandleSpawn(req Request) (ipcPath, serverID string, err error)
+	HandleSpawn(req Request) (ipcPath, serverID, token string, err error)
 	HandleRemove(serverID string) error
 }

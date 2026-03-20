@@ -20,16 +20,17 @@ const (
 	msgFromIPCBufferSize     = 1000
 )
 
-// ReconnectFunc reconnects to the daemon and returns the new IPC path.
+// ReconnectFunc reconnects to the daemon and returns the new IPC path and handshake token.
 // Called when the IPC connection to the owner breaks.
-// Must handle: ensureDaemon + spawnViaDaemon + return ipcPath.
-type ReconnectFunc func() (ipcPath string, err error)
+// Must handle: ensureDaemon + spawnViaDaemon + return ipcPath, token.
+type ReconnectFunc func() (ipcPath string, token string, err error)
 
 // ResilientClientConfig configures the resilient shim proxy.
 type ResilientClientConfig struct {
 	Stdin             io.Reader
 	Stdout            io.Writer
 	InitialIPCPath    string
+	Token             string        // handshake token from initial spawn; sent to owner on connect
 	Reconnect         ReconnectFunc
 	ReconnectTimeout  time.Duration // default: 30s
 	KeepaliveInterval time.Duration // default: 5s
@@ -47,6 +48,7 @@ type initCache struct {
 // resilientClient holds the runtime state for RunResilientClient.
 type resilientClient struct {
 	cfg        ResilientClientConfig
+	token      string     // current handshake token; updated on reconnect
 	msgFromCC  chan []byte // stdin → proxy (buffered 1000)
 	msgFromIPC chan []byte // ipc → stdout (buffered 1000)
 	ipcEOF     chan struct{} // closed when IPC reader detects EOF/error
@@ -77,6 +79,7 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 
 	rc := &resilientClient{
 		cfg:        cfg,
+		token:      cfg.Token,
 		msgFromCC:  make(chan []byte, msgFromCCBufferSize),
 		msgFromIPC: make(chan []byte, msgFromIPCBufferSize),
 		ipcEOF:     make(chan struct{}),
@@ -87,6 +90,14 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 	conn, err := ipc.Dial(cfg.InitialIPCPath)
 	if err != nil {
 		return fmt.Errorf("resilient client: initial dial %s: %w", cfg.InitialIPCPath, err)
+	}
+
+	// Send handshake token so the owner can bind this connection to a session context.
+	if rc.token != "" {
+		if _, err := fmt.Fprintf(conn, "%s\n", rc.token); err != nil {
+			conn.Close()
+			return fmt.Errorf("resilient client: send token: %w", err)
+		}
 	}
 
 	// stdinReader: reads CC stdin, sends raw message bytes to msgFromCC.
@@ -262,8 +273,9 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 
 // reconnectResult carries the result of an async Reconnect() attempt.
 type reconnectResult struct {
-	path string
-	err  error
+	path  string
+	token string
+	err   error
 }
 
 // reconnect enters the RECONNECTING state: polls cfg.Reconnect every 500ms
@@ -324,8 +336,8 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 			}
 			pending = true
 			go func() {
-				newPath, err := rc.cfg.Reconnect()
-				resultCh <- reconnectResult{path: newPath, err: err}
+				newPath, newToken, err := rc.cfg.Reconnect()
+				resultCh <- reconnectResult{path: newPath, token: newToken, err: err}
 			}()
 
 		case res := <-resultCh:
@@ -339,6 +351,16 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 			if err != nil {
 				rc.log.Printf("resilient: dial %s failed: %v (retrying)", res.path, err)
 				continue
+			}
+
+			// Update and send the new handshake token before replaying init.
+			rc.token = res.token
+			if rc.token != "" {
+				if _, err := fmt.Fprintf(conn, "%s\n", rc.token); err != nil {
+					rc.log.Printf("resilient: send token on reconnect failed: %v (retrying)", err)
+					conn.Close()
+					continue
+				}
 			}
 
 			// Replay cached initialize request to warm new daemon.

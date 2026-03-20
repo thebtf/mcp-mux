@@ -95,11 +95,11 @@ func (s *Server) dispatch(req Request) Response {
 		if !ok {
 			return Response{OK: false, Message: "spawn not supported (not a daemon)"}
 		}
-		ipcPath, serverID, err := dh.HandleSpawn(req)
+		ipcPath, serverID, token, err := dh.HandleSpawn(req)
 		if err != nil {
 			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}
 		}
-		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID}
+		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID, Token: token}
 
 	case "remove":
 		dh, ok := s.handler.(DaemonHandler)

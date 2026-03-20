@@ -33,7 +33,7 @@ func testDaemonWithReaper(t *testing.T, grace, idle time.Duration) (*Daemon, *Re
 func TestReaperGracePeriodExpiry(t *testing.T) {
 	d, _ := testDaemonWithReaper(t, 500*time.Millisecond, 1*time.Minute)
 
-	_, sid, err := d.Spawn(control.Request{
+	_, sid, _, err := d.Spawn(control.Request{
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
 		Mode:    "global",
@@ -67,7 +67,7 @@ func TestReaperGracePeriodExpiry(t *testing.T) {
 func TestReaperPersistentSurvivesGrace(t *testing.T) {
 	d, _ := testDaemonWithReaper(t, 500*time.Millisecond, 1*time.Minute)
 
-	_, sid, err := d.Spawn(control.Request{
+	_, sid, _, err := d.Spawn(control.Request{
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
 		Mode:    "global",

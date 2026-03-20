@@ -129,7 +129,7 @@ func (r *Reaper) respawn(entry *OwnerEntry) {
 	_ = r.daemon.Remove(sid)
 
 	// Re-spawn with same parameters
-	_, newSID, err := r.daemon.Spawn(control.Request{
+	_, newSID, _, err := r.daemon.Spawn(control.Request{
 		Command: entry.Command,
 		Args:    entry.Args,
 		Cwd:     entry.Cwd,

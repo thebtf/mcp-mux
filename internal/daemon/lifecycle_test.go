@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,13 +24,20 @@ func testdataPath(t *testing.T, name string) string {
 }
 
 // dialIPC retries ipc.Dial until the socket is available or the timeout elapses.
+// If token is non-empty, sends it as the handshake line immediately after connecting
+// (required for daemon-owned owners that have TokenHandshake enabled).
 // Returns a connected ipcConn or fails the test.
-func dialIPC(t *testing.T, ipcPath string) *ipcConn {
+func dialIPC(t *testing.T, ipcPath string, token ...string) *ipcConn {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		c, err := ipc.Dial(ipcPath)
 		if err == nil {
+			if len(token) > 0 && token[0] != "" {
+				if _, werr := fmt.Fprintf(c, "%s\n", token[0]); werr != nil {
+					t.Fatalf("dialIPC: send token: %v", werr)
+				}
+			}
 			return &ipcConn{conn: c, scanner: bufio.NewScanner(c)}
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -70,7 +78,7 @@ func TestUpstreamCrashDisconnectsSession(t *testing.T) {
 	d := testDaemon(t)
 
 	// Spawn an owner using mock_server_crash — it responds to initialize then exits.
-	ipcPath, _, err := d.Spawn(control.Request{
+	ipcPath, _, tok, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server_crash.go"},
@@ -81,7 +89,7 @@ func TestUpstreamCrashDisconnectsSession(t *testing.T) {
 	}
 
 	// Connect one IPC client.
-	client := dialIPC(t, ipcPath)
+	client := dialIPC(t, ipcPath, tok)
 	defer client.conn.Close()
 
 	// Send initialize so the upstream processes at least one request.
@@ -103,7 +111,7 @@ func TestUpstreamCrashDisconnectsSession(t *testing.T) {
 func TestDaemonShutdownDisconnectsAllSessions(t *testing.T) {
 	d := testDaemon(t)
 
-	ipcPath, _, err := d.Spawn(control.Request{
+	ipcPath, _, tok1, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -112,12 +120,21 @@ func TestDaemonShutdownDisconnectsAllSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn() error: %v", err)
 	}
+	_, _, tok2, err2 := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	})
+	if err2 != nil {
+		t.Fatalf("Spawn() second error: %v", err2)
+	}
 
 	// Connect two IPC clients.
-	client1 := dialIPC(t, ipcPath)
+	client1 := dialIPC(t, ipcPath, tok1)
 	defer client1.conn.Close()
 
-	client2 := dialIPC(t, ipcPath)
+	client2 := dialIPC(t, ipcPath, tok2)
 	defer client2.conn.Close()
 
 	// Prime initialize on both sessions so the owner is fully initialised.
@@ -152,7 +169,7 @@ func TestDaemonShutdownDisconnectsAllSessions(t *testing.T) {
 func TestOwnerSurvivesSingleSessionDisconnect(t *testing.T) {
 	d := testDaemon(t)
 
-	ipcPath, sid, err := d.Spawn(control.Request{
+	ipcPath, sid, tok1, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -160,6 +177,15 @@ func TestOwnerSurvivesSingleSessionDisconnect(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Spawn() error: %v", err)
+	}
+	_, _, tok2, err2 := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	})
+	if err2 != nil {
+		t.Fatalf("Spawn() second error: %v", err2)
 	}
 
 	entry := d.Entry(sid)
@@ -182,8 +208,8 @@ func TestOwnerSurvivesSingleSessionDisconnect(t *testing.T) {
 	}
 
 	// Connect two clients.
-	client1 := dialIPC(t, ipcPath)
-	client2 := dialIPC(t, ipcPath)
+	client1 := dialIPC(t, ipcPath, tok1)
+	client2 := dialIPC(t, ipcPath, tok2)
 	defer client2.conn.Close()
 
 	waitSessionCount(2, 5*time.Second)
@@ -235,7 +261,7 @@ func TestDedup_SharedServersReusedAcrossCwd(t *testing.T) {
 	})
 
 	// First spawn — cwdA.
-	ipcPath1, sid1, err := d.Spawn(control.Request{
+	ipcPath1, sid1, probeTok, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", mockServer},
@@ -248,7 +274,7 @@ func TestDedup_SharedServersReusedAcrossCwd(t *testing.T) {
 
 	// Prime the owner: send initialize + tools/list so auto_classification is
 	// populated ("shared") before the second spawn's findSharedOwner check runs.
-	probe := dialIPC(t, ipcPath1)
+	probe := dialIPC(t, ipcPath1, probeTok)
 	daemonSendReq(t, probe, 1, "initialize",
 		`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}`)
 	daemonReadResp(t, probe)
@@ -258,7 +284,7 @@ func TestDedup_SharedServersReusedAcrossCwd(t *testing.T) {
 
 	// Second spawn — same command, different cwd (cwdB).
 	// findSharedOwner must find the first owner because its classification is not "isolated".
-	ipcPath2, sid2, err := d.Spawn(control.Request{
+	ipcPath2, sid2, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", mockServer},
@@ -291,7 +317,7 @@ func TestDedup_IsolatedServersNotShared(t *testing.T) {
 	// Use the absolute path to mock_server.go so the process can start from any cwd.
 	mockServer := testdataPath(t, "mock_server.go")
 
-	ipcPath1, sid1, err := d.Spawn(control.Request{
+	ipcPath1, sid1, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", mockServer},
@@ -301,7 +327,7 @@ func TestDedup_IsolatedServersNotShared(t *testing.T) {
 		t.Fatalf("Spawn() isolated-1 error: %v", err)
 	}
 
-	ipcPath2, sid2, err := d.Spawn(control.Request{
+	ipcPath2, sid2, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", mockServer},

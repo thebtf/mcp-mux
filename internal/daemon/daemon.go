@@ -4,6 +4,8 @@
 package daemon
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -95,10 +97,21 @@ func New(cfg Config) (*Daemon, error) {
 	return d, nil
 }
 
+// generateToken creates a 16-character hex handshake token (8 random bytes).
+func generateToken() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: use a deterministic but unique value.
+		return hex.EncodeToString([]byte(fmt.Sprintf("%016x", time.Now().UnixNano())))
+	}
+	return hex.EncodeToString(b)
+}
+
 // Spawn creates or returns an existing owner for the given server identity.
 // Deduplication: if a shared owner for the same command+args already exists
 // (from any cwd), it is reused — stateless servers don't need per-project copies.
-func (d *Daemon) Spawn(req control.Request) (string, string, error) {
+// Returns the IPC path, server ID, and a one-time handshake token for session binding.
+func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	mode := serverid.ModeCwd
 	switch req.Mode {
 	case "global":
@@ -109,6 +122,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 		mode = serverid.ModeCwd
 	}
 
+	// Generate handshake token upfront — valid for this spawn call only.
+	token := generateToken()
+
 	// Server identity is based on command+args+cwd only, NOT env.
 	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
 
@@ -118,8 +134,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	if entry, ok := d.owners[sid]; ok {
 		entry.LastSession = time.Now()
 		d.mu.Unlock()
+		entry.Owner.SessionMgr().PreRegister(token, req.Cwd)
 		d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
-		return entry.Owner.IPCPath(), sid, nil
+		return entry.Owner.IPCPath(), sid, token, nil
 	}
 
 	// 2. Global dedup: if a shared owner for same command+args exists (any cwd), reuse it.
@@ -133,8 +150,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 			if req.Cwd != "" {
 				existing.Owner.AddCwd(req.Cwd)
 			}
+			existing.Owner.SessionMgr().PreRegister(token, req.Cwd)
 			d.logger.Printf("dedup: reusing shared owner %s for %s (added cwd: %s)", existingSID[:8], req.Command, req.Cwd)
-			return existing.Owner.IPCPath(), existingSID, nil
+			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
 	}
 
@@ -149,13 +167,14 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	controlPath := serverid.ControlPath(sid)
 
 	owner, err := mux.NewOwner(mux.OwnerConfig{
-		Command:     req.Command,
-		Args:        req.Args,
-		Env:         envDiff,
-		Cwd:         req.Cwd,
-		IPCPath:     ipcPath,
-		ControlPath: controlPath,
-		ServerID:    sid,
+		Command:        req.Command,
+		Args:           req.Args,
+		Env:            envDiff,
+		Cwd:            req.Cwd,
+		IPCPath:        ipcPath,
+		ControlPath:    controlPath,
+		ServerID:       sid,
+		TokenHandshake: true, // daemon-managed owners: shims send a handshake token
 		OnZeroSessions: func(serverID string) {
 			d.onZeroSessions(serverID)
 		},
@@ -168,7 +187,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
+		return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
 	}
 
 	entry := &OwnerEntry{
@@ -187,8 +206,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 	d.owners[sid] = entry
 	d.mu.Unlock()
 
+	owner.SessionMgr().PreRegister(token, req.Cwd)
 	d.logger.Printf("spawned owner %s for %s %v", sid[:8], req.Command, req.Args)
-	return ipcPath, sid, nil
+	return ipcPath, sid, token, nil
 }
 
 // Remove shuts down and removes an owner by server ID.
@@ -208,7 +228,7 @@ func (d *Daemon) Remove(serverID string) error {
 }
 
 // HandleSpawn implements control.DaemonHandler.
-func (d *Daemon) HandleSpawn(req control.Request) (string, string, error) {
+func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error) {
 	return d.Spawn(req)
 }
 
