@@ -292,6 +292,8 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 			"description": "List all running mcp-mux managed MCP server instances. " +
 				"Returns compact summary by default: server name, sessions, classification, version. " +
 				"Set verbose=true for full details (PID, IPC path, cache status, classification reason). " +
+				"By default shows only servers belonging to this CC session's project. " +
+				"Set all=true to see servers from all projects/sessions. " +
 				"Use server_id or name from the output to target mux_stop or mux_restart.",
 			"inputSchema": map[string]any{
 				"type": "object",
@@ -299,6 +301,11 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 					"verbose": map[string]any{
 						"type":        "boolean",
 						"description": "Return full status details for each server (default: compact summary).",
+						"default":     false,
+					},
+					"all": map[string]any{
+						"type":        "boolean",
+						"description": "Show servers from all projects/sessions, not just this one (default: false).",
 						"default":     false,
 					},
 				},
@@ -385,13 +392,20 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 }
 
 // toolMuxList scans all .ctl.sock files and queries status from each.
+// By default filters to servers belonging to this CC session's project (by cwd).
+// Set all=true to see all servers across all projects.
 func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	var params struct {
 		Verbose bool `json:"verbose"`
+		All     bool `json:"all"`
 	}
 	if args != nil {
 		_ = json.Unmarshal(args, &params)
 	}
+
+	// Determine this session's cwd for filtering
+	myCwd, _ := os.Getwd()
+	myCwd = strings.ToLower(filepath.Clean(myCwd))
 
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
@@ -419,6 +433,13 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 		if resp.OK && resp.Data != nil {
 			var data map[string]any
 			if err := json.Unmarshal(resp.Data, &data); err == nil {
+				// Filter by cwd unless all=true
+				if !params.All && myCwd != "" {
+					if !s.ownerHasCwd(data, myCwd) {
+						continue
+					}
+				}
+
 				if params.Verbose {
 					data["server_id"] = serverID
 					servers = append(servers, data)
@@ -441,6 +462,27 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 
 	result, _ := json.MarshalIndent(servers, "", "  ")
 	s.sendToolResult(id, string(result))
+}
+
+// ownerHasCwd checks if an owner's status data contains a given cwd in its cwdSet or primary cwd.
+func (s *Server) ownerHasCwd(data map[string]any, cwd string) bool {
+	// Check primary cwd
+	if primary, ok := data["cwd"].(string); ok {
+		if strings.ToLower(filepath.Clean(primary)) == cwd {
+			return true
+		}
+	}
+	// Check cwdSet (array of strings in status response)
+	if cwdSet, ok := data["cwd_set"].([]any); ok {
+		for _, c := range cwdSet {
+			if cs, ok := c.(string); ok {
+				if strings.ToLower(filepath.Clean(cs)) == cwd {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // toolMuxStop stops a specific server.
@@ -572,7 +614,8 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 
 // resolveServerID returns a server ID from either an explicit ID or a name substring match.
 // If name is provided, scans all running instances and matches against command+args (case-insensitive).
-// Fails if neither is provided, or if name matches zero or multiple servers.
+// Prefers servers belonging to this CC session's project (by cwd).
+// Fails if neither is provided, or if name matches zero or multiple servers after cwd filtering.
 func (s *Server) resolveServerID(serverID, name string) (string, error) {
 	if serverID != "" {
 		return serverID, nil
@@ -581,6 +624,8 @@ func (s *Server) resolveServerID(serverID, name string) (string, error) {
 		return "", fmt.Errorf("provide either server_id or name")
 	}
 
+	myCwd, _ := os.Getwd()
+	myCwd = strings.ToLower(filepath.Clean(myCwd))
 	name = strings.ToLower(name)
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
@@ -588,7 +633,11 @@ func (s *Server) resolveServerID(serverID, name string) (string, error) {
 		return "", fmt.Errorf("read temp dir: %v", err)
 	}
 
-	var matches []string
+	type candidate struct {
+		sid    string
+		hasCwd bool // true if this server belongs to our cwd
+	}
+	var candidates []candidate
 	for _, entry := range entries {
 		fname := entry.Name()
 		if !strings.HasPrefix(fname, "mcp-mux-") || !strings.HasSuffix(fname, ".ctl.sock") {
@@ -603,29 +652,57 @@ func (s *Server) resolveServerID(serverID, name string) (string, error) {
 			continue
 		}
 
-		var status struct {
-			Command string   `json:"command"`
-			Args    []string `json:"args"`
-		}
-		if err := json.Unmarshal(resp.Data, &status); err != nil {
+		var data map[string]any
+		if err := json.Unmarshal(resp.Data, &data); err != nil {
 			continue
 		}
 
 		// Match against command + args concatenated
-		haystack := strings.ToLower(status.Command + " " + strings.Join(status.Args, " "))
+		cmd, _ := data["command"].(string)
+		var args []string
+		if rawArgs, ok := data["args"].([]any); ok {
+			for _, a := range rawArgs {
+				if as, ok := a.(string); ok {
+					args = append(args, as)
+				}
+			}
+		}
+		haystack := strings.ToLower(cmd + " " + strings.Join(args, " "))
 		if strings.Contains(haystack, name) {
-			matches = append(matches, sid)
+			candidates = append(candidates, candidate{
+				sid:    sid,
+				hasCwd: s.ownerHasCwd(data, myCwd),
+			})
 		}
 	}
 
-	switch len(matches) {
-	case 0:
+	if len(candidates) == 0 {
 		return "", fmt.Errorf("no server matching '%s' found", name)
-	case 1:
-		return matches[0], nil
-	default:
-		return "", fmt.Errorf("'%s' matches %d servers — be more specific or use server_id", name, len(matches))
 	}
+
+	// Prefer servers belonging to this session's cwd
+	var myCwdMatches []string
+	var allMatches []string
+	for _, c := range candidates {
+		allMatches = append(allMatches, c.sid)
+		if c.hasCwd {
+			myCwdMatches = append(myCwdMatches, c.sid)
+		}
+	}
+
+	// If exactly one match in our cwd — use it (even if there are others)
+	if len(myCwdMatches) == 1 {
+		return myCwdMatches[0], nil
+	}
+	// If multiple in our cwd — still ambiguous
+	if len(myCwdMatches) > 1 {
+		return "", fmt.Errorf("'%s' matches %d servers in this project — use server_id", name, len(myCwdMatches))
+	}
+	// No cwd match — fall back to all matches
+	if len(allMatches) == 1 {
+		return allMatches[0], nil
+	}
+	return "", fmt.Errorf("'%s' matches %d servers (none in this project) — be more specific or use server_id", name, len(allMatches))
 }
 
 // --- JSON-RPC response helpers ---
