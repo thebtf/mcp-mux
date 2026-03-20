@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -224,10 +225,11 @@ func (o *Owner) SessionMgr() *SessionManager {
 // readToken reads the handshake token sent by the shim immediately after connecting.
 // The token is a hex string terminated by '\n'. Uses byte-by-byte reading to avoid
 // consuming subsequent MCP messages that immediately follow the token line.
-// Returns an empty string on timeout or read error — callers treat that as no-token.
-func readToken(conn net.Conn) string {
+// Returns (token, conn) where conn may be wrapped with io.MultiReader if the first
+// bytes were not a token (backward compat with old shims that send MCP directly).
+func readToken(conn net.Conn) (string, io.Reader) {
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return ""
+		return "", conn
 	}
 	defer conn.SetReadDeadline(time.Time{}) // clear deadline after read
 
@@ -236,17 +238,31 @@ func readToken(conn net.Conn) string {
 	for {
 		_, err := conn.Read(one)
 		if err != nil {
-			return ""
+			// Timeout or error — return whatever we read prepended back
+			if len(buf) > 0 {
+				return "", io.MultiReader(bytes.NewReader(buf), conn)
+			}
+			return "", conn
 		}
 		if one[0] == '\n' {
 			break
 		}
+		// First byte check: hex tokens are [0-9a-f]. If first byte is '{' or '[',
+		// this is an MCP message from an old shim — prepend and return.
+		if len(buf) == 0 && !isHexChar(one[0]) {
+			return "", io.MultiReader(bytes.NewReader(one), conn)
+		}
 		buf = append(buf, one[0])
 		if len(buf) > 64 { // tokens are 16 hex chars; >64 means something is wrong
-			return ""
+			return "", io.MultiReader(bytes.NewReader(buf), conn)
 		}
 	}
-	return string(buf)
+	return string(buf), conn
+}
+
+// isHexChar returns true if b is a valid hex character [0-9a-f].
+func isHexChar(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f')
 }
 
 // AddSession registers a new downstream session and starts routing its messages.
@@ -714,10 +730,17 @@ func (o *Owner) acceptLoop() {
 		}
 
 		var token string
+		var reader io.Reader = conn
 		if o.tokenHandshake {
-			token = readToken(conn)
+			token, reader = readToken(conn)
 		}
-		s := NewSession(conn, conn)
+		// reader may be io.MultiReader if readToken prepended unconsumed bytes.
+		// conn is always the writer and closer.
+		s := NewSession(reader, conn)
+		if s.closer == nil {
+			// io.MultiReader doesn't implement io.Closer — set closer to conn explicitly
+			s.closer = conn
+		}
 		if token != "" {
 			o.sessionMgr.Bind(token, s) // sets s.Cwd from pre-registered token
 		}
