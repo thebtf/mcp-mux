@@ -245,6 +245,7 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
+	o.logger.Printf("[TRACE] session %d → owner: type=%s method=%s id=%s (%d bytes)", s.ID, msg.Type, msg.Method, string(msg.ID), len(msg.Raw))
 	switch {
 	case msg.IsNotification():
 		// Suppress notifications/initialized for sessions that received a cached initialize response
@@ -325,7 +326,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 	case msg.IsResponse():
 		// Client is responding to a server→client request (e.g., sampling/createMessage).
 		// Forward as-is — the ID belongs to the upstream's request, no remapping needed.
-		o.logger.Printf("session %d: forwarding client response to upstream (id=%s)", s.ID, string(msg.ID))
+		o.logger.Printf("[TRACE] session %d: forwarding client response to upstream (id=%s, %d bytes)", s.ID, string(msg.ID), len(msg.Raw))
 		return o.upstream.WriteLine(msg.Raw)
 
 	default:
@@ -359,6 +360,7 @@ func (o *Owner) readUpstream() {
 // handleUpstreamMessage routes a message from the upstream to the correct session.
 // It also intercepts server→client requests like roots/list.
 func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
+	o.logger.Printf("[TRACE] upstream → owner: type=%s method=%s id=%s (%d bytes)", msg.Type, msg.Method, string(msg.ID), len(msg.Raw))
 	if msg.IsNotification() {
 		// Route progress notifications to owning session instead of broadcast
 		if msg.Method == "notifications/progress" {
@@ -405,21 +407,28 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	o.mu.RUnlock()
 
 	if !ok {
-		o.logger.Printf("session %d not found for response (may have disconnected)", result.SessionID)
+		o.logger.Printf("[TRACE] owner → session %d: NOT FOUND (disconnected?)", result.SessionID)
 		return nil
 	}
 
+	o.logger.Printf("[TRACE] owner → session %d: response (%d bytes)", result.SessionID, len(restored))
 	return session.WriteRaw(restored)
 }
 
 // handleUpstreamRequest handles server→client requests from the upstream.
-// The most important one is roots/list — the server asks what filesystem
-// boundaries are available. We respond with the owner's cwd as a file:// URI.
+// Most requests (roots/list, sampling, elicitation) are forwarded to the active
+// session — CC itself responds with correct per-session data.
 func (o *Owner) handleUpstreamRequest(msg *jsonrpc.Message) error {
 	switch msg.Method {
 	case "roots/list":
-		o.logger.Printf("upstream requested roots/list, responding with cwd: %s", o.cwd)
-		return o.respondToRootsList(msg.ID)
+		// Forward to the active session — CC knows its own roots.
+		// Falls back to local respondToRootsList if no active session.
+		o.logger.Printf("[TRACE] roots/list received from upstream, forwarding to active session")
+		err := o.routeToLastActiveSession(msg)
+		if err != nil {
+			o.logger.Printf("[TRACE] roots/list forward error: %v", err)
+		}
+		return err
 	case "ping":
 		// Respond locally with empty result — no client involvement needed
 		o.logger.Printf("upstream sent ping, responding locally")
@@ -431,7 +440,8 @@ func (o *Owner) handleUpstreamRequest(msg *jsonrpc.Message) error {
 }
 
 // respondToRootsList sends a roots/list response to the upstream with ALL known cwds.
-// With dedup, multiple projects may share one owner — each project's cwd is a root.
+// Used as fallback when no active session can handle roots/list directly.
+// In normal operation, roots/list is forwarded to the active session (CC answers).
 func (o *Owner) respondToRootsList(id json.RawMessage) error {
 	type rootEntry struct {
 		URI  string `json:"uri"`
@@ -488,15 +498,27 @@ func (o *Owner) routeToLastActiveSession(msg *jsonrpc.Message) error {
 	o.mu.RUnlock()
 
 	if !ok {
-		o.logger.Printf("no active session for server request %s, returning error", msg.Method)
-		if msg.Method == "elicitation/create" {
+		o.logger.Printf("no active session for server request %s", msg.Method)
+		switch msg.Method {
+		case "roots/list":
+			// Fallback: answer locally from cwdSet when no session can handle it
+			o.logger.Printf("roots/list fallback: responding locally with cwdSet")
+			return o.respondToRootsList(msg.ID)
+		case "elicitation/create":
 			return o.respondToElicitationCancel(msg.ID)
+		default:
+			return o.respondWithError(msg.ID, -32603, "no active session available")
 		}
-		return o.respondWithError(msg.ID, -32603, "no active session available")
 	}
 
-	o.logger.Printf("routing server request %s to session %d", msg.Method, sessionID)
-	return session.WriteRaw(msg.Raw)
+	o.logger.Printf("[TRACE] routing server request %s (id=%s) to session %d", msg.Method, string(msg.ID), sessionID)
+	err := session.WriteRaw(msg.Raw)
+	if err != nil {
+		o.logger.Printf("[TRACE] routing %s to session %d failed: %v", msg.Method, sessionID, err)
+	} else {
+		o.logger.Printf("[TRACE] routing %s to session %d succeeded, waiting for response", msg.Method, sessionID)
+	}
+	return err
 }
 
 // respondToElicitationCancel sends an elicitation cancel response to upstream.
@@ -821,12 +843,22 @@ func (o *Owner) Status() map[string]any {
 	hasCachedResources := o.resourceList != nil
 	o.mu.RUnlock()
 
+	// Collect cwdSet for status
+	o.mu.RLock()
+	cwds := make([]string, 0, len(o.cwdSet))
+	for c := range o.cwdSet {
+		cwds = append(cwds, c)
+	}
+	o.mu.RUnlock()
+
 	status := map[string]any{
 		"mux_version":      Version,
 		"upstream_pid":      o.upstream.PID(),
 		"ipc_path":          o.ipcPath,
 		"command":           o.command,
 		"args":              o.args,
+		"cwd":               o.cwd,
+		"cwd_set":           cwds,
 		"sessions":          sessionIDs,
 		"session_count":     len(sessionIDs),
 		"pending_requests":  o.pendingRequests.Load(),
@@ -871,6 +903,7 @@ func (o *Owner) getCachedResponse(method string) []byte {
 
 // replayFromCache sends a cached response to the session with the client's request ID.
 func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte) error {
+	o.logger.Printf("[TRACE] cache → session %d: replaying %s (%d bytes)", s.ID, msg.Method, len(cached))
 	replaced, err := jsonrpc.ReplaceID(cached, msg.ID)
 	if err != nil {
 		return fmt.Errorf("replay %s: replace id: %w", msg.Method, err)
