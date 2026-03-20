@@ -205,6 +205,35 @@ During reconnect, the shim:
 
 Reconnect timeout: 30 seconds. If reconnect fails, the shim exits and CC restarts it.
 
+## Session Transport Layer
+
+mcp-mux v0.4.0 introduces a session transport layer that replaces the old `lastActiveSessionID`
+heuristic with deterministic, per-session routing.
+
+### Token handshake
+
+When CC spawns a shim, the daemon generates a cryptographic token tied to that spawn's working
+directory. The shim sends this token as the first line on the IPC connection:
+
+```
+CC → shim → [token\n] → Owner (SessionManager) → upstream
+```
+
+The Owner reads the token, looks up the corresponding `Session.Cwd`, and binds the IPC connection
+to that session. From this point the session identity is authoritative — no heuristics required.
+
+### Deterministic callback routing
+
+The `SessionManager` tracks inflight requests per session. When exactly one session has pending
+requests outstanding, response routing is deterministic without needing to inspect message content.
+This eliminates spurious mis-routing in high-concurrency scenarios.
+
+### roots/list forwarding
+
+`roots/list` requests from the upstream are forwarded to the active CC session (the one with
+pending requests), so the server receives the real workspace roots for that session rather than a
+static fallback.
+
 ## Commands
 
 ```sh
@@ -275,9 +304,22 @@ any other server:
 
 | Tool | Description |
 |------|-------------|
-| `mux_list` | Returns all running instances with server ID, PID, session count, pending requests, classification, and cache status. |
+| `mux_list` | Returns running instances for the **current project** (filtered by caller's cwd). Pass `all: true` to list instances across all projects. Includes server ID, PID, session count, pending requests, classification, and cache status. |
 | `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. |
-| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. Connected sessions reconnect automatically on their next tool call. |
+| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux, not another project's). Connected sessions reconnect automatically on their next tool call. |
+
+**Session-scoped control plane:**
+
+The control plane is session-aware. Each tool call is resolved in the context of the calling
+session's working directory:
+
+- `mux_list` — shows only servers owned by the current project by default.
+  Use `mux_list(all: true)` for a full view across all projects.
+- `mux_restart(name: "aimux")` — resolves to the aimux instance started from this project's
+  directory, not a same-named server from a different project.
+
+This prevents accidental cross-project interference when multiple projects use the same server
+name.
 
 **Prompts:**
 
