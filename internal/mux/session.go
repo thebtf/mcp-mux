@@ -21,6 +21,7 @@ var sessionCounter atomic.Int32
 type Session struct {
 	ID           int
 	MuxSessionID string // unique session identifier for _meta injection (e.g., "sess_a1b2c3d4")
+	Cwd          string // working directory bound via token handshake
 	reader       *jsonrpc.Scanner
 	writer       io.Writer
 	closer       io.Closer // underlying connection (net.Conn for IPC sessions, nil for stdio)
