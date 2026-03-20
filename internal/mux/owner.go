@@ -56,7 +56,8 @@ func initVersion() string {
 type Owner struct {
 	upstream *upstream.Process
 	ipcPath  string
-	cwd      string   // working directory for this owner instance
+	cwd      string   // primary working directory (from first spawn)
+	cwdSet   map[string]bool // all known cwds (for multi-project roots/list)
 	command  string   // upstream command (for status/restart)
 	args     []string // upstream args (for status/restart)
 	serverID string   // server identity hash
@@ -157,6 +158,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		upstream:       proc,
 		ipcPath:        cfg.IPCPath,
 		cwd:            cfg.Cwd,
+		cwdSet:         map[string]bool{cfg.Cwd: true},
 		command:        cfg.Command,
 		args:           cfg.Args,
 		serverID:       cfg.ServerID,
@@ -428,35 +430,40 @@ func (o *Owner) handleUpstreamRequest(msg *jsonrpc.Message) error {
 	}
 }
 
-// respondToRootsList sends a roots/list response to the upstream with the owner's cwd.
+// respondToRootsList sends a roots/list response to the upstream with ALL known cwds.
+// With dedup, multiple projects may share one owner — each project's cwd is a root.
 func (o *Owner) respondToRootsList(id json.RawMessage) error {
-	cwd := o.cwd
-	if cwd == "" {
-		cwd, _ = os.Getwd()
+	type rootEntry struct {
+		URI  string `json:"uri"`
+		Name string `json:"name,omitempty"`
 	}
 
-	// Convert to file:// URI
-	uri := pathToFileURI(cwd)
+	o.mu.RLock()
+	var roots []rootEntry
+	for cwd := range o.cwdSet {
+		if cwd != "" {
+			roots = append(roots, rootEntry{URI: pathToFileURI(cwd), Name: filepath.Base(cwd)})
+		}
+	}
+	o.mu.RUnlock()
+
+	// Fallback if no cwds registered
+	if len(roots) == 0 {
+		fallback, _ := os.Getwd()
+		roots = []rootEntry{{URI: pathToFileURI(fallback), Name: filepath.Base(fallback)}}
+	}
 
 	resp := struct {
 		JSONRPC string          `json:"jsonrpc"`
 		ID      json.RawMessage `json:"id"`
 		Result  struct {
-			Roots []struct {
-				URI  string `json:"uri"`
-				Name string `json:"name,omitempty"`
-			} `json:"roots"`
+			Roots []rootEntry `json:"roots"`
 		} `json:"result"`
 	}{
 		JSONRPC: "2.0",
 		ID:      id,
 	}
-	resp.Result.Roots = []struct {
-		URI  string `json:"uri"`
-		Name string `json:"name,omitempty"`
-	}{
-		{URI: uri, Name: filepath.Base(cwd)},
-	}
+	resp.Result.Roots = roots
 
 	data, err := json.Marshal(resp)
 	if err != nil {
@@ -760,6 +767,20 @@ func (o *Owner) ServerID() string {
 // IPCPath returns the IPC socket path for this owner.
 func (o *Owner) IPCPath() string {
 	return o.ipcPath
+}
+
+// AddCwd registers an additional project cwd for this owner.
+// Used by dedup: when a second project reuses a shared owner,
+// its cwd is added so roots/list includes all project roots.
+func (o *Owner) AddCwd(cwd string) {
+	o.mu.Lock()
+	if !o.cwdSet[cwd] {
+		o.cwdSet[cwd] = true
+		o.logger.Printf("added cwd: %s (now %d roots)", cwd, len(o.cwdSet))
+	}
+	o.mu.Unlock()
+	// Notify upstream that roots changed
+	o.sendRootsListChanged()
 }
 
 // Command returns the upstream command.

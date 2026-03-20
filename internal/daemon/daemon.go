@@ -129,7 +129,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, error) {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
 			d.mu.Unlock()
-			d.logger.Printf("dedup: reusing shared owner %s for %s (different cwd)", existingSID[:8], req.Command)
+			// Register this project's cwd so roots/list includes it
+			if req.Cwd != "" {
+				existing.Owner.AddCwd(req.Cwd)
+			}
+			d.logger.Printf("dedup: reusing shared owner %s for %s (added cwd: %s)", existingSID[:8], req.Command, req.Cwd)
 			return existing.Owner.IPCPath(), existingSID, nil
 		}
 	}
