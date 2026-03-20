@@ -841,14 +841,11 @@ func (o *Owner) Status() map[string]any {
 	hasCachedTools := o.toolList != nil
 	hasCachedPrompts := o.promptList != nil
 	hasCachedResources := o.resourceList != nil
-	o.mu.RUnlock()
-
-	// Collect cwdSet for status
-	o.mu.RLock()
 	cwds := make([]string, 0, len(o.cwdSet))
 	for c := range o.cwdSet {
 		cwds = append(cwds, c)
 	}
+	primaryCwd := o.cwd
 	o.mu.RUnlock()
 
 	status := map[string]any{
@@ -857,7 +854,7 @@ func (o *Owner) Status() map[string]any {
 		"ipc_path":          o.ipcPath,
 		"command":           o.command,
 		"args":              o.args,
-		"cwd":               o.cwd,
+		"cwd":               primaryCwd,
 		"cwd_set":           cwds,
 		"sessions":          sessionIDs,
 		"session_count":     len(sessionIDs),

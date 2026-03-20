@@ -658,7 +658,11 @@ func (s *Server) resolveServerID(serverID, name string) (string, error) {
 		}
 
 		// Match against command + args concatenated
-		cmd, _ := data["command"].(string)
+		cmd, ok := data["command"].(string)
+		if !ok {
+			s.logger.Printf("server %s status has invalid 'command' field, skipping", sid)
+			continue
+		}
 		var args []string
 		if rawArgs, ok := data["args"].([]any); ok {
 			for _, a := range rawArgs {
