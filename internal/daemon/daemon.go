@@ -257,22 +257,23 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 	d.mu.Unlock()
 }
 
-// findReusableOwner searches for an existing owner with the same command+args
-// that can be shared (classified as shared or session-aware, not isolated).
+// findSharedOwner searches for an existing owner with the same command+args
+// that is classified as shared (stateless — no per-session state).
+// Session-aware and isolated servers are NOT deduped: they need per-cwd owners
+// because upstream uses roots/list to determine the working directory.
 // Must be called with d.mu held.
 func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
 	for _, entry := range d.owners {
 		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
 		if candidate == needle {
-			// Reuse if shared or session-aware (both can multiplex).
-			// Only isolated servers require per-cwd copies.
 			status := entry.Owner.Status()
 			classification, _ := status["auto_classification"].(string)
-			if classification == "isolated" {
-				continue
+			// Only truly stateless (shared) servers can be deduped across cwds.
+			// Session-aware servers need per-cwd roots for correct upstream behavior.
+			if classification == "" || classification == "shared" {
+				return entry
 			}
-			return entry
 		}
 	}
 	return nil
