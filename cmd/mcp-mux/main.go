@@ -19,6 +19,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -153,14 +154,19 @@ func main() {
 					}
 					return spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 				}
-				if err := mux.RunResilientClient(mux.ResilientClientConfig{
+				err := mux.RunResilientClient(mux.ResilientClientConfig{
 					Stdin:          os.Stdin,
 					Stdout:         os.Stdout,
 					InitialIPCPath: daemonIPC,
 					Token:          daemonToken,
 					Reconnect:      reconnectFn,
 					Logger:         logger,
-				}); err != nil {
+				})
+				if err != nil {
+					if errors.Is(err, mux.ErrReconnectExit) {
+						logger.Printf("daemon restarted, exiting for CC to restart shim")
+						os.Exit(0)
+					}
 					logger.Printf("client error: %v", err)
 					os.Exit(1)
 				}

@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -55,6 +56,12 @@ type resilientClient struct {
 	initCache  initCache
 	log        *log.Logger
 }
+
+// ErrReconnectExit is returned by reconnect when the shim should exit
+// so CC restarts it with a fresh MCP handshake.
+// ErrReconnectExit is returned when the shim should exit after successful reconnect
+// so CC restarts it with a fresh MCP handshake.
+var ErrReconnectExit = errors.New("reconnect: exit for fresh handshake")
 
 // RunResilientClient proxies CC stdio ↔ IPC with automatic reconnect on IPC failure.
 //
@@ -370,14 +377,14 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				continue
 			}
 
-			// Flush buffered CC messages.
-			rc.flushBuffer(conn)
-
-			// Notify CC that upstream capabilities may have changed after reconnect.
-			// Without these, CC keeps stale tools/prompts/resources lists.
-			rc.sendListChangedNotifications(stdoutMu)
-
-			return conn, nil
+			// Reconnect successful — new daemon is ready with warm cache.
+			// Return ErrReconnectExit so runProxy exits cleanly.
+			// CC does not re-handshake after transparent reconnect (no tools/list,
+			// no prompts/list), leaving the MCP session in a broken state.
+			// Clean exit forces CC to spawn a new shim process with full handshake.
+			conn.Close()
+			rc.log.Printf("resilient: reconnected to daemon, exiting for CC to restart with fresh handshake")
+			return nil, ErrReconnectExit
 		}
 	}
 }
