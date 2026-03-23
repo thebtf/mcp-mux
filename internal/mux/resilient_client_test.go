@@ -141,14 +141,15 @@ func newTestIPCPath(t *testing.T) string {
 }
 
 // TestResilientClient_ReconnectAfterIPCClose verifies that when the initial IPC
-// connection is closed (simulating daemon restart), the client calls ReconnectFunc
-// and then returns ErrReconnectExit so the shim can restart with a fresh handshake.
+// connection is closed (simulating daemon restart), the client calls ReconnectFunc,
+// reconnects transparently, and resumes proxying — RunResilientClient does NOT exit
+// until CC stdin closes.
 func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 	path1 := newTestIPCPath(t)
 	path2 := newTestIPCPath(t)
 
 	srv1, recv1 := startEchoIPCServer(t, path1)
-	_, _ = startEchoIPCServer(t, path2)
+	_, recv2 := startEchoIPCServer(t, path2)
 
 	// Set up CC stdin/stdout pipes.
 	ccStdinR, ccStdinW := io.Pipe()
@@ -178,7 +179,8 @@ func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 		errCh <- RunResilientClient(cfg)
 	}()
 
-	// Drain CC stdout so the client does not block writing keepalives.
+	// Drain CC stdout (keepalives and list_changed notifications) so the client
+	// does not block on writes.
 	go func() {
 		io.Copy(io.Discard, ccStdoutR)
 	}()
@@ -204,30 +206,63 @@ func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 		t.Fatal("timeout: ReconnectFunc was not called")
 	}
 
-	// Step 4: after successful reconnect, RunResilientClient must return ErrReconnectExit
-	// so the shim process can exit and let CC restart it with a fresh MCP handshake.
+	// Step 4: RunResilientClient must NOT have exited yet — proxy resumes after reconnect.
 	select {
 	case err := <-errCh:
-		if err != ErrReconnectExit {
-			t.Errorf("expected ErrReconnectExit, got: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout: RunResilientClient did not exit after reconnect")
+		t.Fatalf("RunResilientClient exited prematurely after reconnect: %v", err)
+	default:
+		// Good — still running.
 	}
 
+	// Step 5: send a message after reconnect and verify server 2 receives it.
+	// (server 2 will also receive the replayed initialize from replayInit)
+	ping := `{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}`
+	fmt.Fprintf(ccStdinW, "%s\n", ping)
+
+	// Drain recv2 until we see the ping (skip initialize replay).
+	timeout := time.After(5 * time.Second)
+	gotPing := false
+	for !gotPing {
+		select {
+		case line := <-recv2:
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			if method, ok := msg["method"]; ok {
+				m := strings.Trim(string(method), `"`)
+				if m == "ping" {
+					gotPing = true
+				}
+			}
+		case <-timeout:
+			t.Fatal("timeout: server 2 did not receive ping after reconnect")
+		}
+	}
+
+	// Step 6: close CC stdin — RunResilientClient should return nil.
 	ccStdinW.Close()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("expected nil on stdin close, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: RunResilientClient did not exit after CC stdin close")
+	}
 }
 
-// TestResilientClient_BufferDuringReconnect verifies that when messages arrive
-// during the RECONNECTING state, RunResilientClient still returns ErrReconnectExit
-// after a successful reconnect (buffer flush no longer happens — the shim exits
-// so CC can restart it with a fresh MCP handshake).
+// TestResilientClient_BufferDuringReconnect verifies that messages sent during
+// the RECONNECTING state are buffered and flushed to the new IPC server after
+// reconnect succeeds. RunResilientClient continues proxying (does not exit) until
+// CC stdin closes.
 func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 	path1 := newTestIPCPath(t)
 	path2 := newTestIPCPath(t)
 
 	srv1, _ := startEchoIPCServer(t, path1)
-	_, _ = startEchoIPCServer(t, path2)
+	_, recv2 := startEchoIPCServer(t, path2)
 
 	ccStdinR, ccStdinW := io.Pipe()
 	ccStdoutR, ccStdoutW := io.Pipe()
@@ -254,18 +289,17 @@ func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 		errCh <- RunResilientClient(cfg)
 	}()
 
-	// Drain CC stdout to prevent blocking.
+	// Drain CC stdout (keepalives and list_changed notifications) to prevent blocking.
 	go func() {
 		io.Copy(io.Discard, ccStdoutR)
 	}()
 
-	// Step 1: close first server immediately to trigger RECONNECTING state.
-	// Give the client a moment to connect.
+	// Step 1: close first server to trigger RECONNECTING state.
+	// Give the client a moment to connect first.
 	time.Sleep(200 * time.Millisecond)
 	srv1.closeAll()
 
-	// Step 2: wait briefly then send 3 messages during RECONNECTING — they may be buffered
-	// but will not be forwarded since the process exits with ErrReconnectExit.
+	// Step 2: wait briefly then send 3 messages during RECONNECTING — they are buffered.
 	time.Sleep(100 * time.Millisecond)
 
 	msgs := []string{
@@ -277,17 +311,52 @@ func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 		fmt.Fprintf(ccStdinW, "%s\n", m)
 	}
 
-	// Step 3: after reconnect succeeds, RunResilientClient must return ErrReconnectExit.
+	// Step 3: after reconnect succeeds, RunResilientClient must NOT exit —
+	// verify server 2 received all 3 buffered messages.
+	// No initialize was sent, so replayInit is a no-op; only the 3 pings arrive.
+	timeout := time.After(5 * time.Second)
+	receivedIDs := make(map[float64]bool)
+	for len(receivedIDs) < 3 {
+		select {
+		case line := <-recv2:
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			idRaw, ok := msg["id"]
+			if !ok {
+				continue
+			}
+			var id float64
+			if err := json.Unmarshal(idRaw, &id); err != nil {
+				continue
+			}
+			receivedIDs[id] = true
+		case <-timeout:
+			t.Fatalf("timeout: server 2 only received %d of 3 buffered messages", len(receivedIDs))
+		}
+	}
+	t.Logf("server 2 received buffered message IDs: %v", receivedIDs)
+
+	// Step 4: RunResilientClient must NOT have exited — proxy is still running.
 	select {
 	case err := <-errCh:
-		if err != ErrReconnectExit {
-			t.Errorf("expected ErrReconnectExit, got: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("timeout: RunResilientClient did not exit after reconnect")
+		t.Fatalf("RunResilientClient exited prematurely after reconnect: %v", err)
+	default:
+		// Good — still running.
 	}
 
+	// Step 5: close CC stdin — RunResilientClient should return nil.
 	ccStdinW.Close()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("expected nil on stdin close, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: RunResilientClient did not exit after CC stdin close")
+	}
 }
 
 // TestResilientClient_TimeoutExits verifies that RunResilientClient returns an
