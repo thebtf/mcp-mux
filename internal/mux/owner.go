@@ -87,6 +87,7 @@ type Owner struct {
 	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
 	progressOwners   map[string]int // progressToken → session ID for targeted routing
 
+	upstreamDead    atomic.Bool // set when upstream exits; prevents sending to dead pipe
 	methodTags      sync.Map // remapped request ID (string) -> method name
 	pendingRequests atomic.Int64
 	startTime       time.Time
@@ -325,6 +326,12 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		return o.upstream.WriteLine(msg.Raw)
 
 	case msg.IsRequest():
+		// Fail fast if upstream is dead — don't send requests to a dead pipe
+		if o.upstreamDead.Load() {
+			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
+			return s.WriteRaw([]byte(errResp))
+		}
+
 		// Replay from cache if available (avoids upstream round-trip)
 		if cached := o.getCachedResponse(msg.Method); cached != nil {
 			// For initialize: verify protocolVersion matches before replaying
@@ -393,6 +400,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 
 // readUpstream reads responses from the upstream and routes them to the correct session.
 func (o *Owner) readUpstream() {
+	defer o.upstreamDead.Store(true) // mark dead so new requests fail fast
 	for {
 		line, err := o.upstream.ReadLine()
 		if err != nil {
