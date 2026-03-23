@@ -373,6 +373,10 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 			// Flush buffered CC messages.
 			rc.flushBuffer(conn)
 
+			// Notify CC that upstream capabilities may have changed after reconnect.
+			// Without these, CC keeps stale tools/prompts/resources lists.
+			rc.sendListChangedNotifications(stdoutMu)
+
 			return conn, nil
 		}
 	}
@@ -421,6 +425,26 @@ func (rc *resilientClient) replayInit(conn interface {
 	}
 	rc.log.Printf("resilient: discarded init replay response (%d bytes)", len(buf))
 	return nil
+}
+
+// sendListChangedNotifications sends *_list_changed notifications to CC after reconnect.
+// This triggers CC to re-fetch tools/list, prompts/list, and resources/list from the
+// new upstream, ensuring CC sees updated capabilities.
+func (rc *resilientClient) sendListChangedNotifications(mu *sync.Mutex) {
+	notifications := []string{
+		`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`,
+		`{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}`,
+		`{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}`,
+	}
+	mu.Lock()
+	for _, n := range notifications {
+		if _, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", n); err != nil {
+			rc.log.Printf("resilient: failed to send list_changed notification: %v", err)
+			break
+		}
+	}
+	mu.Unlock()
+	rc.log.Printf("resilient: sent list_changed notifications to CC")
 }
 
 // flushBuffer drains any messages buffered in msgFromCC and writes them to

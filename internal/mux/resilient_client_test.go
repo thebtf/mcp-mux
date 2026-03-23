@@ -257,8 +257,8 @@ func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 		if !ok {
 			t.Fatal("timeout: no ping response after reconnect")
 		}
-		// Skip keepalive messages.
-		if strings.Contains(resp, "mux-reconnect") {
+		// Skip keepalive and list_changed notifications.
+		if strings.Contains(resp, "mux-reconnect") || strings.Contains(resp, "list_changed") {
 			continue
 		}
 		break
