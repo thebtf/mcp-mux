@@ -377,14 +377,14 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				continue
 			}
 
-			// Reconnect successful — new daemon is ready with warm cache.
-			// Return ErrReconnectExit so runProxy exits cleanly.
-			// CC does not re-handshake after transparent reconnect (no tools/list,
-			// no prompts/list), leaving the MCP session in a broken state.
-			// Clean exit forces CC to spawn a new shim process with full handshake.
-			conn.Close()
-			rc.log.Printf("resilient: reconnected to daemon, exiting for CC to restart with fresh handshake")
-			return nil, ErrReconnectExit
+			// Flush buffered CC messages that arrived during RECONNECTING.
+			rc.flushBuffer(conn)
+
+			// Notify CC that upstream capabilities may have changed.
+			// This triggers CC to re-fetch tools/list, prompts/list, resources/list.
+			rc.sendListChangedNotifications(stdoutMu)
+
+			return conn, nil
 		}
 	}
 }
