@@ -132,11 +132,17 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 
 	// 1. Exact match (same command+args+cwd)?
 	if entry, ok := d.owners[sid]; ok {
-		entry.LastSession = time.Now()
-		d.mu.Unlock()
-		entry.Owner.SessionMgr().PreRegister(token, req.Cwd)
-		d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
-		return entry.Owner.IPCPath(), sid, token, nil
+		if entry.Owner.IsAccepting() {
+			entry.LastSession = time.Now()
+			d.mu.Unlock()
+			entry.Owner.SessionMgr().PreRegister(token, req.Cwd)
+			d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
+			return entry.Owner.IPCPath(), sid, token, nil
+		}
+		// Owner exists but IPC listener is closed (isolated server) — remove and re-spawn.
+		entry.Owner.Shutdown()
+		delete(d.owners, sid)
+		d.logger.Printf("owner %s not accepting (isolated), re-spawning", sid[:8])
 	}
 
 	// 2. Global dedup: if a shared owner for same command+args exists (any cwd), reuse it.
