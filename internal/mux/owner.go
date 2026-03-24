@@ -857,6 +857,17 @@ func (o *Owner) IPCPath() string {
 	return o.ipcPath
 }
 
+// IsAccepting returns true if the IPC listener is still active (not closed).
+// Isolated owners close their listener after the first session connects.
+func (o *Owner) IsAccepting() bool {
+	select {
+	case <-o.listenerDone:
+		return false
+	default:
+		return true
+	}
+}
+
 // AddCwd registers an additional project cwd for this owner.
 // Used by dedup: when a second project reuses a shared owner,
 // its cwd is added so roots/list includes all project roots.
