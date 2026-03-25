@@ -148,7 +148,8 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	// 2. Global dedup: if a shared owner for same command+args exists (any cwd), reuse it.
 	//    This prevents N copies of stateless servers (tavily, time, nia) across projects.
 	if mode == serverid.ModeCwd {
-		if existing := d.findSharedOwner(req.Command, req.Args); existing != nil {
+		existing := d.findSharedOwner(req.Command, req.Args)
+		if existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
 			d.mu.Unlock()
@@ -160,9 +161,32 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			d.logger.Printf("dedup: reusing shared owner %s for %s (added cwd: %s)", existingSID[:8], req.Command, req.Cwd)
 			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
+		// No dedup match — check if there's an unclassified owner we should wait for.
+		// This prevents spawning duplicate owners during the classification window.
+		if pending := d.findPendingOwner(req.Command, req.Args); pending != nil {
+			d.mu.Unlock()
+			d.logger.Printf("waiting for classification of owner %s before dedup decision", pending.ServerID[:8])
+			classification := d.waitForClassification(pending, 15*time.Second)
+			d.mu.Lock()
+			if classification != "" && classification != "isolated" && pending.Owner.IsAccepting() {
+				pending.LastSession = time.Now()
+				pendingSID := pending.ServerID
+				d.mu.Unlock()
+				if req.Cwd != "" {
+					pending.Owner.AddCwd(req.Cwd)
+				}
+				pending.Owner.SessionMgr().PreRegister(token, req.Cwd)
+				d.logger.Printf("dedup: reusing shared owner %s for %s after classification wait (added cwd: %s)", pendingSID[:8], req.Command, req.Cwd)
+				return pending.Owner.IPCPath(), pendingSID, token, nil
+			}
+			// Classification is isolated or timed out — fall through to spawn new owner.
+			d.mu.Unlock()
+		} else {
+			d.mu.Unlock()
+		}
+	} else {
+		d.mu.Unlock()
 	}
-
-	d.mu.Unlock()
 
 	ipcPath := serverid.IPCPath(sid)
 
@@ -309,6 +333,45 @@ func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 		}
 	}
 	return nil
+}
+
+// findPendingOwner searches for an owner with the same command+args that hasn't
+// been classified yet (auto_classification is empty). Used to detect owners still
+// starting up so we can wait for classification instead of spawning a duplicate.
+// Must be called with d.mu held.
+func (d *Daemon) findPendingOwner(command string, args []string) *OwnerEntry {
+	needle := command + " " + strings.Join(args, " ")
+	for _, entry := range d.owners {
+		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
+		if candidate == needle {
+			if !entry.Owner.IsAccepting() {
+				continue
+			}
+			status := entry.Owner.Status()
+			classification, _ := status["auto_classification"].(string)
+			if classification == "" {
+				return entry
+			}
+		}
+	}
+	return nil
+}
+
+// waitForClassification polls the owner's status until auto_classification is set
+// or timeout expires. Returns the classification or "" on timeout.
+// Called WITHOUT d.mu held.
+func (d *Daemon) waitForClassification(entry *OwnerEntry, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		status := entry.Owner.Status()
+		classification, _ := status["auto_classification"].(string)
+		if classification != "" {
+			return classification
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	d.logger.Printf("waitForClassification: timed out for owner %s", entry.ServerID[:8])
+	return ""
 }
 
 // diffEnv returns only the env vars from shim that differ from daemon's own env.
