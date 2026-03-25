@@ -284,9 +284,10 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 }
 
 // findSharedOwner searches for an existing owner with the same command+args
-// that is classified as shared (stateless — no per-session state).
-// Session-aware and isolated servers are NOT deduped: they need per-cwd owners
-// because upstream uses roots/list to determine the working directory.
+// that can be shared across cwds. Both shared and session-aware servers are
+// eligible for dedup — session-aware servers route per-session via token
+// handshake (Session.Cwd) and inflight request correlation (SessionManager).
+// Only isolated servers are excluded: they require a dedicated owner per session.
 // Must be called with d.mu held.
 func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
@@ -295,9 +296,9 @@ func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 		if candidate == needle {
 			status := entry.Owner.Status()
 			classification, _ := status["auto_classification"].(string)
-			// Only truly stateless (shared) servers can be deduped across cwds.
-			// Session-aware servers need per-cwd roots for correct upstream behavior.
-			if classification == "" || classification == "shared" {
+			// Isolated servers need their own owner (closed IPC listener after first session).
+			// Shared and session-aware servers can be deduped across cwds.
+			if classification != "isolated" {
 				return entry
 			}
 		}
