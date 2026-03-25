@@ -93,6 +93,12 @@ func (r *Reaper) sweep() int {
 
 	for i, entry := range entries {
 		sid := sids[i]
+
+		// Skip placeholders — owner is still being created by Spawn.
+		if entry.Owner == nil {
+			continue
+		}
+
 		sessions := entry.Owner.SessionCount()
 
 		// Check if upstream is dead
@@ -152,7 +158,9 @@ func (r *Reaper) totalSessions() int {
 	defer r.daemon.mu.RUnlock()
 	total := 0
 	for _, e := range r.daemon.owners {
-		total += e.Owner.SessionCount()
+		if e.Owner != nil {
+			total += e.Owner.SessionCount()
+		}
 	}
 	return total
 }

@@ -20,6 +20,9 @@ import (
 )
 
 // OwnerEntry tracks a single managed owner and its metadata.
+// When creating != nil, the entry is a placeholder: Owner is nil and is being
+// created by another goroutine. Waiters must read creating under d.mu, then
+// release d.mu, block on <-creating, re-acquire d.mu, and re-check Owner.
 type OwnerEntry struct {
 	Owner       *mux.Owner
 	ServerID    string
@@ -31,6 +34,9 @@ type OwnerEntry struct {
 	Persistent  bool
 	LastSession time.Time
 	GracePeriod time.Duration
+	// creating is closed when Owner transitions from nil (placeholder) to a real
+	// owner.  It is non-nil only while the placeholder is being created.
+	creating chan struct{}
 }
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
@@ -111,6 +117,9 @@ func generateToken() string {
 // Deduplication: if a shared owner for the same command+args already exists
 // (from any cwd), it is reused — stateless servers don't need per-project copies.
 // Returns the IPC path, server ID, and a one-time handshake token for session binding.
+//
+// Concurrent spawns for the same sid are serialised via a placeholder entry whose
+// creating channel is closed once the real owner is available (or creation fails).
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	mode := serverid.ModeCwd
 	switch req.Mode {
@@ -132,6 +141,24 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 
 	// 1. Exact match (same command+args+cwd)?
 	if entry, ok := d.owners[sid]; ok {
+		if entry.creating != nil {
+			// Another goroutine is creating this owner — wait for it.
+			creating := entry.creating
+			d.mu.Unlock()
+			<-creating
+			d.mu.Lock()
+			// Re-check: creation may have succeeded or failed.
+			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
+				e.LastSession = time.Now()
+				d.mu.Unlock()
+				e.Owner.SessionMgr().PreRegister(token, req.Cwd)
+				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
+				return e.Owner.IPCPath(), sid, token, nil
+			}
+			// Creation failed or entry was removed — fall through to create anew.
+			d.mu.Unlock()
+			return d.Spawn(req)
+		}
 		if entry.Owner.IsAccepting() {
 			entry.LastSession = time.Now()
 			d.mu.Unlock()
@@ -163,6 +190,17 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		}
 	}
 
+	// Reserve the slot with a placeholder before releasing d.mu.
+	// Any concurrent goroutine that arrives for the same sid will wait on the
+	// creating channel instead of racing to spawn a duplicate owner.
+	placeholder := &OwnerEntry{
+		ServerID: sid,
+		Command:  req.Command,
+		Args:     req.Args,
+		Cwd:      req.Cwd,
+		creating: make(chan struct{}),
+	}
+	d.owners[sid] = placeholder
 	d.mu.Unlock()
 
 	ipcPath := serverid.IPCPath(sid)
@@ -194,23 +232,25 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 	})
 	if err != nil {
+		// Remove the placeholder and unblock any waiters.
+		d.mu.Lock()
+		if d.owners[sid] == placeholder {
+			delete(d.owners, sid)
+		}
+		close(placeholder.creating)
+		d.mu.Unlock()
 		return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
 	}
 
-	entry := &OwnerEntry{
-		Owner:       owner,
-		ServerID:    sid,
-		Command:     req.Command,
-		Args:        req.Args,
-		Cwd:         req.Cwd,
-		Mode:        req.Mode,
-		Env:         req.Env,
-		LastSession: time.Now(),
-		GracePeriod: d.gracePeriod,
-	}
-
+	// Promote the placeholder to a real entry and signal waiters.
 	d.mu.Lock()
-	d.owners[sid] = entry
+	placeholder.Owner = owner
+	placeholder.Mode = req.Mode
+	placeholder.Env = req.Env
+	placeholder.LastSession = time.Now()
+	placeholder.GracePeriod = d.gracePeriod
+	close(placeholder.creating)
+	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
 
 	owner.SessionMgr().PreRegister(token, req.Cwd)
@@ -225,6 +265,11 @@ func (d *Daemon) Remove(serverID string) error {
 	if !ok {
 		d.mu.Unlock()
 		return fmt.Errorf("server %s not found", serverID)
+	}
+	if entry.Owner == nil {
+		// Placeholder still being created — do not remove; caller should retry later.
+		d.mu.Unlock()
+		return fmt.Errorf("server %s is still being created", serverID)
 	}
 	delete(d.owners, serverID)
 	d.mu.Unlock()
@@ -257,6 +302,9 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	servers := make([]map[string]any, 0, len(d.owners))
 	for sid, entry := range d.owners {
+		if entry.Owner == nil {
+			continue // placeholder still being created
+		}
 		s := entry.Owner.Status()
 		s["server_id"] = sid
 		s["persistent"] = entry.Persistent
@@ -267,7 +315,7 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	return map[string]any{
 		"daemon":       true,
-		"owner_count":  len(d.owners),
+		"owner_count":  len(servers), // excludes placeholders still being created
 		"servers":      servers,
 		"grace_period": d.gracePeriod.String(),
 		"idle_timeout": d.idleTimeout.String(),
@@ -288,12 +336,30 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // that is still accepting connections. Dedup is optimistic: unclassified owners
 // are assumed shareable. If an owner later classifies as isolated, it closes its
 // IPC listener — extra sessions get EOF and reconnect with their own owner.
-// Must be called with d.mu held.
+//
+// Must be called with d.mu held. May transiently release and re-acquire d.mu
+// when it encounters a placeholder (Owner == nil) for a matching command+args —
+// it waits for that creation to complete before returning.
 func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
 	for _, entry := range d.owners {
 		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
-		if candidate == needle && entry.Owner.IsAccepting() {
+		if candidate != needle {
+			continue
+		}
+		if entry.Owner == nil {
+			// Matching command+args but still being created — wait for it.
+			creating := entry.creating
+			d.mu.Unlock()
+			<-creating
+			d.mu.Lock()
+			// Re-check after wait: creation may have succeeded or failed.
+			if entry.Owner != nil && entry.Owner.IsAccepting() {
+				return entry
+			}
+			return nil
+		}
+		if entry.Owner.IsAccepting() {
 			return entry
 		}
 	}
@@ -339,7 +405,9 @@ func (d *Daemon) Shutdown() {
 		d.mu.Unlock()
 
 		for _, e := range entries {
-			e.Owner.Shutdown()
+			if e.Owner != nil {
+				e.Owner.Shutdown()
+			}
 		}
 
 		d.logger.Printf("daemon stopped (%d owners shut down)", len(entries))
@@ -352,11 +420,17 @@ func (d *Daemon) Done() <-chan struct{} {
 	return d.done
 }
 
-// OwnerCount returns the number of managed owners.
+// OwnerCount returns the number of fully-created owners (excludes placeholders).
 func (d *Daemon) OwnerCount() int {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return len(d.owners)
+	n := 0
+	for _, e := range d.owners {
+		if e.Owner != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // Entry returns the OwnerEntry for the given server ID, or nil.
