@@ -294,11 +294,16 @@ func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 	for _, entry := range d.owners {
 		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
 		if candidate == needle {
+			// Skip owners that can't accept connections (isolated with closed listener)
+			if !entry.Owner.IsAccepting() {
+				continue
+			}
 			status := entry.Owner.Status()
 			classification, _ := status["auto_classification"].(string)
-			// Isolated servers need their own owner (closed IPC listener after first session).
-			// Shared and session-aware servers can be deduped across cwds.
-			if classification != "isolated" {
+			// Only dedup if classification is known AND not isolated.
+			// Unknown ("") means upstream hasn't responded to tools/list yet — could be isolated.
+			// Isolated servers close their IPC listener after first session.
+			if classification != "" && classification != "isolated" {
 				return entry
 			}
 		}
