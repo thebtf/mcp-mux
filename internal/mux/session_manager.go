@@ -104,6 +104,25 @@ func (sm *SessionManager) CompleteRequest(remappedID string) {
 	delete(sm.inflight, remappedID)
 }
 
+// InflightEntry represents an in-flight request that needs an error response.
+type InflightEntry struct {
+	RemappedID string
+	SessionID  int
+}
+
+// DrainInflight removes all in-flight requests and returns them.
+// Used when upstream dies to send error responses to originating sessions.
+func (sm *SessionManager) DrainInflight() []InflightEntry {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	entries := make([]InflightEntry, 0, len(sm.inflight))
+	for remappedID, sessionID := range sm.inflight {
+		entries = append(entries, InflightEntry{RemappedID: remappedID, SessionID: sessionID})
+	}
+	sm.inflight = make(map[string]int)
+	return entries
+}
+
 // ResolveCallback returns the SessionContext that should handle a server→client
 // callback (roots/list, sampling, elicitation). Resolution logic:
 //  1. Collect unique session IDs from the inflight map.

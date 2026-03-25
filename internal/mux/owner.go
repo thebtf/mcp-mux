@@ -400,7 +400,10 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 
 // readUpstream reads responses from the upstream and routes them to the correct session.
 func (o *Owner) readUpstream() {
-	defer o.upstreamDead.Store(true) // mark dead so new requests fail fast
+	defer func() {
+		o.upstreamDead.Store(true)
+		o.drainInflightRequests() // send error responses for all pending requests
+	}()
 	for {
 		line, err := o.upstream.ReadLine()
 		if err != nil {
@@ -810,6 +813,40 @@ func (o *Owner) closeListener() {
 		o.listener.Close()
 		ipc.Cleanup(o.ipcPath)
 	})
+}
+
+// drainInflightRequests sends JSON-RPC error responses for all in-flight requests
+// when the upstream process dies. Without this, clients wait forever for responses
+// that will never come.
+func (o *Owner) drainInflightRequests() {
+	entries := o.sessionMgr.DrainInflight()
+	if len(entries) == 0 {
+		return
+	}
+	o.logger.Printf("upstream died: sending error responses for %d in-flight requests", len(entries))
+
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	for _, entry := range entries {
+		result, err := remap.Deremap(json.RawMessage(`"` + entry.RemappedID + `"`))
+		if err != nil {
+			o.logger.Printf("drainInflight: deremap error for %s: %v", entry.RemappedID, err)
+			continue
+		}
+		session, ok := o.sessions[result.SessionID]
+		if !ok {
+			continue // session already disconnected
+		}
+		errResp := fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
+			string(result.OriginalID),
+		)
+		if writeErr := session.WriteRaw([]byte(errResp)); writeErr != nil {
+			o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
+		}
+		o.pendingRequests.Add(-1)
+	}
 }
 
 // Shutdown stops the owner, closing all sessions and the upstream.
