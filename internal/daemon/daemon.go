@@ -415,18 +415,37 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 	return nil
 }
 
-// envCompatible returns true if two env maps have no conflicting values.
-// Missing keys are ignored — only keys present in BOTH maps are compared.
-// This allows dedup when one project has no env and another has env (the upstream
-// inherits daemon's env which includes system-level vars), but prevents dedup
-// when two projects explicitly set different values for the same key.
+// envCompatible returns true if two env maps have no conflicting values
+// for semantically significant keys (API tokens, config paths, etc.).
+// Transient per-session vars (CLAUDE_CODE_*, WT_SESSION, etc.) are ignored.
 func envCompatible(a, b map[string]string) bool {
 	for k, va := range a {
+		if envTransient(k) {
+			continue
+		}
 		if vb, ok := b[k]; ok && va != vb {
 			return false
 		}
 	}
 	return true
+}
+
+// envTransient returns true for env vars that are per-session/transient
+// and should NOT affect dedup decisions.
+func envTransient(key string) bool {
+	switch {
+	case strings.HasPrefix(key, "CLAUDE_CODE_"):
+		return true
+	case strings.HasPrefix(key, "CLAUDE_AUTO"):
+		return true
+	case strings.HasPrefix(key, "WT_"):
+		return true
+	case key == "SESSIONNAME" || key == "WSLENV":
+		return true
+	case key == "CLAUDE_CODE_ENTRYPOINT":
+		return true
+	}
+	return false
 }
 
 // diffEnv returns only the env vars from shim that differ from daemon's own env.
