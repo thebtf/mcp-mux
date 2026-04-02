@@ -177,7 +177,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	//    If the owner later classifies as isolated, it closes its listener — extra
 	//    sessions get EOF and reconnect, spawning their own owner.
 	if mode == serverid.ModeCwd {
-		if existing := d.findSharedOwner(req.Command, req.Args); existing != nil {
+		if existing := d.findSharedOwner(req.Command, req.Args, req.Env); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
 			d.mu.Unlock()
@@ -340,7 +340,7 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // Must be called with d.mu held. May transiently release and re-acquire d.mu
 // when it encounters a placeholder (Owner == nil) for a matching command+args —
 // it waits for that creation to complete before returning.
-func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
+func (d *Daemon) findSharedOwner(command string, args []string, env map[string]string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
 	for _, entry := range d.owners {
 		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
@@ -354,16 +354,35 @@ func (d *Daemon) findSharedOwner(command string, args []string) *OwnerEntry {
 			<-creating
 			d.mu.Lock()
 			// Re-check after wait: creation may have succeeded or failed.
-			if entry.Owner != nil && entry.Owner.IsAccepting() {
+			if entry.Owner != nil && entry.Owner.IsAccepting() && envCompatible(entry.Env, env) {
 				return entry
 			}
 			return nil
+		}
+		// Skip owners with incompatible env — different API keys, tokens, etc.
+		// Without this, project-scope .mcp.json env overrides are silently ignored.
+		if !envCompatible(entry.Env, env) {
+			continue
 		}
 		if entry.Owner.IsAccepting() {
 			return entry
 		}
 	}
 	return nil
+}
+
+// envCompatible returns true if two env maps have no conflicting values.
+// Missing keys are ignored — only keys present in BOTH maps are compared.
+// This allows dedup when one project has no env and another has env (the upstream
+// inherits daemon's env which includes system-level vars), but prevents dedup
+// when two projects explicitly set different values for the same key.
+func envCompatible(a, b map[string]string) bool {
+	for k, va := range a {
+		if vb, ok := b[k]; ok && va != vb {
+			return false
+		}
+	}
+	return true
 }
 
 // diffEnv returns only the env vars from shim that differ from daemon's own env.
