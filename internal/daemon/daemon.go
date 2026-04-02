@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -100,7 +101,50 @@ func New(cfg Config) (*Daemon, error) {
 	d.ctlSrv = ctlSrv
 	logger.Printf("daemon started, control socket: %s", cfg.ControlPath)
 
+	// Clean up stale socket files from previous daemon crashes/kills.
+	cleaned := cleanStaleSockets(logger)
+	if cleaned > 0 {
+		logger.Printf("startup: cleaned %d stale socket files", cleaned)
+	}
+
 	return d, nil
+}
+
+// cleanStaleSockets removes mcp-mux-*.ctl.sock and mcp-mux-*.sock files from
+// the temp directory that are not reachable (leftover from daemon crash/kill).
+func cleanStaleSockets(logger *log.Logger) int {
+	tmpDir := os.TempDir()
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return 0
+	}
+	cleaned := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "mcp-mux-") {
+			continue
+		}
+		if !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		path := filepath.Join(tmpDir, name)
+		// Try to connect — if unreachable, it's stale
+		if strings.HasSuffix(name, ".ctl.sock") {
+			if _, err := control.Send(path, control.Request{Cmd: "ping"}); err != nil {
+				os.Remove(path)
+				cleaned++
+			}
+		} else {
+			// IPC data socket — check if the corresponding .ctl.sock exists and is alive
+			ctlName := strings.TrimSuffix(name, ".sock") + ".ctl.sock"
+			ctlPath := filepath.Join(tmpDir, ctlName)
+			if _, err := control.Send(ctlPath, control.Request{Cmd: "ping"}); err != nil {
+				os.Remove(path)
+				cleaned++
+			}
+		}
+	}
+	return cleaned
 }
 
 // generateToken creates a 16-character hex handshake token (8 random bytes).
