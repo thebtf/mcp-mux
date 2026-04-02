@@ -5,10 +5,17 @@ import (
 	"time"
 )
 
-// SessionContext holds a session and its associated working directory.
+// SessionContext holds a session and its associated metadata.
 type SessionContext struct {
 	Session *Session
 	Cwd     string
+	Env     map[string]string // per-session env diff (from project-scope .mcp.json)
+}
+
+// pendingSession holds pre-registered session data waiting for a shim to connect.
+type pendingSession struct {
+	Cwd string
+	Env map[string]string
 }
 
 // SessionManager tracks active sessions, their working directories,
@@ -19,7 +26,7 @@ type SessionContext struct {
 type SessionManager struct {
 	sessions   map[int]*SessionContext // session ID → context
 	inflight   map[string]int          // remapped request ID → session ID
-	pending    map[string]string       // token → cwd (pre-registered, consumed on Bind)
+	pending    map[string]*pendingSession // token → session data (pre-registered, consumed on Bind)
 	lastActive map[int]time.Time       // session ID → time of last TrackRequest call
 	mu         sync.RWMutex
 }
@@ -29,7 +36,7 @@ func NewSessionManager() *SessionManager {
 	return &SessionManager{
 		sessions:   make(map[int]*SessionContext),
 		inflight:   make(map[string]int),
-		pending:    make(map[string]string),
+		pending:    make(map[string]*pendingSession),
 		lastActive: make(map[int]time.Time),
 	}
 }
@@ -58,32 +65,34 @@ func (sm *SessionManager) RemoveSession(sessionID int) {
 	}
 }
 
-// PreRegister stores a token→cwd mapping before the shim connects.
+// PreRegister stores a token→(cwd,env) mapping before the shim connects.
 // Called by the daemon after generating a handshake token.
-func (sm *SessionManager) PreRegister(token, cwd string) {
+func (sm *SessionManager) PreRegister(token, cwd string, env map[string]string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.pending[token] = cwd
+	sm.pending[token] = &pendingSession{Cwd: cwd, Env: env}
 }
 
-// Bind resolves a token to a cwd and sets session.Cwd accordingly.
+// Bind resolves a token to session metadata (cwd, env) and sets them on the session.
 // Returns false if the token was not found (already consumed or never registered).
 // The token is consumed on first use.
 func (sm *SessionManager) Bind(token string, session *Session) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	cwd, ok := sm.pending[token]
+	ps, ok := sm.pending[token]
 	if !ok {
 		return false
 	}
 	delete(sm.pending, token)
 
-	session.Cwd = cwd
+	session.Cwd = ps.Cwd
+	session.Env = ps.Env
 
 	// Update SessionContext if the session is already registered.
 	if ctx, exists := sm.sessions[session.ID]; exists {
-		ctx.Cwd = cwd
+		ctx.Cwd = ps.Cwd
+		ctx.Env = ps.Env
 	}
 	return true
 }

@@ -42,7 +42,7 @@ func TestPreRegisterBind(t *testing.T) {
 	s := &Session{ID: 2}
 	sm.RegisterSession(s, "")
 
-	sm.PreRegister("tok-abc", "/project/b")
+	sm.PreRegister("tok-abc", "/project/b", nil)
 
 	ok := sm.Bind("tok-abc", s)
 	if !ok {

@@ -195,7 +195,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
 				e.LastSession = time.Now()
 				d.mu.Unlock()
-				e.Owner.SessionMgr().PreRegister(token, req.Cwd)
+				e.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
@@ -206,7 +206,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		if entry.Owner.IsAccepting() {
 			entry.LastSession = time.Now()
 			d.mu.Unlock()
-			entry.Owner.SessionMgr().PreRegister(token, req.Cwd)
+			entry.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 			d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
 			return entry.Owner.IPCPath(), sid, token, nil
 		}
@@ -228,7 +228,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			if req.Cwd != "" {
 				existing.Owner.AddCwd(req.Cwd)
 			}
-			existing.Owner.SessionMgr().PreRegister(token, req.Cwd)
+			existing.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 			d.logger.Printf("dedup: reusing shared owner %s for %s (added cwd: %s)", existingSID[:8], req.Command, req.Cwd)
 			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
@@ -297,7 +297,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
 
-	owner.SessionMgr().PreRegister(token, req.Cwd)
+	owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 	d.logger.Printf("spawned owner %s for %s %v", sid[:8], req.Command, req.Args)
 	return ipcPath, sid, token, nil
 }

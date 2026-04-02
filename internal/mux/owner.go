@@ -366,7 +366,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			o.captureInitFingerprint(msg.Raw)
 		}
 
-		// Inject _meta.muxSessionId for session-aware servers
+		// Inject _meta.muxSessionId and _meta.muxEnv for session-aware servers
 		o.mu.RLock()
 		isSessionAware := o.autoClassification == classify.ModeSessionAware
 		o.mu.RUnlock()
@@ -376,6 +376,15 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 				o.logger.Printf("session %d: failed to inject muxSessionId: %v", s.ID, err)
 			} else {
 				remapped = injected
+			}
+			// Inject per-session env diff so upstream can use project-scope credentials
+			if len(s.Env) > 0 {
+				injected, err := jsonrpc.InjectMeta(remapped, "muxEnv", s.Env)
+				if err != nil {
+					o.logger.Printf("session %d: failed to inject muxEnv: %v", s.ID, err)
+				} else {
+					remapped = injected
+				}
 			}
 		}
 

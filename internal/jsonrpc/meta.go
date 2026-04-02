@@ -8,7 +8,8 @@ import (
 // InjectMeta adds a key-value pair to the _meta object inside params.
 // If params or _meta don't exist, they are created.
 // Existing _meta fields are preserved — only the specified key is added/overwritten.
-func InjectMeta(raw []byte, key string, value string) ([]byte, error) {
+// Value can be any JSON-serializable type (string, map, slice, etc.).
+func InjectMeta(raw []byte, key string, value any) ([]byte, error) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
 		return nil, fmt.Errorf("inject meta: parse message: %w", err)
