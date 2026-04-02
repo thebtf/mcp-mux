@@ -333,7 +333,7 @@ func TestDaemonMultiSessionSharing(t *testing.T) {
 
 // ipcConn bundles a net.Conn with its line scanner for test helpers.
 type ipcConn struct {
-	conn    interface {
+	conn interface {
 		Write([]byte) (int, error)
 		Close() error
 	}
@@ -455,4 +455,145 @@ func daemonAssertID(t *testing.T, resp []byte, expectedID int) {
 	if id != expectedID {
 		t.Errorf("daemonAssertID: id = %d, want %d (full: %s)", id, expectedID, resp)
 	}
+}
+
+func TestEnvTransient(t *testing.T) {
+	testCases := []struct {
+		name string
+		key  string
+		want bool
+	}{
+		{name: "entrypoint", key: "CLAUDE_CODE_ENTRYPOINT", want: true},
+		{name: "claude code prefix", key: "CLAUDE_CODE_USE_POWERSHELL_TOOL", want: true},
+		{name: "claude auto prefix", key: "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", want: true},
+		{name: "wt session", key: "WT_SESSION", want: true},
+		{name: "wt profile", key: "WT_PROFILE_ID", want: true},
+		{name: "session name", key: "SESSIONNAME", want: true},
+		{name: "wsl env", key: "WSLENV", want: true},
+		{name: "github token", key: "GITHUB_TOKEN", want: false},
+		{name: "github personal access token", key: "GITHUB_PERSONAL_ACCESS_TOKEN", want: false},
+		{name: "tavily api key", key: "TAVILY_API_KEY", want: false},
+		{name: "path", key: "PATH", want: false},
+		{name: "home", key: "HOME", want: false},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := envTransient(tc.key)
+			if got != tc.want {
+				t.Fatalf("envTransient(%q) = %v, want %v", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnvCompatible(t *testing.T) {
+	testCases := []struct {
+		name string
+		a    map[string]string
+		b    map[string]string
+		want bool
+	}{
+		{name: "both empty", a: map[string]string{}, b: map[string]string{}, want: true},
+		{name: "a empty b has keys", a: map[string]string{}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: true},
+		{name: "a has keys b empty", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{}, want: true},
+		{name: "same key same value", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: true},
+		{name: "same key different value semantic", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{"GITHUB_TOKEN": "xyz"}, want: false},
+		{name: "transient key different value", a: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "cli"}, b: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "ide"}, want: true},
+		{name: "transient key semantic same", a: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "cli", "GITHUB_TOKEN": "abc"}, b: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "ide", "GITHUB_TOKEN": "abc"}, want: true},
+		{name: "transient key semantic different", a: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "cli", "GITHUB_TOKEN": "abc"}, b: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "ide", "GITHUB_TOKEN": "xyz"}, want: false},
+		{name: "overlapping partial", a: map[string]string{"GITHUB_TOKEN": "abc", "PATH": "/usr"}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: true},
+		{name: "real world same token", a: map[string]string{"GITHUB_TOKEN": "abc", "CLAUDE_CODE_ENTRYPOINT": "cli"}, b: map[string]string{"GITHUB_TOKEN": "abc", "CLAUDE_CODE_ENTRYPOINT": "ide"}, want: true},
+		{name: "real world different token", a: map[string]string{"GITHUB_TOKEN": "abc", "CLAUDE_CODE_ENTRYPOINT": "cli"}, b: map[string]string{"GITHUB_TOKEN": "xyz", "CLAUDE_CODE_ENTRYPOINT": "cli"}, want: false},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := envCompatible(tc.a, tc.b)
+			if got != tc.want {
+				t.Fatalf("envCompatible(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFindSharedOwnerEnvFiltering(t *testing.T) {
+	d := testDaemon(t)
+	req := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "cwd",
+		Env:     map[string]string{"GITHUB_TOKEN": "abc"},
+	}
+
+	_, sid, _, err := d.Spawn(req)
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+
+	entry := findSharedOwnerLocked(d, req.Command, req.Args, map[string]string{"GITHUB_TOKEN": "abc"})
+	if entry == nil {
+		t.Fatal("findSharedOwner() returned nil for matching semantic env")
+	}
+	if entry.ServerID != sid {
+		t.Fatalf("findSharedOwner() serverID = %q, want %q", entry.ServerID, sid)
+	}
+
+	conflict := findSharedOwnerLocked(d, req.Command, req.Args, map[string]string{"GITHUB_TOKEN": "xyz"})
+	if conflict != nil {
+		t.Fatalf("findSharedOwner() returned %q for conflicting semantic env", conflict.ServerID)
+	}
+
+	transientMatch := findSharedOwnerLocked(d, req.Command, req.Args, map[string]string{
+		"GITHUB_TOKEN":           "abc",
+		"CLAUDE_CODE_ENTRYPOINT": "cli",
+	})
+	if transientMatch == nil {
+		t.Fatal("findSharedOwner() returned nil when only transient env differed")
+	}
+	if transientMatch.ServerID != sid {
+		t.Fatalf("findSharedOwner() with transient env returned %q, want %q", transientMatch.ServerID, sid)
+	}
+}
+
+func TestCleanStaleSockets(t *testing.T) {
+	const staleSocketCount = 3
+
+	paths := make([]string, 0, staleSocketCount)
+	for i := 0; i < staleSocketCount; i++ {
+		f, err := os.CreateTemp(os.TempDir(), "mcp-mux-*-test.ctl.sock")
+		if err != nil {
+			t.Fatalf("CreateTemp() error: %v", err)
+		}
+		path := f.Name()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+		t.Cleanup(func() { os.Remove(path) })
+		paths = append(paths, path)
+	}
+
+	cleaned := cleanStaleSockets(testLogger(t))
+	if cleaned != staleSocketCount {
+		t.Fatalf("cleanStaleSockets() = %d, want %d", cleaned, staleSocketCount)
+	}
+
+	for _, path := range paths {
+		_, err := os.Stat(path)
+		if err == nil {
+			t.Fatalf("cleanStaleSockets() did not remove %q", path)
+		}
+		if !os.IsNotExist(err) {
+			t.Fatalf("Stat(%q) error = %v, want not exist", path, err)
+		}
+	}
+}
+
+func findSharedOwnerLocked(d *Daemon, command string, args []string, env map[string]string) *OwnerEntry {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.findSharedOwner(command, args, env)
 }
