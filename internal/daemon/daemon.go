@@ -186,10 +186,15 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	// 1. Exact match (same command+args+cwd)?
 	if entry, ok := d.owners[sid]; ok {
 		if entry.creating != nil {
-			// Another goroutine is creating this owner — wait for it.
+			// Another goroutine is creating this owner — wait with timeout.
 			creating := entry.creating
 			d.mu.Unlock()
-			<-creating
+			select {
+			case <-creating:
+			case <-time.After(30 * time.Second):
+				d.logger.Printf("timeout waiting for placeholder %s, creating new", sid[:8])
+				return d.Spawn(req) // recursive — will create new placeholder
+			}
 			d.mu.Lock()
 			// Re-check: creation may have succeeded or failed.
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
@@ -392,10 +397,15 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 			continue
 		}
 		if entry.Owner == nil {
-			// Matching command+args but still being created — wait for it.
+			// Matching command+args but still being created — wait with timeout.
 			creating := entry.creating
 			d.mu.Unlock()
-			<-creating
+			select {
+			case <-creating:
+			case <-time.After(30 * time.Second):
+				d.mu.Lock()
+				return nil // timed out waiting for placeholder — caller will create new
+			}
 			d.mu.Lock()
 			// Re-check after wait: creation may have succeeded or failed.
 			if entry.Owner != nil && entry.Owner.IsAccepting() && envCompatible(entry.Env, env) {
