@@ -1,0 +1,6 @@
+[allowlist]
+  description = "Allow test tokens in test files"
+  paths = [
+    '''_test\.go$''',
+    '''testdata/''',
+  ]

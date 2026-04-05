@@ -3,11 +3,15 @@ package mux
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/internal/jsonrpc"
 )
 
 // ---------------------------------------------------------------------------
@@ -833,4 +837,405 @@ func TestSessionWriteRaw_NonBufio(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimRight(out, ""), "\n") {
 		t.Errorf("WriteRaw non-bufio: expected trailing newline")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// isHexChar
+// ---------------------------------------------------------------------------
+
+func TestIsHexChar(t *testing.T) {
+	valid := "0123456789abcdef"
+	for i := 0; i < len(valid); i++ {
+		if !isHexChar(valid[i]) {
+			t.Errorf("isHexChar(%q) = false, want true", valid[i])
+		}
+	}
+	// uppercase and non-hex must return false
+	invalid := []byte{'A', 'F', 'g', 'z', '{', ' ', '\n', 0x00}
+	for _, b := range invalid {
+		if isHexChar(b) {
+			t.Errorf("isHexChar(%q) = true, want false", b)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// readToken — uses net.Pipe() which supports SetReadDeadline on Go 1.12+
+// ---------------------------------------------------------------------------
+
+// pipeWithData creates a net.Pipe pair, writes data to the client end, and
+// returns the server-side conn for readToken to consume.
+// The caller must close both conns when done.
+func pipeWithData(t *testing.T, data []byte) (serverConn net.Conn, clientConn net.Conn) {
+	t.Helper()
+	c, s := net.Pipe()
+	go func() {
+		c.Write(data)
+	}()
+	return s, c
+}
+
+func TestReadToken_ValidHex(t *testing.T) {
+	token := "abcdef1234567890"
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go func() {
+		client.Write([]byte(token + "\n"))
+	}()
+
+	got, _ := readToken(server)
+	if got != token {
+		t.Errorf("readToken valid hex: got %q, want %q", got, token)
+	}
+}
+
+func TestReadToken_EmptyNewline(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go func() {
+		client.Write([]byte("\n"))
+	}()
+
+	got, _ := readToken(server)
+	if got != "" {
+		t.Errorf("readToken empty newline: got %q, want empty string", got)
+	}
+}
+
+func TestReadToken_NonHexFirstByte(t *testing.T) {
+	// '{' is not a hex char — readToken should return "" and prepend it via MultiReader
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	payload := `{"jsonrpc":"2.0"}` + "\n"
+	go func() {
+		client.Write([]byte(payload))
+	}()
+
+	got, reader := readToken(server)
+	if got != "" {
+		t.Errorf("readToken non-hex first byte: expected empty token, got %q", got)
+	}
+	// The reader should include the prepended '{' byte
+	buf := make([]byte, 1)
+	if _, err := reader.Read(buf); err != nil {
+		t.Fatalf("readToken non-hex: read prepended byte: %v", err)
+	}
+	if buf[0] != '{' {
+		t.Errorf("readToken non-hex: prepended byte = %q, want '{'", buf[0])
+	}
+}
+
+func TestReadToken_TooLong(t *testing.T) {
+	// >64 hex chars without newline should trigger the length guard
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	// Write 65 'a' bytes then newline — triggers len(buf) > 64 guard before newline is read
+	go func() {
+		data := bytes.Repeat([]byte("a"), 65)
+		data = append(data, '\n')
+		client.Write(data)
+	}()
+
+	got, _ := readToken(server)
+	if got != "" {
+		t.Errorf("readToken too long: expected empty token, got %q", got)
+	}
+}
+
+func TestReadToken_ErrorOnFirstRead(t *testing.T) {
+	// Close the write end before readToken reads anything → EOF on first Read.
+	// This simulates the timeout/error path: returns ("", conn).
+	server, client := net.Pipe()
+	defer server.Close()
+
+	// Close client immediately — server's Read will return io.EOF
+	client.Close()
+
+	got, reader := readToken(server)
+	if got != "" {
+		t.Errorf("readToken error path: expected empty token, got %q", got)
+	}
+	if reader == nil {
+		t.Error("readToken error path: reader should not be nil")
+	}
+}
+
+func TestReadToken_ErrorAfterSomeBytes(t *testing.T) {
+	// Write some valid hex bytes then close before newline.
+	// Should return ("", MultiReader(buf, conn)).
+	server, client := net.Pipe()
+	defer server.Close()
+
+	go func() {
+		client.Write([]byte("abc")) // valid hex, no newline
+		client.Close()
+	}()
+
+	got, reader := readToken(server)
+	if got != "" {
+		t.Errorf("readToken partial hex then close: expected empty token, got %q", got)
+	}
+	// reader should have the partial bytes prepended
+	var buf bytes.Buffer
+	io.Copy(&buf, reader)
+	if !strings.HasPrefix(buf.String(), "abc") {
+		t.Errorf("readToken partial bytes not prepended: got %q", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// IsAccepting
+// ---------------------------------------------------------------------------
+
+func TestIsAccepting_NewOwner(t *testing.T) {
+	o := newMinimalOwner()
+	if !o.IsAccepting() {
+		t.Error("IsAccepting() = false on a fresh owner, want true")
+	}
+}
+
+func TestIsAccepting_AfterCloseListener(t *testing.T) {
+	o := newMinimalOwner()
+	// closeListener requires a real listener; signal the channel directly instead.
+	close(o.listenerDone)
+	if o.IsAccepting() {
+		t.Error("IsAccepting() = true after listenerDone closed, want false")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AddCwd
+// ---------------------------------------------------------------------------
+
+func TestAddCwd_AddsNew(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	owner, err := NewOwner(OwnerConfig{
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		IPCPath: ipcPath,
+		Logger:  testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	newCwd := t.TempDir()
+	owner.AddCwd(newCwd)
+
+	status := owner.Status()
+	cwdSet, ok := status["cwd_set"].([]string)
+	if !ok {
+		t.Fatalf("cwd_set not []string in status: %T", status["cwd_set"])
+	}
+
+	found := false
+	for _, c := range cwdSet {
+		if c == newCwd {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("AddCwd: new cwd %q not in cwd_set %v", newCwd, cwdSet)
+	}
+}
+
+func TestAddCwd_NoDuplicate(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	owner, err := NewOwner(OwnerConfig{
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		IPCPath: ipcPath,
+		Logger:  testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	newCwd := t.TempDir()
+	owner.AddCwd(newCwd)
+	owner.AddCwd(newCwd) // second add — should not duplicate
+
+	owner.mu.RLock()
+	count := 0
+	for c := range owner.cwdSet {
+		if c == newCwd {
+			count++
+		}
+	}
+	owner.mu.RUnlock()
+
+	if count != 1 {
+		t.Errorf("AddCwd duplicate: cwd appears %d times in cwdSet, want 1", count)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// drainInflightRequests
+// ---------------------------------------------------------------------------
+
+func TestDrainInflightRequests_SendsError(t *testing.T) {
+	o := newMinimalOwner()
+	o.sessionMgr = NewSessionManager()
+
+	// Create a session backed by a buffer so we can inspect what's written to it
+	var buf bytes.Buffer
+	s := NewSession(strings.NewReader(""), &buf)
+
+	// Register the session
+	o.mu.Lock()
+	o.sessions[s.ID] = s
+	o.mu.Unlock()
+	o.sessionMgr.RegisterSession(s, "")
+
+	// Track a request: remapped ID for session s.ID, original numeric id 42
+	// Remap format for numeric id: "s{N}:n:42"
+	remappedStr := fmt.Sprintf("s%d:n:42", s.ID)
+	o.sessionMgr.TrackRequest(remappedStr, s.ID)
+	o.pendingRequests.Add(1)
+
+	// Call drain
+	o.drainInflightRequests()
+
+	// Session should have received a JSON-RPC error response for id 42
+	out := buf.String()
+	if !strings.Contains(out, `"error"`) {
+		t.Errorf("drainInflightRequests: session did not receive error response; got: %s", out)
+	}
+	if !strings.Contains(out, `"id":42`) {
+		t.Errorf("drainInflightRequests: error response missing original id 42; got: %s", out)
+	}
+	if !strings.Contains(out, "upstream process exited") {
+		t.Errorf("drainInflightRequests: error message missing; got: %s", out)
+	}
+	if o.pendingRequests.Load() != 0 {
+		t.Errorf("drainInflightRequests: pendingRequests = %d, want 0", o.pendingRequests.Load())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// routeToLastActiveSession
+// ---------------------------------------------------------------------------
+
+func TestRouteToLastActiveSession_RoutesToActiveSession(t *testing.T) {
+	o := newMinimalOwner()
+	o.sessionMgr = NewSessionManager()
+
+	// Create a session backed by a buffer
+	var buf bytes.Buffer
+	s := NewSession(strings.NewReader(""), &buf)
+
+	o.mu.Lock()
+	o.sessions[s.ID] = s
+	o.mu.Unlock()
+	o.sessionMgr.RegisterSession(s, "")
+
+	// Track a request so ResolveCallback returns this session
+	remappedID := fmt.Sprintf("s%d:n:7", s.ID)
+	o.sessionMgr.TrackRequest(remappedID, s.ID)
+
+	// Build a server→client request message using the internal jsonrpc.Parse
+	raw := []byte(`{"jsonrpc":"2.0","id":99,"method":"roots/list","params":{}}`)
+	msg, err := parseMsg(raw)
+	if err != nil {
+		t.Fatalf("parse message: %v", err)
+	}
+
+	if err := o.routeToLastActiveSession(msg); err != nil {
+		t.Errorf("routeToLastActiveSession: %v", err)
+	}
+
+	// Session should have received the message
+	if !strings.Contains(buf.String(), "roots/list") {
+		t.Errorf("routeToLastActiveSession: session did not receive message; got: %s", buf.String())
+	}
+}
+
+func TestRouteToLastActiveSession_NoSession_ElicitationCreate(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	owner, err := NewOwner(OwnerConfig{
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		IPCPath: ipcPath,
+		Logger:  testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	// No sessions registered — ResolveCallback returns nil
+	raw := []byte(`{"jsonrpc":"2.0","id":5,"method":"elicitation/create","params":{}}`)
+	msg, err := parseMsg(raw)
+	if err != nil {
+		t.Fatalf("parse message: %v", err)
+	}
+
+	// Should call respondToElicitationCancel which writes to upstream — no error
+	if err := owner.routeToLastActiveSession(msg); err != nil {
+		t.Errorf("routeToLastActiveSession elicitation/create fallback: %v", err)
+	}
+}
+
+func TestRouteToLastActiveSession_NoSession_RootsList(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	owner, err := NewOwner(OwnerConfig{
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		IPCPath: ipcPath,
+		Logger:  testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	raw := []byte(`{"jsonrpc":"2.0","id":6,"method":"roots/list","params":{}}`)
+	msg, err := parseMsg(raw)
+	if err != nil {
+		t.Fatalf("parse message: %v", err)
+	}
+
+	// Should call respondToRootsList which writes to upstream — no error
+	if err := owner.routeToLastActiveSession(msg); err != nil {
+		t.Errorf("routeToLastActiveSession roots/list fallback: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SessionMgr accessor
+// ---------------------------------------------------------------------------
+
+func TestSessionMgr_NonNil(t *testing.T) {
+	o := newMinimalOwner()
+	o.sessionMgr = NewSessionManager()
+
+	if o.SessionMgr() == nil {
+		t.Error("SessionMgr() returned nil, want non-nil *SessionManager")
+	}
+	if o.SessionMgr() != o.sessionMgr {
+		t.Error("SessionMgr() returned wrong value")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// parseMsg — test helper: wraps jsonrpc.Parse for concise test code
+// ---------------------------------------------------------------------------
+
+func parseMsg(raw []byte) (*jsonrpc.Message, error) {
+	return jsonrpc.Parse(raw)
 }
