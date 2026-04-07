@@ -265,3 +265,80 @@ func TestSnapshotOwnerWithClassification(t *testing.T) {
 		t.Errorf("sessions = %d, want 1", len(snap.Sessions))
 	}
 }
+
+func TestGracefulRestartCycle(t *testing.T) {
+	// Phase 1: Create daemon with a real owner
+	d1 := testDaemon(t)
+	req := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "cwd",
+	}
+	_, sid, _, err := d1.Spawn(req)
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+
+	// Wait for proactive init to complete (init response cached)
+	d1.mu.RLock()
+	entry := d1.owners[sid]
+	d1.mu.RUnlock()
+	if entry != nil && entry.Owner != nil {
+		select {
+		case <-entry.Owner.InitReady():
+		case <-time.After(10 * time.Second):
+			t.Fatal("timeout waiting for init")
+		}
+		entry.Owner.MarkClassified()
+	}
+
+	// Phase 2: Serialize snapshot (graceful restart)
+	snapshotPath, err := d1.SerializeSnapshot()
+	if err != nil {
+		t.Fatalf("SerializeSnapshot() error: %v", err)
+	}
+
+	// Verify snapshot file exists
+	if _, err := os.Stat(snapshotPath); err != nil {
+		t.Fatalf("snapshot file not found: %v", err)
+	}
+
+	// Phase 3: Shutdown old daemon
+	d1.Shutdown()
+
+	// Phase 4: New daemon loads snapshot automatically in New()
+	d2 := testDaemon(t)
+
+	// Verify owner was restored (loaded by New → loadSnapshot)
+	d2.mu.RLock()
+	ownerCount := len(d2.owners)
+	var restoredEntry *OwnerEntry
+	for _, e := range d2.owners {
+		restoredEntry = e
+		break
+	}
+	d2.mu.RUnlock()
+
+	if ownerCount != 1 {
+		t.Fatalf("daemon has %d owners after snapshot load, want 1", ownerCount)
+	}
+	if restoredEntry == nil || restoredEntry.Owner == nil {
+		t.Fatal("restored owner is nil")
+	}
+	if restoredEntry.Command != "go" {
+		t.Errorf("restored command = %q, want %q", restoredEntry.Command, "go")
+	}
+
+	// Verify snapshot file was consumed (deleted)
+	if _, err := os.Stat(SnapshotPath()); !os.IsNotExist(err) {
+		t.Error("snapshot file should be consumed after load")
+	}
+
+	// Verify restored owner has InitSuccess (cached init from snapshot)
+	if !restoredEntry.Owner.InitSuccess() {
+		t.Error("restored owner should have InitSuccess=true from snapshot cache")
+	}
+
+	d2.Shutdown()
+}
