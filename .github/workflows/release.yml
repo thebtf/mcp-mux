@@ -64,11 +64,18 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Create release
+      - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${GITHUB_REF_NAME} \
-            --title "mcp-mux ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            artifacts/mcp-mux-*
+          # Create release if it doesn't exist yet, otherwise just upload assets
+          if gh release view ${GITHUB_REF_NAME} >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} exists, uploading binaries"
+            gh release upload ${GITHUB_REF_NAME} artifacts/mcp-mux-* --clobber
+          else
+            echo "Creating release ${GITHUB_REF_NAME}"
+            gh release create ${GITHUB_REF_NAME} \
+              --title "mcp-mux ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              artifacts/mcp-mux-*
+          fi
