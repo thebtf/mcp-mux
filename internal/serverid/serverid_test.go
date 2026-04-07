@@ -126,15 +126,12 @@ func TestFindGitRootWorktree(t *testing.T) {
 	}
 
 	got := findGitRoot(worktreeDir)
-	// Should resolve to mainRepo, not worktreeDir
-	wantAbs, _ := filepath.Abs(mainRepo)
-	gotAbs, _ := filepath.Abs(got)
-	if runtime.GOOS == "windows" {
-		wantAbs = strings.ToLower(wantAbs)
-		gotAbs = strings.ToLower(gotAbs)
-	}
-	if gotAbs != wantAbs {
-		t.Errorf("findGitRoot(worktree) = %q, want %q", got, mainRepo)
+	// Should resolve to mainRepo, not worktreeDir.
+	// Use CanonicalizePath on both sides: macOS /var → /private/var symlink.
+	wantCanon := CanonicalizePath(mainRepo)
+	gotCanon := CanonicalizePath(got)
+	if gotCanon != wantCanon {
+		t.Errorf("findGitRoot(worktree) = %q (canon: %q), want %q (canon: %q)", got, gotCanon, mainRepo, wantCanon)
 	}
 }
 
@@ -161,14 +158,10 @@ func TestFindGitRootWorktreeSubdir(t *testing.T) {
 
 	// Searching from a subdirectory of a worktree should still find main repo
 	got := findGitRoot(sub)
-	wantAbs, _ := filepath.Abs(mainRepo)
-	gotAbs, _ := filepath.Abs(got)
-	if runtime.GOOS == "windows" {
-		wantAbs = strings.ToLower(wantAbs)
-		gotAbs = strings.ToLower(gotAbs)
-	}
-	if gotAbs != wantAbs {
-		t.Errorf("findGitRoot(worktree/sub) = %q, want %q", got, mainRepo)
+	wantCanon := CanonicalizePath(mainRepo)
+	gotCanon := CanonicalizePath(got)
+	if gotCanon != wantCanon {
+		t.Errorf("findGitRoot(worktree/sub) = %q (canon: %q), want %q (canon: %q)", got, gotCanon, mainRepo, wantCanon)
 	}
 }
 
