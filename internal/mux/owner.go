@@ -756,6 +756,9 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 		return fmt.Errorf("deremap response id: %w", err)
 	}
 
+	o.logger.Printf("response routing: id=%s → session %d (original id=%s)",
+		string(msg.ID), result.SessionID, string(result.OriginalID))
+
 	// Replace the remapped ID with the original
 	restored, err := jsonrpc.ReplaceID(msg.Raw, result.OriginalID)
 	if err != nil {
@@ -772,7 +775,12 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 		return nil
 	}
 
-	return session.WriteRaw(restored)
+	if err := session.WriteRaw(restored); err != nil {
+		o.logger.Printf("session %d: response write error: %v", result.SessionID, err)
+		return err
+	}
+	o.logger.Printf("session %d: response delivered (%d bytes)", result.SessionID, len(restored))
+	return nil
 }
 
 // handleUpstreamRequest handles server→client requests from the upstream.
