@@ -84,6 +84,8 @@ type Owner struct {
 	classificationReason []string // tool names that triggered isolation
 	classified           chan struct{} // closed when autoClassification is first set
 	classifiedOnce       sync.Once
+	initReady            chan struct{} // closed when initialize response is cached or upstream dies
+	initReadyOnce        sync.Once
 
 	sessionMgr       *SessionManager
 	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
@@ -183,6 +185,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		sessionMgr:         NewSessionManager(),
 		tokenHandshake:     cfg.TokenHandshake,
 		classified:         make(chan struct{}),
+		initReady:          make(chan struct{}),
 		progressOwners:     make(map[string]int),
 		startTime:          time.Now(),
 		listenerDone:       make(chan struct{}),
@@ -203,6 +206,11 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	// Start reading from upstream
 	go o.readUpstream()
 
+	// Send proactive initialize to upstream so init response is cached
+	// before any session connects. Without this, Daemon.Spawn blocks on
+	// InitReady() but init requires a session to send the request — deadlock.
+	go o.sendProactiveInit()
+
 	// Start accepting IPC connections
 	go o.acceptLoop()
 
@@ -210,6 +218,12 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	go func() {
 		<-proc.Done
 		logger.Printf("upstream exited: %v", proc.ExitErr)
+		// Signal init-ready so Daemon.Spawn doesn't block forever on crashed upstream
+		o.initReadyOnce.Do(func() {
+			if o.initReady != nil {
+				close(o.initReady)
+			}
+		})
 		if o.onUpstreamExit != nil {
 			o.onUpstreamExit(o.serverID)
 		} else {
@@ -417,6 +431,59 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 	default:
 		return fmt.Errorf("unexpected message type from downstream: %s", msg.Type)
 	}
+}
+
+// sendProactiveInit sends an initialize request to the upstream immediately after
+// starting, without waiting for a session to connect. This enables the init-ready
+// gate: Daemon.Spawn blocks until init is cached, but init requires a request.
+// The response is cached by handleUpstreamMessage → cacheResponse("initialize"),
+// which closes initReady. Subsequent sessions get instant cached replay.
+//
+// Also sends notifications/initialized and tools/list to pre-populate caches.
+func (o *Owner) sendProactiveInit() {
+	initReq := `{"jsonrpc":"2.0","id":"mux-init-0","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"mcp-mux","version":"1.0.0"}}}`
+
+	// Tag the request so handleUpstreamMessage caches the response.
+	// Key must match string(msg.ID) which includes JSON quotes: "\"mux-init-0\"".
+	o.methodTags.Store(`"mux-init-0"`, "initialize")
+	o.pendingRequests.Add(1)
+
+	if err := o.upstream.WriteLine([]byte(initReq)); err != nil {
+		o.logger.Printf("proactive init: write failed: %v", err)
+		return
+	}
+	// Do NOT capture fingerprint from proactive init — let the first real
+	// session's initialize capture it. Our synthetic protocolVersion may
+	// differ from what CC actually sends, causing fingerprint mismatches.
+	o.logger.Printf("proactive init: sent initialize request")
+
+	// After init response is cached (signaled by initReady), send the
+	// followup notifications/initialized + tools/list to pre-populate caches.
+	go func() {
+		select {
+		case <-o.initReady:
+		case <-o.done:
+			return
+		}
+		if !o.InitSuccess() {
+			return
+		}
+
+		// Send notifications/initialized (required by MCP after initialize)
+		notif := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
+		if err := o.upstream.WriteLine([]byte(notif)); err != nil {
+			o.logger.Printf("proactive init: notifications/initialized failed: %v", err)
+			return
+		}
+
+		// Request tools/list to pre-populate tool cache + trigger classification
+		toolsReq := `{"jsonrpc":"2.0","id":"mux-init-1","method":"tools/list","params":{}}`
+		o.methodTags.Store(`"mux-init-1"`, "tools/list")
+		o.pendingRequests.Add(1)
+		if err := o.upstream.WriteLine([]byte(toolsReq)); err != nil {
+			o.logger.Printf("proactive init: tools/list failed: %v", err)
+		}
+	}()
 }
 
 // readUpstream reads responses from the upstream and routes them to the correct session.
@@ -962,6 +1029,23 @@ func (o *Owner) IsAccepting() bool {
 	}
 }
 
+// InitReady returns a channel that is closed when the owner's upstream has responded
+// to the first initialize request (response cached for replay) OR the upstream has
+// exited. Used by Daemon.Spawn to block until the server is ready, preventing CC
+// from timing out on slow-starting upstreams.
+func (o *Owner) InitReady() <-chan struct{} {
+	return o.initReady
+}
+
+// InitSuccess returns true if the initialize response was successfully cached.
+// Returns false if the upstream exited before responding to initialize.
+// Must only be called after InitReady() is closed.
+func (o *Owner) InitSuccess() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.initDone
+}
+
 // Classified returns a channel that is closed when the owner's auto-classification
 // is determined (shared, isolated, or session-aware). Used by daemon's findSharedOwner
 // to wait for classification before dedup decision.
@@ -1129,6 +1213,11 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	o.logger.Printf("cached %s response (%d bytes)", method, len(cached))
 
 	if method == "initialize" {
+		o.initReadyOnce.Do(func() {
+			if o.initReady != nil {
+				close(o.initReady)
+			}
+		})
 		o.classifyFromCapabilities(cached)
 		o.checkPersistent(cached)
 	}

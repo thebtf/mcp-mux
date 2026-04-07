@@ -304,6 +304,33 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 
 	owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 	d.logger.Printf("spawned owner %s for %s %v", sid[:8], req.Command, req.Args)
+
+	// Wait for the upstream to respond to initialize before returning IPC path.
+	// Without this, the shim connects and CC sends a probe, but the upstream
+	// hasn't started yet. CC times out (~5-10s) and kills the shim, leaving
+	// the owner with 0 sessions → reaper kills it → CC retries → infinite loop.
+	// By blocking here, the shim stays alive (CC sees the process as "starting"),
+	// and when we return, init is cached for instant replay.
+	d.logger.Printf("owner %s: waiting for upstream init...", sid[:8])
+	select {
+	case <-owner.InitReady():
+		if !owner.InitSuccess() {
+			// Upstream died before responding to initialize
+			d.mu.Lock()
+			delete(d.owners, sid)
+			d.mu.Unlock()
+			owner.Shutdown()
+			return "", "", "", fmt.Errorf("spawn %s: upstream exited before init", req.Command)
+		}
+		d.logger.Printf("owner %s: init ready, returning IPC path", sid[:8])
+	case <-time.After(60 * time.Second):
+		d.mu.Lock()
+		delete(d.owners, sid)
+		d.mu.Unlock()
+		owner.Shutdown()
+		return "", "", "", fmt.Errorf("spawn %s: init timeout (60s)", req.Command)
+	}
+
 	return ipcPath, sid, token, nil
 }
 
