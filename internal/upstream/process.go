@@ -87,9 +87,11 @@ func Start(command string, args []string, env map[string]string, cwd string) (*P
 	}()
 
 	// Forward stderr to logger (prefix with [upstream]) so diagnostics are visible.
+	// Buffer must be large enough for long lines (MSBuild paths, NuGet restore logs).
+	// If scanner stops reading (line too long), stderr pipe fills → upstream blocks.
 	go func() {
 		scanner := bufio.NewScanner(stderr)
-		scanner.Buffer(make([]byte, 4096), 4096)
+		scanner.Buffer(make([]byte, 64*1024), 64*1024) // 64KB — handles any build output line
 		for scanner.Scan() {
 			fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", p.cmd.Process.Pid, scanner.Text())
 		}

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -108,7 +109,20 @@ func main() {
 	ipcPath := serverid.IPCPath(sid)
 	controlPath := serverid.ControlPath(sid)
 
-	logger := log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags)
+	// Log to stderr (CC captures) + optionally to file for debugging shim issues.
+	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
+	var logger *log.Logger
+	if shimLogPath := os.Getenv("MCP_MUX_SHIM_LOG"); shimLogPath != "" {
+		f, err := os.OpenFile(shimLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			multi := io.MultiWriter(os.Stderr, f)
+			logger = log.New(multi, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds)
+		} else {
+			logger = log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags)
+		}
+	} else {
+		logger = log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags)
+	}
 
 	// In isolated mode, always become owner (skip IPC check)
 	if *isolated {
