@@ -52,9 +52,11 @@ type resilientClient struct {
 	token      string     // current handshake token; updated on reconnect
 	msgFromCC  chan []byte // stdin → proxy (buffered 1000)
 	msgFromIPC chan []byte // ipc → stdout (buffered 1000)
-	ipcEOF     chan struct{} // closed when IPC reader detects EOF/error
-	initCache  initCache
-	log        *log.Logger
+	ipcEOF      chan struct{} // closed when IPC reader detects EOF/error
+	stdoutDead  chan struct{} // closed when CC stdout pipe breaks
+	stdoutOnce  sync.Once    // ensures stdoutDead is closed once
+	initCache   initCache
+	log         *log.Logger
 }
 
 // ErrReconnectExit is returned by reconnect when the shim should exit
@@ -90,6 +92,7 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 		msgFromCC:  make(chan []byte, msgFromCCBufferSize),
 		msgFromIPC: make(chan []byte, msgFromIPCBufferSize),
 		ipcEOF:     make(chan struct{}),
+		stdoutDead: make(chan struct{}),
 		log:        logger,
 	}
 
@@ -173,7 +176,9 @@ func (rc *resilientClient) runStdoutWriter(mu *sync.Mutex) {
 		_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", data)
 		mu.Unlock()
 		if err != nil {
-			rc.log.Printf("resilient: stdout write error: %v", err)
+			rc.log.Printf("resilient: stdout broken (CC gone): %v", err)
+			rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
+			return
 		}
 	}
 }
@@ -200,7 +205,7 @@ func (rc *resilientClient) runProxy(conn interface {
 		writerDone := make(chan struct{})
 		go rc.runIPCWriter(conn, ipcEOF, writerDone)
 
-		// Wait for: IPC EOF (reconnect needed) or CC stdin EOF (exit).
+		// Wait for: IPC EOF (reconnect), CC stdin EOF (exit), or stdout dead (CC gone).
 		select {
 		case err := <-stdinDone:
 			// CC disconnected — clean up and exit.
@@ -209,6 +214,12 @@ func (rc *resilientClient) runProxy(conn interface {
 				return nil
 			}
 			return fmt.Errorf("resilient: stdin: %w", err)
+
+		case <-rc.stdoutDead:
+			// CC stdout pipe broken — CC is gone. Exit to prevent zombie shim.
+			conn.Close()
+			rc.log.Printf("resilient: CC stdout dead, exiting")
+			return nil
 
 		case <-ipcEOF:
 			// IPC broken — enter RECONNECTING state.
@@ -331,10 +342,11 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 			_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", ka)
 			stdoutMu.Unlock()
 			if err != nil {
-				rc.log.Printf("resilient: keepalive write error: %v", err)
-			} else {
-				rc.log.Printf("resilient: sent keepalive %d", keepaliveN)
+				// CC stdout broken pipe — CC is gone, exit to prevent zombie shim.
+				rc.log.Printf("resilient: keepalive write failed (CC gone): %v", err)
+				return nil, fmt.Errorf("resilient: CC stdout closed")
 			}
+			rc.log.Printf("resilient: sent keepalive %d", keepaliveN)
 
 		case <-pollTicker.C:
 			if pending {
