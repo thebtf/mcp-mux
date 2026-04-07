@@ -864,8 +864,13 @@ func (o *Owner) routeToLastActiveSession(msg *jsonrpc.Message) error {
 	}
 
 	session := ctx.Session
-	o.logger.Printf("routing server request %s to session %d", msg.Method, session.ID)
-	return session.WriteRaw(msg.Raw)
+	o.logger.Printf("routing server request %s to session %d (async)", msg.Method, session.ID)
+	// Use async SendNotification to prevent blocking readUpstream.
+	// Server→client requests (roots/list, sampling) go through the notification
+	// channel so upstream can continue producing output. The session's drain
+	// goroutine delivers it to CC, and CC responds when ready.
+	session.SendNotification(msg.Raw)
+	return nil
 }
 
 // respondToElicitationCancel sends an elicitation cancel response to upstream.

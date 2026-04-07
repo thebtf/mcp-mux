@@ -1157,6 +1157,9 @@ func TestRouteToLastActiveSession_RoutesToActiveSession(t *testing.T) {
 		t.Errorf("routeToLastActiveSession: %v", err)
 	}
 
+	// Delivery is async via notification channel — wait for drain goroutine
+	time.Sleep(50 * time.Millisecond)
+
 	// Session should have received the message
 	if !strings.Contains(buf.String(), "roots/list") {
 		t.Errorf("routeToLastActiveSession: session did not receive message; got: %s", buf.String())
