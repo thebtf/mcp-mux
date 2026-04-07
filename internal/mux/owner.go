@@ -349,6 +349,24 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			return s.WriteRaw([]byte(errResp))
 		}
 
+		// For initialize requests: if proactive init is in progress but not yet
+		// cached, wait for it. This blocks the init RESPONSE (normal MCP behavior)
+		// instead of blocking the process startup (which CC times out on).
+		if msg.Method == "initialize" {
+			o.mu.RLock()
+			done := o.initDone
+			o.mu.RUnlock()
+			if !done {
+				o.logger.Printf("session %d: waiting for proactive init to complete", s.ID)
+				select {
+				case <-o.initReady:
+					o.logger.Printf("session %d: proactive init completed, replaying", s.ID)
+				case <-o.done:
+					return fmt.Errorf("owner shutting down while waiting for init")
+				}
+			}
+		}
+
 		// Replay from cache if available (avoids upstream round-trip)
 		if cached := o.getCachedResponse(msg.Method); cached != nil {
 			// For initialize: verify protocolVersion matches before replaying

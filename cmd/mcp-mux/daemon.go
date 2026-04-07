@@ -179,9 +179,8 @@ func startDaemonProcess() error {
 func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
 	ctlPath := serverid.DaemonControlPath()
 
-	// Spawn now blocks until upstream responds to initialize (init-ready gate).
-	// Slow upstreams (uvx serena ~15s, uvx time ~8s) need the full wait.
-	// 90s accommodates: daemon processing + upstream startup + init response.
+	// Spawn returns immediately after creating the owner — proactive init runs
+	// in background. 30s timeout covers daemon processing + upstream process start.
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:     "spawn",
 		Command: command,
@@ -189,7 +188,7 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 		Cwd:     cwd,
 		Mode:    mode,
 		Env:     env,
-	}, 90*time.Second)
+	}, 30*time.Second)
 	if err != nil {
 		return "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
