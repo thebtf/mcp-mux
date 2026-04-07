@@ -814,6 +814,42 @@ func (o *Owner) HandleStatus() map[string]any {
 	return o.Status()
 }
 
+// evictExtraSessions disconnects all sessions except the first one.
+// Called when an owner is reclassified as isolated after optimistic dedup
+// connected multiple sessions. Evicted sessions get IPC EOF → their shims
+// reconnect → daemon spawns separate owners for each.
+func (o *Owner) evictExtraSessions() {
+	o.mu.Lock()
+	if len(o.sessions) <= 1 {
+		o.mu.Unlock()
+		return
+	}
+
+	// Find the lowest session ID (first connected) — keep it.
+	keepID := -1
+	for id := range o.sessions {
+		if keepID == -1 || id < keepID {
+			keepID = id
+		}
+	}
+
+	// Collect sessions to evict.
+	var evict []*Session
+	for id, s := range o.sessions {
+		if id != keepID {
+			evict = append(evict, s)
+		}
+	}
+	o.mu.Unlock()
+
+	if len(evict) > 0 {
+		o.logger.Printf("evicting %d extra sessions (keeping session %d) — server classified isolated after dedup", len(evict), keepID)
+	}
+	for _, s := range evict {
+		s.Close() // triggers IPC EOF → shim reconnects → gets own owner
+	}
+}
+
 // closeListener stops the IPC listener and removes the socket file.
 // Safe to call multiple times (uses sync.Once).
 func (o *Owner) closeListener() {
@@ -1227,6 +1263,9 @@ func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 		o.logger.Printf("auto-classification: ISOLATED (matched: %v)", matched)
 		o.logger.Printf("closing IPC listener — server requires per-session isolation")
 		o.closeListener()
+		// Disconnect extra sessions that were dedup'd before classification.
+		// Keep only the first session — others will reconnect and get their own owner.
+		o.evictExtraSessions()
 	} else {
 		o.logger.Printf("auto-classification: SHARED")
 	}
