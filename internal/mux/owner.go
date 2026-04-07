@@ -1620,7 +1620,15 @@ func (o *Owner) initFingerprintMatches(raw []byte) bool {
 
 // classifyFromCapabilities extracts x-mux capability from the cached initialize
 // response and sets the classification. Has priority over tool-name classification.
+// Skipped if already classified (snapshot restore, duplicate proactive init).
 func (o *Owner) classifyFromCapabilities(initJSON []byte) {
+	o.mu.RLock()
+	alreadyClassified := o.classificationSource != ""
+	o.mu.RUnlock()
+	if alreadyClassified {
+		return
+	}
+
 	mode, ok := classify.ClassifyCapabilities(initJSON)
 	if !ok {
 		return // no x-mux capability — will fall back to tool classification
@@ -1647,13 +1655,14 @@ func (o *Owner) classifyFromCapabilities(initJSON []byte) {
 }
 
 // classifyFromToolList runs the auto-classifier on a cached tools/list response.
-// Skipped if x-mux capability already provided classification (capability has priority).
+// Skipped if classification already determined (capability has priority, snapshot
+// restores classification, duplicate proactive init responses are ignored).
 func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 	o.mu.RLock()
-	alreadyClassified := o.classificationSource == "capability"
+	alreadyClassified := o.classificationSource != ""
 	o.mu.RUnlock()
 	if alreadyClassified {
-		o.logger.Printf("skipping tool classification — x-mux capability takes priority")
+		o.logger.Printf("skipping tool classification — already classified via %s", o.classificationSource)
 		return
 	}
 
