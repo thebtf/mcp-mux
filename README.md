@@ -166,6 +166,18 @@ Cache entries are invalidated when the upstream sends the corresponding `*_chang
 For `initialize`, the cache is keyed on `protocolVersion`. A new client using a different protocol
 version bypasses the cache and goes to the upstream directly.
 
+## Proactive Init
+
+When a new owner is created, mcp-mux sends a synthetic `initialize` request to the upstream
+immediately — before any CC session connects. This pre-populates the response cache so the first
+session gets an instant cached replay instead of waiting for the upstream to start.
+
+For slow-starting servers (serena via uvx ~3s, tavily via npx ~5s), this eliminates the CC
+"failed" status that occurred when the upstream couldn't respond within CC's startup timeout.
+
+The proactive init also sends `notifications/initialized` and `tools/list` to warm the full
+cache and trigger auto-classification.
+
 ## Daemon Mode
 
 The daemon is enabled by default. It starts automatically when the first mcp-mux shim connects and
@@ -253,24 +265,44 @@ mcp-mux daemon
 mcp-mux serve
 ```
 
-## Atomic Upgrade
+## Atomic Upgrade with Graceful Restart
 
-Upgrading the mcp-mux binary while sessions are active is safe:
+Upgrading the mcp-mux binary while sessions are active is safe and fast:
 
 ```sh
-# 1. Build new binary to a staging path
-go build -o mcp-mux.exe~ ./cmd/mcp-mux
+# One-command upgrade with graceful restart
+go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
+```
 
-# 2. Swap atomically — stops active sessions, replaces binary, leaves upstream processes intact
+**What happens:**
+
+1. Binary swap: `current` → `.old`, `pending~` → `current` (atomic rename)
+2. Graceful restart: daemon serializes state snapshot (cached init/tools/prompts/resources
+   responses, classification, session metadata) to a JSON file
+3. Daemon shuts down, shims detect IPC EOF
+4. Shims auto-reconnect, starting a new daemon from the updated binary
+5. New daemon loads snapshot → owners restored with pre-populated caches
+6. Shims get instant cached replay (~1 second reconnect vs 5-15 second cold start)
+
+**Without `--restart`** (hot swap only):
+
+```sh
 mcp-mux upgrade
 ```
 
-`upgrade` performs an atomic file rename using a two-step rename dance
-(`current` → `.old`, `pending~` → `current`). If the pending binary is missing or the rename
-fails, `upgrade` exits with an error and the existing binary is untouched.
+The daemon keeps running with the old binary. New shim processes use the new binary.
+The daemon updates on next natural restart.
 
-After upgrade, MCP servers restart automatically on the next CC tool call — the shim reconnects
-to a new daemon started by the new binary.
+**Graceful restart preserves:**
+
+- Cached MCP responses (init, tools, prompts, resources)
+- Server classification (shared/isolated/session-aware)
+- Session metadata (cwd, env)
+
+**Not preserved** (by design):
+
+- In-flight requests (get error response, retry automatically)
+- Upstream process state (re-spawned in background with proactive init)
 
 ## Configuration
 
@@ -304,7 +336,7 @@ any other server:
 
 | Tool | Description |
 |------|-------------|
-| `mux_list` | Returns running instances for the **current project** (filtered by caller's cwd). Pass `all: true` to list instances across all projects. Includes server ID, PID, session count, pending requests, classification, and cache status. |
+| `mux_list` | Returns running instances for the **current project** (filtered by caller's cwd). Pass `all: true` to list instances across all projects. Includes server ID, PID, session count, pending requests, classification, and cache status. With `verbose: true`, includes inflight request details: method, tool name, session, elapsed time. |
 | `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. |
 | `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux, not another project's). Connected sessions reconnect automatically on their next tool call. |
 
@@ -352,8 +384,11 @@ from:
 { "x-mux": { "sharing": "shared", "stateless": true } }
 ```
 
-For session-aware servers, mcp-mux injects `_meta.muxSessionId` (format: `sess_` + 8 hex chars)
-into every request. Use it to partition in-process state by session:
+For session-aware servers, mcp-mux injects into every request:
+
+- `_meta.muxSessionId` — unique session identifier (format: `sess_` + 8 hex chars)
+- `_meta.muxCwd` — the CC session's project directory (for `--project-from-cwd` servers)
+- `_meta.muxEnv` — per-session environment variable diff (API keys, config paths)
 
 ```json
 { "x-mux": { "sharing": "session-aware" } }
@@ -368,6 +403,33 @@ background indexing), declare persistence:
 
 Full protocol specification including implementation examples (TypeScript, Python, Go) and
 migration path: [`docs/mux-protocol.md`](docs/mux-protocol.md).
+
+## Smoke Testing
+
+mcp-mux includes a smoke test that validates mux-specific behavior with real upstream servers:
+
+```sh
+# Basic: verify serena works through mux
+SMOKE_CWD=D:/Dev/my-project SMOKE_EXPECT=isolated \
+  go run testdata/smoke_isolated.go uvx --from git+https://github.com/oraios/serena \
+  serena start-mcp-server --project-from-cwd
+
+# Isolation check: two projects get separate owners
+SMOKE_CWD=D:/Dev/project-a SMOKE_CWD2=D:/Dev/project-b SMOKE_EXPECT=isolated \
+  go run testdata/smoke_isolated.go uvx --from serena ...
+
+# With tool call
+SMOKE_CWD=D:/Dev/my-project SMOKE_TOOL=activate_project \
+  go run testdata/smoke_isolated.go uvx --from serena ...
+```
+
+**What it validates** (mux behavior, not upstream correctness):
+
+- Spawn via daemon with proactive init
+- Classification matches expected mode
+- Session isolation: different cwds → different owners for isolated servers
+- Init response forwarded correctly through mux
+- Optional: tool call forwarded and response returned
 
 ## Contributing
 
