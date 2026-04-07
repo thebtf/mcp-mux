@@ -226,10 +226,24 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
 			return entry.Owner.IPCPath(), sid, token, nil
 		}
-		// Owner exists but IPC listener is closed (isolated server) — remove and re-spawn.
+		// Owner exists but IPC listener is closed (isolated server).
+		// If owner still has active sessions (in-flight requests), DON'T kill it —
+		// that would break the active session's pipe mid-request (BrokenResourceError).
+		// Leave the old owner alive and fall through to create a NEW isolated owner
+		// with a fresh server ID.
+		if entry.Owner.SessionCount() > 0 {
+			d.logger.Printf("owner %s not accepting but has %d active sessions, leaving alive",
+				sid[:8], entry.Owner.SessionCount())
+			// DON'T delete or shutdown. Fall through — new owner will get a unique
+			// isolated ID from serverid.ModeIsolated below.
+			d.mu.Unlock()
+			// Force isolated mode for the new spawn so it gets a unique server ID
+			req.Mode = "isolated"
+			return d.Spawn(req)
+		}
 		entry.Owner.Shutdown()
 		delete(d.owners, sid)
-		d.logger.Printf("owner %s not accepting (isolated), re-spawning", sid[:8])
+		d.logger.Printf("owner %s not accepting (isolated, 0 sessions), re-spawning", sid[:8])
 	}
 
 	// 2. Global dedup: if an accepting owner for same command+args exists (any cwd), reuse it.
