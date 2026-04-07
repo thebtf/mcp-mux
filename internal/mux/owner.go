@@ -53,6 +53,15 @@ func initVersion() string {
 	return rev + dirty
 }
 
+// InflightRequest holds metadata about a request currently being processed by upstream.
+// Used for observability: mux_list --verbose shows what's pending and for how long.
+type InflightRequest struct {
+	Method    string    `json:"method"`
+	Tool      string    `json:"tool,omitempty"`
+	SessionID int       `json:"session"`
+	StartTime time.Time `json:"started_at"`
+}
+
 // Owner is the multiplexer core. It manages a single upstream process and
 // routes requests from multiple downstream sessions through it.
 type Owner struct {
@@ -94,6 +103,7 @@ type Owner struct {
 
 	upstreamDead    atomic.Bool // set when upstream exits; prevents sending to dead pipe
 	methodTags      sync.Map // remapped request ID (string) -> method name
+	inflightTracker sync.Map // remapped request ID (string) -> *InflightRequest
 	pendingRequests atomic.Int64
 	startTime       time.Time
 	controlServer   *control.Server
@@ -450,6 +460,20 @@ func Base64Decode(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
 }
 
+// extractToolName extracts params.name from a tools/call JSON-RPC request.
+// Returns empty string for non-tools/call requests or malformed params.
+func extractToolName(raw []byte) string {
+	var req struct {
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(raw, &req) == nil && req.Params.Name != "" {
+		return req.Params.Name
+	}
+	return ""
+}
+
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
@@ -542,6 +566,14 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			o.pendingRequests.Add(-1) // undo increment on error
 			return fmt.Errorf("remap request: %w", err)
 		}
+
+		// Track inflight request for observability (mux_list --verbose)
+		o.inflightTracker.Store(string(newID), &InflightRequest{
+			Method:    msg.Method,
+			Tool:      extractToolName(msg.Raw),
+			SessionID: s.ID,
+			StartTime: time.Now(),
+		})
 
 		// Tag cacheable methods for response interception
 		if msg.Method == "initialize" || msg.Method == "tools/list" ||
@@ -708,8 +740,9 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
 	}
 
-	// Decrement pending counter before routing (handles disconnected sessions too)
+	// Decrement pending counter and remove inflight tracking
 	o.pendingRequests.Add(-1)
+	o.inflightTracker.Delete(string(msg.ID))
 	o.sessionMgr.CompleteRequest(string(msg.ID))
 
 	// Cache response if this was a tagged cacheable request
@@ -1145,6 +1178,7 @@ func (o *Owner) drainInflightRequests() {
 			o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
 		}
 		o.pendingRequests.Add(-1)
+		o.inflightTracker.Delete(entry.RemappedID)
 	}
 }
 
@@ -1324,6 +1358,23 @@ func (o *Owner) Status() map[string]any {
 		if len(reason) > 0 {
 			status["classification_reason"] = reason
 		}
+	}
+
+	// Include inflight request details when requests are pending
+	var inflight []map[string]any
+	o.inflightTracker.Range(func(key, value any) bool {
+		req := value.(*InflightRequest)
+		inflight = append(inflight, map[string]any{
+			"method":          req.Method,
+			"tool":            req.Tool,
+			"session":         req.SessionID,
+			"started_at":      req.StartTime.UTC().Format(time.RFC3339Nano),
+			"elapsed_seconds": time.Since(req.StartTime).Seconds(),
+		})
+		return true
+	})
+	if len(inflight) > 0 {
+		status["inflight"] = inflight
 	}
 
 	return status
