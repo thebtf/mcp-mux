@@ -3,11 +3,13 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/mux"
+	"github.com/thebtf/mcp-mux/internal/serverid"
 )
 
 const (
@@ -147,4 +149,74 @@ func DeserializeSnapshot(logger interface{ Printf(string, ...any) }) (*DaemonSna
 	logger.Printf("snapshot loaded: %d owners, %d sessions (version %d, age %.1fs)",
 		len(snapshot.Owners), len(snapshot.Sessions), snapshot.Version, time.Since(ts).Seconds())
 	return &snapshot, nil
+}
+
+// loadSnapshot checks for a snapshot file and restores owners from it.
+// Called on daemon startup. If no snapshot exists, returns 0 (cold start).
+// Returns the number of owners restored.
+func (d *Daemon) loadSnapshot() int {
+	snap, err := DeserializeSnapshot(d.logger)
+	if err != nil {
+		d.logger.Printf("snapshot load error: %v", err)
+		return 0
+	}
+	if snap == nil {
+		return 0 // cold start
+	}
+
+	restored := 0
+	for _, ownerSnap := range snap.Owners {
+		sid := ownerSnap.ServerID
+		ipcPath := serverid.IPCPath(sid)
+		controlPath := serverid.ControlPath(sid)
+
+		owner, err := mux.NewOwnerFromSnapshot(mux.OwnerConfig{
+			Command:     ownerSnap.Command,
+			Args:        ownerSnap.Args,
+			Env:         ownerSnap.Env,
+			Cwd:         ownerSnap.Cwd,
+			IPCPath:     ipcPath,
+			ControlPath: controlPath,
+			ServerID:    sid,
+			TokenHandshake: true,
+			OnZeroSessions: func(serverID string) {
+				d.onZeroSessions(serverID)
+			},
+			OnUpstreamExit: func(serverID string) {
+				d.onUpstreamExit(serverID)
+			},
+			OnPersistentDetected: func(serverID string) {
+				d.SetPersistent(serverID, true)
+			},
+			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
+		}, ownerSnap)
+		if err != nil {
+			d.logger.Printf("snapshot: failed to restore owner %s (%s): %v", sid[:8], ownerSnap.Command, err)
+			continue
+		}
+
+		d.mu.Lock()
+		d.owners[sid] = &OwnerEntry{
+			Owner:       owner,
+			ServerID:    sid,
+			Command:     ownerSnap.Command,
+			Args:        ownerSnap.Args,
+			Cwd:         ownerSnap.Cwd,
+			Mode:        ownerSnap.Mode,
+			Env:         ownerSnap.Env,
+			Persistent:  ownerSnap.Persistent,
+			LastSession: time.Now(),
+			GracePeriod: d.gracePeriod,
+		}
+		d.mu.Unlock()
+
+		// Spawn upstream in background — refreshes caches when ready
+		owner.SpawnUpstreamBackground()
+
+		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)
+		restored++
+	}
+
+	d.logger.Printf("snapshot: restored %d/%d owners", restored, len(snap.Owners))
+	return restored
 }

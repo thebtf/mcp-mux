@@ -107,6 +107,11 @@ func New(cfg Config) (*Daemon, error) {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
 	}
 
+	// Load snapshot from graceful restart (if available)
+	if restored := d.loadSnapshot(); restored > 0 {
+		logger.Printf("startup: restored %d owners from snapshot", restored)
+	}
+
 	return d, nil
 }
 
