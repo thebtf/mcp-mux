@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -58,6 +59,7 @@ type resilientClient struct {
 	stdoutOnce  sync.Once    // ensures stdoutDead is closed once
 	startTime   time.Time    // when the client started (for probe detection)
 	initCache   initCache
+	inflight    sync.Map     // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
 	log         *log.Logger
 }
 
@@ -271,6 +273,11 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 		data := make([]byte, len(line))
 		copy(data, line)
 
+		// Clear inflight tracking when we receive a response (has "id" + "result"/"error")
+		if id := extractResponseID(data); id != "" {
+			rc.inflight.Delete(id)
+		}
+
 		select {
 		case rc.msgFromIPC <- data:
 		default:
@@ -291,6 +298,7 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 // runIPCWriter reads from rc.msgFromCC and writes to the IPC connection.
 // Stops when ipcEOF is closed (preventing writes to a dead connection).
 // Closes writerDone when it exits.
+// Tracks request IDs so orphaned in-flight requests can get error responses on reconnect.
 func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, writerDone chan<- struct{}) {
 	defer close(writerDone)
 	for {
@@ -298,6 +306,10 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 		case <-ipcEOF:
 			return
 		case data := <-rc.msgFromCC:
+			// Track request IDs (messages with "id" field that are not responses)
+			if id := extractRequestID(data); id != "" {
+				rc.inflight.Store(id, true)
+			}
 			_, err := fmt.Fprintf(conn, "%s\n", data)
 			if err != nil {
 				rc.log.Printf("resilient: ipc write error: %v", err)
@@ -407,6 +419,11 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				continue
 			}
 
+			// Send error responses for in-flight requests that were lost
+			// when the old IPC connection died. Without this, CC waits
+			// forever for responses that will never come.
+			rc.drainOrphanedInflight(stdoutMu)
+
 			// Flush buffered CC messages that arrived during RECONNECTING.
 			rc.flushBuffer(conn)
 
@@ -505,4 +522,61 @@ func (rc *resilientClient) flushBuffer(conn io.Writer) {
 			return
 		}
 	}
+}
+
+// drainOrphanedInflight sends JSON-RPC error responses to CC stdout for any
+// requests that were in-flight when the IPC connection died. Without this,
+// CC waits forever for responses that will never come (request was sent to
+// old upstream which was killed during reconnect).
+func (rc *resilientClient) drainOrphanedInflight(stdoutMu *sync.Mutex) {
+	var orphaned []string
+	rc.inflight.Range(func(key, _ any) bool {
+		orphaned = append(orphaned, key.(string))
+		return true
+	})
+	if len(orphaned) == 0 {
+		return
+	}
+
+	rc.log.Printf("resilient: sending error responses for %d orphaned in-flight requests", len(orphaned))
+	for _, id := range orphaned {
+		errResp := fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream restarted, request lost during reconnect"}}`,
+			id,
+		)
+		stdoutMu.Lock()
+		fmt.Fprintf(rc.cfg.Stdout, "%s\n", errResp)
+		stdoutMu.Unlock()
+		rc.inflight.Delete(id)
+	}
+}
+
+// extractRequestID returns the JSON "id" field from a request message (has "method").
+// Returns empty string for notifications (no id) or responses.
+func extractRequestID(data []byte) string {
+	var msg struct {
+		ID     json.RawMessage `json:"id,omitempty"`
+		Method string          `json:"method,omitempty"`
+	}
+	if json.Unmarshal(data, &msg) != nil || msg.Method == "" || msg.ID == nil {
+		return "" // not a request (notification or response)
+	}
+	return string(msg.ID)
+}
+
+// extractResponseID returns the JSON "id" field from a response message (has "result" or "error").
+// Returns empty string for requests or notifications.
+func extractResponseID(data []byte) string {
+	var msg struct {
+		ID     json.RawMessage `json:"id,omitempty"`
+		Result json.RawMessage `json:"result,omitempty"`
+		Error  json.RawMessage `json:"error,omitempty"`
+	}
+	if json.Unmarshal(data, &msg) != nil || msg.ID == nil {
+		return ""
+	}
+	if msg.Result == nil && msg.Error == nil {
+		return "" // request, not response
+	}
+	return string(msg.ID)
 }
