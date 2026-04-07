@@ -8,11 +8,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thebtf/mcp-mux/internal/jsonrpc"
 )
+
+// writeTimeout is the maximum time a write to a session can block before
+// the session is considered dead. Prevents one slow/stuck session from
+// blocking the upstream reader goroutine and stalling all other sessions.
+const writeTimeout = 30 * time.Second
 
 var sessionCounter atomic.Int32
 
@@ -25,6 +32,7 @@ type Session struct {
 	Env          map[string]string // per-session env diff bound via token handshake
 	reader       *jsonrpc.Scanner
 	writer       io.Writer
+	conn         net.Conn  // underlying connection for write deadlines (nil for stdio)
 	closer       io.Closer // underlying connection (net.Conn for IPC sessions, nil for stdio)
 	mu           sync.Mutex // protects writer
 	done         chan struct{}
@@ -38,11 +46,17 @@ func NewSession(r io.Reader, w io.Writer) *Session {
 	if c, ok := r.(io.Closer); ok {
 		closer = c
 	}
+	// Detect net.Conn for write deadline support (IPC sessions)
+	var conn net.Conn
+	if nc, ok := w.(net.Conn); ok {
+		conn = nc
+	}
 	return &Session{
 		ID:           int(sessionCounter.Add(1)),
 		MuxSessionID: generateMuxSessionID(),
 		reader:       jsonrpc.NewScanner(r),
 		writer:       bufio.NewWriter(w),
+		conn:         conn,
 		closer:       closer,
 		done:         make(chan struct{}),
 	}
@@ -71,6 +85,13 @@ func (s *Session) WriteRaw(data []byte) error {
 
 	if s.closed.Load() {
 		return fmt.Errorf("session %d: closed", s.ID)
+	}
+
+	// Set write deadline for IPC sessions to prevent one slow/stuck session
+	// from blocking the upstream reader goroutine (which stalls ALL sessions).
+	if s.conn != nil {
+		_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		defer func() { _ = s.conn.SetWriteDeadline(time.Time{}) }()
 	}
 
 	bw, ok := s.writer.(*bufio.Writer)
