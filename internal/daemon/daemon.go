@@ -451,15 +451,21 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 		if !entry.Owner.IsAccepting() {
 			continue
 		}
-		// Optimistic dedup: return immediately without waiting for classification.
-		// If the owner later classifies as isolated, it closes its IPC listener —
-		// extra sessions get EOF and reconnect with their own owner.
-		// This is correct because:
-		// - Shared servers: dedup works, no evict needed
-		// - Session-aware servers: dedup works, sessions get muxSessionId
-		// - Isolated servers: dedup temporarily, then evict on classification
-		// Waiting for classification here blocks ALL parallel sessions for the
-		// full upstream init time (8s+ for uvx servers), causing CC timeout.
+		// Non-blocking classification check: if already classified, respect it.
+		// If not yet classified, return optimistically (assume shareable).
+		// This avoids both extremes:
+		// - Blocking wait (8s+ for slow upstreams → CC timeout)
+		// - Blind optimistic dedup (returns isolated owners → evict storm)
+		select {
+		case <-entry.Owner.Classified():
+			// Classification known — re-check IsAccepting (may have closed listener)
+			if !entry.Owner.IsAccepting() {
+				continue
+			}
+		default:
+			// Not yet classified — optimistic: assume shareable.
+			// If later classified isolated → evict extra sessions.
+		}
 		return entry
 	}
 	return nil
