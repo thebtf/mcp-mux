@@ -38,6 +38,11 @@ type Process struct {
 func Start(command string, args []string, env map[string]string, cwd string) (*Process, error) {
 	cmd := exec.Command(command, args...)
 
+	// Isolate upstream into its own process group to prevent signal propagation.
+	// On Windows: prevents CTRL_C_EVENT from CC→shim reaching upstream.
+	// On Unix: prevents SIGINT/SIGTERM from propagating to upstream children.
+	setSysProcAttr(cmd)
+
 	// Set working directory if specified
 	if cwd != "" {
 		cmd.Dir = cwd
