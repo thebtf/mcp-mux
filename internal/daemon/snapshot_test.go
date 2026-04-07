@@ -13,6 +13,7 @@ import (
 )
 
 func TestSnapshotRoundTrip(t *testing.T) {
+	os.Remove(SnapshotPath()) // clean stale snapshots from previous runs
 	d := testDaemon(t)
 
 	// Create a real owner via Spawn
@@ -267,6 +268,9 @@ func TestSnapshotOwnerWithClassification(t *testing.T) {
 }
 
 func TestGracefulRestartCycle(t *testing.T) {
+	// Clean any stale snapshot from previous test runs
+	os.Remove(SnapshotPath())
+
 	// Phase 1: Create daemon with a real owner
 	d1 := testDaemon(t)
 	req := control.Request{
