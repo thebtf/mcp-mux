@@ -114,8 +114,14 @@ func (r *Reaper) sweep() int {
 		default:
 		}
 
-		// Non-persistent + zero sessions + grace elapsed → remove
+		// Non-persistent + zero sessions + grace elapsed → remove.
+		// But NOT if upstream has pending requests (long-running tool call
+		// like dotnet build may outlive the session that requested it).
 		if sessions == 0 && !entry.Persistent {
+			pending := entry.Owner.PendingRequests()
+			if pending > 0 {
+				continue // upstream still processing — don't kill it
+			}
 			elapsed := now.Sub(entry.LastSession)
 			if elapsed > entry.GracePeriod {
 				r.logger.Printf("reaper: owner %s grace expired (%.0fs), removing", sid[:8], elapsed.Seconds())
