@@ -489,28 +489,15 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			return o.forwardCancelledNotification(s, msg)
 		}
 		// Forward other notifications as-is to upstream
+		if o.upstream == nil {
+			return nil // snapshot owner — upstream not yet spawned, drop notification
+		}
 		return o.upstream.WriteLine(msg.Raw)
 
 	case msg.IsRequest():
-		// Fail fast if upstream is dead — don't send requests to a dead pipe
-		if o.upstreamDead.Load() {
-			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
-			return s.WriteRaw([]byte(errResp))
-		}
-
-		// For snapshot-restored owners: init is already cached, initReady is
-		// already closed, so getCachedResponse below handles it instantly.
-		// For new owners with proactive init: don't wait here — let the session's
-		// init race with proactive init. Whichever response arrives first is cached;
-		// the other is a harmless duplicate.
-		// Only wait if initReady is ALREADY closed (snapshot mode) but initDone is
-		// false (upstream died before init — edge case).
-		//
-		// The wait is useful for snapshot owners where cache is pre-populated and
-		// the session should get instant replay. For new owners, the session's init
-		// request goes to upstream directly via the normal path below.
-
-		// Replay from cache if available (avoids upstream round-trip)
+		// Replay from cache if available (avoids upstream round-trip).
+		// Check cache BEFORE upstream-dead check: snapshot owners have nil upstream
+		// but valid caches — they must serve from cache, not return error.
 		if cached := o.getCachedResponse(msg.Method); cached != nil {
 			// For initialize: verify protocolVersion matches before replaying
 			if msg.Method == "initialize" && !o.initFingerprintMatches(msg.Raw) {
@@ -519,6 +506,12 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			} else {
 				return o.replayFromCache(s, msg, cached)
 			}
+		}
+
+		// Fail fast if upstream is dead or not yet spawned (snapshot owner without cache hit)
+		if o.upstream == nil || o.upstreamDead.Load() {
+			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
+			return s.WriteRaw([]byte(errResp))
 		}
 
 		// Track pending requests
@@ -913,6 +906,9 @@ func (o *Owner) trackProgressToken(sessionID int, raw []byte) {
 
 // sendRootsListChanged notifies the upstream that roots have changed.
 func (o *Owner) sendRootsListChanged() {
+	if o.upstream == nil {
+		return // snapshot owner — upstream not yet spawned
+	}
 	notification := `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`
 	if err := o.upstream.WriteLine([]byte(notification)); err != nil {
 		o.logger.Printf("failed to send roots/list_changed: %v", err)
@@ -1155,7 +1151,9 @@ func (o *Owner) Shutdown() {
 		o.sessions = make(map[int]*Session)
 		o.mu.Unlock()
 
-		o.upstream.Close()
+		if o.upstream != nil {
+			o.upstream.Close()
+		}
 
 		o.logger.Printf("owner shut down")
 
@@ -1283,7 +1281,7 @@ func (o *Owner) Status() map[string]any {
 
 	status := map[string]any{
 		"mux_version":      Version,
-		"upstream_pid":      o.upstream.PID(),
+		"upstream_pid":      func() int { if o.upstream != nil { return o.upstream.PID() }; return 0 }(),
 		"ipc_path":          o.ipcPath,
 		"command":           o.command,
 		"args":              o.args,

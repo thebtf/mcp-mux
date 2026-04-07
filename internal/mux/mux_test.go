@@ -782,3 +782,146 @@ func assertResponseID(t *testing.T, resp []byte, expectedID int) {
 		t.Errorf("response id = %d, want %d (full: %s)", id, expectedID, string(resp))
 	}
 }
+
+func TestNewOwnerFromSnapshot_CachedInit(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	initResp := `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"snap-server","version":"0.1.0"}}}`
+
+	snap := OwnerSnapshot{
+		ServerID:       "test123",
+		Command:        "echo",
+		Args:           []string{"hello"},
+		Cwd:            t.TempDir(),
+		CwdSet:         []string{t.TempDir()},
+		Mode:           "cwd",
+		Classification: "shared",
+		CachedInit:     base64Encode([]byte(initResp)),
+	}
+
+	owner, err := NewOwnerFromSnapshot(OwnerConfig{
+		Command:  snap.Command,
+		Args:     snap.Args,
+		Cwd:      snap.Cwd,
+		IPCPath:  ipcPath,
+		ServerID: snap.ServerID,
+		Logger:   testLogger(t),
+	}, snap)
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	// Verify init is already cached
+	if !owner.InitSuccess() {
+		t.Error("InitSuccess() should be true for snapshot owner with cached init")
+	}
+
+	// Connect a session via IPC and send initialize — should get instant cached replay
+	conn, err := ipc.Dial(ipcPath)
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer conn.Close()
+
+	// Send initialize request
+	initReq := `{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}` + "\n"
+	if _, err := conn.Write([]byte(initReq)); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+
+	// Read response — should be instant (from cache, no upstream needed)
+	scanner := bufio.NewScanner(conn)
+	done := make(chan bool, 1)
+	var line string
+	go func() {
+		if scanner.Scan() {
+			line = scanner.Text()
+		}
+		done <- true
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for cached init response")
+	}
+
+	if !strings.Contains(line, "snap-server") {
+		t.Errorf("response should contain snap-server: %s", line)
+	}
+	// Verify ID was replaced to match our request (42)
+	if !strings.Contains(line, `"id":42`) {
+		t.Errorf("response should have id:42: %s", line)
+	}
+}
+
+func TestNewOwnerFromSnapshot_NoUpstream(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	snap := OwnerSnapshot{
+		ServerID: "test456",
+		Command:  "nonexistent-command",
+		Args:     []string{},
+		Cwd:      t.TempDir(),
+		CwdSet:   []string{},
+		Mode:     "cwd",
+	}
+
+	// Should succeed even though upstream command doesn't exist
+	// (upstream is NOT spawned in NewOwnerFromSnapshot)
+	owner, err := NewOwnerFromSnapshot(OwnerConfig{
+		Command:  snap.Command,
+		Args:     snap.Args,
+		Cwd:      snap.Cwd,
+		IPCPath:  ipcPath,
+		ServerID: snap.ServerID,
+		Logger:   testLogger(t),
+	}, snap)
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot() should succeed without upstream: %v", err)
+	}
+	defer owner.Shutdown()
+
+	// Owner exists but has no upstream — no cached init
+	if owner.InitSuccess() {
+		t.Error("InitSuccess() should be false for snapshot without cached init")
+	}
+}
+
+func TestNewOwnerFromSnapshot_ClassificationPreserved(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	snap := OwnerSnapshot{
+		ServerID:             "test789",
+		Command:              "echo",
+		Args:                 []string{},
+		Cwd:                  t.TempDir(),
+		CwdSet:               []string{},
+		Mode:                 "cwd",
+		Classification:       "isolated",
+		ClassificationSource: "capability",
+		CachedInit:           base64Encode([]byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)),
+	}
+
+	owner, err := NewOwnerFromSnapshot(OwnerConfig{
+		Command:  snap.Command,
+		Args:     snap.Args,
+		Cwd:      snap.Cwd,
+		IPCPath:  ipcPath,
+		ServerID: snap.ServerID,
+		Logger:   testLogger(t),
+	}, snap)
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	status := owner.Status()
+	if status["auto_classification"] != "isolated" {
+		t.Errorf("classification = %v, want isolated", status["auto_classification"])
+	}
+	if status["classification_source"] != "capability" {
+		t.Errorf("classification_source = %v, want capability", status["classification_source"])
+	}
+}
