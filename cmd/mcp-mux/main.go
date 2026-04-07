@@ -52,10 +52,9 @@ func main() {
 			return
 		case "upgrade":
 			upgradeFlags := flag.NewFlagSet("upgrade", flag.ExitOnError)
-			drainTimeout := upgradeFlags.Duration("drain-timeout", 30*time.Second, "Drain timeout before force kill")
-			force := upgradeFlags.Bool("force", false, "Force immediate shutdown (no drain)")
+			restart := upgradeFlags.Bool("restart", false, "Restart daemon after binary swap (shims auto-reconnect)")
 			upgradeFlags.Parse(os.Args[2:])
-			runUpgrade(*drainTimeout, *force)
+			runUpgrade(*restart)
 			return
 		case "serve":
 			runServe()
@@ -410,7 +409,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	}
 }
 
-func runUpgrade(_ time.Duration, _ bool) {
+func runUpgrade(restart bool) {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot resolve executable path: %v\n", err)
@@ -469,9 +468,23 @@ func runUpgrade(_ time.Duration, _ bool) {
 	ctlPath := serverid.DaemonControlPath()
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
-	if isDaemonRunning(ctlPath) {
+
+	if restart && isDaemonRunning(ctlPath) {
+		// Stop old daemon — shims (resilient_client) detect IPC EOF and auto-reconnect.
+		// Next reconnect spawns a new daemon from the new binary.
+		fmt.Fprintln(os.Stderr, "Restarting daemon...")
+		resp, err := control.Send(ctlPath, control.Request{Cmd: "shutdown"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: daemon shutdown request failed: %v\n", err)
+		} else if !resp.OK {
+			fmt.Fprintf(os.Stderr, "  warning: daemon shutdown: %s\n", resp.Message)
+		} else {
+			fmt.Fprintln(os.Stderr, "  daemon stopped. Shims will auto-reconnect with new binary.")
+		}
+	} else if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")
 		fmt.Fprintln(os.Stderr, "New shims use new binary. Daemon updates on next restart.")
+		fmt.Fprintln(os.Stderr, "Use: mcp-mux upgrade --restart to restart daemon immediately.")
 	} else {
 		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
 	}
