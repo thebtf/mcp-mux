@@ -414,13 +414,29 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 			return nil
 		}
 		// Skip owners with incompatible env — different API keys, tokens, etc.
-		// Without this, project-scope .mcp.json env overrides are silently ignored.
 		if !envCompatible(entry.Env, env) {
 			continue
 		}
-		if entry.Owner.IsAccepting() {
-			return entry
+		if !entry.Owner.IsAccepting() {
+			continue
 		}
+		// Wait for classification before dedup decision. Without this,
+		// isolated servers get dedup'd during the classification window,
+		// causing evict storms (evict → reconnect → dedup → classify → evict).
+		classified := entry.Owner.Classified()
+		d.mu.Unlock()
+		select {
+		case <-classified:
+		case <-time.After(30 * time.Second):
+			d.mu.Lock()
+			return nil // timed out — caller will create new owner
+		}
+		d.mu.Lock()
+		// Re-check after classification: may now be isolated or not accepting.
+		if !entry.Owner.IsAccepting() {
+			continue
+		}
+		return entry
 	}
 	return nil
 }

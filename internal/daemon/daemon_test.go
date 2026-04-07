@@ -534,6 +534,15 @@ func TestFindSharedOwnerEnvFiltering(t *testing.T) {
 		t.Fatalf("Spawn() error: %v", err)
 	}
 
+	// Mark classification complete — findSharedOwner waits on Classified() channel,
+	// but this test doesn't run a real init/tools handshake.
+	d.mu.RLock()
+	ownerEntry := d.owners[sid]
+	d.mu.RUnlock()
+	if ownerEntry != nil && ownerEntry.Owner != nil {
+		ownerEntry.Owner.MarkClassified()
+	}
+
 	entry := findSharedOwnerLocked(d, req.Command, req.Args, map[string]string{"GITHUB_TOKEN": "abc"})
 	if entry == nil {
 		t.Fatal("findSharedOwner() returned nil for matching semantic env")

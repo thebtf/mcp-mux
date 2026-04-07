@@ -82,6 +82,8 @@ type Owner struct {
 	autoClassification   classify.SharingMode
 	classificationSource string   // "capability" or "tools" — what determined classification
 	classificationReason []string // tool names that triggered isolation
+	classified           chan struct{} // closed when autoClassification is first set
+	classifiedOnce       sync.Once
 
 	sessionMgr       *SessionManager
 	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
@@ -180,6 +182,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		cachedInitSessions: make(map[int]bool),
 		sessionMgr:         NewSessionManager(),
 		tokenHandshake:     cfg.TokenHandshake,
+		classified:         make(chan struct{}),
 		progressOwners:     make(map[string]int),
 		startTime:          time.Now(),
 		listenerDone:       make(chan struct{}),
@@ -950,6 +953,23 @@ func (o *Owner) IsAccepting() bool {
 	}
 }
 
+// Classified returns a channel that is closed when the owner's auto-classification
+// is determined (shared, isolated, or session-aware). Used by daemon's findSharedOwner
+// to wait for classification before dedup decision.
+func (o *Owner) Classified() <-chan struct{} {
+	return o.classified
+}
+
+// MarkClassified forces the classified channel closed. Used by tests that need
+// to bypass the normal init/tools handshake classification flow.
+func (o *Owner) MarkClassified() {
+	o.classifiedOnce.Do(func() {
+		if o.classified != nil {
+			close(o.classified)
+		}
+	})
+}
+
 // AddCwd registers an additional project cwd for this owner.
 // Used by dedup: when a second project reuses a shared owner,
 // its cwd is added so roots/list includes all project roots.
@@ -1232,11 +1252,17 @@ func (o *Owner) classifyFromCapabilities(initJSON []byte) {
 	o.classificationReason = nil
 	o.mu.Unlock()
 
+	o.classifiedOnce.Do(func() {
+		if o.classified != nil {
+			close(o.classified)
+		}
+	})
 	o.logger.Printf("x-mux capability: %s", mode)
 
 	if mode == classify.ModeIsolated {
 		o.logger.Printf("closing IPC listener — server declares isolated via x-mux")
 		o.closeListener()
+		o.evictExtraSessions()
 	}
 }
 
@@ -1258,6 +1284,12 @@ func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 	o.classificationSource = "tools"
 	o.classificationReason = matched
 	o.mu.Unlock()
+
+	o.classifiedOnce.Do(func() {
+		if o.classified != nil {
+			close(o.classified)
+		}
+	})
 
 	if mode == classify.ModeIsolated {
 		o.logger.Printf("auto-classification: ISOLATED (matched: %v)", matched)
