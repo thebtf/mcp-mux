@@ -42,15 +42,16 @@ func TestClassifyTools(t *testing.T) {
 			wantMatched: 0,
 		},
 		{
-			name: "serena - shared",
+			name: "serena - isolated via activate_project",
 			json: `{"jsonrpc":"2.0","id":1,"result":{"tools":[
 				{"name":"find_symbol"},
 				{"name":"get_symbols_overview"},
 				{"name":"replace_symbol_body"},
-				{"name":"search_for_pattern"}
+				{"name":"search_for_pattern"},
+				{"name":"activate_project"}
 			]}}`,
-			wantMode:    ModeShared,
-			wantMatched: 0,
+			wantMode:    ModeIsolated,
+			wantMatched: 1,
 		},
 		{
 			name: "mixed stateless and stateful - isolated wins",
@@ -198,6 +199,7 @@ func TestIsIsolationPattern(t *testing.T) {
 		{"search", false},
 		{"store_memory", false},
 		{"tavily_search", false},
+		{"activate_project", true},       // substring: activate_project (serena LSP)
 		{"find_symbol", false},
 		{"echo", false},
 		{"add", false},

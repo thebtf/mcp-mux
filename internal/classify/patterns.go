@@ -20,10 +20,11 @@ var isolationPrefixes = []string{
 // anywhere in the tool name. Used for tools like "get_editor_state" or
 // "interact_with_process" that don't match prefix patterns.
 var isolationSubstrings = []string{
-	"_process",   // desktop-commander: start_process, interact_with_process, kill_process
-	"_document",  // pencil: open_document
-	"_editor_",   // pencil: get_editor_state
-	"snapshot",   // pencil: snapshot_layout (canvas state)
+	"_process",        // desktop-commander: start_process, interact_with_process, kill_process
+	"_document",       // pencil: open_document
+	"_editor_",        // pencil: get_editor_state
+	"snapshot",        // pencil: snapshot_layout (canvas state)
+	"activate_project", // serena: activate_project (LSP per-project state)
 }
 
 // isIsolationPattern returns true if the tool name matches any isolation pattern.
