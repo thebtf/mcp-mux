@@ -1,6 +1,8 @@
 package serverid
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -83,6 +85,114 @@ func TestDescribeArgs(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("DescribeArgs(%v) = %q, want %q", tt.args, got, tt.want)
 		}
+	}
+}
+
+func TestFindGitRootRegularRepo(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.Mkdir(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "src", "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := findGitRoot(sub)
+	if got != dir {
+		t.Errorf("findGitRoot(%q) = %q, want %q", sub, got, dir)
+	}
+}
+
+func TestFindGitRootWorktree(t *testing.T) {
+	// Simulate a git worktree layout:
+	// mainRepo/.git/worktrees/wt1/  (directory)
+	// worktreeDir/.git              (file: "gitdir: mainRepo/.git/worktrees/wt1")
+	mainRepo := t.TempDir()
+	mainGit := filepath.Join(mainRepo, ".git")
+	if err := os.Mkdir(mainGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtGitDir := filepath.Join(mainGit, "worktrees", "wt1")
+	if err := os.MkdirAll(wtGitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := t.TempDir()
+	gitFile := filepath.Join(worktreeDir, ".git")
+	content := "gitdir: " + wtGitDir + "\n"
+	if err := os.WriteFile(gitFile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := findGitRoot(worktreeDir)
+	// Should resolve to mainRepo, not worktreeDir
+	wantAbs, _ := filepath.Abs(mainRepo)
+	gotAbs, _ := filepath.Abs(got)
+	if runtime.GOOS == "windows" {
+		wantAbs = strings.ToLower(wantAbs)
+		gotAbs = strings.ToLower(gotAbs)
+	}
+	if gotAbs != wantAbs {
+		t.Errorf("findGitRoot(worktree) = %q, want %q", got, mainRepo)
+	}
+}
+
+func TestFindGitRootWorktreeSubdir(t *testing.T) {
+	mainRepo := t.TempDir()
+	mainGit := filepath.Join(mainRepo, ".git")
+	if err := os.Mkdir(mainGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtGitDir := filepath.Join(mainGit, "worktrees", "feature")
+	if err := os.MkdirAll(wtGitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktreeDir, ".git"),
+		[]byte("gitdir: "+wtGitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(worktreeDir, "src", "main")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Searching from a subdirectory of a worktree should still find main repo
+	got := findGitRoot(sub)
+	wantAbs, _ := filepath.Abs(mainRepo)
+	gotAbs, _ := filepath.Abs(got)
+	if runtime.GOOS == "windows" {
+		wantAbs = strings.ToLower(wantAbs)
+		gotAbs = strings.ToLower(gotAbs)
+	}
+	if gotAbs != wantAbs {
+		t.Errorf("findGitRoot(worktree/sub) = %q, want %q", got, mainRepo)
+	}
+}
+
+func TestWorktreeAndMainShareServerID(t *testing.T) {
+	mainRepo := t.TempDir()
+	mainGit := filepath.Join(mainRepo, ".git")
+	if err := os.Mkdir(mainGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtGitDir := filepath.Join(mainGit, "worktrees", "wt1")
+	if err := os.MkdirAll(wtGitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktreeDir, ".git"),
+		[]byte("gitdir: "+wtGitDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idMain := GenerateContextKey(ModeGit, "node", []string{"server.js"}, nil, mainRepo)
+	idWT := GenerateContextKey(ModeGit, "node", []string{"server.js"}, nil, worktreeDir)
+	if idMain != idWT {
+		t.Errorf("worktree and main produce different server IDs:\n  main: %s\n  wt:   %s", idMain, idWT)
 	}
 }
 

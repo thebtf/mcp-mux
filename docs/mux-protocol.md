@@ -90,7 +90,9 @@ into every JSON-RPC request via the `_meta` field:
   "method": "tools/call",
   "params": {
     "_meta": {
-      "muxSessionId": "sess_a1b2c3d4"
+      "muxSessionId": "sess_a1b2c3d4",
+      "muxCwd": "D:\\Dev\\novascript",
+      "muxEnv": { "GITHUB_TOKEN": "ghp_..." }
     },
     "name": "exec",
     "arguments": { "command": "echo hello" }
@@ -104,6 +106,19 @@ into every JSON-RPC request via the `_meta` field:
 - Unique per downstream client connection
 - Stable for the connection lifetime
 - Injected into ALL requests (not notifications)
+
+### Per-Session Working Directory (`_meta.muxCwd`)
+
+- The CC session's project directory (where Claude Code was launched)
+- Allows session-aware servers with `--project-from-cwd` to scope per-request
+- Works with git worktrees — each worktree session gets its own cwd
+- Only injected when the session has a bound cwd (daemon mode with token handshake)
+
+### Per-Session Environment (`_meta.muxEnv`)
+
+- Environment variable diff between the session and the owner
+- Allows session-aware servers to use project-scope credentials
+- Only injected when the session has bound env vars
 
 ### Why `_meta`
 

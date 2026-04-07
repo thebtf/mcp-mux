@@ -46,20 +46,57 @@ func CanonicalizePath(p string) string {
 	return clean
 }
 
-// findGitRoot recursively searches upwards for a .git directory
+// findGitRoot recursively searches upwards for a .git directory or file.
+// In a regular checkout, .git is a directory. In a git worktree, .git is a
+// file containing "gitdir: <path>". Both indicate a git repository root.
 func findGitRoot(startPath string) string {
 	current := startPath
 	for {
-		if info, err := os.Stat(filepath.Join(current, ".git")); err == nil && info.IsDir() {
-			return current
+		gitPath := filepath.Join(current, ".git")
+		if _, err := os.Stat(gitPath); err == nil {
+			// .git exists — either directory (normal) or file (worktree).
+			// In both cases, this is the repo/worktree root.
+			return resolveWorktreeRoot(current, gitPath)
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
-			// Reached root, fallback to original path
 			return startPath
 		}
 		current = parent
 	}
+}
+
+// resolveWorktreeRoot resolves a worktree .git file to the main repo root.
+// For a regular .git directory, returns dir unchanged.
+// For a worktree .git file (contains "gitdir: ..."), follows the pointer
+// back to the main repo so all worktrees share the same server ID.
+func resolveWorktreeRoot(dir, gitPath string) string {
+	info, err := os.Stat(gitPath)
+	if err != nil || info.IsDir() {
+		return dir // regular .git directory
+	}
+	// .git file — read "gitdir: <path>" pointer
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return dir
+	}
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, "gitdir: ") {
+		return dir
+	}
+	gitdir := strings.TrimPrefix(line, "gitdir: ")
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(dir, gitdir)
+	}
+	// gitdir points to .git/worktrees/<name> — go up two levels to get repo root
+	// e.g., /repo/.git/worktrees/my-branch → /repo
+	repoGitDir := filepath.Dir(filepath.Dir(gitdir))
+	repoRoot := filepath.Dir(repoGitDir)
+	// Verify it's actually a git directory
+	if info, err := os.Stat(repoGitDir); err == nil && info.IsDir() {
+		return CanonicalizePath(repoRoot)
+	}
+	return dir
 }
 
 // Compute (deprecated) is kept for backward compatibility if needed temporarily.
