@@ -205,6 +205,10 @@ func (m *mockDaemonHandler) HandleRemove(serverID string) error {
 	return m.removeErr
 }
 
+func (m *mockDaemonHandler) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
+	return "/tmp/snapshot.json", nil
+}
+
 // TestSocketPath verifies SocketPath returns the address used at creation.
 func TestSocketPath(t *testing.T) {
 	path := testSocketPath(t)

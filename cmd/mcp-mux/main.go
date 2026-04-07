@@ -470,16 +470,25 @@ func runUpgrade(restart bool) {
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
 	if restart && isDaemonRunning(ctlPath) {
-		// Stop old daemon — shims (resilient_client) detect IPC EOF and auto-reconnect.
-		// Next reconnect spawns a new daemon from the new binary.
-		fmt.Fprintln(os.Stderr, "Restarting daemon...")
-		resp, err := control.Send(ctlPath, control.Request{Cmd: "shutdown"})
+		// Graceful restart: serialize state snapshot, then shutdown.
+		// New daemon loads snapshot → owners restored with cached state → instant reconnect.
+		fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
+		resp, err := control.Send(ctlPath, control.Request{
+			Cmd:            "graceful-restart",
+			DrainTimeoutMs: 30000,
+		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: daemon shutdown request failed: %v\n", err)
+			// Fallback to plain shutdown if graceful-restart not supported (old daemon)
+			fmt.Fprintf(os.Stderr, "  graceful-restart not available: %v, falling back to shutdown\n", err)
+			resp, err = control.Send(ctlPath, control.Request{Cmd: "shutdown"})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: shutdown failed: %v\n", err)
+			}
 		} else if !resp.OK {
-			fmt.Fprintf(os.Stderr, "  warning: daemon shutdown: %s\n", resp.Message)
+			fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
+			control.Send(ctlPath, control.Request{Cmd: "shutdown"})
 		} else {
-			fmt.Fprintln(os.Stderr, "  daemon stopped. Shims will auto-reconnect with new binary.")
+			fmt.Fprintf(os.Stderr, "  snapshot written. Daemon stopping. Shims will auto-reconnect.\n")
 		}
 	} else if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")

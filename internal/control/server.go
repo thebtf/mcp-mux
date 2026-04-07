@@ -111,6 +111,17 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		return Response{OK: true, Message: "removed"}
 
+	case "graceful-restart":
+		dh, ok := s.handler.(DaemonHandler)
+		if !ok {
+			return Response{OK: false, Message: "graceful-restart not supported (not a daemon)"}
+		}
+		snapshotPath, err := dh.HandleGracefulRestart(req.DrainTimeoutMs)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("graceful-restart: %v", err)}
+		}
+		return Response{OK: true, Message: "snapshot written, shutting down", IPCPath: snapshotPath}
+
 	default:
 		return Response{OK: false, Message: fmt.Sprintf("unknown command: %s", req.Cmd)}
 	}
