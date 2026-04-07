@@ -23,6 +23,11 @@ const writeTimeout = 30 * time.Second
 
 var sessionCounter atomic.Int32
 
+// notificationBufferSize is the capacity of the per-session async notification
+// send channel. Notifications are queued here by broadcast() and drained by a
+// dedicated goroutine, preventing the upstream reader from blocking on slow sessions.
+const notificationBufferSize = 256
+
 // Session represents one downstream client connection.
 // It reads JSON-RPC requests and writes responses.
 type Session struct {
@@ -35,6 +40,7 @@ type Session struct {
 	conn         net.Conn  // underlying connection for write deadlines (nil for stdio)
 	closer       io.Closer // underlying connection (net.Conn for IPC sessions, nil for stdio)
 	mu           sync.Mutex // protects writer
+	notifCh      chan []byte // async notification send buffer (drained by drainNotifications goroutine)
 	done         chan struct{}
 	closed       atomic.Bool
 }
@@ -51,15 +57,18 @@ func NewSession(r io.Reader, w io.Writer) *Session {
 	if nc, ok := w.(net.Conn); ok {
 		conn = nc
 	}
-	return &Session{
+	s := &Session{
 		ID:           int(sessionCounter.Add(1)),
 		MuxSessionID: generateMuxSessionID(),
 		reader:       jsonrpc.NewScanner(r),
 		writer:       bufio.NewWriter(w),
 		conn:         conn,
 		closer:       closer,
+		notifCh:      make(chan []byte, notificationBufferSize),
 		done:         make(chan struct{}),
 	}
+	go s.drainNotifications()
+	return s
 }
 
 // generateMuxSessionID creates a unique session identifier: "sess_" + 8 hex chars.
@@ -142,6 +151,46 @@ func (s *Session) Close() {
 		close(s.done)
 		if s.closer != nil {
 			s.closer.Close()
+		}
+	}
+}
+
+// SendNotification queues a notification for async delivery. Never blocks the
+// caller — if the buffer is full, the oldest notification is dropped to make room.
+// This prevents the upstream reader goroutine from deadlocking when a session's
+// IPC write is slow (e.g., CC not reading fast enough).
+func (s *Session) SendNotification(data []byte) {
+	if s.closed.Load() {
+		return
+	}
+	// Make a copy — data may be reused by caller for other sessions
+	cp := make([]byte, len(data))
+	copy(cp, data)
+
+	select {
+	case s.notifCh <- cp:
+	default:
+		// Buffer full — drop oldest to make room (backpressure)
+		select {
+		case <-s.notifCh:
+		default:
+		}
+		s.notifCh <- cp
+	}
+}
+
+// drainNotifications reads from notifCh and writes to the session's IPC connection.
+// Runs as a goroutine per session. Exits when the session closes.
+func (s *Session) drainNotifications() {
+	for {
+		select {
+		case data := <-s.notifCh:
+			if err := s.WriteRaw(data); err != nil {
+				// Write failed — session likely disconnected. Stop draining.
+				return
+			}
+		case <-s.done:
+			return
 		}
 	}
 }

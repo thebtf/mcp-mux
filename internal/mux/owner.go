@@ -990,16 +990,14 @@ func (o *Owner) broadcast(data []byte) error {
 	}
 	o.mu.RUnlock()
 
-	var firstErr error
+	// Async broadcast: queue notifications via SendNotification (non-blocking).
+	// Each session has a drain goroutine that writes to IPC at its own pace.
+	// This prevents the upstream reader goroutine from deadlocking when a
+	// session's IPC write is slow — upstream can keep producing output.
 	for _, s := range sessions {
-		if err := s.WriteRaw(data); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			o.logger.Printf("broadcast to session %d error: %v", s.ID, err)
-		}
+		s.SendNotification(data)
 	}
-	return firstErr
+	return nil
 }
 
 // removeSession removes a session from the owner.
