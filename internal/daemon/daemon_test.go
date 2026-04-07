@@ -36,6 +36,8 @@ func shortSocketPath(t *testing.T, name string) string {
 
 func testDaemon(t *testing.T) *Daemon {
 	t.Helper()
+	// Clean up any stale snapshot from previous tests to prevent cross-test interference
+	os.Remove(SnapshotPath())
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	d, err := New(Config{
 		ControlPath: ctlPath,
