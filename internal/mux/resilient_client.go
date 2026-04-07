@@ -35,6 +35,7 @@ type ResilientClientConfig struct {
 	Reconnect         ReconnectFunc
 	ReconnectTimeout  time.Duration // default: 30s
 	KeepaliveInterval time.Duration // default: 5s
+	ProbeGracePeriod  time.Duration // default: 10s; 0 disables probe detection
 	Logger            *log.Logger
 }
 
@@ -55,6 +56,7 @@ type resilientClient struct {
 	ipcEOF      chan struct{} // closed when IPC reader detects EOF/error
 	stdoutDead  chan struct{} // closed when CC stdout pipe breaks
 	stdoutOnce  sync.Once    // ensures stdoutDead is closed once
+	startTime   time.Time    // when the client started (for probe detection)
 	initCache   initCache
 	log         *log.Logger
 }
@@ -81,6 +83,9 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 	if cfg.KeepaliveInterval == 0 {
 		cfg.KeepaliveInterval = defaultKeepaliveInterval
 	}
+	if cfg.ProbeGracePeriod == 0 {
+		cfg.ProbeGracePeriod = 10 * time.Second
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
@@ -93,6 +98,7 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 		msgFromIPC: make(chan []byte, msgFromIPCBufferSize),
 		ipcEOF:     make(chan struct{}),
 		stdoutDead: make(chan struct{}),
+		startTime:  time.Now(),
 		log:        logger,
 	}
 
@@ -208,7 +214,19 @@ func (rc *resilientClient) runProxy(conn interface {
 		// Wait for: IPC EOF (reconnect), CC stdin EOF (exit), or stdout dead (CC gone).
 		select {
 		case err := <-stdinDone:
-			// CC disconnected — clean up and exit.
+			if err == io.EOF && rc.cfg.ProbeGracePeriod > 0 && time.Since(rc.startTime) < rc.cfg.ProbeGracePeriod {
+				// CC probe: stdin closed too quickly (< 10s after start).
+				// Don't exit — wait to see if CC stdout also breaks (truly gone)
+				// or if it stays alive (probe only, CC will reconnect).
+				rc.log.Printf("resilient: stdin EOF after %.1fs (probe?), waiting for stdout", time.Since(rc.startTime).Seconds())
+				select {
+				case <-rc.stdoutDead:
+					rc.log.Printf("resilient: stdout also dead after probe, exiting")
+				case <-time.After(30 * time.Second):
+					rc.log.Printf("resilient: probe grace expired, exiting")
+				}
+			}
+			// Exit — either normal disconnect, probe confirmed dead, or grace expired.
 			conn.Close()
 			if err == io.EOF {
 				return nil

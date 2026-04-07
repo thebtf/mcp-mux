@@ -165,6 +165,7 @@ func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 	}
 
 	cfg := ResilientClientConfig{
+		ProbeGracePeriod: time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -275,6 +276,7 @@ func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 	}
 
 	cfg := ResilientClientConfig{
+		ProbeGracePeriod: time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -376,6 +378,7 @@ func TestResilientClient_TimeoutExits(t *testing.T) {
 	const shortTimeout = 2 * time.Second
 
 	cfg := ResilientClientConfig{
+		ProbeGracePeriod: time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -436,6 +439,7 @@ func TestResilientClient_KeepaliveEmitted(t *testing.T) {
 	const keepaliveInterval = 800 * time.Millisecond
 
 	cfg := ResilientClientConfig{
+		ProbeGracePeriod: time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -532,6 +536,7 @@ func TestResilientClient_InitReplayOnReconnect(t *testing.T) {
 	}
 
 	cfg := ResilientClientConfig{
+		ProbeGracePeriod: time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
