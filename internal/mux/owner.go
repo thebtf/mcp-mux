@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -281,6 +282,15 @@ func readToken(conn net.Conn) (string, io.Reader) {
 // isHexChar returns true if b is a valid hex character [0-9a-f].
 func isHexChar(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f')
+}
+
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+// Base64Decode decodes a base64-encoded string. Exported for snapshot loading.
+func Base64Decode(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // AddSession registers a new downstream session and starts routing its messages.
@@ -1165,6 +1175,57 @@ func (o *Owner) Status() map[string]any {
 	}
 
 	return status
+}
+
+// ExportSnapshot captures the owner's serializable state for graceful restart.
+// Thread-safe: acquires RLock. Cached responses are base64-encoded.
+func (o *Owner) ExportSnapshot() OwnerSnapshot {
+	o.mu.RLock()
+	cwds := make([]string, 0, len(o.cwdSet))
+	for c := range o.cwdSet {
+		cwds = append(cwds, c)
+	}
+	snap := OwnerSnapshot{
+		Command:              o.command,
+		Args:                 o.args,
+		Cwd:                  o.cwd,
+		CwdSet:               cwds,
+		Classification:       o.autoClassification,
+		ClassificationSource: o.classificationSource,
+		ClassificationReason: o.classificationReason,
+	}
+	if o.initResp != nil {
+		snap.CachedInit = base64Encode(o.initResp)
+	}
+	if o.toolList != nil {
+		snap.CachedTools = base64Encode(o.toolList)
+	}
+	if o.promptList != nil {
+		snap.CachedPrompts = base64Encode(o.promptList)
+	}
+	if o.resourceList != nil {
+		snap.CachedResources = base64Encode(o.resourceList)
+	}
+	if o.resourceTemplateList != nil {
+		snap.CachedResourceTemplates = base64Encode(o.resourceTemplateList)
+	}
+	o.mu.RUnlock()
+	return snap
+}
+
+// ExportSessions returns snapshot metadata for all active sessions.
+func (o *Owner) ExportSessions() []SessionSnapshot {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	sessions := make([]SessionSnapshot, 0, len(o.sessions))
+	for _, s := range o.sessions {
+		sessions = append(sessions, SessionSnapshot{
+			MuxSessionID: s.MuxSessionID,
+			Cwd:          s.Cwd,
+			Env:          s.Env,
+		})
+	}
+	return sessions
 }
 
 // getCachedResponse returns the cached response for the given method, or nil.
