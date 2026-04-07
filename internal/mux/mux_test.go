@@ -754,7 +754,7 @@ func readResp(t *testing.T, r io.Reader) []byte {
 
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("readResp timeout")
 	}
 

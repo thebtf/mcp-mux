@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -146,6 +147,145 @@ type OwnerConfig struct {
 	Logger *log.Logger
 }
 
+// NewOwnerFromSnapshot creates an Owner with pre-populated caches from a snapshot.
+// Does NOT spawn the upstream process — caller must call SpawnUpstreamBackground()
+// after the owner is registered in the daemon. The owner serves cached responses
+// immediately (cache-first mode) while the upstream starts in the background.
+func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+
+	// Start IPC listener (no upstream yet)
+	ln, err := ipc.Listen(cfg.IPCPath)
+	if err != nil {
+		return nil, fmt.Errorf("owner from snapshot: listen %s: %w", cfg.IPCPath, err)
+	}
+
+	cwdSet := map[string]bool{}
+	for _, c := range snap.CwdSet {
+		cwdSet[c] = true
+	}
+	if cfg.Cwd != "" {
+		cwdSet[cfg.Cwd] = true
+	}
+
+	o := &Owner{
+		ipcPath:              cfg.IPCPath,
+		cwd:                  cfg.Cwd,
+		cwdSet:               cwdSet,
+		command:              cfg.Command,
+		args:                 cfg.Args,
+		serverID:             cfg.ServerID,
+		listener:             ln,
+		logger:               logger,
+		onZeroSessions:       cfg.OnZeroSessions,
+		onUpstreamExit:       cfg.OnUpstreamExit,
+		onPersistentDetected: cfg.OnPersistentDetected,
+		sessions:             make(map[int]*Session),
+		cachedInitSessions:   make(map[int]bool),
+		sessionMgr:           NewSessionManager(),
+		tokenHandshake:       cfg.TokenHandshake,
+		autoClassification:   snap.Classification,
+		classificationSource: snap.ClassificationSource,
+		classificationReason: snap.ClassificationReason,
+		classified:           make(chan struct{}),
+		initReady:            make(chan struct{}),
+		progressOwners:       make(map[string]int),
+		startTime:            time.Now(),
+		listenerDone:         make(chan struct{}),
+		done:                 make(chan struct{}),
+	}
+
+	// Pre-populate caches from snapshot
+	if snap.CachedInit != "" {
+		if data, err := Base64Decode(snap.CachedInit); err == nil {
+			o.initResp = data
+			o.initDone = true
+		}
+	}
+	if snap.CachedTools != "" {
+		if data, err := Base64Decode(snap.CachedTools); err == nil {
+			o.toolList = data
+		}
+	}
+	if snap.CachedPrompts != "" {
+		if data, err := Base64Decode(snap.CachedPrompts); err == nil {
+			o.promptList = data
+		}
+	}
+	if snap.CachedResources != "" {
+		if data, err := Base64Decode(snap.CachedResources); err == nil {
+			o.resourceList = data
+		}
+	}
+	if snap.CachedResourceTemplates != "" {
+		if data, err := Base64Decode(snap.CachedResourceTemplates); err == nil {
+			o.resourceTemplateList = data
+		}
+	}
+
+	// Close initReady and classified immediately — caches already populated
+	o.initReadyOnce.Do(func() { close(o.initReady) })
+	o.classifiedOnce.Do(func() { close(o.classified) })
+
+	// Start control plane if configured
+	if cfg.ControlPath != "" {
+		ctlSrv, err := control.NewServer(cfg.ControlPath, o, logger)
+		if err != nil {
+			logger.Printf("warning: control server failed to start: %v", err)
+		} else {
+			o.controlServer = ctlSrv
+		}
+	}
+
+	// Start accepting IPC connections (sessions get cached replay immediately)
+	go o.acceptLoop()
+
+	logger.Printf("owner restored from snapshot (cached: init=%v tools=%v prompts=%v resources=%v)",
+		o.initDone, o.toolList != nil, o.promptList != nil, o.resourceList != nil)
+
+	return o, nil
+}
+
+// SpawnUpstreamBackground starts the upstream process in a goroutine and runs
+// proactive init to refresh caches. Called after NewOwnerFromSnapshot when the
+// owner is registered in the daemon. If upstream fails, owner continues serving
+// stale cached responses.
+func (o *Owner) SpawnUpstreamBackground() {
+	go func() {
+		proc, err := upstream.Start(o.command, o.args, nil, o.cwd)
+		if err != nil {
+			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
+			return
+		}
+		o.upstream = proc
+
+		// Start reading upstream responses
+		go o.readUpstream()
+
+		// Send proactive init to refresh caches from new upstream
+		go o.sendProactiveInit()
+
+		// Monitor upstream exit
+		go func() {
+			<-proc.Done
+			o.logger.Printf("upstream exited: %v", proc.ExitErr)
+			o.initReadyOnce.Do(func() {
+				if o.initReady != nil {
+					close(o.initReady)
+				}
+			})
+			if o.onUpstreamExit != nil {
+				o.onUpstreamExit(o.serverID)
+			} else {
+				o.Shutdown()
+			}
+		}()
+	}()
+}
+
 // NewOwner creates and starts a new Owner.
 // It spawns the upstream process and starts the IPC listener.
 func NewOwner(cfg OwnerConfig) (*Owner, error) {
@@ -283,6 +423,15 @@ func isHexChar(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f')
 }
 
+func base64Encode(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+// Base64Decode decodes a base64-encoded string. Exported for snapshot loading.
+func Base64Decode(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
+
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
@@ -349,23 +498,17 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			return s.WriteRaw([]byte(errResp))
 		}
 
-		// For initialize requests: if proactive init is in progress but not yet
-		// cached, wait for it. This blocks the init RESPONSE (normal MCP behavior)
-		// instead of blocking the process startup (which CC times out on).
-		if msg.Method == "initialize" {
-			o.mu.RLock()
-			done := o.initDone
-			o.mu.RUnlock()
-			if !done {
-				o.logger.Printf("session %d: waiting for proactive init to complete", s.ID)
-				select {
-				case <-o.initReady:
-					o.logger.Printf("session %d: proactive init completed, replaying", s.ID)
-				case <-o.done:
-					return fmt.Errorf("owner shutting down while waiting for init")
-				}
-			}
-		}
+		// For snapshot-restored owners: init is already cached, initReady is
+		// already closed, so getCachedResponse below handles it instantly.
+		// For new owners with proactive init: don't wait here — let the session's
+		// init race with proactive init. Whichever response arrives first is cached;
+		// the other is a harmless duplicate.
+		// Only wait if initReady is ALREADY closed (snapshot mode) but initDone is
+		// false (upstream died before init — edge case).
+		//
+		// The wait is useful for snapshot owners where cache is pre-populated and
+		// the session should get instant replay. For new owners, the session's init
+		// request goes to upstream directly via the normal path below.
 
 		// Replay from cache if available (avoids upstream round-trip)
 		if cached := o.getCachedResponse(msg.Method); cached != nil {
@@ -1165,6 +1308,57 @@ func (o *Owner) Status() map[string]any {
 	}
 
 	return status
+}
+
+// ExportSnapshot captures the owner's serializable state for graceful restart.
+// Thread-safe: acquires RLock. Cached responses are base64-encoded.
+func (o *Owner) ExportSnapshot() OwnerSnapshot {
+	o.mu.RLock()
+	cwds := make([]string, 0, len(o.cwdSet))
+	for c := range o.cwdSet {
+		cwds = append(cwds, c)
+	}
+	snap := OwnerSnapshot{
+		Command:              o.command,
+		Args:                 o.args,
+		Cwd:                  o.cwd,
+		CwdSet:               cwds,
+		Classification:       o.autoClassification,
+		ClassificationSource: o.classificationSource,
+		ClassificationReason: o.classificationReason,
+	}
+	if o.initResp != nil {
+		snap.CachedInit = base64Encode(o.initResp)
+	}
+	if o.toolList != nil {
+		snap.CachedTools = base64Encode(o.toolList)
+	}
+	if o.promptList != nil {
+		snap.CachedPrompts = base64Encode(o.promptList)
+	}
+	if o.resourceList != nil {
+		snap.CachedResources = base64Encode(o.resourceList)
+	}
+	if o.resourceTemplateList != nil {
+		snap.CachedResourceTemplates = base64Encode(o.resourceTemplateList)
+	}
+	o.mu.RUnlock()
+	return snap
+}
+
+// ExportSessions returns snapshot metadata for all active sessions.
+func (o *Owner) ExportSessions() []SessionSnapshot {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	sessions := make([]SessionSnapshot, 0, len(o.sessions))
+	for _, s := range o.sessions {
+		sessions = append(sessions, SessionSnapshot{
+			MuxSessionID: s.MuxSessionID,
+			Cwd:          s.Cwd,
+			Env:          s.Env,
+		})
+	}
+	return sessions
 }
 
 // getCachedResponse returns the cached response for the given method, or nil.

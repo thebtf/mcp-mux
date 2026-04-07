@@ -107,6 +107,11 @@ func New(cfg Config) (*Daemon, error) {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
 	}
 
+	// Load snapshot from graceful restart (if available)
+	if restored := d.loadSnapshot(); restored > 0 {
+		logger.Printf("startup: restored %d owners from snapshot", restored)
+	}
+
 	return d, nil
 }
 
@@ -350,6 +355,18 @@ func (d *Daemon) HandleRemove(serverID string) error {
 func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
 	go d.Shutdown()
 	return "daemon shutting down"
+}
+
+// HandleGracefulRestart implements control.DaemonHandler.
+// Serializes state snapshot, then shuts down. The new daemon will load the snapshot
+// on startup and restore owners with pre-populated caches.
+func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
+	snapshotPath, err := d.SerializeSnapshot()
+	if err != nil {
+		return "", fmt.Errorf("snapshot: %w", err)
+	}
+	go d.Shutdown()
+	return snapshotPath, nil
 }
 
 // HandleStatus implements control.CommandHandler.
