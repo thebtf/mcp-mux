@@ -30,6 +30,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/control"
@@ -163,12 +164,16 @@ type initResult struct {
 }
 
 func spawnServer(ctlPath, command string, args []string, cwd string, timeout time.Duration) (*control.Response, error) {
+	// Collect env vars like the real shim does — daemon's diffEnv extracts
+	// CC-configured vars (API keys, paths) that upstream needs.
+	env := collectEnv()
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:     "spawn",
 		Command: command,
 		Args:    args,
 		Cwd:     cwd,
 		Mode:    "cwd",
+		Env:     env,
 	}, timeout)
 	if err != nil {
 		return nil, err
@@ -313,6 +318,16 @@ func mustGetwd() string {
 		os.Exit(1)
 	}
 	return cwd
+}
+
+func collectEnv() map[string]string {
+	env := make(map[string]string)
+	for _, e := range os.Environ() {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			env[e[:i]] = e[i+1:]
+		}
+	}
+	return env
 }
 
 func fail(step string, err error) {
