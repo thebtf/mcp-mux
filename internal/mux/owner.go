@@ -255,12 +255,30 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 // stale cached responses.
 func (o *Owner) SpawnUpstreamBackground() {
 	go func() {
+		// Check if owner is already shutting down before spawning
+		select {
+		case <-o.done:
+			return
+		default:
+		}
+
 		proc, err := upstream.Start(o.command, o.args, nil, o.cwd)
 		if err != nil {
 			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
 			return
 		}
+
+		// Check again after spawn — owner may have shut down while process was starting
+		select {
+		case <-o.done:
+			proc.Close()
+			return
+		default:
+		}
+
+		o.mu.Lock()
 		o.upstream = proc
+		o.mu.Unlock()
 
 		// Start reading upstream responses
 		go o.readUpstream()
@@ -1151,8 +1169,11 @@ func (o *Owner) Shutdown() {
 		o.sessions = make(map[int]*Session)
 		o.mu.Unlock()
 
-		if o.upstream != nil {
-			o.upstream.Close()
+		o.mu.Lock()
+		up := o.upstream
+		o.mu.Unlock()
+		if up != nil {
+			up.Close()
 		}
 
 		o.logger.Printf("owner shut down")
