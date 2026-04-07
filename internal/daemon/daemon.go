@@ -267,6 +267,13 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 
 	// Compute env diff: only vars that the shim has but daemon doesn't (CC-configured vars).
 	envDiff := diffEnv(req.Env)
+	if len(envDiff) > 0 {
+		keys := make([]string, 0, len(envDiff))
+		for k := range envDiff {
+			keys = append(keys, k)
+		}
+		d.logger.Printf("owner %s: env diff %d vars: %v", sid[:8], len(envDiff), keys)
+	}
 
 	// Create a new owner
 	controlPath := serverid.ControlPath(sid)

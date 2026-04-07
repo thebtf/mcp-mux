@@ -37,8 +37,14 @@ func runGlobalDaemon() {
 	}
 
 	// Debug log to file — daemon is detached, stderr goes nowhere.
-	// Always log to file so we can trace issues like roots/list routing.
+	// Rotate: if log > 50MB, shift .1 → .2, current → .1, start fresh.
+	// Keeps up to ~2 days of history across restarts (3 files × 50MB max).
 	debugLogPath := filepath.Join(os.TempDir(), "mcp-muxd-debug.log")
+	if info, err := os.Stat(debugLogPath); err == nil && info.Size() > 50*1024*1024 {
+		os.Remove(debugLogPath + ".2")
+		os.Rename(debugLogPath+".1", debugLogPath+".2")
+		os.Rename(debugLogPath, debugLogPath+".1")
+	}
 	logFile, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	var logger *log.Logger
 	if err == nil {
