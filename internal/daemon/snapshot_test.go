@@ -13,7 +13,6 @@ import (
 )
 
 func TestSnapshotRoundTrip(t *testing.T) {
-	os.Remove(SnapshotPath()) // clean stale snapshots from previous runs
 	d := testDaemon(t)
 
 	// Create a real owner via Spawn
@@ -311,10 +310,14 @@ func TestGracefulRestartCycle(t *testing.T) {
 	// Phase 3: Shutdown old daemon
 	d1.Shutdown()
 
-	// Phase 4: New daemon loads snapshot automatically in New()
+	// Phase 4: New daemon loads snapshot explicitly (testDaemon skips snapshot)
 	d2 := testDaemon(t)
+	restored := d2.loadSnapshot()
+	if restored != 1 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+	}
 
-	// Verify owner was restored (loaded by New → loadSnapshot)
+	// Verify owner was restored
 	d2.mu.RLock()
 	ownerCount := len(d2.owners)
 	var restoredEntry *OwnerEntry

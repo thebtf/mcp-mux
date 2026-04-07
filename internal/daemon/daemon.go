@@ -68,6 +68,10 @@ type Config struct {
 	IdleTimeout time.Duration
 
 	Logger *log.Logger
+
+	// SkipSnapshot disables snapshot loading on startup. Used by tests
+	// to prevent cross-test interference from stale snapshot files.
+	SkipSnapshot bool
 }
 
 // New creates and starts a new Daemon with a control server.
@@ -108,8 +112,10 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	// Load snapshot from graceful restart (if available)
-	if restored := d.loadSnapshot(); restored > 0 {
-		logger.Printf("startup: restored %d owners from snapshot", restored)
+	if !cfg.SkipSnapshot {
+		if restored := d.loadSnapshot(); restored > 0 {
+			logger.Printf("startup: restored %d owners from snapshot", restored)
+		}
 	}
 
 	return d, nil

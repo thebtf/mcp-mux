@@ -38,10 +38,11 @@ func testDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	d, err := New(Config{
-		ControlPath: ctlPath,
-		GracePeriod: 1 * time.Second,
-		IdleTimeout: 5 * time.Second,
-		Logger:      testLogger(t),
+		ControlPath:  ctlPath,
+		GracePeriod:  1 * time.Second,
+		IdleTimeout:  5 * time.Second,
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
 	})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -404,10 +405,11 @@ func TestDaemonStartAfterCrash(t *testing.T) {
 
 	// Step 2: Start a new daemon — this must succeed despite the stale file.
 	d, err := New(Config{
-		ControlPath: ctlPath,
-		GracePeriod: 1 * time.Second,
-		IdleTimeout: 5 * time.Second,
-		Logger:      testLogger(t),
+		ControlPath:  ctlPath,
+		GracePeriod:  1 * time.Second,
+		IdleTimeout:  5 * time.Second,
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
 	})
 	if err != nil {
 		t.Fatalf("daemon.New() with stale socket: %v", err)
