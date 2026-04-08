@@ -7,14 +7,18 @@ import (
 	"syscall"
 )
 
-// setSysProcAttr isolates the upstream process from the daemon's console group.
-// Without this, CTRL_C_EVENT from CC (sent to shim) propagates through the
-// shared console to daemon's children, killing upstream mid-request.
-// STATUS_CONTROL_C_EXIT (0xc000013a) was observed killing netcoredbg during
-// worktree dotnet build (~46s) while main builds (~11s) completed before
-// any signal arrived.
+// setSysProcAttr configures the upstream process for headless operation.
+// CREATE_NO_WINDOW (0x08000000) creates the process without a visible window
+// but WITH a valid console — required by dotnet build, MSBuild, and other
+// tools that write to console output. Without a console, these tools hang
+// indefinitely on progress output.
+//
+// We do NOT use CREATE_NEW_PROCESS_GROUP here because it, combined with the
+// daemon's HideWindow=true, creates an environment without a valid console
+// handle. dotnet build detected this and hung on console write.
 func setSysProcAttr(cmd *exec.Cmd) {
+	const CREATE_NO_WINDOW = 0x08000000
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+		CreationFlags: CREATE_NO_WINDOW,
 	}
 }

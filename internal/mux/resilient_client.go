@@ -162,6 +162,10 @@ func (rc *resilientClient) runStdinReader(done chan<- error) {
 		raw := make([]byte, len(msg.Raw))
 		copy(raw, msg.Raw)
 
+		if msg.IsRequest() {
+			rc.log.Printf("resilient: CC sent request method=%s id=%s (%d bytes)", msg.Method, string(msg.ID), len(raw))
+		}
+
 		select {
 		case rc.msgFromCC <- raw:
 		default:
@@ -309,6 +313,7 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 			// Track request IDs (messages with "id" field that are not responses)
 			if id := extractRequestID(data); id != "" {
 				rc.inflight.Store(id, true)
+				rc.log.Printf("resilient: forwarding request id=%s (%d bytes) to IPC", id, len(data))
 			}
 			_, err := fmt.Fprintf(conn, "%s\n", data)
 			if err != nil {
