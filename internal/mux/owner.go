@@ -106,6 +106,7 @@ type Owner struct {
 	methodTags      sync.Map // remapped request ID (string) -> method name
 	inflightTracker sync.Map // remapped request ID (string) -> *InflightRequest
 	pendingRequests atomic.Int64
+	drainTimeout    time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	startTime       time.Time
 	controlServer   *control.Server
 
@@ -1531,6 +1532,7 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		})
 		o.classifyFromCapabilities(cached)
 		o.checkPersistent(cached)
+		o.parseDrainTimeout(cached)
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
@@ -1736,5 +1738,27 @@ func (o *Owner) checkPersistent(initJSON []byte) {
 	if o.onPersistentDetected != nil {
 		o.onPersistentDetected(o.serverID)
 	}
+}
+
+// parseDrainTimeout extracts x-mux.drainTimeout from the init response
+// and stores it for use during graceful shutdown.
+func (o *Owner) parseDrainTimeout(initJSON []byte) {
+	seconds := classify.ParseDrainTimeout(initJSON)
+	if seconds > 0 {
+		o.drainTimeout = time.Duration(seconds) * time.Second
+		o.logger.Printf("x-mux capability: drainTimeout=%ds", seconds)
+		// Propagate to upstream process so Close() uses the declared timeout
+		o.mu.RLock()
+		up := o.upstream
+		o.mu.RUnlock()
+		if up != nil {
+			up.SetDrainTimeout(o.drainTimeout)
+		}
+	}
+}
+
+// DrainTimeout returns the upstream's declared drain timeout, or 0 if not declared.
+func (o *Owner) DrainTimeout() time.Duration {
+	return o.drainTimeout
 }
 

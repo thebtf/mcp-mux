@@ -129,3 +129,46 @@ func ParsePersistent(initJSON []byte) bool {
 	}
 	return xmux.Persistent
 }
+
+// ParseDrainTimeout extracts x-mux.drainTimeout from a cached initialize response.
+// Returns the declared drain timeout in seconds, or 0 if not declared.
+// Servers use this to tell mux how long they need to gracefully shut down
+// (e.g., drain running async jobs, flush state).
+func ParseDrainTimeout(initJSON []byte) int {
+	var resp struct {
+		Result struct {
+			Capabilities struct {
+				XMux *struct {
+					DrainTimeout int `json:"drainTimeout"`
+				} `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(initJSON, &resp); err != nil {
+		return 0
+	}
+
+	xmux := resp.Result.Capabilities.XMux
+
+	// Fallback: check experimental.x-mux
+	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
+		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
+			xmux = &struct {
+				DrainTimeout int `json:"drainTimeout"`
+			}{}
+			if err := json.Unmarshal(raw, xmux); err != nil {
+				return 0
+			}
+		}
+	}
+
+	if xmux == nil || xmux.DrainTimeout <= 0 {
+		return 0
+	}
+	// Cap at 5 minutes to prevent runaway drain
+	if xmux.DrainTimeout > 300 {
+		return 300
+	}
+	return xmux.DrainTimeout
+}

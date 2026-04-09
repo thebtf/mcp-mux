@@ -24,13 +24,22 @@ type Process struct {
 
 	scanner *bufio.Scanner
 
-	mu     sync.Mutex
-	closed bool
+	mu           sync.Mutex
+	closed       bool
+	drainTimeout time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
 
 	// Done is closed when the process exits.
 	Done chan struct{}
 	// ExitErr holds the error from Wait(), available after Done is closed.
 	ExitErr error
+}
+
+// SetDrainTimeout sets the graceful shutdown wait time after stdin close.
+// Called by the owner when x-mux.drainTimeout capability is parsed.
+func (p *Process) SetDrainTimeout(d time.Duration) {
+	p.mu.Lock()
+	p.drainTimeout = d
+	p.mu.Unlock()
 }
 
 // Start spawns an upstream process with the given command, args, environment, and working directory.
@@ -151,7 +160,8 @@ func (p *Process) ReadLine() ([]byte, error) {
 // Graceful shutdown sequence:
 //  1. Close stdin — the MCP-standard way to signal "session ended". Well-behaved
 //     servers (Python MCP SDK, Node SDK) exit on stdin close.
-//  2. Wait up to 5s for the process to exit on its own.
+//  2. Wait for the process to exit on its own. Duration is drainTimeout from
+//     x-mux.drainTimeout capability (default: 5s).
 //  3. If still alive: send SIGINT/SIGTERM (platform-specific) for graceful cleanup.
 //  4. Wait up to 3s more.
 //  5. If still alive: Kill (SIGKILL / TerminateProcess).
@@ -162,16 +172,21 @@ func (p *Process) Close() error {
 		return nil
 	}
 	p.closed = true
+	stdinWait := p.drainTimeout
 	p.mu.Unlock()
+
+	if stdinWait <= 0 {
+		stdinWait = 5 * time.Second // default
+	}
 
 	// Phase 1: close stdin — the polite MCP shutdown signal.
 	_ = p.stdin.Close()
 
-	// Phase 2: wait for voluntary exit (5s).
+	// Phase 2: wait for voluntary exit (drainTimeout or default 5s).
 	select {
 	case <-p.Done:
 		return nil // process exited cleanly
-	case <-time.After(5 * time.Second):
+	case <-time.After(stdinWait):
 	}
 
 	// Phase 3: send interrupt signal (SIGINT on Unix, GenerateConsoleCtrlEvent on Windows).
