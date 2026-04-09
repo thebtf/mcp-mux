@@ -78,6 +78,7 @@ type Owner struct {
 	onZeroSessions       func(serverID string)
 	onUpstreamExit       func(serverID string)
 	onPersistentDetected func(serverID string)
+	onCacheReady         func(serverID string)
 
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
@@ -147,6 +148,10 @@ type OwnerConfig struct {
 	// Used by the daemon to mark the owner entry as persistent.
 	OnPersistentDetected func(serverID string)
 
+	// OnCacheReady is called when the owner has cached both init and tools/list responses.
+	// Used by the daemon to update the template cache for instant isolated server spawns.
+	OnCacheReady func(serverID string)
+
 	// TokenHandshake enables reading the shim's handshake token from each new IPC
 	// connection before the MCP session begins. Only set true when the owner is
 	// managed by the global daemon — shims always send a token in that mode.
@@ -193,6 +198,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		onZeroSessions:       cfg.OnZeroSessions,
 		onUpstreamExit:       cfg.OnUpstreamExit,
 		onPersistentDetected: cfg.OnPersistentDetected,
+		onCacheReady:         cfg.OnCacheReady,
 		sessions:             make(map[int]*Session),
 		cachedInitSessions:   make(map[int]bool),
 		sessionMgr:           NewSessionManager(),
@@ -348,6 +354,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		onZeroSessions:       cfg.OnZeroSessions,
 		onUpstreamExit:       cfg.OnUpstreamExit,
 		onPersistentDetected: cfg.OnPersistentDetected,
+		onCacheReady:         cfg.OnCacheReady,
 		sessions:           make(map[int]*Session),
 		cachedInitSessions: make(map[int]bool),
 		sessionMgr:         NewSessionManager(),
@@ -483,6 +490,17 @@ func (o *Owner) AddSession(s *Session) {
 
 	o.sessionMgr.RegisterSession(s, s.Cwd)
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
+
+	// For template-restored isolated owners, close the IPC listener after the first
+	// session connects. Normal owners close the listener during classification
+	// (classifyFromCapabilities/classifyFromToolList), but template owners skip
+	// classification (already set from snapshot) so the listener stays open.
+	o.mu.RLock()
+	isIsolated := o.autoClassification == classify.ModeIsolated && o.classificationSource != ""
+	o.mu.RUnlock()
+	if isIsolated {
+		o.closeListener()
+	}
 
 	// Notify upstream that roots may have changed (new client = new potential root)
 	o.sendRootsListChanged()
@@ -1516,6 +1534,11 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
+		// Notify daemon that a complete template is available (init + tools cached).
+		// Daemon stores this as a template for instant future isolated spawns.
+		if o.onCacheReady != nil && o.initDone {
+			go o.onCacheReady(o.serverID)
+		}
 	}
 }
 

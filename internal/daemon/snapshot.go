@@ -170,9 +170,11 @@ func (d *Daemon) loadSnapshot() int {
 		ipcPath := serverid.IPCPath(sid)
 		controlPath := serverid.ControlPath(sid)
 
+		// Capture loop variables for closure
+		cmd, args := ownerSnap.Command, ownerSnap.Args
 		owner, err := mux.NewOwnerFromSnapshot(mux.OwnerConfig{
-			Command:     ownerSnap.Command,
-			Args:        ownerSnap.Args,
+			Command:     cmd,
+			Args:        args,
 			Env:         ownerSnap.Env,
 			Cwd:         ownerSnap.Cwd,
 			IPCPath:     ipcPath,
@@ -187,6 +189,16 @@ func (d *Daemon) loadSnapshot() int {
 			},
 			OnPersistentDetected: func(serverID string) {
 				d.SetPersistent(serverID, true)
+			},
+			OnCacheReady: func(serverID string) {
+				d.mu.RLock()
+				entry, ok := d.owners[serverID]
+				d.mu.RUnlock()
+				if !ok || entry.Owner == nil {
+					return
+				}
+				snap := entry.Owner.ExportSnapshot()
+				d.updateTemplate(cmd, args, snap)
 			},
 			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 		}, ownerSnap)
@@ -209,6 +221,11 @@ func (d *Daemon) loadSnapshot() int {
 			GracePeriod: d.gracePeriod,
 		}
 		d.mu.Unlock()
+
+		// Seed template cache from snapshot so new isolated spawns can use it immediately.
+		if ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
+			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
+		}
 
 		// Spawn upstream in background — refreshes caches when ready
 		owner.SpawnUpstreamBackground()

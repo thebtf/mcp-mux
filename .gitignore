@@ -9,3 +9,6 @@ coverage.html
 .agent/
 .mcp.json
 .mcp.json.bak
+
+# Graphify knowledge graph
+graphify-out/

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/ipc"
@@ -58,6 +59,7 @@ type resilientClient struct {
 	stdoutDead  chan struct{} // closed when CC stdout pipe breaks
 	stdoutOnce  sync.Once    // ensures stdoutDead is closed once
 	startTime   time.Time    // when the client started (for probe detection)
+	ipcMsgSent  atomic.Bool  // true after first IPC→stdout message forwarded (disables probe detection)
 	initCache   initCache
 	inflight    sync.Map     // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
 	log         *log.Logger
@@ -192,6 +194,9 @@ func (rc *resilientClient) runStdoutWriter(mu *sync.Mutex) {
 			rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
 			return
 		}
+		// Mark that we successfully forwarded data to CC.
+		// Once set, stdin EOF is treated as intentional disconnect (not probe).
+		rc.ipcMsgSent.Store(true)
 	}
 }
 
@@ -220,17 +225,23 @@ func (rc *resilientClient) runProxy(conn interface {
 		// Wait for: IPC EOF (reconnect), CC stdin EOF (exit), or stdout dead (CC gone).
 		select {
 		case err := <-stdinDone:
-			if err == io.EOF && rc.cfg.ProbeGracePeriod > 0 && time.Since(rc.startTime) < rc.cfg.ProbeGracePeriod {
-				// CC probe: stdin closed too quickly (< 10s after start).
-				// Don't exit — wait to see if CC stdout also breaks (truly gone)
-				// or if it stays alive (probe only, CC will reconnect).
-				rc.log.Printf("resilient: stdin EOF after %.1fs (probe?), waiting for stdout", time.Since(rc.startTime).Seconds())
+			if err == io.EOF && rc.cfg.ProbeGracePeriod > 0 &&
+				time.Since(rc.startTime) < rc.cfg.ProbeGracePeriod &&
+				!rc.ipcMsgSent.Load() {
+				// CC probe: stdin closed too quickly (< 10s after start) AND
+				// we haven't forwarded any IPC data to CC yet. This is a real
+				// probe — CC is checking if the process starts, not a post-init
+				// restart. Wait briefly for CC stdout to break (confirming exit).
+				rc.log.Printf("resilient: stdin EOF after %.1fs (probe, no data sent), waiting for stdout", time.Since(rc.startTime).Seconds())
 				select {
 				case <-rc.stdoutDead:
 					rc.log.Printf("resilient: stdout also dead after probe, exiting")
-				case <-time.After(30 * time.Second):
+				case <-time.After(5 * time.Second):
 					rc.log.Printf("resilient: probe grace expired, exiting")
 				}
+			} else if err == io.EOF {
+				rc.log.Printf("resilient: stdin EOF after %.1fs (data_sent=%v), exiting immediately",
+					time.Since(rc.startTime).Seconds(), rc.ipcMsgSent.Load())
 			}
 			// Exit — either normal disconnect, probe confirmed dead, or grace expired.
 			conn.Close()

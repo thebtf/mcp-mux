@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 // Process represents a running upstream MCP server process.
@@ -145,20 +146,47 @@ func (p *Process) ReadLine() ([]byte, error) {
 	return nil, io.EOF
 }
 
-// Close terminates the upstream process.
+// Close terminates the upstream process gracefully.
+//
+// Graceful shutdown sequence:
+//  1. Close stdin — the MCP-standard way to signal "session ended". Well-behaved
+//     servers (Python MCP SDK, Node SDK) exit on stdin close.
+//  2. Wait up to 5s for the process to exit on its own.
+//  3. If still alive: send SIGINT/SIGTERM (platform-specific) for graceful cleanup.
+//  4. Wait up to 3s more.
+//  5. If still alive: Kill (SIGKILL / TerminateProcess).
 func (p *Process) Close() error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.closed {
+		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
+	p.mu.Unlock()
 
-	// Close stdin to signal the process
+	// Phase 1: close stdin — the polite MCP shutdown signal.
 	_ = p.stdin.Close()
 
-	// Kill if still running
+	// Phase 2: wait for voluntary exit (5s).
+	select {
+	case <-p.Done:
+		return nil // process exited cleanly
+	case <-time.After(5 * time.Second):
+	}
+
+	// Phase 3: send interrupt signal (SIGINT on Unix, GenerateConsoleCtrlEvent on Windows).
+	if p.cmd.Process != nil {
+		interruptProcess(p.cmd.Process)
+	}
+
+	// Phase 4: wait for signal-triggered exit (3s).
+	select {
+	case <-p.Done:
+		return nil
+	case <-time.After(3 * time.Second):
+	}
+
+	// Phase 5: force kill.
 	if p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 	}

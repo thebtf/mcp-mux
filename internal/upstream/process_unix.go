@@ -3,6 +3,7 @@
 package upstream
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -13,4 +14,9 @@ func setSysProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+}
+
+// interruptProcess sends SIGINT to the process for graceful shutdown.
+func interruptProcess(p *os.Process) {
+	_ = p.Signal(syscall.SIGINT)
 }

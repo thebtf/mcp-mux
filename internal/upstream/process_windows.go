@@ -3,6 +3,7 @@
 package upstream
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -21,4 +22,14 @@ func setSysProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: CREATE_NO_WINDOW,
 	}
+}
+
+// interruptProcess on Windows: close stdin is the primary signal (already done).
+// Windows doesn't support SIGINT to processes without a console group.
+// We just kill — the 5s stdin-close grace period already gave the process time.
+func interruptProcess(p *os.Process) {
+	// On Windows, there's no reliable SIGINT equivalent for headless processes.
+	// GenerateConsoleCtrlEvent requires CREATE_NEW_PROCESS_GROUP which we can't use
+	// (breaks dotnet build). stdin close is the graceful signal; Kill is the fallback.
+	_ = p.Kill()
 }

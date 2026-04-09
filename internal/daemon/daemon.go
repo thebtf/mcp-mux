@@ -48,8 +48,9 @@ type Daemon struct {
 	ctlSrv  *control.Server
 	done    chan struct{}
 
-	gracePeriod time.Duration
-	idleTimeout time.Duration
+	gracePeriod   time.Duration
+	idleTimeout   time.Duration
+	templateCache map[string]mux.OwnerSnapshot // command+args key → cached init data
 
 	shutdownOnce sync.Once
 }
@@ -91,11 +92,12 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	d := &Daemon{
-		owners:      make(map[string]*OwnerEntry),
-		logger:      logger,
-		done:        make(chan struct{}),
-		gracePeriod: gracePeriod,
-		idleTimeout: idleTimeout,
+		owners:        make(map[string]*OwnerEntry),
+		logger:        logger,
+		done:          make(chan struct{}),
+		gracePeriod:   gracePeriod,
+		idleTimeout:   idleTimeout,
+		templateCache: make(map[string]mux.OwnerSnapshot),
 	}
 
 	ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
@@ -170,6 +172,30 @@ func generateToken() string {
 
 // Spawn creates or returns an existing owner for the given server identity.
 // Deduplication: if a shared owner for the same command+args already exists
+// templateKey returns a cache key based on command+args only (ignoring cwd/env).
+// All instances of the same server share identical init/tools responses.
+func templateKey(command string, args []string) string {
+	return serverid.GenerateContextKey(serverid.ModeGlobal, command, args, nil, "")
+}
+
+// updateTemplate stores an owner's cached state as a template for future isolated spawns.
+func (d *Daemon) updateTemplate(command string, args []string, snap mux.OwnerSnapshot) {
+	key := templateKey(command, args)
+	d.mu.Lock()
+	d.templateCache[key] = snap
+	d.mu.Unlock()
+	d.logger.Printf("template cache updated for %s (key=%s)", command, key[:8])
+}
+
+// getTemplate returns a cached template for the given command+args, if available.
+func (d *Daemon) getTemplate(command string, args []string) (mux.OwnerSnapshot, bool) {
+	key := templateKey(command, args)
+	d.mu.RLock()
+	snap, ok := d.templateCache[key]
+	d.mu.RUnlock()
+	return snap, ok
+}
+
 // (from any cwd), it is reused — stateless servers don't need per-project copies.
 // Returns the IPC path, server ID, and a one-time handshake token for session binding.
 //
@@ -289,10 +315,9 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		d.logger.Printf("owner %s: env diff %d vars: %v", sid[:8], len(envDiff), keys)
 	}
 
-	// Create a new owner
+	// Build the shared owner config (used by both template and fresh paths).
 	controlPath := serverid.ControlPath(sid)
-
-	owner, err := mux.NewOwner(mux.OwnerConfig{
+	ownerCfg := mux.OwnerConfig{
 		Command:        req.Command,
 		Args:           req.Args,
 		Env:            envDiff,
@@ -310,17 +335,57 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		OnPersistentDetected: func(serverID string) {
 			d.SetPersistent(serverID, true)
 		},
+		OnCacheReady: func(serverID string) {
+			d.mu.RLock()
+			entry, ok := d.owners[serverID]
+			d.mu.RUnlock()
+			if !ok || entry.Owner == nil {
+				return
+			}
+			snap := entry.Owner.ExportSnapshot()
+			d.updateTemplate(req.Command, req.Args, snap)
+		},
 		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
-	})
-	if err != nil {
-		// Remove the placeholder and unblock any waiters.
-		d.mu.Lock()
-		if d.owners[sid] == placeholder {
-			delete(d.owners, sid)
+	}
+
+	// Try template-based spawn: if the daemon has seen this server before,
+	// create the owner from cached init data (instant response to CC) and
+	// start the real upstream process in the background.
+	var owner *mux.Owner
+	var err error
+	fromTemplate := false
+	if tmpl, ok := d.getTemplate(req.Command, req.Args); ok {
+		// Adapt template for this specific owner instance
+		tmpl.ServerID = sid
+		tmpl.Cwd = req.Cwd
+		tmpl.CwdSet = []string{req.Cwd}
+		tmpl.Env = envDiff
+		tmpl.Mode = req.Mode
+
+		owner, err = mux.NewOwnerFromSnapshot(ownerCfg, tmpl)
+		if err != nil {
+			d.logger.Printf("template spawn failed for %s: %v, falling back to fresh spawn", sid[:8], err)
+			owner = nil // fall through to fresh spawn
+		} else {
+			fromTemplate = true
+			d.logger.Printf("spawned owner %s from template cache (instant init) for %s", sid[:8], req.Command)
 		}
-		close(placeholder.creating)
-		d.mu.Unlock()
-		return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
+	}
+
+	// Fresh spawn: no template available, or template spawn failed.
+	if owner == nil {
+		owner, err = mux.NewOwner(ownerCfg)
+		if err != nil {
+			// Remove the placeholder and unblock any waiters.
+			d.mu.Lock()
+			if d.owners[sid] == placeholder {
+				delete(d.owners, sid)
+			}
+			close(placeholder.creating)
+			d.mu.Unlock()
+			return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
+		}
+		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
 	}
 
 	// Promote the placeholder to a real entry and signal waiters.
@@ -334,16 +399,13 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
 
-	owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
-	d.logger.Printf("spawned owner %s for %s %v", sid[:8], req.Command, req.Args)
+	// For template-spawned owners, start the upstream process in the background.
+	// The owner already serves cached responses; upstream refreshes caches when ready.
+	if fromTemplate {
+		owner.SpawnUpstreamBackground()
+	}
 
-	// Return immediately — proactive init runs in background (owner.sendProactiveInit).
-	// When a session connects and sends initialize, the owner either:
-	// (a) replays from cache if proactive init already completed, or
-	// (b) waits on initReady then replays (blocks the init RESPONSE, not the process)
-	// This ensures the shim process starts quickly — CC sees a responsive process
-	// and waits for the init response (normal MCP behavior) instead of seeing a
-	// silent process and timing out.
+	owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 	return ipcPath, sid, token, nil
 }
 
