@@ -28,10 +28,14 @@ func runGlobalDaemon() {
 	if g := os.Getenv("MCP_MUX_OWNER_IDLE"); g != "" {
 		if d, err := time.ParseDuration(g); err == nil {
 			ownerIdleTimeout = d
+		} else {
+			log.Printf("warning: invalid MCP_MUX_OWNER_IDLE=%q (%v), using default %s", g, err, ownerIdleTimeout)
 		}
 	} else if g := os.Getenv("MCP_MUX_GRACE"); g != "" {
 		if d, err := time.ParseDuration(g); err == nil {
 			ownerIdleTimeout = d
+		} else {
+			log.Printf("warning: invalid MCP_MUX_GRACE=%q (%v), using default %s", g, err, ownerIdleTimeout)
 		}
 	}
 
@@ -39,6 +43,8 @@ func runGlobalDaemon() {
 	if t := os.Getenv("MCP_MUX_IDLE_TIMEOUT"); t != "" {
 		if d, err := time.ParseDuration(t); err == nil {
 			idleTimeout = d
+		} else {
+			log.Printf("warning: invalid MCP_MUX_IDLE_TIMEOUT=%q (%v), using default %s", t, err, idleTimeout)
 		}
 	}
 

@@ -575,7 +575,14 @@ func (d *Daemon) HandleStatus() map[string]any {
 		s["server_id"] = sid
 		s["persistent"] = entry.Persistent
 		s["last_session"] = entry.LastSession.Format(time.RFC3339)
-		s["idle_timeout_s"] = entry.IdleTimeout.Seconds()
+		// Prefer the per-owner override from x-mux.idleTimeout capability
+		// (set via Owner.SetIdleTimeout after init); fall back to the
+		// daemon-wide default captured at spawn time.
+		effectiveIdleTimeout := entry.IdleTimeout
+		if override := entry.Owner.IdleTimeout(); override > 0 {
+			effectiveIdleTimeout = override
+		}
+		s["idle_timeout_s"] = effectiveIdleTimeout.Seconds()
 		if !entry.Owner.LastActivity().IsZero() {
 			s["last_activity"] = entry.Owner.LastActivity().Format(time.RFC3339)
 		}
