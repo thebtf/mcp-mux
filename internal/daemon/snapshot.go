@@ -10,6 +10,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thejerf/suture/v4"
 )
 
 const (
@@ -207,18 +208,26 @@ func (d *Daemon) loadSnapshot() int {
 			continue
 		}
 
+		// Register with supervisor BEFORE inserting into owners map so that
+		// any concurrent failure is handled by suture.
+		var serviceToken suture.ServiceToken
+		if d.supervisor != nil {
+			serviceToken = d.supervisor.Add(owner)
+		}
+
 		d.mu.Lock()
 		d.owners[sid] = &OwnerEntry{
-			Owner:       owner,
-			ServerID:    sid,
-			Command:     ownerSnap.Command,
-			Args:        ownerSnap.Args,
-			Cwd:         ownerSnap.Cwd,
-			Mode:        ownerSnap.Mode,
-			Env:         ownerSnap.Env,
-			Persistent:  ownerSnap.Persistent,
-			LastSession: time.Now(),
-			GracePeriod: d.gracePeriod,
+			Owner:        owner,
+			ServerID:     sid,
+			Command:      ownerSnap.Command,
+			Args:         ownerSnap.Args,
+			Cwd:          ownerSnap.Cwd,
+			Mode:         ownerSnap.Mode,
+			Env:          ownerSnap.Env,
+			Persistent:   ownerSnap.Persistent,
+			LastSession:  time.Now(),
+			GracePeriod:  d.gracePeriod,
+			serviceToken: serviceToken,
 		}
 		d.mu.Unlock()
 
