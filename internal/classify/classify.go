@@ -130,6 +130,49 @@ func ParsePersistent(initJSON []byte) bool {
 	return xmux.Persistent
 }
 
+// ParseToolTimeout extracts x-mux.toolTimeout from a cached initialize response.
+// Returns the declared tool call timeout in seconds, or 0 if not declared.
+// When set, mux wraps tools/call requests in a watchdog that synthesizes a
+// JSON-RPC error response if upstream doesn't respond within the timeout.
+// Prevents eternal hangs when upstream deadlocks or crashes silently.
+func ParseToolTimeout(initJSON []byte) int {
+	var resp struct {
+		Result struct {
+			Capabilities struct {
+				XMux *struct {
+					ToolTimeout int `json:"toolTimeout"`
+				} `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(initJSON, &resp); err != nil {
+		return 0
+	}
+
+	xmux := resp.Result.Capabilities.XMux
+
+	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
+		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
+			xmux = &struct {
+				ToolTimeout int `json:"toolTimeout"`
+			}{}
+			if err := json.Unmarshal(raw, xmux); err != nil {
+				return 0
+			}
+		}
+	}
+
+	if xmux == nil || xmux.ToolTimeout <= 0 {
+		return 0
+	}
+	// Cap at 1 hour to prevent unreasonable values
+	if xmux.ToolTimeout > 3600 {
+		return 3600
+	}
+	return xmux.ToolTimeout
+}
+
 // ParseDrainTimeout extracts x-mux.drainTimeout from a cached initialize response.
 // Returns the declared drain timeout in seconds, or 0 if not declared.
 // Servers use this to tell mux how long they need to gracefully shut down
