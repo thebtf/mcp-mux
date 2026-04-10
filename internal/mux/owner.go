@@ -1851,21 +1851,13 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
 
-	// v0.11.0: synthetically force listChanged=true on all list-providing
-	// capabilities in the cached initialize response. Claude Code only
-	// subscribes to notifications/tools/list_changed (and siblings) when
-	// the server advertises listChanged in its capabilities; without this,
-	// our cache-busting notifications are ignored by CC and the client
-	// keeps serving stale tools. We take responsibility for the list-
-	// changed contract at the mux layer regardless of what upstream
-	// declares. Source: D:/Dev/_EXTRAS_/claude-code/src/services/mcp/
-	//   useManageMCPConnections.ts:618-699 (tools/prompts/resources
-	//   list_changed subscription is gated on capabilities.*.listChanged).
-	if method == "initialize" {
-		if injected, ok := injectListChangedCapabilities(cached); ok {
-			cached = injected
-		}
-	}
+	// NOTE (v0.11.0): injectListChangedCapabilities is intentionally NOT called
+	// here. The injection function is correct and ready (listchanged_inject.go),
+	// but the companion trigger (synthetic list_changed emit on upstream restart)
+	// is not yet implemented. Wiring injection without the trigger would cause CC
+	// to subscribe to list_changed on a channel that never fires, leaving its
+	// tool-list cache permanently stale. Both pieces ship together in v0.12.0.
+	// See FR-4 in .agent/specs/survive-disconnects/spec.md.
 
 	o.mu.Lock()
 	switch method {
