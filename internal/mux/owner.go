@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/ipc"
 	"github.com/thebtf/mcp-mux/internal/jsonrpc"
 	"github.com/thebtf/mcp-mux/internal/remap"
+	"github.com/thebtf/mcp-mux/internal/serverid"
 	"github.com/thebtf/mcp-mux/internal/upstream"
 )
 
@@ -1051,6 +1053,12 @@ func (o *Owner) removeSession(s *Session) {
 }
 
 // acceptLoop accepts new IPC connections and creates sessions for them.
+//
+// If listener.Close() is called WITHOUT closing listenerDone, Accept() returns
+// "use of closed network connection" forever — previously this caused a tight
+// spin loop (711 errors/sec observed) that killed the daemon with log spam.
+// Now we detect the "closed" error class and exit cleanly; other errors get a
+// small backoff to prevent CPU saturation.
 func (o *Owner) acceptLoop() {
 	for {
 		conn, err := o.listener.Accept()
@@ -1061,9 +1069,17 @@ func (o *Owner) acceptLoop() {
 			case <-o.listenerDone:
 				return // listener closed (auto-isolation or shutdown)
 			default:
-				o.logger.Printf("accept error: %v", err)
-				continue
 			}
+			// Detect "listener closed" by error type — if we can't Accept again,
+			// don't spin. This catches the case where listener.Close() was called
+			// but listenerDone wasn't signaled (bug safety net).
+			if errors.Is(err, net.ErrClosed) {
+				o.logger.Printf("accept loop exiting: listener closed (%v)", err)
+				return
+			}
+			o.logger.Printf("accept error: %v", err)
+			time.Sleep(100 * time.Millisecond) // backoff to prevent CPU saturation
+			continue
 		}
 
 		var token string
@@ -1096,8 +1112,11 @@ func (o *Owner) HandleShutdown(drainTimeoutMs int) string {
 	}
 
 	go func() {
-		// Close IPC listener to stop new connections
-		o.listener.Close()
+		// Close IPC listener to stop new connections.
+		// Use closeListener() to signal listenerDone — otherwise acceptLoop spins
+		// in a tight error loop ("use of closed network connection") at CPU speed,
+		// producing 700+ log lines/sec and eventually killing the daemon.
+		o.closeListener()
 
 		timeout := time.Duration(drainTimeoutMs) * time.Millisecond
 		deadline := time.After(timeout)
@@ -1310,14 +1329,27 @@ func (o *Owner) MarkClassified() {
 // AddCwd registers an additional project cwd for this owner.
 // Used by dedup: when a second project reuses a shared owner,
 // its cwd is added so roots/list includes all project roots.
+//
+// Paths are canonicalized (lowercased on Windows, symlinks resolved) to
+// prevent memory leaks from case/slash variants being treated as distinct.
+// Before normalization: D:\Dev\foo, D:/Dev/foo, d:\dev\foo all grew cwdSet.
+// sendRootsListChanged is called ONLY when a new cwd is actually added,
+// preventing log spam and upstream notification storms on duplicate calls.
 func (o *Owner) AddCwd(cwd string) {
-	o.mu.Lock()
-	if !o.cwdSet[cwd] {
-		o.cwdSet[cwd] = true
-		o.logger.Printf("added cwd: %s (now %d roots)", cwd, len(o.cwdSet))
+	if cwd == "" {
+		return
 	}
+	canonical := serverid.CanonicalizePath(cwd)
+	o.mu.Lock()
+	if o.cwdSet[canonical] {
+		o.mu.Unlock()
+		return // already registered — silent no-op, no log, no notify
+	}
+	o.cwdSet[canonical] = true
+	count := len(o.cwdSet)
 	o.mu.Unlock()
-	// Notify upstream that roots changed
+	o.logger.Printf("added cwd: %s (now %d roots)", canonical, count)
+	// Notify upstream ONLY on actual change
 	o.sendRootsListChanged()
 }
 

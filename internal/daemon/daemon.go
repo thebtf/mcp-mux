@@ -249,7 +249,8 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			entry.LastSession = time.Now()
 			d.mu.Unlock()
 			entry.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
-			d.logger.Printf("reusing existing owner %s for %s", sid[:8], req.Command)
+			// Note: no log here — this path is the hot path (every CC session reconnect).
+			// Logging each reuse produced 500+ lines/minute during multi-session incidents.
 			return entry.Owner.IPCPath(), sid, token, nil
 		}
 		// Owner exists but IPC listener is closed (isolated server).
@@ -282,10 +283,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			existingSID := existing.ServerID
 			d.mu.Unlock()
 			if req.Cwd != "" {
+				// AddCwd itself logs only when a new canonical cwd is added.
+				// Dedup hot path is silent — logging every reuse produced 500+ lines/minute.
 				existing.Owner.AddCwd(req.Cwd)
 			}
 			existing.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
-			d.logger.Printf("dedup: reusing shared owner %s for %s (added cwd: %s)", existingSID[:8], req.Command, req.Cwd)
 			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
 	}

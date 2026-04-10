@@ -91,6 +91,20 @@ func (r *Reaper) sweep() int {
 	}
 	r.daemon.mu.RUnlock()
 
+	// Sweep expired pending tokens across all owners.
+	// Prevents unbounded growth of sm.pending when shims never connect
+	// (CC killed the process before dial, or spawn request had no follow-up).
+	totalSwept := 0
+	for _, entry := range entries {
+		if entry.Owner == nil {
+			continue
+		}
+		totalSwept += entry.Owner.SessionMgr().SweepExpiredPending()
+	}
+	if totalSwept > 0 {
+		r.logger.Printf("reaper: swept %d expired pending tokens", totalSwept)
+	}
+
 	for i, entry := range entries {
 		sid := sids[i]
 

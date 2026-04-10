@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/serverid"
 )
 
 // ---------------------------------------------------------------------------
@@ -1031,6 +1032,7 @@ func TestAddCwd_AddsNew(t *testing.T) {
 
 	newCwd := t.TempDir()
 	owner.AddCwd(newCwd)
+	canonicalCwd := serverid.CanonicalizePath(newCwd)
 
 	status := owner.Status()
 	cwdSet, ok := status["cwd_set"].([]string)
@@ -1040,13 +1042,13 @@ func TestAddCwd_AddsNew(t *testing.T) {
 
 	found := false
 	for _, c := range cwdSet {
-		if c == newCwd {
+		if c == canonicalCwd {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("AddCwd: new cwd %q not in cwd_set %v", newCwd, cwdSet)
+		t.Errorf("AddCwd: canonical cwd %q not in cwd_set %v", canonicalCwd, cwdSet)
 	}
 }
 
@@ -1067,18 +1069,19 @@ func TestAddCwd_NoDuplicate(t *testing.T) {
 	newCwd := t.TempDir()
 	owner.AddCwd(newCwd)
 	owner.AddCwd(newCwd) // second add — should not duplicate
+	canonicalCwd := serverid.CanonicalizePath(newCwd)
 
 	owner.mu.RLock()
 	count := 0
 	for c := range owner.cwdSet {
-		if c == newCwd {
+		if c == canonicalCwd {
 			count++
 		}
 	}
 	owner.mu.RUnlock()
 
 	if count != 1 {
-		t.Errorf("AddCwd duplicate: cwd appears %d times in cwdSet, want 1", count)
+		t.Errorf("AddCwd duplicate: canonical cwd appears %d times in cwdSet, want 1", count)
 	}
 }
 

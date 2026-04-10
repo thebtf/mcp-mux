@@ -14,9 +14,15 @@ type SessionContext struct {
 
 // pendingSession holds pre-registered session data waiting for a shim to connect.
 type pendingSession struct {
-	Cwd string
-	Env map[string]string
+	Cwd       string
+	Env       map[string]string
+	CreatedAt time.Time // for TTL expiry — orphan tokens are swept if shim never connects
 }
+
+// pendingTokenTTL is the maximum time a pre-registered token lives before
+// being swept. Must be long enough to cover slow CC startup + daemon spawn
+// + shim dial, but short enough to prevent memory leaks from orphan spawns.
+const pendingTokenTTL = 2 * time.Minute
 
 // SessionManager tracks active sessions, their working directories,
 // and in-flight upstream request correlations. It replaces the
@@ -67,10 +73,42 @@ func (sm *SessionManager) RemoveSession(sessionID int) {
 
 // PreRegister stores a token→(cwd,env) mapping before the shim connects.
 // Called by the daemon after generating a handshake token.
+// Pending entries have a TTL (pendingTokenTTL) — orphan tokens from failed
+// spawns are swept by SweepExpiredPending to prevent unbounded growth.
 func (sm *SessionManager) PreRegister(token, cwd string, env map[string]string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	sm.pending[token] = &pendingSession{Cwd: cwd, Env: env}
+	sm.pending[token] = &pendingSession{
+		Cwd:       cwd,
+		Env:       env,
+		CreatedAt: time.Now(),
+	}
+}
+
+// SweepExpiredPending removes pending tokens older than pendingTokenTTL.
+// Returns the number of swept entries. Called periodically by the daemon
+// to prevent memory leaks from orphan tokens (shim never connected after
+// Spawn — e.g., CC killed the process before shim could dial IPC).
+func (sm *SessionManager) SweepExpiredPending() int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	now := time.Now()
+	swept := 0
+	for token, ps := range sm.pending {
+		if now.Sub(ps.CreatedAt) > pendingTokenTTL {
+			delete(sm.pending, token)
+			swept++
+		}
+	}
+	return swept
+}
+
+// PendingCount returns the number of pending (pre-registered but not yet bound) tokens.
+// Exposed for observability (mux_list --verbose).
+func (sm *SessionManager) PendingCount() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.pending)
 }
 
 // Bind resolves a token to session metadata (cwd, env) and sets them on the session.
