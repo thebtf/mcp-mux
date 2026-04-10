@@ -7,10 +7,26 @@ import (
 	"github.com/thebtf/mcp-mux/internal/control"
 )
 
-// Reaper periodically sweeps daemon owners for cleanup:
-// - Non-persistent owners with zero sessions past grace period → shutdown
-// - Dead upstreams on persistent owners → re-spawn
-// - Daemon idle (zero owners, zero sessions) past idle timeout → auto-exit
+// Reaper periodically sweeps daemon owners for cleanup.
+//
+// v0.11.0 "Activity-Aware Reaping": the old grace-period model (kill on zero
+// sessions after 30s) was replaced with an activity-aware model because the
+// grace-period semantic killed stateful async work that didn't emit
+// pending_requests (aimux background jobs, long-running inference).
+//
+// An owner is eligible for removal only when ALL of the following hold:
+//   1. sessions == 0
+//   2. not persistent (x-mux.persistent: true pins the owner forever)
+//   3. pending JSON-RPC requests == 0
+//   4. active progress tokens == 0 (no long-running tool/call streaming)
+//   5. no active busy declarations (x-mux busy protocol)
+//   6. lastActivity older than the owner's idleTimeout
+//
+// The default idleTimeout is 10 minutes (was 30s grace in v0.10.x).
+// Overridable via MCP_MUX_OWNER_IDLE env or per-owner via x-mux.idleTimeout.
+//
+// Dead upstreams on persistent owners are still re-spawned, and the daemon
+// still auto-exits after its own idle period when it has zero owners.
 type Reaper struct {
 	daemon   *Daemon
 	interval time.Duration
@@ -113,8 +129,6 @@ func (r *Reaper) sweep() int {
 			continue
 		}
 
-		sessions := entry.Owner.SessionCount()
-
 		// Check if upstream is dead
 		select {
 		case <-entry.Owner.Done():
@@ -128,24 +142,108 @@ func (r *Reaper) sweep() int {
 		default:
 		}
 
-		// Non-persistent + zero sessions + grace elapsed → remove.
-		// But NOT if upstream has pending requests (long-running tool call
-		// like dotnet build may outlive the session that requested it).
-		if sessions == 0 && !entry.Persistent {
-			pending := entry.Owner.PendingRequests()
-			if pending > 0 {
-				continue // upstream still processing — don't kill it
-			}
-			elapsed := now.Sub(entry.LastSession)
-			if elapsed > entry.GracePeriod {
-				r.logger.Printf("reaper: owner %s grace expired (%.0fs), removing", sid[:8], elapsed.Seconds())
-				_ = r.daemon.Remove(sid)
-				affected++
-			}
+		sample := evictionSample{
+			Sessions:             entry.Owner.SessionCount(),
+			Persistent:           entry.Persistent,
+			PendingRequests:      entry.Owner.PendingRequests(),
+			ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),
+			HasBusyWork:          entry.Owner.HasActiveBusyWork(),
+			IdleTimeout:          entry.IdleTimeout,
+			OwnerIdleOverride:    entry.Owner.IdleTimeout(),
+			LastSession:          entry.LastSession,
+			LastActivity:         entry.Owner.LastActivity(),
+		}
+		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout)
+		if decision.evict {
+			r.logger.Printf(
+				"reaper: owner %s idle for %.0fs (timeout %.0fs), removing",
+				sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
+			)
+			_ = r.daemon.Remove(sid)
+			affected++
 		}
 	}
 
 	return affected
+}
+
+// evictionSample captures all state the reaper needs to decide whether an
+// owner is eligible for removal. Extracted as a value type so the kill-gate
+// logic (shouldEvict) is a pure function and can be unit-tested without
+// constructing a real Owner.
+type evictionSample struct {
+	Sessions             int
+	Persistent           bool
+	PendingRequests      int64
+	ActiveProgressTokens int
+	HasBusyWork          bool
+	// IdleTimeout is the owner-entry idle timeout (set at Spawn time
+	// from daemon defaults).
+	IdleTimeout time.Duration
+	// OwnerIdleOverride is the x-mux.idleTimeout capability (0 if unset).
+	OwnerIdleOverride time.Duration
+	LastSession       time.Time
+	LastActivity      time.Time
+}
+
+type evictionDecision struct {
+	evict       bool
+	elapsed     time.Duration
+	idleTimeout time.Duration
+}
+
+// shouldEvict applies the activity-aware kill gate:
+//
+//	sessions == 0 AND
+//	!persistent AND
+//	pendingRequests == 0 AND
+//	activeProgressTokens == 0 AND
+//	!hasBusyWork AND
+//	now - max(lastSession, lastActivity) > idleTimeout
+//
+// The effective idleTimeout is, in priority order:
+//  1. OwnerIdleOverride from x-mux.idleTimeout capability
+//  2. Sample.IdleTimeout (daemon default copied at spawn)
+//  3. daemonDefault argument (fallback for placeholder entries)
+func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) evictionDecision {
+	if s.Sessions != 0 {
+		return evictionDecision{}
+	}
+	if s.Persistent {
+		return evictionDecision{}
+	}
+	if s.PendingRequests > 0 {
+		return evictionDecision{}
+	}
+	if s.ActiveProgressTokens > 0 {
+		return evictionDecision{}
+	}
+	if s.HasBusyWork {
+		return evictionDecision{}
+	}
+
+	idleTimeout := s.IdleTimeout
+	if s.OwnerIdleOverride > 0 {
+		idleTimeout = s.OwnerIdleOverride
+	}
+	if idleTimeout <= 0 {
+		idleTimeout = daemonDefault
+	}
+	if idleTimeout <= 0 {
+		// No timeout configured anywhere — do not evict.
+		return evictionDecision{}
+	}
+
+	idleSince := s.LastSession
+	if s.LastActivity.After(idleSince) {
+		idleSince = s.LastActivity
+	}
+	elapsed := now.Sub(idleSince)
+	return evictionDecision{
+		evict:       elapsed > idleTimeout,
+		elapsed:     elapsed,
+		idleTimeout: idleTimeout,
+	}
 }
 
 // respawn attempts to re-create a persistent owner after upstream death.

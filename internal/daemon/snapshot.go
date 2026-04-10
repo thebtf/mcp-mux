@@ -226,7 +226,7 @@ func (d *Daemon) loadSnapshot() int {
 			Env:          ownerSnap.Env,
 			Persistent:   ownerSnap.Persistent,
 			LastSession:  time.Now(),
-			GracePeriod:  d.gracePeriod,
+			IdleTimeout:  d.ownerIdleTimeout,
 			serviceToken: serviceToken,
 		}
 		d.mu.Unlock()

@@ -36,7 +36,11 @@ type OwnerEntry struct {
 	Env         map[string]string
 	Persistent  bool
 	LastSession time.Time
-	GracePeriod time.Duration
+	// IdleTimeout is the effective idle timeout for this owner (daemon
+	// default or per-owner x-mux.idleTimeout override). The reaper uses
+	// this to decide whether an idle owner is eligible for removal.
+	// Replaces v0.10.x GracePeriod.
+	IdleTimeout time.Duration
 	// serviceToken is the suture.ServiceToken returned by supervisor.Add.
 	// Used to remove the owner from the supervisor on Remove/Shutdown.
 	// In-memory only — not serialized to snapshots.
@@ -54,9 +58,13 @@ type Daemon struct {
 	ctlSrv  *control.Server
 	done    chan struct{}
 
-	gracePeriod   time.Duration
-	idleTimeout   time.Duration
-	templateCache map[string]mux.OwnerSnapshot // command+args key → cached init data
+	// ownerIdleTimeout is the default time an owner may sit with no activity
+	// (no MCP traffic, no sessions, no pending requests, no active progress
+	// tokens, no busy declarations) before the reaper removes it. Default 10m.
+	// Overridable per-owner via x-mux.idleTimeout capability.
+	ownerIdleTimeout time.Duration
+	idleTimeout      time.Duration // daemon-level auto-exit timeout (zero owners + zero sessions)
+	templateCache    map[string]mux.OwnerSnapshot // command+args key → cached init data
 
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
@@ -74,8 +82,20 @@ type Config struct {
 	// ControlPath is the daemon's control socket path.
 	ControlPath string
 
-	// GracePeriod is how long non-persistent owners survive with zero sessions.
-	// Default: 30s. Overridden by MCP_MUX_GRACE env var.
+	// OwnerIdleTimeout is how long an owner may be idle (no MCP traffic, no
+	// sessions, no pending JSON-RPC requests, no active progress tokens, no
+	// busy declarations) before the reaper removes it. Default: 10 minutes.
+	// Overridden by MCP_MUX_OWNER_IDLE env var and per-owner via the
+	// x-mux.idleTimeout capability in the upstream initializeResult.
+	// v0.10.x used GracePeriod (default 30s); replaced in v0.11.0 because
+	// the grace-period semantic killed stateful async work that didn't
+	// emit pending_requests (e.g. aimux background jobs).
+	OwnerIdleTimeout time.Duration
+
+	// GracePeriod is a v0.10.x legacy alias for OwnerIdleTimeout. Kept for
+	// callers that haven't migrated. Ignored if OwnerIdleTimeout is set.
+	//
+	// Deprecated: use OwnerIdleTimeout.
 	GracePeriod time.Duration
 
 	// IdleTimeout is how long the daemon waits with zero owners before auto-exiting.
@@ -96,9 +116,14 @@ func New(cfg Config) (*Daemon, error) {
 		logger = log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
 	}
 
-	gracePeriod := cfg.GracePeriod
-	if gracePeriod == 0 {
-		gracePeriod = 30 * time.Second
+	// Resolve the owner idle timeout with legacy fallback.
+	// Priority: OwnerIdleTimeout → GracePeriod (legacy alias) → 10m default.
+	ownerIdleTimeout := cfg.OwnerIdleTimeout
+	if ownerIdleTimeout == 0 {
+		ownerIdleTimeout = cfg.GracePeriod
+	}
+	if ownerIdleTimeout == 0 {
+		ownerIdleTimeout = 10 * time.Minute
 	}
 	idleTimeout := cfg.IdleTimeout
 	if idleTimeout == 0 {
@@ -110,7 +135,7 @@ func New(cfg Config) (*Daemon, error) {
 		owners:           make(map[string]*OwnerEntry),
 		logger:           logger,
 		done:             make(chan struct{}),
-		gracePeriod:      gracePeriod,
+		ownerIdleTimeout: ownerIdleTimeout,
 		idleTimeout:      idleTimeout,
 		templateCache:    make(map[string]mux.OwnerSnapshot),
 		supervisorCtx:    supCtx,
@@ -458,7 +483,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	placeholder.Mode = req.Mode
 	placeholder.Env = req.Env
 	placeholder.LastSession = time.Now()
-	placeholder.GracePeriod = d.gracePeriod
+	placeholder.IdleTimeout = d.ownerIdleTimeout
 	placeholder.serviceToken = serviceToken
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
@@ -550,16 +575,28 @@ func (d *Daemon) HandleStatus() map[string]any {
 		s["server_id"] = sid
 		s["persistent"] = entry.Persistent
 		s["last_session"] = entry.LastSession.Format(time.RFC3339)
-		s["grace_period_s"] = entry.GracePeriod.Seconds()
+		// Prefer the per-owner override from x-mux.idleTimeout capability
+		// (set via Owner.SetIdleTimeout after init); fall back to the
+		// daemon-wide default captured at spawn time.
+		effectiveIdleTimeout := entry.IdleTimeout
+		if override := entry.Owner.IdleTimeout(); override > 0 {
+			effectiveIdleTimeout = override
+		}
+		s["idle_timeout_s"] = effectiveIdleTimeout.Seconds()
+		if !entry.Owner.LastActivity().IsZero() {
+			s["last_activity"] = entry.Owner.LastActivity().Format(time.RFC3339)
+		}
+		s["active_progress_tokens"] = entry.Owner.ActiveProgressTokens()
+		s["busy"] = entry.Owner.HasActiveBusyWork()
 		servers = append(servers, s)
 	}
 
 	return map[string]any{
-		"daemon":       true,
-		"owner_count":  len(servers), // excludes placeholders still being created
-		"servers":      servers,
-		"grace_period": d.gracePeriod.String(),
-		"idle_timeout": d.idleTimeout.String(),
+		"daemon":             true,
+		"owner_count":        len(servers), // excludes placeholders still being created
+		"servers":            servers,
+		"owner_idle_timeout": d.ownerIdleTimeout.String(),
+		"idle_timeout":       d.idleTimeout.String(),
 	}
 }
 

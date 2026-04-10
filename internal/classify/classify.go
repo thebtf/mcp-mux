@@ -215,3 +215,53 @@ func ParseDrainTimeout(initJSON []byte) int {
 	}
 	return xmux.DrainTimeout
 }
+
+// ParseIdleTimeout extracts x-mux.idleTimeout from a cached initialize response.
+// Returns the declared owner idle timeout in seconds, or 0 if not declared.
+// When set, the daemon reaper uses this value instead of the daemon default
+// (MCP_MUX_OWNER_IDLE or 10m) to decide when to evict this owner.
+//
+// Upstreams that know they hold stateful background work (async job queues,
+// persistent LLM sessions, in-memory caches) should declare a long idle
+// timeout to survive multi-hour quiet periods. Upstreams that are cheap to
+// re-spawn can declare a short timeout to free RAM faster.
+func ParseIdleTimeout(initJSON []byte) int {
+	var resp struct {
+		Result struct {
+			Capabilities struct {
+				XMux *struct {
+					IdleTimeout int `json:"idleTimeout"`
+				} `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(initJSON, &resp); err != nil {
+		return 0
+	}
+
+	xmux := resp.Result.Capabilities.XMux
+
+	// Fallback: check experimental.x-mux (TypeScript SDK puts custom
+	// capabilities under experimental rather than at capability root).
+	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
+		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
+			xmux = &struct {
+				IdleTimeout int `json:"idleTimeout"`
+			}{}
+			if err := json.Unmarshal(raw, xmux); err != nil {
+				return 0
+			}
+		}
+	}
+
+	if xmux == nil || xmux.IdleTimeout <= 0 {
+		return 0
+	}
+	// Cap at 24 hours. Larger values are almost certainly a unit mistake
+	// (ms vs seconds) and would effectively disable the reaper.
+	if xmux.IdleTimeout > 86400 {
+		return 86400
+	}
+	return xmux.IdleTimeout
+}
