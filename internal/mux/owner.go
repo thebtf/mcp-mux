@@ -1308,6 +1308,21 @@ func (o *Owner) Done() <-chan struct{} {
 	return o.done
 }
 
+// String implements fmt.Stringer to provide a compact identifier for
+// the suture supervisor's logging. Without this, suture falls back to
+// fmt.Sprintf("%#v", o) which dumps all fields — including raw []byte
+// caches (initResp, toolList can be 10s of KB) — on every termination
+// event. The reflected dump was 25 KB per log line and consumed 93%
+// of log volume during supervisor restart cycles (see aimux→mcp-mux
+// issue #5 comment 2026-04-10).
+func (o *Owner) String() string {
+	sid := o.serverID
+	if len(sid) > 8 {
+		sid = sid[:8]
+	}
+	return fmt.Sprintf("owner[%s %s]", sid, o.command)
+}
+
 // closedChan is a pre-closed channel used by upstreamDeadCh when the owner
 // has no upstream process. Returning a closed channel lets Serve observe
 // upstream-missing as a failure (so suture can backoff/restart) instead of
