@@ -104,7 +104,9 @@ type Owner struct {
 
 	sessionMgr       *SessionManager
 	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
-	progressOwners   map[string]int // progressToken → session ID for targeted routing
+	progressOwners         map[string]int      // progressToken → session ID for targeted routing
+	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
+	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
 	upstreamDead    atomic.Bool  // set when upstream exits; prevents sending to dead pipe
 	methodTags      sync.Map     // remapped request ID (string) -> method name
@@ -217,12 +219,14 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		autoClassification:   snap.Classification,
 		classificationSource: snap.ClassificationSource,
 		classificationReason: snap.ClassificationReason,
-		classified:           make(chan struct{}),
-		initReady:            make(chan struct{}),
-		progressOwners:       make(map[string]int),
-		startTime:            time.Now(),
-		listenerDone:         make(chan struct{}),
-		done:                 make(chan struct{}),
+		classified:               make(chan struct{}),
+		initReady:                make(chan struct{}),
+		progressOwners:           make(map[string]int),
+		progressTokenRequestID:   make(map[string]string),
+		requestToTokens:          make(map[string][]string),
+		startTime:                time.Now(),
+		listenerDone:             make(chan struct{}),
+		done:                     make(chan struct{}),
 	}
 
 	// Pre-populate caches from snapshot
@@ -370,12 +374,14 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		cachedInitSessions: make(map[int]bool),
 		sessionMgr:         NewSessionManager(),
 		tokenHandshake:     cfg.TokenHandshake,
-		classified:         make(chan struct{}),
-		initReady:          make(chan struct{}),
-		progressOwners:     make(map[string]int),
-		startTime:          time.Now(),
-		listenerDone:       make(chan struct{}),
-		done:               make(chan struct{}),
+		classified:             make(chan struct{}),
+		initReady:              make(chan struct{}),
+		progressOwners:         make(map[string]int),
+		progressTokenRequestID: make(map[string]string),
+		requestToTokens:        make(map[string][]string),
+		startTime:              time.Now(),
+		listenerDone:           make(chan struct{}),
+		done:                   make(chan struct{}),
 	}
 
 	// Start control plane if configured
@@ -649,7 +655,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		}
 
 		// Track progressToken ownership for targeted notification routing
-		o.trackProgressToken(s.ID, msg.Raw)
+		o.trackProgressToken(s.ID, string(newID), msg.Raw)
 
 		// Record the active session so server→client requests can be routed back
 		o.sessionMgr.TrackRequest(string(newID), s.ID)
@@ -803,6 +809,8 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 		if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
 			o.cacheResponse(methodRaw.(string), msg.Raw)
 		}
+		// Clean up progress tokens for the (watchdog-timed-out) request (FIX 1).
+		o.clearProgressTokensForRequest(string(msg.ID))
 		return nil
 	}
 
@@ -817,6 +825,9 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	}
 	o.pendingRequests.Add(-1)
 	o.sessionMgr.CompleteRequest(string(msg.ID))
+
+	// Clean up any progress tokens registered for this request (FIX 1).
+	o.clearProgressTokensForRequest(string(msg.ID))
 
 	// Cache response if this was a tagged cacheable request
 	if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
@@ -1021,7 +1032,9 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 
 // trackProgressToken extracts _meta.progressToken from a request and records
 // which session owns it, enabling targeted progress notification routing.
-func (o *Owner) trackProgressToken(sessionID int, raw []byte) {
+// requestID is the remapped (upstream-facing) request ID; it is stored so that
+// clearProgressTokensForRequest can clean up when the response arrives.
+func (o *Owner) trackProgressToken(sessionID int, requestID string, raw []byte) {
 	var req struct {
 		Params struct {
 			Meta struct {
@@ -1038,7 +1051,27 @@ func (o *Owner) trackProgressToken(sessionID int, raw []byte) {
 	token := string(req.Params.Meta.ProgressToken)
 	o.mu.Lock()
 	o.progressOwners[token] = sessionID
+	o.progressTokenRequestID[token] = requestID
+	o.requestToTokens[requestID] = append(o.requestToTokens[requestID], token)
 	o.mu.Unlock()
+}
+
+// clearProgressTokensForRequest removes all progress tokens associated with the
+// given remapped request ID. Called when:
+//   - the upstream response for that request arrives (normal completion),
+//   - notifications/cancelled is received for that request (client abort), or
+//   - the owning session is removed (session died before the call completed).
+//
+// Must be called with o.mu held for write, or acquire it internally.
+// This variant acquires the lock itself (safe to call from any goroutine).
+func (o *Owner) clearProgressTokensForRequest(requestID string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, token := range o.requestToTokens[requestID] {
+		delete(o.progressOwners, token)
+		delete(o.progressTokenRequestID, token)
+	}
+	delete(o.requestToTokens, requestID)
 }
 
 // sendRootsListChanged notifies the upstream that roots have changed.
@@ -1091,6 +1124,16 @@ func (o *Owner) removeSession(s *Session) {
 	o.mu.Lock()
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
+	// Clean up progress tokens owned by this session (FIX 1: session died
+	// before its tool call completed — prevent permanent reaper veto).
+	for token, ownerID := range o.progressOwners {
+		if ownerID == s.ID {
+			reqID := o.progressTokenRequestID[token]
+			delete(o.progressOwners, token)
+			delete(o.progressTokenRequestID, token)
+			delete(o.requestToTokens, reqID)
+		}
+	}
 	o.mu.Unlock()
 
 	o.sessionMgr.RemoveSession(s.ID)
@@ -1903,6 +1946,9 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 	if err != nil {
 		return o.writeUpstream(msg.Raw)
 	}
+
+	// Clean up progress tokens for the cancelled request (FIX 1).
+	o.clearProgressTokensForRequest(string(remappedRequestID))
 
 	o.logger.Printf("session %d: forwarding notifications/cancelled with remapped requestId", s.ID)
 	return o.writeUpstream(remapped)

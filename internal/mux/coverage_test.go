@@ -241,16 +241,19 @@ func TestCaptureInitFingerprint_OnlyFirstCapture(t *testing.T) {
 
 func newMinimalOwner() *Owner {
 	return &Owner{
-		sessions:           make(map[int]*Session),
-		cachedInitSessions: make(map[int]bool),
-		progressOwners:     make(map[string]int),
-		ipcPath:            "/tmp/test.sock",
-		command:            "echo",
-		args:               []string{"hello", "world"},
-		serverID:           "test-server-id",
-		logger:             log.New(io.Discard, "", 0),
-		done:               make(chan struct{}),
-		listenerDone:       make(chan struct{}),
+		sessions:               make(map[int]*Session),
+		cachedInitSessions:     make(map[int]bool),
+		progressOwners:         make(map[string]int),
+		progressTokenRequestID: make(map[string]string),
+		requestToTokens:        make(map[string][]string),
+		sessionMgr:             NewSessionManager(),
+		ipcPath:                "/tmp/test.sock",
+		command:                "echo",
+		args:                   []string{"hello", "world"},
+		serverID:               "test-server-id",
+		logger:                 log.New(io.Discard, "", 0),
+		done:                   make(chan struct{}),
+		listenerDone:           make(chan struct{}),
 	}
 }
 
