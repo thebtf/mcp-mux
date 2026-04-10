@@ -1316,6 +1316,9 @@ func (o *Owner) Done() <-chan struct{} {
 // of log volume during supervisor restart cycles (see aimux→mcp-mux
 // issue #5 comment 2026-04-10).
 func (o *Owner) String() string {
+	if o == nil {
+		return "owner[<nil>]"
+	}
 	sid := o.serverID
 	if len(sid) > 8 {
 		sid = sid[:8]
