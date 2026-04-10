@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/remap"
 	"github.com/thebtf/mcp-mux/internal/serverid"
 	"github.com/thebtf/mcp-mux/internal/upstream"
+	"github.com/thejerf/suture/v4"
 )
 
 // Version is the mcp-mux build version, included in status output.
@@ -1188,11 +1190,16 @@ func (o *Owner) evictExtraSessions() {
 
 // closeListener stops the IPC listener and removes the socket file.
 // Safe to call multiple times (uses sync.Once).
+// Nil-safe: owners constructed for tests may not have a listener.
 func (o *Owner) closeListener() {
 	o.closeListenerOnce.Do(func() {
 		close(o.listenerDone)
-		o.listener.Close()
-		ipc.Cleanup(o.ipcPath)
+		if o.listener != nil {
+			o.listener.Close()
+		}
+		if o.ipcPath != "" {
+			ipc.Cleanup(o.ipcPath)
+		}
 	})
 }
 
@@ -1269,6 +1276,56 @@ func (o *Owner) Shutdown() {
 // Done returns a channel closed when the owner has shut down.
 func (o *Owner) Done() <-chan struct{} {
 	return o.done
+}
+
+// Serve implements the suture.Service interface, enabling owner lifecycle
+// management via supervisor trees with exponential backoff on restart.
+//
+// Serve blocks until one of:
+//   - ctx is cancelled (external shutdown → returns ctx.Err() after Shutdown)
+//   - owner.done is closed via Shutdown (clean exit → returns nil, no restart)
+//   - upstream dies fatally (returns error → suture restarts with backoff,
+//     unless classification is isolated or ErrDoNotRestart is returned)
+//
+// Isolated owners intentionally return suture.ErrDoNotRestart on upstream
+// death — they should not be auto-restarted because each CC session creates
+// its own dedicated isolated owner.
+func (o *Owner) Serve(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		// External cancellation (daemon shutdown, supervisor stop)
+		o.Shutdown()
+		return ctx.Err()
+	case <-o.done:
+		// Owner already shut down cleanly (external Shutdown call, mux_stop, etc.)
+		return nil
+	case <-o.upstreamDeadCh():
+		// Upstream died. Check classification to decide restart behavior.
+		o.mu.RLock()
+		mode := o.autoClassification
+		o.mu.RUnlock()
+		if mode == classify.ModeIsolated {
+			// Isolated servers should not be restarted by the supervisor.
+			// Each CC session spawns its own dedicated isolated owner.
+			return suture.ErrDoNotRestart
+		}
+		return fmt.Errorf("owner %s: upstream exited", o.serverID[:8])
+	}
+}
+
+// upstreamDeadCh returns a channel that closes when the upstream process dies.
+// Uses the existing upstream.Done channel if available, else returns a channel
+// that closes immediately (snapshot-restored owners with no upstream yet).
+func (o *Owner) upstreamDeadCh() <-chan struct{} {
+	o.mu.RLock()
+	up := o.upstream
+	o.mu.RUnlock()
+	if up == nil {
+		// No upstream (e.g., snapshot-restored owner before SpawnUpstreamBackground).
+		// Return a channel that never closes — Serve will block on ctx/done instead.
+		return make(chan struct{})
+	}
+	return up.Done
 }
 
 // ServerID returns the server identity hash for this owner.
