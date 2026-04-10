@@ -667,63 +667,40 @@ func TestPromptsListCachedAndReplayed(t *testing.T) {
 
 // TestCacheInvalidatedOnListChanged verifies that when upstream sends a
 // notifications/tools/list_changed notification, the tools/list cache is cleared.
+//
+// Uses newMinimalOwner (no real upstream, no proactive init) to avoid a race
+// where proactive init's mux-init-1 (tools/list) response could re-populate
+// the cache AFTER the test's invalidation, causing spurious failures.
 func TestCacheInvalidatedOnListChanged(t *testing.T) {
-	ipcPath := testIPCPath(t)
+	o := newMinimalOwner()
+	o.controlServer = nil
+	defer o.Shutdown()
 
-	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
-		IPCPath: ipcPath,
-		Logger:  testLogger(t),
-	})
-	if err != nil {
-		t.Fatalf("NewOwner() error: %v", err)
-	}
-	defer owner.Shutdown()
+	// Manually prime the cache (no real upstream needed)
+	o.mu.Lock()
+	o.toolList = []byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo"}]}}`)
+	o.mu.Unlock()
 
-	clientR, serverW := io.Pipe()
-	serverR, clientW := io.Pipe()
-	session := NewSession(serverR, serverW)
-	owner.AddSession(session)
-
-	// Prime the tools/list cache
-	sendReq(t, clientW, 1, "initialize", `{}`)
-	readResp(t, clientR)
-	sendReq(t, clientW, 2, "tools/list", `{}`)
-	readResp(t, clientR)
-
-	// Verify cache is set
-	owner.mu.RLock()
-	hasTools := owner.toolList != nil
-	owner.mu.RUnlock()
+	// Verify cache is set before invalidation
+	o.mu.RLock()
+	hasTools := o.toolList != nil
+	o.mu.RUnlock()
 	if !hasTools {
 		t.Fatal("toolList should be cached before invalidation test")
 	}
 
-	// Drain the client pipe so broadcast doesn't block
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			if _, err := clientR.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
-
-	// Simulate upstream sending notifications/tools/list_changed by calling broadcast directly
+	// Simulate upstream sending notifications/tools/list_changed via broadcast.
+	// broadcast() is the code path that dispatches to invalidateCache which
+	// clears the tools/list cache.
 	listChangedNotif := []byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`)
-	if err := owner.broadcast(listChangedNotif); err != nil {
-		// Ignore broadcast errors (session may not be reading)
-		_ = err
+	if err := o.broadcast(listChangedNotif); err != nil {
+		_ = err // broadcast may fail if no sessions — that's fine, we only care about cache invalidation
 	}
 
-	// Small pause for processing
-	time.Sleep(50 * time.Millisecond)
-
-	// Verify cache is cleared
-	owner.mu.RLock()
-	hasToolsAfter := owner.toolList != nil
-	owner.mu.RUnlock()
+	// Verify cache is cleared synchronously (broadcast invalidation is sync).
+	o.mu.RLock()
+	hasToolsAfter := o.toolList != nil
+	o.mu.RUnlock()
 	if hasToolsAfter {
 		t.Error("toolList cache should have been cleared by notifications/tools/list_changed")
 	}
