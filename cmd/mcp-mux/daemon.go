@@ -22,10 +22,16 @@ import (
 func runGlobalDaemon() {
 	ctlPath := serverid.DaemonControlPath()
 
-	gracePeriod := 30 * time.Second
-	if g := os.Getenv("MCP_MUX_GRACE"); g != "" {
+	// Owner idle timeout: prefer MCP_MUX_OWNER_IDLE, fall back to MCP_MUX_GRACE
+	// (v0.10.x legacy name). Default 10 minutes (was 30s grace in v0.10.x).
+	ownerIdleTimeout := 10 * time.Minute
+	if g := os.Getenv("MCP_MUX_OWNER_IDLE"); g != "" {
 		if d, err := time.ParseDuration(g); err == nil {
-			gracePeriod = d
+			ownerIdleTimeout = d
+		}
+	} else if g := os.Getenv("MCP_MUX_GRACE"); g != "" {
+		if d, err := time.ParseDuration(g); err == nil {
+			ownerIdleTimeout = d
 		}
 	}
 
@@ -55,10 +61,10 @@ func runGlobalDaemon() {
 	}
 
 	d, err := daemon.New(daemon.Config{
-		ControlPath: ctlPath,
-		GracePeriod: gracePeriod,
-		IdleTimeout: idleTimeout,
-		Logger:      logger,
+		ControlPath:      ctlPath,
+		OwnerIdleTimeout: ownerIdleTimeout,
+		IdleTimeout:      idleTimeout,
+		Logger:           logger,
 	})
 	if err != nil {
 		logger.Fatalf("failed to start daemon: %v", err)

@@ -113,6 +113,10 @@ type Owner struct {
 	pendingRequests atomic.Int64
 	drainTimeout    time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs   atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
+	idleTimeoutNs   atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
+	lastActivityNs  atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
+	busyMu          sync.Mutex
+	busyDeclarations map[string]busyDeclaration // busy_id → declaration (long-running work signal)
 	startTime       time.Time
 	controlServer   *control.Server
 
@@ -496,6 +500,7 @@ func (o *Owner) AddSession(s *Session) {
 	o.mu.Unlock()
 
 	o.sessionMgr.RegisterSession(s, s.Cwd)
+	o.touchActivity()
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
 
 	// For template-restored isolated owners, close the IPC listener after the first
@@ -559,7 +564,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		if o.upstream == nil {
 			return nil // snapshot owner — upstream not yet spawned, drop notification
 		}
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 
 	case msg.IsRequest():
 		// Replay from cache if available (avoids upstream round-trip).
@@ -657,13 +662,13 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 		}
 
-		return o.upstream.WriteLine(remapped)
+		return o.writeUpstream(remapped)
 
 	case msg.IsResponse():
 		// Client is responding to a server→client request (e.g., sampling/createMessage).
 		// Forward as-is — the ID belongs to the upstream's request, no remapping needed.
 		o.logger.Printf("session %d: forwarding client response to upstream (id=%s)", s.ID, string(msg.ID))
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 
 	default:
 		return fmt.Errorf("unexpected message type from downstream: %s", msg.Type)
@@ -685,7 +690,7 @@ func (o *Owner) sendProactiveInit() {
 	o.methodTags.Store(`"mux-init-0"`, "initialize")
 	o.pendingRequests.Add(1)
 
-	if err := o.upstream.WriteLine([]byte(initReq)); err != nil {
+	if err := o.writeUpstream([]byte(initReq)); err != nil {
 		o.logger.Printf("proactive init: write failed: %v", err)
 		return
 	}
@@ -708,7 +713,7 @@ func (o *Owner) sendProactiveInit() {
 
 		// Send notifications/initialized (required by MCP after initialize)
 		notif := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-		if err := o.upstream.WriteLine([]byte(notif)); err != nil {
+		if err := o.writeUpstream([]byte(notif)); err != nil {
 			o.logger.Printf("proactive init: notifications/initialized failed: %v", err)
 			return
 		}
@@ -717,7 +722,7 @@ func (o *Owner) sendProactiveInit() {
 		toolsReq := `{"jsonrpc":"2.0","id":"mux-init-1","method":"tools/list","params":{}}`
 		o.methodTags.Store(`"mux-init-1"`, "tools/list")
 		o.pendingRequests.Add(1)
-		if err := o.upstream.WriteLine([]byte(toolsReq)); err != nil {
+		if err := o.writeUpstream([]byte(toolsReq)); err != nil {
 			o.logger.Printf("proactive init: tools/list failed: %v", err)
 		}
 	}()
@@ -737,6 +742,9 @@ func (o *Owner) readUpstream() {
 			}
 			return
 		}
+
+		// Any line from upstream counts as activity for reaper idle tracking.
+		o.touchActivity()
 
 		msg, err := jsonrpc.Parse(line)
 		if err != nil {
@@ -760,6 +768,18 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 				return nil
 			}
 			// Fallback to broadcast if routing fails
+		}
+		// x-mux busy protocol: upstream declares long-running background work
+		// so the reaper does not idle-kill it. Consumed at the mux layer —
+		// not forwarded to sessions (the busy signal is a mux contract, not
+		// an MCP-client concern).
+		if msg.Method == "notifications/x-mux/busy" {
+			o.handleBusyNotification(msg.Raw)
+			return nil
+		}
+		if msg.Method == "notifications/x-mux/idle" {
+			o.handleIdleNotification(msg.Raw)
+			return nil
 		}
 		return o.broadcast(msg.Raw)
 	}
@@ -896,13 +916,13 @@ func (o *Owner) respondToRootsList(id json.RawMessage) error {
 		return fmt.Errorf("marshal roots response: %w", err)
 	}
 
-	return o.upstream.WriteLine(data)
+	return o.writeUpstream(data)
 }
 
 // respondToPing sends an empty result to the upstream in response to a ping.
 func (o *Owner) respondToPing(id json.RawMessage) error {
 	resp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{}}`, string(id))
-	return o.upstream.WriteLine([]byte(resp))
+	return o.writeUpstream([]byte(resp))
 }
 
 // routeToLastActiveSession forwards a server→client request to the most recently
@@ -948,7 +968,7 @@ func (o *Owner) respondToElicitationCancel(id json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("marshal elicitation cancel: %w", err)
 	}
-	return o.upstream.WriteLine(data)
+	return o.writeUpstream(data)
 }
 
 // respondWithError sends a JSON-RPC error response to upstream.
@@ -967,7 +987,7 @@ func (o *Owner) respondWithError(id json.RawMessage, code int, message string) e
 	if err != nil {
 		return fmt.Errorf("marshal error response: %w", err)
 	}
-	return o.upstream.WriteLine(data)
+	return o.writeUpstream(data)
 }
 
 // routeProgressNotification sends a notifications/progress to the session that
@@ -1027,7 +1047,7 @@ func (o *Owner) sendRootsListChanged() {
 		return // snapshot owner — upstream not yet spawned
 	}
 	notification := `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`
-	if err := o.upstream.WriteLine([]byte(notification)); err != nil {
+	if err := o.writeUpstream([]byte(notification)); err != nil {
 		o.logger.Printf("failed to send roots/list_changed: %v", err)
 	}
 }
@@ -1074,6 +1094,7 @@ func (o *Owner) removeSession(s *Session) {
 	o.mu.Unlock()
 
 	o.sessionMgr.RemoveSession(s.ID)
+	o.touchActivity()
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
 
 	if remaining > 0 {
@@ -1510,6 +1531,120 @@ func (o *Owner) PendingRequests() int64 {
 	return o.pendingRequests.Load()
 }
 
+// ActiveProgressTokens returns the number of tracked progressTokens —
+// long-running tool calls that are still streaming notifications/progress
+// from upstream. While non-zero, the reaper must not kill this owner.
+func (o *Owner) ActiveProgressTokens() int {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return len(o.progressOwners)
+}
+
+// LastActivity returns the unix-nano timestamp of the last activity seen by
+// the owner (inbound upstream message, outbound session→upstream message, or
+// a session connect/disconnect event).
+func (o *Owner) LastActivity() time.Time {
+	ns := o.lastActivityNs.Load()
+	if ns == 0 {
+		return o.startTime
+	}
+	return time.Unix(0, ns)
+}
+
+// touchActivity records the current time as the last activity timestamp.
+// Called on every MCP message (both directions), session add/remove, and
+// upstream init. The reaper uses this to decide whether an owner is idle.
+func (o *Owner) touchActivity() {
+	o.lastActivityNs.Store(time.Now().UnixNano())
+}
+
+// writeUpstream is the single choke point for sending a line to upstream
+// stdin. Wrapping upstream.WriteLine lets us touch activity on every
+// outbound message without scattering the call across 15+ sites.
+func (o *Owner) writeUpstream(data []byte) error {
+	o.touchActivity()
+	return o.upstream.WriteLine(data)
+}
+
+// busyDeclaration is a signal from upstream that it is doing long-running
+// work without an active JSON-RPC request or progress token. Used by the
+// reaper to exempt such owners from idle-based kill.
+type busyDeclaration struct {
+	StartedAt     time.Time
+	EstimatedEnd  time.Time // StartedAt + estimatedDuration
+	HardExpiresAt time.Time // safety cap: StartedAt + estimatedDuration * 2
+	Task          string
+	SessionID     int // session that declared the work (-1 if unattributed)
+}
+
+// HasActiveBusyWork returns true if the owner has any unexpired busy
+// declarations. The reaper must not kill an owner while this is true.
+// Expired declarations are garbage-collected inside the call.
+func (o *Owner) HasActiveBusyWork() bool {
+	now := time.Now()
+	o.busyMu.Lock()
+	defer o.busyMu.Unlock()
+	active := false
+	for id, d := range o.busyDeclarations {
+		if now.After(d.HardExpiresAt) {
+			delete(o.busyDeclarations, id)
+			continue
+		}
+		active = true
+	}
+	return active
+}
+
+// RegisterBusy records a long-running work declaration from upstream.
+// The reaper will not kill the owner while any non-expired declaration
+// exists. estimatedDuration of 0 falls back to 10 minutes.
+func (o *Owner) RegisterBusy(id string, startedAt time.Time, estimatedDuration time.Duration, task string, sessionID int) {
+	if estimatedDuration <= 0 {
+		estimatedDuration = 10 * time.Minute
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	d := busyDeclaration{
+		StartedAt:     startedAt,
+		EstimatedEnd:  startedAt.Add(estimatedDuration),
+		HardExpiresAt: startedAt.Add(estimatedDuration * 2),
+		Task:          task,
+		SessionID:     sessionID,
+	}
+	o.busyMu.Lock()
+	if o.busyDeclarations == nil {
+		o.busyDeclarations = map[string]busyDeclaration{}
+	}
+	o.busyDeclarations[id] = d
+	o.busyMu.Unlock()
+	o.touchActivity()
+}
+
+// ClearBusy removes a busy declaration (upstream signalled the long-running
+// work is finished).
+func (o *Owner) ClearBusy(id string) {
+	o.busyMu.Lock()
+	delete(o.busyDeclarations, id)
+	o.busyMu.Unlock()
+	o.touchActivity()
+}
+
+// IdleTimeout returns the owner-specific idle timeout override from
+// x-mux.idleTimeout capability, or 0 if not declared (caller uses default).
+func (o *Owner) IdleTimeout() time.Duration {
+	return time.Duration(o.idleTimeoutNs.Load())
+}
+
+// SetIdleTimeout stores the x-mux.idleTimeout override. Called by the
+// cache-init path after parsing the upstream initializeResult.
+func (o *Owner) SetIdleTimeout(d time.Duration) {
+	if d < 0 {
+		return
+	}
+	o.idleTimeoutNs.Store(int64(d))
+}
+
 // Status returns a JSON-serializable status summary.
 func (o *Owner) Status() map[string]any {
 	o.mu.RLock()
@@ -1673,6 +1808,22 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
 
+	// v0.11.0: synthetically force listChanged=true on all list-providing
+	// capabilities in the cached initialize response. Claude Code only
+	// subscribes to notifications/tools/list_changed (and siblings) when
+	// the server advertises listChanged in its capabilities; without this,
+	// our cache-busting notifications are ignored by CC and the client
+	// keeps serving stale tools. We take responsibility for the list-
+	// changed contract at the mux layer regardless of what upstream
+	// declares. Source: D:/Dev/_EXTRAS_/claude-code/src/services/mcp/
+	//   useManageMCPConnections.ts:618-699 (tools/prompts/resources
+	//   list_changed subscription is gated on capabilities.*.listChanged).
+	if method == "initialize" {
+		if injected, ok := injectListChangedCapabilities(cached); ok {
+			cached = injected
+		}
+	}
+
 	o.mu.Lock()
 	switch method {
 	case "initialize":
@@ -1701,6 +1852,7 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		o.checkPersistent(cached)
 		o.parseDrainTimeout(cached)
 		o.parseToolTimeout(cached)
+		o.parseIdleTimeout(cached)
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
@@ -1719,22 +1871,22 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(msg.Raw, &obj); err != nil {
 		// Fallback: forward as-is
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 	}
 
 	paramsRaw, hasParams := obj["params"]
 	if !hasParams {
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 	}
 
 	var params map[string]json.RawMessage
 	if err := json.Unmarshal(paramsRaw, &params); err != nil {
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 	}
 
 	requestIDRaw, hasRequestID := params["requestId"]
 	if !hasRequestID {
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 	}
 
 	// Remap the requestId to the upstream-facing ID
@@ -1743,17 +1895,17 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 
 	newParams, err := json.Marshal(params)
 	if err != nil {
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 	}
 
 	obj["params"] = newParams
 	remapped, err := json.Marshal(obj)
 	if err != nil {
-		return o.upstream.WriteLine(msg.Raw)
+		return o.writeUpstream(msg.Raw)
 	}
 
 	o.logger.Printf("session %d: forwarding notifications/cancelled with remapped requestId", s.ID)
-	return o.upstream.WriteLine(remapped)
+	return o.writeUpstream(remapped)
 }
 
 // invalidateCacheIfNeeded checks if a notification from upstream signals that a
@@ -1916,6 +2068,18 @@ func (o *Owner) parseToolTimeout(initJSON []byte) {
 		timeout := time.Duration(seconds) * time.Second
 		o.toolTimeoutNs.Store(int64(timeout))
 		o.logger.Printf("x-mux capability: toolTimeout=%ds", seconds)
+	}
+}
+
+// parseIdleTimeout extracts x-mux.idleTimeout from the init response
+// and stores it atomically for use by the daemon reaper. Overrides
+// the daemon-wide default (MCP_MUX_OWNER_IDLE or 10m).
+func (o *Owner) parseIdleTimeout(initJSON []byte) {
+	seconds := classify.ParseIdleTimeout(initJSON)
+	if seconds > 0 {
+		timeout := time.Duration(seconds) * time.Second
+		o.SetIdleTimeout(timeout)
+		o.logger.Printf("x-mux capability: idleTimeout=%ds", seconds)
 	}
 }
 
