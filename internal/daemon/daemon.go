@@ -4,6 +4,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/control"
 	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thejerf/suture/v4"
 )
 
 // OwnerEntry tracks a single managed owner and its metadata.
@@ -35,6 +37,10 @@ type OwnerEntry struct {
 	Persistent  bool
 	LastSession time.Time
 	GracePeriod time.Duration
+	// serviceToken is the suture.ServiceToken returned by supervisor.Add.
+	// Used to remove the owner from the supervisor on Remove/Shutdown.
+	// In-memory only — not serialized to snapshots.
+	serviceToken suture.ServiceToken
 	// creating is closed when Owner transitions from nil (placeholder) to a real
 	// owner.  It is non-nil only while the placeholder is being created.
 	creating chan struct{}
@@ -51,6 +57,14 @@ type Daemon struct {
 	gracePeriod   time.Duration
 	idleTimeout   time.Duration
 	templateCache map[string]mux.OwnerSnapshot // command+args key → cached init data
+
+	// supervisor manages owner lifecycle with exponential backoff on restart.
+	// Owners are added via supervisor.Add in Spawn() and removed via
+	// supervisor.Remove in daemon.Remove. Context-cancelled on Shutdown.
+	supervisor    *suture.Supervisor
+	supervisorCtx context.Context
+	supervisorCancel context.CancelFunc
+	supervisorErr <-chan error
 
 	shutdownOnce sync.Once
 }
@@ -91,14 +105,29 @@ func New(cfg Config) (*Daemon, error) {
 		idleTimeout = 5 * time.Minute
 	}
 
+	supCtx, supCancel := context.WithCancel(context.Background())
 	d := &Daemon{
-		owners:        make(map[string]*OwnerEntry),
-		logger:        logger,
-		done:          make(chan struct{}),
-		gracePeriod:   gracePeriod,
-		idleTimeout:   idleTimeout,
-		templateCache: make(map[string]mux.OwnerSnapshot),
+		owners:           make(map[string]*OwnerEntry),
+		logger:           logger,
+		done:             make(chan struct{}),
+		gracePeriod:      gracePeriod,
+		idleTimeout:      idleTimeout,
+		templateCache:    make(map[string]mux.OwnerSnapshot),
+		supervisorCtx:    supCtx,
+		supervisorCancel: supCancel,
 	}
+
+	// Create supervisor with exponential backoff on restart storms.
+	// Tuning rationale:
+	//   FailureDecay=30s    — old failures fade from the rate counter after 30s
+	//   FailureThreshold=5  — 5 failures in 30s → permanent failure (stop retrying)
+	//   FailureBackoff=15s  — wait 15s between restart attempts after threshold hit
+	// These are sensible defaults inherited from suture. If an upstream crashes
+	// 5 times in 30 seconds, we stop retrying — something is fundamentally broken
+	// and endless retry would just spam logs (the bug we fixed in v0.9.2).
+	d.supervisor = suture.New("mcp-mux-daemon", suture.Spec{
+		EventHook: d.supervisorEventHook,
+	})
 
 	ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
 	if err != nil {
@@ -120,7 +149,33 @@ func New(cfg Config) (*Daemon, error) {
 		}
 	}
 
+	// Start supervisor AFTER snapshot load so restored owners are already added.
+	// ServeBackground returns a channel that will receive the final error when
+	// the supervisor exits (via context cancel or root termination).
+	d.supervisorErr = d.supervisor.ServeBackground(d.supervisorCtx)
+
 	return d, nil
+}
+
+// supervisorEventHook receives lifecycle events from the suture supervisor:
+// service failures, restarts, backoffs, and permanent failures. Logs them
+// for observability and debugging.
+func (d *Daemon) supervisorEventHook(event suture.Event) {
+	switch e := event.(type) {
+	case suture.EventServicePanic:
+		d.logger.Printf("supervisor: service %q PANIC: %v", e.ServiceName, e.PanicMsg)
+	case suture.EventServiceTerminate:
+		d.logger.Printf("supervisor: service %q terminated: %v (restarting=%v)",
+			e.ServiceName, e.Err, e.Restarting)
+	case suture.EventBackoff:
+		d.logger.Printf("supervisor: backoff — too many failures, slowing restart rate")
+	case suture.EventResume:
+		d.logger.Printf("supervisor: resume — resuming normal operation after backoff")
+	case suture.EventStopTimeout:
+		d.logger.Printf("supervisor: service %q did not stop in time", e.ServiceName)
+	default:
+		// Unknown event type — ignore silently
+	}
 }
 
 // cleanStaleSockets removes mcp-mux-*.ctl.sock and mcp-mux-*.sock files from
@@ -390,6 +445,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
 	}
 
+	// Register owner with the supervisor for lifecycle management.
+	// Suture will call owner.Serve(ctx) in its own goroutine and handle
+	// restart with exponential backoff if Serve returns an error.
+	serviceToken := d.supervisor.Add(owner)
+
 	// Promote the placeholder to a real entry and signal waiters.
 	d.mu.Lock()
 	placeholder.Owner = owner
@@ -397,6 +457,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	placeholder.Env = req.Env
 	placeholder.LastSession = time.Now()
 	placeholder.GracePeriod = d.gracePeriod
+	placeholder.serviceToken = serviceToken
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
@@ -425,8 +486,16 @@ func (d *Daemon) Remove(serverID string) error {
 		return fmt.Errorf("server %s is still being created", serverID)
 	}
 	delete(d.owners, serverID)
+	token := entry.serviceToken
 	d.mu.Unlock()
 
+	// Remove from supervisor BEFORE Shutdown to prevent suture from
+	// interpreting the shutdown as a failure and attempting restart.
+	// Use RemoveAndWait with a short timeout to avoid blocking forever
+	// if the service is stuck.
+	if d.supervisor != nil {
+		_ = d.supervisor.RemoveAndWait(token, 2*time.Second)
+	}
 	entry.Owner.Shutdown()
 	d.logger.Printf("removed owner %s", serverID[:8])
 	return nil
@@ -612,6 +681,21 @@ func diffEnv(shimEnv map[string]string) map[string]string {
 func (d *Daemon) Shutdown() {
 	d.shutdownOnce.Do(func() {
 		d.logger.Printf("daemon shutting down...")
+
+		// Cancel supervisor context first — prevents suture from restarting
+		// services as we're tearing down owners one by one. We wait briefly
+		// for the supervisor goroutine to exit before proceeding.
+		if d.supervisorCancel != nil {
+			d.supervisorCancel()
+		}
+		if d.supervisorErr != nil {
+			select {
+			case <-d.supervisorErr:
+				// Supervisor exited cleanly
+			case <-time.After(2 * time.Second):
+				d.logger.Printf("supervisor did not exit within 2s, proceeding anyway")
+			}
+		}
 
 		// Close control server
 		if d.ctlSrv != nil {
