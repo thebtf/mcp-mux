@@ -111,6 +111,7 @@ type Owner struct {
 	inflightTracker sync.Map // remapped request ID (string) -> *InflightRequest
 	pendingRequests atomic.Int64
 	drainTimeout    time.Duration // from x-mux.drainTimeout capability; 0 = use default
+	toolTimeout     time.Duration // from x-mux.toolTimeout capability; 0 = no tool call timeout
 	startTime       time.Time
 	controlServer   *control.Server
 
@@ -646,6 +647,14 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 
 		// Record the active session so server→client requests can be routed back
 		o.sessionMgr.TrackRequest(string(newID), s.ID)
+
+		// Start tool-call watchdog if the upstream declared x-mux.toolTimeout.
+		// The watchdog synthesizes a timeout error response if the upstream
+		// doesn't respond within the declared window. Prevents eternal hangs
+		// when upstream deadlocks or crashes silently during a tool call.
+		if msg.Method == "tools/call" && o.toolTimeout > 0 {
+			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
+		}
 
 		return o.upstream.WriteLine(remapped)
 
@@ -1652,6 +1661,7 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		o.classifyFromCapabilities(cached)
 		o.checkPersistent(cached)
 		o.parseDrainTimeout(cached)
+		o.parseToolTimeout(cached)
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
@@ -1857,6 +1867,65 @@ func (o *Owner) checkPersistent(initJSON []byte) {
 	if o.onPersistentDetected != nil {
 		o.onPersistentDetected(o.serverID)
 	}
+}
+
+// parseToolTimeout extracts x-mux.toolTimeout from the init response
+// and stores it for use during tools/call watchdog.
+func (o *Owner) parseToolTimeout(initJSON []byte) {
+	seconds := classify.ParseToolTimeout(initJSON)
+	if seconds > 0 {
+		o.toolTimeout = time.Duration(seconds) * time.Second
+		o.logger.Printf("x-mux capability: toolTimeout=%ds", seconds)
+	}
+}
+
+// startToolWatchdog launches a goroutine that fires after o.toolTimeout.
+// If the inflight request is still tracked when the watchdog fires, it
+// synthesizes a JSON-RPC error response and sends it to the session,
+// preventing eternal hangs when upstream deadlocks during a tool call.
+//
+// The watchdog races with the natural response path:
+//   - Natural completion: handleUpstreamMessage deletes inflight first →
+//     watchdog's LoadAndDelete misses → watchdog exits silently
+//   - Watchdog fires first: watchdog removes inflight, sends error →
+//     if upstream later responds, handleUpstreamMessage finds no inflight
+//     and drops the response (logged)
+//
+// Only fires for tools/call requests — other methods (initialize, tools/list)
+// have their own timing semantics (cached replays are instant).
+func (o *Owner) startToolWatchdog(remappedID string, originalID json.RawMessage, s *Session, method string) {
+	timeout := o.toolTimeout
+	if timeout <= 0 {
+		return
+	}
+	// Copy originalID to avoid aliasing the caller's buffer after this goroutine returns.
+	origIDCopy := make(json.RawMessage, len(originalID))
+	copy(origIDCopy, originalID)
+
+	go func() {
+		select {
+		case <-time.After(timeout):
+		case <-o.done:
+			return
+		}
+		// Try to claim the inflight. If another path already claimed it, exit.
+		if _, ok := o.inflightTracker.LoadAndDelete(remappedID); !ok {
+			return
+		}
+		o.methodTags.Delete(remappedID)
+		o.sessionMgr.CompleteRequest(remappedID)
+		o.pendingRequests.Add(-1)
+		errResp := fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"mux: %s timed out after %s (upstream did not respond)"}}`,
+			string(origIDCopy), method, timeout,
+		)
+		if err := s.WriteRaw([]byte(errResp)); err != nil {
+			o.logger.Printf("watchdog: session %d write error: %v", s.ID, err)
+			return
+		}
+		o.logger.Printf("watchdog: %s (id=%s) timed out after %s, sent error to session %d",
+			method, remappedID, timeout, s.ID)
+	}()
 }
 
 // parseDrainTimeout extracts x-mux.drainTimeout from the init response
