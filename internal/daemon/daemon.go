@@ -131,6 +131,8 @@ func New(cfg Config) (*Daemon, error) {
 
 	ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
 	if err != nil {
+		// Cancel supervisor context to prevent leak of the context goroutine.
+		supCancel()
 		return nil, fmt.Errorf("daemon: control server: %w", err)
 	}
 	d.ctlSrv = ctlSrv
@@ -492,13 +494,18 @@ func (d *Daemon) Remove(serverID string) error {
 	// Remove from supervisor BEFORE Shutdown to prevent suture from
 	// interpreting the shutdown as a failure and attempting restart.
 	// Use RemoveAndWait with a short timeout to avoid blocking forever
-	// if the service is stuck.
+	// if the service is stuck. We report the error to the caller but
+	// still proceed with Owner.Shutdown to avoid leaking resources.
+	var supErr error
 	if d.supervisor != nil {
-		_ = d.supervisor.RemoveAndWait(token, 2*time.Second)
+		if err := d.supervisor.RemoveAndWait(token, 2*time.Second); err != nil {
+			supErr = fmt.Errorf("remove owner %s from supervisor: %w", serverID[:8], err)
+			d.logger.Printf("warning: %v", supErr)
+		}
 	}
 	entry.Owner.Shutdown()
 	d.logger.Printf("removed owner %s", serverID[:8])
-	return nil
+	return supErr
 }
 
 // HandleSpawn implements control.DaemonHandler.

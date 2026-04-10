@@ -180,7 +180,10 @@ func (p *Process) Close() error {
 	}
 
 	// Phase 1: close stdin — the polite MCP shutdown signal.
-	_ = p.stdin.Close()
+	// Nil-safe for test-constructed Process values (no real process attached).
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
 
 	// Phase 2: wait for voluntary exit (drainTimeout or default 5s).
 	select {
@@ -190,7 +193,7 @@ func (p *Process) Close() error {
 	}
 
 	// Phase 3: send interrupt signal (SIGINT on Unix, GenerateConsoleCtrlEvent on Windows).
-	if p.cmd.Process != nil {
+	if p.cmd != nil && p.cmd.Process != nil {
 		interruptProcess(p.cmd.Process)
 	}
 
@@ -202,7 +205,7 @@ func (p *Process) Close() error {
 	}
 
 	// Phase 5: force kill.
-	if p.cmd.Process != nil {
+	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 	}
 

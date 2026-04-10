@@ -7,15 +7,33 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/classify"
+	"github.com/thebtf/mcp-mux/internal/upstream"
 	"github.com/thejerf/suture/v4"
 )
 
+// mockLiveUpstream returns a minimal *upstream.Process with a Done channel
+// that never closes — simulates a healthy, running upstream for Serve tests
+// that need to block on ctx.Done or o.done instead of upstream death.
+// Sets drainTimeout via SetDrainTimeout to a tiny value so that Shutdown→Close
+// phase 2 (voluntary exit wait) returns quickly in tests.
+func mockLiveUpstream() *upstream.Process {
+	p := &upstream.Process{
+		Done: make(chan struct{}),
+	}
+	// Make Close() phase-2 wait very short for test speed
+	p.SetDrainTimeout(10 * time.Millisecond)
+	return p
+}
+
 // TestOwnerServe_BlocksUntilCancel verifies that Serve blocks until
 // the provided context is cancelled, then calls Shutdown and returns
-// the context's error.
+// the context's error. Uses a mock live upstream so Serve blocks on
+// ctx/done rather than returning immediately on upstream death.
 func TestOwnerServe_BlocksUntilCancel(t *testing.T) {
 	o := newMinimalOwner()
 	o.controlServer = nil // avoid control server shutdown in Shutdown()
+	mockUp := mockLiveUpstream()
+	o.upstream = mockUp
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -34,8 +52,16 @@ func TestOwnerServe_BlocksUntilCancel(t *testing.T) {
 	default:
 	}
 
-	// Cancel the context
+	// Cancel the context — Serve will observe ctx.Done() first (both
+	// upstream Done and ctx.Done fire in select; we want ctx to win to
+	// verify the cancellation path). Close mockUp.Done after a short
+	// delay so Shutdown→Close can proceed quickly.
 	cancel()
+	go func() {
+		// Give Serve's select time to pick ctx.Done() over upstream.Done.
+		time.Sleep(20 * time.Millisecond)
+		close(mockUp.Done)
+	}()
 
 	// Wait for Serve to return
 	select {
@@ -43,7 +69,7 @@ func TestOwnerServe_BlocksUntilCancel(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("Serve returned %v, want context.Canceled", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("Serve did not return after context cancel")
 	}
 
@@ -57,53 +83,82 @@ func TestOwnerServe_BlocksUntilCancel(t *testing.T) {
 }
 
 // TestOwnerServe_ReturnsNilOnCleanShutdown verifies that if Shutdown
-// is called externally before Serve starts (or during), Serve returns
-// nil — telling suture not to restart.
+// is called externally while Serve is waiting, Serve returns nil —
+// telling suture not to restart.
 func TestOwnerServe_ReturnsNilOnCleanShutdown(t *testing.T) {
 	o := newMinimalOwner()
 	o.controlServer = nil
+	o.upstream = mockLiveUpstream() // prevent early return from upstream-dead path
 
-	// Shutdown before starting Serve
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- o.Serve(context.Background())
+	}()
+
+	// Give Serve time to enter blocking select
+	time.Sleep(50 * time.Millisecond)
+
+	// Call Shutdown — closes o.done, Serve returns nil
 	o.Shutdown()
 
-	err := o.Serve(context.Background())
-	if err != nil {
-		t.Errorf("Serve after Shutdown returned %v, want nil", err)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Serve after Shutdown returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Shutdown")
 	}
 }
 
-// TestOwnerServe_ReturnsErrDoNotRestartForIsolated verifies that when
-// an isolated owner's upstream dies, Serve returns suture.ErrDoNotRestart
-// so the supervisor will not auto-restart it.
-func TestOwnerServe_ReturnsErrDoNotRestartForIsolated(t *testing.T) {
+// TestOwnerServe_IsolatedReturnsErrDoNotRestart verifies that when an
+// isolated owner is served and the upstream is absent/dead, Serve returns
+// suture.ErrDoNotRestart. With a nil upstream, upstreamDeadCh returns the
+// package-level closedChan, so Serve observes "upstream dead" immediately.
+// The classification branch should then convert this to ErrDoNotRestart.
+func TestOwnerServe_IsolatedReturnsErrDoNotRestart(t *testing.T) {
 	o := newMinimalOwner()
 	o.controlServer = nil
 	o.autoClassification = classify.ModeIsolated
 	o.classificationSource = "tools"
+	// Leave o.upstream = nil — upstreamDeadCh will return closedChan.
 
-	// Set upstream to nil — upstreamDeadCh returns a never-closing channel,
-	// so we need a different approach: simulate death via the done channel
-	// after Serve starts. For this test, we'll use context cancellation path
-	// instead — but that doesn't test the isolated branch.
-	//
-	// Alternative: create a done channel, set upstream to a mock that signals death.
-	// Since we can't easily create a real upstream.Process, we test the branch
-	// indirectly by closing done while Serve is running — but that returns nil.
-	//
-	// The cleanest test: use a real (minimal) upstream process.
-	// For now, test the logic via the helper directly.
+	err := o.Serve(context.Background())
+	if !errors.Is(err, suture.ErrDoNotRestart) {
+		t.Errorf("Serve returned %v, want suture.ErrDoNotRestart", err)
+	}
+}
 
-	// Helper verification: upstreamDeadCh returns a never-close channel when nil.
+// TestOwnerServe_NonIsolatedReturnsErrorOnUpstreamDead verifies that a
+// non-isolated owner with a nil (dead) upstream returns a non-nil error
+// to trigger supervisor restart with backoff.
+func TestOwnerServe_NonIsolatedReturnsErrorOnUpstreamDead(t *testing.T) {
+	o := newMinimalOwner()
+	o.controlServer = nil
+	o.autoClassification = classify.ModeShared
+	o.classificationSource = "tools"
+
+	err := o.Serve(context.Background())
+	if err == nil {
+		t.Error("Serve returned nil, want non-nil error for dead upstream")
+	}
+	if errors.Is(err, suture.ErrDoNotRestart) {
+		t.Error("Serve returned ErrDoNotRestart for non-isolated owner")
+	}
+}
+
+// TestOwnerUpstreamDeadCh_NilUpstreamReturnsClosedChannel verifies the
+// helper returns closedChan when upstream is nil, so Serve can observe
+// upstream absence as failure (not hang).
+func TestOwnerUpstreamDeadCh_NilUpstreamReturnsClosedChannel(t *testing.T) {
+	o := newMinimalOwner()
 	ch := o.upstreamDeadCh()
 	select {
 	case <-ch:
-		t.Fatal("upstreamDeadCh with nil upstream should never close")
+		// Expected: closedChan is already closed
 	case <-time.After(50 * time.Millisecond):
-		// Expected: no close
+		t.Fatal("upstreamDeadCh with nil upstream must return a closed channel")
 	}
-
-	// Integration test with a real dying upstream is covered in Phase 4
-	// (TestSupervisor_IsolatedNoRestart).
 }
 
 // TestOwnerServe_ReturnsErrorOnUpstreamExit verifies that when a non-isolated
