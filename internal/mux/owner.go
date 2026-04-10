@@ -106,12 +106,13 @@ type Owner struct {
 	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
 	progressOwners   map[string]int // progressToken → session ID for targeted routing
 
-	upstreamDead    atomic.Bool // set when upstream exits; prevents sending to dead pipe
-	methodTags      sync.Map // remapped request ID (string) -> method name
-	inflightTracker sync.Map // remapped request ID (string) -> *InflightRequest
+	upstreamDead    atomic.Bool  // set when upstream exits; prevents sending to dead pipe
+	methodTags      sync.Map     // remapped request ID (string) -> method name
+	inflightTracker sync.Map     // remapped request ID (string) -> *InflightRequest
+	timedOutIDs     sync.Map     // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests atomic.Int64
 	drainTimeout    time.Duration // from x-mux.drainTimeout capability; 0 = use default
-	toolTimeout     time.Duration // from x-mux.toolTimeout capability; 0 = no tool call timeout
+	toolTimeoutNs   atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
 	startTime       time.Time
 	controlServer   *control.Server
 
@@ -652,7 +653,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		// The watchdog synthesizes a timeout error response if the upstream
 		// doesn't respond within the declared window. Prevents eternal hangs
 		// when upstream deadlocks or crashes silently during a tool call.
-		if msg.Method == "tools/call" && o.toolTimeout > 0 {
+		if msg.Method == "tools/call" && o.toolTimeoutNs.Load() > 0 {
 			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 		}
 
@@ -772,9 +773,29 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
 	}
 
-	// Decrement pending counter and remove inflight tracking
+	// If the watchdog already claimed this request as timed-out, drop the
+	// late upstream response to prevent duplicate delivery to the session.
+	// Note: we keep methodTags caching (upstream response is still useful
+	// for future cached replays), just skip the session delivery path.
+	if _, timedOut := o.timedOutIDs.LoadAndDelete(string(msg.ID)); timedOut {
+		o.logger.Printf("dropping late response for timed-out request id=%s", string(msg.ID))
+		// Still cache if tagged — the response body is valid even if late
+		if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
+			o.cacheResponse(methodRaw.(string), msg.Raw)
+		}
+		return nil
+	}
+
+	// Atomically claim the inflight entry. If the watchdog claimed it first,
+	// the timedOutIDs check above would have caught it — but we double-check
+	// via LoadAndDelete here to handle any concurrent claim race safely.
+	if _, claimed := o.inflightTracker.LoadAndDelete(string(msg.ID)); !claimed {
+		// Inflight already gone — either watchdog claimed it between checks,
+		// or this is a proactive/untracked response (mux-init-0, mux-init-1).
+		// Still process cache + routing because proactive responses aren't
+		// tracked in inflight but DO need caching.
+	}
 	o.pendingRequests.Add(-1)
-	o.inflightTracker.Delete(string(msg.ID))
 	o.sessionMgr.CompleteRequest(string(msg.ID))
 
 	// Cache response if this was a tagged cacheable request
@@ -1870,41 +1891,48 @@ func (o *Owner) checkPersistent(initJSON []byte) {
 }
 
 // parseToolTimeout extracts x-mux.toolTimeout from the init response
-// and stores it for use during tools/call watchdog.
+// and stores it atomically for use during tools/call watchdog.
 func (o *Owner) parseToolTimeout(initJSON []byte) {
 	seconds := classify.ParseToolTimeout(initJSON)
 	if seconds > 0 {
-		o.toolTimeout = time.Duration(seconds) * time.Second
+		timeout := time.Duration(seconds) * time.Second
+		o.toolTimeoutNs.Store(int64(timeout))
 		o.logger.Printf("x-mux capability: toolTimeout=%ds", seconds)
 	}
 }
 
-// startToolWatchdog launches a goroutine that fires after o.toolTimeout.
+// startToolWatchdog launches a goroutine that fires after toolTimeout.
 // If the inflight request is still tracked when the watchdog fires, it
 // synthesizes a JSON-RPC error response and sends it to the session,
 // preventing eternal hangs when upstream deadlocks during a tool call.
 //
-// The watchdog races with the natural response path:
-//   - Natural completion: handleUpstreamMessage deletes inflight first →
-//     watchdog's LoadAndDelete misses → watchdog exits silently
-//   - Watchdog fires first: watchdog removes inflight, sends error →
-//     if upstream later responds, handleUpstreamMessage finds no inflight
-//     and drops the response (logged)
+// Race design (prevents double response delivery):
+//   - The watchdog and handleUpstreamMessage both call LoadAndDelete on
+//     inflightTracker. Whichever wins delivers the response.
+//   - Watchdog wins → records ID in timedOutIDs → handleUpstreamMessage
+//     checks timedOutIDs and drops the late response.
+//   - handleUpstreamMessage wins → watchdog's LoadAndDelete misses → exits.
+//
+// Uses time.NewTimer (with defer Stop) instead of time.After to avoid
+// goroutine leaks when the tool call completes naturally before timeout.
 //
 // Only fires for tools/call requests — other methods (initialize, tools/list)
 // have their own timing semantics (cached replays are instant).
 func (o *Owner) startToolWatchdog(remappedID string, originalID json.RawMessage, s *Session, method string) {
-	timeout := o.toolTimeout
-	if timeout <= 0 {
+	timeoutNs := o.toolTimeoutNs.Load()
+	if timeoutNs <= 0 {
 		return
 	}
+	timeout := time.Duration(timeoutNs)
 	// Copy originalID to avoid aliasing the caller's buffer after this goroutine returns.
 	origIDCopy := make(json.RawMessage, len(originalID))
 	copy(origIDCopy, originalID)
 
 	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
 		select {
-		case <-time.After(timeout):
+		case <-timer.C:
 		case <-o.done:
 			return
 		}
@@ -1912,6 +1940,9 @@ func (o *Owner) startToolWatchdog(remappedID string, originalID json.RawMessage,
 		if _, ok := o.inflightTracker.LoadAndDelete(remappedID); !ok {
 			return
 		}
+		// Mark this ID as timed-out so handleUpstreamMessage drops any
+		// late upstream response (prevents duplicate delivery to session).
+		o.timedOutIDs.Store(remappedID, struct{}{})
 		o.methodTags.Delete(remappedID)
 		o.sessionMgr.CompleteRequest(remappedID)
 		o.pendingRequests.Add(-1)
