@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thebtf/mcp-mux/internal/classify"
 	"github.com/thebtf/mcp-mux/internal/jsonrpc"
 	"github.com/thebtf/mcp-mux/internal/serverid"
 )
@@ -1085,6 +1086,36 @@ func TestAddCwd_NoDuplicate(t *testing.T) {
 
 	if count != 1 {
 		t.Errorf("AddCwd duplicate: canonical cwd appears %d times in cwdSet, want 1", count)
+	}
+}
+
+func TestClassifyFromToolList_IsolatedResetsCwdSetToPrimary(t *testing.T) {
+	o := newMinimalOwner()
+	o.cwd = t.TempDir()
+	o.cwdSet = map[string]bool{
+		serverid.CanonicalizePath(o.cwd):       true,
+		serverid.CanonicalizePath(t.TempDir()): true,
+	}
+
+	toolsJSON := []byte(`{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"activate_project"}]}}`)
+	o.classifyFromToolList(toolsJSON)
+
+	status := o.Status()
+	if status["auto_classification"] != string(classify.ModeIsolated) {
+		t.Fatalf("classification = %v, want %q", status["auto_classification"], classify.ModeIsolated)
+	}
+
+	cwdSet, ok := status["cwd_set"].([]string)
+	if !ok {
+		t.Fatalf("cwd_set not []string in status: %T", status["cwd_set"])
+	}
+
+	primaryCwd := serverid.CanonicalizePath(o.cwd)
+	if len(cwdSet) != 1 {
+		t.Fatalf("cwd_set size = %d, want 1 (%v)", len(cwdSet), cwdSet)
+	}
+	if cwdSet[0] != primaryCwd {
+		t.Fatalf("cwd_set[0] = %q, want %q", cwdSet[0], primaryCwd)
 	}
 }
 

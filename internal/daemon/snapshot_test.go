@@ -349,3 +349,62 @@ func TestGracefulRestartCycle(t *testing.T) {
 
 	d2.Shutdown()
 }
+
+func TestLoadSnapshot_HealsIsolatedOwnerCwdSet(t *testing.T) {
+	os.Remove(SnapshotPath())
+
+	primaryCwd := t.TempDir()
+	otherCwd := t.TempDir()
+	snapshot := DaemonSnapshot{
+		Version:   snapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mux.OwnerSnapshot{
+			{
+				ServerID:             "abc12345-heal-test",
+				Command:              "uvx",
+				Args:                 []string{"--from", "serena"},
+				Cwd:                  primaryCwd,
+				CwdSet:               []string{primaryCwd, otherCwd},
+				Mode:                 "cwd",
+				Classification:       classify.ModeIsolated,
+				ClassificationSource: "tools",
+			},
+		},
+	}
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal() error: %v", err)
+	}
+
+	path := SnapshotPath()
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+
+	d := testDaemon(t)
+	restored := d.loadSnapshot()
+	if restored != 1 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+	}
+
+	d.mu.RLock()
+	entry := d.owners["abc12345-heal-test"]
+	d.mu.RUnlock()
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("restored owner is nil")
+	}
+
+	status := entry.Owner.Status()
+	cwdSet, ok := status["cwd_set"].([]string)
+	if !ok {
+		t.Fatalf("cwd_set not []string in status: %T", status["cwd_set"])
+	}
+	if len(cwdSet) != 1 {
+		t.Fatalf("cwd_set size = %d, want 1 (%v)", len(cwdSet), cwdSet)
+	}
+	if cwdSet[0] != primaryCwd {
+		t.Fatalf("cwd_set[0] = %q, want %q", cwdSet[0], primaryCwd)
+	}
+}
