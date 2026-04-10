@@ -81,7 +81,13 @@ func (o *Owner) handleBusyNotification(raw []byte) {
 	if p.StartedAt != "" {
 		if t, err := time.Parse(time.RFC3339, p.StartedAt); err == nil {
 			startedAt = t
+		} else {
+			o.logger.Printf("x-mux busy: invalid startedAt %q (%v), using now", p.StartedAt, err)
 		}
+	}
+	const maxBusyDurationMs = int64(86_400_000) // 24 h — matches maxBusyDuration in owner.go
+	if p.EstimatedDurationMs > maxBusyDurationMs {
+		p.EstimatedDurationMs = maxBusyDurationMs
 	}
 	estimated := time.Duration(p.EstimatedDurationMs) * time.Millisecond
 

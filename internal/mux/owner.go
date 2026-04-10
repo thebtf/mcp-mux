@@ -1597,8 +1597,16 @@ func (o *Owner) LastActivity() time.Time {
 // touchActivity records the current time as the last activity timestamp.
 // Called on every MCP message (both directions), session add/remove, and
 // upstream init. The reaper uses this to decide whether an owner is idle.
+//
+// Throttled to one atomic write per second: the reaper only needs
+// second-level precision, and avoiding a store on every streaming message
+// reduces cache-line contention on high-traffic owners (e.g. LLM responses).
 func (o *Owner) touchActivity() {
-	o.lastActivityNs.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	last := o.lastActivityNs.Load()
+	if now-last >= int64(time.Second) {
+		o.lastActivityNs.Store(now)
+	}
 }
 
 // writeUpstream is the single choke point for sending a line to upstream
@@ -1640,10 +1648,17 @@ func (o *Owner) HasActiveBusyWork() bool {
 
 // RegisterBusy records a long-running work declaration from upstream.
 // The reaper will not kill the owner while any non-expired declaration
-// exists. estimatedDuration of 0 falls back to 10 minutes.
+// exists. estimatedDuration of 0 falls back to 10 minutes; values above
+// 24 hours are clamped to prevent overflow and forgotten declarations from
+// living indefinitely.
+const maxBusyDuration = 24 * time.Hour
+
 func (o *Owner) RegisterBusy(id string, startedAt time.Time, estimatedDuration time.Duration, task string, sessionID int) {
 	if estimatedDuration <= 0 {
 		estimatedDuration = 10 * time.Minute
+	}
+	if estimatedDuration > maxBusyDuration {
+		estimatedDuration = maxBusyDuration
 	}
 	if startedAt.IsZero() {
 		startedAt = time.Now()

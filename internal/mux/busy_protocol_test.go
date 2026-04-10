@@ -108,3 +108,44 @@ func TestBusyProtocol_MissingIDIgnored(t *testing.T) {
 		t.Fatal("expected empty-id notification to be ignored")
 	}
 }
+
+func TestBusyProtocol_DurationCappedAt24h(t *testing.T) {
+	o := newMinimalOwner()
+
+	// RegisterBusy with a duration far above 24 h — must be clamped.
+	o.RegisterBusy("long-job", time.Now(), 48*time.Hour, "should cap", -1)
+
+	o.busyMu.Lock()
+	d, ok := o.busyDeclarations["long-job"]
+	o.busyMu.Unlock()
+	if !ok {
+		t.Fatal("declaration not found")
+	}
+	actual := d.HardExpiresAt.Sub(d.StartedAt)
+	// Clamped to 24 h → hard cap = 24 h * 2 = 48 h
+	want := 48 * time.Hour
+	if actual < want-time.Second || actual > want+time.Second {
+		t.Errorf("hard cap want ~%s, got %s", want, actual)
+	}
+}
+
+func TestBusyProtocol_NotificationDurationCappedAt24h(t *testing.T) {
+	o := newMinimalOwner()
+
+	// estimatedDurationMs = 200_000_000 (> 86_400_000 ms = 24 h) must be clamped.
+	raw := []byte(`{"jsonrpc":"2.0","method":"notifications/x-mux/busy","params":{"id":"huge","estimatedDurationMs":200000000}}`)
+	o.handleBusyNotification(raw)
+
+	o.busyMu.Lock()
+	d, ok := o.busyDeclarations["huge"]
+	o.busyMu.Unlock()
+	if !ok {
+		t.Fatal("declaration not found")
+	}
+	actual := d.HardExpiresAt.Sub(d.StartedAt)
+	// Clamped to 24 h → hard cap = 48 h
+	want := 48 * time.Hour
+	if actual < want-time.Second || actual > want+time.Second {
+		t.Errorf("notification hard cap want ~%s, got %s", want, actual)
+	}
+}
