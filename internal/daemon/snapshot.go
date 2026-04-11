@@ -172,11 +172,14 @@ func (d *Daemon) loadSnapshot() int {
 		ipcPath := serverid.IPCPath(sid)
 		controlPath := serverid.ControlPath(sid)
 
-		if ownerSnap.ClassificationSource != "" &&
-			ownerSnap.Classification == classify.ModeIsolated &&
+		if ownerSnap.Classification == classify.ModeIsolated &&
 			len(ownerSnap.CwdSet) > 1 {
+			shortSID := sid
+			if len(shortSID) > 8 {
+				shortSID = shortSID[:8]
+			}
 			d.logger.Printf("snapshot: healing poisoned isolated owner %s: cwdSet %v → [%s]",
-				sid[:8], ownerSnap.CwdSet, ownerSnap.Cwd)
+				shortSID, ownerSnap.CwdSet, ownerSnap.Cwd)
 			ownerSnap.CwdSet = []string{ownerSnap.Cwd}
 		}
 
