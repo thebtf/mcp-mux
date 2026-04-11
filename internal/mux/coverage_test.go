@@ -1119,6 +1119,36 @@ func TestClassifyFromToolList_IsolatedResetsCwdSetToPrimary(t *testing.T) {
 	}
 }
 
+func TestClassifyFromCapabilities_IsolatedResetsCwdSetToPrimary(t *testing.T) {
+	o := newMinimalOwner()
+	o.cwd = t.TempDir()
+	o.cwdSet = map[string]bool{
+		serverid.CanonicalizePath(o.cwd):       true,
+		serverid.CanonicalizePath(t.TempDir()): true,
+	}
+
+	initJSON := []byte(`{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"tools":{},"x-mux":{"sharing":"isolated"}}}}`)
+	o.classifyFromCapabilities(initJSON)
+
+	status := o.Status()
+	if status["auto_classification"] != string(classify.ModeIsolated) {
+		t.Fatalf("classification = %v, want %q", status["auto_classification"], classify.ModeIsolated)
+	}
+
+	cwdSet, ok := status["cwd_set"].([]string)
+	if !ok {
+		t.Fatalf("cwd_set not []string in status: %T", status["cwd_set"])
+	}
+
+	primaryCwd := serverid.CanonicalizePath(o.cwd)
+	if len(cwdSet) != 1 {
+		t.Fatalf("cwd_set size = %d, want 1 (%v)", len(cwdSet), cwdSet)
+	}
+	if cwdSet[0] != primaryCwd {
+		t.Fatalf("cwd_set[0] = %q, want %q", cwdSet[0], primaryCwd)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // drainInflightRequests
 // ---------------------------------------------------------------------------
