@@ -360,7 +360,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		upstream:               proc,
 		ipcPath:                cfg.IPCPath,
 		cwd:                    cfg.Cwd,
-		cwdSet:                 map[string]bool{cfg.Cwd: true},
+		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
 		command:                cfg.Command,
 		args:                   cfg.Args,
 		serverID:               cfg.ServerID,
@@ -1284,9 +1284,6 @@ func (o *Owner) evictExtraSessions() {
 
 func (o *Owner) resetCwdSetToPrimary() (string, int) {
 	primaryCwd := serverid.CanonicalizePath(o.cwd)
-	if primaryCwd == "" {
-		return "", 0
-	}
 	o.cwdSet = map[string]bool{primaryCwd: true}
 	return primaryCwd, 1
 }
@@ -2071,6 +2068,13 @@ func (o *Owner) classifyFromCapabilities(initJSON []byte) {
 	o.logger.Printf("x-mux capability: %s", mode)
 
 	if mode == classify.ModeIsolated {
+		o.mu.Lock()
+		primaryCwd, cwdCount := o.resetCwdSetToPrimary()
+		o.mu.Unlock()
+
+		if primaryCwd != "" {
+			o.logger.Printf("reset cwd_set to primary cwd: %s (now %d roots)", primaryCwd, cwdCount)
+		}
 		o.logger.Printf("closing IPC listener — server declares isolated via x-mux")
 		o.closeListener()
 		o.evictExtraSessions()
