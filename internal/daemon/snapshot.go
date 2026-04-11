@@ -8,23 +8,24 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/thebtf/mcp-mux/internal/classify"
 	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/serverid"
 	"github.com/thejerf/suture/v4"
 )
 
 const (
-	snapshotFileName   = "mcp-muxd-snapshot.json"
-	snapshotVersion    = 1
-	snapshotMaxAge     = 5 * time.Minute
+	snapshotFileName = "mcp-muxd-snapshot.json"
+	snapshotVersion  = 1
+	snapshotMaxAge   = 5 * time.Minute
 )
 
 // DaemonSnapshot captures the full daemon state for graceful restart.
 type DaemonSnapshot struct {
-	Version    int                  `json:"version"`
-	MuxVersion string               `json:"mux_version"`
-	Timestamp  string               `json:"timestamp"`
-	Owners     []mux.OwnerSnapshot  `json:"owners"`
+	Version    int                   `json:"version"`
+	MuxVersion string                `json:"mux_version"`
+	Timestamp  string                `json:"timestamp"`
+	Owners     []mux.OwnerSnapshot   `json:"owners"`
 	Sessions   []mux.SessionSnapshot `json:"sessions"`
 }
 
@@ -171,16 +172,27 @@ func (d *Daemon) loadSnapshot() int {
 		ipcPath := serverid.IPCPath(sid)
 		controlPath := serverid.ControlPath(sid)
 
+		if ownerSnap.Classification == classify.ModeIsolated &&
+			len(ownerSnap.CwdSet) > 1 {
+			shortSID := sid
+			if len(shortSID) > 8 {
+				shortSID = shortSID[:8]
+			}
+			d.logger.Printf("snapshot: healing poisoned isolated owner %s: cwdSet %v → [%s]",
+				shortSID, ownerSnap.CwdSet, ownerSnap.Cwd)
+			ownerSnap.CwdSet = []string{ownerSnap.Cwd}
+		}
+
 		// Capture loop variables for closure
 		cmd, args := ownerSnap.Command, ownerSnap.Args
 		owner, err := mux.NewOwnerFromSnapshot(mux.OwnerConfig{
-			Command:     cmd,
-			Args:        args,
-			Env:         ownerSnap.Env,
-			Cwd:         ownerSnap.Cwd,
-			IPCPath:     ipcPath,
-			ControlPath: controlPath,
-			ServerID:    sid,
+			Command:        cmd,
+			Args:           args,
+			Env:            ownerSnap.Env,
+			Cwd:            ownerSnap.Cwd,
+			IPCPath:        ipcPath,
+			ControlPath:    controlPath,
+			ServerID:       sid,
 			TokenHandshake: true,
 			OnZeroSessions: func(serverID string) {
 				d.onZeroSessions(serverID)

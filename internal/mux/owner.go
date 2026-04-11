@@ -71,11 +71,11 @@ type InflightRequest struct {
 type Owner struct {
 	upstream *upstream.Process
 	ipcPath  string
-	cwd      string   // primary working directory (from first spawn)
+	cwd      string          // primary working directory (from first spawn)
 	cwdSet   map[string]bool // all known cwds (for multi-project roots/list)
-	command  string   // upstream command (for status/restart)
-	args     []string // upstream args (for status/restart)
-	serverID string   // server identity hash
+	command  string          // upstream command (for status/restart)
+	args     []string        // upstream args (for status/restart)
+	serverID string          // server identity hash
 	listener net.Listener
 	logger   *log.Logger
 
@@ -86,41 +86,41 @@ type Owner struct {
 
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
-	cachedInitSessions   map[int]bool     // sessions that received a cached (replayed) initialize response
+	cachedInitSessions   map[int]bool // sessions that received a cached (replayed) initialize response
 	initDone             bool
-	initResp             []byte          // cached initialize response (raw JSON-RPC)
-	initProtocolVersion  string          // protocolVersion from first initialize request (for fingerprint matching)
-	toolList             []byte          // cached tools/list response (raw JSON-RPC)
-	promptList           []byte          // cached prompts/list response (raw JSON-RPC)
-	resourceList         []byte          // cached resources/list response (raw JSON-RPC)
-	resourceTemplateList []byte          // cached resources/templates/list response (raw JSON-RPC)
+	initResp             []byte // cached initialize response (raw JSON-RPC)
+	initProtocolVersion  string // protocolVersion from first initialize request (for fingerprint matching)
+	toolList             []byte // cached tools/list response (raw JSON-RPC)
+	promptList           []byte // cached prompts/list response (raw JSON-RPC)
+	resourceList         []byte // cached resources/list response (raw JSON-RPC)
+	resourceTemplateList []byte // cached resources/templates/list response (raw JSON-RPC)
 	autoClassification   classify.SharingMode
-	classificationSource string   // "capability" or "tools" — what determined classification
-	classificationReason []string // tool names that triggered isolation
+	classificationSource string        // "capability" or "tools" — what determined classification
+	classificationReason []string      // tool names that triggered isolation
 	classified           chan struct{} // closed when autoClassification is first set
 	classifiedOnce       sync.Once
 	initReady            chan struct{} // closed when initialize response is cached or upstream dies
 	initReadyOnce        sync.Once
 
-	sessionMgr       *SessionManager
-	tokenHandshake   bool           // true when daemon manages this owner (shims send token)
+	sessionMgr             *SessionManager
+	tokenHandshake         bool                // true when daemon manages this owner (shims send token)
 	progressOwners         map[string]int      // progressToken → session ID for targeted routing
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
 	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
-	upstreamDead    atomic.Bool  // set when upstream exits; prevents sending to dead pipe
-	methodTags      sync.Map     // remapped request ID (string) -> method name
-	inflightTracker sync.Map     // remapped request ID (string) -> *InflightRequest
-	timedOutIDs     sync.Map     // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
-	pendingRequests atomic.Int64
-	drainTimeout    time.Duration // from x-mux.drainTimeout capability; 0 = use default
-	toolTimeoutNs   atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
-	idleTimeoutNs   atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
-	lastActivityNs  atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
-	busyMu          sync.Mutex
+	upstreamDead     atomic.Bool // set when upstream exits; prevents sending to dead pipe
+	methodTags       sync.Map    // remapped request ID (string) -> method name
+	inflightTracker  sync.Map    // remapped request ID (string) -> *InflightRequest
+	timedOutIDs      sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
+	pendingRequests  atomic.Int64
+	drainTimeout     time.Duration // from x-mux.drainTimeout capability; 0 = use default
+	toolTimeoutNs    atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
+	idleTimeoutNs    atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
+	lastActivityNs   atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
+	busyMu           sync.Mutex
 	busyDeclarations map[string]busyDeclaration // busy_id → declaration (long-running work signal)
-	startTime       time.Time
-	controlServer   *control.Server
+	startTime        time.Time
+	controlServer    *control.Server
 
 	shutdownOnce      sync.Once
 	closeListenerOnce sync.Once
@@ -200,33 +200,33 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	}
 
 	o := &Owner{
-		ipcPath:              cfg.IPCPath,
-		cwd:                  cfg.Cwd,
-		cwdSet:               cwdSet,
-		command:              cfg.Command,
-		args:                 cfg.Args,
-		serverID:             cfg.ServerID,
-		listener:             ln,
-		logger:               logger,
-		onZeroSessions:       cfg.OnZeroSessions,
-		onUpstreamExit:       cfg.OnUpstreamExit,
-		onPersistentDetected: cfg.OnPersistentDetected,
-		onCacheReady:         cfg.OnCacheReady,
-		sessions:             make(map[int]*Session),
-		cachedInitSessions:   make(map[int]bool),
-		sessionMgr:           NewSessionManager(),
-		tokenHandshake:       cfg.TokenHandshake,
-		autoClassification:   snap.Classification,
-		classificationSource: snap.ClassificationSource,
-		classificationReason: snap.ClassificationReason,
-		classified:               make(chan struct{}),
-		initReady:                make(chan struct{}),
-		progressOwners:           make(map[string]int),
-		progressTokenRequestID:   make(map[string]string),
-		requestToTokens:          make(map[string][]string),
-		startTime:                time.Now(),
-		listenerDone:             make(chan struct{}),
-		done:                     make(chan struct{}),
+		ipcPath:                cfg.IPCPath,
+		cwd:                    cfg.Cwd,
+		cwdSet:                 cwdSet,
+		command:                cfg.Command,
+		args:                   cfg.Args,
+		serverID:               cfg.ServerID,
+		listener:               ln,
+		logger:                 logger,
+		onZeroSessions:         cfg.OnZeroSessions,
+		onUpstreamExit:         cfg.OnUpstreamExit,
+		onPersistentDetected:   cfg.OnPersistentDetected,
+		onCacheReady:           cfg.OnCacheReady,
+		sessions:               make(map[int]*Session),
+		cachedInitSessions:     make(map[int]bool),
+		sessionMgr:             NewSessionManager(),
+		tokenHandshake:         cfg.TokenHandshake,
+		autoClassification:     snap.Classification,
+		classificationSource:   snap.ClassificationSource,
+		classificationReason:   snap.ClassificationReason,
+		classified:             make(chan struct{}),
+		initReady:              make(chan struct{}),
+		progressOwners:         make(map[string]int),
+		progressTokenRequestID: make(map[string]string),
+		requestToTokens:        make(map[string][]string),
+		startTime:              time.Now(),
+		listenerDone:           make(chan struct{}),
+		done:                   make(chan struct{}),
 	}
 
 	// Pre-populate caches from snapshot
@@ -357,23 +357,23 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	}
 
 	o := &Owner{
-		upstream:       proc,
-		ipcPath:        cfg.IPCPath,
-		cwd:            cfg.Cwd,
-		cwdSet:         map[string]bool{cfg.Cwd: true},
-		command:        cfg.Command,
-		args:           cfg.Args,
-		serverID:       cfg.ServerID,
-		listener:       ln,
-		logger:         logger,
-		onZeroSessions:       cfg.OnZeroSessions,
-		onUpstreamExit:       cfg.OnUpstreamExit,
-		onPersistentDetected: cfg.OnPersistentDetected,
-		onCacheReady:         cfg.OnCacheReady,
-		sessions:           make(map[int]*Session),
-		cachedInitSessions: make(map[int]bool),
-		sessionMgr:         NewSessionManager(),
-		tokenHandshake:     cfg.TokenHandshake,
+		upstream:               proc,
+		ipcPath:                cfg.IPCPath,
+		cwd:                    cfg.Cwd,
+		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
+		command:                cfg.Command,
+		args:                   cfg.Args,
+		serverID:               cfg.ServerID,
+		listener:               ln,
+		logger:                 logger,
+		onZeroSessions:         cfg.OnZeroSessions,
+		onUpstreamExit:         cfg.OnUpstreamExit,
+		onPersistentDetected:   cfg.OnPersistentDetected,
+		onCacheReady:           cfg.OnCacheReady,
+		sessions:               make(map[int]*Session),
+		cachedInitSessions:     make(map[int]bool),
+		sessionMgr:             NewSessionManager(),
+		tokenHandshake:         cfg.TokenHandshake,
 		classified:             make(chan struct{}),
 		initReady:              make(chan struct{}),
 		progressOwners:         make(map[string]int),
@@ -1282,6 +1282,12 @@ func (o *Owner) evictExtraSessions() {
 	}
 }
 
+func (o *Owner) resetCwdSetToPrimary() (string, int) {
+	primaryCwd := serverid.CanonicalizePath(o.cwd)
+	o.cwdSet = map[string]bool{primaryCwd: true}
+	return primaryCwd, 1
+}
+
 // closeListener stops the IPC listener and removes the socket file.
 // Safe to call multiple times (uses sync.Once).
 // Nil-safe: owners constructed for tests may not have a listener.
@@ -1725,21 +1731,26 @@ func (o *Owner) Status() map[string]any {
 	o.mu.RUnlock()
 
 	status := map[string]any{
-		"mux_version":      Version,
-		"upstream_pid":      func() int { if o.upstream != nil { return o.upstream.PID() }; return 0 }(),
-		"ipc_path":          o.ipcPath,
-		"command":           o.command,
-		"args":              o.args,
-		"cwd":               primaryCwd,
-		"cwd_set":           cwds,
-		"sessions":          sessionIDs,
-		"session_count":     len(sessionIDs),
-		"pending_requests":  o.pendingRequests.Load(),
-		"uptime_seconds":    time.Since(o.startTime).Seconds(),
-		"cached_init":       hasCachedInit,
-		"cached_tools":      hasCachedTools,
-		"cached_prompts":    hasCachedPrompts,
-		"cached_resources":  hasCachedResources,
+		"mux_version": Version,
+		"upstream_pid": func() int {
+			if o.upstream != nil {
+				return o.upstream.PID()
+			}
+			return 0
+		}(),
+		"ipc_path":         o.ipcPath,
+		"command":          o.command,
+		"args":             o.args,
+		"cwd":              primaryCwd,
+		"cwd_set":          cwds,
+		"sessions":         sessionIDs,
+		"session_count":    len(sessionIDs),
+		"pending_requests": o.pendingRequests.Load(),
+		"uptime_seconds":   time.Since(o.startTime).Seconds(),
+		"cached_init":      hasCachedInit,
+		"cached_tools":     hasCachedTools,
+		"cached_prompts":   hasCachedPrompts,
+		"cached_resources": hasCachedResources,
 	}
 
 	if classification != "" {
@@ -2057,6 +2068,13 @@ func (o *Owner) classifyFromCapabilities(initJSON []byte) {
 	o.logger.Printf("x-mux capability: %s", mode)
 
 	if mode == classify.ModeIsolated {
+		o.mu.Lock()
+		primaryCwd, cwdCount := o.resetCwdSetToPrimary()
+		o.mu.Unlock()
+
+		if primaryCwd != "" {
+			o.logger.Printf("reset cwd_set to primary cwd: %s (now %d roots)", primaryCwd, cwdCount)
+		}
 		o.logger.Printf("closing IPC listener — server declares isolated via x-mux")
 		o.closeListener()
 		o.evictExtraSessions()
@@ -2090,7 +2108,14 @@ func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 	})
 
 	if mode == classify.ModeIsolated {
+		o.mu.Lock()
+		primaryCwd, cwdCount := o.resetCwdSetToPrimary()
+		o.mu.Unlock()
+
 		o.logger.Printf("auto-classification: ISOLATED (matched: %v)", matched)
+		if primaryCwd != "" {
+			o.logger.Printf("reset cwd_set to primary cwd: %s (now %d roots)", primaryCwd, cwdCount)
+		}
 		o.logger.Printf("closing IPC listener — server requires per-session isolation")
 		o.closeListener()
 		// Disconnect extra sessions that were dedup'd before classification.
@@ -2215,4 +2240,3 @@ func (o *Owner) parseDrainTimeout(initJSON []byte) {
 func (o *Owner) DrainTimeout() time.Duration {
 	return o.drainTimeout
 }
-
