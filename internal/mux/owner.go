@@ -1768,6 +1768,7 @@ func (o *Owner) Status() map[string]any {
 
 	// Include inflight request details when requests are pending
 	var inflight []map[string]any
+	var oldestMs int64
 	o.inflightTracker.Range(func(key, value any) bool {
 		req := value.(*InflightRequest)
 		inflight = append(inflight, map[string]any{
@@ -1777,10 +1778,17 @@ func (o *Owner) Status() map[string]any {
 			"started_at":      req.StartTime.UTC().Format(time.RFC3339Nano),
 			"elapsed_seconds": time.Since(req.StartTime).Seconds(),
 		})
+		age := time.Since(req.StartTime).Milliseconds()
+		if age > oldestMs {
+			oldestMs = age
+		}
 		return true
 	})
 	if len(inflight) > 0 {
 		status["inflight"] = inflight
+	}
+	if oldestMs > 0 {
+		status["oldest_request_age_ms"] = oldestMs
 	}
 
 	return status

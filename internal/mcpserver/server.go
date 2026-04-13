@@ -551,12 +551,19 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	var status struct {
-		Command string   `json:"command"`
-		Args    []string `json:"args"`
+	var statusData struct {
+		Command         string   `json:"command"`
+		Args            []string `json:"args"`
+		PendingRequests int      `json:"pending_requests"`
 	}
-	if err := json.Unmarshal(statusResp.Data, &status); err != nil || status.Command == "" {
+	if err := json.Unmarshal(statusResp.Data, &statusData); err != nil || statusData.Command == "" {
 		s.sendToolError(id, fmt.Sprintf("server %s has no command info", serverID))
+		return
+	}
+
+	// Reject restart when requests are in-flight unless force is set
+	if statusData.PendingRequests > 0 && !params.Force {
+		s.sendToolError(id, fmt.Sprintf("server %s has %d pending requests. Use force=true to kill them, or wait for completion.", serverID[:8], statusData.PendingRequests))
 		return
 	}
 
@@ -594,8 +601,8 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	}
 
 	daemonArgs := []string{"--daemon"}
-	daemonArgs = append(daemonArgs, status.Command)
-	daemonArgs = append(daemonArgs, status.Args...)
+	daemonArgs = append(daemonArgs, statusData.Command)
+	daemonArgs = append(daemonArgs, statusData.Args...)
 
 	cmd := exec.Command(exe, daemonArgs...)
 	cmd.Stdin = nil
@@ -609,7 +616,11 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	// Detach — don't wait for the daemon
 	go cmd.Wait()
 
-	s.sendToolResult(id, fmt.Sprintf("restarted: stopped (%s), new daemon PID %d", stopResp.Message, cmd.Process.Pid))
+	warning := ""
+	if params.Force && statusData.PendingRequests > 0 {
+		warning = fmt.Sprintf("WARNING: force restart killed %d pending requests. ", statusData.PendingRequests)
+	}
+	s.sendToolResult(id, fmt.Sprintf("%srestarted: stopped (%s), new daemon PID %d", warning, stopResp.Message, cmd.Process.Pid))
 }
 
 // resolveServerID returns a server ID from either an explicit ID or a name substring match.
