@@ -148,7 +148,6 @@ func (r *Reaper) sweep() int {
 			PendingRequests:      entry.Owner.PendingRequests(),
 			ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),
 			HasBusyWork:          entry.Owner.HasActiveBusyWork(),
-			UpstreamDead:         entry.Owner.UpstreamDead(),
 			IdleTimeout:          entry.IdleTimeout,
 			OwnerIdleOverride:    entry.Owner.IdleTimeout(),
 			LastSession:          entry.LastSession,
@@ -156,14 +155,10 @@ func (r *Reaper) sweep() int {
 		}
 		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout)
 		if decision.evict {
-			if decision.reason == "zombie" {
-				r.logger.Printf("reaper: owner %s upstream dead with 0 sessions, removing", sid[:8])
-			} else {
-				r.logger.Printf(
-					"reaper: owner %s idle for %.0fs (timeout %.0fs), removing",
-					sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
-				)
-			}
+			r.logger.Printf(
+				"reaper: owner %s idle for %.0fs (timeout %.0fs), removing",
+				sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
+			)
 			_ = r.daemon.Remove(sid)
 			affected++
 		}
@@ -182,7 +177,6 @@ type evictionSample struct {
 	PendingRequests      int64
 	ActiveProgressTokens int
 	HasBusyWork          bool
-	UpstreamDead         bool
 	// IdleTimeout is the owner-entry idle timeout (set at Spawn time
 	// from daemon defaults).
 	IdleTimeout time.Duration
@@ -196,7 +190,6 @@ type evictionDecision struct {
 	evict       bool
 	elapsed     time.Duration
 	idleTimeout time.Duration
-	reason      string // "zombie" or "idle"
 }
 
 // shouldEvict applies the activity-aware kill gate:
@@ -213,10 +206,6 @@ type evictionDecision struct {
 //  2. Sample.IdleTimeout (daemon default copied at spawn)
 //  3. daemonDefault argument (fallback for placeholder entries)
 func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) evictionDecision {
-	// Zombie: upstream dead + zero sessions = evict immediately regardless of other conditions.
-	if s.UpstreamDead && s.Sessions == 0 {
-		return evictionDecision{evict: true, reason: "zombie"}
-	}
 	if s.Sessions != 0 {
 		return evictionDecision{}
 	}
@@ -254,7 +243,6 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) e
 		evict:       elapsed > idleTimeout,
 		elapsed:     elapsed,
 		idleTimeout: idleTimeout,
-		reason:      "idle",
 	}
 }
 
