@@ -150,6 +150,12 @@ type Owner struct {
 	closeListenerOnce sync.Once
 	listenerDone      chan struct{} // closed when IPC listener is intentionally stopped
 	done              chan struct{}
+
+	// backgroundSpawnCh is non-nil for owners created via NewOwnerFromSnapshot,
+	// where the upstream is started asynchronously via SpawnUpstreamBackground.
+	// It is closed (under mu) when background spawn finishes (success or failure),
+	// allowing Serve to block instead of treating nil upstream as dead.
+	backgroundSpawnCh chan struct{}
 }
 
 // OwnerConfig holds parameters for creating an Owner.
@@ -252,6 +258,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
+		backgroundSpawnCh:      make(chan struct{}),
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
 
@@ -325,6 +332,13 @@ func (o *Owner) SpawnUpstreamBackground() {
 		proc, err := upstream.Start(o.command, o.args, nil, o.cwd)
 		if err != nil {
 			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
+			// Unblock Serve — spawn is done (failed), nil upstream will be observed via upstreamDeadCh.
+			o.mu.Lock()
+			if o.backgroundSpawnCh != nil {
+				close(o.backgroundSpawnCh)
+				o.backgroundSpawnCh = nil
+			}
+			o.mu.Unlock()
 			return
 		}
 
@@ -332,12 +346,24 @@ func (o *Owner) SpawnUpstreamBackground() {
 		select {
 		case <-o.done:
 			proc.Close()
+			// Still unblock Serve so it can observe o.done and exit cleanly.
+			o.mu.Lock()
+			if o.backgroundSpawnCh != nil {
+				close(o.backgroundSpawnCh)
+				o.backgroundSpawnCh = nil
+			}
+			o.mu.Unlock()
 			return
 		default:
 		}
 
 		o.mu.Lock()
 		o.upstream = proc
+		// Unblock Serve — upstream is now set; upstreamDeadCh will return proc.Done.
+		if o.backgroundSpawnCh != nil {
+			close(o.backgroundSpawnCh)
+			o.backgroundSpawnCh = nil
+		}
 		o.mu.Unlock()
 
 		// Start reading upstream responses
@@ -1470,23 +1496,49 @@ var closedChan = func() chan struct{} {
 // non-deterministically return nil instead of the expected error/ErrDoNotRestart,
 // making restart/backoff policies unreliable.
 func (o *Owner) Serve(ctx context.Context) error {
-	// Non-blocking upstream check first — avoids race with concurrent Shutdown
-	select {
-	case <-o.upstreamDeadCh():
-		return o.upstreamDeathResult()
-	default:
-	}
+	for {
+		// Snapshot the current dead/pending channel under a single lock read.
+		// If backgroundSpawnCh is non-nil, upstreamDeadCh returns it (blocking Serve
+		// until the spawn goroutine finishes). If nil and upstream is also nil,
+		// upstreamDeadCh returns closedChan (immediate death). If upstream is set,
+		// upstreamDeadCh returns proc.Done.
+		deadCh := o.upstreamDeadCh()
 
-	select {
-	case <-ctx.Done():
-		// External cancellation (daemon shutdown, supervisor stop)
-		o.Shutdown()
-		return ctx.Err()
-	case <-o.done:
-		// Owner already shut down cleanly (external Shutdown call, mux_stop, etc.)
-		return nil
-	case <-o.upstreamDeadCh():
-		return o.upstreamDeathResult()
+		// Non-blocking check: if the channel is already closed, act immediately.
+		select {
+		case <-deadCh:
+			// If this was backgroundSpawnCh (now closed and cleared), loop to
+			// re-evaluate — the upstream may now be set or definitively absent.
+			o.mu.RLock()
+			bgCh := o.backgroundSpawnCh
+			o.mu.RUnlock()
+			if bgCh == nil && deadCh != closedChan {
+				// backgroundSpawnCh just fired; upstream may be set now — loop.
+				continue
+			}
+			return o.upstreamDeathResult()
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+			// External cancellation (daemon shutdown, supervisor stop)
+			o.Shutdown()
+			return ctx.Err()
+		case <-o.done:
+			// Owner already shut down cleanly (external Shutdown call, mux_stop, etc.)
+			return nil
+		case <-deadCh:
+			// Same logic as the non-blocking check above.
+			o.mu.RLock()
+			bgCh := o.backgroundSpawnCh
+			o.mu.RUnlock()
+			if bgCh == nil && deadCh != closedChan {
+				// backgroundSpawnCh just fired; loop to re-evaluate.
+				continue
+			}
+			return o.upstreamDeathResult()
+		}
 	}
 }
 
@@ -1506,18 +1558,26 @@ func (o *Owner) upstreamDeathResult() error {
 }
 
 // upstreamDeadCh returns a channel that closes when the upstream process dies.
-// If the owner has no upstream (nil, e.g. snapshot-restored before
-// SpawnUpstreamBackground or after a failed background spawn), returns the
-// package-level closedChan so Serve observes it as failure. This prevents
-// Serve from hanging forever and lets suture apply backoff/restart.
+//
+// Three cases:
+//  1. Upstream is set: return proc.Done (normal path).
+//  2. Background spawn is pending (backgroundSpawnCh != nil): return backgroundSpawnCh.
+//     Serve blocks on it; when it closes Serve loops and re-checks the upstream.
+//  3. Upstream is nil and no spawn pending (spawn failed or never started): return
+//     closedChan so Serve observes it as failure and suture applies backoff/restart.
 func (o *Owner) upstreamDeadCh() <-chan struct{} {
 	o.mu.RLock()
 	up := o.upstream
+	bgCh := o.backgroundSpawnCh
 	o.mu.RUnlock()
-	if up == nil {
-		return closedChan
+	if up != nil {
+		return up.Done
 	}
-	return up.Done
+	if bgCh != nil {
+		// Template owner: upstream is starting in background. Block Serve until done.
+		return bgCh
+	}
+	return closedChan
 }
 
 // ServerID returns the server identity hash for this owner.
