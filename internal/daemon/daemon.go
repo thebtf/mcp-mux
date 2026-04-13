@@ -194,6 +194,10 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 	case suture.EventServiceTerminate:
 		d.logger.Printf("supervisor: service %q terminated: %v (restarting=%v)",
 			e.ServiceName, e.Err, e.Restarting)
+		if !e.Restarting {
+			d.logger.Printf("supervisor: service %q permanently failed — cleaning up zombie owner", e.ServiceName)
+			go d.cleanupDeadOwner(e.ServiceName)
+		}
 	case suture.EventBackoff:
 		d.logger.Printf("supervisor: backoff — too many failures, slowing restart rate")
 	case suture.EventResume:
@@ -202,6 +206,39 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 		d.logger.Printf("supervisor: service %q did not stop in time", e.ServiceName)
 	default:
 		// Unknown event type — ignore silently
+	}
+}
+
+// cleanupDeadOwner finds and removes a permanently-failed owner from the registry.
+// ServiceName format from suture: "owner[XXXXXXXX command args]"
+func (d *Daemon) cleanupDeadOwner(serviceName string) {
+	// Extract server ID prefix: between "owner[" and first space or "]"
+	const prefix = "owner["
+	idx := strings.Index(serviceName, prefix)
+	if idx < 0 {
+		return
+	}
+	rest := serviceName[idx+len(prefix):]
+	// serverID is the first token (8 hex chars before space)
+	spaceIdx := strings.IndexByte(rest, ' ')
+	if spaceIdx < 0 {
+		return
+	}
+	sidPrefix := rest[:spaceIdx]
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for sid, entry := range d.owners {
+		if !strings.HasPrefix(sid, sidPrefix) {
+			continue
+		}
+		if entry.Owner != nil {
+			d.logger.Printf("cleaning up zombie owner %s", sid[:8])
+			go entry.Owner.Shutdown()
+		}
+		delete(d.owners, sid)
+		return
 	}
 }
 

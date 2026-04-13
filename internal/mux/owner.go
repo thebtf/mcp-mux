@@ -1589,6 +1589,11 @@ func (o *Owner) ActiveProgressTokens() int {
 	return len(o.progressOwners)
 }
 
+// UpstreamDead returns true if the upstream process has exited.
+func (o *Owner) UpstreamDead() bool {
+	return o.upstreamDead.Load()
+}
+
 // LastActivity returns the unix-nano timestamp of the last activity seen by
 // the owner (inbound upstream message, outbound session→upstream message, or
 // a session connect/disconnect event).

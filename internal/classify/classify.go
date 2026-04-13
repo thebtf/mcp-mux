@@ -265,3 +265,46 @@ func ParseIdleTimeout(initJSON []byte) int {
 	}
 	return xmux.IdleTimeout
 }
+
+// ParseProgressInterval reads the x-mux.progressInterval field from an
+// initialize JSON response and returns the value in seconds.
+// Returns 0 if absent or invalid. Clamps to 60 if over.
+func ParseProgressInterval(initJSON []byte) int {
+	var resp struct {
+		Result struct {
+			Capabilities struct {
+				XMux *struct {
+					ProgressInterval int `json:"progressInterval"`
+				} `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(initJSON, &resp); err != nil {
+		return 0
+	}
+
+	xmux := resp.Result.Capabilities.XMux
+
+	// Fallback: check experimental.x-mux (TypeScript SDK puts custom
+	// capabilities under experimental rather than at capability root).
+	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
+		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
+			xmux = &struct {
+				ProgressInterval int `json:"progressInterval"`
+			}{}
+			if err := json.Unmarshal(raw, xmux); err != nil {
+				return 0
+			}
+		}
+	}
+
+	if xmux == nil || xmux.ProgressInterval <= 0 {
+		return 0
+	}
+	// Cap at 60 seconds. Larger values defeat the purpose of progress reporting.
+	if xmux.ProgressInterval > 60 {
+		return 60
+	}
+	return xmux.ProgressInterval
+}

@@ -148,6 +148,7 @@ func (r *Reaper) sweep() int {
 			PendingRequests:      entry.Owner.PendingRequests(),
 			ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),
 			HasBusyWork:          entry.Owner.HasActiveBusyWork(),
+			UpstreamDead:         entry.Owner.UpstreamDead(),
 			IdleTimeout:          entry.IdleTimeout,
 			OwnerIdleOverride:    entry.Owner.IdleTimeout(),
 			LastSession:          entry.LastSession,
@@ -177,6 +178,7 @@ type evictionSample struct {
 	PendingRequests      int64
 	ActiveProgressTokens int
 	HasBusyWork          bool
+	UpstreamDead         bool
 	// IdleTimeout is the owner-entry idle timeout (set at Spawn time
 	// from daemon defaults).
 	IdleTimeout time.Duration
@@ -206,6 +208,10 @@ type evictionDecision struct {
 //  2. Sample.IdleTimeout (daemon default copied at spawn)
 //  3. daemonDefault argument (fallback for placeholder entries)
 func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) evictionDecision {
+	// Zombie: upstream dead + zero sessions = evict immediately regardless of other conditions.
+	if s.UpstreamDead && s.Sessions == 0 {
+		return evictionDecision{evict: true}
+	}
 	if s.Sessions != 0 {
 		return evictionDecision{}
 	}
