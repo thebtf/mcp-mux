@@ -31,10 +31,10 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/control"
-	"github.com/thebtf/mcp-mux/internal/ipc"
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
 	"github.com/thebtf/mcp-mux/internal/mux"
-	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
 func main() {

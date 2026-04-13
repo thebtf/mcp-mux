@@ -34,7 +34,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/control"
-	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
 func main() {

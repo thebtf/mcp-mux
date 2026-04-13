@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/classify"
+	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
 	"github.com/thebtf/mcp-mux/internal/upstream"
 	"github.com/thejerf/suture/v4"
 )

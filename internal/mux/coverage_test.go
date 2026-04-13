@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/classify"
-	"github.com/thebtf/mcp-mux/internal/jsonrpc"
-	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
+	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
 // safeBuf is a thread-safe bytes.Buffer for use in tests where concurrent

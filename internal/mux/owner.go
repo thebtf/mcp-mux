@@ -17,12 +17,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/classify"
 	"github.com/thebtf/mcp-mux/internal/control"
-	"github.com/thebtf/mcp-mux/internal/ipc"
-	"github.com/thebtf/mcp-mux/internal/jsonrpc"
-	"github.com/thebtf/mcp-mux/internal/remap"
-	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/remap"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/internal/upstream"
 	"github.com/thejerf/suture/v4"
 )

@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/control"
-	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
 )
 
 // instructions is injected into the initialize response so the connecting agent

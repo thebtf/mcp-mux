@@ -5,7 +5,7 @@
 // and restored across daemon restarts.
 package mux
 
-import "github.com/thebtf/mcp-mux/internal/classify"
+import "github.com/thebtf/mcp-mux/internal/muxcore/classify"
 
 // OwnerSnapshot captures the serializable state of an Owner for graceful restart.
 // Cached responses are base64-encoded raw JSON-RPC messages.

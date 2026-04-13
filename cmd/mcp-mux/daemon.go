@@ -12,8 +12,8 @@ import (
 
 	"github.com/thebtf/mcp-mux/internal/control"
 	"github.com/thebtf/mcp-mux/internal/daemon"
-	"github.com/thebtf/mcp-mux/internal/ipc"
-	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
 // runGlobalDaemon starts the global daemon process. This is invoked via

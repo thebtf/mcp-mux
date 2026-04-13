@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
 )
 
 // writeTimeout is the maximum time a write to a session can block before
