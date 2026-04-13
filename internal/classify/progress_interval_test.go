@@ -43,3 +43,17 @@ func TestParseProgressInterval_InvalidJSON(t *testing.T) {
 		t.Errorf("want 0 on parse error, got %d", got)
 	}
 }
+
+func TestParseProgressInterval_MinBoundary(t *testing.T) {
+	in := []byte(`{"result":{"capabilities":{"x-mux":{"progressInterval":1}}}}`)
+	if got := ParseProgressInterval(in); got != 1 {
+		t.Errorf("want 1 (min boundary), got %d", got)
+	}
+}
+
+func TestParseProgressInterval_MaxBoundary(t *testing.T) {
+	in := []byte(`{"result":{"capabilities":{"x-mux":{"progressInterval":60}}}}`)
+	if got := ParseProgressInterval(in); got != 60 {
+		t.Errorf("want 60 (max boundary), got %d", got)
+	}
+}

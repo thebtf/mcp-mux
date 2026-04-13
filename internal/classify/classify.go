@@ -43,46 +43,45 @@ func ClassifyTools(toolsListJSON []byte) (SharingMode, []string) {
 	return ModeShared, nil
 }
 
+// unmarshalXMux extracts and unmarshals the x-mux capability block from an
+// initialize JSON-RPC response into out. Checks capabilities.x-mux directly
+// first, then falls back to capabilities.experimental["x-mux"] (TypeScript SDK
+// places custom capabilities there). Returns false if absent or if unmarshalling
+// fails.
+func unmarshalXMux(initJSON []byte, out any) bool {
+	var resp struct {
+		Result struct {
+			Capabilities struct {
+				XMux         json.RawMessage            `json:"x-mux"`
+				Experimental map[string]json.RawMessage `json:"experimental"`
+			} `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(initJSON, &resp); err != nil {
+		return false
+	}
+	if len(resp.Result.Capabilities.XMux) > 0 {
+		return json.Unmarshal(resp.Result.Capabilities.XMux, out) == nil
+	}
+	raw, ok := resp.Result.Capabilities.Experimental["x-mux"]
+	if !ok {
+		return false
+	}
+	return json.Unmarshal(raw, out) == nil
+}
+
 // ClassifyCapabilities parses an initialize JSON-RPC response and extracts
 // the x-mux capability to determine the server's declared sharing mode.
 //
 // Returns the declared mode and true if x-mux was found, or ("", false) if absent.
 // This takes priority over tool-name classification when present.
 func ClassifyCapabilities(initJSON []byte) (SharingMode, bool) {
-	// Try direct x-mux capability first
-	var resp struct {
-		Result struct {
-			Capabilities struct {
-				XMux *struct {
-					Sharing string `json:"sharing"`
-				} `json:"x-mux"`
-				Experimental map[string]json.RawMessage `json:"experimental"`
-			} `json:"capabilities"`
-		} `json:"result"`
+	var xmux struct {
+		Sharing string `json:"sharing"`
 	}
-	if err := json.Unmarshal(initJSON, &resp); err != nil {
+	if !unmarshalXMux(initJSON, &xmux) {
 		return "", false
 	}
-
-	// Check direct x-mux capability
-	xmux := resp.Result.Capabilities.XMux
-
-	// Fallback: check experimental.x-mux (TypeScript SDK puts custom capabilities here)
-	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
-		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
-			xmux = &struct {
-				Sharing string `json:"sharing"`
-			}{}
-			if err := json.Unmarshal(raw, xmux); err != nil {
-				xmux = nil
-			}
-		}
-	}
-
-	if xmux == nil {
-		return "", false
-	}
-
 	mode := SharingMode(xmux.Sharing)
 	switch mode {
 	case ModeShared, ModeIsolated, ModeSessionAware:
@@ -95,36 +94,10 @@ func ClassifyCapabilities(initJSON []byte) (SharingMode, bool) {
 // ParsePersistent extracts x-mux.persistent from a cached initialize response.
 // Returns true if the server declares itself as persistent.
 func ParsePersistent(initJSON []byte) bool {
-	// Try direct x-mux capability
-	var resp struct {
-		Result struct {
-			Capabilities struct {
-				XMux *struct {
-					Persistent bool `json:"persistent"`
-				} `json:"x-mux"`
-				Experimental map[string]json.RawMessage `json:"experimental"`
-			} `json:"capabilities"`
-		} `json:"result"`
+	var xmux struct {
+		Persistent bool `json:"persistent"`
 	}
-	if err := json.Unmarshal(initJSON, &resp); err != nil {
-		return false
-	}
-
-	xmux := resp.Result.Capabilities.XMux
-
-	// Fallback: check experimental.x-mux
-	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
-		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
-			xmux = &struct {
-				Persistent bool `json:"persistent"`
-			}{}
-			if err := json.Unmarshal(raw, xmux); err != nil {
-				return false
-			}
-		}
-	}
-
-	if xmux == nil {
+	if !unmarshalXMux(initJSON, &xmux) {
 		return false
 	}
 	return xmux.Persistent
@@ -136,34 +109,13 @@ func ParsePersistent(initJSON []byte) bool {
 // JSON-RPC error response if upstream doesn't respond within the timeout.
 // Prevents eternal hangs when upstream deadlocks or crashes silently.
 func ParseToolTimeout(initJSON []byte) int {
-	var resp struct {
-		Result struct {
-			Capabilities struct {
-				XMux *struct {
-					ToolTimeout int `json:"toolTimeout"`
-				} `json:"x-mux"`
-				Experimental map[string]json.RawMessage `json:"experimental"`
-			} `json:"capabilities"`
-		} `json:"result"`
+	var xmux struct {
+		ToolTimeout int `json:"toolTimeout"`
 	}
-	if err := json.Unmarshal(initJSON, &resp); err != nil {
+	if !unmarshalXMux(initJSON, &xmux) {
 		return 0
 	}
-
-	xmux := resp.Result.Capabilities.XMux
-
-	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
-		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
-			xmux = &struct {
-				ToolTimeout int `json:"toolTimeout"`
-			}{}
-			if err := json.Unmarshal(raw, xmux); err != nil {
-				return 0
-			}
-		}
-	}
-
-	if xmux == nil || xmux.ToolTimeout <= 0 {
+	if xmux.ToolTimeout <= 0 {
 		return 0
 	}
 	// Cap at 1 hour to prevent unreasonable values
@@ -178,35 +130,13 @@ func ParseToolTimeout(initJSON []byte) int {
 // Servers use this to tell mux how long they need to gracefully shut down
 // (e.g., drain running async jobs, flush state).
 func ParseDrainTimeout(initJSON []byte) int {
-	var resp struct {
-		Result struct {
-			Capabilities struct {
-				XMux *struct {
-					DrainTimeout int `json:"drainTimeout"`
-				} `json:"x-mux"`
-				Experimental map[string]json.RawMessage `json:"experimental"`
-			} `json:"capabilities"`
-		} `json:"result"`
+	var xmux struct {
+		DrainTimeout int `json:"drainTimeout"`
 	}
-	if err := json.Unmarshal(initJSON, &resp); err != nil {
+	if !unmarshalXMux(initJSON, &xmux) {
 		return 0
 	}
-
-	xmux := resp.Result.Capabilities.XMux
-
-	// Fallback: check experimental.x-mux
-	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
-		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
-			xmux = &struct {
-				DrainTimeout int `json:"drainTimeout"`
-			}{}
-			if err := json.Unmarshal(raw, xmux); err != nil {
-				return 0
-			}
-		}
-	}
-
-	if xmux == nil || xmux.DrainTimeout <= 0 {
+	if xmux.DrainTimeout <= 0 {
 		return 0
 	}
 	// Cap at 5 minutes to prevent runaway drain
@@ -226,36 +156,13 @@ func ParseDrainTimeout(initJSON []byte) int {
 // timeout to survive multi-hour quiet periods. Upstreams that are cheap to
 // re-spawn can declare a short timeout to free RAM faster.
 func ParseIdleTimeout(initJSON []byte) int {
-	var resp struct {
-		Result struct {
-			Capabilities struct {
-				XMux *struct {
-					IdleTimeout int `json:"idleTimeout"`
-				} `json:"x-mux"`
-				Experimental map[string]json.RawMessage `json:"experimental"`
-			} `json:"capabilities"`
-		} `json:"result"`
+	var xmux struct {
+		IdleTimeout int `json:"idleTimeout"`
 	}
-	if err := json.Unmarshal(initJSON, &resp); err != nil {
+	if !unmarshalXMux(initJSON, &xmux) {
 		return 0
 	}
-
-	xmux := resp.Result.Capabilities.XMux
-
-	// Fallback: check experimental.x-mux (TypeScript SDK puts custom
-	// capabilities under experimental rather than at capability root).
-	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
-		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
-			xmux = &struct {
-				IdleTimeout int `json:"idleTimeout"`
-			}{}
-			if err := json.Unmarshal(raw, xmux); err != nil {
-				return 0
-			}
-		}
-	}
-
-	if xmux == nil || xmux.IdleTimeout <= 0 {
+	if xmux.IdleTimeout <= 0 {
 		return 0
 	}
 	// Cap at 24 hours. Larger values are almost certainly a unit mistake
@@ -270,36 +177,13 @@ func ParseIdleTimeout(initJSON []byte) int {
 // initialize JSON response and returns the value in seconds.
 // Returns 0 if absent or invalid. Clamps to 60 if over.
 func ParseProgressInterval(initJSON []byte) int {
-	var resp struct {
-		Result struct {
-			Capabilities struct {
-				XMux *struct {
-					ProgressInterval int `json:"progressInterval"`
-				} `json:"x-mux"`
-				Experimental map[string]json.RawMessage `json:"experimental"`
-			} `json:"capabilities"`
-		} `json:"result"`
+	var xmux struct {
+		ProgressInterval int `json:"progressInterval"`
 	}
-	if err := json.Unmarshal(initJSON, &resp); err != nil {
+	if !unmarshalXMux(initJSON, &xmux) {
 		return 0
 	}
-
-	xmux := resp.Result.Capabilities.XMux
-
-	// Fallback: check experimental.x-mux (TypeScript SDK puts custom
-	// capabilities under experimental rather than at capability root).
-	if xmux == nil && resp.Result.Capabilities.Experimental != nil {
-		if raw, ok := resp.Result.Capabilities.Experimental["x-mux"]; ok {
-			xmux = &struct {
-				ProgressInterval int `json:"progressInterval"`
-			}{}
-			if err := json.Unmarshal(raw, xmux); err != nil {
-				return 0
-			}
-		}
-	}
-
-	if xmux == nil || xmux.ProgressInterval <= 0 {
+	if xmux.ProgressInterval <= 0 {
 		return 0
 	}
 	// Cap at 60 seconds. Larger values defeat the purpose of progress reporting.

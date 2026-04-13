@@ -156,10 +156,14 @@ func (r *Reaper) sweep() int {
 		}
 		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout)
 		if decision.evict {
-			r.logger.Printf(
-				"reaper: owner %s idle for %.0fs (timeout %.0fs), removing",
-				sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
-			)
+			if decision.reason == "zombie" {
+				r.logger.Printf("reaper: owner %s upstream dead with 0 sessions, removing", sid[:8])
+			} else {
+				r.logger.Printf(
+					"reaper: owner %s idle for %.0fs (timeout %.0fs), removing",
+					sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
+				)
+			}
 			_ = r.daemon.Remove(sid)
 			affected++
 		}
@@ -192,6 +196,7 @@ type evictionDecision struct {
 	evict       bool
 	elapsed     time.Duration
 	idleTimeout time.Duration
+	reason      string // "zombie" or "idle"
 }
 
 // shouldEvict applies the activity-aware kill gate:
@@ -210,7 +215,7 @@ type evictionDecision struct {
 func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) evictionDecision {
 	// Zombie: upstream dead + zero sessions = evict immediately regardless of other conditions.
 	if s.UpstreamDead && s.Sessions == 0 {
-		return evictionDecision{evict: true}
+		return evictionDecision{evict: true, reason: "zombie"}
 	}
 	if s.Sessions != 0 {
 		return evictionDecision{}
@@ -249,6 +254,7 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) e
 		evict:       elapsed > idleTimeout,
 		elapsed:     elapsed,
 		idleTimeout: idleTimeout,
+		reason:      "idle",
 	}
 }
 

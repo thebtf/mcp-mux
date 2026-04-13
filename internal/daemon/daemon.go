@@ -211,35 +211,59 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 
 // cleanupDeadOwner finds and removes a permanently-failed owner from the registry.
 // ServiceName format from suture: "owner[XXXXXXXX command args]"
+// NOTE: the format must match Owner.String() in internal/mux/owner.go.
 func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	// Extract server ID prefix: between "owner[" and first space or "]"
 	const prefix = "owner["
 	idx := strings.Index(serviceName, prefix)
 	if idx < 0 {
+		d.logger.Printf("cleanupDeadOwner: unexpected service name format: %q", serviceName)
 		return
 	}
 	rest := serviceName[idx+len(prefix):]
 	// serverID is the first token (8 hex chars before space)
 	spaceIdx := strings.IndexByte(rest, ' ')
 	if spaceIdx < 0 {
+		d.logger.Printf("cleanupDeadOwner: cannot extract serverID from: %q", serviceName)
 		return
 	}
 	sidPrefix := rest[:spaceIdx]
 
+	// Find the matching owner under the lock, then release before calling
+	// Shutdown to avoid blocking while holding d.mu (Shutdown may wait for
+	// upstream I/O). Re-acquire to delete the map entry afterwards.
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	var (
+		found bool
+		sid   string
+		entry *OwnerEntry
+	)
+	for s, e := range d.owners {
+		if strings.HasPrefix(s, sidPrefix) {
+			found = true
+			sid = s
+			entry = e
+			break
+		}
+	}
+	d.mu.Unlock()
 
-	for sid, entry := range d.owners {
-		if !strings.HasPrefix(sid, sidPrefix) {
-			continue
-		}
-		if entry.Owner != nil {
-			d.logger.Printf("cleaning up zombie owner %s", sid[:8])
-			go entry.Owner.Shutdown()
-		}
-		delete(d.owners, sid)
+	if !found {
 		return
 	}
+	if entry.Owner != nil {
+		d.logger.Printf("cleaning up zombie owner %s", sid[:8])
+		// Synchronous shutdown ensures the IPC socket file is removed before
+		// the entry is deleted from the registry. Without this, a concurrent
+		// Spawn for the same SID could call ipc.Listen and find the stale
+		// socket still present. Safe to block here because cleanupDeadOwner
+		// itself is always called from a goroutine (line ~199).
+		entry.Owner.Shutdown()
+	}
+
+	d.mu.Lock()
+	delete(d.owners, sid)
+	d.mu.Unlock()
 }
 
 // cleanStaleSockets removes mcp-mux-*.ctl.sock and mcp-mux-*.sock files from
