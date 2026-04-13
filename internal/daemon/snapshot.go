@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/classify"
 	"github.com/thebtf/mcp-mux/internal/mux"
-	"github.com/thebtf/mcp-mux/internal/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 	"github.com/thejerf/suture/v4"
 )
 

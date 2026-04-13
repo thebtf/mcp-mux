@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/control"
-	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
 )
 
 // testdataPath returns the absolute path to a file under the project's testdata directory.

@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/ipc"
-	"github.com/thebtf/mcp-mux/internal/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
 )
 
 const (

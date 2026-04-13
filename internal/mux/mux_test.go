@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
 )
 
 // testLogger returns a logger that writes to test output.
