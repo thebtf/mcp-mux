@@ -57,7 +57,7 @@ func TestDaemonSpawnAndStatus(t *testing.T) {
 	ipcPath, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Cwd:     "",
 		Mode:    "global",
 	})
@@ -91,7 +91,7 @@ func TestDaemonSpawnReusesExisting(t *testing.T) {
 	req := control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	}
 
@@ -122,7 +122,7 @@ func TestDaemonRemove(t *testing.T) {
 	_, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -150,7 +150,7 @@ func TestDaemonShutdownCleansAll(t *testing.T) {
 		_, _, _, err := d.Spawn(control.Request{
 			Cmd:     "spawn",
 			Command: "go",
-			Args:    []string{"run", "../../testdata/mock_server.go"},
+			Args:    []string{"run", "../../../testdata/mock_server.go"},
 			Mode:    "isolated",
 		})
 		if err != nil {
@@ -182,7 +182,7 @@ func TestDaemonSetPersistent(t *testing.T) {
 	_, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -215,7 +215,7 @@ func TestDaemonMultiSessionSharing(t *testing.T) {
 	ipcPath, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -526,7 +526,7 @@ func TestFindSharedOwnerEnvFiltering(t *testing.T) {
 	req := control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "cwd",
 		Env:     map[string]string{"GITHUB_TOKEN": "abc"},
 	}

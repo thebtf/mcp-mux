@@ -35,7 +35,7 @@ func TestReaperGracePeriodExpiry(t *testing.T) {
 
 	_, sid, _, err := d.Spawn(control.Request{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -69,7 +69,7 @@ func TestReaperPersistentSurvivesGrace(t *testing.T) {
 
 	_, sid, _, err := d.Spawn(control.Request{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
