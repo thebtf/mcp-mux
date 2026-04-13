@@ -114,9 +114,9 @@ type Owner struct {
 	timedOutIDs      sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests  atomic.Int64
 	drainTimeout     time.Duration // from x-mux.drainTimeout capability; 0 = use default
-	toolTimeoutNs    atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
-	idleTimeoutNs    atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
-	progressInterval time.Duration // from x-mux.progressInterval capability; 0 = use default (5s)
+	toolTimeoutNs      atomic.Int64 // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
+	idleTimeoutNs      atomic.Int64 // from x-mux.idleTimeout capability; 0 = use daemon default
+	progressIntervalNs atomic.Int64 // from x-mux.progressInterval capability; stored as nanoseconds; 0 = use default (5s)
 	lastActivityNs   atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
 	busyMu           sync.Mutex
 	busyDeclarations map[string]busyDeclaration // busy_id → declaration (long-running work signal)
@@ -225,11 +225,11 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
-		progressInterval:       5 * time.Second,
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
 	}
+	o.progressIntervalNs.Store(int64(5 * time.Second))
 
 	// Pre-populate caches from snapshot
 	if snap.CachedInit != "" {
@@ -384,11 +384,11 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
-		progressInterval:       5 * time.Second,
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
 	}
+	o.progressIntervalNs.Store(int64(5 * time.Second))
 
 	// Start control plane if configured
 	if cfg.ControlPath != "" {
@@ -1937,7 +1937,7 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		o.parseToolTimeout(cached)
 		o.parseIdleTimeout(cached)
 		if sec := classify.ParseProgressInterval(cached); sec > 0 {
-			o.progressInterval = time.Duration(sec) * time.Second
+			o.progressIntervalNs.Store(int64(time.Duration(sec) * time.Second))
 			o.logger.Printf("using x-mux.progressInterval: %ds", sec)
 		}
 	}

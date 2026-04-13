@@ -19,7 +19,10 @@ func doneContext(done <-chan struct{}) context.Context {
 }
 
 // buildSyntheticProgress builds JSON-RPC notification bytes for synthetic progress.
-// token: from CC's SDK (tracked in requestToTokens)
+// token: JSON-encoded progress token from CC's SDK (tracked in requestToTokens); stored
+//
+//	as raw JSON so numeric and string tokens are both preserved without re-quoting.
+//
 // toolOrMethod: tool name (e.g. "tavily_search") or method (e.g. "tools/call")
 // elapsedSeconds: seconds since request start, used as monotonically increasing progress counter
 func buildSyntheticProgress(token string, toolOrMethod string, elapsedSeconds int) []byte {
@@ -27,15 +30,15 @@ func buildSyntheticProgress(token string, toolOrMethod string, elapsedSeconds in
 		JSONRPC string `json:"jsonrpc"`
 		Method  string `json:"method"`
 		Params  struct {
-			ProgressToken string `json:"progressToken"`
-			Progress      int    `json:"progress"`
-			Message       string `json:"message,omitempty"`
+			ProgressToken json.RawMessage `json:"progressToken"`
+			Progress      int             `json:"progress"`
+			Message       string          `json:"message,omitempty"`
 		} `json:"params"`
 	}{
 		JSONRPC: "2.0",
 		Method:  "notifications/progress",
 	}
-	msg.Params.ProgressToken = token
+	msg.Params.ProgressToken = json.RawMessage(token)
 	msg.Params.Progress = elapsedSeconds
 	msg.Params.Message = fmt.Sprintf("%s: %ds elapsed", toolOrMethod, elapsedSeconds)
 
@@ -43,13 +46,22 @@ func buildSyntheticProgress(token string, toolOrMethod string, elapsedSeconds in
 	return data
 }
 
+// loadProgressInterval reads the current interval from the atomic field with a
+// fallback to 5 s when the stored value is zero or negative.
+func (o *Owner) loadProgressInterval() time.Duration {
+	ns := o.progressIntervalNs.Load()
+	if ns <= 0 {
+		return 5 * time.Second
+	}
+	return time.Duration(ns)
+}
+
 // runProgressReporter scans inflightTracker every interval and sends synthetic
 // notifications/progress for long-running requests without recent real progress.
+// The ticker is reset whenever the configured interval changes so that updates
+// from the initialize response take effect without restarting the goroutine.
 func (o *Owner) runProgressReporter(ctx context.Context) {
-	interval := o.progressInterval
-	if interval <= 0 {
-		interval = 5 * time.Second
-	}
+	interval := o.loadProgressInterval()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -58,6 +70,11 @@ func (o *Owner) runProgressReporter(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			current := o.loadProgressInterval()
+			if current != interval {
+				interval = current
+				ticker.Reset(interval)
+			}
 			o.emitSyntheticProgress(interval)
 		}
 	}

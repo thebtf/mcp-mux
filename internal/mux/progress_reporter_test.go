@@ -38,8 +38,8 @@ func TestBuildSyntheticProgress_WithTool(t *testing.T) {
 	if msg.Method != "notifications/progress" {
 		t.Errorf("method: got %q, want %q", msg.Method, "notifications/progress")
 	}
-	if msg.Params.ProgressToken != `"tok-1"` {
-		t.Errorf("progressToken: got %q, want %q", msg.Params.ProgressToken, `"tok-1"`)
+	if msg.Params.ProgressToken != "tok-1" {
+		t.Errorf("progressToken: got %q, want %q", msg.Params.ProgressToken, "tok-1")
 	}
 	if msg.Params.Progress != 10 {
 		t.Errorf("progress: got %d, want 10", msg.Params.Progress)
@@ -150,7 +150,7 @@ func TestProgressReporter_NoEmitWhenYoung(t *testing.T) {
 
 func TestProgressReporter_StopsOnCancel(t *testing.T) {
 	o := newMinimalOwner()
-	o.progressInterval = 50 * time.Millisecond
+	o.progressIntervalNs.Store(int64(50 * time.Millisecond))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
