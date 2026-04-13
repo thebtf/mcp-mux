@@ -37,7 +37,7 @@ func TestStartAndClose(t *testing.T) {
 func TestWriteAndRead(t *testing.T) {
 	// Use 'go run' with a simple cat-like program
 	// For cross-platform, we use Go itself
-	p, err := Start("go", []string{"run", "../../testdata/echo_pipe.go"}, nil, "")
+	p, err := Start("go", []string{"run", "../../../testdata/echo_pipe.go"}, nil, "")
 	if err != nil {
 		t.Skipf("Skipping: cannot start echo_pipe: %v", err)
 	}

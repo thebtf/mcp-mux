@@ -29,7 +29,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/internal/muxcore/session"
 	"github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
-	"github.com/thebtf/mcp-mux/internal/upstream"
+	"github.com/thebtf/mcp-mux/internal/muxcore/upstream"
 	"github.com/thejerf/suture/v4"
 )
 
