@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,25 @@ import (
 	"github.com/thebtf/mcp-mux/internal/jsonrpc"
 	"github.com/thebtf/mcp-mux/internal/serverid"
 )
+
+// safeBuf is a thread-safe bytes.Buffer for use in tests where concurrent
+// goroutines (e.g. drainNotifications) may write while the test reads.
+type safeBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 // ---------------------------------------------------------------------------
 // pathToFileURI
@@ -778,7 +798,7 @@ func TestRouteProgressNotification_Routed(t *testing.T) {
 	defer owner.Shutdown()
 
 	// Create a session and register it
-	var buf bytes.Buffer
+	var buf safeBuf
 	s := NewSession(strings.NewReader(""), &buf)
 
 	owner.mu.Lock()
@@ -791,8 +811,9 @@ func TestRouteProgressNotification_Routed(t *testing.T) {
 		t.Errorf("routeProgressNotification: %v", err)
 	}
 
-	if !strings.Contains(buf.String(), "tok-1") {
-		t.Errorf("expected progress notification routed to session, got: %s", buf.String())
+	got := buf.String()
+	if !strings.Contains(got, "tok-1") {
+		t.Errorf("expected progress notification routed to session, got: %s", got)
 	}
 }
 
@@ -1158,7 +1179,7 @@ func TestDrainInflightRequests_SendsError(t *testing.T) {
 	o.sessionMgr = NewSessionManager()
 
 	// Create a session backed by a buffer so we can inspect what's written to it
-	var buf bytes.Buffer
+	var buf safeBuf
 	s := NewSession(strings.NewReader(""), &buf)
 
 	// Register the session
@@ -1201,7 +1222,7 @@ func TestRouteToLastActiveSession_RoutesToActiveSession(t *testing.T) {
 	o.sessionMgr = NewSessionManager()
 
 	// Create a session backed by a buffer
-	var buf bytes.Buffer
+	var buf safeBuf
 	s := NewSession(strings.NewReader(""), &buf)
 
 	o.mu.Lock()
@@ -1228,8 +1249,9 @@ func TestRouteToLastActiveSession_RoutesToActiveSession(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Session should have received the message
-	if !strings.Contains(buf.String(), "roots/list") {
-		t.Errorf("routeToLastActiveSession: session did not receive message; got: %s", buf.String())
+	got := buf.String()
+	if !strings.Contains(got, "roots/list") {
+		t.Errorf("routeToLastActiveSession: session did not receive message; got: %s", got)
 	}
 }
 
