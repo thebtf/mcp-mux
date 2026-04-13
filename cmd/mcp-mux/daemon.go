@@ -22,6 +22,13 @@ import (
 func runGlobalDaemon() {
 	ctlPath := serverid.DaemonControlPath("")
 
+	// Single-daemon validation: if another daemon is already running on this
+	// control socket, exit immediately instead of competing.
+	if isDaemonRunning(ctlPath) {
+		log.Printf("another daemon is already running on %s, exiting", ctlPath)
+		os.Exit(0)
+	}
+
 	// Owner idle timeout: prefer MCP_MUX_OWNER_IDLE, fall back to MCP_MUX_GRACE
 	// (v0.10.x legacy name). Default 10 minutes (was 30s grace in v0.10.x).
 	ownerIdleTimeout := 10 * time.Minute
