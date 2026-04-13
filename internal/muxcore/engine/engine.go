@@ -8,7 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"time"
+
+	"github.com/thebtf/mcp-mux/internal/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
 // Handler is the MCP server implementation function.
@@ -89,13 +93,76 @@ func New(cfg Config) (*MuxEngine, error) {
 	return &MuxEngine{cfg: cfg, logger: logger}, nil
 }
 
-// Run detects the operating mode and runs the engine.
+// isDaemonMode checks whether the current process was invoked with the daemon flag.
+func (e *MuxEngine) isDaemonMode() bool {
+	for _, arg := range os.Args {
+		if arg == e.cfg.DaemonFlag {
+			return true
+		}
+	}
+	return false
+}
+
+// isProxyMode checks whether the current process is running behind a parent
+// mcp-mux shim (identified by the MCP_MUX_SESSION_ID environment variable).
+func (e *MuxEngine) isProxyMode() bool {
+	return os.Getenv("MCP_MUX_SESSION_ID") != ""
+}
+
+// Run detects the operating mode and dispatches to the appropriate path.
 //   - If DaemonFlag is in os.Args → daemon mode (manage owners, accept IPC)
-//   - If MCP_MUX_SESSION_ID env var is set → proxy mode (pass-through)
-//   - Otherwise → client/shim mode (find/start daemon, connect via IPC)
+//   - If MCP_MUX_SESSION_ID env var is set → proxy mode (pass-through, T025)
+//   - Otherwise → client/shim mode (find/start daemon, connect via IPC, T024)
 //
-// Blocks until ctx is cancelled or the engine exits.
-// Mode implementations are wired in T023-T025.
+// Blocks until ctx is cancelled or the engine exits naturally.
 func (e *MuxEngine) Run(ctx context.Context) error {
-	return fmt.Errorf("engine: Run() not yet implemented (modes pending T023-T025)")
+	if e.isDaemonMode() {
+		return e.runDaemon(ctx)
+	}
+	if e.isProxyMode() {
+		return e.runProxy(ctx)
+	}
+	return e.runClient(ctx)
+}
+
+// runDaemon starts the global daemon that manages owners and accepts IPC
+// connections. It mirrors the behaviour of runGlobalDaemon() in cmd/mcp-mux/
+// but uses the engine's Config for timeouts and base directory.
+func (e *MuxEngine) runDaemon(ctx context.Context) error {
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir)
+
+	d, err := daemon.New(daemon.Config{
+		ControlPath:      ctlPath,
+		OwnerIdleTimeout: e.cfg.IdleTimeout,
+		IdleTimeout:      e.cfg.IdleTimeout,
+		Logger:           e.logger,
+		SkipSnapshot:     false,
+	})
+	if err != nil {
+		return fmt.Errorf("engine daemon: %w", err)
+	}
+
+	reaper := daemon.NewReaper(d, 10*time.Second)
+
+	select {
+	case <-ctx.Done():
+		reaper.Stop()
+		d.Shutdown()
+		return ctx.Err()
+	case <-d.Done():
+		reaper.Stop()
+		return nil
+	}
+}
+
+// runClient connects to (or starts) the global daemon and runs as a shim.
+// Implemented in T024.
+func (e *MuxEngine) runClient(ctx context.Context) error {
+	return fmt.Errorf("engine: client/shim mode not yet implemented (T024)")
+}
+
+// runProxy runs as a pass-through proxy when behind a parent mcp-mux shim.
+// Implemented in T025.
+func (e *MuxEngine) runProxy(ctx context.Context) error {
+	return fmt.Errorf("engine: proxy mode not yet implemented (T025)")
 }
