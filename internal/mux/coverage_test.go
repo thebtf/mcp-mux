@@ -14,6 +14,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
 	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/progress"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
@@ -267,8 +268,7 @@ func newMinimalOwner() *Owner {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
-		lastRealProgress:       make(map[string]time.Time),
-		determinateTokens:      make(map[string]bool),
+		progressTracker:        progress.NewTracker(),
 		sessionMgr:             NewSessionManager(),
 		ipcPath:                "/tmp/test.sock",
 		command:                "echo",
@@ -847,11 +847,7 @@ func TestRouteProgressNotification_NoOwner(t *testing.T) {
 func TestSessionWriteRaw_NonBufio(t *testing.T) {
 	var buf bytes.Buffer
 	// Create session with a plain writer (not bufio.Writer) by bypassing NewSession
-	s := &Session{
-		ID:     999,
-		writer: &buf, // plain bytes.Buffer, not *bufio.Writer
-		done:   make(chan struct{}),
-	}
+	s := NewSessionWithRawWriter(999, &buf)
 
 	data := []byte(`{"test":"nonbufio"}`)
 	if err := s.WriteRaw(data); err != nil {

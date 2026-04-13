@@ -23,6 +23,13 @@ type Options struct {
 	Stdout  io.Writer
 	Stderr  io.Writer
 	Logger  *log.Logger // optional logger
+
+	// PreStart is an optional callback invoked after the exec.Cmd is built and
+	// platform-configured but before cmd.Start() is called. Callers can use
+	// this to call cmd.StdinPipe / cmd.StdoutPipe / cmd.StderrPipe and capture
+	// the resulting io.ReadCloser / io.WriteCloser handles.
+	// If PreStart returns a non-nil error, Spawn aborts and propagates the error.
+	PreStart func(cmd *exec.Cmd) error
 }
 
 // Process manages a child process with its entire process tree.
@@ -55,6 +62,12 @@ func Spawn(opts Options) (*Process, error) {
 
 	if err := configurePlatform(cmd, p); err != nil {
 		return nil, fmt.Errorf("procgroup: configure platform: %w", err)
+	}
+
+	if opts.PreStart != nil {
+		if err := opts.PreStart(cmd); err != nil {
+			return nil, fmt.Errorf("procgroup: pre-start: %w", err)
+		}
 	}
 
 	if err := cmd.Start(); err != nil {

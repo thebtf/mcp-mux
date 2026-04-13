@@ -7,14 +7,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/internal/muxcore/progress"
 )
 
 // ---------------------------------------------------------------------------
-// buildSyntheticProgress — unit tests
+// BuildSyntheticNotification — smoke tests via the muxcore/progress package.
+// Full unit coverage lives in internal/muxcore/progress/progress_test.go.
 // ---------------------------------------------------------------------------
 
 func TestBuildSyntheticProgress_WithTool(t *testing.T) {
-	data := buildSyntheticProgress(`"tok-1"`, "tavily_search", 10)
+	data := progress.BuildSyntheticNotification(`"tok-1"`, "tavily_search", 10)
 	if data == nil {
 		t.Fatal("expected non-nil bytes")
 	}
@@ -53,15 +56,15 @@ func TestBuildSyntheticProgress_WithTool(t *testing.T) {
 }
 
 func TestBuildSyntheticProgress_WithoutTool(t *testing.T) {
-	// When Tool is empty, Method is used as the label.
-	data := buildSyntheticProgress(`"tok-2"`, "tools/call", 5)
+	// When the label is a method name it must still appear in the message.
+	data := progress.BuildSyntheticNotification(`"tok-2"`, "tools/call", 5)
 	if !bytes.Contains(data, []byte("tools/call")) {
 		t.Errorf("expected message to contain method name; got: %s", data)
 	}
 }
 
 func TestBuildSyntheticProgress_LongElapsed(t *testing.T) {
-	data := buildSyntheticProgress(`"tok-3"`, "slow_tool", 3661)
+	data := progress.BuildSyntheticNotification(`"tok-3"`, "slow_tool", 3661)
 	var msg struct {
 		Params struct {
 			Progress int    `json:"progress"`
@@ -226,9 +229,7 @@ func TestDedup_SyntheticResumesAfterSilence(t *testing.T) {
 	o, buf, token := buildDedupOwner(t)
 
 	// Record real progress that is 10 seconds in the past — older than the 5s interval.
-	o.progressMu.Lock()
-	o.lastRealProgress[token] = time.Now().Add(-10 * time.Second)
-	o.progressMu.Unlock()
+	o.progressTracker.RecordRealProgressAt(token, time.Now().Add(-10*time.Second), false)
 
 	o.emitSyntheticProgress(5 * time.Second)
 
@@ -246,14 +247,10 @@ func TestDedup_SyntheticResumesAfterSilence(t *testing.T) {
 func TestDedup_DeterminatePermanentlySuppresses(t *testing.T) {
 	o, buf, token := buildDedupOwner(t)
 
-	// Record real progress with hasTotalField=true (determinate bar).
-	o.recordRealProgress(token, true)
-
-	// Push lastRealProgress far into the past so the "within interval" guard alone
-	// would not suppress — only determinateTokens must suppress.
-	o.progressMu.Lock()
-	o.lastRealProgress[token] = time.Now().Add(-1 * time.Hour)
-	o.progressMu.Unlock()
+	// Record real progress with hasTotalField=true (determinate bar), placing
+	// the timestamp 1 hour in the past so the time-based guard alone would not
+	// suppress — only the determinate flag must suppress.
+	o.progressTracker.RecordRealProgressAt(token, time.Now().Add(-1*time.Hour), true)
 
 	o.emitSyntheticProgress(5 * time.Second)
 
@@ -291,7 +288,7 @@ func TestProgressInterval_DefaultWhenAbsent(t *testing.T) {
 }
 
 // TestDedup_CleanupOnRequestComplete verifies that clearProgressTokensForRequest
-// removes entries from lastRealProgress and determinateTokens.
+// removes dedup state from the Tracker and all main progress maps.
 func TestDedup_CleanupOnRequestComplete(t *testing.T) {
 	const reqID = `"req-cleanup-001"`
 	const token = `"tok-cleanup-001"`
@@ -304,23 +301,19 @@ func TestDedup_CleanupOnRequestComplete(t *testing.T) {
 	o.requestToTokens[reqID] = []string{token}
 	o.mu.Unlock()
 
-	o.progressMu.Lock()
-	o.lastRealProgress[token] = time.Now()
-	o.determinateTokens[token] = true
-	o.progressMu.Unlock()
+	// Seed the tracker with real progress so there is state to clean up.
+	o.progressTracker.RecordRealProgress(token, true)
+
+	// Verify state is suppressing before cleanup.
+	if !o.progressTracker.ShouldSuppress(token, 5*time.Second) {
+		t.Fatal("expected token to be suppressed before cleanup")
+	}
 
 	o.clearProgressTokensForRequest(reqID)
 
-	o.progressMu.Lock()
-	_, hasLast := o.lastRealProgress[token]
-	_, hasDet := o.determinateTokens[token]
-	o.progressMu.Unlock()
-
-	if hasLast {
-		t.Errorf("lastRealProgress[%s] not cleaned up after clearProgressTokensForRequest", token)
-	}
-	if hasDet {
-		t.Errorf("determinateTokens[%s] not cleaned up after clearProgressTokensForRequest", token)
+	// After cleanup the tracker must no longer suppress.
+	if o.progressTracker.ShouldSuppress(token, 1*time.Hour) {
+		t.Errorf("token should not suppress after clearProgressTokensForRequest")
 	}
 
 	// Also verify the main progress maps were cleaned up.
