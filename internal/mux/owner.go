@@ -108,14 +108,19 @@ type Owner struct {
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
 	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
+	progressMu        sync.Mutex
+	lastRealProgress  map[string]time.Time // progressToken → last time real progress was received
+	determinateTokens map[string]bool      // progressToken → true when real progress included a total field
+
 	upstreamDead     atomic.Bool // set when upstream exits; prevents sending to dead pipe
 	methodTags       sync.Map    // remapped request ID (string) -> method name
 	inflightTracker  sync.Map    // remapped request ID (string) -> *InflightRequest
 	timedOutIDs      sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests  atomic.Int64
 	drainTimeout     time.Duration // from x-mux.drainTimeout capability; 0 = use default
-	toolTimeoutNs    atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
-	idleTimeoutNs    atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
+	toolTimeoutNs      atomic.Int64 // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
+	idleTimeoutNs      atomic.Int64 // from x-mux.idleTimeout capability; 0 = use daemon default
+	progressIntervalNs atomic.Int64 // from x-mux.progressInterval capability; stored as nanoseconds; 0 = use default (5s)
 	lastActivityNs   atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
 	busyMu           sync.Mutex
 	busyDeclarations map[string]busyDeclaration // busy_id → declaration (long-running work signal)
@@ -224,10 +229,13 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		lastRealProgress:       make(map[string]time.Time),
+		determinateTokens:      make(map[string]bool),
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
 	}
+	o.progressIntervalNs.Store(int64(5 * time.Second))
 
 	// Pre-populate caches from snapshot
 	if snap.CachedInit != "" {
@@ -273,6 +281,9 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 
 	// Start accepting IPC connections (sessions get cached replay immediately)
 	go o.acceptLoop()
+
+	// Start synthetic progress reporter
+	go o.runProgressReporter(doneContext(o.done))
 
 	logger.Printf("owner restored from snapshot (cached: init=%v tools=%v prompts=%v resources=%v)",
 		o.initDone, o.toolList != nil, o.promptList != nil, o.resourceList != nil)
@@ -379,10 +390,13 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		lastRealProgress:       make(map[string]time.Time),
+		determinateTokens:      make(map[string]bool),
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
 	}
+	o.progressIntervalNs.Store(int64(5 * time.Second))
 
 	// Start control plane if configured
 	if cfg.ControlPath != "" {
@@ -405,6 +419,9 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 
 	// Start accepting IPC connections
 	go o.acceptLoop()
+
+	// Start synthetic progress reporter
+	go o.runProgressReporter(doneContext(o.done))
 
 	// Monitor upstream exit
 	go func() {
@@ -1007,6 +1024,7 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 	var notif struct {
 		Params struct {
 			ProgressToken json.RawMessage `json:"progressToken"`
+			Total         *float64        `json:"total"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(raw, &notif); err != nil {
@@ -1027,7 +1045,13 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 		return fmt.Errorf("no owner for progressToken %s", token)
 	}
 
-	return session.WriteRaw(raw)
+	if err := session.WriteRaw(raw); err != nil {
+		return err
+	}
+
+	// Record that real progress arrived so the synthetic reporter can back off.
+	o.recordRealProgress(token, notif.Params.Total != nil)
+	return nil
 }
 
 // trackProgressToken extracts _meta.progressToken from a request and records
@@ -1066,12 +1090,23 @@ func (o *Owner) trackProgressToken(sessionID int, requestID string, raw []byte) 
 // This variant acquires the lock itself (safe to call from any goroutine).
 func (o *Owner) clearProgressTokensForRequest(requestID string) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	for _, token := range o.requestToTokens[requestID] {
+	tokens := o.requestToTokens[requestID]
+	for _, token := range tokens {
 		delete(o.progressOwners, token)
 		delete(o.progressTokenRequestID, token)
 	}
 	delete(o.requestToTokens, requestID)
+	o.mu.Unlock()
+
+	// Clean up dedup maps under their own mutex to avoid lock inversion.
+	if len(tokens) > 0 {
+		o.progressMu.Lock()
+		for _, token := range tokens {
+			delete(o.lastRealProgress, token)
+			delete(o.determinateTokens, token)
+		}
+		o.progressMu.Unlock()
+	}
 }
 
 // sendRootsListChanged notifies the upstream that roots have changed.
@@ -1927,6 +1962,10 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		o.parseDrainTimeout(cached)
 		o.parseToolTimeout(cached)
 		o.parseIdleTimeout(cached)
+		if sec := classify.ParseProgressInterval(cached); sec > 0 {
+			o.progressIntervalNs.Store(int64(time.Duration(sec) * time.Second))
+			o.logger.Printf("using x-mux.progressInterval: %ds", sec)
+		}
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
