@@ -24,6 +24,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/listchanged"
 	"github.com/thebtf/mcp-mux/internal/muxcore/progress"
 	"github.com/thebtf/mcp-mux/internal/muxcore/remap"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
@@ -364,7 +365,17 @@ func (o *Owner) SpawnUpstreamBackground() {
 			close(o.backgroundSpawnCh)
 			o.backgroundSpawnCh = nil
 		}
+		// Invalidate stale list caches — the new upstream may have different
+		// tools/prompts/resources. Proactive init will repopulate them.
+		o.toolList = nil
+		o.promptList = nil
+		o.resourceList = nil
+		o.resourceTemplateList = nil
 		o.mu.Unlock()
+
+		// Notify all connected sessions that lists have changed so CC re-fetches
+		// its tool/prompt/resource lists from the fresh upstream.
+		o.broadcastListChanged()
 
 		// Start reading upstream responses
 		go o.readUpstream()
@@ -1190,6 +1201,35 @@ func (o *Owner) broadcast(data []byte) error {
 	return nil
 }
 
+// broadcastListChanged sends tools/prompts/resources list_changed notifications
+// to all connected sessions. Called after upstream restarts to prompt CC to
+// re-fetch its tool/prompt/resource lists. Uses async delivery (SendNotification)
+// so the caller is never blocked by a slow session.
+func (o *Owner) broadcastListChanged() {
+	notifications := []string{
+		`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`,
+		`{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}`,
+		`{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}`,
+	}
+	o.mu.RLock()
+	sessions := make([]*Session, 0, len(o.sessions))
+	for _, s := range o.sessions {
+		sessions = append(sessions, s)
+	}
+	o.mu.RUnlock()
+
+	if len(sessions) == 0 {
+		return
+	}
+
+	for _, s := range sessions {
+		for _, notif := range notifications {
+			s.SendNotification([]byte(notif))
+		}
+	}
+	o.logger.Printf("broadcast list_changed to %d sessions", len(sessions))
+}
+
 // removeSession removes a session from the owner.
 func (o *Owner) removeSession(s *Session) {
 	o.mu.Lock()
@@ -1994,20 +2034,15 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
 
-	// NOTE (v0.11.0): listchanged.InjectInitializeCapability is intentionally
-	// NOT called here. The injection function is correct and ready
-	// (internal/muxcore/listchanged/inject.go), but the companion trigger
-	// (synthetic list_changed emit on upstream restart) is not yet implemented.
-	// Wiring injection without the trigger would cause CC to subscribe to
-	// list_changed on a channel that never fires, leaving its tool-list cache
-	// permanently stale. Both pieces ship together in v0.12.0.
-	// See FR-4 in .agent/specs/survive-disconnects/spec.md.
-
 	o.mu.Lock()
 	switch method {
 	case "initialize":
 		o.initResp = cached
 		o.initDone = true
+		if injected, ok := listchanged.InjectInitializeCapability(cached); ok {
+			o.initResp = injected
+			o.logger.Printf("injected listChanged:true into cached initialize response")
+		}
 	case "tools/list":
 		o.toolList = cached
 	case "prompts/list":
