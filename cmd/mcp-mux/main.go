@@ -485,6 +485,24 @@ func runUpgrade(restart bool) {
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
 	if restart && isDaemonRunning(ctlPath) {
+		// Acquire daemon lock BEFORE sending graceful-restart.
+		// This prevents shims from spawning a competing daemon during the restart window.
+		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
+		lockPath := serverid.DaemonLockPath("")
+		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
+		if lockErr == nil {
+			if flockErr := lockFile(lock); flockErr == nil {
+				defer func() {
+					unlockFile(lock)
+					lock.Close()
+				}()
+				fmt.Fprintln(os.Stderr, "Acquired daemon lock (shims blocked from respawning).")
+			} else {
+				lock.Close()
+				fmt.Fprintf(os.Stderr, "Warning: could not acquire daemon lock: %v (proceeding anyway)\n", flockErr)
+			}
+		}
+
 		// Graceful restart: serialize state snapshot, then shutdown.
 		// New daemon loads snapshot → owners restored with cached state → instant reconnect.
 		fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
@@ -504,7 +522,7 @@ func runUpgrade(restart bool) {
 			control.Send(ctlPath, control.Request{Cmd: "shutdown"})
 		} else {
 			fmt.Fprintf(os.Stderr, "  snapshot written. Waiting for daemon to exit...")
-			// Poll until old daemon is fully dead — prevents two daemons racing.
+			// Poll until old daemon is fully dead.
 			for i := 0; i < 20; i++ {
 				time.Sleep(500 * time.Millisecond)
 				if !isDaemonRunning(ctlPath) {
@@ -516,12 +534,61 @@ func runUpgrade(restart bool) {
 				}
 			}
 		}
+
+		// Clean up stale daemon control socket — old daemon may not have removed it.
+		if _, statErr := os.Stat(ctlPath); statErr == nil {
+			if !isDaemonRunning(ctlPath) {
+				_ = os.Remove(ctlPath)
+				fmt.Fprintln(os.Stderr, "Cleaned stale daemon control socket.")
+			}
+		}
+
+		// Clean up stale old binary files from previous upgrades.
+		cleanupOldBinaries(exe)
+
+		// Start new daemon while holding lock — shims will connect to it.
+		fmt.Fprintln(os.Stderr, "Starting new daemon...")
+		if startErr := startDaemonProcess(); startErr != nil {
+			fmt.Fprintf(os.Stderr, "  warning: failed to start new daemon: %v\n", startErr)
+			fmt.Fprintln(os.Stderr, "  Shims will start it on next reconnect.")
+		} else {
+			if waitErr := waitForDaemon(ctlPath, 10*time.Second); waitErr != nil {
+				fmt.Fprintf(os.Stderr, "  warning: new daemon not ready: %v\n", waitErr)
+			} else {
+				fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
+			}
+		}
+		// Lock released by defer — shims unblock and connect to new daemon.
 	} else if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")
 		fmt.Fprintln(os.Stderr, "New shims use new binary. Daemon updates on next restart.")
 		fmt.Fprintln(os.Stderr, "Use: mcp-mux upgrade --restart to restart daemon immediately.")
 	} else {
 		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
+	}
+}
+
+// cleanupOldBinaries removes stale .old.* and .bak files from previous upgrades.
+// These accumulate when Windows locks prevent deletion during upgrade.
+func cleanupOldBinaries(exe string) {
+	patterns := []string{
+		exe + ".old.*",
+		exe + ".bak",
+		exe + "~",  // pending binary leftover
+		exe + "~~", // double-pending from failed upgrades
+	}
+	cleaned := 0
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(pattern)
+		for _, m := range matches {
+			if err := os.Remove(m); err == nil {
+				cleaned++
+			}
+			// Ignore errors — files may be locked by still-running processes.
+		}
+	}
+	if cleaned > 0 {
+		fmt.Fprintf(os.Stderr, "Cleaned %d stale binary file(s).\n", cleaned)
 	}
 }
 
