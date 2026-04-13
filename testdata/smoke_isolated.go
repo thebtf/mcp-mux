@@ -58,7 +58,7 @@ func main() {
 		fmt.Printf("cwd2: %s (isolation check)\n", cwd2)
 	}
 
-	ctlPath := serverid.DaemonControlPath()
+	ctlPath := serverid.DaemonControlPath("")
 	failures := 0
 
 	// ── TEST 1: Spawn via daemon ──

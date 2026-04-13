@@ -106,8 +106,8 @@ func main() {
 	command := args[0]
 	cmdArgs := args[1:]
 	sid := serverid.GenerateContextKey(mode, command, cmdArgs, nil, cwd)
-	ipcPath := serverid.IPCPath(sid)
-	controlPath := serverid.ControlPath(sid)
+	ipcPath := serverid.IPCPath(sid, "")
+	controlPath := serverid.ControlPath(sid, "")
 
 	// Log to stderr (CC captures) + optionally to file for debugging shim issues.
 	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
@@ -291,7 +291,7 @@ func runServe() {
 
 func runStop(drainTimeout time.Duration, force bool) {
 	// Try stopping daemon first
-	ctlPath := serverid.DaemonControlPath()
+	ctlPath := serverid.DaemonControlPath("")
 	if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Stopping daemon...")
 		drainMs := int(drainTimeout.Milliseconds())
@@ -479,7 +479,7 @@ func runUpgrade(restart bool) {
 	}
 
 	// Report
-	ctlPath := serverid.DaemonControlPath()
+	ctlPath := serverid.DaemonControlPath("")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
@@ -527,7 +527,7 @@ func collectEnv() map[string]string {
 
 func runStatus() {
 	// Try daemon first
-	ctlPath := serverid.DaemonControlPath()
+	ctlPath := serverid.DaemonControlPath("")
 	if isDaemonRunning(ctlPath) {
 		resp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
 		if err == nil && resp.OK && resp.Data != nil {

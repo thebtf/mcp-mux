@@ -169,8 +169,8 @@ func (d *Daemon) loadSnapshot() int {
 	restored := 0
 	for _, ownerSnap := range snap.Owners {
 		sid := ownerSnap.ServerID
-		ipcPath := serverid.IPCPath(sid)
-		controlPath := serverid.ControlPath(sid)
+		ipcPath := serverid.IPCPath(sid, "")
+		controlPath := serverid.ControlPath(sid, "")
 
 		if ownerSnap.Classification == classify.ModeIsolated &&
 			len(ownerSnap.CwdSet) > 1 {

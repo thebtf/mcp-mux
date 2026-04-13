@@ -44,7 +44,7 @@ func TestComputeEmptyFallback(t *testing.T) {
 }
 
 func TestIPCPath(t *testing.T) {
-	path := IPCPath("abc123def456")
+	path := IPCPath("abc123def456", "")
 	if !strings.HasSuffix(path, ".sock") {
 		t.Errorf("IPCPath = %q, want .sock suffix", path)
 	}
@@ -54,7 +54,7 @@ func TestIPCPath(t *testing.T) {
 }
 
 func TestControlPath(t *testing.T) {
-	path := ControlPath("abc123def456")
+	path := ControlPath("abc123def456", "")
 	if !strings.HasSuffix(path, ".ctl.sock") {
 		t.Errorf("ControlPath = %q, want .ctl.sock suffix", path)
 	}
@@ -64,9 +64,50 @@ func TestControlPath(t *testing.T) {
 }
 
 func TestLockPath(t *testing.T) {
-	path := LockPath("test123")
+	path := LockPath("test123", "")
 	if !strings.Contains(path, "mcp-mux-test123.lock") {
 		t.Errorf("LockPath = %q, missing expected pattern", path)
+	}
+}
+
+func TestIPCPath_EmptyBaseDir(t *testing.T) {
+	path := IPCPath("abc123", "")
+	tmpDir := os.TempDir()
+	if filepath.Dir(path) != tmpDir {
+		t.Errorf("IPCPath with empty baseDir: got dir %q, want os.TempDir() %q", filepath.Dir(path), tmpDir)
+	}
+}
+
+func TestIPCPath_CustomBaseDir(t *testing.T) {
+	customDir := t.TempDir()
+	path := IPCPath("abc123", customDir)
+	if filepath.Dir(path) != customDir {
+		t.Errorf("IPCPath with custom baseDir: got dir %q, want %q", filepath.Dir(path), customDir)
+	}
+	if !strings.Contains(path, "mcp-mux-abc123.sock") {
+		t.Errorf("IPCPath = %q, missing expected filename", path)
+	}
+}
+
+func TestDaemonControlPath_CustomBaseDir(t *testing.T) {
+	customDir := t.TempDir()
+	path := DaemonControlPath(customDir)
+	if filepath.Dir(path) != customDir {
+		t.Errorf("DaemonControlPath with custom baseDir: got dir %q, want %q", filepath.Dir(path), customDir)
+	}
+	if filepath.Base(path) != "mcp-muxd.ctl.sock" {
+		t.Errorf("DaemonControlPath = %q, unexpected filename", path)
+	}
+}
+
+func TestDaemonLockPath_CustomBaseDir(t *testing.T) {
+	customDir := t.TempDir()
+	path := DaemonLockPath(customDir)
+	if filepath.Dir(path) != customDir {
+		t.Errorf("DaemonLockPath with custom baseDir: got dir %q, want %q", filepath.Dir(path), customDir)
+	}
+	if filepath.Base(path) != "mcp-muxd.lock" {
+		t.Errorf("DaemonLockPath = %q, unexpected filename", path)
 	}
 }
 
