@@ -9,9 +9,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
+	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/owner"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 )
 
@@ -155,14 +160,175 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 	}
 }
 
-// runClient connects to (or starts) the global daemon and runs as a shim.
-// Implemented in T024.
+// runClient connects to (or starts) the global daemon and runs as a shim (T024).
+//
+// Flow:
+//  1. Ensure daemon is running (start it if not).
+//  2. Send "spawn" to daemon with our server identity.
+//  3. Connect to the returned IPC socket.
+//  4. Bridge stdin/stdout ↔ IPC with automatic reconnect.
 func (e *MuxEngine) runClient(ctx context.Context) error {
-	return fmt.Errorf("engine: client/shim mode not yet implemented (T024)")
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir)
+
+	// 1. Ensure the daemon is running, starting it if necessary.
+	if !isDaemonRunning(ctlPath) {
+		e.logger.Printf("engine client: daemon not running, starting...")
+		if err := e.startDaemon(); err != nil {
+			return fmt.Errorf("engine client: start daemon: %w", err)
+		}
+	}
+
+	// 2. Determine sharing mode from environment (mirrors cmd/mcp-mux/main.go logic).
+	mode := serverid.ModeCwd
+	if os.Getenv("MCP_MUX_STATELESS") == "1" {
+		mode = serverid.ModeGlobal
+	}
+	if os.Getenv("MCP_MUX_ISOLATED") == "1" {
+		mode = serverid.ModeIsolated
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("engine client: getwd: %w", err)
+	}
+
+	// Collect current environment for forwarding to daemon (API keys, config paths, etc.)
+	env := collectEnv()
+
+	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
+	ipcPath, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
+	if err != nil {
+		return fmt.Errorf("engine client: spawn: %w", err)
+	}
+
+	e.logger.Printf("engine client: connecting to %s (resilient)", ipcPath)
+
+	// 4. Bridge stdin/stdout ↔ IPC with automatic reconnect on IPC failure.
+	reconnectFn := func() (string, string, error) {
+		// Jitter to spread thundering-herd reconnects from concurrent shims.
+		jitter := time.Duration(os.Getpid()%500) * time.Millisecond
+		time.Sleep(jitter)
+
+		if !isDaemonRunning(ctlPath) {
+			if err := e.startDaemon(); err != nil {
+				return "", "", fmt.Errorf("engine client: reconnect: start daemon: %w", err)
+			}
+		}
+		return spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
+	}
+
+	return owner.RunResilientClient(owner.ResilientClientConfig{
+		Stdin:          os.Stdin,
+		Stdout:         os.Stdout,
+		InitialIPCPath: ipcPath,
+		Token:          token,
+		Reconnect:      reconnectFn,
+		Logger:         e.logger,
+	})
 }
 
-// runProxy runs as a pass-through proxy when behind a parent mcp-mux shim.
-// Implemented in T025.
+// runProxy runs the Handler directly on stdin/stdout (T025).
+//
+// Used when MCP_MUX_SESSION_ID is set, meaning this process is already running
+// behind a parent mcp-mux shim. There is no need to create a daemon or IPC
+// layer — the shim above us handles multiplexing.
 func (e *MuxEngine) runProxy(ctx context.Context) error {
-	return fmt.Errorf("engine: proxy mode not yet implemented (T025)")
+	if e.cfg.Handler == nil {
+		return fmt.Errorf("engine proxy: Handler is required for proxy mode")
+	}
+	e.logger.Printf("engine proxy: running handler directly on stdio (session=%s)", os.Getenv("MCP_MUX_SESSION_ID"))
+	return e.cfg.Handler(ctx, os.Stdin, os.Stdout)
+}
+
+// startDaemon re-execs the current binary with DaemonFlag as a detached background
+// process, then polls until the daemon control socket responds (up to 10 seconds).
+func (e *MuxEngine) startDaemon() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+
+	cmd := exec.Command(exe, e.cfg.DaemonFlag)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	setDetached(cmd)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start daemon process: %w", err)
+	}
+
+	// Release: we don't wait for the daemon — it runs independently.
+	if err := cmd.Process.Release(); err != nil {
+		return fmt.Errorf("release daemon process: %w", err)
+	}
+
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir)
+	return waitForDaemon(ctlPath, 10*time.Second)
+}
+
+// isDaemonRunning checks whether the daemon control socket responds to ping.
+func isDaemonRunning(ctlPath string) bool {
+	if !ipc.IsAvailable(ctlPath) {
+		return false
+	}
+	resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"})
+	return err == nil && resp.OK
+}
+
+// waitForDaemon polls until the daemon control socket responds (up to timeout).
+func waitForDaemon(ctlPath string, timeout time.Duration) error {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			return fmt.Errorf("daemon did not start within %s", timeout)
+		case <-ticker.C:
+			if isDaemonRunning(ctlPath) {
+				return nil
+			}
+		}
+	}
+}
+
+// spawnViaDaemon sends a spawn request to the daemon and returns the IPC path
+// and handshake token for the owner that will serve our server identity.
+func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
+	// 30s covers daemon processing + upstream process start + proactive init.
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+		Cmd:     "spawn",
+		Command: command,
+		Args:    args,
+		Cwd:     cwd,
+		Mode:    mode,
+		Env:     env,
+	}, 30*time.Second)
+	if err != nil {
+		return "", "", fmt.Errorf("spawn via daemon: %w", err)
+	}
+	if !resp.OK {
+		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+	}
+
+	sid := resp.ServerID
+	if len(sid) > 8 {
+		sid = sid[:8]
+	}
+	logger.Printf("engine client: daemon spawned server %s at %s", sid, resp.IPCPath)
+	return resp.IPCPath, resp.Token, nil
+}
+
+// collectEnv returns the current process environment as a map.
+// Used to forward CC-configured env vars (API keys, config paths) to the daemon.
+func collectEnv() map[string]string {
+	env := make(map[string]string)
+	for _, e := range os.Environ() {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			env[e[:i]] = e[i+1:]
+		}
+	}
+	return env
 }
