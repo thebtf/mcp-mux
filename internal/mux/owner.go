@@ -108,6 +108,10 @@ type Owner struct {
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
 	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
+	progressMu        sync.Mutex
+	lastRealProgress  map[string]time.Time // progressToken → last time real progress was received
+	determinateTokens map[string]bool      // progressToken → true when real progress included a total field
+
 	upstreamDead     atomic.Bool // set when upstream exits; prevents sending to dead pipe
 	methodTags       sync.Map    // remapped request ID (string) -> method name
 	inflightTracker  sync.Map    // remapped request ID (string) -> *InflightRequest
@@ -225,6 +229,8 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		lastRealProgress:       make(map[string]time.Time),
+		determinateTokens:      make(map[string]bool),
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
@@ -384,6 +390,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		lastRealProgress:       make(map[string]time.Time),
+		determinateTokens:      make(map[string]bool),
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
@@ -1016,6 +1024,7 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 	var notif struct {
 		Params struct {
 			ProgressToken json.RawMessage `json:"progressToken"`
+			Total         *float64        `json:"total"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(raw, &notif); err != nil {
@@ -1036,7 +1045,13 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 		return fmt.Errorf("no owner for progressToken %s", token)
 	}
 
-	return session.WriteRaw(raw)
+	if err := session.WriteRaw(raw); err != nil {
+		return err
+	}
+
+	// Record that real progress arrived so the synthetic reporter can back off.
+	o.recordRealProgress(token, notif.Params.Total != nil)
+	return nil
 }
 
 // trackProgressToken extracts _meta.progressToken from a request and records
@@ -1075,12 +1090,23 @@ func (o *Owner) trackProgressToken(sessionID int, requestID string, raw []byte) 
 // This variant acquires the lock itself (safe to call from any goroutine).
 func (o *Owner) clearProgressTokensForRequest(requestID string) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	for _, token := range o.requestToTokens[requestID] {
+	tokens := o.requestToTokens[requestID]
+	for _, token := range tokens {
 		delete(o.progressOwners, token)
 		delete(o.progressTokenRequestID, token)
 	}
 	delete(o.requestToTokens, requestID)
+	o.mu.Unlock()
+
+	// Clean up dedup maps under their own mutex to avoid lock inversion.
+	if len(tokens) > 0 {
+		o.progressMu.Lock()
+		for _, token := range tokens {
+			delete(o.lastRealProgress, token)
+			delete(o.determinateTokens, token)
+		}
+		o.progressMu.Unlock()
+	}
 }
 
 // sendRootsListChanged notifies the upstream that roots have changed.

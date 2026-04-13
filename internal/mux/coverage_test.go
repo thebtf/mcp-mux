@@ -267,6 +267,8 @@ func newMinimalOwner() *Owner {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		lastRealProgress:       make(map[string]time.Time),
+		determinateTokens:      make(map[string]bool),
 		sessionMgr:             NewSessionManager(),
 		ipcPath:                "/tmp/test.sock",
 		command:                "echo",

@@ -46,6 +46,18 @@ func buildSyntheticProgress(token string, toolOrMethod string, elapsedSeconds in
 	return data
 }
 
+// recordRealProgress notes that a real upstream progress notification was received
+// for the given token. If hasTotalField is true the token is marked determinate
+// and synthetic progress is permanently suppressed for it.
+func (o *Owner) recordRealProgress(token string, hasTotalField bool) {
+	o.progressMu.Lock()
+	defer o.progressMu.Unlock()
+	o.lastRealProgress[token] = time.Now()
+	if hasTotalField {
+		o.determinateTokens[token] = true
+	}
+}
+
 // loadProgressInterval reads the current interval from the atomic field with a
 // fallback to 5 s when the stored value is zero or negative.
 func (o *Owner) loadProgressInterval() time.Duration {
@@ -119,6 +131,23 @@ func (o *Owner) emitSyntheticProgress(interval time.Duration) {
 		}
 
 		for _, token := range tokens {
+			// Dedup: skip if real progress is active for this token.
+			o.progressMu.Lock()
+			isDeterminate := o.determinateTokens[token]
+			lastReal, hasReal := o.lastRealProgress[token]
+			o.progressMu.Unlock()
+
+			if isDeterminate {
+				// Real progress with a total field was received — never override a
+				// determinate progress bar with synthetic indeterminate ticks.
+				continue
+			}
+			if hasReal && now.Sub(lastReal) < interval {
+				// Real progress arrived within this interval — back off and let
+				// the upstream-driven bar drive the UI.
+				continue
+			}
+
 			data := buildSyntheticProgress(token, toolOrMethod, elapsedSec)
 			if err := session.WriteRaw(data); err != nil {
 				o.logger.Printf("session %d: synthetic progress write error: %v", req.SessionID, err)

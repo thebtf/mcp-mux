@@ -168,3 +168,147 @@ func TestProgressReporter_StopsOnCancel(t *testing.T) {
 		t.Fatal("runProgressReporter did not stop after context cancellation")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Dedup tests — Phase 3
+// ---------------------------------------------------------------------------
+
+// buildDedupOwner builds an Owner with one session and exactly one inflight request
+// seeded 10 s ago. The request has a single progress token. Returns the owner, the
+// buffer receiving writes from that session, and the token string.
+func buildDedupOwner(t *testing.T) (*Owner, *bytes.Buffer, string) {
+	t.Helper()
+	const reqID = `"req-dedup-001"`
+	const token = `"tok-dedup-001"`
+
+	o := newMinimalOwner()
+
+	var buf bytes.Buffer
+	s := NewSession(strings.NewReader(""), &buf)
+
+	o.mu.Lock()
+	o.sessions[s.ID] = s
+	o.progressOwners[token] = s.ID
+	o.progressTokenRequestID[token] = reqID
+	o.requestToTokens[reqID] = []string{token}
+	o.mu.Unlock()
+
+	req := &InflightRequest{
+		Method:    "tools/call",
+		Tool:      "slow_tool",
+		SessionID: s.ID,
+		StartTime: time.Now().Add(-10 * time.Second),
+	}
+	o.inflightTracker.Store(reqID, req)
+
+	return o, &buf, token
+}
+
+// TestDedup_RealProgressSuppressesSynthetic verifies that when real progress was
+// received within the current interval, emitSyntheticProgress skips that token.
+func TestDedup_RealProgressSuppressesSynthetic(t *testing.T) {
+	o, buf, token := buildDedupOwner(t)
+
+	// Record real progress just now — within any reasonable interval.
+	o.recordRealProgress(token, false)
+
+	o.emitSyntheticProgress(5 * time.Second)
+
+	if buf.Len() > 0 {
+		t.Errorf("expected no synthetic emission when real progress active for %s; got: %q",
+			token, buf.String())
+	}
+}
+
+// TestDedup_SyntheticResumesAfterSilence verifies that when real progress is older
+// than one interval, synthetic progress resumes.
+func TestDedup_SyntheticResumesAfterSilence(t *testing.T) {
+	o, buf, token := buildDedupOwner(t)
+
+	// Record real progress that is 10 seconds in the past — older than the 5s interval.
+	o.progressMu.Lock()
+	o.lastRealProgress[token] = time.Now().Add(-10 * time.Second)
+	o.progressMu.Unlock()
+
+	o.emitSyntheticProgress(5 * time.Second)
+
+	if buf.Len() == 0 {
+		t.Error("expected synthetic emission to resume after real progress went silent")
+	}
+	if !strings.Contains(buf.String(), "notifications/progress") {
+		t.Errorf("written data missing notifications/progress: %q", buf.String())
+	}
+}
+
+// TestDedup_DeterminatePermanentlySuppresses verifies that once real progress with
+// a total field is recorded, synthetic progress is never emitted for that token —
+// even after the interval has elapsed.
+func TestDedup_DeterminatePermanentlySuppresses(t *testing.T) {
+	o, buf, token := buildDedupOwner(t)
+
+	// Record real progress with hasTotalField=true (determinate bar).
+	o.recordRealProgress(token, true)
+
+	// Push lastRealProgress far into the past so the "within interval" guard alone
+	// would not suppress — only determinateTokens must suppress.
+	o.progressMu.Lock()
+	o.lastRealProgress[token] = time.Now().Add(-1 * time.Hour)
+	o.progressMu.Unlock()
+
+	o.emitSyntheticProgress(5 * time.Second)
+
+	if buf.Len() > 0 {
+		t.Errorf("expected no synthetic emission for determinate token; got: %q", buf.String())
+	}
+}
+
+// TestDedup_CleanupOnRequestComplete verifies that clearProgressTokensForRequest
+// removes entries from lastRealProgress and determinateTokens.
+func TestDedup_CleanupOnRequestComplete(t *testing.T) {
+	const reqID = `"req-cleanup-001"`
+	const token = `"tok-cleanup-001"`
+
+	o := newMinimalOwner()
+
+	o.mu.Lock()
+	o.progressOwners[token] = 1
+	o.progressTokenRequestID[token] = reqID
+	o.requestToTokens[reqID] = []string{token}
+	o.mu.Unlock()
+
+	o.progressMu.Lock()
+	o.lastRealProgress[token] = time.Now()
+	o.determinateTokens[token] = true
+	o.progressMu.Unlock()
+
+	o.clearProgressTokensForRequest(reqID)
+
+	o.progressMu.Lock()
+	_, hasLast := o.lastRealProgress[token]
+	_, hasDet := o.determinateTokens[token]
+	o.progressMu.Unlock()
+
+	if hasLast {
+		t.Errorf("lastRealProgress[%s] not cleaned up after clearProgressTokensForRequest", token)
+	}
+	if hasDet {
+		t.Errorf("determinateTokens[%s] not cleaned up after clearProgressTokensForRequest", token)
+	}
+
+	// Also verify the main progress maps were cleaned up.
+	o.mu.RLock()
+	_, hasOwner := o.progressOwners[token]
+	_, hasReqID := o.progressTokenRequestID[token]
+	_, hasTokens := o.requestToTokens[reqID]
+	o.mu.RUnlock()
+
+	if hasOwner {
+		t.Errorf("progressOwners[%s] not cleaned up", token)
+	}
+	if hasReqID {
+		t.Errorf("progressTokenRequestID[%s] not cleaned up", token)
+	}
+	if hasTokens {
+		t.Errorf("requestToTokens[%s] not cleaned up", reqID)
+	}
+}
