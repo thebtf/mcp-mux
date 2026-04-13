@@ -1,45 +1,33 @@
 package daemon
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
+	mcpsnapshot "github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
 
-const (
-	snapshotFileName = "mcp-muxd-snapshot.json"
-	snapshotVersion  = 1
-	snapshotMaxAge   = 5 * time.Minute
-)
-
-// DaemonSnapshot captures the full daemon state for graceful restart.
-type DaemonSnapshot struct {
-	Version    int                   `json:"version"`
-	MuxVersion string                `json:"mux_version"`
-	Timestamp  string                `json:"timestamp"`
-	Owners     []mux.OwnerSnapshot   `json:"owners"`
-	Sessions   []mux.SessionSnapshot `json:"sessions"`
-}
+// DaemonSnapshot is an alias for mcpsnapshot.DaemonSnapshot.
+// Re-exported here so daemon-internal code can reference it without
+// the package qualifier while tests continue to use the type directly.
+type DaemonSnapshot = mcpsnapshot.DaemonSnapshot
 
 // SnapshotPath returns the well-known path for the daemon state snapshot file.
 func SnapshotPath() string {
-	return filepath.Join(os.TempDir(), snapshotFileName)
+	return mcpsnapshot.SnapshotPath("")
 }
 
-// SerializeSnapshot walks all owners, exports their state, and writes an atomic
-// JSON snapshot to the well-known path. Uses temp file + rename for atomicity.
+// SerializeSnapshot walks all owners, exports their state, and delegates
+// to mcpsnapshot.Serialize for the atomic write.
 func (d *Daemon) SerializeSnapshot() (string, error) {
 	d.mu.RLock()
-	owners := make([]mux.OwnerSnapshot, 0, len(d.owners))
-	sessions := make([]mux.SessionSnapshot, 0)
+	owners := make([]mcpsnapshot.OwnerSnapshot, 0, len(d.owners))
+	sessions := make([]mcpsnapshot.SessionSnapshot, 0)
 
 	for sid, entry := range d.owners {
 		if entry.Owner == nil {
@@ -54,7 +42,7 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 		snap.Persistent = entry.Persistent
 		owners = append(owners, snap)
 
-		// Collect session metadata from this owner
+		// Collect session metadata from this owner.
 		for _, ss := range entry.Owner.ExportSessions() {
 			ss.OwnerServerID = sid
 			sessions = append(sessions, ss)
@@ -62,95 +50,22 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 	}
 	d.mu.RUnlock()
 
-	snapshot := DaemonSnapshot{
-		Version:    snapshotVersion,
+	data := &DaemonSnapshot{
+		Version:    mcpsnapshot.SnapshotVersion,
 		MuxVersion: mux.Version,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		Owners:     owners,
 		Sessions:   sessions,
 	}
 
-	data, err := json.MarshalIndent(snapshot, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("snapshot marshal: %w", err)
-	}
-
-	path := SnapshotPath()
-
-	// Atomic write: temp file + rename
-	tmpFile, err := os.CreateTemp(filepath.Dir(path), "mcp-muxd-snapshot-*.tmp")
-	if err != nil {
-		return "", fmt.Errorf("snapshot create temp: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("snapshot write: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("snapshot close: %w", err)
-	}
-
-	// On Windows, os.Rename fails if target exists — remove first
-	os.Remove(path)
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("snapshot rename: %w", err)
-	}
-
-	d.logger.Printf("snapshot written: %d owners, %d sessions (%d bytes)", len(owners), len(sessions), len(data))
-	return path, nil
+	return mcpsnapshot.Serialize(data, d.logger)
 }
 
 // DeserializeSnapshot reads and validates a snapshot from the well-known path.
 // Returns nil, nil if no snapshot exists (cold start). Deletes the file after
 // successful load or if stale. Logs warnings for corrupt/stale snapshots.
 func DeserializeSnapshot(logger interface{ Printf(string, ...any) }) (*DaemonSnapshot, error) {
-	path := SnapshotPath()
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // cold start — no snapshot
-		}
-		return nil, fmt.Errorf("snapshot read: %w", err)
-	}
-
-	var snapshot DaemonSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil {
-		logger.Printf("warning: corrupt snapshot at %s, ignoring: %v", path, err)
-		os.Remove(path)
-		return nil, nil
-	}
-
-	if snapshot.Version != snapshotVersion {
-		logger.Printf("warning: snapshot version %d != expected %d, ignoring", snapshot.Version, snapshotVersion)
-		os.Remove(path)
-		return nil, nil
-	}
-
-	// Check staleness
-	ts, err := time.Parse(time.RFC3339, snapshot.Timestamp)
-	if err != nil {
-		logger.Printf("warning: invalid snapshot timestamp %q, ignoring", snapshot.Timestamp)
-		os.Remove(path)
-		return nil, nil
-	}
-	if time.Since(ts) > snapshotMaxAge {
-		logger.Printf("warning: stale snapshot (%.0fs old), ignoring", time.Since(ts).Seconds())
-		os.Remove(path)
-		return nil, nil
-	}
-
-	// Consume: delete after successful load
-	os.Remove(path)
-
-	logger.Printf("snapshot loaded: %d owners, %d sessions (version %d, age %.1fs)",
-		len(snapshot.Owners), len(snapshot.Sessions), snapshot.Version, time.Since(ts).Seconds())
-	return &snapshot, nil
+	return mcpsnapshot.Deserialize(logger)
 }
 
 // loadSnapshot checks for a snapshot file and restores owners from it.
@@ -183,7 +98,7 @@ func (d *Daemon) loadSnapshot() int {
 			ownerSnap.CwdSet = []string{ownerSnap.Cwd}
 		}
 
-		// Capture loop variables for closure
+		// Capture loop variables for closure.
 		cmd, args := ownerSnap.Command, ownerSnap.Args
 		owner, err := mux.NewOwnerFromSnapshot(mux.OwnerConfig{
 			Command:        cmd,
@@ -210,8 +125,8 @@ func (d *Daemon) loadSnapshot() int {
 				if !ok || entry.Owner == nil {
 					return
 				}
-				snap := entry.Owner.ExportSnapshot()
-				d.updateTemplate(cmd, args, snap)
+				s := entry.Owner.ExportSnapshot()
+				d.updateTemplate(cmd, args, s)
 			},
 			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 		}, ownerSnap)
@@ -248,7 +163,7 @@ func (d *Daemon) loadSnapshot() int {
 			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
 		}
 
-		// Spawn upstream in background — refreshes caches when ready
+		// Spawn upstream in background — refreshes caches when ready.
 		owner.SpawnUpstreamBackground()
 
 		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)

@@ -12,3 +12,4 @@ coverage.html
 
 # Graphify knowledge graph
 graphify-out/
+.aider*
