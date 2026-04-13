@@ -17,8 +17,16 @@ import (
 // TestDaemonSupervisorInitialized verifies that the daemon creates a supervisor
 // during New() and that it's reachable via the exported fields.
 func TestDaemonSupervisorInitialized(t *testing.T) {
-	tmpDir := t.TempDir()
-	ctlPath := tmpDir + "/daemon.ctl.sock"
+	// Use os.CreateTemp for a short path — t.TempDir() on macOS exceeds
+	// the 108-byte Unix socket path limit.
+	f, err := os.CreateTemp("", "daemon-ctl-*.sock")
+	if err != nil {
+		t.Fatalf("create temp socket path: %v", err)
+	}
+	ctlPath := f.Name()
+	f.Close()
+	os.Remove(ctlPath)
+	t.Cleanup(func() { os.Remove(ctlPath) })
 
 	d, err := New(Config{
 		ControlPath:  ctlPath,
