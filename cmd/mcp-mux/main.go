@@ -535,6 +535,17 @@ func runUpgrade(restart bool) {
 			}
 		}
 
+		// Clean up stale daemon control socket — old daemon may not have removed it.
+		if _, statErr := os.Stat(ctlPath); statErr == nil {
+			if !isDaemonRunning(ctlPath) {
+				_ = os.Remove(ctlPath)
+				fmt.Fprintln(os.Stderr, "Cleaned stale daemon control socket.")
+			}
+		}
+
+		// Clean up stale old binary files from previous upgrades.
+		cleanupOldBinaries(exe)
+
 		// Start new daemon while holding lock — shims will connect to it.
 		fmt.Fprintln(os.Stderr, "Starting new daemon...")
 		if startErr := startDaemonProcess(); startErr != nil {
@@ -554,6 +565,30 @@ func runUpgrade(restart bool) {
 		fmt.Fprintln(os.Stderr, "Use: mcp-mux upgrade --restart to restart daemon immediately.")
 	} else {
 		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
+	}
+}
+
+// cleanupOldBinaries removes stale .old.* and .bak files from previous upgrades.
+// These accumulate when Windows locks prevent deletion during upgrade.
+func cleanupOldBinaries(exe string) {
+	patterns := []string{
+		exe + ".old.*",
+		exe + ".bak",
+		exe + "~",  // pending binary leftover
+		exe + "~~", // double-pending from failed upgrades
+	}
+	cleaned := 0
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(pattern)
+		for _, m := range matches {
+			if err := os.Remove(m); err == nil {
+				cleaned++
+			}
+			// Ignore errors — files may be locked by still-running processes.
+		}
+	}
+	if cleaned > 0 {
+		fmt.Fprintf(os.Stderr, "Cleaned %d stale binary file(s).\n", cleaned)
 	}
 }
 
