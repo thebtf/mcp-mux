@@ -17,10 +17,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
+	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/internal/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/progress"
 	"github.com/thebtf/mcp-mux/internal/muxcore/remap"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/internal/upstream"
@@ -108,9 +109,7 @@ type Owner struct {
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
 	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
-	progressMu        sync.Mutex
-	lastRealProgress  map[string]time.Time // progressToken → last time real progress was received
-	determinateTokens map[string]bool      // progressToken → true when real progress included a total field
+	progressTracker *progress.Tracker // dedup state for synthetic progress emission
 
 	upstreamDead     atomic.Bool // set when upstream exits; prevents sending to dead pipe
 	methodTags       sync.Map    // remapped request ID (string) -> method name
@@ -229,8 +228,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
-		lastRealProgress:       make(map[string]time.Time),
-		determinateTokens:      make(map[string]bool),
+		progressTracker:        progress.NewTracker(),
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
@@ -390,8 +388,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
-		lastRealProgress:       make(map[string]time.Time),
-		determinateTokens:      make(map[string]bool),
+		progressTracker:        progress.NewTracker(),
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
@@ -1098,15 +1095,8 @@ func (o *Owner) clearProgressTokensForRequest(requestID string) {
 	delete(o.requestToTokens, requestID)
 	o.mu.Unlock()
 
-	// Clean up dedup maps under their own mutex to avoid lock inversion.
-	if len(tokens) > 0 {
-		o.progressMu.Lock()
-		for _, token := range tokens {
-			delete(o.lastRealProgress, token)
-			delete(o.determinateTokens, token)
-		}
-		o.progressMu.Unlock()
-	}
+	// Clean up dedup state via the Tracker so no stale suppression remains.
+	o.progressTracker.Cleanup(tokens)
 }
 
 // sendRootsListChanged notifies the upstream that roots have changed.
