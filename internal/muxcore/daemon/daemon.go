@@ -17,8 +17,9 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/muxcore/control"
-	"github.com/thebtf/mcp-mux/internal/mux"
+	"github.com/thebtf/mcp-mux/internal/muxcore/owner"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
+	mcpsnapshot "github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
 
@@ -27,7 +28,7 @@ import (
 // created by another goroutine. Waiters must read creating under d.mu, then
 // release d.mu, block on <-creating, re-acquire d.mu, and re-check Owner.
 type OwnerEntry struct {
-	Owner       *mux.Owner
+	Owner       *owner.Owner
 	ServerID    string
 	Command     string
 	Args        []string
@@ -64,7 +65,7 @@ type Daemon struct {
 	// Overridable per-owner via x-mux.idleTimeout capability.
 	ownerIdleTimeout time.Duration
 	idleTimeout      time.Duration // daemon-level auto-exit timeout (zero owners + zero sessions)
-	templateCache    map[string]mux.OwnerSnapshot // command+args key → cached init data
+	templateCache    map[string]mcpsnapshot.OwnerSnapshot // command+args key → cached init data
 
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
@@ -137,7 +138,7 @@ func New(cfg Config) (*Daemon, error) {
 		done:             make(chan struct{}),
 		ownerIdleTimeout: ownerIdleTimeout,
 		idleTimeout:      idleTimeout,
-		templateCache:    make(map[string]mux.OwnerSnapshot),
+		templateCache:    make(map[string]mcpsnapshot.OwnerSnapshot),
 		supervisorCtx:    supCtx,
 		supervisorCancel: supCancel,
 	}
@@ -322,7 +323,7 @@ func templateKey(command string, args []string) string {
 }
 
 // updateTemplate stores an owner's cached state as a template for future isolated spawns.
-func (d *Daemon) updateTemplate(command string, args []string, snap mux.OwnerSnapshot) {
+func (d *Daemon) updateTemplate(command string, args []string, snap mcpsnapshot.OwnerSnapshot) {
 	key := templateKey(command, args)
 	d.mu.Lock()
 	d.templateCache[key] = snap
@@ -331,7 +332,7 @@ func (d *Daemon) updateTemplate(command string, args []string, snap mux.OwnerSna
 }
 
 // getTemplate returns a cached template for the given command+args, if available.
-func (d *Daemon) getTemplate(command string, args []string) (mux.OwnerSnapshot, bool) {
+func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSnapshot, bool) {
 	key := templateKey(command, args)
 	d.mu.RLock()
 	snap, ok := d.templateCache[key]
@@ -462,7 +463,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 
 	// Build the shared owner config (used by both template and fresh paths).
 	controlPath := serverid.ControlPath(sid, "")
-	ownerCfg := mux.OwnerConfig{
+	ownerCfg := owner.OwnerConfig{
 		Command:        req.Command,
 		Args:           req.Args,
 		Env:            envDiff,
@@ -496,7 +497,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	// Try template-based spawn: if the daemon has seen this server before,
 	// create the owner from cached init data (instant response to CC) and
 	// start the real upstream process in the background.
-	var owner *mux.Owner
+	var o *owner.Owner
 	var err error
 	fromTemplate := false
 	if tmpl, ok := d.getTemplate(req.Command, req.Args); ok {
@@ -507,10 +508,10 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		tmpl.Env = envDiff
 		tmpl.Mode = req.Mode
 
-		owner, err = mux.NewOwnerFromSnapshot(ownerCfg, tmpl)
+		o, err = owner.NewOwnerFromSnapshot(ownerCfg, tmpl)
 		if err != nil {
 			d.logger.Printf("template spawn failed for %s: %v, falling back to fresh spawn", sid[:8], err)
-			owner = nil // fall through to fresh spawn
+			o = nil // fall through to fresh spawn
 		} else {
 			fromTemplate = true
 			d.logger.Printf("spawned owner %s from template cache (instant init) for %s", sid[:8], req.Command)
@@ -518,8 +519,8 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	}
 
 	// Fresh spawn: no template available, or template spawn failed.
-	if owner == nil {
-		owner, err = mux.NewOwner(ownerCfg)
+	if o == nil {
+		o, err = owner.NewOwner(ownerCfg)
 		if err != nil {
 			// Remove the placeholder and unblock any waiters.
 			d.mu.Lock()
@@ -536,11 +537,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	// Register owner with the supervisor for lifecycle management.
 	// Suture will call owner.Serve(ctx) in its own goroutine and handle
 	// restart with exponential backoff if Serve returns an error.
-	serviceToken := d.supervisor.Add(owner)
+	serviceToken := d.supervisor.Add(o)
 
 	// Promote the placeholder to a real entry and signal waiters.
 	d.mu.Lock()
-	placeholder.Owner = owner
+	placeholder.Owner = o
 	placeholder.Mode = req.Mode
 	placeholder.Env = req.Env
 	placeholder.LastSession = time.Now()
@@ -553,10 +554,10 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	// For template-spawned owners, start the upstream process in the background.
 	// The owner already serves cached responses; upstream refreshes caches when ready.
 	if fromTemplate {
-		owner.SpawnUpstreamBackground()
+		o.SpawnUpstreamBackground()
 	}
 
-	owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+	o.SessionMgr().PreRegister(token, req.Cwd, req.Env)
 	return ipcPath, sid, token, nil
 }
 
