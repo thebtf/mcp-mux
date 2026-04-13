@@ -116,6 +116,7 @@ type Owner struct {
 	drainTimeout     time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs    atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
 	idleTimeoutNs    atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
+	progressInterval time.Duration // from x-mux.progressInterval capability; 0 = use default (5s)
 	lastActivityNs   atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
 	busyMu           sync.Mutex
 	busyDeclarations map[string]busyDeclaration // busy_id → declaration (long-running work signal)
@@ -224,6 +225,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		progressInterval:       5 * time.Second,
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
@@ -273,6 +275,9 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 
 	// Start accepting IPC connections (sessions get cached replay immediately)
 	go o.acceptLoop()
+
+	// Start synthetic progress reporter
+	go o.runProgressReporter(doneContext(o.done))
 
 	logger.Printf("owner restored from snapshot (cached: init=%v tools=%v prompts=%v resources=%v)",
 		o.initDone, o.toolList != nil, o.promptList != nil, o.resourceList != nil)
@@ -379,6 +384,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		progressOwners:         make(map[string]int),
 		progressTokenRequestID: make(map[string]string),
 		requestToTokens:        make(map[string][]string),
+		progressInterval:       5 * time.Second,
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
@@ -405,6 +411,9 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 
 	// Start accepting IPC connections
 	go o.acceptLoop()
+
+	// Start synthetic progress reporter
+	go o.runProgressReporter(doneContext(o.done))
 
 	// Monitor upstream exit
 	go func() {
@@ -1927,6 +1936,10 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		o.parseDrainTimeout(cached)
 		o.parseToolTimeout(cached)
 		o.parseIdleTimeout(cached)
+		if sec := classify.ParseProgressInterval(cached); sec > 0 {
+			o.progressInterval = time.Duration(sec) * time.Second
+			o.logger.Printf("using x-mux.progressInterval: %ds", sec)
+		}
 	}
 	if method == "tools/list" {
 		o.classifyFromToolList(cached)
