@@ -152,29 +152,42 @@ func GenerateContextKey(mode SharingMode, cmd string, args, env []string, rawCwd
 	return hex.EncodeToString(hash.Sum(nil))[:16]
 }
 
+// resolveBaseDir returns baseDir if non-empty, otherwise os.TempDir().
+func resolveBaseDir(baseDir string) string {
+	if baseDir == "" {
+		return os.TempDir()
+	}
+	return baseDir
+}
+
 // IPCPath returns the platform-specific IPC endpoint path for a given server ID.
-func IPCPath(id string) string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.sock", id))
+// When baseDir is empty, os.TempDir() is used.
+func IPCPath(id string, baseDir string) string {
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.sock", id))
 }
 
 // ControlPath returns the control socket path for a given server ID.
-func ControlPath(id string) string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", id))
+// When baseDir is empty, os.TempDir() is used.
+func ControlPath(id string, baseDir string) string {
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.ctl.sock", id))
 }
 
 // LockPath returns the lock file path used for owner election.
-func LockPath(id string) string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.lock", id))
+// When baseDir is empty, os.TempDir() is used.
+func LockPath(id string, baseDir string) string {
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.lock", id))
 }
 
 // DaemonControlPath returns the control socket path for the global daemon.
-func DaemonControlPath() string {
-	return filepath.Join(os.TempDir(), "mcp-muxd.ctl.sock")
+// When baseDir is empty, os.TempDir() is used.
+func DaemonControlPath(baseDir string) string {
+	return filepath.Join(resolveBaseDir(baseDir), "mcp-muxd.ctl.sock")
 }
 
 // DaemonLockPath returns the lock file path for daemon startup coordination.
-func DaemonLockPath() string {
-	return filepath.Join(os.TempDir(), "mcp-muxd.lock")
+// When baseDir is empty, os.TempDir() is used.
+func DaemonLockPath(baseDir string) string {
+	return filepath.Join(resolveBaseDir(baseDir), "mcp-muxd.lock")
 }
 
 // DescribeArgs returns a human-readable summary of the command + args

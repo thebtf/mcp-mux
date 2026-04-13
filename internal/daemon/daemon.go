@@ -448,7 +448,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	d.owners[sid] = placeholder
 	d.mu.Unlock()
 
-	ipcPath := serverid.IPCPath(sid)
+	ipcPath := serverid.IPCPath(sid, "")
 
 	// Compute env diff: only vars that the shim has but daemon doesn't (CC-configured vars).
 	envDiff := diffEnv(req.Env)
@@ -461,7 +461,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
-	controlPath := serverid.ControlPath(sid)
+	controlPath := serverid.ControlPath(sid, "")
 	ownerCfg := mux.OwnerConfig{
 		Command:        req.Command,
 		Args:           req.Args,
