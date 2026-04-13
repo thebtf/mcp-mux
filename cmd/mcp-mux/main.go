@@ -30,12 +30,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
-	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
-	"github.com/thebtf/mcp-mux/internal/muxcore/owner"
-	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
-	"github.com/thebtf/mcp-mux/internal/muxcore/session"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/session"
 )
 
 func main() {

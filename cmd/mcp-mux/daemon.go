@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/muxcore/control"
-	"github.com/thebtf/mcp-mux/internal/muxcore/daemon"
-	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
-	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 // runGlobalDaemon starts the global daemon process. This is invoked via
