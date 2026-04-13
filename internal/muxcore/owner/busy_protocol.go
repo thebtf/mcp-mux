@@ -1,4 +1,4 @@
-package mux
+package owner
 
 import (
 	"github.com/thebtf/mcp-mux/internal/muxcore/busy"

@@ -41,7 +41,7 @@ internal/jsonrpc/     JSON-RPC message parsing, ID replacement, meta injection
 internal/remap/       Request ID remapping (session-scoped)
 internal/serverid/    Deterministic server identity hashing
 internal/ipc/         Unix domain socket helpers
-internal/upstream/    Upstream process lifecycle
+internal/muxcore/upstream/    Upstream process lifecycle
 testdata/             Mock MCP server for integration tests
 docs/                 Public protocol specifications
 ```

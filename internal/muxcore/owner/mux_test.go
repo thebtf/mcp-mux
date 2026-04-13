@@ -1,4 +1,4 @@
-package mux
+package owner
 
 import (
 	"bufio"
@@ -43,7 +43,7 @@ func TestOwnerSingleSession(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -69,7 +69,7 @@ func TestOwnerWithMockServer(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -111,7 +111,7 @@ func TestOwnerMultipleSessions(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -166,7 +166,7 @@ func TestOwnerIPCClient(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -226,7 +226,7 @@ func TestSessionDisconnectDoesNotCrashOwner(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -263,7 +263,7 @@ func TestOwnerCachesInitializeAndToolsList(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -312,7 +312,7 @@ func TestOwnerReplaysCachedResponses(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -361,7 +361,7 @@ func TestOwnerStatusIncludesClassification(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -415,7 +415,7 @@ func TestServerPingHandledLocally(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -458,7 +458,7 @@ func TestSamplingRequestRoutedToSession(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -516,7 +516,7 @@ func TestCancelledNotificationIDRemapped(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -561,7 +561,7 @@ func TestCachedInitSuppressesInitializedNotification(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -621,7 +621,7 @@ func TestPromptsListCachedAndReplayed(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})

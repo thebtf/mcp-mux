@@ -1,4 +1,4 @@
-package mux
+package owner
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
-	"github.com/thebtf/mcp-mux/internal/upstream"
+	"github.com/thebtf/mcp-mux/internal/muxcore/upstream"
 	"github.com/thejerf/suture/v4"
 )
 

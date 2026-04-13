@@ -1,4 +1,7 @@
-package mux
+// Package owner implements the core multiplexer routing logic for mcp-mux.
+// It manages a single upstream process and routes requests from multiple
+// downstream sessions through it.
+package owner
 
 import (
 	"bytes"
@@ -24,13 +27,30 @@ import (
 	"github.com/thebtf/mcp-mux/internal/muxcore/progress"
 	"github.com/thebtf/mcp-mux/internal/muxcore/remap"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
-	"github.com/thebtf/mcp-mux/internal/upstream"
+	"github.com/thebtf/mcp-mux/internal/muxcore/session"
+	"github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
+	"github.com/thebtf/mcp-mux/internal/muxcore/upstream"
 	"github.com/thejerf/suture/v4"
+)
+
+// Type aliases for session and snapshot types used throughout owner.
+type (
+	Session        = session.Session
+	SessionManager = session.Manager
+	OwnerSnapshot  = snapshot.OwnerSnapshot
+	SessionSnapshot = snapshot.SessionSnapshot
+)
+
+// Constructor aliases.
+var (
+	NewSession              = session.NewSession
+	NewSessionWithRawWriter = session.NewSessionWithRawWriter
+	NewSessionManager       = session.NewManager
 )
 
 // Version is the mcp-mux build version, included in status output.
 // Auto-detected from Go build info (vcs.revision + vcs.modified).
-// Override at build time via: -ldflags "-X github.com/thebtf/mcp-mux/internal/mux.Version=..."
+// Override at build time via: -ldflags "-X github.com/thebtf/mcp-mux/internal/muxcore/owner.Version=..."
 var Version = initVersion()
 
 func initVersion() string {

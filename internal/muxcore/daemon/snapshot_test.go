@@ -20,7 +20,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	req := control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "cwd",
 	}
 	_, sid, _, err := d.Spawn(req)
@@ -276,7 +276,7 @@ func TestGracefulRestartCycle(t *testing.T) {
 	req := control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "cwd",
 	}
 	_, sid, _, err := d1.Spawn(req)

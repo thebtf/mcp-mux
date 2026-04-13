@@ -13,14 +13,14 @@ import (
 )
 
 // testdataPath returns the absolute path to a file under the project's testdata directory.
-// Tests in this package execute with cwd = internal/daemon, so testdata is two levels up.
+// Tests in this package execute with cwd = internal/muxcore/daemon, so testdata is three levels up.
 func testdataPath(t *testing.T, name string) string {
 	t.Helper()
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("testdataPath: Getwd: %v", err)
 	}
-	return filepath.Join(cwd, "..", "..", "testdata", name)
+	return filepath.Join(cwd, "..", "..", "..", "testdata", name)
 }
 
 // dialIPC retries ipc.Dial until the socket is available or the timeout elapses.
@@ -81,7 +81,7 @@ func TestUpstreamCrashDisconnectsSession(t *testing.T) {
 	ipcPath, _, tok, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server_crash.go"},
+		Args:    []string{"run", "../../../testdata/mock_server_crash.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -114,7 +114,7 @@ func TestDaemonShutdownDisconnectsAllSessions(t *testing.T) {
 	ipcPath, _, tok1, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -123,7 +123,7 @@ func TestDaemonShutdownDisconnectsAllSessions(t *testing.T) {
 	_, _, tok2, err2 := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err2 != nil {
@@ -172,7 +172,7 @@ func TestOwnerSurvivesSingleSessionDisconnect(t *testing.T) {
 	ipcPath, sid, tok1, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err != nil {
@@ -181,7 +181,7 @@ func TestOwnerSurvivesSingleSessionDisconnect(t *testing.T) {
 	_, _, tok2, err2 := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		Mode:    "global",
 	})
 	if err2 != nil {
