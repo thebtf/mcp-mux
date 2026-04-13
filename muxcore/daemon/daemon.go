@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -53,11 +54,12 @@ type OwnerEntry struct {
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
 type Daemon struct {
-	mu      sync.RWMutex
-	owners  map[string]*OwnerEntry
-	logger  *log.Logger
-	ctlSrv  *control.Server
-	done    chan struct{}
+	mu          sync.RWMutex
+	owners      map[string]*OwnerEntry
+	logger      *log.Logger
+	ctlSrv      *control.Server
+	done        chan struct{}
+	handlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 
 	// ownerIdleTimeout is the default time an owner may sit with no activity
 	// (no MCP traffic, no sessions, no pending requests, no active progress
@@ -82,6 +84,12 @@ type Daemon struct {
 type Config struct {
 	// ControlPath is the daemon's control socket path.
 	ControlPath string
+
+	// HandlerFunc is an in-process MCP server implementation.
+	// When set, owners are started via io.Pipe instead of spawning subprocesses.
+	// Mutually exclusive with Command/Args in spawn requests: if HandlerFunc is
+	// non-nil, it overrides any Command in the request.
+	HandlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 
 	// OwnerIdleTimeout is how long an owner may be idle (no MCP traffic, no
 	// sessions, no pending JSON-RPC requests, no active progress tokens, no
@@ -141,6 +149,7 @@ func New(cfg Config) (*Daemon, error) {
 		templateCache:    make(map[string]mcpsnapshot.OwnerSnapshot),
 		supervisorCtx:    supCtx,
 		supervisorCancel: supCancel,
+		handlerFunc:      cfg.HandlerFunc,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -472,6 +481,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		ControlPath:    controlPath,
 		ServerID:       sid,
 		TokenHandshake: true, // daemon-managed owners: shims send a handshake token
+		HandlerFunc:    d.handlerFunc,
 		OnZeroSessions: func(serverID string) {
 			d.onZeroSessions(serverID)
 		},

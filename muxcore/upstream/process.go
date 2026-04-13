@@ -7,6 +7,7 @@ package upstream
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -216,4 +217,42 @@ func (p *Process) PID() int {
 		return p.proc.PID()
 	}
 	return 0
+}
+
+// NewProcessFromHandler creates a Process that runs an in-process handler via
+// io.Pipe instead of spawning a subprocess. The handler receives the write end
+// of the stdin pipe and the read end of the stdout pipe. Done is closed when
+// the handler goroutine returns.
+//
+// The returned Process has PID() == 0 and no procgroup backing; Close() closes
+// the stdin pipe (EOF signal) and waits for the handler to exit.
+func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context, stdin io.Reader, stdout io.Writer) error) *Process {
+	// stdinR → handler reads its "stdin" from here
+	// stdinW → process.WriteLine writes here
+	stdinR, stdinW := io.Pipe()
+
+	// stdoutR → process.ReadLine reads from here
+	// stdoutW → handler writes its responses here
+	stdoutR, stdoutW := io.Pipe()
+
+	p := &Process{
+		stdin:  stdinW,
+		stdout: stdoutR,
+		Done:   make(chan struct{}),
+	}
+	p.scanner = bufio.NewScanner(stdoutR)
+	p.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	go func() {
+		// handler runs until it returns or ctx is cancelled.
+		err := handler(ctx, stdinR, stdoutW)
+		// Signal EOF on stdout so ReadLine returns io.EOF.
+		stdoutW.CloseWithError(err)
+		// Drain stdin pipe (in case handler exited before reading all input).
+		stdinR.CloseWithError(err)
+		p.ExitErr = err
+		close(p.Done)
+	}()
+
+	return p
 }
