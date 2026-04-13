@@ -4,6 +4,7 @@ dist/
 *.exe
 *.exe~
 *.exe.old
+*.exe.old.*
 coverage.out
 coverage.html
 .agent/*
