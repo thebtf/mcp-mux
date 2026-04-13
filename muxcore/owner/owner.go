@@ -95,8 +95,9 @@ type Owner struct {
 	ipcPath  string
 	cwd      string          // primary working directory (from first spawn)
 	cwdSet   map[string]bool // all known cwds (for multi-project roots/list)
-	command  string          // upstream command (for status/restart)
-	args     []string        // upstream args (for status/restart)
+	command     string          // upstream command (for status/restart)
+	args        []string        // upstream args (for status/restart)
+	handlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
 	serverID string          // server identity hash
 	listener net.Listener
 	logger   *log.Logger
@@ -242,6 +243,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		cwdSet:                 cwdSet,
 		command:                cfg.Command,
 		args:                   cfg.Args,
+		handlerFunc:            cfg.HandlerFunc,
 		serverID:               cfg.ServerID,
 		listener:               ln,
 		logger:                 logger,
@@ -336,7 +338,14 @@ func (o *Owner) SpawnUpstreamBackground() {
 		default:
 		}
 
-		proc, err := upstream.Start(o.command, o.args, nil, o.cwd)
+		var proc *upstream.Process
+		var err error
+		if o.handlerFunc != nil {
+			proc = upstream.NewProcessFromHandler(context.Background(), o.handlerFunc)
+			o.logger.Printf("background handler spawn: in-process (no subprocess)")
+		} else {
+			proc, err = upstream.Start(o.command, o.args, nil, o.cwd)
+		}
 		if err != nil {
 			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
 			// Unblock Serve — spawn is done (failed), nil upstream will be observed via upstreamDeadCh.
@@ -444,6 +453,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
 		command:                cfg.Command,
 		args:                   cfg.Args,
+		handlerFunc:            cfg.HandlerFunc,
 		serverID:               cfg.ServerID,
 		listener:               ln,
 		logger:                 logger,
