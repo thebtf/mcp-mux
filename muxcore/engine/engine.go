@@ -142,6 +142,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		IdleTimeout:      e.cfg.IdleTimeout,
 		Logger:           e.logger,
 		SkipSnapshot:     false,
+		HandlerFunc:      e.cfg.Handler,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)

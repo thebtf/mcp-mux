@@ -221,3 +221,90 @@ func TestRunProxy_NoHandler(t *testing.T) {
 		t.Fatal("runProxy() expected error for nil Handler, got nil")
 	}
 }
+
+// TestNew_HandlerOnly verifies that New succeeds when only Handler is set
+// (no Command), which is the in-process mode configuration.
+func TestNew_HandlerOnly(t *testing.T) {
+	e, err := New(Config{
+		Name:    "test-handler-server",
+		Handler: noopHandler,
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error with Handler-only config: %v", err)
+	}
+	if e == nil {
+		t.Fatal("New() returned nil engine")
+	}
+	if e.cfg.Handler == nil {
+		t.Error("Handler field not preserved in engine config")
+	}
+	if e.cfg.Command != "" {
+		t.Errorf("Command should be empty for Handler-only config, got %q", e.cfg.Command)
+	}
+}
+
+// TestRunProxy_HandlerReceivesData verifies that when runProxy is called with a
+// Handler, the handler can both read from its stdin and write to its stdout.
+// This exercises the full in-process pipe path.
+func TestRunProxy_HandlerReceivesData(t *testing.T) {
+	const testPayload = `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+
+	receivedLine := make(chan string, 1)
+	handler := Handler(func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		buf := make([]byte, 256)
+		n, _ := stdin.Read(buf)
+		receivedLine <- string(buf[:n])
+		_, err := io.WriteString(stdout, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+		return err
+	})
+
+	e, err := New(Config{
+		Name:    "test-server",
+		Handler: handler,
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	t.Setenv("MCP_MUX_SESSION_ID", "test-session-data")
+
+	// Build pipe-backed os.Stdin / os.Stdout for runProxy.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() stdin: %v", err)
+	}
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() stdout: %v", err)
+	}
+	defer stdoutR.Close()
+
+	// Write test payload then close write end so handler sees EOF after one read.
+	if _, err := io.WriteString(stdinW, testPayload); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	stdinW.Close()
+
+	origStdin, origStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdinR, stdoutW
+	defer func() {
+		os.Stdin = origStdin
+		os.Stdout = origStdout
+	}()
+
+	ctx := context.Background()
+	if err := e.runProxy(ctx); err != nil {
+		t.Fatalf("runProxy() unexpected error: %v", err)
+	}
+	stdoutW.Close()
+	stdinR.Close()
+
+	select {
+	case line := <-receivedLine:
+		if line != testPayload {
+			t.Errorf("handler received %q, want %q", line, testPayload)
+		}
+	default:
+		t.Error("handler did not receive stdin data")
+	}
+}

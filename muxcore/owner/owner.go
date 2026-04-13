@@ -202,6 +202,12 @@ type OwnerConfig struct {
 	// Legacy and test connections do not send a token; leave this false (default).
 	TokenHandshake bool
 
+	// HandlerFunc is an in-process MCP server implementation.
+	// When set, Owner runs the handler via io.Pipe instead of spawning a subprocess.
+	// The handler receives stdin/stdout pipes and should speak JSON-RPC 2.0 on them.
+	// Mutually exclusive with Command/Args: if HandlerFunc is set, Command is ignored.
+	HandlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -403,16 +409,25 @@ func (o *Owner) SpawnUpstreamBackground() {
 
 // NewOwner creates and starts a new Owner.
 // It spawns the upstream process and starts the IPC listener.
+// If cfg.HandlerFunc is set, the handler is run in-process via io.Pipe instead
+// of spawning a subprocess.
 func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
 	}
 
-	// Spawn upstream with the client's cwd
-	proc, err := upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd)
-	if err != nil {
-		return nil, fmt.Errorf("owner: start upstream: %w", err)
+	// Spawn upstream — either in-process handler or subprocess.
+	var proc *upstream.Process
+	if cfg.HandlerFunc != nil {
+		proc = upstream.NewProcessFromHandler(context.Background(), cfg.HandlerFunc)
+		logger.Printf("owner: started in-process handler (no subprocess)")
+	} else {
+		var err error
+		proc, err = upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd)
+		if err != nil {
+			return nil, fmt.Errorf("owner: start upstream: %w", err)
+		}
 	}
 
 	// Start IPC listener
