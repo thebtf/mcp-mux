@@ -262,6 +262,34 @@ func TestDedup_DeterminatePermanentlySuppresses(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T013 — configurable progressInterval tests (Phase 4)
+// ---------------------------------------------------------------------------
+
+// TestProgressInterval_CustomValue verifies that loadProgressInterval returns
+// the interval stored in progressIntervalNs when it is explicitly set.
+func TestProgressInterval_CustomValue(t *testing.T) {
+	o := newMinimalOwner()
+	o.progressIntervalNs.Store(int64(10 * time.Second))
+
+	got := o.loadProgressInterval()
+	if got != 10*time.Second {
+		t.Errorf("loadProgressInterval() = %v, want %v", got, 10*time.Second)
+	}
+}
+
+// TestProgressInterval_DefaultWhenAbsent verifies that loadProgressInterval
+// returns the 5 s default when no interval has been stored (zero value).
+func TestProgressInterval_DefaultWhenAbsent(t *testing.T) {
+	o := newMinimalOwner()
+	// progressIntervalNs is zero-valued — default fallback must apply.
+
+	got := o.loadProgressInterval()
+	if got != 5*time.Second {
+		t.Errorf("loadProgressInterval() = %v, want %v", got, 5*time.Second)
+	}
+}
+
 // TestDedup_CleanupOnRequestComplete verifies that clearProgressTokensForRequest
 // removes entries from lastRealProgress and determinateTokens.
 func TestDedup_CleanupOnRequestComplete(t *testing.T) {
