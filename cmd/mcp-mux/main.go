@@ -32,9 +32,10 @@ import (
 
 	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
-	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/internal/muxcore/owner"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/internal/muxcore/session"
 )
 
 func main() {
@@ -134,7 +135,7 @@ func main() {
 	// Fast path: per-server IPC socket exists → connect as client (works with both legacy and daemon)
 	if ipc.IsAvailable(ipcPath) {
 		logger.Printf("connecting to existing owner at %s", ipcPath)
-		if err := mux.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
+		if err := owner.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
 			logger.Printf("client error: %v", err)
 			os.Exit(1)
 		}
@@ -166,7 +167,7 @@ func main() {
 					}
 					return spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 				}
-				if err := mux.RunResilientClient(mux.ResilientClientConfig{
+				if err := owner.RunResilientClient(owner.ResilientClientConfig{
 					Stdin:          os.Stdin,
 					Stdout:         os.Stdout,
 					InitialIPCPath: daemonIPC,
@@ -211,7 +212,7 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.ctl.sock", sid, pidSuffix))
 	}
 
-	owner, err := mux.NewOwner(mux.OwnerConfig{
+	o, err := owner.NewOwner(owner.OwnerConfig{
 		Command:     command,
 		Args:        cmdArgs,
 		Env:         env,
@@ -225,8 +226,8 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 	}
 
 	// Add our own stdio as the first session
-	session := mux.NewSession(os.Stdin, os.Stdout)
-	owner.AddSession(session)
+	sess := session.NewSession(os.Stdin, os.Stdout)
+	o.AddSession(sess)
 
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
@@ -235,13 +236,13 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 	select {
 	case sig := <-sigCh:
 		logger.Printf("received signal %v, shutting down", sig)
-		owner.Shutdown()
-	case <-owner.Done():
+		o.Shutdown()
+	case <-o.Done():
 		// Owner shut down (upstream exited)
-	case <-session.Done():
+	case <-sess.Done():
 		// Our own session ended (stdin closed)
 		logger.Printf("stdin closed, shutting down")
-		owner.Shutdown()
+		o.Shutdown()
 	}
 }
 
@@ -253,7 +254,7 @@ func runLegacyDaemon(args []string, cwd, ipcPath, controlPath, _ string, logger 
 
 	env := make(map[string]string)
 
-	owner, err := mux.NewOwner(mux.OwnerConfig{
+	o, err := owner.NewOwner(owner.OwnerConfig{
 		Command:     command,
 		Args:        cmdArgs,
 		Env:         env,
@@ -274,8 +275,8 @@ func runLegacyDaemon(args []string, cwd, ipcPath, controlPath, _ string, logger 
 	select {
 	case sig := <-sigCh:
 		logger.Printf("received signal %v, shutting down", sig)
-		owner.Shutdown()
-	case <-owner.Done():
+		o.Shutdown()
+	case <-o.Done():
 		// Owner shut down (upstream exited)
 	}
 }

@@ -5,8 +5,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
+	"github.com/thebtf/mcp-mux/internal/muxcore/owner"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 	mcpsnapshot "github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
@@ -52,7 +52,7 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 
 	data := &DaemonSnapshot{
 		Version:    mcpsnapshot.SnapshotVersion,
-		MuxVersion: mux.Version,
+		MuxVersion: owner.Version,
 		Timestamp:  time.Now().UTC().Format(time.RFC3339),
 		Owners:     owners,
 		Sessions:   sessions,
@@ -100,7 +100,7 @@ func (d *Daemon) loadSnapshot() int {
 
 		// Capture loop variables for closure.
 		cmd, args := ownerSnap.Command, ownerSnap.Args
-		owner, err := mux.NewOwnerFromSnapshot(mux.OwnerConfig{
+		o, err := owner.NewOwnerFromSnapshot(owner.OwnerConfig{
 			Command:        cmd,
 			Args:           args,
 			Env:            ownerSnap.Env,
@@ -139,12 +139,12 @@ func (d *Daemon) loadSnapshot() int {
 		// any concurrent failure is handled by suture.
 		var serviceToken suture.ServiceToken
 		if d.supervisor != nil {
-			serviceToken = d.supervisor.Add(owner)
+			serviceToken = d.supervisor.Add(o)
 		}
 
 		d.mu.Lock()
 		d.owners[sid] = &OwnerEntry{
-			Owner:        owner,
+			Owner:        o,
 			ServerID:     sid,
 			Command:      ownerSnap.Command,
 			Args:         ownerSnap.Args,
@@ -164,7 +164,7 @@ func (d *Daemon) loadSnapshot() int {
 		}
 
 		// Spawn upstream in background — refreshes caches when ready.
-		owner.SpawnUpstreamBackground()
+		o.SpawnUpstreamBackground()
 
 		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)
 		restored++

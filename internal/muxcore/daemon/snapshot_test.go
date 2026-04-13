@@ -9,7 +9,6 @@ import (
 
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
 	"github.com/thebtf/mcp-mux/internal/muxcore/control"
-	"github.com/thebtf/mcp-mux/internal/mux"
 	mcpsnapshot "github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
 )
 
@@ -96,8 +95,8 @@ func TestSnapshotStaleTimestamp(t *testing.T) {
 	stale := DaemonSnapshot{
 		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
-		Owners:    []mux.OwnerSnapshot{},
-		Sessions:  []mux.SessionSnapshot{},
+		Owners:    []mcpsnapshot.OwnerSnapshot{},
+		Sessions:  []mcpsnapshot.SessionSnapshot{},
 	}
 	data, _ := json.Marshal(stale)
 
@@ -125,8 +124,8 @@ func TestSnapshotVersionMismatch(t *testing.T) {
 	future := DaemonSnapshot{
 		Version:   999,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Owners:    []mux.OwnerSnapshot{},
-		Sessions:  []mux.SessionSnapshot{},
+		Owners:    []mcpsnapshot.OwnerSnapshot{},
+		Sessions:  []mcpsnapshot.SessionSnapshot{},
 	}
 	data, _ := json.Marshal(future)
 
@@ -149,8 +148,8 @@ func TestSnapshotEmptyOwners(t *testing.T) {
 	valid := DaemonSnapshot{
 		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Owners:    []mux.OwnerSnapshot{},
-		Sessions:  []mux.SessionSnapshot{},
+		Owners:    []mcpsnapshot.OwnerSnapshot{},
+		Sessions:  []mcpsnapshot.SessionSnapshot{},
 	}
 	data, _ := json.Marshal(valid)
 
@@ -216,7 +215,7 @@ func TestSnapshotOwnerWithClassification(t *testing.T) {
 	valid := DaemonSnapshot{
 		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Owners: []mux.OwnerSnapshot{
+		Owners: []mcpsnapshot.OwnerSnapshot{
 			{
 				ServerID:             "abc123",
 				Command:              "uvx",
@@ -229,7 +228,7 @@ func TestSnapshotOwnerWithClassification(t *testing.T) {
 				CachedInit:           "eyJqc29ucnBjIjoiMi4wIn0=", // base64 of {"jsonrpc":"2.0"}
 			},
 		},
-		Sessions: []mux.SessionSnapshot{
+		Sessions: []mcpsnapshot.SessionSnapshot{
 			{
 				MuxSessionID:  "sess_12345678",
 				Cwd:           "/dev/project",
@@ -359,7 +358,7 @@ func TestLoadSnapshot_HealsIsolatedOwnerCwdSet(t *testing.T) {
 	snapshot := DaemonSnapshot{
 		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Owners: []mux.OwnerSnapshot{
+		Owners: []mcpsnapshot.OwnerSnapshot{
 			{
 				ServerID:             "abc12345-heal-test",
 				Command:              "uvx",

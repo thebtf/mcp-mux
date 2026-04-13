@@ -6,7 +6,9 @@ dist/
 *.exe.old
 coverage.out
 coverage.html
-.agent/
+.agent/*
+!.agent/specs
+!.agent/arch
 .mcp.json
 .mcp.json.bak
 
