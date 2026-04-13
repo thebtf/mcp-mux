@@ -47,7 +47,7 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           go build -trimpath \
-            -ldflags "-X github.com/thebtf/mcp-mux/internal/mux.Version=${VERSION}" \
+            -ldflags "-X github.com/thebtf/mcp-mux/internal/muxcore/owner.Version=${VERSION}" \
             -o mcp-mux-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
             ./cmd/mcp-mux
       - uses: actions/upload-artifact@v4

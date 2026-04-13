@@ -1,4 +1,4 @@
-package mux
+package owner
 
 import (
 	"bytes"
@@ -331,7 +331,7 @@ func TestOwnerStatusWithClassificationReason(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -375,7 +375,7 @@ func TestHandleStatus(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -623,7 +623,7 @@ func TestHandleShutdown_Force(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -650,7 +650,7 @@ func TestHandleShutdown_Drain(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -699,7 +699,7 @@ func TestRespondToRootsList_WithCwd(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Cwd:     cwd,
 		Logger:  testLogger(t),
@@ -721,7 +721,7 @@ func TestRespondToRootsList_EmptyCwd(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Cwd:     "", // empty — should use os.Getwd()
 		Logger:  testLogger(t),
@@ -746,7 +746,7 @@ func TestRespondWithError(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -766,7 +766,7 @@ func TestRespondToElicitationCancel(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -790,7 +790,7 @@ func TestRouteProgressNotification_Routed(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -824,7 +824,7 @@ func TestRouteProgressNotification_NoOwner(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -1044,7 +1044,7 @@ func TestAddCwd_AddsNew(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -1080,7 +1080,7 @@ func TestAddCwd_NoDuplicate(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -1258,7 +1258,7 @@ func TestRouteToLastActiveSession_NoSession_ElicitationCreate(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -1285,7 +1285,7 @@ func TestRouteToLastActiveSession_NoSession_RootsList(t *testing.T) {
 
 	owner, err := NewOwner(OwnerConfig{
 		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Args:    []string{"run", "../../../testdata/mock_server.go"},
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
