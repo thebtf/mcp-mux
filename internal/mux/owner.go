@@ -1924,12 +1924,13 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
 
-	// NOTE (v0.11.0): injectListChangedCapabilities is intentionally NOT called
-	// here. The injection function is correct and ready (listchanged_inject.go),
-	// but the companion trigger (synthetic list_changed emit on upstream restart)
-	// is not yet implemented. Wiring injection without the trigger would cause CC
-	// to subscribe to list_changed on a channel that never fires, leaving its
-	// tool-list cache permanently stale. Both pieces ship together in v0.12.0.
+	// NOTE (v0.11.0): listchanged.InjectInitializeCapability is intentionally
+	// NOT called here. The injection function is correct and ready
+	// (internal/muxcore/listchanged/inject.go), but the companion trigger
+	// (synthetic list_changed emit on upstream restart) is not yet implemented.
+	// Wiring injection without the trigger would cause CC to subscribe to
+	// list_changed on a channel that never fires, leaving its tool-list cache
+	// permanently stale. Both pieces ship together in v0.12.0.
 	// See FR-4 in .agent/specs/survive-disconnects/spec.md.
 
 	o.mu.Lock()
