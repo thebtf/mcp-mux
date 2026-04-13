@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/mux"
 	"github.com/thebtf/mcp-mux/internal/muxcore/serverid"
 	"github.com/thejerf/suture/v4"

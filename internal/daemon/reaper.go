@@ -4,7 +4,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 )
 
 // Reaper periodically sweeps daemon owners for cleanup.

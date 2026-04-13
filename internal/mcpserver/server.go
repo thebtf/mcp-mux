@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/muxcore/ipc"
 )
 

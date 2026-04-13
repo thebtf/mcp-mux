@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thebtf/mcp-mux/internal/control"
+	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 )
 
 func testDaemonWithReaper(t *testing.T, grace, idle time.Duration) (*Daemon, *Reaper) {
