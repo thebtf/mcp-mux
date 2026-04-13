@@ -41,9 +41,18 @@ Quick start: call mux_list to see what's running, then use server_id from the ou
 
 // Server is a minimal MCP server that provides control plane tools and prompts.
 type Server struct {
-	reader *bufio.Scanner
-	writer io.Writer
-	logger *log.Logger
+	reader  *bufio.Scanner
+	writer  io.Writer
+	logger  *log.Logger
+	BaseDir string // directory scanned for .ctl.sock files; empty = os.TempDir()
+}
+
+// socketDir returns the directory to scan for .ctl.sock files.
+func (s *Server) socketDir() string {
+	if s.BaseDir != "" {
+		return s.BaseDir
+	}
+	return os.TempDir()
 }
 
 // NewServer creates a new MCP control server.
@@ -407,7 +416,7 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	myCwd, _ := os.Getwd()
 	myCwd = strings.ToLower(filepath.Clean(myCwd))
 
-	tmpDir := os.TempDir()
+	tmpDir := s.socketDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		s.sendToolError(id, fmt.Sprintf("read temp dir: %v", err))
@@ -503,7 +512,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
+	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
 
 	drainMs := 30000
 	timeout := 35 * time.Second
@@ -542,7 +551,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
+	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
 
 	// Get current status to learn command + args
 	statusResp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
@@ -588,7 +597,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify the old owner is gone
-	if ipc.IsAvailable(filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.sock", params.ServerID))) {
+	if ipc.IsAvailable(filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.sock", params.ServerID))) {
 		// Still alive — drain might be in progress, wait more
 		time.Sleep(2 * time.Second)
 	}
@@ -638,7 +647,7 @@ func (s *Server) resolveServerID(serverID, name string) (string, error) {
 	myCwd, _ := os.Getwd()
 	myCwd = strings.ToLower(filepath.Clean(myCwd))
 	name = strings.ToLower(name)
-	tmpDir := os.TempDir()
+	tmpDir := s.socketDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return "", fmt.Errorf("read temp dir: %v", err)

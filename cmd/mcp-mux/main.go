@@ -503,7 +503,18 @@ func runUpgrade(restart bool) {
 			fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
 			control.Send(ctlPath, control.Request{Cmd: "shutdown"})
 		} else {
-			fmt.Fprintf(os.Stderr, "  snapshot written. Daemon stopping. Shims will auto-reconnect.\n")
+			fmt.Fprintf(os.Stderr, "  snapshot written. Waiting for daemon to exit...")
+			// Poll until old daemon is fully dead — prevents two daemons racing.
+			for i := 0; i < 20; i++ {
+				time.Sleep(500 * time.Millisecond)
+				if !isDaemonRunning(ctlPath) {
+					fmt.Fprintln(os.Stderr, " done.")
+					break
+				}
+				if i == 19 {
+					fmt.Fprintln(os.Stderr, " timeout (daemon may still be shutting down).")
+				}
+			}
 		}
 	} else if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")

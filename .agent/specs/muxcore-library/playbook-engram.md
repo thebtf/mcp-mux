@@ -3,12 +3,12 @@
 ## Prerequisites
 
 - Go 1.25+
-- `go get github.com/thebtf/mcp-mux/internal/muxcore/engine`
+- `go get github.com/thebtf/mcp-mux/muxcore/engine`
 
 ## Step 1: Add engine dependency
 
 ```go
-import "github.com/thebtf/mcp-mux/internal/muxcore/engine"
+import "github.com/thebtf/mcp-mux/muxcore/engine"
 ```
 
 ## Step 2: Create engine config

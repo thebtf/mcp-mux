@@ -16,10 +16,18 @@ import (
 )
 
 // newTestServer creates a Server wired to an io.Pipe pair and returns
-// the client-side reader/writer and a function that closes the input pipe
-// (simulating EOF so Run() returns).
-func newTestServer(t *testing.T) (clientW io.WriteCloser, clientR io.Reader, done chan error) {
+// the client-side reader/writer, a done channel, and an isolated base directory
+// for socket files. BaseDir is a short temp dir so Unix socket paths stay
+// within the ~108-byte limit on Windows; tests never touch real daemon sockets.
+func newTestServer(t *testing.T) (clientW io.WriteCloser, clientR io.Reader, done chan error, baseDir string) {
 	t.Helper()
+
+	var err error
+	baseDir, err = os.MkdirTemp("", "mcpmux-")
+	if err != nil {
+		t.Fatalf("newTestServer: MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
 	// clientW -> serverR  (test writes requests, server reads them)
 	serverR, clientW := io.Pipe()
@@ -28,6 +36,7 @@ func newTestServer(t *testing.T) (clientW io.WriteCloser, clientR io.Reader, don
 
 	logger := log.New(os.Stderr, "[mcpserver-test] ", 0)
 	srv := NewServer(serverR, serverW, logger)
+	srv.BaseDir = baseDir // isolate from real daemon sockets
 
 	done = make(chan error, 1)
 	go func() {
@@ -36,7 +45,7 @@ func newTestServer(t *testing.T) (clientW io.WriteCloser, clientR io.Reader, don
 		done <- err
 	}()
 
-	return clientW, clientR, done
+	return clientW, clientR, done, baseDir
 }
 
 // sendLine writes a single JSON-RPC line to the server.
@@ -117,7 +126,7 @@ func unmarshalResult(t *testing.T, resp map[string]json.RawMessage, dst any) {
 // --- Tests ---
 
 func TestInitialize(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
@@ -165,7 +174,7 @@ func TestInitialize(t *testing.T) {
 }
 
 func TestToolsList(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
@@ -199,7 +208,7 @@ func TestToolsList(t *testing.T) {
 }
 
 func TestPromptsList(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":3,"method":"prompts/list","params":{}}`)
@@ -233,7 +242,7 @@ func TestPromptsList(t *testing.T) {
 }
 
 func TestPromptsGetMuxGuide(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	params := `{"name":"mux-guide"}`
@@ -265,7 +274,7 @@ func TestPromptsGetMuxGuide(t *testing.T) {
 }
 
 func TestPromptsGetMuxStatusSummary(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	params := `{"name":"mux-status-summary"}`
@@ -289,7 +298,7 @@ func TestPromptsGetMuxStatusSummary(t *testing.T) {
 }
 
 func TestPromptsGetUnknownPrompt(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	params := `{"name":"nonexistent-prompt"}`
@@ -320,7 +329,7 @@ func TestPromptsGetUnknownPrompt(t *testing.T) {
 }
 
 func TestPing(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":7,"method":"ping","params":{}}`)
@@ -345,7 +354,7 @@ func TestPing(t *testing.T) {
 }
 
 func TestUnknownMethod(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":8,"method":"no/such/method","params":{}}`)
@@ -375,7 +384,7 @@ func TestUnknownMethod(t *testing.T) {
 }
 
 func TestNotificationIgnored(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// A notification has no "id" field — the server must silently ignore it.
@@ -391,7 +400,7 @@ func TestNotificationIgnored(t *testing.T) {
 }
 
 func TestToolsCallUnknownTool(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}`)
@@ -422,7 +431,7 @@ func TestToolsCallUnknownTool(t *testing.T) {
 }
 
 func TestToolsCallInvalidParams(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":11,"method":"tools/call","params":"not-json"}`)
@@ -448,7 +457,7 @@ func TestToolsCallInvalidParams(t *testing.T) {
 }
 
 func TestPromptsGetInvalidParams(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":12,"method":"prompts/get","params":"not-json"}`)
@@ -516,7 +525,7 @@ func TestOwnerHasCwd(t *testing.T) {
 }
 
 func TestParseError(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `not valid json{{{`)
@@ -530,7 +539,7 @@ func TestParseError(t *testing.T) {
 }
 
 func TestEmptyLine(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, "")
@@ -544,7 +553,7 @@ func TestEmptyLine(t *testing.T) {
 }
 
 func TestMultipleRequests(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// Interleave send/receive to avoid blocking the pipe.
@@ -568,7 +577,7 @@ func TestMultipleRequests(t *testing.T) {
 }
 
 func TestMuxStopInvalidArgs(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// Pass malformed JSON arguments to mux_stop — triggers json.Unmarshal error inside toolMuxStop.
@@ -592,7 +601,7 @@ func TestMuxStopInvalidArgs(t *testing.T) {
 }
 
 func TestMuxStopNoIDOrName(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// Call mux_stop with empty server_id and name — resolveServerID returns an error.
@@ -619,7 +628,7 @@ func TestMuxStopNoIDOrName(t *testing.T) {
 }
 
 func TestMuxRestartInvalidArgs(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// Pass malformed JSON arguments to mux_restart — triggers json.Unmarshal error inside toolMuxRestart.
@@ -640,7 +649,7 @@ func TestMuxRestartInvalidArgs(t *testing.T) {
 }
 
 func TestMuxRestartNoIDOrName(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// Call mux_restart with empty arguments — resolveServerID returns an error.
@@ -661,7 +670,7 @@ func TestMuxRestartNoIDOrName(t *testing.T) {
 }
 
 func TestMuxStopNoMatchingServer(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	// Call mux_stop with a name that matches no running server.
@@ -685,7 +694,7 @@ func TestMuxStopNoMatchingServer(t *testing.T) {
 }
 
 func TestMuxRestartNoMatchingServer(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"mux_restart","arguments":{"name":"nonexistent-server-xyzzy-12345"}}}`)
@@ -705,7 +714,7 @@ func TestMuxRestartNoMatchingServer(t *testing.T) {
 }
 
 func TestToolsCallMuxListNoServers(t *testing.T) {
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"mux_list","arguments":{}}}`)
@@ -759,11 +768,13 @@ func (h *fakeHandler) HandleStatus() map[string]interface{} {
 	return h.status
 }
 
-// startFakeControlServer creates a .ctl.sock in tmpDir with the given server ID
+// startFakeControlServer creates a .ctl.sock in dir with the given server ID
 // and a real control.Server that responds to status/shutdown commands.
-func startFakeControlServer(t *testing.T, serverID string, status map[string]any) *control.Server {
+// Pass the same dir that was returned by newTestServer so the Server finds
+// the socket without touching os.TempDir().
+func startFakeControlServer(t *testing.T, dir, serverID string, status map[string]any) *control.Server {
 	t.Helper()
-	ctlPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
+	ctlPath := filepath.Join(dir, fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
 	t.Cleanup(func() { os.Remove(ctlPath) })
 
 	handler := &fakeHandler{
@@ -781,18 +792,18 @@ func startFakeControlServer(t *testing.T, serverID string, status map[string]any
 
 func TestMuxListWithFakeServer(t *testing.T) {
 	sid := "aabbccdd11223344"
-	_ = startFakeControlServer(t, sid, map[string]any{
+	clientW, clientR, _, baseDir := newTestServer(t)
+	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
 		"command":             "uvx",
 		"args":               []string{"test-server"},
 		"session_count":      2,
 		"pending_requests":   0,
 		"auto_classification": "shared",
 		"mux_version":        "test",
-		"cwd":                os.TempDir(), // won't match our cwd
+		"cwd":                baseDir,
 	})
-
-	clientW, clientR, _ := newTestServer(t)
-	defer clientW.Close()
 
 	// all=true to see servers from any cwd
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":40,"method":"tools/call","params":{"name":"mux_list","arguments":{"all":true}}}`)
@@ -823,19 +834,19 @@ func TestMuxListWithFakeServer(t *testing.T) {
 
 func TestMuxListVerbose(t *testing.T) {
 	sid := "eeff001122334455"
-	_ = startFakeControlServer(t, sid, map[string]any{
+	clientW, clientR, _, baseDir := newTestServer(t)
+	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
 		"command":             "node",
 		"args":               []string{"verbose-test.js"},
 		"session_count":      3,
 		"pending_requests":   1,
 		"auto_classification": "session-aware",
 		"mux_version":        "v0.5.1",
-		"cwd":                os.TempDir(),
+		"cwd":                baseDir,
 		"upstream_pid":       12345,
 	})
-
-	clientW, clientR, _ := newTestServer(t)
-	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{"name":"mux_list","arguments":{"all":true,"verbose":true}}}`)
 	line := readLine(t, clientR)
@@ -859,15 +870,15 @@ func TestMuxListVerbose(t *testing.T) {
 
 func TestMuxStopWithFakeServer(t *testing.T) {
 	sid := "ddee112233445566"
-	_ = startFakeControlServer(t, sid, map[string]any{
-		"command":        "uvx",
-		"args":           []string{"stop-test"},
-		"session_count":  1,
-		"mux_version":    "test",
-	})
-
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, baseDir := newTestServer(t)
 	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command":       "uvx",
+		"args":          []string{"stop-test"},
+		"session_count": 1,
+		"mux_version":   "test",
+	})
 
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"mux_stop","arguments":{"server_id":"%s"}}}`, sid))
@@ -893,15 +904,15 @@ func TestMuxStopWithFakeServer(t *testing.T) {
 
 func TestMuxStopByName(t *testing.T) {
 	sid := "aabb112233445566"
-	_ = startFakeControlServer(t, sid, map[string]any{
-		"command":        "uvx",
-		"args":           []string{"unique-name-for-stop-test"},
-		"session_count":  1,
-		"mux_version":    "test",
-	})
-
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, baseDir := newTestServer(t)
 	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command":       "uvx",
+		"args":          []string{"unique-name-for-stop-test"},
+		"session_count": 1,
+		"mux_version":   "test",
+	})
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"mux_stop","arguments":{"name":"unique-name-for-stop-test"}}}`)
 	line := readLine(t, clientR)
@@ -923,15 +934,15 @@ func TestMuxStopByName(t *testing.T) {
 
 func TestMuxRestartWithFakeServer(t *testing.T) {
 	sid := "ffaa112233445566"
-	_ = startFakeControlServer(t, sid, map[string]any{
-		"command":        "uvx",
-		"args":           []string{"restart-test"},
-		"session_count":  1,
-		"mux_version":    "test",
-	})
-
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, baseDir := newTestServer(t)
 	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command":       "uvx",
+		"args":          []string{"restart-test"},
+		"session_count": 1,
+		"mux_version":   "test",
+	})
 
 	// force=true to skip drain wait
 	sendLine(t, clientW, fmt.Sprintf(
@@ -967,15 +978,15 @@ func TestMuxRestartWithFakeServer(t *testing.T) {
 
 func TestMuxRestartByName(t *testing.T) {
 	sid := "ffbb112233445566"
-	_ = startFakeControlServer(t, sid, map[string]any{
-		"command":        "node",
-		"args":           []string{"unique-restart-by-name-test.js"},
-		"session_count":  1,
-		"mux_version":    "test",
-	})
-
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, baseDir := newTestServer(t)
 	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command":       "node",
+		"args":          []string{"unique-restart-by-name-test.js"},
+		"session_count": 1,
+		"mux_version":   "test",
+	})
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"mux_restart","arguments":{"name":"unique-restart-by-name-test","force":true}}}`)
 	line := readLine(t, clientR)
@@ -1002,14 +1013,14 @@ func TestMuxRestartByName(t *testing.T) {
 
 func TestMuxRestartNoCommandInfo(t *testing.T) {
 	sid := "ffcc112233445566"
+	clientW, clientR, _, baseDir := newTestServer(t)
+	defer clientW.Close()
+
 	// Status returns no command field — should fail with "has no command info"
-	_ = startFakeControlServer(t, sid, map[string]any{
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
 		"session_count": 1,
 		"mux_version":   "test",
 	})
-
-	clientW, clientR, _ := newTestServer(t)
-	defer clientW.Close()
 
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"mux_restart","arguments":{"server_id":"%s"}}}`, sid))
@@ -1035,15 +1046,15 @@ func TestMuxRestartNoCommandInfo(t *testing.T) {
 
 func TestMuxStopForce(t *testing.T) {
 	sid := "ffdd112233445566"
-	_ = startFakeControlServer(t, sid, map[string]any{
-		"command":        "uvx",
-		"args":           []string{"force-stop-test"},
-		"session_count":  1,
-		"mux_version":    "test",
-	})
-
-	clientW, clientR, _ := newTestServer(t)
+	clientW, clientR, _, baseDir := newTestServer(t)
 	defer clientW.Close()
+
+	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command":       "uvx",
+		"args":          []string{"force-stop-test"},
+		"session_count": 1,
+		"mux_version":   "test",
+	})
 
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":48,"method":"tools/call","params":{"name":"mux_stop","arguments":{"server_id":"%s","force":true}}}`, sid))
@@ -1067,28 +1078,28 @@ func TestMuxStopForce(t *testing.T) {
 func TestMuxListFilterByCwd(t *testing.T) {
 	myCwd, _ := os.Getwd()
 
+	clientW, clientR, _, baseDir := newTestServer(t)
+	defer clientW.Close()
+
 	// Server WITH our cwd
 	sid1 := "ccdd001122334455"
-	_ = startFakeControlServer(t, sid1, map[string]any{
-		"command":        "uvx",
-		"args":           []string{"my-server"},
-		"session_count":  1,
-		"cwd":            myCwd,
-		"mux_version":    "test",
+	_ = startFakeControlServer(t, baseDir, sid1, map[string]any{
+		"command":       "uvx",
+		"args":          []string{"my-server"},
+		"session_count": 1,
+		"cwd":           myCwd,
+		"mux_version":   "test",
 	})
 
 	// Server with DIFFERENT cwd
 	sid2 := "ccdd998877665544"
-	_ = startFakeControlServer(t, sid2, map[string]any{
-		"command":        "uvx",
-		"args":           []string{"other-server"},
-		"session_count":  1,
-		"cwd":            filepath.Join(os.TempDir(), "nonexistent-project"),
-		"mux_version":    "test",
+	_ = startFakeControlServer(t, baseDir, sid2, map[string]any{
+		"command":       "uvx",
+		"args":          []string{"other-server"},
+		"session_count": 1,
+		"cwd":           filepath.Join(baseDir, "nonexistent-project"),
+		"mux_version":   "test",
 	})
-
-	clientW, clientR, _ := newTestServer(t)
-	defer clientW.Close()
 
 	// Default (no all=true) — should filter by cwd
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"mux_list","arguments":{}}}`)
