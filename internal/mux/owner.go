@@ -1221,10 +1221,9 @@ func (o *Owner) acceptLoop() {
 		// reader may be io.MultiReader if readToken prepended unconsumed bytes.
 		// conn is always the writer and closer.
 		s := NewSession(reader, conn)
-		if s.closer == nil {
-			// io.MultiReader doesn't implement io.Closer — set closer to conn explicitly
-			s.closer = conn
-		}
+		// io.MultiReader doesn't implement io.Closer — set closer to conn explicitly
+		// so Close() can forcefully disconnect the IPC connection.
+		s.SetCloser(conn)
 		if token != "" {
 			o.sessionMgr.Bind(token, s) // sets s.Cwd from pre-registered token
 		}

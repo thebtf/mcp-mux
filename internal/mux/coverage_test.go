@@ -847,11 +847,7 @@ func TestRouteProgressNotification_NoOwner(t *testing.T) {
 func TestSessionWriteRaw_NonBufio(t *testing.T) {
 	var buf bytes.Buffer
 	// Create session with a plain writer (not bufio.Writer) by bypassing NewSession
-	s := &Session{
-		ID:     999,
-		writer: &buf, // plain bytes.Buffer, not *bufio.Writer
-		done:   make(chan struct{}),
-	}
+	s := NewSessionWithRawWriter(999, &buf)
 
 	data := []byte(`{"test":"nonbufio"}`)
 	if err := s.WriteRaw(data); err != nil {
