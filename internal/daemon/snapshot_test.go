@@ -10,6 +10,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/muxcore/classify"
 	"github.com/thebtf/mcp-mux/internal/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/mux"
+	mcpsnapshot "github.com/thebtf/mcp-mux/internal/muxcore/snapshot"
 )
 
 func TestSnapshotRoundTrip(t *testing.T) {
@@ -54,8 +55,8 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if snap == nil {
 		t.Fatal("DeserializeSnapshot() returned nil")
 	}
-	if snap.Version != snapshotVersion {
-		t.Errorf("version = %d, want %d", snap.Version, snapshotVersion)
+	if snap.Version != mcpsnapshot.SnapshotVersion {
+		t.Errorf("version = %d, want %d", snap.Version, mcpsnapshot.SnapshotVersion)
 	}
 	if len(snap.Owners) != 1 {
 		t.Errorf("owners count = %d, want 1", len(snap.Owners))
@@ -93,7 +94,7 @@ func TestSnapshotCorruptJSON(t *testing.T) {
 
 func TestSnapshotStaleTimestamp(t *testing.T) {
 	stale := DaemonSnapshot{
-		Version:   snapshotVersion,
+		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
 		Owners:    []mux.OwnerSnapshot{},
 		Sessions:  []mux.SessionSnapshot{},
@@ -146,7 +147,7 @@ func TestSnapshotVersionMismatch(t *testing.T) {
 
 func TestSnapshotEmptyOwners(t *testing.T) {
 	valid := DaemonSnapshot{
-		Version:   snapshotVersion,
+		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Owners:    []mux.OwnerSnapshot{},
 		Sessions:  []mux.SessionSnapshot{},
@@ -213,7 +214,7 @@ func TestSnapshotAtomicWrite(t *testing.T) {
 
 func TestSnapshotOwnerWithClassification(t *testing.T) {
 	valid := DaemonSnapshot{
-		Version:   snapshotVersion,
+		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Owners: []mux.OwnerSnapshot{
 			{
@@ -356,7 +357,7 @@ func TestLoadSnapshot_HealsIsolatedOwnerCwdSet(t *testing.T) {
 	primaryCwd := t.TempDir()
 	otherCwd := t.TempDir()
 	snapshot := DaemonSnapshot{
-		Version:   snapshotVersion,
+		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Owners: []mux.OwnerSnapshot{
 			{
