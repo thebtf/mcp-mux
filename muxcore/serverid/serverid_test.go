@@ -252,6 +252,72 @@ func TestWorktreeAndMainShareServerID(t *testing.T) {
 	}
 }
 
+func TestWorktreeRoot_MainCheckout(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.Mkdir(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := WorktreeRoot(dir)
+	if CanonicalizePath(got) != CanonicalizePath(dir) {
+		t.Errorf("WorktreeRoot(main checkout) = %q, want %q", got, dir)
+	}
+}
+
+func TestWorktreeRoot_LinkedWorktree(t *testing.T) {
+	// Create a fake worktree: .git is a file (not a directory).
+	// WorktreeRoot should return the worktree dir, NOT resolve back to main repo.
+	mainRepo := t.TempDir()
+	mainGit := filepath.Join(mainRepo, ".git")
+	if err := os.Mkdir(mainGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wtGitDir := filepath.Join(mainGit, "worktrees", "wt1")
+	if err := os.MkdirAll(wtGitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := t.TempDir()
+	gitFile := filepath.Join(worktreeDir, ".git")
+	content := "gitdir: " + wtGitDir + "\n"
+	if err := os.WriteFile(gitFile, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := WorktreeRoot(worktreeDir)
+	// Should return the worktree dir itself, NOT the main repo.
+	if CanonicalizePath(got) != CanonicalizePath(worktreeDir) {
+		t.Errorf("WorktreeRoot(linked worktree) = %q, want %q (NOT resolved to main repo)", got, worktreeDir)
+	}
+	if CanonicalizePath(got) == CanonicalizePath(mainRepo) {
+		t.Errorf("WorktreeRoot(linked worktree) incorrectly resolved to main repo %q", mainRepo)
+	}
+}
+
+func TestWorktreeRoot_NoGit(t *testing.T) {
+	dir := t.TempDir()
+	got := WorktreeRoot(dir)
+	if CanonicalizePath(got) != CanonicalizePath(dir) {
+		t.Errorf("WorktreeRoot(no .git) = %q, want canonical cwd %q", got, dir)
+	}
+}
+
+func TestWorktreeRoot_Subdirectory(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.Mkdir(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(dir, "src", "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := WorktreeRoot(sub)
+	if CanonicalizePath(got) != CanonicalizePath(dir) {
+		t.Errorf("WorktreeRoot(subdir) = %q, want parent with .git %q", got, dir)
+	}
+}
+
 func TestPathNormalization(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-specific path normalization test")

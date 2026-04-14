@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
@@ -97,7 +98,8 @@ type Owner struct {
 	cwdSet   map[string]bool // all known cwds (for multi-project roots/list)
 	command     string          // upstream command (for status/restart)
 	args        []string        // upstream args (for status/restart)
-	handlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
+	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
+	sessionHandler muxcore.SessionHandler                                            // structured in-process handler (nil = pipe or subprocess)
 	serverID string          // server identity hash
 	listener net.Listener
 	logger   *log.Logger
@@ -209,6 +211,12 @@ type OwnerConfig struct {
 	// Mutually exclusive with Command/Args: if HandlerFunc is set, Command is ignored.
 	HandlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 
+	// SessionHandler is a structured in-process MCP server implementation.
+	// When set, Owner calls HandleRequest directly for each downstream request
+	// instead of routing through a pipe or subprocess.
+	// Mutually exclusive with HandlerFunc and Command/Args.
+	SessionHandler muxcore.SessionHandler
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -244,6 +252,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		command:                cfg.Command,
 		args:                   cfg.Args,
 		handlerFunc:            cfg.HandlerFunc,
+		sessionHandler:         cfg.SessionHandler,
 		serverID:               cfg.ServerID,
 		listener:               ln,
 		logger:                 logger,
@@ -302,6 +311,13 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	// Close initReady and classified immediately — caches already populated
 	o.initReadyOnce.Do(func() { close(o.initReady) })
 	o.classifiedOnce.Do(func() { close(o.classified) })
+
+	// Wire notifier into sessionHandler if it supports NotifierAware.
+	if o.sessionHandler != nil {
+		if na, ok := o.sessionHandler.(muxcore.NotifierAware); ok {
+			na.SetNotifier(&ownerNotifier{owner: o})
+		}
+	}
 
 	// Start control plane if configured
 	if cfg.ControlPath != "" {
@@ -454,6 +470,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		command:                cfg.Command,
 		args:                   cfg.Args,
 		handlerFunc:            cfg.HandlerFunc,
+		sessionHandler:         cfg.SessionHandler,
 		serverID:               cfg.ServerID,
 		listener:               ln,
 		logger:                 logger,
@@ -476,6 +493,13 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		done:                   make(chan struct{}),
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
+
+	// Wire notifier into sessionHandler if it supports NotifierAware.
+	if o.sessionHandler != nil {
+		if na, ok := o.sessionHandler.(muxcore.NotifierAware); ok {
+			na.SetNotifier(&ownerNotifier{owner: o})
+		}
+	}
 
 	// Start control plane if configured
 	if cfg.ControlPath != "" {
@@ -605,6 +629,17 @@ func (o *Owner) AddSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
 
+	if o.sessionHandler != nil {
+		if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
+			project := muxcore.ProjectContext{
+				ID:  muxcore.ProjectContextID(s.Cwd),
+				Cwd: s.Cwd,
+				Env: s.Env,
+			}
+			go lc.OnProjectConnect(project)
+		}
+	}
+
 	// For template-restored isolated owners, close the IPC listener after the first
 	// session connects. Normal owners close the listener during classification
 	// (classifyFromCapabilities/classifyFromToolList), but template owners skip
@@ -662,6 +697,18 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		if msg.Method == "notifications/cancelled" {
 			return o.forwardCancelledNotification(s, msg)
 		}
+		// NotificationHandler dispatch for SessionHandler mode
+		if o.sessionHandler != nil {
+			if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
+				project := muxcore.ProjectContext{
+					ID:  muxcore.ProjectContextID(s.Cwd),
+					Cwd: s.Cwd,
+					Env: s.Env,
+				}
+				go nh.HandleNotification(context.Background(), project, msg.Raw)
+			}
+			return nil // notifications don't need forwarding to upstream
+		}
 		// Forward other notifications as-is to upstream
 		if o.upstream == nil {
 			return nil // snapshot owner — upstream not yet spawned, drop notification
@@ -686,6 +733,11 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		if o.upstream == nil || o.upstreamDead.Load() {
 			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
 			return s.WriteRaw([]byte(errResp))
+		}
+
+		// SessionHandler dispatch: structured path without pipe/remap/_meta
+		if o.sessionHandler != nil {
+			return o.dispatchToSessionHandler(s, msg)
 		}
 
 		// Track pending requests
@@ -778,6 +830,66 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 	default:
 		return fmt.Errorf("unexpected message type from downstream: %s", msg.Type)
 	}
+}
+
+// dispatchToSessionHandler calls the SessionHandler directly instead of writing
+// to the pipe. Runs in a goroutine for concurrent request handling.
+func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error {
+	project := muxcore.ProjectContext{
+		ID:  muxcore.ProjectContextID(s.Cwd),
+		Cwd: s.Cwd,
+		Env: s.Env,
+	}
+
+	o.pendingRequests.Add(1)
+
+	go func() {
+		defer o.pendingRequests.Add(-1)
+		defer func() {
+			if r := recover(); r != nil {
+				o.logger.Printf("session %d: HandleRequest panic: %v", s.ID, r)
+				errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"internal error: handler panic"}}`, string(msg.ID))
+				s.WriteRaw([]byte(errResp))
+			}
+		}()
+
+		// Build context: cancel on session disconnect or owner shutdown
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		go func() {
+			select {
+			case <-s.Done():
+				cancel()
+			case <-o.done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		// Apply toolTimeout deadline if configured
+		if timeout := o.toolTimeoutNs.Load(); timeout > 0 {
+			var timeoutCancel context.CancelFunc
+			ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(timeout))
+			defer timeoutCancel()
+		}
+
+		resp, err := o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
+		if err != nil {
+			if ctx.Err() != nil {
+				// Context cancelled (timeout or disconnect)
+				resp = []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"request timeout"}}`, string(msg.ID)))
+			} else {
+				resp = []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}`, string(msg.ID), err.Error()))
+			}
+		}
+
+		if resp != nil {
+			s.WriteRaw(resp)
+		}
+	}()
+
+	return nil
 }
 
 // sendProactiveInit sends an initialize request to the upstream immediately after
@@ -1258,6 +1370,35 @@ func (o *Owner) broadcastListChanged() {
 	o.logger.Printf("broadcast list_changed to %d sessions", len(sessions))
 }
 
+// ownerNotifier implements muxcore.Notifier by routing notifications through
+// the Owner's session manager.
+type ownerNotifier struct {
+	owner *Owner
+}
+
+func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
+	n.owner.mu.RLock()
+	defer n.owner.mu.RUnlock()
+	for _, s := range n.owner.sessions {
+		if muxcore.ProjectContextID(s.Cwd) == projectID {
+			return s.WriteRaw(notification)
+		}
+	}
+	return fmt.Errorf("no session found for project %s", projectID)
+}
+
+func (n *ownerNotifier) Broadcast(notification []byte) {
+	n.owner.mu.RLock()
+	sessions := make([]*Session, 0, len(n.owner.sessions))
+	for _, s := range n.owner.sessions {
+		sessions = append(sessions, s)
+	}
+	n.owner.mu.RUnlock()
+	for _, s := range sessions {
+		s.WriteRaw(notification)
+	}
+}
+
 // removeSession removes a session from the owner.
 func (o *Owner) removeSession(s *Session) {
 	o.mu.Lock()
@@ -1278,6 +1419,12 @@ func (o *Owner) removeSession(s *Session) {
 	o.sessionMgr.RemoveSession(s.ID)
 	o.touchActivity()
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
+
+	if o.sessionHandler != nil {
+		if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
+			go lc.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
+		}
+	}
 
 	if remaining > 0 {
 		// Notify upstream that roots may have changed (client left)
@@ -1572,7 +1719,20 @@ func (o *Owner) Serve(ctx context.Context) error {
 		// upstreamDeadCh returns proc.Done.
 		deadCh := o.upstreamDeadCh()
 
-		// Non-blocking check: if the channel is already closed, act immediately.
+		// Non-blocking priority checks: done/ctx take precedence over upstream death.
+		// Without these, a shutdown owner with nil upstream (deadCh == closedChan)
+		// would return error → suture restart → immediate return → tight CPU spin.
+		select {
+		case <-o.done:
+			return nil // owner already shut down — clean exit, no restart
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			o.Shutdown()
+			return ctx.Err()
+		default:
+		}
 		select {
 		case <-deadCh:
 			// If this was backgroundSpawnCh (now closed and cleared), loop to

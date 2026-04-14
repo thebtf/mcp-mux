@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -58,8 +59,9 @@ type Daemon struct {
 	owners      map[string]*OwnerEntry
 	logger      *log.Logger
 	ctlSrv      *control.Server
-	done        chan struct{}
-	handlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
+	done           chan struct{}
+	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
+	sessionHandler muxcore.SessionHandler
 
 	// ownerIdleTimeout is the default time an owner may sit with no activity
 	// (no MCP traffic, no sessions, no pending requests, no active progress
@@ -96,6 +98,13 @@ type Config struct {
 	// Mutually exclusive with Command/Args in spawn requests: if HandlerFunc is
 	// non-nil, it overrides any Command in the request.
 	HandlerFunc func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
+
+	// SessionHandler is a structured in-process MCP server implementation.
+	// When set, owners call HandleRequest directly for each downstream request
+	// instead of routing through a pipe or subprocess.
+	// Mutually exclusive with HandlerFunc: if SessionHandler is set, it takes
+	// priority and HandlerFunc is ignored.
+	SessionHandler muxcore.SessionHandler
 
 	// OwnerIdleTimeout is how long an owner may be idle (no MCP traffic, no
 	// sessions, no pending JSON-RPC requests, no active progress tokens, no
@@ -157,6 +166,7 @@ func New(cfg Config) (*Daemon, error) {
 		supervisorCtx:    supCtx,
 		supervisorCancel: supCancel,
 		handlerFunc:      cfg.HandlerFunc,
+		sessionHandler:   cfg.SessionHandler,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -504,6 +514,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		ServerID:       sid,
 		TokenHandshake: true, // daemon-managed owners: shims send a handshake token
 		HandlerFunc:    d.handlerFunc,
+		SessionHandler: d.sessionHandler,
 		OnZeroSessions: func(serverID string) {
 			d.onZeroSessions(serverID)
 		},
