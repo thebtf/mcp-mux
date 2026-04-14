@@ -99,6 +99,29 @@ func resolveWorktreeRoot(dir, gitPath string) string {
 	return dir
 }
 
+// WorktreeRoot finds the worktree root for a given path. Unlike findGitRoot which
+// resolves linked worktrees back to the main repo root, this function returns the
+// worktree directory itself — each worktree has a separate identity.
+//
+// Resolution:
+//   - .git is a directory → root = that directory (main checkout)
+//   - .git is a file (linked worktree) → root = that directory (NOT resolved)
+//   - No .git found → canonical CWD
+func WorktreeRoot(startPath string) string {
+	current := CanonicalizePath(startPath)
+	for {
+		gitPath := filepath.Join(current, ".git")
+		if _, err := os.Stat(gitPath); err == nil {
+			return current
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return CanonicalizePath(startPath)
+		}
+		current = parent
+	}
+}
+
 // Compute (deprecated) is kept for backward compatibility if needed temporarily.
 // Use GenerateContextKey instead.
 func Compute(args []string) string {
