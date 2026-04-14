@@ -1719,7 +1719,20 @@ func (o *Owner) Serve(ctx context.Context) error {
 		// upstreamDeadCh returns proc.Done.
 		deadCh := o.upstreamDeadCh()
 
-		// Non-blocking check: if the channel is already closed, act immediately.
+		// Non-blocking priority checks: done/ctx take precedence over upstream death.
+		// Without these, a shutdown owner with nil upstream (deadCh == closedChan)
+		// would return error → suture restart → immediate return → tight CPU spin.
+		select {
+		case <-o.done:
+			return nil // owner already shut down — clean exit, no restart
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			o.Shutdown()
+			return ctx.Err()
+		default:
+		}
 		select {
 		case <-deadCh:
 			// If this was backgroundSpawnCh (now closed and cleared), loop to
