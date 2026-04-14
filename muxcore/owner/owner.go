@@ -1690,6 +1690,21 @@ func (o *Owner) Classified() <-chan struct{} {
 	return o.classified
 }
 
+// IsClassifiedShareable returns true if the owner has been classified AND
+// the classification allows cross-CWD sharing (shared or session-aware).
+// Returns false if not yet classified or classified as isolated.
+func (o *Owner) IsClassifiedShareable() bool {
+	select {
+	case <-o.classified:
+	default:
+		return false // not yet classified
+	}
+	o.mu.RLock()
+	mode := o.autoClassification
+	o.mu.RUnlock()
+	return mode == classify.ModeShared || mode == classify.ModeSessionAware
+}
+
 // MarkClassified forces the classified channel closed. Used by tests that need
 // to bypass the normal init/tools handshake classification flow.
 func (o *Owner) MarkClassified() {

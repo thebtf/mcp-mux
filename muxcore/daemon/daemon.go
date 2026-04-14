@@ -77,6 +77,12 @@ type Daemon struct {
 	supervisorCancel context.CancelFunc
 	supervisorErr <-chan error
 
+	// crashTracker records recent crash timestamps per command key.
+	// Used by Spawn() as a circuit breaker: if an upstream crashes too many
+	// times within a window, further spawn requests are rejected instead of
+	// creating an infinite respawn loop that burns CPU.
+	crashTracker map[string][]time.Time
+
 	shutdownOnce sync.Once
 }
 
@@ -147,6 +153,7 @@ func New(cfg Config) (*Daemon, error) {
 		ownerIdleTimeout: ownerIdleTimeout,
 		idleTimeout:      idleTimeout,
 		templateCache:    make(map[string]mcpsnapshot.OwnerSnapshot),
+		crashTracker:     make(map[string][]time.Time),
 		supervisorCtx:    supCtx,
 		supervisorCancel: supCancel,
 		handlerFunc:      cfg.HandlerFunc,
@@ -368,6 +375,20 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	// Generate handshake token upfront — valid for this spawn call only.
 	token := generateToken()
 
+	// Circuit breaker: reject spawn if the upstream has been crash-looping.
+	// This prevents infinite respawn loops (shim reconnect → spawn → crash → repeat)
+	// that burn CPU when an upstream is fundamentally broken.
+	cmdKey := req.Command + " " + strings.Join(req.Args, " ")
+	d.mu.RLock()
+	if d.isCrashLooping(cmdKey) {
+		d.mu.RUnlock()
+		d.logger.Printf("circuit breaker: rejecting spawn for %q (%d crashes in %s)",
+			cmdKey, crashThreshold, crashWindow)
+		return "", "", "", fmt.Errorf("upstream %q crashed %d times in %s, spawn rejected (circuit breaker)",
+			req.Command, crashThreshold, crashWindow)
+	}
+	d.mu.RUnlock()
+
 	// Server identity is based on command+args+cwd only, NOT env.
 	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
 
@@ -427,11 +448,12 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	}
 
 	// 2. Global dedup: if an accepting owner for same command+args exists (any cwd), reuse it.
-	//    Dedup is optimistic: unclassified owners are assumed shared/session-aware.
-	//    If the owner later classifies as isolated, it closes its listener — extra
-	//    sessions get EOF and reconnect, spawning their own owner.
+	//    Cross-CWD sharing is only allowed when the owner is CONFIRMED shareable
+	//    (classified as shared or session-aware). Unclassified owners are NOT shared
+	//    across different CWDs — every process has exactly one CWD, so sharing an
+	//    unclassified server with a different CWD risks context leaks.
 	if mode == serverid.ModeCwd {
-		if existing := d.findSharedOwner(req.Command, req.Args, req.Env); existing != nil {
+		if existing := d.findSharedOwner(req.Command, req.Args, req.Env, req.Cwd); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
 			d.mu.Unlock()
@@ -690,8 +712,10 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // Must be called with d.mu held. May transiently release and re-acquire d.mu
 // when it encounters a placeholder (Owner == nil) for a matching command+args —
 // it waits for that creation to complete before returning.
-func (d *Daemon) findSharedOwner(command string, args []string, env map[string]string) *OwnerEntry {
+func (d *Daemon) findSharedOwner(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
+	canonReqCwd := serverid.CanonicalizePath(reqCwd)
+
 	for _, entry := range d.owners {
 		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
 		if candidate != needle {
@@ -721,11 +745,23 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 		if !entry.Owner.IsAccepting() {
 			continue
 		}
+
+		// CWD-aware dedup: every process has exactly one CWD. Sharing an upstream
+		// across sessions with different CWDs is only safe when the server has been
+		// confirmed CWD-independent (classified as shared or session-aware).
+		// Unclassified servers are NOT shared across CWDs — this prevents
+		// cross-project context leaks for CWD-dependent servers.
+		canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
+		cwdMatch := canonReqCwd == canonEntryCwd
+
+		if !cwdMatch {
+			// Different CWD — only share if owner is confirmed shareable.
+			if !entry.Owner.IsClassifiedShareable() {
+				continue
+			}
+		}
+
 		// Non-blocking classification check: if already classified, respect it.
-		// If not yet classified, return optimistically (assume shareable).
-		// This avoids both extremes:
-		// - Blocking wait (8s+ for slow upstreams → CC timeout)
-		// - Blind optimistic dedup (returns isolated owners → evict storm)
 		select {
 		case <-entry.Owner.Classified():
 			// Classification known — re-check IsAccepting (may have closed listener)
@@ -733,8 +769,8 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 				continue
 			}
 		default:
-			// Not yet classified — optimistic: assume shareable.
-			// If later classified isolated → evict extra sessions.
+			// Not yet classified. Same CWD → safe to share optimistically.
+			// Different CWD → already filtered above (IsClassifiedShareable).
 		}
 		return entry
 	}
@@ -883,6 +919,10 @@ func (d *Daemon) onUpstreamExit(serverID string) {
 	d.mu.Lock()
 	entry, ok := d.owners[serverID]
 	if ok {
+		// Record crash for circuit breaker before any other action.
+		cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
+		d.recordCrash(cmdKey)
+
 		if entry.Persistent {
 			d.mu.Unlock()
 			d.logger.Printf("owner %s: upstream exited, will re-spawn (persistent)", serverID[:8])
@@ -897,6 +937,47 @@ func (d *Daemon) onUpstreamExit(serverID string) {
 		entry.Owner.Shutdown()
 		d.logger.Printf("owner %s: upstream exited, removed", serverID[:8])
 	}
+}
+
+// crashWindow is the time window for crash counting. If an upstream crashes
+// crashThreshold times within this window, further spawns are rejected.
+const crashWindow = 60 * time.Second
+const crashThreshold = 5
+
+// recordCrash adds a crash timestamp for the given command key.
+// Must be called with d.mu held.
+func (d *Daemon) recordCrash(cmdKey string) {
+	now := time.Now()
+	d.crashTracker[cmdKey] = append(d.crashTracker[cmdKey], now)
+
+	// Trim old entries outside the window.
+	cutoff := now.Add(-crashWindow)
+	crashes := d.crashTracker[cmdKey]
+	i := 0
+	for i < len(crashes) && crashes[i].Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		d.crashTracker[cmdKey] = crashes[i:]
+	}
+}
+
+// isCrashLooping returns true if the command has crashed too many times recently.
+// Must be called with d.mu held (at least RLock).
+func (d *Daemon) isCrashLooping(cmdKey string) bool {
+	crashes := d.crashTracker[cmdKey]
+	if len(crashes) < crashThreshold {
+		return false
+	}
+	// Count crashes within the window.
+	cutoff := time.Now().Add(-crashWindow)
+	count := 0
+	for _, t := range crashes {
+		if !t.Before(cutoff) {
+			count++
+		}
+	}
+	return count >= crashThreshold
 }
 
 // StatusJSON returns the daemon status as a JSON-encoded byte slice.

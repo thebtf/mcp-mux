@@ -159,6 +159,17 @@ func TestClassifyTools(t *testing.T) {
 			wantMode:    ModeIsolated,
 			wantMatched: 3,
 		},
+		{
+			name: "pr-review-mcp - shared (no isolation patterns)",
+			json: `{"jsonrpc":"2.0","id":1,"result":{"tools":[
+				{"name":"pr_create"},
+				{"name":"pr_invoke"},
+				{"name":"pr_list"},
+				{"name":"pr_merge"}
+			]}}`,
+			wantMode:    ModeShared,
+			wantMatched: 0,
+		},
 	}
 
 	for _, tt := range tests {

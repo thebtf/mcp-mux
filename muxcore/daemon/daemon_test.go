@@ -606,5 +606,73 @@ func TestCleanStaleSockets(t *testing.T) {
 func findSharedOwnerLocked(d *Daemon, command string, args []string, env map[string]string) *OwnerEntry {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.findSharedOwner(command, args, env)
+	return d.findSharedOwner(command, args, env, "")
+}
+
+func TestCrashCircuitBreaker(t *testing.T) {
+	d := &Daemon{
+		owners:       make(map[string]*OwnerEntry),
+		crashTracker: make(map[string][]time.Time),
+		logger:       testLogger(t),
+	}
+
+	cmdKey := "bad-server --broken"
+
+	// Under threshold — should not be crash looping
+	for i := 0; i < crashThreshold-1; i++ {
+		d.mu.Lock()
+		d.recordCrash(cmdKey)
+		d.mu.Unlock()
+	}
+	d.mu.RLock()
+	looping := d.isCrashLooping(cmdKey)
+	d.mu.RUnlock()
+	if looping {
+		t.Errorf("isCrashLooping = true after %d crashes, want false", crashThreshold-1)
+	}
+
+	// Hit threshold — should be crash looping
+	d.mu.Lock()
+	d.recordCrash(cmdKey)
+	d.mu.Unlock()
+	d.mu.RLock()
+	looping = d.isCrashLooping(cmdKey)
+	d.mu.RUnlock()
+	if !looping {
+		t.Errorf("isCrashLooping = false after %d crashes, want true", crashThreshold)
+	}
+
+	// Different command — should not be affected
+	d.mu.RLock()
+	otherLooping := d.isCrashLooping("good-server")
+	d.mu.RUnlock()
+	if otherLooping {
+		t.Error("isCrashLooping = true for unrelated command")
+	}
+}
+
+func TestCrashCircuitBreaker_WindowExpiry(t *testing.T) {
+	d := &Daemon{
+		owners:       make(map[string]*OwnerEntry),
+		crashTracker: make(map[string][]time.Time),
+		logger:       testLogger(t),
+	}
+
+	cmdKey := "flaky-server"
+
+	// Record crashes with old timestamps (outside the window).
+	oldTime := time.Now().Add(-crashWindow - time.Second)
+	d.mu.Lock()
+	for i := 0; i < crashThreshold+5; i++ {
+		d.crashTracker[cmdKey] = append(d.crashTracker[cmdKey], oldTime)
+	}
+	d.mu.Unlock()
+
+	// Old crashes should not trigger circuit breaker.
+	d.mu.RLock()
+	looping := d.isCrashLooping(cmdKey)
+	d.mu.RUnlock()
+	if looping {
+		t.Error("isCrashLooping = true for old crashes outside window")
+	}
 }
