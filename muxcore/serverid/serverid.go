@@ -178,16 +178,26 @@ func LockPath(id string, baseDir string) string {
 	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.lock", id))
 }
 
-// DaemonControlPath returns the control socket path for the global daemon.
+// DaemonControlPath returns the control socket path for a named daemon.
+// The name parameter identifies the engine instance (e.g. "mcp-mux", "aimux").
+// When name is empty, defaults to "mcp-mux" for backward compatibility.
 // When baseDir is empty, os.TempDir() is used.
-func DaemonControlPath(baseDir string) string {
-	return filepath.Join(resolveBaseDir(baseDir), "mcp-muxd.ctl.sock")
+func DaemonControlPath(baseDir, name string) string {
+	if name == "" {
+		name = "mcp-mux"
+	}
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("%s-muxd.ctl.sock", name))
 }
 
 // DaemonLockPath returns the lock file path for daemon startup coordination.
+// The name parameter identifies the engine instance (e.g. "mcp-mux", "aimux").
+// When name is empty, defaults to "mcp-mux" for backward compatibility.
 // When baseDir is empty, os.TempDir() is used.
-func DaemonLockPath(baseDir string) string {
-	return filepath.Join(resolveBaseDir(baseDir), "mcp-muxd.lock")
+func DaemonLockPath(baseDir, name string) string {
+	if name == "" {
+		name = "mcp-mux"
+	}
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("%s-muxd.lock", name))
 }
 
 // DescribeArgs returns a human-readable summary of the command + args

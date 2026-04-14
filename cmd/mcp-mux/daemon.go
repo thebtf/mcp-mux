@@ -20,7 +20,7 @@ import (
 // `mcp-mux daemon` subcommand. The daemon manages all upstream MCP servers,
 // accepts spawn requests via its control socket, and auto-exits after idle timeout.
 func runGlobalDaemon() {
-	ctlPath := serverid.DaemonControlPath("")
+	ctlPath := serverid.DaemonControlPath("", "")
 
 	// Single-daemon validation: if another daemon is already running on this
 	// control socket, exit immediately instead of competing.
@@ -105,7 +105,7 @@ func runGlobalDaemon() {
 // as a detached background process. Returns nil when daemon is ready.
 // Uses a file lock to prevent multiple shims from spawning concurrent daemons.
 func ensureDaemon(logger *log.Logger) error {
-	ctlPath := serverid.DaemonControlPath("")
+	ctlPath := serverid.DaemonControlPath("", "")
 
 	// Fast path: daemon already running (no lock needed)
 	if isDaemonRunning(ctlPath) {
@@ -114,7 +114,7 @@ func ensureDaemon(logger *log.Logger) error {
 
 	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
 	// Lock file is NOT deleted — it persists for coordination across shims.
-	lockPath := serverid.DaemonLockPath("")
+	lockPath := serverid.DaemonLockPath("", "")
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
@@ -202,7 +202,7 @@ func startDaemonProcess() error {
 
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path and handshake token.
 func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
-	ctlPath := serverid.DaemonControlPath("")
+	ctlPath := serverid.DaemonControlPath("", "")
 
 	// Spawn returns immediately after creating the owner — proactive init runs
 	// in background. 30s timeout covers daemon processing + upstream process start.
