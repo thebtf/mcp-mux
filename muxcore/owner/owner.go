@@ -719,11 +719,14 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			o.captureInitFingerprint(msg.Raw)
 		}
 
-		// Inject _meta.muxSessionId, _meta.muxCwd, and _meta.muxEnv for session-aware servers
+		// Inject _meta.muxSessionId, _meta.muxCwd, and _meta.muxEnv when the upstream
+		// needs to distinguish between CC sessions. Two cases:
+		// 1. session-aware: upstream declared x-mux.sharing: session-aware
+		// 2. in-process handler: single handler serves all CC sessions, always needs session identity
 		o.mu.RLock()
-		isSessionAware := o.autoClassification == classify.ModeSessionAware
+		needsMeta := o.autoClassification == classify.ModeSessionAware || o.handlerFunc != nil
 		o.mu.RUnlock()
-		if isSessionAware {
+		if needsMeta {
 			injected, err := jsonrpc.InjectMeta(remapped, "muxSessionId", s.MuxSessionID)
 			if err != nil {
 				o.logger.Printf("session %d: failed to inject muxSessionId: %v", s.ID, err)
