@@ -6,22 +6,22 @@
 
 ## Phase 1: Types + ProjectContext ID
 
-- [ ] T001 Define ProjectContext struct and SessionHandler interface in muxcore/handler.go
+- [x] T001 Define ProjectContext struct and SessionHandler interface in muxcore/handler.go
   AC: ProjectContext has ID (string), Cwd (string), Env (map[string]string) · SessionHandler has HandleRequest(ctx, ProjectContext, []byte) ([]byte, error) · compiles with `go build ./...` · swap body→return null ⇒ tests MUST fail
 
-- [ ] T002 [P] Define optional interfaces in muxcore/handler.go: ProjectLifecycle, NotificationHandler, Notifier, NotifierAware
+- [x] T002 [P] Define optional interfaces in muxcore/handler.go: ProjectLifecycle, NotificationHandler, Notifier, NotifierAware
   AC: ProjectLifecycle has OnProjectConnect(ProjectContext) + OnProjectDisconnect(string) · NotificationHandler has HandleNotification(ctx, ProjectContext, []byte) · Notifier has Notify(string, []byte) error + Broadcast([]byte) · NotifierAware has SetNotifier(Notifier) · compiles · swap body→return null ⇒ tests MUST fail
 
-- [ ] T003 Add WorktreeRoot(cwd string) string to muxcore/serverid/serverid.go
+- [x] T003 Add WorktreeRoot(cwd string) string to muxcore/serverid/serverid.go
   AC: walks up from cwd to find .git · .git dir → returns that directory · .git file (linked worktree) → returns that directory (NOT resolved to main repo) · no .git → returns canonical cwd · swap body→return null ⇒ tests MUST fail
 
-- [ ] T004 [P] Add ProjectContextID(cwd string) string to muxcore/handler.go using WorktreeRoot + sha256
+- [x] T004 [P] Add ProjectContextID(cwd string) string to muxcore/handler.go using WorktreeRoot + sha256
   AC: same worktree root → same ID · different worktree → different ID · subdirectory of worktree → same ID as root · no .git → ID from canonical cwd · ID is hex string len 16 · swap body→return null ⇒ tests MUST fail
 
-- [ ] T005 [P] Tests for WorktreeRoot and ProjectContextID in muxcore/serverid/serverid_test.go and muxcore/handler_test.go
+- [x] T005 [P] Tests for WorktreeRoot and ProjectContextID in muxcore/serverid/serverid_test.go and muxcore/handler_test.go
   AC: TestWorktreeRoot: main checkout, linked worktree (mock .git file), no git, subdirectory · TestProjectContextID: determinism, different cwds, same worktree subdirs · 8+ test cases total · swap body→return null ⇒ tests MUST fail
 
-- [ ] G001 VERIFY Phase 1 (T001–T005) — BLOCKED until T001–T005 all [x]
+- [x] G001 VERIFY Phase 1 (T001–T005) — BLOCKED until T001–T005 all [x]
   RUN: `go test ./muxcore/... ./muxcore/serverid/...`. Code review on handler.go and serverid.go changes.
   CHECK: All types exported. ID generation deterministic. WorktreeRoot does NOT resolve linked worktrees.
   ENFORCE: Zero stubs. Zero TODOs. Every function has tests.
@@ -36,25 +36,25 @@
 **Goal:** SessionHandler receives HandleRequest with ProjectContext per request.
 **Independent Test:** Two mock sessions with different CWDs → handler receives different ProjectContext.ID values. Concurrent requests don't block each other.
 
-- [ ] T006 [US1] Add sessionHandler field to Owner struct and OwnerConfig in muxcore/owner/owner.go
+- [x] T006 [US1] Add sessionHandler field to Owner struct and OwnerConfig in muxcore/owner/owner.go
   AC: OwnerConfig.SessionHandler field added · Owner stores it at construction (NewOwner + NewOwnerFromSnapshot) · nil = legacy path · compiles · swap body→return null ⇒ tests MUST fail
 
-- [ ] T007 [US1] Implement dispatchToSessionHandler in muxcore/owner/owner.go
+- [x] T007 [US1] Implement dispatchToSessionHandler in muxcore/owner/owner.go
   AC: builds ProjectContext from session (ID via ProjectContextID(s.Cwd), Cwd, Env) · calls handler.HandleRequest in goroutine · passes original request bytes (no ID remap) · writes response to session · increments/decrements pendingRequests · swap body→return null ⇒ tests MUST fail
 
-- [ ] T008 [US1] Add ctx deadline from toolTimeout in dispatchToSessionHandler
+- [x] T008 [US1] Add ctx deadline from toolTimeout in dispatchToSessionHandler
   AC: if toolTimeoutNs > 0 → ctx gets deadline · if handler exceeds deadline → JSON-RPC timeout error returned to session · ctx cancelled when session disconnects (s.Done()) · swap body→return null ⇒ tests MUST fail
 
-- [ ] T009 [US1] Add panic recovery in dispatchToSessionHandler goroutine
+- [x] T009 [US1] Add panic recovery in dispatchToSessionHandler goroutine
   AC: handler panic → recovered → JSON-RPC internal error returned to session · daemon does not crash · panic logged with stack · swap body→return null ⇒ tests MUST fail
 
-- [ ] T010 [US1] Wire dispatch in handleSessionRequest: if sessionHandler != nil → dispatchToSessionHandler
+- [x] T010 [US1] Wire dispatch in handleSessionRequest: if sessionHandler != nil → dispatchToSessionHandler
   AC: request branch checks sessionHandler before pipe path · notifications still go to pipe/NotificationHandler (not HandleRequest) · cached responses still replayed (initialize after first call, tools/list etc) · first initialize goes to HandleRequest, Owner caches response · swap body→return null ⇒ tests MUST fail
 
-- [ ] T011 [US1] Tests for dispatch path in muxcore/owner/owner_test.go or new dispatch_test.go
+- [x] T011 [US1] Tests for dispatch path in muxcore/owner/owner_test.go or new dispatch_test.go
   AC: TestDispatchToSessionHandler_BasicEcho · TestDispatchToSessionHandler_ConcurrentSessions (2 sessions, different CWDs, concurrent requests) · TestDispatchToSessionHandler_Timeout (handler blocks, deadline fires) · TestDispatchToSessionHandler_PanicRecovery · TestDispatchToSessionHandler_CacheReplay (second session gets cached init) · 5+ tests · swap body→return null ⇒ tests MUST fail
 
-- [ ] G002 VERIFY Phase 2 (T006–T011) — BLOCKED until T006–T011 all [x]
+- [x] G002 VERIFY Phase 2 (T006–T011) — BLOCKED until T006–T011 all [x]
   RUN: `go test -count=1 ./muxcore/owner/...`. Code review on owner.go dispatch changes.
   CHECK: Concurrent requests work. Timeout fires correctly. Panic doesn't crash daemon. Cache works.
   ENFORCE: Zero stubs. Zero TODOs. Independent test passes.
