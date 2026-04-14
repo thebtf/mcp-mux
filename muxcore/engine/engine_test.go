@@ -1,11 +1,16 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
+
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 )
 
 // noopHandler is a Handler that does nothing and returns immediately.
@@ -240,6 +245,87 @@ func TestNew_HandlerOnly(t *testing.T) {
 	}
 	if e.cfg.Command != "" {
 		t.Errorf("Command should be empty for Handler-only config, got %q", e.cfg.Command)
+	}
+}
+
+// noopSessionHandler implements muxcore.SessionHandler for testing.
+type noopSessionHandler struct{}
+
+func (noopSessionHandler) HandleRequest(_ context.Context, _ muxcore.ProjectContext, _ []byte) ([]byte, error) {
+	return []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`), nil
+}
+
+// TestEngineConfig_BothHandlerAndSessionHandler verifies that when both Handler
+// and SessionHandler are set, New() succeeds and logs a warning that SessionHandler
+// takes priority.
+func TestEngineConfig_BothHandlerAndSessionHandler(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := log.New(&logBuf, "", 0)
+
+	cfg := Config{
+		Name:           "test-server",
+		Handler:        noopHandler,
+		SessionHandler: noopSessionHandler{},
+		Logger:         logger,
+	}
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() unexpected error when both Handler and SessionHandler set: %v", err)
+	}
+	if e == nil {
+		t.Fatal("New() returned nil engine")
+	}
+
+	// Verify the warning was logged.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "SessionHandler takes priority") {
+		t.Errorf("expected warning about SessionHandler priority, got log: %q", logged)
+	}
+
+	// Verify both fields are preserved in the config.
+	if e.cfg.Handler == nil {
+		t.Error("Handler field should be preserved in engine config")
+	}
+	if e.cfg.SessionHandler == nil {
+		t.Error("SessionHandler field should be preserved in engine config")
+	}
+}
+
+// TestEngineConfig_SessionHandlerOnly verifies that New() succeeds when only
+// SessionHandler is set (no Command, no Handler).
+func TestEngineConfig_SessionHandlerOnly(t *testing.T) {
+	cfg := Config{
+		Name:           "test-server",
+		SessionHandler: noopSessionHandler{},
+	}
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() unexpected error with SessionHandler-only config: %v", err)
+	}
+	if e == nil {
+		t.Fatal("New() returned nil engine")
+	}
+	if e.cfg.SessionHandler == nil {
+		t.Error("SessionHandler field not preserved in engine config")
+	}
+}
+
+// TestEngineConfig_MissingAll verifies that New() returns an error when none of
+// Command, Handler, or SessionHandler are provided.
+func TestEngineConfig_MissingAll(t *testing.T) {
+	cfg := Config{
+		Name: "test-server",
+		// Command, Handler, and SessionHandler all omitted
+	}
+	e, err := New(cfg)
+	if err == nil {
+		t.Fatal("New() expected error when Command/Handler/SessionHandler all missing, got nil")
+	}
+	if e != nil {
+		t.Fatal("New() expected nil engine on error, got non-nil")
+	}
+	if !strings.Contains(err.Error(), "SessionHandler") {
+		t.Errorf("error message should mention SessionHandler, got: %v", err)
 	}
 }
 

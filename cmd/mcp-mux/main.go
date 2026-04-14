@@ -36,6 +36,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
+	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
 
 func main() {
@@ -450,14 +451,11 @@ func runUpgrade(restart bool) {
 	//
 	// NEVER call runStop here — it kills daemon, owners, upstreams, and all sessions.
 
-	// Use PID-suffixed .old path to avoid conflicts with locked files from previous upgrades
-	oldPath := fmt.Sprintf("%s.old.%d", exe, os.Getpid())
-
-	// Rename current → .old
-	if err := os.Rename(exe, oldPath); err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot rename %s → %s: %v\n", filepath.Base(exe), filepath.Base(oldPath), err)
+	oldPath, swapErr := upgrade.Swap(exe, pendingPath)
+	if swapErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", swapErr)
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "The binary is locked. This can happen when another mcp-mux")
+		fmt.Fprintln(os.Stderr, "The binary may be locked. This can happen when another mcp-mux")
 		fmt.Fprintln(os.Stderr, "process holds a file handle. Try:")
 		fmt.Fprintln(os.Stderr, "  1. Close all CC sessions")
 		fmt.Fprintln(os.Stderr, "  2. mcp-mux stop --force")
@@ -465,19 +463,10 @@ func runUpgrade(restart bool) {
 		os.Exit(1)
 	}
 
-	// Rename pending → current
-	if err := os.Rename(pendingPath, exe); err != nil {
-		_ = os.Rename(oldPath, exe) // rollback
-		fmt.Fprintf(os.Stderr, "error: rename %s → %s: %v\n", filepath.Base(pendingPath), filepath.Base(exe), err)
-		os.Exit(1)
-	}
-
-	// Best-effort cleanup of .old files (may fail if daemon still runs — that's fine)
+	// Best-effort immediate cleanup of this upgrade's old binary (may be locked — that's fine)
 	_ = os.Remove(oldPath)
-	matches, _ := filepath.Glob(exe + ".old.*")
-	for _, m := range matches {
-		_ = os.Remove(m)
-	}
+	// Clean any other stale artefacts from previous upgrades
+	upgrade.CleanStale(exe)
 
 	// Report
 	ctlPath := serverid.DaemonControlPath("", "")
@@ -544,7 +533,7 @@ func runUpgrade(restart bool) {
 		}
 
 		// Clean up stale old binary files from previous upgrades.
-		cleanupOldBinaries(exe)
+		upgrade.CleanStale(exe)
 
 		// Start new daemon while holding lock — shims will connect to it.
 		fmt.Fprintln(os.Stderr, "Starting new daemon...")
@@ -565,30 +554,6 @@ func runUpgrade(restart bool) {
 		fmt.Fprintln(os.Stderr, "Use: mcp-mux upgrade --restart to restart daemon immediately.")
 	} else {
 		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
-	}
-}
-
-// cleanupOldBinaries removes stale .old.* and .bak files from previous upgrades.
-// These accumulate when Windows locks prevent deletion during upgrade.
-func cleanupOldBinaries(exe string) {
-	patterns := []string{
-		exe + ".old.*",
-		exe + ".bak",
-		exe + "~",  // pending binary leftover
-		exe + "~~", // double-pending from failed upgrades
-	}
-	cleaned := 0
-	for _, pattern := range patterns {
-		matches, _ := filepath.Glob(pattern)
-		for _, m := range matches {
-			if err := os.Remove(m); err == nil {
-				cleaned++
-			}
-			// Ignore errors — files may be locked by still-running processes.
-		}
-	}
-	if cleaned > 0 {
-		fmt.Fprintf(os.Stderr, "Cleaned %d stale binary file(s).\n", cleaned)
 	}
 }
 

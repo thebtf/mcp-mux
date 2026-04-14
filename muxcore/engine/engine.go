@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
@@ -41,6 +42,13 @@ type Config struct {
 	// If set, the daemon runs the handler instead of spawning a subprocess.
 	// Mutually exclusive with Command (if both set, Handler wins).
 	Handler Handler
+
+	// SessionHandler is a structured in-process MCP server implementation.
+	// When set, Owner calls HandleRequest directly for each downstream request
+	// instead of routing through a pipe or subprocess.
+	// Mutually exclusive with Handler and Command.
+	// If both Handler and SessionHandler are set, SessionHandler takes priority.
+	SessionHandler muxcore.SessionHandler
 
 	// IdleTimeout is how long the daemon waits with zero sessions before exiting.
 	// Default: 5 minutes.
@@ -79,8 +87,8 @@ func New(cfg Config) (*MuxEngine, error) {
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("engine: Name is required")
 	}
-	if cfg.Command == "" && cfg.Handler == nil {
-		return nil, fmt.Errorf("engine: Command or Handler is required")
+	if cfg.Command == "" && cfg.Handler == nil && cfg.SessionHandler == nil {
+		return nil, fmt.Errorf("engine: Command, Handler, or SessionHandler is required")
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 5 * time.Minute
@@ -94,6 +102,9 @@ func New(cfg Config) (*MuxEngine, error) {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
+	}
+	if cfg.Handler != nil && cfg.SessionHandler != nil {
+		logger.Printf("engine: warning: both Handler and SessionHandler set, SessionHandler takes priority")
 	}
 	return &MuxEngine{cfg: cfg, logger: logger}, nil
 }
@@ -136,13 +147,19 @@ func (e *MuxEngine) Run(ctx context.Context) error {
 func (e *MuxEngine) runDaemon(ctx context.Context) error {
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 
+	// SessionHandler takes priority over Handler when both are set.
+	handlerFunc := e.cfg.Handler
+	if e.cfg.SessionHandler != nil {
+		handlerFunc = nil // SessionHandler is passed separately; clear HandlerFunc
+	}
 	d, err := daemon.New(daemon.Config{
 		ControlPath:      ctlPath,
 		OwnerIdleTimeout: e.cfg.IdleTimeout,
 		IdleTimeout:      e.cfg.IdleTimeout,
 		Logger:           e.logger,
 		SkipSnapshot:     false,
-		HandlerFunc:      e.cfg.Handler,
+		HandlerFunc:      handlerFunc,
+		SessionHandler:   e.cfg.SessionHandler,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)
@@ -233,7 +250,22 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 // Used when MCP_MUX_SESSION_ID is set, meaning this process is already running
 // behind a parent mcp-mux shim. There is no need to create a daemon or IPC
 // layer — the shim above us handles multiplexing.
+//
+// SessionHandler takes priority over Handler when both are set. If only
+// SessionHandler is set (no Handler), proxy mode is unsupported because
+// SessionHandler requires per-request dispatch, not a raw stdio bridge.
 func (e *MuxEngine) runProxy(ctx context.Context) error {
+	// SessionHandler takes priority — if both are set, use Handler is skipped.
+	if e.cfg.SessionHandler != nil {
+		if e.cfg.Handler == nil {
+			return fmt.Errorf("engine proxy: proxy mode requires Handler; SessionHandler does not support raw stdio proxy mode")
+		}
+		// Both set: SessionHandler wins — do not fall through to Handler.
+		// Proxy mode is a stdio passthrough; SessionHandler is handled by the daemon.
+		// Log and skip — the daemon will route requests through SessionHandler.
+		e.logger.Printf("engine proxy: SessionHandler set, skipping Handler for proxy mode (session=%s)", os.Getenv("MCP_MUX_SESSION_ID"))
+		return nil
+	}
 	if e.cfg.Handler == nil {
 		return fmt.Errorf("engine proxy: Handler is required for proxy mode")
 	}

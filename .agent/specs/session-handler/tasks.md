@@ -102,16 +102,16 @@
 **Goal:** engine.Config accepts SessionHandler. Legacy Handler path unbroken.
 **Independent Test:** engine.Config{Handler: legacyFunc} works. engine.Config{SessionHandler: x} works. Both set → SessionHandler wins.
 
-- [ ] T018 [US4] Add SessionHandler field to engine.Config in muxcore/engine/engine.go
+- [x] T018 [US4] Add SessionHandler field to engine.Config in muxcore/engine/engine.go
   AC: field added · passed to daemon.Config · if both Handler and SessionHandler set → log warning, SessionHandler wins · swap body→return null ⇒ tests MUST fail
 
-- [ ] T019 [US4] Add SessionHandler field to daemon.Config and wire to OwnerConfig in muxcore/daemon/daemon.go
+- [x] T019 [US4] Add SessionHandler field to daemon.Config and wire to OwnerConfig in muxcore/daemon/daemon.go
   AC: daemon.Config.SessionHandler stored · passed to OwnerConfig in Spawn() · swap body→return null ⇒ tests MUST fail
 
-- [ ] T020 [US4] Backward compatibility regression tests
+- [x] T020 [US4] Backward compatibility regression tests
   AC: TestEngineConfig_LegacyHandler (Handler only → pipe path, _meta injection works) · TestEngineConfig_SessionHandler (SessionHandler only → structured path) · TestEngineConfig_BothSet (SessionHandler wins, Handler ignored, warning logged) · TestEngineConfig_NeitherSet (error) · 4 tests · swap body→return null ⇒ tests MUST fail
 
-- [ ] G004 VERIFY Phase 4 (T018–T020) — BLOCKED until T018–T020 all [x]
+- [x] G004 VERIFY Phase 4 (T018–T020) — BLOCKED until T018–T020 all [x]
   RUN: `go test -count=1 ./muxcore/...`. Full test suite — no regressions.
   CHECK: Legacy path unchanged. SessionHandler path works through engine.
   ENFORCE: Zero stubs. Zero breaking changes to existing API.
@@ -126,19 +126,19 @@
 **Goal:** Export upgrade/restart mechanism as library API.
 **Independent Test:** upgrade.Upgrade renames binary atomically. Cleanup removes stale files.
 
-- [ ] T021 Extract upgrade logic from cmd/mcp-mux/main.go into muxcore/upgrade/upgrade.go
+- [x] T021 Extract upgrade logic from cmd/mcp-mux/main.go into muxcore/upgrade/upgrade.go
   AC: Upgrade(currentExe, newExe string, restart bool) error exported · atomic rename (rename current → .old.{pid}, rename new → current) · if restart: serialize snapshot, signal daemon, wait for exit, start new · swap body→return null ⇒ tests MUST fail
 
-- [ ] T022 [P] Platform-specific files: muxcore/upgrade/upgrade_windows.go and upgrade_unix.go
+- [x] T022 [P] Platform-specific files: muxcore/upgrade/upgrade_windows.go and upgrade_unix.go
   AC: Windows: rename semantics handle locked exe (rename-over works) · Unix: standard rename + SIGTERM · both compile on respective platforms · swap body→return null ⇒ tests MUST fail
 
-- [ ] T023 [P] Refactor cmd/mcp-mux/main.go runUpgrade() to call upgrade.Upgrade()
+- [x] T023 [P] Refactor cmd/mcp-mux/main.go runUpgrade() to call upgrade.Upgrade()
   AC: runUpgrade() delegates to upgrade.Upgrade() · all existing behavior preserved · stale binary cleanup preserved · swap body→return null ⇒ tests MUST fail
 
-- [ ] T024 Tests for upgrade in muxcore/upgrade/upgrade_test.go
+- [x] T024 Tests for upgrade in muxcore/upgrade/upgrade_test.go
   AC: TestUpgrade_AtomicRename (temp files, verify swap) · TestUpgrade_CleanupStaleFiles · TestUpgrade_NewBinaryNotFound_Error · 3+ tests · swap body→return null ⇒ tests MUST fail
 
-- [ ] G005 VERIFY Phase 5 (T021–T024) — BLOCKED until T021–T024 all [x]
+- [x] G005 VERIFY Phase 5 (T021–T024) — BLOCKED until T021–T024 all [x]
   RUN: `go test -count=1 ./muxcore/upgrade/...` + `go build ./cmd/mcp-mux/`.
   CHECK: Existing mcp-mux upgrade --restart still works. Library API callable from external consumers.
   ENFORCE: Zero stubs. No behavior change in cmd/mcp-mux.
