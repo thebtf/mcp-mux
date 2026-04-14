@@ -46,13 +46,21 @@ func (p *Process) SetDrainTimeout(d time.Duration) {
 }
 
 // Start spawns an upstream process with the given command, args, environment, and working directory.
-// The env map is merged with the current process environment.
+// When env is non-empty, it is used as the complete process environment (converted from map to slice).
+// When env is nil/empty, the current process environment (os.Environ()) is used as fallback.
 // If cwd is non-empty, the child process runs in that directory.
 func Start(command string, args []string, env map[string]string, cwd string) (*Process, error) {
-	// Build merged environment: start from current process env, then overlay caller-supplied vars.
-	merged := os.Environ()
-	for k, v := range env {
-		merged = append(merged, fmt.Sprintf("%s=%s", k, v))
+	var merged []string
+	if len(env) > 0 {
+		// Full session env provided — use it directly, no os.Environ() merge.
+		merged = make([]string, 0, len(env))
+		for k, v := range env {
+			merged = append(merged, fmt.Sprintf("%s=%s", k, v))
+		}
+	} else {
+		// No session env (nil map) — fallback to daemon process env.
+		// This covers owners created without spawn request (tests, direct construction).
+		merged = os.Environ()
 	}
 
 	p := &Process{

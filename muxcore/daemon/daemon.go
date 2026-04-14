@@ -492,14 +492,12 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 
 	ipcPath := serverid.IPCPath(sid, "")
 
-	// Compute env diff: only vars that the shim has but daemon doesn't (CC-configured vars).
-	envDiff := diffEnv(req.Env)
-	if len(envDiff) > 0 {
-		keys := make([]string, 0, len(envDiff))
-		for k := range envDiff {
-			keys = append(keys, k)
-		}
-		d.logger.Printf("owner %s: env diff %d vars: %v", sid[:8], len(envDiff), keys)
+	// Pass full session env to the owner. No diff — the owner and upstream
+	// receive exactly the environment the CC session had. This prevents env
+	// leaks between sessions and ensures session-aware servers see all vars.
+	sessionEnv := req.Env
+	if len(sessionEnv) > 0 {
+		d.logger.Printf("owner %s: session env %d vars", sid[:8], len(sessionEnv))
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
@@ -507,7 +505,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	ownerCfg := owner.OwnerConfig{
 		Command:        req.Command,
 		Args:           req.Args,
-		Env:            envDiff,
+		Env:            sessionEnv,
 		Cwd:            req.Cwd,
 		IPCPath:        ipcPath,
 		ControlPath:    controlPath,
@@ -548,7 +546,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 		tmpl.ServerID = sid
 		tmpl.Cwd = req.Cwd
 		tmpl.CwdSet = []string{req.Cwd}
-		tmpl.Env = envDiff
+		tmpl.Env = sessionEnv
 		tmpl.Mode = req.Mode
 
 		o, err = owner.NewOwnerFromSnapshot(ownerCfg, tmpl)
@@ -819,25 +817,6 @@ func envTransient(key string) bool {
 		return true
 	}
 	return false
-}
-
-// diffEnv returns only the env vars from shim that differ from daemon's own env.
-// This extracts CC-configured vars (API keys, config paths) without duplicating
-// the ~100 standard OS vars that daemon already has.
-func diffEnv(shimEnv map[string]string) map[string]string {
-	if len(shimEnv) == 0 {
-		return nil
-	}
-	diff := make(map[string]string)
-	for k, v := range shimEnv {
-		if daemonVal, ok := os.LookupEnv(k); !ok || daemonVal != v {
-			diff[k] = v
-		}
-	}
-	if len(diff) == 0 {
-		return nil
-	}
-	return diff
 }
 
 // Shutdown gracefully stops all owners and the daemon.
