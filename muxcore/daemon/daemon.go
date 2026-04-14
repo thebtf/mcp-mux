@@ -304,10 +304,10 @@ func cleanStaleSockets(logger *log.Logger) int {
 	cleaned := 0
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") {
-			continue
-		}
-		if !strings.HasSuffix(name, ".sock") {
+		// Match mcp-mux sockets (mcp-mux-*.sock) and engine daemon sockets (*-muxd.ctl.sock)
+		isMuxSocket := strings.HasPrefix(name, "mcp-mux-") && strings.HasSuffix(name, ".sock")
+		isDaemonSocket := strings.HasSuffix(name, "-muxd.ctl.sock")
+		if !isMuxSocket && !isDaemonSocket {
 			continue
 		}
 		path := filepath.Join(tmpDir, name)
