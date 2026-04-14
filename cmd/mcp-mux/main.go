@@ -292,7 +292,7 @@ func runServe() {
 
 func runStop(drainTimeout time.Duration, force bool) {
 	// Try stopping daemon first
-	ctlPath := serverid.DaemonControlPath("")
+	ctlPath := serverid.DaemonControlPath("", "")
 	if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Stopping daemon...")
 		drainMs := int(drainTimeout.Milliseconds())
@@ -480,7 +480,7 @@ func runUpgrade(restart bool) {
 	}
 
 	// Report
-	ctlPath := serverid.DaemonControlPath("")
+	ctlPath := serverid.DaemonControlPath("", "")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
@@ -488,7 +488,7 @@ func runUpgrade(restart bool) {
 		// Acquire daemon lock BEFORE sending graceful-restart.
 		// This prevents shims from spawning a competing daemon during the restart window.
 		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
-		lockPath := serverid.DaemonLockPath("")
+		lockPath := serverid.DaemonLockPath("", "")
 		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 		if lockErr == nil {
 			if flockErr := lockFile(lock); flockErr == nil {
@@ -606,7 +606,7 @@ func collectEnv() map[string]string {
 
 func runStatus() {
 	// Try daemon first
-	ctlPath := serverid.DaemonControlPath("")
+	ctlPath := serverid.DaemonControlPath("", "")
 	if isDaemonRunning(ctlPath) {
 		resp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
 		if err == nil && resp.OK && resp.Data != nil {

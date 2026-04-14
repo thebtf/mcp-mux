@@ -91,23 +91,45 @@ func TestIPCPath_CustomBaseDir(t *testing.T) {
 
 func TestDaemonControlPath_CustomBaseDir(t *testing.T) {
 	customDir := t.TempDir()
-	path := DaemonControlPath(customDir)
+	path := DaemonControlPath(customDir, "")
 	if filepath.Dir(path) != customDir {
 		t.Errorf("DaemonControlPath with custom baseDir: got dir %q, want %q", filepath.Dir(path), customDir)
 	}
-	if filepath.Base(path) != "mcp-muxd.ctl.sock" {
+	if filepath.Base(path) != "mcp-mux-muxd.ctl.sock" {
 		t.Errorf("DaemonControlPath = %q, unexpected filename", path)
+	}
+}
+
+func TestDaemonControlPath_CustomName(t *testing.T) {
+	customDir := t.TempDir()
+	path := DaemonControlPath(customDir, "aimux")
+	if filepath.Dir(path) != customDir {
+		t.Errorf("DaemonControlPath with custom name: got dir %q, want %q", filepath.Dir(path), customDir)
+	}
+	if filepath.Base(path) != "aimux-muxd.ctl.sock" {
+		t.Errorf("DaemonControlPath = %q, want aimux-muxd.ctl.sock", filepath.Base(path))
 	}
 }
 
 func TestDaemonLockPath_CustomBaseDir(t *testing.T) {
 	customDir := t.TempDir()
-	path := DaemonLockPath(customDir)
+	path := DaemonLockPath(customDir, "")
 	if filepath.Dir(path) != customDir {
 		t.Errorf("DaemonLockPath with custom baseDir: got dir %q, want %q", filepath.Dir(path), customDir)
 	}
-	if filepath.Base(path) != "mcp-muxd.lock" {
+	if filepath.Base(path) != "mcp-mux-muxd.lock" {
 		t.Errorf("DaemonLockPath = %q, unexpected filename", path)
+	}
+}
+
+func TestDaemonLockPath_CustomName(t *testing.T) {
+	customDir := t.TempDir()
+	path := DaemonLockPath(customDir, "aimux")
+	if filepath.Dir(path) != customDir {
+		t.Errorf("DaemonLockPath with custom name: got dir %q, want %q", filepath.Dir(path), customDir)
+	}
+	if filepath.Base(path) != "aimux-muxd.lock" {
+		t.Errorf("DaemonLockPath = %q, want aimux-muxd.lock", filepath.Base(path))
 	}
 }
 

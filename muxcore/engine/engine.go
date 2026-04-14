@@ -134,7 +134,7 @@ func (e *MuxEngine) Run(ctx context.Context) error {
 // connections. It mirrors the behaviour of runGlobalDaemon() in cmd/mcp-mux/
 // but uses the engine's Config for timeouts and base directory.
 func (e *MuxEngine) runDaemon(ctx context.Context) error {
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir)
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 
 	d, err := daemon.New(daemon.Config{
 		ControlPath:      ctlPath,
@@ -169,7 +169,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 //  3. Connect to the returned IPC socket.
 //  4. Bridge stdin/stdout ↔ IPC with automatic reconnect.
 func (e *MuxEngine) runClient(ctx context.Context) error {
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir)
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 
 	// 1. Ensure the daemon is running, starting it if necessary.
 	if !isDaemonRunning(ctlPath) {
@@ -264,7 +264,7 @@ func (e *MuxEngine) startDaemon() error {
 		return fmt.Errorf("release daemon process: %w", err)
 	}
 
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir)
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 	return waitForDaemon(ctlPath, 10*time.Second)
 }
 
