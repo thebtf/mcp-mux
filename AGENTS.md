@@ -57,12 +57,12 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.18.0)
+## muxcore Library API (v0.19.0)
 
-### Upgrade from v0.17.x
+### Upgrade from v0.18.x
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.18.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.19.0
 ```
 
 #### Breaking changes
@@ -126,10 +126,12 @@ For full graceful restart with snapshot serialization, the daemon-specific logic
 (signal, wait, re-start) remains in the consumer's main.go — `upgrade.Swap` handles
 only the atomic file rename.
 
-#### Bug fixes included in v0.18.0
+#### Bug fixes included in v0.18.0–v0.19.0
 
 | Fix | Issue |
 |-----|-------|
+| Full env passthrough — remove diffEnv, pass complete session env | #50 |
+| Stale daemon socket cleanup for engine consumers | #48 |
 | Daemon CPU spin (60-80%) when owner shutdown with nil upstream | #46 |
 | Crash circuit breaker (5 crashes/60s → spawn rejected) | #43 |
 | CWD-aware dedup (no cross-project context leaks) | #42 |
@@ -140,7 +142,7 @@ only the atomic file rename.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.18.0
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.19.0
 ```
 
 Key changes to adopt:
@@ -152,7 +154,7 @@ Key changes to adopt:
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.18.0
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.19.0
 ```
 
 Key changes:
