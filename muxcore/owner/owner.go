@@ -442,9 +442,13 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger = log.Default()
 	}
 
-	// Spawn upstream — either in-process handler or subprocess.
+	// Spawn upstream — either in-process handler, subprocess, or neither (SessionHandler-only).
 	var proc *upstream.Process
-	if cfg.HandlerFunc != nil {
+	if cfg.SessionHandler != nil && cfg.HandlerFunc == nil {
+		// SessionHandler-only: no upstream process needed.
+		// Requests dispatch directly via dispatchToSessionHandler.
+		logger.Printf("owner: SessionHandler-only mode (no upstream process)")
+	} else if cfg.HandlerFunc != nil {
 		proc = upstream.NewProcessFromHandler(context.Background(), cfg.HandlerFunc)
 		logger.Printf("owner: started in-process handler (no subprocess)")
 	} else {
@@ -458,7 +462,9 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	// Start IPC listener
 	ln, err := ipc.Listen(cfg.IPCPath)
 	if err != nil {
-		proc.Close()
+		if proc != nil {
+			proc.Close()
+		}
 		return nil, fmt.Errorf("owner: listen %s: %w", cfg.IPCPath, err)
 	}
 
@@ -518,7 +524,10 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	// Send proactive initialize to upstream so init response is cached
 	// before any session connects. Without this, Daemon.Spawn blocks on
 	// InitReady() but init requires a session to send the request — deadlock.
-	go o.sendProactiveInit()
+	// SessionHandler-only owners have no upstream, so skip the proactive init.
+	if proc != nil {
+		go o.sendProactiveInit()
+	}
 
 	// Start accepting IPC connections
 	go o.acceptLoop()
@@ -526,22 +535,24 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	// Start synthetic progress reporter
 	go o.runProgressReporter(doneContext(o.done))
 
-	// Monitor upstream exit
-	go func() {
-		<-proc.Done
-		logger.Printf("upstream exited: %v", proc.ExitErr)
-		// Signal init-ready so Daemon.Spawn doesn't block forever on crashed upstream
-		o.initReadyOnce.Do(func() {
-			if o.initReady != nil {
-				close(o.initReady)
+	// Monitor upstream exit (skip in SessionHandler-only mode — proc is nil)
+	if proc != nil {
+		go func() {
+			<-proc.Done
+			logger.Printf("upstream exited: %v", proc.ExitErr)
+			// Signal init-ready so Daemon.Spawn doesn't block forever on crashed upstream
+			o.initReadyOnce.Do(func() {
+				if o.initReady != nil {
+					close(o.initReady)
+				}
+			})
+			if o.onUpstreamExit != nil {
+				o.onUpstreamExit(o.serverID)
+			} else {
+				o.Shutdown()
 			}
-		})
-		if o.onUpstreamExit != nil {
-			o.onUpstreamExit(o.serverID)
-		} else {
-			o.Shutdown()
-		}
-	}()
+		}()
+	}
 
 	return o, nil
 }
@@ -729,15 +740,17 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			}
 		}
 
-		// Fail fast if upstream is dead or not yet spawned (snapshot owner without cache hit)
+		// SessionHandler dispatch: structured path without pipe/remap/_meta.
+		// Must come BEFORE the upstream nil check so SessionHandler-only owners
+		// (where o.upstream == nil by design) can serve requests normally.
+		if o.sessionHandler != nil {
+			return o.dispatchToSessionHandler(s, msg)
+		}
+
+		// Fail fast if upstream is dead or not yet spawned (pipe-based mode only)
 		if o.upstream == nil || o.upstreamDead.Load() {
 			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
 			return s.WriteRaw([]byte(errResp))
-		}
-
-		// SessionHandler dispatch: structured path without pipe/remap/_meta
-		if o.sessionHandler != nil {
-			return o.dispatchToSessionHandler(s, msg)
 		}
 
 		// Track pending requests
@@ -947,6 +960,9 @@ func (o *Owner) sendProactiveInit() {
 
 // readUpstream reads responses from the upstream and routes them to the correct session.
 func (o *Owner) readUpstream() {
+	if o.upstream == nil {
+		return // SessionHandler-only mode — no upstream to read
+	}
 	defer func() {
 		o.upstreamDead.Store(true)
 		o.drainInflightRequests() // send error responses for all pending requests
@@ -1711,6 +1727,18 @@ var closedChan = func() chan struct{} {
 // non-deterministically return nil instead of the expected error/ErrDoNotRestart,
 // making restart/backoff policies unreliable.
 func (o *Owner) Serve(ctx context.Context) error {
+	// SessionHandler-only: no upstream process to monitor.
+	// Block until ctx is cancelled or Shutdown is called, then return cleanly.
+	if o.sessionHandler != nil && o.upstream == nil {
+		select {
+		case <-ctx.Done():
+			o.Shutdown()
+			return ctx.Err()
+		case <-o.done:
+			return nil
+		}
+	}
+
 	for {
 		// Snapshot the current dead/pending channel under a single lock read.
 		// If backgroundSpawnCh is non-nil, upstreamDeadCh returns it (blocking Serve
@@ -1970,6 +1998,10 @@ func (o *Owner) touchActivity() {
 // writeUpstream is the single choke point for sending a line to upstream
 // stdin. Wrapping upstream.WriteLine lets us touch activity on every
 // outbound message without scattering the call across 15+ sites.
+//
+// SessionHandler-only owners never call writeUpstream — requests dispatch
+// directly via dispatchToSessionHandler, and notification forwarding
+// returns early when o.upstream == nil.
 func (o *Owner) writeUpstream(data []byte) error {
 	o.touchActivity()
 	return o.upstream.WriteLine(data)
