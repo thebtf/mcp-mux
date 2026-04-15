@@ -555,15 +555,23 @@ func (rc *resilientClient) drainOrphanedInflight(stdoutMu *sync.Mutex) {
 	}
 
 	rc.log.Printf("resilient: sending error responses for %d orphaned in-flight requests", len(orphaned))
+	var writeErrors int
 	for _, id := range orphaned {
 		errResp := fmt.Sprintf(
 			`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream restarted, request lost during reconnect"}}`,
 			id,
 		)
 		stdoutMu.Lock()
-		fmt.Fprintf(rc.cfg.Stdout, "%s\n", errResp)
+		_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", errResp)
 		stdoutMu.Unlock()
+		if err != nil {
+			writeErrors++
+			rc.log.Printf("resilient: failed to write orphaned-inflight error response for id=%s: %v", id, err)
+		}
 		rc.inflight.Delete(id)
+	}
+	if writeErrors > 0 {
+		rc.log.Printf("resilient: drainOrphanedInflight: %d/%d write errors — CC may hang on those requests", writeErrors, len(orphaned))
 	}
 }
 

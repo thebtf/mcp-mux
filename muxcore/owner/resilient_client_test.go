@@ -597,3 +597,133 @@ func TestResilientClient_InitReplayOnReconnect(t *testing.T) {
 		t.Fatal("RunResilientClient did not exit")
 	}
 }
+
+// failingWriter fails every Write with a configurable error.
+type failingWriter struct {
+	err   error
+	count int
+	mu    sync.Mutex
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.count++
+	return 0, w.err
+}
+
+// capturingLogger is an io.Writer that buffers log output for inspection.
+type capturingLogger struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (c *capturingLogger) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *capturingLogger) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+// TestResilientClient_DrainOrphanedInflight_LogsWriteErrors verifies FR-7:
+// when drainOrphanedInflight fails to write an error response to CC stdout
+// (e.g. pipe closed during reconnect), the failure must be logged with the
+// failing request id so operators can see which CC requests will hang.
+//
+// Regression for: previously fmt.Fprintf's error was discarded, making it
+// impossible to distinguish "CC got all responses" from "CC is hung on N
+// lost requests".
+func TestResilientClient_DrainOrphanedInflight_LogsWriteErrors(t *testing.T) {
+	sink := &capturingLogger{}
+	logger := log.New(sink, "", 0)
+	stdout := &failingWriter{err: io.ErrClosedPipe}
+
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{
+			Stdout: stdout,
+		},
+		log: logger,
+	}
+
+	// Seed inflight with 3 orphaned IDs: one numeric, two string.
+	rc.inflight.Store("42", true)
+	rc.inflight.Store(`"req-xyz"`, true)
+	rc.inflight.Store(`"req-hang"`, true)
+
+	var stdoutMu sync.Mutex
+	rc.drainOrphanedInflight(&stdoutMu)
+
+	// All inflight entries must be cleared regardless of write success,
+	// otherwise they'd accumulate on every reconnect.
+	remaining := 0
+	rc.inflight.Range(func(_, _ any) bool { remaining++; return true })
+	if remaining != 0 {
+		t.Errorf("inflight not cleared after drain: %d entries remain", remaining)
+	}
+
+	// Writer must have been called 3 times (one per orphaned id).
+	if stdout.count != 3 {
+		t.Errorf("expected 3 write attempts, got %d", stdout.count)
+	}
+
+	// Log must contain: (a) the initial summary line, (b) per-id error lines
+	// identifying *which* requests will hang, (c) the aggregate failure count.
+	logs := sink.String()
+	t.Logf("captured logs:\n%s", logs)
+
+	if !strings.Contains(logs, "sending error responses for 3 orphaned in-flight requests") {
+		t.Errorf("log missing initial summary: %q", logs)
+	}
+	for _, id := range []string{"42", `"req-xyz"`, `"req-hang"`} {
+		snippet := fmt.Sprintf("failed to write orphaned-inflight error response for id=%s", id)
+		if !strings.Contains(logs, snippet) {
+			t.Errorf("log missing per-id error for id=%s: %q", id, logs)
+		}
+	}
+	if !strings.Contains(logs, "3/3 write errors") {
+		t.Errorf("log missing aggregate write-error summary: %q", logs)
+	}
+	if !strings.Contains(logs, "CC may hang on those requests") {
+		t.Errorf("log missing operator-visible hang warning: %q", logs)
+	}
+}
+
+// TestResilientClient_DrainOrphanedInflight_NoErrorsOnSuccess verifies that
+// drainOrphanedInflight does NOT log any write-error lines or aggregate
+// summary when writes succeed — avoids log-pollution false positives.
+func TestResilientClient_DrainOrphanedInflight_NoErrorsOnSuccess(t *testing.T) {
+	sink := &capturingLogger{}
+	logger := log.New(sink, "", 0)
+	var buf strings.Builder
+
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{
+			Stdout: &buf,
+		},
+		log: logger,
+	}
+	rc.inflight.Store("1", true)
+	rc.inflight.Store("2", true)
+
+	var stdoutMu sync.Mutex
+	rc.drainOrphanedInflight(&stdoutMu)
+
+	logs := sink.String()
+	if strings.Contains(logs, "failed to write orphaned-inflight") {
+		t.Errorf("unexpected per-id failure log on success path: %q", logs)
+	}
+	if strings.Contains(logs, "write errors") {
+		t.Errorf("unexpected aggregate failure summary on success path: %q", logs)
+	}
+
+	// Sanity: both error responses were actually written.
+	out := buf.String()
+	if !strings.Contains(out, `"id":1`) || !strings.Contains(out, `"id":2`) {
+		t.Errorf("expected both error responses on stdout, got: %q", out)
+	}
+}
