@@ -964,3 +964,103 @@ func TestFindSharedOwner_SkipsPlaceholdersFirstPass(t *testing.T) {
 	delete(d.owners, stuckSID)
 	d.mu.Unlock()
 }
+
+// TestArgsEqual covers the small helper used by findSharedOwner for argv
+// comparison. Regression guard: before FR-8 review, argv was compared by
+// joining with spaces, which collided on ("sh -c", ["ls"]) vs ("sh", ["-c", "ls"]).
+func TestArgsEqual(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"both nil", nil, nil, true},
+		{"nil vs empty", nil, []string{}, true},
+		{"identical", []string{"run", "main.go"}, []string{"run", "main.go"}, true},
+		{"different lengths", []string{"run"}, []string{"run", "main.go"}, false},
+		{"different elements", []string{"run", "a.go"}, []string{"run", "b.go"}, false},
+		// The historical space-join collision: these argv lists would produce
+		// the same concatenated needle "sh -c ls" under the old code.
+		{
+			name: "space-join collision sh -c",
+			a:    []string{"-c", "ls"},
+			b:    []string{"-c ls"},
+			want: false,
+		},
+		{
+			name: "single arg with space",
+			a:    []string{"hello world"},
+			b:    []string{"hello", "world"},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := argsEqual(tc.a, tc.b); got != tc.want {
+				t.Errorf("argsEqual(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFindSharedOwner_NoArgsJoinCollision is a regression test for Gemini's
+// PR #55 review finding: findSharedOwner previously used
+//
+//	needle := command + " " + strings.Join(args, " ")
+//
+// to compare argv, which collides on different tokenizations of the same
+// command line. Two owners with commands that produce the same joined string
+// but DIFFERENT argv were wrongly reported as matches.
+//
+// This test installs a live owner for ("sh", ["-c ls"]) and asks for
+// ("sh", ["-c", "ls"]). With the old code findSharedOwner would return the
+// live entry (false positive). With the fix it must return nil.
+func TestFindSharedOwner_NoArgsJoinCollision(t *testing.T) {
+	d := testDaemon(t)
+
+	// Seed a real owner via Spawn so findSharedOwner has a live candidate.
+	// We use the same mock server harness the other tests use.
+	seedReq := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	}
+	_, seedSID, _, err := d.Spawn(seedReq)
+	if err != nil {
+		t.Fatalf("seed Spawn: %v", err)
+	}
+
+	// Classify so findSharedOwner's Classified() check does not gate the match.
+	d.mu.RLock()
+	entry := d.owners[seedSID]
+	d.mu.RUnlock()
+	if entry != nil && entry.Owner != nil {
+		entry.Owner.MarkClassified()
+	}
+
+	// A request with DIFFERENT argv tokenization that would historically
+	// collide on the space-joined needle must NOT be matched.
+	//
+	//   old: "go run ../../testdata/mock_server.go"  (joined)
+	//   new: needs exact argv equality
+	//
+	// Construct a collision candidate: one element that equals the joined
+	// version of the seeded argv.
+	joined := seedReq.Args[0] + " " + seedReq.Args[1]
+	collision := findSharedOwnerLocked(d, seedReq.Command, []string{joined}, nil)
+	if collision != nil {
+		t.Fatalf("findSharedOwner matched on space-joined argv (collision) — got entry %q, want nil",
+			collision.ServerID)
+	}
+
+	// Sanity: with the EXACT argv, the match should still succeed.
+	match := findSharedOwnerLocked(d, seedReq.Command, seedReq.Args, nil)
+	if match == nil {
+		t.Fatal("findSharedOwner missed the legitimate exact match after the arg-collision fix")
+	}
+	if match.ServerID != seedSID {
+		t.Errorf("findSharedOwner returned serverID %q, want %q", match.ServerID, seedSID)
+	}
+}

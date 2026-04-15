@@ -766,21 +766,20 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 	d.mu.Unlock()
 }
 
-// findSharedOwner searches for an existing owner with the same command+args
-// that is still accepting connections. Dedup is optimistic: unclassified owners
-// are assumed shareable. If an owner later classifies as isolated, it closes its
-// IPC listener — extra sessions get EOF and reconnect with their own owner.
-//
-// Must be called with d.mu held. May transiently release and re-acquire d.mu
-// when it encounters a placeholder (Owner == nil) for a matching command+args —
-// it waits for that creation to complete before returning.
 // findSharedOwner looks for an accepting owner that matches the requested
 // command+args and is compatible with the caller's env and cwd for shared reuse.
+// Dedup is optimistic: unclassified owners are assumed shareable. If an owner
+// later classifies as isolated, it closes its IPC listener — extra sessions get
+// EOF and reconnect with their own owner.
 //
-// FR-8 / BUG-007 — Lock semantics: this function must be called with d.mu
-// held (Lock or RLock). It never drops and re-acquires the lock mid-iteration
-// over d.owners (that would leave subsequent iteration reading a stale map
-// snapshot while allowing concurrent mutations to corrupt pointers).
+// Lock semantics (FR-8 / BUG-007): this function MUST be called with d.mu
+// Lock-held (write lock, not RLock). It drops d.mu via d.mu.Unlock() while
+// waiting for an in-flight placeholder to resolve, then re-acquires with
+// d.mu.Lock(). Calling it under RLock is a panic (Unlock on an RLock-held mutex).
+//
+// Match semantics: command and args are compared field-by-field, NOT by
+// joining on spaces — that would make ("sh -c", ["ls"]) collide with
+// ("sh", ["-c", "ls"]) and produce false positives for shells and wrappers.
 //
 // Placeholder handling: the first scan pass skips entries still being created
 // (Owner == nil). If the scan finds no concrete match but one or more matching
@@ -791,7 +790,6 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // actively creating an owner; after a full wait-and-resolve cycle, either a
 // live entry exists or no placeholder remains).
 func (d *Daemon) findSharedOwner(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
-	needle := command + " " + strings.Join(args, " ")
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
 
 	// Wait budget: at most one placeholder-wait cycle. Multiple matching
@@ -807,8 +805,10 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 			placeholder chan struct{}
 		)
 		for _, entry := range d.owners {
-			candidate := entry.Command + " " + strings.Join(entry.Args, " ")
-			if candidate != needle {
+			if entry.Command != command {
+				continue
+			}
+			if !argsEqual(entry.Args, args) {
 				continue
 			}
 			if entry.Owner == nil {
@@ -881,6 +881,21 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 		d.mu.Lock()
 		// Loop: fresh scan on the now-mutated map.
 	}
+}
+
+// argsEqual compares two argv slices element-by-element. Used by findSharedOwner
+// instead of joining on spaces, which would collide on different tokenizations
+// of the same command line (e.g. "sh -c" + "ls" vs "sh" + "-c ls").
+func argsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // envCompatible returns true if two env maps have no conflicting values
