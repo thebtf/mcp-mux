@@ -57,13 +57,31 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.19.2)
+## muxcore Library API (v0.19.3)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.19.2
+go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
 ```
+
+v0.19.3 is a concurrency-correctness release on top of v0.19.2. Fixes 7
+post-audit findings (4 P1 blockers + 3 P2 High). No API changes — zero
+consumer code modifications required. Drop-in upgrade.
+
+| Fix | Where | Severity |
+|-----|-------|----------|
+| Owner Serve loop CPU spin after failed background spawn (BUG-001) | `owner/owner.go` | P1 |
+| `ownerNotifier.Notify` held RLock across 30s write deadline (BUG-002) | `owner/owner.go` | P1 |
+| JSON escape regression in `dispatchToSessionHandler` — invalid JSON on Windows paths/quotes (H1) | `owner/owner.go` | P1 |
+| `daemon.cleanupDeadOwner` TOCTOU identity gap (BUG-003) | `daemon/daemon.go` | P1 |
+| `control.Server handleConn` no read/write deadlines — silent-client DoS (BUG-004) | `control/server.go` | P1 |
+| `daemon.Spawn` recursion on stuck placeholder + findSharedOwner argv collision | `daemon/daemon.go` | P2 |
+| `drainOrphanedInflight` silent stdout write failures — CC hang with no log | `owner/resilient_client.go` | P2 |
+| `findSharedOwner` lock-semantics doc ambiguity + stale-iterator hazard | `daemon/daemon.go` | P2 |
+
+Every fix ships with at least one regression test. Full release notes:
+https://github.com/thebtf/mcp-mux/releases/tag/muxcore/v0.19.3
 
 v0.19.2 is a bug fix release on top of v0.19.1 — fixes a recursive goroutine
 leak in `daemon.Spawn` when a concurrent placeholder wait times out. No API
@@ -152,24 +170,24 @@ only the atomic file rename.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.19.0
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
 ```
 
 Key changes to adopt:
 1. **SessionHandler** — replace `srv.StdioHandler()` with SessionHandler implementation to get per-CC-session ProjectContext
 2. **upgrade.Swap** — replace manual binary rename with `upgrade.Swap(exe, newExe)` + `upgrade.CleanStale(exe)`
-3. **CPU spin fix** — included automatically, no code changes needed
+3. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
 4. **Circuit breaker** — included automatically, protects against upstream crash loops
 
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.19.0
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
 ```
 
 Key changes:
 1. **DaemonControlPath** — if you call it directly, add name parameter: `DaemonControlPath(baseDir, "engram")`
-2. **CPU spin fix** — included automatically
+2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
 
 ## INSTRUCTION HIERARCHY
