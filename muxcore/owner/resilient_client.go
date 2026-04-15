@@ -544,6 +544,13 @@ func (rc *resilientClient) flushBuffer(conn io.Writer) {
 // requests that were in-flight when the IPC connection died. Without this,
 // CC waits forever for responses that will never come (request was sent to
 // old upstream which was killed during reconnect).
+//
+// Stdout-failure handling: a write error on stdout is a terminal condition
+// (same rule as runStdoutWriter and the keepalive path). On the FIRST write
+// failure we log once, signal stdoutDead so the client exits gracefully,
+// and then continue iterating only to drain the inflight map — we do NOT
+// attempt further writes, so a broken pipe cannot produce N log lines for
+// N orphaned requests.
 func (rc *resilientClient) drainOrphanedInflight(stdoutMu *sync.Mutex) {
 	var orphaned []string
 	rc.inflight.Range(func(key, _ any) bool {
@@ -555,8 +562,18 @@ func (rc *resilientClient) drainOrphanedInflight(stdoutMu *sync.Mutex) {
 	}
 
 	rc.log.Printf("resilient: sending error responses for %d orphaned in-flight requests", len(orphaned))
-	var writeErrors int
+	stdoutBroken := false
 	for _, id := range orphaned {
+		// Always clear the inflight entry — drain completes regardless of
+		// write outcome so repeated reconnects do not leak tracking state.
+		rc.inflight.Delete(id)
+
+		if stdoutBroken {
+			// Stdout is dead; don't try to write N more lines only to log
+			// N more failures. Keep draining the map though.
+			continue
+		}
+
 		errResp := fmt.Sprintf(
 			`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream restarted, request lost during reconnect"}}`,
 			id,
@@ -565,13 +582,15 @@ func (rc *resilientClient) drainOrphanedInflight(stdoutMu *sync.Mutex) {
 		_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", errResp)
 		stdoutMu.Unlock()
 		if err != nil {
-			writeErrors++
-			rc.log.Printf("resilient: failed to write orphaned-inflight error response for id=%s: %v", id, err)
+			stdoutBroken = true
+			rc.log.Printf("resilient: stdout broken while draining orphaned in-flight requests: %v", err)
+			// Same terminal-condition signaling as runStdoutWriter (line ~194):
+			// close stdoutDead so the main loop unblocks and exits gracefully.
+			rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
 		}
-		rc.inflight.Delete(id)
 	}
-	if writeErrors > 0 {
-		rc.log.Printf("resilient: drainOrphanedInflight: %d/%d write errors — CC may hang on those requests", writeErrors, len(orphaned))
+	if stdoutBroken {
+		rc.log.Printf("resilient: drainOrphanedInflight: stdout broken — CC may hang on the remaining orphaned requests")
 	}
 }
 
