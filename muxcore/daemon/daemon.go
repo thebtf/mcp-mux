@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,16 @@ import (
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
+
+// errSpawnRetry is a sentinel returned by spawnOnce to signal that Spawn should
+// retry from the top (new iteration in the retry loop). Used internally by the
+// FR-6 retry pattern that replaced the old recursive d.Spawn(req) calls.
+var errSpawnRetry = errors.New("spawn: retry requested")
+
+// maxSpawnRetries bounds the retry budget in Spawn. Three iterations handle the
+// realistic cases (stuck placeholder cleanup + one isolated-mode promotion);
+// exhaustion is treated as a hard failure and returned to the caller.
+const maxSpawnRetries = 3
 
 // OwnerEntry tracks a single managed owner and its metadata.
 // When creating != nil, the entry is a placeholder: Owner is nil and is being
@@ -288,8 +299,17 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 		entry.Owner.Shutdown()
 	}
 
+	// FR-4 / BUG-003: guard the delete with an identity check. Between the
+	// prior unlock (line 276) and here, a concurrent Spawn may have replaced
+	// d.owners[sid] with a fresh live entry for the same server ID (common
+	// case: shim reconnects right as the old owner dies). An unconditional
+	// delete would evict the fresh entry, leaving the server unreachable
+	// until the next spawn attempt. Only delete if the current map entry is
+	// still the same pointer we observed at the start of cleanup.
 	d.mu.Lock()
-	delete(d.owners, sid)
+	if current, ok := d.owners[sid]; ok && current == entry {
+		delete(d.owners, sid)
+	}
 	d.mu.Unlock()
 }
 
@@ -366,12 +386,36 @@ func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSn
 	return snap, ok
 }
 
-// (from any cwd), it is reused — stateless servers don't need per-project copies.
-// Returns the IPC path, server ID, and a one-time handshake token for session binding.
+// Spawn creates or reuses an owner for the given command. If a compatible owner
+// already exists (same command+args+cwd, or globally shareable), it is reused —
+// stateless servers don't need per-project copies. Returns the IPC path, server
+// ID, and a one-time handshake token for session binding.
 //
 // Concurrent spawns for the same sid are serialised via a placeholder entry whose
 // creating channel is closed once the real owner is available (or creation fails).
+//
+// FR-6: Spawn is a thin retry wrapper around spawnOnce. Previously, the paths
+// at the old line 435 ("creation failed or entry was removed") and line 458
+// ("owner not accepting but has active sessions — retry in isolated mode")
+// called d.Spawn(req) recursively. Two audit agents (code-reviewer H2,
+// bug-hunter BUG-005) flagged the stack-depth risk and the comment-vs-code
+// divergence. spawnOnce now returns errSpawnRetry on those paths; Spawn loops
+// up to maxSpawnRetries times and surfaces an error on exhaustion.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
+	for attempt := 0; attempt < maxSpawnRetries; attempt++ {
+		ipcPath, sid, token, err := d.spawnOnce(&req)
+		if !errors.Is(err, errSpawnRetry) {
+			return ipcPath, sid, token, err
+		}
+	}
+	return "", "", "", fmt.Errorf("spawn %s: exhausted retry budget after %d attempts", req.Command, maxSpawnRetries)
+}
+
+// spawnOnce performs one attempt at creating or reusing an owner. It takes req
+// by pointer because some retry paths mutate req.Mode (isolated promotion) and
+// the mutation must persist across iterations of the Spawn retry loop.
+func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, error) {
+	req := *reqPtr
 	mode := serverid.ModeCwd
 	switch req.Mode {
 	case "global":
@@ -430,9 +474,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
-			// Creation failed or entry was removed — fall through to create anew.
+			// Creation failed or entry was removed — signal retry so Spawn's
+			// retry loop can start fresh. Previously recursed directly into
+			// d.Spawn(req); see errSpawnRetry / Spawn comment for rationale.
 			d.mu.Unlock()
-			return d.Spawn(req)
+			return "", "", "", errSpawnRetry
 		}
 		if entry.Owner.IsAccepting() {
 			entry.LastSession = time.Now()
@@ -453,9 +499,11 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			// DON'T delete or shutdown. Fall through — new owner will get a unique
 			// isolated ID from serverid.ModeIsolated below.
 			d.mu.Unlock()
-			// Force isolated mode for the new spawn so it gets a unique server ID
-			req.Mode = "isolated"
-			return d.Spawn(req)
+			// Force isolated mode for the new spawn so it gets a unique server ID.
+			// Mutate through reqPtr so the next Spawn retry iteration sees the
+			// updated mode (reqPtr points to Spawn's for-loop-local req).
+			reqPtr.Mode = "isolated"
+			return "", "", "", errSpawnRetry
 		}
 		entry.Owner.Shutdown()
 		delete(d.owners, sid)
@@ -726,69 +774,113 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // Must be called with d.mu held. May transiently release and re-acquire d.mu
 // when it encounters a placeholder (Owner == nil) for a matching command+args —
 // it waits for that creation to complete before returning.
+// findSharedOwner looks for an accepting owner that matches the requested
+// command+args and is compatible with the caller's env and cwd for shared reuse.
+//
+// FR-8 / BUG-007 — Lock semantics: this function must be called with d.mu
+// held (Lock or RLock). It never drops and re-acquires the lock mid-iteration
+// over d.owners (that would leave subsequent iteration reading a stale map
+// snapshot while allowing concurrent mutations to corrupt pointers).
+//
+// Placeholder handling: the first scan pass skips entries still being created
+// (Owner == nil). If the scan finds no concrete match but one or more matching
+// placeholders exist, the function waits for the first matching placeholder
+// (releases the lock during the wait), then starts a fresh scan from scratch
+// to avoid stale-iteration hazards. The outer loop is bounded by the number
+// of wait cycles (at most one — placeholders only exist while someone is
+// actively creating an owner; after a full wait-and-resolve cycle, either a
+// live entry exists or no placeholder remains).
 func (d *Daemon) findSharedOwner(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
 	needle := command + " " + strings.Join(args, " ")
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
 
-	for _, entry := range d.owners {
-		candidate := entry.Command + " " + strings.Join(entry.Args, " ")
-		if candidate != needle {
-			continue
-		}
-		if entry.Owner == nil {
-			// Matching command+args but still being created — wait with timeout.
-			creating := entry.creating
-			d.mu.Unlock()
-			select {
-			case <-creating:
-			case <-time.After(concurrentCreateWaitTimeout):
-				d.mu.Lock()
-				return nil // timed out waiting for placeholder — caller will create new
-			}
-			d.mu.Lock()
-			// Re-check after wait: creation may have succeeded or failed.
-			if entry.Owner != nil && entry.Owner.IsAccepting() && envCompatible(entry.Env, env) {
-				return entry
-			}
-			return nil
-		}
-		// Skip owners with incompatible env — different API keys, tokens, etc.
-		if !envCompatible(entry.Env, env) {
-			continue
-		}
-		if !entry.Owner.IsAccepting() {
-			continue
-		}
+	// Wait budget: at most one placeholder-wait cycle. Multiple matching
+	// placeholders in flight is pathological; one wait is sufficient for
+	// the common concurrent-spawn case and bounds the wall-clock cost.
+	const maxWaits = 1
+	waitsDone := 0
 
-		// CWD-aware dedup: every process has exactly one CWD. Sharing an upstream
-		// across sessions with different CWDs is only safe when the server has been
-		// confirmed CWD-independent (classified as shared or session-aware).
-		// Unclassified servers are NOT shared across CWDs — this prevents
-		// cross-project context leaks for CWD-dependent servers.
-		canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
-		cwdMatch := canonReqCwd == canonEntryCwd
-
-		if !cwdMatch {
-			// Different CWD — only share if owner is confirmed shareable.
-			if !entry.Owner.IsClassifiedShareable() {
+	for {
+		// Phase 1: scan live entries for a concrete match.
+		var (
+			match       *OwnerEntry
+			placeholder chan struct{}
+		)
+		for _, entry := range d.owners {
+			candidate := entry.Command + " " + strings.Join(entry.Args, " ")
+			if candidate != needle {
 				continue
 			}
-		}
-
-		// Non-blocking classification check: if already classified, respect it.
-		select {
-		case <-entry.Owner.Classified():
-			// Classification known — re-check IsAccepting (may have closed listener)
+			if entry.Owner == nil {
+				// Placeholder — remember the first one; skip for now, may
+				// come back to it if no live match is found below.
+				if placeholder == nil {
+					placeholder = entry.creating
+				}
+				continue
+			}
+			// Skip owners with incompatible env — different API keys, tokens, etc.
+			if !envCompatible(entry.Env, env) {
+				continue
+			}
 			if !entry.Owner.IsAccepting() {
 				continue
 			}
-		default:
-			// Not yet classified. Same CWD → safe to share optimistically.
-			// Different CWD → already filtered above (IsClassifiedShareable).
+
+			// CWD-aware dedup: every process has exactly one CWD. Sharing an upstream
+			// across sessions with different CWDs is only safe when the server has been
+			// confirmed CWD-independent (classified as shared or session-aware).
+			// Unclassified servers are NOT shared across CWDs — this prevents
+			// cross-project context leaks for CWD-dependent servers.
+			canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
+			cwdMatch := canonReqCwd == canonEntryCwd
+
+			if !cwdMatch {
+				// Different CWD — only share if owner is confirmed shareable.
+				if !entry.Owner.IsClassifiedShareable() {
+					continue
+				}
+			}
+
+			// Non-blocking classification check: if already classified, respect it.
+			select {
+			case <-entry.Owner.Classified():
+				// Classification known — re-check IsAccepting (may have closed listener)
+				if !entry.Owner.IsAccepting() {
+					continue
+				}
+			default:
+				// Not yet classified. Same CWD → safe to share optimistically.
+				// Different CWD → already filtered above (IsClassifiedShareable).
+			}
+			match = entry
+			break
 		}
-		return entry
+
+		if match != nil {
+			return match
+		}
+
+		// No concrete match. If a placeholder was seen and we have wait
+		// budget, release the lock, wait for it (or time out), re-acquire,
+		// and rescan. Otherwise give up.
+		if placeholder == nil || waitsDone >= maxWaits {
+			return nil
+		}
+		waitsDone++
+
+		d.mu.Unlock()
+		select {
+		case <-placeholder:
+			// Creation resolved (success or failure) — rescan.
+		case <-time.After(concurrentCreateWaitTimeout):
+			// Timed out. Re-acquire and return — caller will create new.
+			d.mu.Lock()
+			return nil
+		}
+		d.mu.Lock()
+		// Loop: fresh scan on the now-mutated map.
 	}
-	return nil
 }
 
 // envCompatible returns true if two env maps have no conflicting values
