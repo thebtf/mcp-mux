@@ -861,8 +861,9 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 		defer func() {
 			if r := recover(); r != nil {
 				o.logger.Printf("session %d: HandleRequest panic: %v", s.ID, r)
-				errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"internal error: handler panic"}}`, string(msg.ID))
-				s.WriteRaw([]byte(errResp))
+				if errResp, marshalErr := buildJSONRPCErrorBytes(msg.ID, -32603, "internal error: handler panic"); marshalErr == nil {
+					s.WriteRaw(errResp)
+				}
 			}
 		}()
 
@@ -889,11 +890,20 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 
 		resp, err := o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
 		if err != nil {
+			// Route through buildJSONRPCErrorBytes so error messages with JSON-special
+			// characters (quotes, backslashes, newlines, Windows paths, control bytes)
+			// are properly escaped and produce valid JSON for the CC client.
+			var errMsg string
 			if ctx.Err() != nil {
-				// Context cancelled (timeout or disconnect)
-				resp = []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"request timeout"}}`, string(msg.ID)))
+				errMsg = "request timeout"
 			} else {
-				resp = []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"%s"}}`, string(msg.ID), err.Error()))
+				errMsg = err.Error()
+			}
+			if errBytes, marshalErr := buildJSONRPCErrorBytes(msg.ID, -32603, errMsg); marshalErr == nil {
+				resp = errBytes
+			} else {
+				o.logger.Printf("session %d: failed to marshal error response: %v", s.ID, marshalErr)
+				resp = nil
 			}
 		}
 
@@ -1211,6 +1221,22 @@ func (o *Owner) respondToElicitationCancel(id json.RawMessage) error {
 
 // respondWithError sends a JSON-RPC error response to upstream.
 func (o *Owner) respondWithError(id json.RawMessage, code int, message string) error {
+	data, err := buildJSONRPCErrorBytes(id, code, message)
+	if err != nil {
+		return fmt.Errorf("marshal error response: %w", err)
+	}
+	return o.writeUpstream(data)
+}
+
+// buildJSONRPCErrorBytes constructs a JSON-RPC 2.0 error response as bytes.
+// Uses json.Marshal on a struct to guarantee valid escaping for any message
+// content — plain strings, quotes, backslashes, newlines, Windows paths,
+// and control characters all round-trip correctly.
+//
+// Callers that need the response bytes (e.g., to send to a downstream session
+// rather than upstream) use this directly; callers that want the full
+// write-to-upstream side effect use respondWithError instead.
+func buildJSONRPCErrorBytes(id json.RawMessage, code int, message string) ([]byte, error) {
 	resp := struct {
 		JSONRPC string          `json:"jsonrpc"`
 		ID      json.RawMessage `json:"id"`
@@ -1221,11 +1247,7 @@ func (o *Owner) respondWithError(id json.RawMessage, code int, message string) e
 	}{JSONRPC: "2.0", ID: id}
 	resp.Error.Code = code
 	resp.Error.Message = message
-	data, err := json.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("marshal error response: %w", err)
-	}
-	return o.writeUpstream(data)
+	return json.Marshal(resp)
 }
 
 // routeProgressNotification sends a notifications/progress to the session that
@@ -1393,14 +1415,33 @@ type ownerNotifier struct {
 }
 
 func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
+	// Collect ALL sessions matching projectID under RLock, then release before
+	// WriteRaw — s.WriteRaw may block up to 30 s on a slow IPC consumer (session
+	// write deadline). Holding o.mu.RLock() during that wait stalls every goroutine
+	// needing o.mu.Lock() (addSession, removeSession, cacheResponse, progress token
+	// cleanup). This pattern mirrors Broadcast below.
+	//
+	// In Shared mode multiple CC sessions can share the same Cwd (same project),
+	// so we must notify ALL of them, not just the first one found (which would be
+	// random due to Go map iteration order).
 	n.owner.mu.RLock()
-	defer n.owner.mu.RUnlock()
+	var targets []*Session
 	for _, s := range n.owner.sessions {
 		if muxcore.ProjectContextID(s.Cwd) == projectID {
-			return s.WriteRaw(notification)
+			targets = append(targets, s)
 		}
 	}
-	return fmt.Errorf("no session found for project %s", projectID)
+	n.owner.mu.RUnlock()
+	if len(targets) == 0 {
+		return fmt.Errorf("no session found for project %s", projectID)
+	}
+	var lastErr error
+	for _, s := range targets {
+		if err := s.WriteRaw(notification); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func (n *ownerNotifier) Broadcast(notification []byte) {
@@ -1801,10 +1842,26 @@ func (o *Owner) Serve(ctx context.Context) error {
 // upstreamDeathResult determines the Serve return value when upstream has died.
 // Checks classification: isolated owners return ErrDoNotRestart (no auto-restart),
 // others return an error to trigger supervisor backoff+restart.
+//
+// Special case (BUG-001 / FR-1): if the owner has NEVER had a live upstream
+// (up == nil and no background spawn pending), the "death" signal came from
+// closedChan — meaning background spawn failed before upstream was ever set.
+// Returning an error here would cause suture to restart Serve, which would
+// immediately re-observe the same nil state and return the same error — a
+// tight CPU spin bounded only by FailureThreshold. Return ErrDoNotRestart
+// for this case so the supervisor stops cycling. The owner is effectively
+// broken and will be cleaned up by the reaper on the next sweep.
 func (o *Owner) upstreamDeathResult() error {
 	o.mu.RLock()
 	mode := o.autoClassification
+	hasUpstream := o.upstream != nil
+	hasPendingSpawn := o.backgroundSpawnCh != nil
 	o.mu.RUnlock()
+	if !hasUpstream && !hasPendingSpawn {
+		// Owner never had a live upstream (failed background spawn, or no
+		// spawn ever attempted). No restart — otherwise suture spins.
+		return suture.ErrDoNotRestart
+	}
 	if mode == classify.ModeIsolated {
 		// Isolated servers should not be restarted by the supervisor.
 		// Each CC session spawns its own dedicated isolated owner.
