@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
@@ -62,14 +63,31 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// Bound the read phase: a silent/malicious client cannot hold the goroutine
+	// open in dec.Decode forever.
+	if err := conn.SetReadDeadline(time.Now().Add(clientDeadline)); err != nil {
+		s.logger.Printf("control: set read deadline: %v", err)
+		return
+	}
+
 	dec := json.NewDecoder(conn)
 	var req Request
 	if err := dec.Decode(&req); err != nil {
+		// Bound the write phase on the error path too — a non-reading client
+		// must not block writeResponse indefinitely.
+		_ = conn.SetWriteDeadline(time.Now().Add(clientDeadline))
 		s.writeResponse(conn, Response{OK: false, Message: fmt.Sprintf("invalid request: %v", err)})
 		return
 	}
 
+	// Dispatch runs the handler (e.g. graceful-restart may take longer than
+	// clientDeadline). Set the write deadline only after dispatch returns so
+	// it bounds only the I/O write, not handler execution.
 	resp := s.dispatch(req)
+	if err := conn.SetWriteDeadline(time.Now().Add(clientDeadline)); err != nil {
+		s.logger.Printf("control: set write deadline: %v", err)
+		return
+	}
 	s.writeResponse(conn, resp)
 }
 

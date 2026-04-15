@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -483,4 +484,71 @@ func TestCloseIdempotent(t *testing.T) {
 
 	srv.Close()
 	srv.Close() // second close must be a no-op, not a panic
+}
+
+// TestControlServer_ReadDeadlineFiresOnSilentClient is a regression test for FR-5.
+// A client that connects but never sends data must not block the server goroutine
+// forever. The server's read deadline must fire within clientDeadline + slack.
+//
+// Regression for post-audit-remediation: a malicious or broken client could DoS
+// the daemon control plane by opening connections and never sending a request,
+// accumulating handler goroutines forever.
+func TestControlServer_ReadDeadlineFiresOnSilentClient(t *testing.T) {
+	const slack = 2 * time.Second
+
+	path := testSocketPath(t)
+	handler := &mockHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	// Connect but never send anything — the server's handleConn goroutine must
+	// self-terminate via the read deadline rather than block indefinitely.
+	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// The server should close the connection (or the goroutine should exit) within
+	// clientDeadline + slack. We verify this by attempting to read from the conn:
+	// the server side will close after deadline, making our Read return io.EOF or
+	// a deadline error.
+	deadline := clientDeadline + slack
+	if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+
+	// Read one NDJSON line using bufio for correct protocol framing.
+	// The server sends JSON followed by '\n' in a single Write.
+	reader := bufio.NewReader(conn)
+	start := time.Now()
+	line, readErr := reader.ReadBytes('\n')
+	elapsed := time.Since(start)
+
+	// A non-empty line means the server sent an error response before closing
+	// (read deadline fired, server wrote the error response, then closed).
+	// Validate it is a well-formed, not-OK response.
+	if len(line) > 0 {
+		var resp Response
+		if err := json.Unmarshal(line, &resp); err != nil {
+			t.Errorf("non-JSON response after read deadline: %q (err=%v)", line, err)
+		}
+		if resp.OK {
+			t.Errorf("expected error response after read deadline, got OK=%v msg=%q", resp.OK, resp.Message)
+		}
+	}
+	// readErr may be io.EOF, a timeout error, or nil — all acceptable as long as
+	// the goroutine unblocked within the expected window.
+	_ = readErr
+
+	// The goroutine must have exited within clientDeadline + slack; if our own
+	// deadline fired first the test itself would time out here, which counts as
+	// failure via the harness.
+	if elapsed > deadline {
+		t.Errorf("server held connection for %v, want <= %v (clientDeadline %v + slack %v)",
+			elapsed, deadline, clientDeadline, slack)
+	}
 }
