@@ -413,8 +413,13 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			select {
 			case <-creating:
 			case <-time.After(concurrentCreateWaitTimeout):
-				d.logger.Printf("timeout waiting for placeholder %s, creating new", sid[:8])
-				return d.Spawn(req) // recursive — will create new placeholder
+				// Do NOT recurse into d.Spawn here: the stuck placeholder is
+				// still in d.owners[sid] and a recursive call would re-enter
+				// the same wait, producing a cascade of leaking goroutines.
+				// Surface the error so the shim can retry at a higher level;
+				// the circuit breaker (recordCrash) handles repeated failures.
+				d.logger.Printf("timeout waiting for placeholder %s (creator stuck)", sid[:8])
+				return "", "", "", fmt.Errorf("spawn %s: timeout waiting for concurrent creation of %s", req.Command, sid[:8])
 			}
 			d.mu.Lock()
 			// Re-check: creation may have succeeded or failed.
@@ -937,8 +942,16 @@ const crashThreshold = 5
 // concurrentCreateWaitTimeout is the maximum time a Spawn / findSharedOwner
 // goroutine will wait for another goroutine that is currently creating the
 // same owner entry (i.e. holds the creating channel). Beyond this, the waiter
-// gives up and either returns nil (shared-owner lookup) or retries Spawn.
-const concurrentCreateWaitTimeout = 30 * time.Second
+// returns a timeout error (in Spawn) or nil (in findSharedOwner).
+//
+// Note: Spawn does NOT recurse on timeout. The stuck placeholder is still in
+// d.owners[sid], so a recursive call would re-enter the same wait, producing a
+// cascade of leaked goroutines. Surfacing the error lets the shim retry at a
+// higher level and allows the circuit breaker to engage on repeated failures.
+//
+// Declared as var (not const) so tests can override it. Production code never
+// writes to it — treat it as an effective constant in all non-test paths.
+var concurrentCreateWaitTimeout = 30 * time.Second
 
 // recordCrash adds a crash timestamp for the given command key.
 // Must be called with d.mu held.

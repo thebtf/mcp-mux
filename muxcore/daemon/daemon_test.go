@@ -12,6 +12,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 func testLogger(t *testing.T) *log.Logger {
@@ -675,4 +676,90 @@ func TestCrashCircuitBreaker_WindowExpiry(t *testing.T) {
 	if looping {
 		t.Error("isCrashLooping = true for old crashes outside window")
 	}
+}
+
+// TestDaemonSpawnStuckPlaceholderReturnsError verifies that Spawn surfaces a
+// timeout error (rather than recursing and leaking goroutines) when a
+// placeholder for the same server is held by a stuck concurrent creator.
+//
+// Regression test for the daemon.go:417 issue flagged by Gemini in PR #51:
+// the previous behaviour was `return d.Spawn(req)` which re-entered the same
+// wait on the same unclosed `creating` channel, cascading goroutine leaks
+// until the shim-side RPC timeout fired. Post-fix behaviour: return an error,
+// let the shim retry at a higher level, let the circuit breaker engage on
+// repeat failures.
+func TestDaemonSpawnStuckPlaceholderReturnsError(t *testing.T) {
+	// Shorten the concurrent-create wait so the test runs in a reasonable
+	// time. Save and restore to avoid leaking state across tests.
+	orig := concurrentCreateWaitTimeout
+	concurrentCreateWaitTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { concurrentCreateWaitTimeout = orig })
+
+	d := testDaemon(t)
+
+	req := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Cwd:     "",
+		Mode:    "global",
+	}
+
+	// Inject a stuck placeholder at the same sid the real Spawn would compute.
+	// We never close the `creating` channel, simulating a deadlocked creator.
+	stuckSID := serverid.GenerateContextKey(serverid.ModeGlobal, req.Command, req.Args, nil, req.Cwd)
+	stuck := &OwnerEntry{
+		ServerID: stuckSID,
+		Command:  req.Command,
+		Args:     req.Args,
+		Cwd:      req.Cwd,
+		creating: make(chan struct{}),
+	}
+	d.mu.Lock()
+	d.owners[stuckSID] = stuck
+	d.mu.Unlock()
+
+	// Before fix: recurses forever, test hangs / t.Fatal via -timeout.
+	// After fix:  returns a timeout error within ~200ms.
+	start := time.Now()
+	_, _, _, err := d.Spawn(req)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Spawn() on stuck placeholder returned nil error, want timeout error")
+	}
+	if !strings.Contains(err.Error(), "timeout waiting for concurrent creation") {
+		t.Errorf("Spawn() error = %q, want it to mention 'timeout waiting for concurrent creation'", err.Error())
+	}
+	// Sanity: should return close to the (shortened) timeout, not 2×/3× it
+	// which would indicate recursive re-entry into the wait.
+	if elapsed > 2*concurrentCreateWaitTimeout {
+		t.Errorf("Spawn() took %v, want close to %v — suggests recursive wait", elapsed, concurrentCreateWaitTimeout)
+	}
+
+	// The stuck placeholder entry must still be present in the map under the
+	// same sid (OwnerCount skips Owner==nil placeholders, so we inspect the
+	// map directly). The daemon must NOT have created a sibling owner for
+	// the same sid, and MUST NOT have removed the placeholder we injected.
+	d.mu.RLock()
+	entry, stillPresent := d.owners[stuckSID]
+	entryCount := len(d.owners)
+	d.mu.RUnlock()
+	if !stillPresent {
+		t.Error("stuck placeholder was removed from d.owners — fix must leave it in place for the original creator to clean up")
+	} else if entry != stuck {
+		t.Error("entry at stuckSID was replaced — fix must not overwrite the placeholder")
+	}
+	if entryCount != 1 {
+		t.Errorf("len(d.owners) = %d after stuck-placeholder timeout, want 1", entryCount)
+	}
+
+	// Clean up the stuck placeholder so t.Cleanup -> Shutdown doesn't wait on it.
+	d.mu.Lock()
+	if stuck.creating != nil {
+		close(stuck.creating)
+		stuck.creating = nil
+	}
+	delete(d.owners, stuckSID)
+	d.mu.Unlock()
 }
