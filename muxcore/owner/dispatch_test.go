@@ -755,3 +755,45 @@ func TestNotifier_Broadcast(t *testing.T) {
 		t.Errorf("sessB did not receive broadcast; got: %s", lineB)
 	}
 }
+
+// TestNotifier_MultiSessionSameProject verifies that Notify delivers the
+// notification to ALL sessions sharing the same CWD (Shared mode: two CC
+// terminals in the same project directory). Previously the implementation
+// stopped at the first matching session (random Go map iteration order), so
+// one of the two sessions would silently miss the notification.
+//
+// Regression test for the Gemini reviewer finding on PR #54.
+func TestNotifier_MultiSessionSameProject(t *testing.T) {
+	sharedCwd := "/project-shared"
+
+	mock := &mockLifecycleHandler{}
+	o := newLifecycleOwner(mock)
+
+	// Two sessions with identical Cwd — simulates Shared mode with two CC terminals.
+	sessA, bufA := newTestSession(sharedCwd)
+	defer sessA.Close()
+	sessB, bufB := newTestSession(sharedCwd)
+	defer sessB.Close()
+
+	addSessionDirect(o, sessA)
+	addSessionDirect(o, sessB)
+
+	notification := []byte(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`)
+	projectID := muxcore.ProjectContextID(sharedCwd)
+
+	n := &ownerNotifier{owner: o}
+	if err := n.Notify(projectID, notification); err != nil {
+		t.Fatalf("Notify returned unexpected error: %v", err)
+	}
+
+	// Both sessions must receive the notification — previously only one would.
+	lineA := waitForWrite(t, bufA, 2*time.Second)
+	if !strings.Contains(lineA, "notifications/tools/list_changed") {
+		t.Errorf("sessA did not receive notification; got: %q", lineA)
+	}
+
+	lineB := waitForWrite(t, bufB, 2*time.Second)
+	if !strings.Contains(lineB, "notifications/tools/list_changed") {
+		t.Errorf("sessB did not receive notification; got: %q", lineB)
+	}
+}

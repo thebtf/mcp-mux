@@ -1415,24 +1415,33 @@ type ownerNotifier struct {
 }
 
 func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
-	// Copy the target pointer under RLock, then release before WriteRaw —
-	// s.WriteRaw may block up to 30 s on a slow IPC consumer (session write
-	// deadline). Holding o.mu.RLock() during that wait stalls every goroutine
-	// needing o.mu.Lock() (addSession, removeSession, cacheResponse, progress
-	// token cleanup). This pattern mirrors Broadcast below.
+	// Collect ALL sessions matching projectID under RLock, then release before
+	// WriteRaw — s.WriteRaw may block up to 30 s on a slow IPC consumer (session
+	// write deadline). Holding o.mu.RLock() during that wait stalls every goroutine
+	// needing o.mu.Lock() (addSession, removeSession, cacheResponse, progress token
+	// cleanup). This pattern mirrors Broadcast below.
+	//
+	// In Shared mode multiple CC sessions can share the same Cwd (same project),
+	// so we must notify ALL of them, not just the first one found (which would be
+	// random due to Go map iteration order).
 	n.owner.mu.RLock()
-	var target *Session
+	var targets []*Session
 	for _, s := range n.owner.sessions {
 		if muxcore.ProjectContextID(s.Cwd) == projectID {
-			target = s
-			break
+			targets = append(targets, s)
 		}
 	}
 	n.owner.mu.RUnlock()
-	if target == nil {
+	if len(targets) == 0 {
 		return fmt.Errorf("no session found for project %s", projectID)
 	}
-	return target.WriteRaw(notification)
+	var lastErr error
+	for _, s := range targets {
+		if err := s.WriteRaw(notification); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 func (n *ownerNotifier) Broadcast(notification []byte) {
