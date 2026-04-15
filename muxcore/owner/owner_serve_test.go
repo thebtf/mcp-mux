@@ -129,21 +129,73 @@ func TestOwnerServe_IsolatedReturnsErrDoNotRestart(t *testing.T) {
 	}
 }
 
-// TestOwnerServe_NonIsolatedReturnsErrorOnUpstreamDead verifies that a
-// non-isolated owner with a nil (dead) upstream returns a non-nil error
-// to trigger supervisor restart with backoff.
-func TestOwnerServe_NonIsolatedReturnsErrorOnUpstreamDead(t *testing.T) {
+// TestOwnerServe_NonIsolatedNilUpstreamReturnsDoNotRestart verifies the FR-1
+// fix: a non-isolated owner that has NEVER had a live upstream (upstream == nil
+// AND backgroundSpawnCh == nil) returns suture.ErrDoNotRestart, NOT a
+// restartable error.
+//
+// Pre-fix: this returned a non-nil error, which caused suture to restart Serve
+// immediately. The new Serve iteration re-observed the same nil state and
+// returned the same error — a tight loop bounded only by suture's
+// FailureThreshold. This was BUG-001 from the 2026-04-15 audit.
+//
+// Post-fix: upstreamDeathResult checks for the "never had upstream" case and
+// returns ErrDoNotRestart so suture removes the owner cleanly without cycling.
+//
+// This is semantically the same as the isolated-owner case — an owner with no
+// realistic path to recovery should not be restarted.
+func TestOwnerServe_NonIsolatedNilUpstreamReturnsDoNotRestart(t *testing.T) {
 	o := newMinimalOwner()
 	o.controlServer = nil
 	o.autoClassification = classify.ModeShared
 	o.classificationSource = "tools"
 
 	err := o.Serve(context.Background())
-	if err == nil {
-		t.Error("Serve returned nil, want non-nil error for dead upstream")
+	if !errors.Is(err, suture.ErrDoNotRestart) {
+		t.Errorf("Serve with nil upstream returned %v, want suture.ErrDoNotRestart (FR-1 fix: cold owner should not restart)", err)
 	}
-	if errors.Is(err, suture.ErrDoNotRestart) {
-		t.Error("Serve returned ErrDoNotRestart for non-isolated owner")
+}
+
+// TestOwnerServe_FailedBackgroundSpawnDoesNotSpin is the direct FR-1 regression
+// test: simulates SpawnUpstreamBackground's failure path (bgCh closed then
+// cleared, upstream still nil) and asserts Serve exits exactly once with
+// ErrDoNotRestart rather than spinning on suture restarts.
+//
+// Setup mirrors what SpawnUpstreamBackground does on error:
+//  1. bgCh was created at NewOwnerFromSnapshot
+//  2. goroutine tried upstream.Start, it failed
+//  3. goroutine closed bgCh and set bgCh = nil
+//  4. upstream remains nil
+//
+// Pre-fix Serve behavior:
+//  - iter 1: deadCh = bgCh (non-nil at entry, since we test right after close)
+//            Actually, bgCh is ALREADY nil in our setup because we mimic the
+//            post-close-and-clear state. deadCh = closedChan.
+//            Non-blocking select hits deadCh → returns upstreamDeathResult()
+//            → for non-isolated: non-nil error → suture restarts → loop
+//  - iter N (inside suture restart): same state, same error, tight loop
+//
+// Post-fix: upstreamDeathResult returns ErrDoNotRestart → suture removes.
+func TestOwnerServe_FailedBackgroundSpawnDoesNotSpin(t *testing.T) {
+	o := newMinimalOwner()
+	o.controlServer = nil
+	o.autoClassification = classify.ModeShared
+	o.classificationSource = "tools"
+	// Simulate post-failed-spawn state: bgCh was allocated, goroutine closed
+	// it and set it to nil, upstream never got set.
+	o.backgroundSpawnCh = nil
+	o.upstream = nil
+
+	start := time.Now()
+	err := o.Serve(context.Background())
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, suture.ErrDoNotRestart) {
+		t.Errorf("Serve after failed background spawn returned %v, want suture.ErrDoNotRestart", err)
+	}
+	// Serve should return immediately — no retry loop, no CPU spin.
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("Serve took %v to return; expected near-instant exit (FR-1: no spin on failed spawn)", elapsed)
 	}
 }
 

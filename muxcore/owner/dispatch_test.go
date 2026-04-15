@@ -2,6 +2,7 @@ package owner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -371,6 +372,163 @@ func TestDispatchToSessionHandler_Timeout(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(2 * time.Second):
 		t.Error("handler goroutine did not exit after context cancellation")
+	}
+}
+
+// blockingWriter is a test io.Writer whose Write blocks until Unblock() is
+// called. Used to simulate a slow IPC consumer for FR-2 lock-release test.
+type blockingWriter struct {
+	unblock chan struct{}
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{unblock: make(chan struct{})}
+}
+
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	<-b.unblock
+	return len(p), nil
+}
+
+func (b *blockingWriter) Unblock() {
+	close(b.unblock)
+}
+
+// TestOwnerNotifier_NotifyReleasesLockBeforeWrite verifies that ownerNotifier.Notify
+// releases o.mu.RLock() before calling s.WriteRaw, so a slow IPC consumer cannot
+// stall every other goroutine needing o.mu.Lock().
+//
+// Regression test for FR-2 / bug-hunter BUG-002: previously Notify held RLock
+// across the full WriteRaw call. A 30s-write-deadline session could stall
+// addSession, removeSession, cacheResponse, and every other o.mu.Lock() caller
+// for the duration of the write. Broadcast (sibling) had the correct pattern
+// of copy-under-lock, release, write. Notify now mirrors that pattern.
+//
+// The test installs a session whose writer blocks indefinitely, calls Notify in
+// one goroutine, then measures how long addSession takes in another goroutine.
+// Pre-fix: addSession would block until the writer unblocks.
+// Post-fix: addSession completes in well under 100ms regardless of the blocker.
+func TestOwnerNotifier_NotifyReleasesLockBeforeWrite(t *testing.T) {
+	o := newDispatchOwner(nil)
+	notifier := &ownerNotifier{owner: o}
+
+	// Session A: writer blocks until the test unblocks it.
+	blocker := newBlockingWriter()
+	sessA := NewSession(strings.NewReader(""), blocker)
+	sessA.Cwd = "/project-slow-writer"
+	defer sessA.Close()
+
+	o.mu.Lock()
+	o.sessions[sessA.ID] = sessA
+	o.mu.Unlock()
+
+	// Call Notify in a goroutine — it will block inside WriteRaw.
+	notifyDone := make(chan struct{})
+	go func() {
+		defer close(notifyDone)
+		_ = notifier.Notify(muxcore.ProjectContextID(sessA.Cwd), []byte(`{"jsonrpc":"2.0","method":"notifications/test"}`))
+	}()
+
+	// Give Notify a moment to enter WriteRaw (so it holds session.mu and would
+	// previously still be holding o.mu.RLock in the buggy code path).
+	time.Sleep(50 * time.Millisecond)
+
+	// Concurrently call AddSession — it needs o.mu.Lock().
+	// Pre-fix: blocks until Unblock() is called.
+	// Post-fix: completes immediately.
+	newSess := NewSession(strings.NewReader(""), &safeBuf{})
+	newSess.Cwd = "/project-new"
+
+	addStart := time.Now()
+	o.AddSession(newSess)
+	addElapsed := time.Since(addStart)
+
+	// Allow a generous upper bound to account for goroutine scheduling on CI,
+	// but still well below the buggy-path elapsed time (which would be "forever"
+	// since blocker.unblock is never closed until test cleanup).
+	const maxAllowed = 200 * time.Millisecond
+	if addElapsed > maxAllowed {
+		t.Errorf("AddSession took %v while Notify was blocked; want <%v — the Notify path is still holding o.mu while WriteRaw blocks",
+			addElapsed, maxAllowed)
+	}
+
+	// Cleanup: unblock the writer so the Notify goroutine can exit.
+	blocker.Unblock()
+	select {
+	case <-notifyDone:
+	case <-time.After(1 * time.Second):
+		t.Error("Notify goroutine did not exit after Unblock")
+	}
+}
+
+// TestDispatchToSessionHandler_ErrorMessageIsValidJSON verifies that error
+// messages from HandleRequest are properly JSON-escaped in the response.
+// Regression test for FR-3 / code-reviewer H1: previously, owner.go:896
+// interpolated err.Error() as a bare %s into a raw JSON literal, so any
+// error message containing a quote, backslash, newline, tab, null byte, or
+// Windows path would produce invalid JSON that the CC client could not parse.
+// Post-fix, all error messages round-trip through json.Marshal/Unmarshal.
+func TestDispatchToSessionHandler_ErrorMessageIsValidJSON(t *testing.T) {
+	cases := []struct {
+		name   string
+		errMsg string
+	}{
+		{"plain", "something went wrong"},
+		{"double_quote", `error: expected "token" got eof`},
+		{"backslash", `path: C:\Users\btf\project`},
+		{"newline", "line one\nline two"},
+		{"tab", "col1\tcol2"},
+		{"null_byte", "before\u0000after"},
+		{"windows_path", `cannot open C:\Program Files\Node\npm.cmd: access denied`},
+		{"mixed", "quote:\" backslash:\\ newline:\n all-together"},
+		{"unicode", "привет мир ☃"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			errMsg := tc.errMsg
+			mock := &mockSessionHandler{
+				handler: func(_ context.Context, _ muxcore.ProjectContext, _ []byte) ([]byte, error) {
+					return nil, fmt.Errorf("%s", errMsg)
+				},
+			}
+			o := newDispatchOwner(mock)
+
+			sess, buf := newTestSession("/project-json-escape")
+			defer sess.Close()
+
+			rawReq := []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{}}`)
+			msg := parseMessage(rawReq)
+
+			if err := o.dispatchToSessionHandler(sess, msg); err != nil {
+				t.Fatalf("dispatchToSessionHandler: %v", err)
+			}
+
+			line := waitForWrite(t, buf, 2*time.Second)
+
+			// Round-trip: the response must be valid JSON and the error.message
+			// field must match the original string exactly.
+			var resp struct {
+				JSONRPC string `json:"jsonrpc"`
+				ID      any    `json:"id"`
+				Error   struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				t.Fatalf("response is not valid JSON: %v\nraw: %q", err, line)
+			}
+			if resp.JSONRPC != "2.0" {
+				t.Errorf("jsonrpc = %q, want %q", resp.JSONRPC, "2.0")
+			}
+			if resp.Error.Code != -32603 {
+				t.Errorf("error.code = %d, want -32603", resp.Error.Code)
+			}
+			if resp.Error.Message != errMsg {
+				t.Errorf("error.message = %q, want %q", resp.Error.Message, errMsg)
+			}
+		})
 	}
 }
 
