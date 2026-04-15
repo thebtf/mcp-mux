@@ -597,3 +597,235 @@ func TestResilientClient_InitReplayOnReconnect(t *testing.T) {
 		t.Fatal("RunResilientClient did not exit")
 	}
 }
+
+// failingWriter fails every Write with a configurable error.
+type failingWriter struct {
+	err   error
+	count int
+	mu    sync.Mutex
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.count++
+	return 0, w.err
+}
+
+// capturingLogger is an io.Writer that buffers log output for inspection.
+type capturingLogger struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (c *capturingLogger) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *capturingLogger) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+
+// TestResilientClient_DrainOrphanedInflight_LogsWriteErrors verifies FR-7 +
+// Gemini's PR #57 review finding: when drainOrphanedInflight fails to write
+// the first error response to CC stdout (e.g. pipe closed during reconnect):
+//   - exactly ONE stdout-broken log line is emitted (no log spam)
+//   - subsequent writes are skipped (count == 1, not N)
+//   - the stdoutDead channel is closed so the main loop exits gracefully
+//   - the inflight map is still fully drained (no leaked tracking state)
+//
+// Regression for two issues:
+//  1. Originally fmt.Fprintf's error was discarded — CC hang with no log.
+//  2. A naive "log per failed write" fix (PR #57 initial) produced log spam
+//     proportional to inflight queue depth and did not signal stdoutDead.
+func TestResilientClient_DrainOrphanedInflight_LogsWriteErrors(t *testing.T) {
+	sink := &capturingLogger{}
+	logger := log.New(sink, "", 0)
+	stdout := &failingWriter{err: io.ErrClosedPipe}
+
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{
+			Stdout: stdout,
+		},
+		log:        logger,
+		stdoutDead: make(chan struct{}),
+	}
+
+	// Seed inflight with 3 orphaned IDs: one numeric, two string.
+	rc.inflight.Store("42", true)
+	rc.inflight.Store(`"req-xyz"`, true)
+	rc.inflight.Store(`"req-hang"`, true)
+
+	var stdoutMu sync.Mutex
+	rc.drainOrphanedInflight(&stdoutMu)
+
+	// All inflight entries must be cleared regardless of write success,
+	// otherwise they'd accumulate on every reconnect.
+	remaining := 0
+	rc.inflight.Range(func(_, _ any) bool { remaining++; return true })
+	if remaining != 0 {
+		t.Errorf("inflight not cleared after drain: %d entries remain", remaining)
+	}
+
+	// With the stdout-broken fast-path, only the first write should be
+	// attempted; the remaining orphaned IDs must be skipped to prevent spam.
+	if stdout.count != 1 {
+		t.Errorf("expected exactly 1 write attempt (fast-skip after first error), got %d", stdout.count)
+	}
+
+	logs := sink.String()
+	t.Logf("captured logs:\n%s", logs)
+
+	if !strings.Contains(logs, "sending error responses for 3 orphaned in-flight requests") {
+		t.Errorf("log missing initial summary: %q", logs)
+	}
+
+	// EXACTLY ONE stdout-broken notice — the core of the log-spam fix.
+	brokenCount := strings.Count(logs, "stdout broken while draining orphaned in-flight requests")
+	if brokenCount != 1 {
+		t.Errorf("expected exactly 1 stdout-broken log line, got %d (logs: %q)", brokenCount, logs)
+	}
+
+	// Per-id error lines from the OLD code must be gone.
+	if strings.Contains(logs, "failed to write orphaned-inflight error response for id=") {
+		t.Errorf("unexpected per-id error log (log-spam regression): %q", logs)
+	}
+
+	if !strings.Contains(logs, "CC may hang on the remaining orphaned requests") {
+		t.Errorf("log missing operator-visible hang warning: %q", logs)
+	}
+
+	// stdoutDead MUST be signaled so the main client loop exits gracefully.
+	select {
+	case <-rc.stdoutDead:
+		// good — stdoutOnce.Do fired
+	default:
+		t.Error("stdoutDead not closed after stdout write failure — client will not exit gracefully")
+	}
+}
+
+// TestResilientClient_DrainOrphanedInflight_NoErrorsOnSuccess verifies that
+// drainOrphanedInflight does NOT log any failure lines, does NOT close
+// stdoutDead, and writes every response on the happy path.
+func TestResilientClient_DrainOrphanedInflight_NoErrorsOnSuccess(t *testing.T) {
+	sink := &capturingLogger{}
+	logger := log.New(sink, "", 0)
+	var buf strings.Builder
+
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{
+			Stdout: &buf,
+		},
+		log:        logger,
+		stdoutDead: make(chan struct{}),
+	}
+	rc.inflight.Store("1", true)
+	rc.inflight.Store("2", true)
+
+	var stdoutMu sync.Mutex
+	rc.drainOrphanedInflight(&stdoutMu)
+
+	logs := sink.String()
+	if strings.Contains(logs, "stdout broken") {
+		t.Errorf("unexpected stdout-broken log on success path: %q", logs)
+	}
+	if strings.Contains(logs, "CC may hang") {
+		t.Errorf("unexpected hang warning on success path: %q", logs)
+	}
+
+	// Sanity: both error responses were actually written.
+	out := buf.String()
+	if !strings.Contains(out, `"id":1`) || !strings.Contains(out, `"id":2`) {
+		t.Errorf("expected both error responses on stdout, got: %q", out)
+	}
+
+	// stdoutDead must still be open on the happy path.
+	select {
+	case <-rc.stdoutDead:
+		t.Error("stdoutDead closed on happy path — would cause false-positive graceful exit")
+	default:
+		// good
+	}
+}
+
+// TestResilientClient_DrainOrphanedInflight_FailAfterSuccess verifies that a
+// mid-iteration write failure triggers the fast-skip correctly: earlier writes
+// in the same drain cycle that succeeded remain observable on stdout, while
+// the failing and subsequent writes are dropped and logged exactly once.
+func TestResilientClient_DrainOrphanedInflight_FailAfterSuccess(t *testing.T) {
+	sink := &capturingLogger{}
+	logger := log.New(sink, "", 0)
+
+	// failAfterNWriter: succeeds for `passes` writes, then fails every subsequent write.
+	writer := &failAfterNWriter{passes: 1, err: io.ErrClosedPipe}
+
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{
+			Stdout: writer,
+		},
+		log:        logger,
+		stdoutDead: make(chan struct{}),
+	}
+
+	// 4 orphaned IDs: first should succeed, rest should fast-skip after failure.
+	rc.inflight.Store("1", true)
+	rc.inflight.Store("2", true)
+	rc.inflight.Store("3", true)
+	rc.inflight.Store("4", true)
+
+	var stdoutMu sync.Mutex
+	rc.drainOrphanedInflight(&stdoutMu)
+
+	// Inflight fully drained.
+	remaining := 0
+	rc.inflight.Range(func(_, _ any) bool { remaining++; return true })
+	if remaining != 0 {
+		t.Errorf("inflight not cleared: %d entries remain", remaining)
+	}
+
+	// Exactly 2 write attempts: the first success + the first failure.
+	// The remaining 2 orphaned IDs must NOT have triggered writes.
+	if writer.attempts != 2 {
+		t.Errorf("expected 2 write attempts (1 success + 1 failure), got %d", writer.attempts)
+	}
+
+	// stdoutDead signaled.
+	select {
+	case <-rc.stdoutDead:
+		// good
+	default:
+		t.Error("stdoutDead not closed after mid-iteration failure")
+	}
+
+	// Exactly one per-failure log line. Use the specific per-failure marker,
+	// not "stdout broken" alone, because the final summary line also contains
+	// that phrase.
+	logs := sink.String()
+	perFailureCount := strings.Count(logs, "stdout broken while draining orphaned in-flight requests")
+	if perFailureCount != 1 {
+		t.Errorf("expected 1 per-failure log line, got %d: %q", perFailureCount, logs)
+	}
+}
+
+// failAfterNWriter succeeds `passes` times, then every subsequent Write
+// returns `err`. Used to test mid-iteration failure handling.
+type failAfterNWriter struct {
+	passes   int
+	err      error
+	mu       sync.Mutex
+	attempts int
+}
+
+func (w *failAfterNWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.attempts++
+	if w.attempts <= w.passes {
+		return len(p), nil
+	}
+	return 0, w.err
+}
