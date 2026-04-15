@@ -484,3 +484,59 @@ func TestCloseIdempotent(t *testing.T) {
 	srv.Close()
 	srv.Close() // second close must be a no-op, not a panic
 }
+
+// TestControlServer_ReadDeadlineFiresOnSilentClient verifies that a client connecting
+// to the control socket without sending any data does not occupy the handler goroutine
+// indefinitely. After clientDeadline elapses, the handler's Decode must return an
+// i/o timeout error, the server must write an error response, and the connection must
+// be closed. If the deadline is not applied, this test hangs until the Go test harness
+// kills the run.
+//
+// Regression test for FR-5 (post-audit remediation): a malicious or broken client could
+// DoS the daemon control plane by opening connections and never sending a request,
+// accumulating handler goroutines forever.
+func TestControlServer_ReadDeadlineFiresOnSilentClient(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	conn, err := net.DialTimeout("unix", path, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Observe server-side timeout by blocking on Read: the server's writeResponse will
+	// produce a JSON error line, then close the connection. We should see that response
+	// (or EOF on close) within clientDeadline + small slack.
+	if err := conn.SetReadDeadline(time.Now().Add(clientDeadline + 3*time.Second)); err != nil {
+		t.Fatalf("set client read deadline: %v", err)
+	}
+
+	start := time.Now()
+	buf := make([]byte, 1024)
+	n, readErr := conn.Read(buf)
+	elapsed := time.Since(start)
+
+	// The server must react within clientDeadline + slack, not hang forever.
+	if elapsed > clientDeadline+2*time.Second {
+		t.Errorf("server did not react within %s: elapsed=%s (handler likely hung on silent client)",
+			clientDeadline+2*time.Second, elapsed)
+	}
+
+	// Either we got an error response line or EOF after the server closed the conn.
+	// Both indicate the handler unblocked and exited. Hang = test fails via harness timeout.
+	if readErr == nil && n > 0 {
+		var resp Response
+		if err := json.Unmarshal(buf[:n], &resp); err != nil {
+			t.Errorf("unexpected non-JSON response after deadline: %q (err=%v)", buf[:n], err)
+		}
+		if resp.OK {
+			t.Errorf("expected error response after read deadline, got OK=%v msg=%q", resp.OK, resp.Message)
+		}
+	}
+}

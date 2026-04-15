@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
@@ -62,10 +63,20 @@ func (s *Server) acceptLoop() {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	if err := conn.SetReadDeadline(time.Now().Add(clientDeadline)); err != nil {
+		s.logger.Printf("control: set read deadline: %v", err)
+		return
+	}
+
 	dec := json.NewDecoder(conn)
 	var req Request
 	if err := dec.Decode(&req); err != nil {
 		s.writeResponse(conn, Response{OK: false, Message: fmt.Sprintf("invalid request: %v", err)})
+		return
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(clientDeadline)); err != nil {
+		s.logger.Printf("control: set write deadline: %v", err)
 		return
 	}
 
