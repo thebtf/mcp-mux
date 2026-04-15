@@ -21,6 +21,27 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
+// Internal timing defaults for the engine. Kept as named constants (not inline
+// literals) so the rationale is discoverable and future tuning has a single
+// place to change.
+const (
+	// defaultReaperInterval is how often the daemon reaper scans for dead or
+	// idle owners. 10s balances responsiveness against scan cost.
+	defaultReaperInterval = 10 * time.Second
+
+	// daemonStartupTimeout is the maximum time startDaemon waits for the
+	// newly spawned daemon process to become reachable on its control socket.
+	daemonStartupTimeout = 10 * time.Second
+
+	// daemonPollInterval is how often startDaemon probes the control socket
+	// while waiting for the daemon to come up.
+	daemonPollInterval = 100 * time.Millisecond
+
+	// spawnRPCTimeout covers daemon processing + upstream process start +
+	// proactive MCP init handshake for the "spawn" control command.
+	spawnRPCTimeout = 30 * time.Second
+)
+
 // Handler is the MCP server implementation function.
 // When running in daemon mode, this is called with the upstream's stdin/stdout.
 // When running in proxy mode, this is called with the CC session's stdin/stdout.
@@ -73,6 +94,13 @@ type Config struct {
 
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
+
+	// SkipSnapshot disables daemon snapshot loading on startup.
+	// Zero value (false) means snapshots are enabled — the normal production
+	// behaviour used by aimux / engram / mcp-mux.
+	// Set to true for ephemeral daemons (tests, one-shot tools) that should
+	// not rehydrate state from prior runs.
+	SkipSnapshot bool
 }
 
 // MuxEngine manages the muxcore multiplexer lifecycle.
@@ -167,7 +195,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		OwnerIdleTimeout: e.cfg.IdleTimeout,
 		IdleTimeout:      e.cfg.IdleTimeout,
 		Logger:           e.logger,
-		SkipSnapshot:     false,
+		SkipSnapshot:     e.cfg.SkipSnapshot,
 		HandlerFunc:      handlerFunc,
 		SessionHandler:   e.cfg.SessionHandler,
 	})
@@ -175,7 +203,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		return fmt.Errorf("engine daemon: %w", err)
 	}
 
-	reaper := daemon.NewReaper(d, 10*time.Second)
+	reaper := daemon.NewReaper(d, defaultReaperInterval)
 
 	select {
 	case <-ctx.Done():
@@ -284,7 +312,8 @@ func (e *MuxEngine) runProxy(ctx context.Context) error {
 }
 
 // startDaemon re-execs the current binary with DaemonFlag as a detached background
-// process, then polls until the daemon control socket responds (up to 10 seconds).
+// process, then polls until the daemon control socket responds (up to
+// daemonStartupTimeout).
 func (e *MuxEngine) startDaemon() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -307,7 +336,7 @@ func (e *MuxEngine) startDaemon() error {
 	}
 
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
-	return waitForDaemon(ctlPath, 10*time.Second)
+	return waitForDaemon(ctlPath, daemonStartupTimeout)
 }
 
 // isDaemonRunning checks whether the daemon control socket responds to ping.
@@ -322,7 +351,7 @@ func isDaemonRunning(ctlPath string) bool {
 // waitForDaemon polls until the daemon control socket responds (up to timeout).
 func waitForDaemon(ctlPath string, timeout time.Duration) error {
 	deadline := time.After(timeout)
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(daemonPollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -340,7 +369,7 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path
 // and handshake token for the owner that will serve our server identity.
 func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
-	// 30s covers daemon processing + upstream process start + proactive init.
+	// spawnRPCTimeout covers daemon processing + upstream process start + proactive init.
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:     "spawn",
 		Command: command,
@@ -348,7 +377,7 @@ func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, en
 		Cwd:     cwd,
 		Mode:    mode,
 		Env:     env,
-	}, 30*time.Second)
+	}, spawnRPCTimeout)
 	if err != nil {
 		return "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}

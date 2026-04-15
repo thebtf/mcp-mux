@@ -412,7 +412,7 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 			d.mu.Unlock()
 			select {
 			case <-creating:
-			case <-time.After(30 * time.Second):
+			case <-time.After(concurrentCreateWaitTimeout):
 				d.logger.Printf("timeout waiting for placeholder %s, creating new", sid[:8])
 				return d.Spawn(req) // recursive — will create new placeholder
 			}
@@ -736,7 +736,7 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 			d.mu.Unlock()
 			select {
 			case <-creating:
-			case <-time.After(30 * time.Second):
+			case <-time.After(concurrentCreateWaitTimeout):
 				d.mu.Lock()
 				return nil // timed out waiting for placeholder — caller will create new
 			}
@@ -933,6 +933,12 @@ func (d *Daemon) onUpstreamExit(serverID string) {
 // crashThreshold times within this window, further spawns are rejected.
 const crashWindow = 60 * time.Second
 const crashThreshold = 5
+
+// concurrentCreateWaitTimeout is the maximum time a Spawn / findSharedOwner
+// goroutine will wait for another goroutine that is currently creating the
+// same owner entry (i.e. holds the creating channel). Beyond this, the waiter
+// gives up and either returns nil (shared-owner lookup) or retries Spawn.
+const concurrentCreateWaitTimeout = 30 * time.Second
 
 // recordCrash adds a crash timestamp for the given command key.
 // Must be called with d.mu held.
