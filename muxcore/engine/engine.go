@@ -293,21 +293,34 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 // SessionHandler is set (no Handler), proxy mode is unsupported because
 // SessionHandler requires per-request dispatch, not a raw stdio bridge.
 func (e *MuxEngine) runProxy(ctx context.Context) error {
-	// SessionHandler takes priority — if both are set, use Handler is skipped.
-	if e.cfg.SessionHandler != nil {
-		if e.cfg.Handler == nil {
-			return fmt.Errorf("engine proxy: proxy mode requires Handler; SessionHandler does not support raw stdio proxy mode")
-		}
-		// Both set: SessionHandler wins — do not fall through to Handler.
-		// Proxy mode is a stdio passthrough; SessionHandler is handled by the daemon.
-		// Log and skip — the daemon will route requests through SessionHandler.
-		e.logger.Printf("engine proxy: SessionHandler set, skipping Handler for proxy mode (session=%s)", os.Getenv("MCP_MUX_SESSION_ID"))
-		return nil
-	}
+	// Proxy mode: we are a subprocess of an EXTERNAL parent shim (e.g. the
+	// user wrapped us via `mcp-mux <our-binary>`). The parent owns stdio and
+	// expects us to serve one request/response per MCP message.
+	//
+	// SessionHandler cannot serve raw stdio on its own — it needs an Owner
+	// with session routing, which only exists in daemon mode. In proxy mode
+	// we rely on the legacy Handler callback for stdio I/O. Consumers that
+	// use SessionHandler in daemon mode should ALSO keep Handler set as a
+	// "proxy mode compatibility" fallback (aimux does exactly this).
+	//
+	// Historical note: v0.18.0–v0.19.3 had a branch here that logged
+	// "SessionHandler set, skipping Handler" and returned nil when both
+	// handlers were set, causing the subprocess to exit instantly. That
+	// broke every muxcore consumer wrapped by mcp-mux (observed: aimux
+	// crash-loop into FAILED state). The branch was based on the wrong
+	// mental model — in proxy mode there is no daemon "handling
+	// SessionHandler" for us; we ARE the thing being wrapped.
 	if e.cfg.Handler == nil {
+		if e.cfg.SessionHandler != nil {
+			return fmt.Errorf("engine proxy: proxy mode requires Handler; SessionHandler alone cannot serve raw stdio — consumers should keep Handler set for proxy-mode compatibility")
+		}
 		return fmt.Errorf("engine proxy: Handler is required for proxy mode")
 	}
-	e.logger.Printf("engine proxy: running handler directly on stdio (session=%s)", os.Getenv("MCP_MUX_SESSION_ID"))
+	if e.cfg.SessionHandler != nil {
+		e.logger.Printf("engine proxy: both handlers set, using Handler for stdio passthrough (session=%s)", os.Getenv("MCP_MUX_SESSION_ID"))
+	} else {
+		e.logger.Printf("engine proxy: running handler directly on stdio (session=%s)", os.Getenv("MCP_MUX_SESSION_ID"))
+	}
 	return e.cfg.Handler(ctx, os.Stdin, os.Stdout)
 }
 
