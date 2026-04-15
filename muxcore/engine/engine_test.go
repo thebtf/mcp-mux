@@ -394,3 +394,129 @@ func TestRunProxy_HandlerReceivesData(t *testing.T) {
 		t.Error("handler did not receive stdin data")
 	}
 }
+
+// TestRunProxy_BothHandlersSet_FallsThroughToHandler is a regression test for
+// the muxcore engine proxy-mode fallthrough bug. v0.18.0–v0.19.3 had a branch
+// in runProxy that returned nil immediately when both Handler and SessionHandler
+// were set — the comment claimed "SessionHandler is handled by the daemon", but
+// in proxy mode the consumer IS the subprocess being wrapped by an external
+// parent shim (e.g. mcp-mux wrapping aimux), and there is no daemon at our
+// level. The early return caused the subprocess to exit in ~138ms, which the
+// parent shim observed as a dead upstream, triggering restart → circuit
+// breaker → permanent FAILED state.
+//
+// The fix: when both handlers are set, fall through to the legacy Handler
+// callback for stdio I/O. SessionHandler is irrelevant in proxy mode because
+// we cannot provide Owner-backed session routing from a subprocess.
+//
+// This test asserts the fix: with both handlers set, runProxy MUST call
+// Handler and must NOT return nil without reading stdin.
+func TestRunProxy_BothHandlersSet_FallsThroughToHandler(t *testing.T) {
+	const testPayload = `{"jsonrpc":"2.0","id":1,"method":"initialize"}`
+
+	var logBuf bytes.Buffer
+	logger := log.New(&logBuf, "", 0)
+
+	handlerCalled := false
+	handlerReadBytes := 0
+	handler := Handler(func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		handlerCalled = true
+		buf := make([]byte, 256)
+		n, _ := stdin.Read(buf)
+		handlerReadBytes = n
+		_, err := io.WriteString(stdout, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+		return err
+	})
+
+	// Both handlers set — the condition that triggered the old bug.
+	e, err := New(Config{
+		Name:           "test-both-handlers",
+		Handler:        handler,
+		SessionHandler: noopSessionHandler{},
+		Logger:         logger,
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	t.Setenv("MCP_MUX_SESSION_ID", "sess_regression")
+
+	// Real os.Pipe-backed stdin/stdout so runProxy's direct use of os.Stdin/
+	// os.Stdout actually flows through to the Handler.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() stdin: %v", err)
+	}
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() stdout: %v", err)
+	}
+	defer stdoutR.Close()
+
+	if _, err := io.WriteString(stdinW, testPayload); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	stdinW.Close()
+
+	origStdin, origStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdinR, stdoutW
+	defer func() {
+		os.Stdin = origStdin
+		os.Stdout = origStdout
+	}()
+
+	ctx := context.Background()
+	if err := e.runProxy(ctx); err != nil {
+		t.Fatalf("runProxy() unexpected error: %v", err)
+	}
+	stdoutW.Close()
+	stdinR.Close()
+
+	if !handlerCalled {
+		t.Fatal("Handler was NOT called in proxy mode with both handlers set — " +
+			"this is the regression bug: runProxy returned early without using Handler, " +
+			"which would cause the subprocess to exit and crash-loop under a parent shim")
+	}
+	if handlerReadBytes == 0 {
+		t.Error("Handler was called but did not read any stdin bytes — stdio passthrough broken")
+	}
+
+	// The new log line must NOT match the old "skipping Handler" string — that
+	// phrasing was the fingerprint of the broken code path.
+	logOut := logBuf.String()
+	if strings.Contains(logOut, "skipping Handler for proxy mode") {
+		t.Errorf("log contains the old 'skipping Handler' marker — bug regressed:\n%s", logOut)
+	}
+	if !strings.Contains(logOut, "both handlers set, using Handler for stdio passthrough") {
+		t.Errorf("log missing the new fallthrough marker:\n%s", logOut)
+	}
+}
+
+// TestRunProxy_SessionHandlerOnly_ReturnsError verifies that when only
+// SessionHandler is set (no Handler), runProxy returns a clear error
+// explaining that raw stdio proxy requires Handler. This guards the
+// negative case of the fallthrough fix: we only fall through when
+// Handler is actually present.
+func TestRunProxy_SessionHandlerOnly_ReturnsError(t *testing.T) {
+	e, err := New(Config{
+		Name:           "test-session-only",
+		SessionHandler: noopSessionHandler{},
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	t.Setenv("MCP_MUX_SESSION_ID", "sess_session_only")
+
+	ctx := context.Background()
+	err = e.runProxy(ctx)
+	if err == nil {
+		t.Fatal("runProxy() expected error for SessionHandler-only config, got nil")
+	}
+	if !strings.Contains(err.Error(), "proxy mode requires Handler") {
+		t.Errorf("error should explain that Handler is required, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "proxy-mode compatibility") {
+		t.Errorf("error should hint that consumers keep Handler for proxy-mode compatibility, got: %v", err)
+	}
+}
