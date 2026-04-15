@@ -57,15 +57,19 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.19.1)
+## muxcore Library API (v0.19.2)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.19.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.19.2
 ```
 
-v0.19.1 is a refactor-only release on top of v0.19.0 — zero behaviour change.
+v0.19.2 is a bug fix release on top of v0.19.1 — fixes a recursive goroutine
+leak in `daemon.Spawn` when a concurrent placeholder wait times out. No API
+changes, zero consumer code modifications required.
+
+v0.19.1 was a refactor-only release on top of v0.19.0 — zero behaviour change.
 Adds `engine.Config.SkipSnapshot` as an opt-in field (zero-value preserves the
 prior hardcoded default). All v0.19.0 migration notes below still apply.
 
