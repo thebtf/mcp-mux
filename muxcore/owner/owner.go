@@ -360,7 +360,7 @@ func (o *Owner) SpawnUpstreamBackground() {
 			proc = upstream.NewProcessFromHandler(context.Background(), o.handlerFunc)
 			o.logger.Printf("background handler spawn: in-process (no subprocess)")
 		} else {
-			proc, err = upstream.Start(o.command, o.args, nil, o.cwd)
+			proc, err = upstream.Start(o.command, o.args, nil, o.cwd, o.logger)
 		}
 		if err != nil {
 			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
@@ -453,7 +453,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger.Printf("owner: started in-process handler (no subprocess)")
 	} else {
 		var err error
-		proc, err = upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd)
+		proc, err = upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd, logger)
 		if err != nil {
 			return nil, fmt.Errorf("owner: start upstream: %w", err)
 		}

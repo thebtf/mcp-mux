@@ -1,8 +1,11 @@
 package upstream
 
 import (
+	"bytes"
+	"log"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -19,7 +22,7 @@ func TestStartAndClose(t *testing.T) {
 		args = []string{"hello"}
 	}
 
-	p, err := Start(cmd, args, nil, "")
+	p, err := Start(cmd, args, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -37,7 +40,7 @@ func TestStartAndClose(t *testing.T) {
 func TestWriteAndRead(t *testing.T) {
 	// Use 'go run' with a simple cat-like program
 	// For cross-platform, we use Go itself
-	p, err := Start("go", []string{"run", "../../testdata/echo_pipe.go"}, nil, "")
+	p, err := Start("go", []string{"run", "../../testdata/echo_pipe.go"}, nil, "", nil)
 	if err != nil {
 		t.Skipf("Skipping: cannot start echo_pipe: %v", err)
 	}
@@ -70,7 +73,7 @@ func TestProcessDone(t *testing.T) {
 		args = []string{"done"}
 	}
 
-	p, err := Start(cmd, args, nil, "")
+	p, err := Start(cmd, args, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -95,7 +98,7 @@ func TestProcessPID(t *testing.T) {
 		args = []string{"pid"}
 	}
 
-	p, err := Start(cmd, args, nil, "")
+	p, err := Start(cmd, args, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -118,7 +121,7 @@ func TestCloseTerminatesProcess(t *testing.T) {
 		args = []string{"30"}
 	}
 
-	p, err := Start(cmd, args, nil, "")
+	p, err := Start(cmd, args, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -147,7 +150,7 @@ func TestReadLineAfterClose(t *testing.T) {
 		args = []string{"line1"}
 	}
 
-	p, err := Start(cmd, args, nil, "")
+	p, err := Start(cmd, args, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
@@ -165,6 +168,74 @@ func TestReadLineAfterClose(t *testing.T) {
 	}
 }
 
+// TestStderrRoutedToLogger verifies upstream stderr lines are forwarded to the
+// caller-supplied logger instead of os.Stderr. This is the diagnostic that
+// lets us see why upstreams (e.g. cclsp) crash with exit status 1 when the
+// daemon runs detached with os.Stderr discarded — before this fix the error
+// output was silently dropped and crashes looked like mysterious "upstream
+// exited: exit status 1" with no further context.
+func TestStderrRoutedToLogger(t *testing.T) {
+	var (
+		buf bytes.Buffer
+		mu  sync.Mutex
+	)
+	logger := log.New(&syncWriter{buf: &buf, mu: &mu}, "", 0)
+
+	// Child process writes a unique sentinel to its stderr then exits.
+	var cmd string
+	var args []string
+	const sentinel = "upstream-stderr-sentinel-x91z"
+	if runtime.GOOS == "windows" {
+		cmd = "cmd"
+		args = []string{"/c", "echo", sentinel, "1>&2"}
+	} else {
+		cmd = "sh"
+		args = []string{"-c", "echo " + sentinel + " 1>&2"}
+	}
+
+	p, err := Start(cmd, args, nil, "", logger)
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	defer p.Close()
+
+	// Wait for the process to exit so the stderr goroutine has flushed.
+	select {
+	case <-p.Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("process did not exit within timeout")
+	}
+	// Allow the forwarding goroutine a brief moment to drain after Done.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		captured := buf.String()
+		mu.Unlock()
+		if strings.Contains(captured, sentinel) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mu.Lock()
+	final := buf.String()
+	mu.Unlock()
+	t.Fatalf("logger did not receive sentinel %q; captured=%q", sentinel, final)
+}
+
+// syncWriter serializes writes under a mutex so concurrent stderr drains and
+// test assertions never observe a torn byte slice.
+type syncWriter struct {
+	buf *bytes.Buffer
+	mu  *sync.Mutex
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
 func TestEnvironmentPassing(t *testing.T) {
 	var cmd string
 	var args []string
@@ -180,7 +251,7 @@ func TestEnvironmentPassing(t *testing.T) {
 		"TEST_MUX_VAR": "mux_value_123",
 	}
 
-	p, err := Start(cmd, args, env, "")
+	p, err := Start(cmd, args, env, "", nil)
 	if err != nil {
 		t.Fatalf("Start() error: %v", err)
 	}
