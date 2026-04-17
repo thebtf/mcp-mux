@@ -96,6 +96,18 @@ type Daemon struct {
 	// creating an infinite respawn loop that burns CPU.
 	crashTracker map[string][]time.Time
 
+	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
+	// gate in spawnOnce tore down a registered owner because IsReachable()
+	// returned false despite IsAccepting() reporting open. Counter is
+	// monotonically increasing for the daemon's lifetime and is surfaced via
+	// HandleStatus / mux_list so operators can correlate zombie recoveries
+	// with upstream churn. Protected by d.mu.
+	zombieDetectedSpawn int
+
+	// zombieDetectedRestore counts zombies detected by the FR-3 post-snapshot
+	// gate. Incremented only by the snapshot.go path, always under d.mu.
+	zombieDetectedRestore int
+
 	shutdownOnce sync.Once
 }
 
@@ -480,13 +492,45 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			d.mu.Unlock()
 			return "", "", "", errSpawnRetry
 		}
+		// FR-4 — spawn-time listener health gate.
+		//
+		// IsAccepting() only checks the listenerDone sync signal; it does NOT
+		// detect zombies where the listener died without signalling that
+		// channel (observed in production on 2026-04-17 after a graceful-restart
+		// snapshot sequence: 6/9 restored owners had upstream_pid alive in
+		// d.owners but refused ipc.Dial from a fresh shim). IsReachable() adds
+		// an authoritative dial probe on top. We run BOTH checks so the fast
+		// path (IsAccepting == false → closed isolated server) keeps its cheap
+		// sync-channel semantics, and only owners that pass IsAccepting pay the
+		// ~1ms dial probe cost.
 		if entry.Owner.IsAccepting() {
-			entry.LastSession = time.Now()
+			if entry.Owner.IsReachable() {
+				entry.LastSession = time.Now()
+				d.mu.Unlock()
+				entry.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+				// Note: no log here — this path is the hot path (every CC session reconnect).
+				// Logging each reuse produced 500+ lines/minute during multi-session incidents.
+				return entry.Owner.IPCPath(), sid, token, nil
+			}
+			// IsAccepting==true but IsReachable==false: zombie listener.
+			// Tear down the dead entry under lock, bump the detection counter,
+			// emit a single structured log line per detection so operators can
+			// grep for zombie recoveries, and fall through to the cold-spawn
+			// path (the shim gets a fresh path, never the zombie path).
+			d.zombieDetectedSpawn++
+			shortSID := sid
+			if len(shortSID) > 8 {
+				shortSID = shortSID[:8]
+			}
+			d.logger.Printf(
+				"zombie-listener detected: path=spawn server=%s ipc=%q cmd=%q action=tear-down-and-respawn",
+				shortSID, entry.Owner.IPCPath(), entry.Command,
+			)
+			entry.Owner.Shutdown()
+			delete(d.owners, sid)
 			d.mu.Unlock()
-			entry.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
-			// Note: no log here — this path is the hot path (every CC session reconnect).
-			// Logging each reuse produced 500+ lines/minute during multi-session incidents.
-			return entry.Owner.IPCPath(), sid, token, nil
+			// Retry from the top so placeholder/dedup paths can see the cleared slot.
+			return "", "", "", errSpawnRetry
 		}
 		// Owner exists but IPC listener is closed (isolated server).
 		// If owner still has active sessions (in-flight requests), DON'T kill it —
@@ -748,11 +792,13 @@ func (d *Daemon) HandleStatus() map[string]any {
 	}
 
 	return map[string]any{
-		"daemon":             true,
-		"owner_count":        len(servers), // excludes placeholders still being created
-		"servers":            servers,
-		"owner_idle_timeout": d.ownerIdleTimeout.String(),
-		"idle_timeout":       d.idleTimeout.String(),
+		"daemon":                   true,
+		"owner_count":              len(servers), // excludes placeholders still being created
+		"servers":                  servers,
+		"owner_idle_timeout":       d.ownerIdleTimeout.String(),
+		"idle_timeout":             d.idleTimeout.String(),
+		"zombie_detections_spawn":  d.zombieDetectedSpawn,
+		"zombie_detections_restore": d.zombieDetectedRestore,
 	}
 }
 
