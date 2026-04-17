@@ -732,7 +732,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		o.SpawnUpstreamBackground()
 	}
 
-	o.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+	// PreRegister with the MERGED env (not raw req.Env) so the session — bound
+	// to this token on handshake — sees daemon-filled credentials too.
+	// owner.go:~815 gates muxEnv injection on `len(s.Env) > 0` and sends s.Env
+	// as _meta.muxEnv; session-aware upstreams (pr-review-mcp etc.) look up
+	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
+	// env would leave muxEnv missing the token even though the owner/upstream
+	// process has it via mergeEnv above.
+	o.SessionMgr().PreRegister(token, req.Cwd, sessionEnv)
 	return ipcPath, sid, token, nil
 }
 
