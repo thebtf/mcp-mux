@@ -330,13 +330,8 @@ func TestDispatchToSessionHandler_Timeout(t *testing.T) {
 		},
 	}
 	o := newDispatchOwner(mock)
-	// Timeout chosen to be comfortably larger than -race scheduler jitter on
-	// slow CI runners while still an order of magnitude below the 5-second
-	// handler budget (which this test asserts must NOT elapse). Earlier value
-	// of 100ms was flaky on ubuntu/macos under -race because the
-	// context-cancellation-and-error-emit path could exceed 100ms of wall
-	// clock when contending with the race detector's serialisation overhead.
-	o.toolTimeoutNs.Store(int64(500 * time.Millisecond))
+	// Set 100 ms timeout.
+	o.toolTimeoutNs.Store(int64(100 * time.Millisecond))
 
 	sess, buf := newTestSession("/project-timeout")
 	defer sess.Close()
