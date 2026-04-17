@@ -617,7 +617,18 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// leaks between sessions and ensures session-aware servers see all vars.
 	sessionEnv := req.Env
 	if len(sessionEnv) > 0 {
-		d.logger.Printf("owner %s: session env %d vars", sid[:8], len(sessionEnv))
+		// Log presence (NOT values) of common credential keys so env-passthrough
+		// regressions surface in mcp-muxd-debug.log without requiring a test
+		// harness. Session-aware upstreams (e.g. pr-review-mcp) error out with
+		// "No GitHub token available for session ..." when these are missing;
+		// this line tells the operator whether the token survived the shim →
+		// daemon hop before they go hunting in the MCP server itself.
+		d.logger.Printf("owner %s: session env %d vars (github_pat=%v gh_token=%v openai_key=%v anthropic_key=%v)",
+			sid[:8], len(sessionEnv),
+			sessionEnv["GITHUB_PERSONAL_ACCESS_TOKEN"] != "",
+			sessionEnv["GH_TOKEN"] != "" || sessionEnv["GITHUB_TOKEN"] != "",
+			sessionEnv["OPENAI_API_KEY"] != "",
+			sessionEnv["ANTHROPIC_API_KEY"] != "")
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
