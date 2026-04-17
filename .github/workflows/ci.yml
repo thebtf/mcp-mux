@@ -45,6 +45,10 @@ jobs:
         run: go test -coverprofile=coverage.out -count=1 -timeout 180s ./...
       - uses: codecov/codecov-action@v4
         with:
-          files: coverage.out
+          # codecov-action@v4: `files` is a comma-separated explicit list.
+          # Include the muxcore module's profile so coverage from the nested
+          # Go module is uploaded alongside the root profile (CodeRabbit major
+          # finding on PR #63).
+          files: coverage.out,muxcore/coverage.out
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
