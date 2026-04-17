@@ -204,8 +204,13 @@ var restoreHealthGateWindow = 750 * time.Millisecond
 // for each zombie found, so concurrent spawn/shutdown cannot produce torn
 // state.
 func (d *Daemon) runRestoreHealthGate() {
+	// Read the tunable once here (main goroutine) and pass into the worker
+	// via closure capture. Reading it inside the worker would race t.Cleanup
+	// callers in tests that restore the var after the test function returns
+	// but before the goroutine wakes.
+	window := restoreHealthGateWindow
 	go func() {
-		time.Sleep(restoreHealthGateWindow)
+		time.Sleep(window)
 
 		d.mu.RLock()
 		entries := make([]*OwnerEntry, 0, len(d.owners))

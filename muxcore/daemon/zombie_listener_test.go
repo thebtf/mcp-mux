@@ -75,9 +75,13 @@ func TestSpawn_ZombieListenerIsTornDownAndRespawned(t *testing.T) {
 	}
 
 	// Call Spawn. Under the fix, spawnOnce detects the zombie, tears it down,
-	// and returns errSpawnRetry; Spawn's outer loop then tries again and will
-	// typically fail to cold-spawn (since "echo zombie" is not a real MCP
-	// server) — we only care about the zombie detection side-effects.
+	// and returns errSpawnRetry; Spawn's outer loop then tries again. The
+	// second attempt falls through the reuse path (no entry for sid anymore),
+	// hits findSharedOwner (no match), and enters the cold-spawn placeholder
+	// path. That path WILL try to spawn "echo zombie" as a real MCP server
+	// and will ultimately fail — but the zombie detection side-effects we
+	// care about (counter increment + the original zombie pointer removed
+	// from d.owners) already fired before any cold-spawn attempt.
 	req := control.Request{
 		Cmd:     "spawn",
 		Command: "echo",
@@ -87,14 +91,18 @@ func TestSpawn_ZombieListenerIsTornDownAndRespawned(t *testing.T) {
 	}
 	_, _, _, _ = d.Spawn(req)
 
-	// Assertions.
+	// The assertion is "the original zombie entry was torn down" — a later
+	// cold-spawn placeholder or partial entry for the SAME serverID is fine
+	// (it's a fresh owner, not the zombie we installed). So compare by
+	// pointer identity, not by presence.
 	d.mu.RLock()
-	_, stillPresent := d.owners[sid]
+	entry, stillPresent := d.owners[sid]
+	isOriginalZombie := stillPresent && entry != nil && entry.Owner == zombie
 	counter := d.zombieDetectedSpawn
 	d.mu.RUnlock()
 
-	if stillPresent {
-		t.Errorf("zombie owner still present in d.owners after Spawn — tear-down path did not run")
+	if isOriginalZombie {
+		t.Errorf("original zombie Owner still registered in d.owners after Spawn — tear-down path did not run (stillPresent=%v entry.Owner==zombie=true)", stillPresent)
 	}
 	if counter != 1 {
 		t.Errorf("zombie_detections_spawn counter = %d, want 1", counter)
