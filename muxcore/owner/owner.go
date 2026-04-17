@@ -1959,17 +1959,22 @@ func (o *Owner) IsAccepting() bool {
 // where a stale "accepting" answer would cause an external caller to dial a
 // dead socket.
 //
-// The probe reuses ipc.Dial's existing 500ms timeout. Bound the probe budget
-// by the bounded internal dialTimeout; callers that need tighter latency may
-// wrap this in a context.
+// The probe reuses ipc.Dial's existing 500ms timeout. Callers MUST NOT hold
+// daemon-wide locks across this call; the probe can take up to 500ms on a
+// hung peer and a daemon-wide lock would freeze every other spawn / status
+// request for that window.
 //
-// Returns false without probing if:
-//   - listenerDone has been signalled (explicit closeListener)
-//   - ipcPath is empty (test owners, SessionHandler-only pre-bind)
-//
-// For any other case the method performs a real dial. This is a ~1ms hot-path
-// cost on healthy listeners; on zombies it surfaces the failure deterministic-
-// ally in a single probe.
+// Returns:
+//   - false if listenerDone has been signalled (explicit closeListener — an
+//     owner that legitimately closed its own listener, e.g. an isolated
+//     server after its first session, will return false here; callers that
+//     need to distinguish "legitimately closed" from "zombie" must pair
+//     IsReachable with IsAccepting to tell them apart).
+//   - true if ipcPath is empty (test owners / pre-bind SessionHandler-only
+//     fixtures have no path to probe — they are treated as reachable so
+//     unit-test flows are not short-circuited).
+//   - otherwise, the result of ipc.IsAvailable(ipcPath) (dial-then-close
+//     probe with the 500ms timeout from ipc.dialTimeout).
 func (o *Owner) IsReachable() bool {
 	// Fast path: explicit close always wins.
 	select {

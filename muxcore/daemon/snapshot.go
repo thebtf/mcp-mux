@@ -210,7 +210,14 @@ func (d *Daemon) runRestoreHealthGate() {
 	// but before the goroutine wakes.
 	window := restoreHealthGateWindow
 	go func() {
-		time.Sleep(window)
+		// Respect daemon shutdown: if Shutdown closes d.done during our
+		// sleep window, exit immediately instead of sweeping a daemon that
+		// is already tearing itself down.
+		select {
+		case <-time.After(window):
+		case <-d.done:
+			return
+		}
 
 		d.mu.RLock()
 		entries := make([]*OwnerEntry, 0, len(d.owners))
@@ -223,9 +230,30 @@ func (d *Daemon) runRestoreHealthGate() {
 
 		zombies := 0
 		for _, entry := range entries {
+			// Re-check shutdown between probes so a large owner set cannot
+			// extend our presence on a dying daemon.
+			select {
+			case <-d.done:
+				return
+			default:
+			}
+
+			// IMPORTANT: a zombie is an owner whose listener died WITHOUT a
+			// closeListener() call — i.e. IsAccepting reports true (sync
+			// channel still open) but IsReachable reports false (dial fails).
+			// Owners that legitimately closed their listener (e.g. isolated
+			// servers after the first session connects) report IsAccepting
+			// false and IsReachable false; they are NOT zombies and we MUST
+			// NOT tear them down here — the health gate is a defensive
+			// check against the unreachable-despite-IsAccepting class only.
+			if !entry.Owner.IsAccepting() {
+				continue
+			}
+			// Probe outside d.mu — ipc.Dial can take up to 500ms.
 			if entry.Owner.IsReachable() {
 				continue
 			}
+
 			d.mu.Lock()
 			sid := entry.ServerID
 			current, ok := d.owners[sid]
@@ -244,6 +272,8 @@ func (d *Daemon) runRestoreHealthGate() {
 			)
 			delete(d.owners, sid)
 			d.mu.Unlock()
+			// Shutdown OUTSIDE the lock — it closes sockets, tears down
+			// upstream, and may fire callbacks back into the daemon.
 			entry.Owner.Shutdown()
 			zombies++
 		}

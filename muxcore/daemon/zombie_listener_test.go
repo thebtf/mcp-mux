@@ -131,12 +131,16 @@ func TestHandleStatus_ZombieCounters(t *testing.T) {
 }
 
 // TestRunRestoreHealthGate_ZombieTornDown exercises the FR-3 post-restore
-// sweep directly: install a zombie entry, call runRestoreHealthGate, and
-// assert the entry was removed and the counter incremented.
+// sweep directly: install three owners in distinct states — zombie (listener
+// died, IsAccepting lies), healthy (bound + accepting), and legitimately
+// closed (closeListener() ran, IsAccepting correctly reports false) — then
+// verify the sweep tears down ONLY the zombie and preserves the other two.
 //
-// We override restoreHealthGateWindow to a short value so the test does not
-// wait 750ms, and we re-override at t.Cleanup to restore the production
-// default for other tests in the same package.
+// The legitimately-closed case is the one CodeRabbit + Gemini flagged: if
+// the gate used `!IsReachable` alone it would tear down isolated owners that
+// legitimately closed their listener after the first session (production
+// regression — would break every isolated MCP server's post-snapshot
+// reconnect contract).
 func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 	origWindow := restoreHealthGateWindow
 	restoreHealthGateWindow = 10 * time.Millisecond
@@ -144,12 +148,8 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 
 	d := testDaemon(t)
 
-	// Install two owners: one zombie, one legit-but-closed (IsAccepting
-	// false, listener never bound). The sweep should only tear down the
-	// zombie — the explicitly-closed owner is a pre-existing legitimate
-	// state (isolated server, listener closed after first session).
-
-	// Zombie: bound listener then closed directly.
+	// Zombie: bind listener then close the fd without signalling
+	// listenerDone — IsAccepting lies, IsReachable tells the truth.
 	zPath := shortSocketPath(t, "zombie.sock")
 	zLn, err := net.Listen("unix", zPath)
 	if err != nil {
@@ -178,6 +178,21 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 	hSID := fmt.Sprintf("%064x", 0xBEEF)
 	healthy := owner.NewTestOwnerWithListener(hPath, hSID, hLn)
 
+	// Legitimately closed: bind, close, AND signal listenerDone. This is
+	// the state an isolated owner lands in after its first session — the
+	// owner itself explicitly closed its listener because it will never
+	// accept another connection. The health gate MUST NOT treat this as
+	// a zombie.
+	cPath := shortSocketPath(t, "closed.sock")
+	cLn, err := net.Listen("unix", cPath)
+	if err != nil {
+		t.Fatalf("net.Listen closed: %v", err)
+	}
+	cLn.Close()
+	cSID := fmt.Sprintf("%064x", 0xC105ED)
+	closed := owner.NewTestOwner(cPath, cSID)
+	owner.TestOwnerSignalListenerDone(closed)
+
 	d.mu.Lock()
 	d.owners[zSID] = &OwnerEntry{
 		Owner: zombie, ServerID: zSID, Command: "echo", Args: []string{"z"}, LastSession: time.Now(),
@@ -185,11 +200,12 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 	d.owners[hSID] = &OwnerEntry{
 		Owner: healthy, ServerID: hSID, Command: "echo", Args: []string{"h"}, LastSession: time.Now(),
 	}
+	d.owners[cSID] = &OwnerEntry{
+		Owner: closed, ServerID: cSID, Command: "echo", Args: []string{"c"}, LastSession: time.Now(),
+	}
 	d.mu.Unlock()
 
-	// Run the sweep and wait for its goroutine to finish its work. We poll
-	// for up to 2 seconds — the override reduces the sleep to 10ms, so the
-	// sweep completes well inside that window even under -race on slow CI.
+	// Run the sweep and wait for its goroutine to finish. Poll up to 2s.
 	d.runRestoreHealthGate()
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -197,9 +213,10 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 		d.mu.RLock()
 		_, zPresent := d.owners[zSID]
 		_, hPresent := d.owners[hSID]
+		_, cPresent := d.owners[cSID]
 		counter := d.zombieDetectedRestore
 		d.mu.RUnlock()
-		if !zPresent && hPresent && counter == 1 {
+		if !zPresent && hPresent && cPresent && counter == 1 {
 			return
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -208,10 +225,14 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 	d.mu.RLock()
 	_, zPresent := d.owners[zSID]
 	_, hPresent := d.owners[hSID]
+	_, cPresent := d.owners[cSID]
 	counter := d.zombieDetectedRestore
 	d.mu.RUnlock()
-	t.Fatalf("post-sweep state: zPresent=%v hPresent=%v counter=%d "+
-		"(want zPresent=false hPresent=true counter=1)", zPresent, hPresent, counter)
+	t.Fatalf("post-sweep state: zPresent=%v hPresent=%v cPresent=%v counter=%d "+
+		"(want zPresent=false hPresent=true cPresent=true counter=1) — "+
+		"critical: cPresent==false means the gate tore down a legitimately-"+
+		"closed isolated owner (production regression)",
+		zPresent, hPresent, cPresent, counter)
 }
 
 // Sanity imports — keep the toolchain honest about unused imports when the

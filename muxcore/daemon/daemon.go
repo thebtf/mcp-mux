@@ -499,37 +499,60 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		// channel (observed in production on 2026-04-17 after a graceful-restart
 		// snapshot sequence: 6/9 restored owners had upstream_pid alive in
 		// d.owners but refused ipc.Dial from a fresh shim). IsReachable() adds
-		// an authoritative dial probe on top. We run BOTH checks so the fast
-		// path (IsAccepting == false → closed isolated server) keeps its cheap
-		// sync-channel semantics, and only owners that pass IsAccepting pay the
-		// ~1ms dial probe cost.
+		// an authoritative dial probe on top, but it can block for up to the
+		// ipc dial timeout (500ms), so we MUST NOT hold d.mu across it —
+		// otherwise every other spawn / status request freezes for that
+		// window. Pattern: release d.mu → probe → re-acquire under CAS (is
+		// this still the same entry we probed?) → tear down or reuse.
 		if entry.Owner.IsAccepting() {
-			if entry.Owner.IsReachable() {
-				entry.LastSession = time.Now()
+			probeOwner := entry.Owner
+			probeSID := sid
+			d.mu.Unlock()
+
+			if probeOwner.IsReachable() {
+				// Healthy — re-acquire to update LastSession (cheap), then
+				// return the path. Re-check that the entry is still the same
+				// pointer; if a concurrent path replaced it, retry from the
+				// top so the new entry goes through its own probe.
+				d.mu.Lock()
+				current, still := d.owners[probeSID]
+				if !still || current.Owner != probeOwner {
+					d.mu.Unlock()
+					return "", "", "", errSpawnRetry
+				}
+				current.LastSession = time.Now()
 				d.mu.Unlock()
-				entry.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
-				// Note: no log here — this path is the hot path (every CC session reconnect).
-				// Logging each reuse produced 500+ lines/minute during multi-session incidents.
-				return entry.Owner.IPCPath(), sid, token, nil
+				probeOwner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+				// Note: no log here — this path is the hot path (every CC
+				// session reconnect). Logging each reuse produced 500+
+				// lines/minute during multi-session incidents.
+				return probeOwner.IPCPath(), probeSID, token, nil
 			}
-			// IsAccepting==true but IsReachable==false: zombie listener.
-			// Tear down the dead entry under lock, bump the detection counter,
-			// emit a single structured log line per detection so operators can
-			// grep for zombie recoveries, and fall through to the cold-spawn
-			// path (the shim gets a fresh path, never the zombie path).
+
+			// Zombie. Re-acquire, CAS, delete + bump counter, then Shutdown
+			// OUTSIDE the lock (Shutdown is heavy — closes sockets, tears
+			// down upstream, may fire callbacks back into the daemon).
+			d.mu.Lock()
+			current, still := d.owners[probeSID]
+			if !still || current.Owner != probeOwner {
+				// Some other path already replaced the zombie; defer to
+				// its replacement and retry.
+				d.mu.Unlock()
+				return "", "", "", errSpawnRetry
+			}
 			d.zombieDetectedSpawn++
-			shortSID := sid
+			shortSID := probeSID
 			if len(shortSID) > 8 {
 				shortSID = shortSID[:8]
 			}
 			d.logger.Printf(
 				"zombie-listener detected: path=spawn server=%s ipc=%q cmd=%q action=tear-down-and-respawn",
-				shortSID, entry.Owner.IPCPath(), entry.Command,
+				shortSID, probeOwner.IPCPath(), current.Command,
 			)
-			entry.Owner.Shutdown()
-			delete(d.owners, sid)
+			delete(d.owners, probeSID)
 			d.mu.Unlock()
-			// Retry from the top so placeholder/dedup paths can see the cleared slot.
+			probeOwner.Shutdown()
+			// Retry from the top so placeholder/dedup paths see the cleared slot.
 			return "", "", "", errSpawnRetry
 		}
 		// Owner exists but IPC listener is closed (isolated server).

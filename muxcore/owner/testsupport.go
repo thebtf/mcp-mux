@@ -49,3 +49,24 @@ func NewTestOwnerWithListener(ipcPath, serverID string, ln net.Listener) *Owner 
 	o.listener = ln
 	return o
 }
+
+// TestOwnerSignalListenerDone simulates the effect of closeListener on a test
+// Owner without going through the full Shutdown machinery. After this call
+// IsAccepting returns false — representing an Owner that legitimately closed
+// its listener (e.g. an isolated server after the first session connected).
+//
+// Used by tests that need to distinguish "legitimately closed" from "zombie":
+// a zombie is IsAccepting==true && IsReachable==false, a legitimately-closed
+// owner is IsAccepting==false regardless of IsReachable, and the health gate
+// must only tear down the former. Intended for tests only.
+//
+// Implementation note: we route the close through closeListenerOnce.Do so a
+// subsequent closeListener() call (e.g. from a t.Cleanup-triggered Shutdown)
+// is a no-op instead of a double-close panic. This mirrors the production
+// closeListener path exactly except that no ipc.Cleanup is performed on the
+// socket file (tests manage their own temp files).
+func TestOwnerSignalListenerDone(o *Owner) {
+	o.closeListenerOnce.Do(func() {
+		close(o.listenerDone)
+	})
+}
