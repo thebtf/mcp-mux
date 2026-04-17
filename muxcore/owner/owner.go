@@ -1267,6 +1267,13 @@ func buildJSONRPCErrorBytes(id json.RawMessage, code int, message string) ([]byt
 
 // routeProgressNotification sends a notifications/progress to the session that
 // owns the progressToken, instead of broadcasting to all sessions.
+//
+// Uses the session's async notification channel (SendNotification) rather than
+// synchronous WriteRaw. This matches how broadcast() and server-to-client
+// requests are delivered elsewhere in the codebase, and prevents a single slow
+// session from stalling the upstream reader loop for up to the write-deadline
+// (30 s). Progress notifications are strictly informational — dropping under
+// backpressure is preferable to blocking the upstream multiplexer.
 func (o *Owner) routeProgressNotification(raw []byte) error {
 	var notif struct {
 		Params struct {
@@ -1292,9 +1299,7 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 		return fmt.Errorf("no owner for progressToken %s", token)
 	}
 
-	if err := session.WriteRaw(raw); err != nil {
-		return err
-	}
+	session.SendNotification(raw)
 
 	// Record that real progress arrived so the synthetic reporter can back off.
 	o.recordRealProgress(token, notif.Params.Total != nil)
