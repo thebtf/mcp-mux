@@ -351,8 +351,19 @@ func TestOwnerStatusWithClassificationReason(t *testing.T) {
 	sendReq(t, clientW, 2, "tools/list", `{}`)
 	readResp(t, clientR)
 
-	// Manually inject classification_reason to test the branch
+	// Manually inject the full classification trio (reason + classification +
+	// source) under a single lock. Previously this test only overwrote
+	// classificationReason and relied on the priming initialize + tools/list
+	// sequence above to have already driven classifyFromToolList to
+	// completion — which is a race: readResp returns when the wire response
+	// lands, but classification runs in the upstream goroutine AFTER that,
+	// so on -race macos the classification fields were sometimes still empty
+	// when Status() ran (Status omits classification_reason when
+	// autoClassification == ""). Injecting all three deterministically
+	// removes the race regardless of goroutine scheduling.
 	owner.mu.Lock()
+	owner.autoClassification = "isolated"
+	owner.classificationSource = "tools"
 	owner.classificationReason = []string{"write_file", "bash"}
 	owner.mu.Unlock()
 
