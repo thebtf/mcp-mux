@@ -612,19 +612,22 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 
 	ipcPath := serverid.IPCPath(sid, "")
 
-	// Pass full session env to the owner. No diff — the owner and upstream
-	// receive exactly the environment the CC session had. This prevents env
-	// leaks between sessions and ensures session-aware servers see all vars.
-	sessionEnv := req.Env
+	// Pass full session env to the owner. Shim-supplied vars WIN; daemon env
+	// fills gaps. Rationale: some shims are launched by tools that strip
+	// inherited vars (observed: CC sessions started in certain worktree paths
+	// arrive with 18-25 vars instead of 130+, missing GITHUB_PERSONAL_ACCESS_TOKEN
+	// and other credentials). Session-aware upstreams (e.g. pr-review-mcp) then
+	// fail with "No GitHub token available for session ...". Merging from the
+	// daemon's own os.Environ() (which was snapshotted at daemon start from the
+	// user env) fills the gap without overriding anything the shim did send.
+	sessionEnv := mergeEnv(req.Env)
 	if len(sessionEnv) > 0 {
 		// Log presence (NOT values) of common credential keys so env-passthrough
-		// regressions surface in mcp-muxd-debug.log without requiring a test
-		// harness. Session-aware upstreams (e.g. pr-review-mcp) error out with
-		// "No GitHub token available for session ..." when these are missing;
-		// this line tells the operator whether the token survived the shim →
-		// daemon hop before they go hunting in the MCP server itself.
-		d.logger.Printf("owner %s: session env %d vars (github_pat=%v gh_token=%v openai_key=%v anthropic_key=%v)",
-			sid[:8], len(sessionEnv),
+		// regressions remain visible. `shim_vars` is the pre-merge count — that
+		// is the one that regresses when CC sends a short env. `total` reflects
+		// what the upstream actually sees after the daemon-env fallback.
+		d.logger.Printf("owner %s: session env shim_vars=%d total=%d (github_pat=%v gh_token=%v openai_key=%v anthropic_key=%v)",
+			sid[:8], len(req.Env), len(sessionEnv),
 			sessionEnv["GITHUB_PERSONAL_ACCESS_TOKEN"] != "",
 			sessionEnv["GH_TOKEN"] != "" || sessionEnv["GITHUB_TOKEN"] != "",
 			sessionEnv["OPENAI_API_KEY"] != "",
@@ -976,6 +979,33 @@ func argsEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// mergeEnv combines a shim-supplied env with the daemon's own os.Environ().
+// Shim-supplied entries win on key collision (per-session credentials and cwd
+// vars must override anything inherited by the daemon). Any key missing from
+// the shim env is filled from the daemon env.
+//
+// Why: some shim launch paths arrive with a drastically trimmed environment
+// (observed in CC sessions started in certain worktree layouts: ~18-25 vars
+// instead of the usual 130+), missing GITHUB_PERSONAL_ACCESS_TOKEN and other
+// credentials. Session-aware upstreams (pr-review-mcp, etc.) then surface
+// "No GitHub token available for session ..." errors and CC marks the server
+// `failed` in `/mcp`. Filling from the daemon's own env (captured from the
+// user environment at daemon start) restores the missing credentials without
+// overriding anything the shim did send. shim-supplied nil map → daemon env
+// returned directly.
+func mergeEnv(shimEnv map[string]string) map[string]string {
+	merged := make(map[string]string, len(shimEnv)+64)
+	for _, e := range os.Environ() {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			merged[e[:i]] = e[i+1:]
+		}
+	}
+	for k, v := range shimEnv {
+		merged[k] = v
+	}
+	return merged
 }
 
 // envCompatible returns true if two env maps have no conflicting values
