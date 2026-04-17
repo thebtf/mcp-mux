@@ -126,6 +126,10 @@ func main() {
 		logger = log.New(os.Stderr, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags)
 	}
 
+	// Startup-time diagnostic: measure total shim startup so the
+	// per-server jsonl can show slow/hung sessions at a glance.
+	shimStart := time.Now()
+
 	// In isolated mode, always become owner (skip IPC check)
 	if *isolated {
 		logger.Printf("isolated mode: starting dedicated upstream")
@@ -133,29 +137,47 @@ func main() {
 		return
 	}
 
-	// Fast path: per-server IPC socket exists → connect as client (works with both legacy and daemon)
-	if ipc.IsAvailable(ipcPath) {
-		logger.Printf("connecting to existing owner at %s", ipcPath)
+	// Fast path: per-server IPC socket exists → connect as client (works with both legacy and daemon).
+	// Log the probe result + duration so post-mortem can distinguish fast-path hits from misses.
+	ipcProbeStart := time.Now()
+	ipcAvail := ipc.IsAvailable(ipcPath)
+	logger.Printf("shim startup step=ipc_probe result=%v duration=%v path=%s",
+		ipcAvail, time.Since(ipcProbeStart), ipcPath)
+	if ipcAvail {
+		runClientStart := time.Now()
+		logger.Printf("shim startup step=run_client_begin target=existing_owner path=%s", ipcPath)
 		if err := owner.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
-			logger.Printf("client error: %v", err)
+			logger.Printf("shim startup step=run_client_end status=error duration=%v err=%v total=%v",
+				time.Since(runClientStart), err, time.Since(shimStart))
 			os.Exit(1)
 		}
+		logger.Printf("shim startup step=run_client_end status=ok duration=%v total=%v (stdin closed)",
+			time.Since(runClientStart), time.Since(shimStart))
 		return
 	}
 
 	// Daemon mode (default): shim → daemon → spawn → connect
 	// Disable with MCP_MUX_NO_DAEMON=1 to fall back to legacy per-session owner.
 	if os.Getenv("MCP_MUX_NO_DAEMON") != "1" {
+		ensureStart := time.Now()
 		if err := ensureDaemon(logger); err != nil {
-			logger.Printf("daemon unavailable: %v, falling back to legacy owner", err)
+			logger.Printf("shim startup step=ensure_daemon status=error duration=%v err=%v (falling back to legacy owner)",
+				time.Since(ensureStart), err)
 		} else {
+			logger.Printf("shim startup step=ensure_daemon status=ok duration=%v",
+				time.Since(ensureStart))
 			modeStr := string(mode)
 			shimEnv := collectEnv()
+			spawnStart := time.Now()
 			daemonIPC, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 			if err != nil {
-				logger.Printf("daemon spawn failed: %v, falling back to legacy owner", err)
+				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%v (falling back to legacy owner)",
+					time.Since(spawnStart), err)
 			} else {
-				logger.Printf("connecting via daemon to %s (resilient)", daemonIPC)
+				logger.Printf("shim startup step=daemon_spawn status=ok duration=%v ipc=%s",
+					time.Since(spawnStart), daemonIPC)
+				logger.Printf("shim startup step=resilient_begin path=%s total_before_client=%v",
+					daemonIPC, time.Since(shimStart))
 				reconnectFn := func() (string, string, error) {
 					// Retry ensureDaemon with jitter to avoid thundering herd.
 					// Multiple shims reconnecting simultaneously compete for lock;
@@ -168,6 +190,7 @@ func main() {
 					}
 					return spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 				}
+				resilientStart := time.Now()
 				if err := owner.RunResilientClient(owner.ResilientClientConfig{
 					Stdin:          os.Stdin,
 					Stdout:         os.Stdout,
@@ -176,9 +199,12 @@ func main() {
 					Reconnect:      reconnectFn,
 					Logger:         logger,
 				}); err != nil {
-					logger.Printf("client error: %v", err)
+					logger.Printf("shim startup step=resilient_end status=error duration=%v err=%v total=%v",
+						time.Since(resilientStart), err, time.Since(shimStart))
 					os.Exit(1)
 				}
+				logger.Printf("shim startup step=resilient_end status=ok duration=%v total=%v (session ended cleanly)",
+					time.Since(resilientStart), time.Since(shimStart))
 				return
 			}
 		}

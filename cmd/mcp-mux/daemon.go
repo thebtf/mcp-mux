@@ -104,13 +104,21 @@ func runGlobalDaemon() {
 // ensureDaemon checks if the global daemon is running. If not, starts it
 // as a detached background process. Returns nil when daemon is ready.
 // Uses a file lock to prevent multiple shims from spawning concurrent daemons.
+//
+// Emits structured "ensure_daemon substep=<name>" log lines so the shim's
+// startup timeline can be reconstructed from the CC mcp-logs jsonl.
 func ensureDaemon(logger *log.Logger) error {
 	ctlPath := serverid.DaemonControlPath("", "")
 
 	// Fast path: daemon already running (no lock needed)
+	pingStart := time.Now()
 	if isDaemonRunning(ctlPath) {
+		logger.Printf("ensure_daemon substep=fast_ping status=ok duration=%v (daemon already up)",
+			time.Since(pingStart))
 		return nil
 	}
+	logger.Printf("ensure_daemon substep=fast_ping status=miss duration=%v (daemon not running)",
+		time.Since(pingStart))
 
 	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
 	// Lock file is NOT deleted — it persists for coordination across shims.
@@ -121,39 +129,72 @@ func ensureDaemon(logger *log.Logger) error {
 	}
 	defer lock.Close()
 
+	lockStart := time.Now()
 	if err := lockFile(lock); err != nil {
 		// Another shim holds the lock (starting daemon) — wait longer for it.
 		// 15s covers: daemon startup + upstream spawn + init response.
-		logger.Printf("another shim is starting daemon, waiting...")
-		return waitForDaemon(ctlPath, 15*time.Second)
-	}
-	defer unlockFile(lock)
-
-	// Re-check after acquiring lock (another shim may have started it)
-	if isDaemonRunning(ctlPath) {
+		logger.Printf("ensure_daemon substep=lock_attempt status=contended duration=%v err=%v (another shim is starting daemon, waiting)",
+			time.Since(lockStart), err)
+		waitStart := time.Now()
+		waitErr := waitForDaemon(ctlPath, 15*time.Second)
+		if waitErr != nil {
+			logger.Printf("ensure_daemon substep=wait_for_other_shim status=error duration=%v err=%v",
+				time.Since(waitStart), waitErr)
+			return waitErr
+		}
+		logger.Printf("ensure_daemon substep=wait_for_other_shim status=ok duration=%v",
+			time.Since(waitStart))
 		return nil
 	}
+	defer unlockFile(lock)
+	logger.Printf("ensure_daemon substep=lock_attempt status=acquired duration=%v",
+		time.Since(lockStart))
+
+	// Re-check after acquiring lock (another shim may have started it)
+	recheckStart := time.Now()
+	if isDaemonRunning(ctlPath) {
+		logger.Printf("ensure_daemon substep=lock_recheck status=already_running duration=%v (another shim started daemon before us)",
+			time.Since(recheckStart))
+		return nil
+	}
+	logger.Printf("ensure_daemon substep=lock_recheck status=still_missing duration=%v",
+		time.Since(recheckStart))
 
 	// Start daemon as detached process
-	logger.Printf("starting daemon...")
+	spawnStart := time.Now()
 	if err := startDaemonProcess(); err != nil {
+		logger.Printf("ensure_daemon substep=spawn_process status=error duration=%v err=%v",
+			time.Since(spawnStart), err)
 		return fmt.Errorf("start daemon: %w", err)
 	}
+	logger.Printf("ensure_daemon substep=spawn_process status=ok duration=%v",
+		time.Since(spawnStart))
 
-	return waitForDaemon(ctlPath, 10*time.Second)
+	waitStart := time.Now()
+	if err := waitForDaemon(ctlPath, 10*time.Second); err != nil {
+		logger.Printf("ensure_daemon substep=wait_for_self status=timeout duration=%v err=%v",
+			time.Since(waitStart), err)
+		return err
+	}
+	logger.Printf("ensure_daemon substep=wait_for_self status=ok duration=%v",
+		time.Since(waitStart))
+	return nil
 }
 
 // waitForDaemon polls until the daemon control socket responds (up to timeout).
+// Counts polling attempts so slow daemon startup is observable via log.
 func waitForDaemon(ctlPath string, timeout time.Duration) error {
 	deadline := time.After(timeout)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
+	attempts := 0
 	for {
 		select {
 		case <-deadline:
-			return fmt.Errorf("daemon did not start within %s", timeout)
+			return fmt.Errorf("daemon did not start within %s (polls=%d)", timeout, attempts)
 		case <-ticker.C:
+			attempts++
 			if isDaemonRunning(ctlPath) {
 				return nil
 			}
@@ -201,11 +242,13 @@ func startDaemonProcess() error {
 }
 
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path and handshake token.
+// Emits a "daemon_rpc_spawn" log line with the total RPC duration for post-mortem latency analysis.
 func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
 	ctlPath := serverid.DaemonControlPath("", "")
 
 	// Spawn returns immediately after creating the owner — proactive init runs
 	// in background. 30s timeout covers daemon processing + upstream process start.
+	rpcStart := time.Now()
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:     "spawn",
 		Command: command,
@@ -214,14 +257,18 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 		Mode:    mode,
 		Env:     env,
 	}, 30*time.Second)
+	rpcDur := time.Since(rpcStart)
 	if err != nil {
+		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%v", rpcDur, err)
 		return "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
+		logger.Printf("daemon_rpc_spawn status=not_ok duration=%v msg=%q", rpcDur, resp.Message)
 		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 
-	logger.Printf("daemon spawned server %s at %s", resp.ServerID[:8], resp.IPCPath)
+	logger.Printf("daemon_rpc_spawn status=ok duration=%v server=%s ipc=%s",
+		rpcDur, resp.ServerID[:8], resp.IPCPath)
 	return resp.IPCPath, resp.Token, nil
 }
 
