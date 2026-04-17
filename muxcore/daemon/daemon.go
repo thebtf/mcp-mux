@@ -715,10 +715,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	serviceToken := d.supervisor.Add(o)
 
 	// Promote the placeholder to a real entry and signal waiters.
+	// Store the merged env (not raw req.Env) so snapshot save and dedup
+	// checks see the same credential-complete view that the upstream and
+	// session already got. Otherwise a daemon restart would round-trip
+	// trimmed env through the snapshot and re-surface the original bug.
 	d.mu.Lock()
 	placeholder.Owner = o
 	placeholder.Mode = req.Mode
-	placeholder.Env = req.Env
+	placeholder.Env = sessionEnv
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout
 	placeholder.serviceToken = serviceToken
