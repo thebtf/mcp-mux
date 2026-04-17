@@ -1089,6 +1089,22 @@ func (d *Daemon) onZeroSessions(serverID string) {
 func (d *Daemon) onUpstreamExit(serverID string) {
 	d.mu.Lock()
 	entry, ok := d.owners[serverID]
+
+	// If the current entry is a placeholder for a different pending owner
+	// creation (entry.Owner == nil), this callback is from a PRIOR owner
+	// whose entry was already replaced in the registry — typically via the
+	// FR-4 zombie-spawn tear-down path which deletes the entry under d.mu
+	// and then calls Shutdown outside the lock, after which a concurrent
+	// shim can install a fresh placeholder at the same serverID. Acting on
+	// the placeholder here would panic on entry.Owner.Shutdown() and would
+	// incorrectly delete the placeholder belonging to a completely different
+	// spawn goroutine. Skip cleanly — the prior owner's tear-down path is
+	// already draining it, and the placeholder will resolve on its own.
+	if ok && entry.Owner == nil {
+		d.mu.Unlock()
+		return
+	}
+
 	if ok {
 		// Record crash for circuit breaker before any other action.
 		cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
