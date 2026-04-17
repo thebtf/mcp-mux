@@ -8,6 +8,7 @@ package upstream
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -158,6 +159,20 @@ func (p *Process) WriteLine(data []byte) error {
 
 // ReadLine reads the next line from the upstream process stdout.
 // Returns io.EOF when the process closes stdout.
+//
+// Error normalisation: exec.Cmd.StdoutPipe is documented to close the pipe
+// after cmd.Wait() returns, and we run Wait in a background goroutine (see
+// Start's "bridge procgroup's done channel" block). A caller that dials
+// ReadLine AFTER Wait has closed the pipe sees "read |0: file already
+// closed" from os.ErrClosed. Semantically this is EOF: no more bytes will
+// ever arrive. Map it so callers can short-circuit on io.EOF without
+// stringy matches (upstream package and product code already treat EOF as
+// clean end-of-stream — see muxcore/owner/owner.go readUpstream).
+//
+// This normalisation does NOT mask the deeper race (Wait concurrently
+// closing the pipe with ReadLine); it just prevents a misleading error
+// surface. Documented with full root-cause analysis in TECHNICAL_DEBT.md
+// under "upstream.Start Wait-vs-ReadLine race".
 func (p *Process) ReadLine() ([]byte, error) {
 	if p.scanner.Scan() {
 		// Return a copy to avoid scanner buffer reuse issues
@@ -168,6 +183,9 @@ func (p *Process) ReadLine() ([]byte, error) {
 	}
 
 	if err := p.scanner.Err(); err != nil {
+		if errors.Is(err, os.ErrClosed) {
+			return nil, io.EOF
+		}
 		return nil, fmt.Errorf("upstream: read: %w", err)
 	}
 

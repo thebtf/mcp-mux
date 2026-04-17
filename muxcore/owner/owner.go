@@ -1931,8 +1931,18 @@ func (o *Owner) IPCPath() string {
 	return o.ipcPath
 }
 
-// IsAccepting returns true if the IPC listener is still active (not closed).
-// Isolated owners close their listener after the first session connects.
+// IsAccepting returns true if the IPC listener has not been explicitly closed
+// via closeListener(). This is a fast synchronization-signal check — it does
+// NOT guarantee the listener is actually reachable from a fresh dial.
+//
+// Use IsReachable() when an authoritative liveness answer is required (e.g.
+// when deciding whether to hand out an IPC path to a shim that will dial it).
+// IsAccepting alone is insufficient: a listener can become unreachable while
+// listenerDone is still open (e.g. a race where the accept goroutine returned
+// on net.ErrClosed before closeListener signalled listenerDone, or where an
+// OS-level teardown closed the socket fd out from under us). Those zombie
+// states produce "dial: connection refused" for shims even though the owner
+// entry is still registered in the daemon.
 func (o *Owner) IsAccepting() bool {
 	select {
 	case <-o.listenerDone:
@@ -1940,6 +1950,44 @@ func (o *Owner) IsAccepting() bool {
 	default:
 		return true
 	}
+}
+
+// IsReachable returns true if the IPC listener is both marked-open
+// (listenerDone not signalled) AND actually accepting new connections right
+// now as observed by an outbound ipc.Dial probe against the owner's own
+// ipcPath. This is the authoritative liveness check — use it at any junction
+// where a stale "accepting" answer would cause an external caller to dial a
+// dead socket.
+//
+// The probe reuses ipc.Dial's existing 500ms timeout. Callers MUST NOT hold
+// daemon-wide locks across this call; the probe can take up to 500ms on a
+// hung peer and a daemon-wide lock would freeze every other spawn / status
+// request for that window.
+//
+// Returns:
+//   - false if listenerDone has been signalled (explicit closeListener — an
+//     owner that legitimately closed its own listener, e.g. an isolated
+//     server after its first session, will return false here; callers that
+//     need to distinguish "legitimately closed" from "zombie" must pair
+//     IsReachable with IsAccepting to tell them apart).
+//   - true if ipcPath is empty (test owners / pre-bind SessionHandler-only
+//     fixtures have no path to probe — they are treated as reachable so
+//     unit-test flows are not short-circuited).
+//   - otherwise, the result of ipc.IsAvailable(ipcPath) (dial-then-close
+//     probe with the 500ms timeout from ipc.dialTimeout).
+func (o *Owner) IsReachable() bool {
+	// Fast path: explicit close always wins.
+	select {
+	case <-o.listenerDone:
+		return false
+	default:
+	}
+	if o.ipcPath == "" {
+		// No path to probe (test owner, pre-bind). Treat as reachable — the
+		// caller is responsible for its own liveness semantics.
+		return true
+	}
+	return ipc.IsAvailable(o.ipcPath)
 }
 
 // InitReady returns a channel that is closed when the owner's upstream has responded

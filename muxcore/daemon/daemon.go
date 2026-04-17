@@ -96,6 +96,18 @@ type Daemon struct {
 	// creating an infinite respawn loop that burns CPU.
 	crashTracker map[string][]time.Time
 
+	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
+	// gate in spawnOnce tore down a registered owner because IsReachable()
+	// returned false despite IsAccepting() reporting open. Counter is
+	// monotonically increasing for the daemon's lifetime and is surfaced via
+	// HandleStatus / mux_list so operators can correlate zombie recoveries
+	// with upstream churn. Protected by d.mu.
+	zombieDetectedSpawn int
+
+	// zombieDetectedRestore counts zombies detected by the FR-3 post-snapshot
+	// gate. Incremented only by the snapshot.go path, always under d.mu.
+	zombieDetectedRestore int
+
 	shutdownOnce sync.Once
 }
 
@@ -480,13 +492,68 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			d.mu.Unlock()
 			return "", "", "", errSpawnRetry
 		}
+		// FR-4 — spawn-time listener health gate.
+		//
+		// IsAccepting() only checks the listenerDone sync signal; it does NOT
+		// detect zombies where the listener died without signalling that
+		// channel (observed in production on 2026-04-17 after a graceful-restart
+		// snapshot sequence: 6/9 restored owners had upstream_pid alive in
+		// d.owners but refused ipc.Dial from a fresh shim). IsReachable() adds
+		// an authoritative dial probe on top, but it can block for up to the
+		// ipc dial timeout (500ms), so we MUST NOT hold d.mu across it —
+		// otherwise every other spawn / status request freezes for that
+		// window. Pattern: release d.mu → probe → re-acquire under CAS (is
+		// this still the same entry we probed?) → tear down or reuse.
 		if entry.Owner.IsAccepting() {
-			entry.LastSession = time.Now()
+			probeOwner := entry.Owner
+			probeSID := sid
 			d.mu.Unlock()
-			entry.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
-			// Note: no log here — this path is the hot path (every CC session reconnect).
-			// Logging each reuse produced 500+ lines/minute during multi-session incidents.
-			return entry.Owner.IPCPath(), sid, token, nil
+
+			if probeOwner.IsReachable() {
+				// Healthy — re-acquire to update LastSession (cheap), then
+				// return the path. Re-check that the entry is still the same
+				// pointer; if a concurrent path replaced it, retry from the
+				// top so the new entry goes through its own probe.
+				d.mu.Lock()
+				current, still := d.owners[probeSID]
+				if !still || current.Owner != probeOwner {
+					d.mu.Unlock()
+					return "", "", "", errSpawnRetry
+				}
+				current.LastSession = time.Now()
+				d.mu.Unlock()
+				probeOwner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+				// Note: no log here — this path is the hot path (every CC
+				// session reconnect). Logging each reuse produced 500+
+				// lines/minute during multi-session incidents.
+				return probeOwner.IPCPath(), probeSID, token, nil
+			}
+
+			// Zombie. Re-acquire, CAS, delete + bump counter, then Shutdown
+			// OUTSIDE the lock (Shutdown is heavy — closes sockets, tears
+			// down upstream, may fire callbacks back into the daemon).
+			d.mu.Lock()
+			current, still := d.owners[probeSID]
+			if !still || current.Owner != probeOwner {
+				// Some other path already replaced the zombie; defer to
+				// its replacement and retry.
+				d.mu.Unlock()
+				return "", "", "", errSpawnRetry
+			}
+			d.zombieDetectedSpawn++
+			shortSID := probeSID
+			if len(shortSID) > 8 {
+				shortSID = shortSID[:8]
+			}
+			d.logger.Printf(
+				"zombie-listener detected: path=spawn server=%s ipc=%q cmd=%q action=tear-down-and-respawn",
+				shortSID, probeOwner.IPCPath(), current.Command,
+			)
+			delete(d.owners, probeSID)
+			d.mu.Unlock()
+			probeOwner.Shutdown()
+			// Retry from the top so placeholder/dedup paths see the cleared slot.
+			return "", "", "", errSpawnRetry
 		}
 		// Owner exists but IPC listener is closed (isolated server).
 		// If owner still has active sessions (in-flight requests), DON'T kill it —
@@ -748,11 +815,13 @@ func (d *Daemon) HandleStatus() map[string]any {
 	}
 
 	return map[string]any{
-		"daemon":             true,
-		"owner_count":        len(servers), // excludes placeholders still being created
-		"servers":            servers,
-		"owner_idle_timeout": d.ownerIdleTimeout.String(),
-		"idle_timeout":       d.idleTimeout.String(),
+		"daemon":                   true,
+		"owner_count":              len(servers), // excludes placeholders still being created
+		"servers":                  servers,
+		"owner_idle_timeout":       d.ownerIdleTimeout.String(),
+		"idle_timeout":             d.idleTimeout.String(),
+		"zombie_detections_spawn":  d.zombieDetectedSpawn,
+		"zombie_detections_restore": d.zombieDetectedRestore,
 	}
 }
 
@@ -1020,6 +1089,22 @@ func (d *Daemon) onZeroSessions(serverID string) {
 func (d *Daemon) onUpstreamExit(serverID string) {
 	d.mu.Lock()
 	entry, ok := d.owners[serverID]
+
+	// If the current entry is a placeholder for a different pending owner
+	// creation (entry.Owner == nil), this callback is from a PRIOR owner
+	// whose entry was already replaced in the registry — typically via the
+	// FR-4 zombie-spawn tear-down path which deletes the entry under d.mu
+	// and then calls Shutdown outside the lock, after which a concurrent
+	// shim can install a fresh placeholder at the same serverID. Acting on
+	// the placeholder here would panic on entry.Owner.Shutdown() and would
+	// incorrectly delete the placeholder belonging to a completely different
+	// spawn goroutine. Skip cleanly — the prior owner's tear-down path is
+	// already draining it, and the placeholder will resolve on its own.
+	if ok && entry.Owner == nil {
+		d.mu.Unlock()
+		return
+	}
+
 	if ok {
 		// Record crash for circuit breaker before any other action.
 		cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
