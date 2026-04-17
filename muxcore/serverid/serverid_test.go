@@ -73,8 +73,20 @@ func TestLockPath(t *testing.T) {
 func TestIPCPath_EmptyBaseDir(t *testing.T) {
 	path := IPCPath("abc123", "")
 	tmpDir := os.TempDir()
-	if filepath.Dir(path) != tmpDir {
-		t.Errorf("IPCPath with empty baseDir: got dir %q, want os.TempDir() %q", filepath.Dir(path), tmpDir)
+	// macOS: os.TempDir() returns the /var/folders/... alias while the value
+	// that reaches the socket path may be resolved through /private/... —
+	// semantically the same directory, textually different. Normalise both
+	// sides via EvalSymlinks before comparing so the test works on darwin
+	// the same way it does on linux and windows.
+	gotDir := filepath.Dir(path)
+	if resolved, err := filepath.EvalSymlinks(gotDir); err == nil {
+		gotDir = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(tmpDir); err == nil {
+		tmpDir = resolved
+	}
+	if gotDir != tmpDir {
+		t.Errorf("IPCPath with empty baseDir: got dir %q, want os.TempDir() %q", gotDir, tmpDir)
 	}
 }
 

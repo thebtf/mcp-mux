@@ -16,11 +16,10 @@ import (
 )
 
 const (
-	defaultReconnectTimeout  = 30 * time.Second
-	defaultKeepaliveInterval = 5 * time.Second
-	reconnectPollInterval    = 500 * time.Millisecond
-	msgFromCCBufferSize      = 1000
-	msgFromIPCBufferSize     = 1000
+	defaultReconnectTimeout = 30 * time.Second
+	reconnectPollInterval   = 500 * time.Millisecond
+	msgFromCCBufferSize     = 1000
+	msgFromIPCBufferSize    = 1000
 )
 
 // ReconnectFunc reconnects to the daemon and returns the new IPC path and handshake token.
@@ -30,15 +29,23 @@ type ReconnectFunc func() (ipcPath string, token string, err error)
 
 // ResilientClientConfig configures the resilient shim proxy.
 type ResilientClientConfig struct {
-	Stdin             io.Reader
-	Stdout            io.Writer
-	InitialIPCPath    string
-	Token             string        // handshake token from initial spawn; sent to owner on connect
-	Reconnect         ReconnectFunc
-	ReconnectTimeout  time.Duration // default: 30s
-	KeepaliveInterval time.Duration // default: 5s
-	ProbeGracePeriod  time.Duration // default: 10s; 0 disables probe detection
-	Logger            *log.Logger
+	Stdin            io.Reader
+	Stdout           io.Writer
+	InitialIPCPath   string
+	Token            string // handshake token from initial spawn; sent to owner on connect
+	Reconnect        ReconnectFunc
+	ReconnectTimeout time.Duration // default: 30s
+
+	// KeepaliveInterval is no longer used. Previous revisions emitted a
+	// synthetic notifications/progress with progressToken="mux-reconnect"
+	// every KeepaliveInterval during reconnect. That violated the MCP spec
+	// (Claude Code tears down the stdio transport on unknown progress
+	// tokens). The field is kept for API compatibility with v0.19.x
+	// consumers (aimux, engram); setting it has no effect.
+	KeepaliveInterval time.Duration
+
+	ProbeGracePeriod time.Duration // default: 10s; 0 disables probe detection
+	Logger           *log.Logger
 }
 
 // initCache stores the first initialize request and response for replay on reconnect.
@@ -76,16 +83,13 @@ var ErrReconnectExit = errors.New("reconnect: exit for fresh handshake")
 // State machine:
 //
 //	CONNECTED     — normal proxy: stdin→IPC, IPC→stdout
-//	RECONNECTING  — IPC broken; buffer stdin, keepalive to stdout, poll Reconnect()
+//	RECONNECTING  — IPC broken; buffer stdin, tombstone inflight, poll Reconnect()
 //	EXIT          — reconnect timed out; return error
 //
 // Returns only on: CC stdin EOF (io.EOF), or reconnect timeout (error).
 func RunResilientClient(cfg ResilientClientConfig) error {
 	if cfg.ReconnectTimeout == 0 {
 		cfg.ReconnectTimeout = defaultReconnectTimeout
-	}
-	if cfg.KeepaliveInterval == 0 {
-		cfg.KeepaliveInterval = defaultKeepaliveInterval
 	}
 	if cfg.ProbeGracePeriod == 0 {
 		cfg.ProbeGracePeriod = 10 * time.Second
@@ -342,26 +346,43 @@ type reconnectResult struct {
 	err   error
 }
 
-// reconnect enters the RECONNECTING state: polls cfg.Reconnect every 500ms
-// (asynchronously so the select loop stays responsive), sends keepalive to
-// CC stdout every KeepaliveInterval, and buffers CC stdin via msgFromCC.
+// reconnect enters the RECONNECTING state: immediately tombstones every
+// in-flight request with an RPC error response (so CC does not hang), polls
+// cfg.Reconnect every 500ms asynchronously, and buffers new CC stdin traffic
+// via msgFromCC.
 //
 // On success: dials new IPC, replays cached initialize, flushes buffered
 // CC messages, and returns the new connection.
 //
 // Returns error on: reconnect timeout, or CC stdin EOF during reconnect.
+//
+// Why no keepalive: a previous revision emitted a synthetic
+// notifications/progress with progressToken="mux-reconnect" every 5s as a
+// "stay alive" signal to CC. That violated the MCP spec — progressTokens
+// must reference a _meta.progressToken the client issued, and Claude Code
+// enforces this by tearing down the stdio transport the moment it sees an
+// unknown token ("Received a progress notification for an unknown token").
+// The keepalive therefore guaranteed that every reconnect window longer
+// than KeepaliveInterval destroyed the transport it was trying to preserve.
+// CC's stdio transport does NOT time out on silence — it times out on
+// unanswered requests. Draining the in-flight map with error responses
+// below is the spec-compliant substitute.
 func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan error) (interface {
 	io.Reader
 	io.Writer
 	io.Closer
 }, error) {
+	// Send error responses for every request that was in-flight when the IPC
+	// died, BEFORE we start the poll loop. Without this, CC waits on each
+	// request until its own timeout (tens of seconds) and marks the transport
+	// broken when it fires — even though the reconnect itself would have
+	// succeeded in under a second.
+	rc.drainOrphanedInflight(stdoutMu)
+
 	deadline := time.Now().Add(rc.cfg.ReconnectTimeout)
-	keepaliveTicker := time.NewTicker(rc.cfg.KeepaliveInterval)
 	pollTicker := time.NewTicker(reconnectPollInterval)
-	defer keepaliveTicker.Stop()
 	defer pollTicker.Stop()
 
-	keepaliveN := 0
 	resultCh := make(chan reconnectResult, 1)
 	pending := false // true when an async Reconnect() call is in-flight
 
@@ -377,22 +398,6 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				return nil, io.EOF
 			}
 			return nil, fmt.Errorf("resilient: stdin during reconnect: %w", err)
-
-		case <-keepaliveTicker.C:
-			keepaliveN++
-			ka := fmt.Sprintf(
-				`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"mux-reconnect","progress":%d,"total":100}}`,
-				keepaliveN,
-			)
-			stdoutMu.Lock()
-			_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", ka)
-			stdoutMu.Unlock()
-			if err != nil {
-				// CC stdout broken pipe — CC is gone, exit to prevent zombie shim.
-				rc.log.Printf("resilient: keepalive write failed (CC gone): %v", err)
-				return nil, fmt.Errorf("resilient: CC stdout closed")
-			}
-			rc.log.Printf("resilient: sent keepalive %d", keepaliveN)
 
 		case <-pollTicker.C:
 			if pending {
@@ -434,11 +439,6 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				conn.Close()
 				continue
 			}
-
-			// Send error responses for in-flight requests that were lost
-			// when the old IPC connection died. Without this, CC waits
-			// forever for responses that will never come.
-			rc.drainOrphanedInflight(stdoutMu)
 
 			// Flush buffered CC messages that arrived during RECONNECTING.
 			rc.flushBuffer(conn)

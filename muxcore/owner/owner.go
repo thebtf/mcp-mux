@@ -867,9 +867,24 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 			}
 		}()
 
-		// Build context: cancel on session disconnect or owner shutdown
+		// Build context: cancel on session disconnect or owner shutdown, and
+		// optionally apply the per-call tool timeout. The WithTimeout wrapping
+		// MUST happen before the watcher goroutine is spawned — otherwise the
+		// goroutine captures the outer ctx and races the parent's ctx
+		// reassignment on the `ctx, timeoutCancel = context.WithTimeout(...)`
+		// line (caught by -race as a data race on the ctx variable,
+		// dispatch_test.go:TestDispatchToSessionHandler_Timeout on CI).
+		// The semantic bug is real too: if toolTimeout fires before s.Done()
+		// or o.done, the watcher is still blocking on the OLD ctx.Done() and
+		// leaks until one of the other two triggers.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		if timeout := o.toolTimeoutNs.Load(); timeout > 0 {
+			var timeoutCancel context.CancelFunc
+			ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(timeout))
+			defer timeoutCancel()
+		}
 
 		go func() {
 			select {
@@ -880,13 +895,6 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 			case <-ctx.Done():
 			}
 		}()
-
-		// Apply toolTimeout deadline if configured
-		if timeout := o.toolTimeoutNs.Load(); timeout > 0 {
-			var timeoutCancel context.CancelFunc
-			ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(timeout))
-			defer timeoutCancel()
-		}
 
 		resp, err := o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
 		if err != nil {

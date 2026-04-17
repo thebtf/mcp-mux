@@ -813,10 +813,19 @@ func TestRouteProgressNotification_Routed(t *testing.T) {
 		t.Errorf("routeProgressNotification: %v", err)
 	}
 
-	got := buf.String()
-	if !strings.Contains(got, "tok-1") {
-		t.Errorf("expected progress notification routed to session, got: %s", got)
+	// routeProgressNotification dispatches via session.SendNotification, which
+	// is async (queues to notifCh, drained by the session's writer goroutine).
+	// Poll the buffer with a short deadline instead of reading immediately.
+	deadline := time.Now().Add(1 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		got = buf.String()
+		if strings.Contains(got, "tok-1") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Errorf("expected progress notification routed to session within 1s, got: %q", got)
 }
 
 func TestRouteProgressNotification_NoOwner(t *testing.T) {

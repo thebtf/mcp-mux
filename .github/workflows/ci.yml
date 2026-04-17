@@ -19,6 +19,11 @@ jobs:
           go-version: "1.25"
       - run: go vet ./...
       - run: go test -race -count=1 -timeout 120s ./...
+      - name: muxcore module
+        working-directory: muxcore
+        run: |
+          go vet ./...
+          go test -race -count=1 -timeout 180s ./...
 
   coverage:
     runs-on: ubuntu-latest
@@ -28,8 +33,22 @@ jobs:
         with:
           go-version: "1.25"
       - run: go test -race -coverprofile=coverage.out ./...
+      - name: muxcore coverage
+        working-directory: muxcore
+        # Note: no -race here. The test matrix (ubuntu/windows/macos) already
+        # exercises the race detector across all muxcore packages, so the
+        # coverage job only needs the coverage profile. Adding -race here
+        # double-serialises the tests and made TestOwnerStatusWithClassification-
+        # Reason flake on slow CI runners (upstream spawn racing the priming
+        # writes) — not a product bug, just coverage + race + timing amplifying
+        # each other.
+        run: go test -coverprofile=coverage.out -count=1 -timeout 180s ./...
       - uses: codecov/codecov-action@v4
         with:
-          files: coverage.out
+          # codecov-action@v4: `files` is a comma-separated explicit list.
+          # Include the muxcore module's profile so coverage from the nested
+          # Go module is uploaded alongside the root profile (CodeRabbit major
+          # finding on PR #63).
+          files: coverage.out,muxcore/coverage.out
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

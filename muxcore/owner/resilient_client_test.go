@@ -417,10 +417,21 @@ func TestResilientClient_TimeoutExits(t *testing.T) {
 	_ = ccStdinW
 }
 
-// TestResilientClient_KeepaliveEmitted verifies that during RECONNECTING state,
-// keepalive notifications are written to CC stdout at the configured interval,
-// and stop after reconnect succeeds.
-func TestResilientClient_KeepaliveEmitted(t *testing.T) {
+// TestResilientClient_NoMuxReconnectKeepalive is a regression test for the
+// "Received a progress notification for an unknown token" transport tear-down
+// symptom. Earlier revisions of resilient_client.reconnect emitted a synthetic
+// notifications/progress with progressToken="mux-reconnect" every few seconds
+// during the RECONNECTING state. The MCP spec requires progressTokens to
+// reference a _meta.progressToken previously issued by the client — Claude
+// Code enforces this by closing the stdio transport as soon as it sees an
+// unknown token. The keepalive therefore guaranteed that every real reconnect
+// window killed the very transport it was trying to preserve.
+//
+// No progress notification with progressToken="mux-reconnect" (or any other
+// shim-invented token) MUST ever be written to CC stdout — not during
+// reconnect, not after, not ever. CC stdio stays healthy via request timeouts,
+// so drainOrphanedInflight below is the spec-compliant substitute.
+func TestResilientClient_NoMuxReconnectKeepalive(t *testing.T) {
 	path1 := newTestIPCPath(t)
 	path2 := newTestIPCPath(t)
 
@@ -430,22 +441,26 @@ func TestResilientClient_KeepaliveEmitted(t *testing.T) {
 	ccStdinR, ccStdinW := io.Pipe()
 	ccStdoutR, ccStdoutW := io.Pipe()
 
+	// Reconnect takes long enough that the OLD keepalive ticker would have
+	// fired several times — so if any keepalive logic sneaks back in, the
+	// test catches it.
 	reconnectDelay := 3 * time.Second
 	reconnectFn := func() (string, string, error) {
 		time.Sleep(reconnectDelay)
 		return path2, "", nil
 	}
 
-	const keepaliveInterval = 800 * time.Millisecond
-
 	cfg := ResilientClientConfig{
 		ProbeGracePeriod: time.Nanosecond,
-		Stdin:             ccStdinR,
-		Stdout:            ccStdoutW,
-		InitialIPCPath:    path1,
-		Reconnect:         reconnectFn,
-		ReconnectTimeout:  15 * time.Second,
-		KeepaliveInterval: keepaliveInterval,
+		Stdin:            ccStdinR,
+		Stdout:           ccStdoutW,
+		InitialIPCPath:   path1,
+		Reconnect:        reconnectFn,
+		ReconnectTimeout: 15 * time.Second,
+		// Non-zero KeepaliveInterval to prove it is genuinely a no-op:
+		// a consumer on v0.19.x muxcore can still pass this value without
+		// triggering spec-violating output.
+		KeepaliveInterval: 200 * time.Millisecond,
 		Logger:            resilientTestLogger(t),
 	}
 
@@ -454,7 +469,6 @@ func TestResilientClient_KeepaliveEmitted(t *testing.T) {
 		errCh <- RunResilientClient(cfg)
 	}()
 
-	// Collect all lines from CC stdout.
 	var mu sync.Mutex
 	var stdoutLines []string
 	go func() {
@@ -467,48 +481,25 @@ func TestResilientClient_KeepaliveEmitted(t *testing.T) {
 		}
 	}()
 
-	// Let client connect then close IPC.
+	// Let the client connect, then kill the IPC to trigger reconnect.
 	time.Sleep(200 * time.Millisecond)
 	srv1.closeAll()
 
-	// Wait for reconnect to complete (reconnectDelay + grace).
+	// Wait past the point where legacy keepalives would have fired multiple
+	// times (reconnectDelay + generous grace for post-reconnect stabilisation).
 	time.Sleep(reconnectDelay + 2*time.Second)
 
-	// Count keepalive messages.
 	mu.Lock()
 	lines := make([]string, len(stdoutLines))
 	copy(lines, stdoutLines)
 	mu.Unlock()
 
-	keepaliveCount := 0
 	for _, line := range lines {
-		if strings.Contains(line, "mux-reconnect") {
-			keepaliveCount++
+		if strings.Contains(line, `"progressToken":"mux-reconnect"`) ||
+			strings.Contains(line, `"mux-reconnect"`) {
+			t.Errorf("shim emitted forbidden mux-reconnect keepalive: %q", line)
 		}
 	}
-
-	// With reconnectDelay=3s and interval=800ms, expect at least 2 keepalives.
-	if keepaliveCount < 2 {
-		t.Errorf("expected >= 2 keepalive messages, got %d (lines: %v)", keepaliveCount, lines)
-	}
-	t.Logf("keepalive count: %d", keepaliveCount)
-
-	// After reconnect, send a normal message and verify no more keepalives.
-	time.Sleep(2 * keepaliveInterval)
-
-	mu.Lock()
-	countAfter := 0
-	linesAfter := len(stdoutLines)
-	for _, line := range stdoutLines {
-		if strings.Contains(line, "mux-reconnect") {
-			countAfter++
-		}
-	}
-	mu.Unlock()
-
-	_ = linesAfter
-	t.Logf("keepalive count after reconnect stabilized: %d", countAfter)
-	// Keepalives should not continue growing significantly after reconnect.
 
 	ccStdinW.Close()
 	select {
