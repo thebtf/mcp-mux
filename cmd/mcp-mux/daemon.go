@@ -110,14 +110,16 @@ func runGlobalDaemon() {
 func ensureDaemon(logger *log.Logger) error {
 	ctlPath := serverid.DaemonControlPath("", "")
 
-	// Fast path: daemon already running (no lock needed)
+	// Fast path: daemon already running (no lock needed).
+	// Log lines use key=value with no trailing prose so post-mortem grep/awk
+	// can parse them without surprises.
 	pingStart := time.Now()
 	if isDaemonRunning(ctlPath) {
-		logger.Printf("ensure_daemon substep=fast_ping status=ok duration=%v (daemon already up)",
+		logger.Printf("ensure_daemon substep=fast_ping status=ok duration=%v",
 			time.Since(pingStart))
 		return nil
 	}
-	logger.Printf("ensure_daemon substep=fast_ping status=miss duration=%v (daemon not running)",
+	logger.Printf("ensure_daemon substep=fast_ping status=miss duration=%v",
 		time.Since(pingStart))
 
 	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
@@ -133,13 +135,13 @@ func ensureDaemon(logger *log.Logger) error {
 	if err := lockFile(lock); err != nil {
 		// Another shim holds the lock (starting daemon) — wait longer for it.
 		// 15s covers: daemon startup + upstream spawn + init response.
-		logger.Printf("ensure_daemon substep=lock_attempt status=contended duration=%v err=%v (another shim is starting daemon, waiting)",
-			time.Since(lockStart), err)
+		logger.Printf("ensure_daemon substep=lock_attempt status=contended duration=%v err=%q",
+			time.Since(lockStart), err.Error())
 		waitStart := time.Now()
 		waitErr := waitForDaemon(ctlPath, 15*time.Second)
 		if waitErr != nil {
-			logger.Printf("ensure_daemon substep=wait_for_other_shim status=error duration=%v err=%v",
-				time.Since(waitStart), waitErr)
+			logger.Printf("ensure_daemon substep=wait_for_other_shim status=error duration=%v err=%q",
+				time.Since(waitStart), waitErr.Error())
 			return waitErr
 		}
 		logger.Printf("ensure_daemon substep=wait_for_other_shim status=ok duration=%v",
@@ -153,7 +155,7 @@ func ensureDaemon(logger *log.Logger) error {
 	// Re-check after acquiring lock (another shim may have started it)
 	recheckStart := time.Now()
 	if isDaemonRunning(ctlPath) {
-		logger.Printf("ensure_daemon substep=lock_recheck status=already_running duration=%v (another shim started daemon before us)",
+		logger.Printf("ensure_daemon substep=lock_recheck status=already_running duration=%v",
 			time.Since(recheckStart))
 		return nil
 	}
@@ -163,8 +165,8 @@ func ensureDaemon(logger *log.Logger) error {
 	// Start daemon as detached process
 	spawnStart := time.Now()
 	if err := startDaemonProcess(); err != nil {
-		logger.Printf("ensure_daemon substep=spawn_process status=error duration=%v err=%v",
-			time.Since(spawnStart), err)
+		logger.Printf("ensure_daemon substep=spawn_process status=error duration=%v err=%q",
+			time.Since(spawnStart), err.Error())
 		return fmt.Errorf("start daemon: %w", err)
 	}
 	logger.Printf("ensure_daemon substep=spawn_process status=ok duration=%v",
@@ -172,8 +174,8 @@ func ensureDaemon(logger *log.Logger) error {
 
 	waitStart := time.Now()
 	if err := waitForDaemon(ctlPath, 10*time.Second); err != nil {
-		logger.Printf("ensure_daemon substep=wait_for_self status=timeout duration=%v err=%v",
-			time.Since(waitStart), err)
+		logger.Printf("ensure_daemon substep=wait_for_self status=timeout duration=%v err=%q",
+			time.Since(waitStart), err.Error())
 		return err
 	}
 	logger.Printf("ensure_daemon substep=wait_for_self status=ok duration=%v",
@@ -259,7 +261,7 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 	}, 30*time.Second)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
-		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%v", rpcDur, err)
+		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%q", rpcDur, err.Error())
 		return "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
@@ -267,8 +269,15 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 
-	logger.Printf("daemon_rpc_spawn status=ok duration=%v server=%s ipc=%s",
-		rpcDur, resp.ServerID[:8], resp.IPCPath)
+	// Safe ID truncation: resp.ServerID may be shorter than 8 chars in edge cases
+	// (test daemons, non-hashed IDs). Matches the pattern used in
+	// muxcore/engine/engine.go and muxcore/daemon/snapshot.go.
+	shortID := resp.ServerID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
+	logger.Printf("daemon_rpc_spawn status=ok duration=%v server=%s ipc=%q",
+		rpcDur, shortID, resp.IPCPath)
 	return resp.IPCPath, resp.Token, nil
 }
 
