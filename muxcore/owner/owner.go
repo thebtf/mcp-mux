@@ -1005,12 +1005,27 @@ func (o *Owner) readUpstream() {
 // It also intercepts server→client requests like roots/list.
 func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	if msg.IsNotification() {
-		// Route progress notifications to owning session instead of broadcast
+		// Route progress notifications to owning session instead of broadcast.
+		//
+		// If the token is NOT in progressOwners (e.g. the originating request
+		// has already completed and its token was cleared, or the upstream
+		// server invented a token instead of echoing the client-supplied one),
+		// we DROP the notification. Broadcasting to all sessions was the old
+		// fallback and is actively harmful: the MCP client receives a
+		// notifications/progress with a token it has no record of and logs
+		// "Received a progress notification for an unknown token" — which
+		// some clients (Claude Code) treat as a transport-level protocol
+		// error and tear the stdio connection down. Observed in production
+		// with netcoredbg-mcp debugger long-polls: the first unknown-token
+		// progress arriving after a tool completed caused CC to close the
+		// stdio transport, which in turn killed the shim, which in turn
+		// required a manual `/mcp` reconnect. Dropping silently (with a log
+		// line) is strictly safer than broadcasting.
 		if msg.Method == "notifications/progress" {
-			if err := o.routeProgressNotification(msg.Raw); err == nil {
-				return nil
+			if err := o.routeProgressNotification(msg.Raw); err != nil {
+				o.logger.Printf("drop notifications/progress: %v (preventing transport tear-down in MCP client)", err)
 			}
-			// Fallback to broadcast if routing fails
+			return nil
 		}
 		// x-mux busy protocol: upstream declares long-running background work
 		// so the reaper does not idle-kill it. Consumed at the mux layer —
@@ -1252,6 +1267,13 @@ func buildJSONRPCErrorBytes(id json.RawMessage, code int, message string) ([]byt
 
 // routeProgressNotification sends a notifications/progress to the session that
 // owns the progressToken, instead of broadcasting to all sessions.
+//
+// Uses the session's async notification channel (SendNotification) rather than
+// synchronous WriteRaw. This matches how broadcast() and server-to-client
+// requests are delivered elsewhere in the codebase, and prevents a single slow
+// session from stalling the upstream reader loop for up to the write-deadline
+// (30 s). Progress notifications are strictly informational — dropping under
+// backpressure is preferable to blocking the upstream multiplexer.
 func (o *Owner) routeProgressNotification(raw []byte) error {
 	var notif struct {
 		Params struct {
@@ -1277,9 +1299,7 @@ func (o *Owner) routeProgressNotification(raw []byte) error {
 		return fmt.Errorf("no owner for progressToken %s", token)
 	}
 
-	if err := session.WriteRaw(raw); err != nil {
-		return err
-	}
+	session.SendNotification(raw)
 
 	// Record that real progress arrived so the synthetic reporter can back off.
 	o.recordRealProgress(token, notif.Params.Total != nil)
