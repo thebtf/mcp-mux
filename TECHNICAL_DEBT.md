@@ -29,7 +29,7 @@ All items from the 2026-04-08 debt batch have been resolved:
 
 ## Open items
 
-(none — FLAKE-UBUNTU-CI-TestOwnerMultipleSessions is being addressed in PR #69; entry removed here to unblock autopilot loop, mux_test.go timeout fix lands via that PR)
+(none)
 
 
 <!--

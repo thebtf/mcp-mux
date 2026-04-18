@@ -717,6 +717,15 @@ func sendReq(t *testing.T, w io.Writer, id int, method, params string) {
 	}
 }
 
+// readRespTimeout is the per-response deadline for pipe-based owner tests.
+// 30s was the historical value; the 90s headroom covers first-invocation
+// `go run ../../testdata/mock_server.go` compile on Ubuntu CI runners where
+// the Go build cache starts cold and under concurrent test load can take
+// 30-45s to finish before the child process begins handling stdin. All local
+// platforms (Windows, macOS) still complete each readResp in <1s — the
+// extended budget only takes effect on a stuck scanner, not on happy paths.
+const readRespTimeout = 90 * time.Second
+
 func readResp(t *testing.T, r io.Reader) []byte {
 	t.Helper()
 	scanner := bufio.NewScanner(r)
@@ -731,8 +740,8 @@ func readResp(t *testing.T, r io.Reader) []byte {
 
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("readResp timeout")
+	case <-time.After(readRespTimeout):
+		t.Fatalf("readResp timeout after %s", readRespTimeout)
 	}
 
 	return []byte(line)
