@@ -8,6 +8,7 @@ package upstream
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -189,9 +190,16 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 			copy(cp, line)
 			p.lineBuf.push(cp)
 		}
-		// Propagate scanner.Err() so ReadLine returns the real failure
-		// (e.g., bufio.ErrTooLong for an oversized line) instead of io.EOF.
-		p.lineBuf.markDoneWithErr(scanner.Err())
+		// Propagate real scanner errors (e.g., bufio.ErrTooLong) so ReadLine
+		// surfaces them instead of io.EOF. But cmd.StdoutPipe closes on
+		// process exit and the scanner then returns os.ErrClosed ("read |N:
+		// file already closed") — that is the expected clean-close path, not
+		// a failure, so normalise it to nil (pop() will return io.EOF).
+		err := scanner.Err()
+		if errors.Is(err, os.ErrClosed) {
+			err = nil
+		}
+		p.lineBuf.markDoneWithErr(err)
 	}()
 
 	// Bridge procgroup's done channel into upstream's Done channel and capture
@@ -337,9 +345,15 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 			copy(cp, line)
 			p.lineBuf.push(cp)
 		}
-		// Propagate scanner.Err() so ReadLine surfaces protocol violations
-		// (e.g., oversized lines) rather than a misleading io.EOF.
-		p.lineBuf.markDoneWithErr(scanner.Err())
+		// Propagate real scanner errors (e.g., bufio.ErrTooLong) but normalise
+		// the expected clean-close path — io.Pipe.CloseWithError produces
+		// io.ErrClosedPipe when the handler exits; os.ErrClosed when stdin
+		// closure cascades — neither is a real failure.
+		err := scanner.Err()
+		if errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+			err = nil
+		}
+		p.lineBuf.markDoneWithErr(err)
 	}()
 
 	go func() {
