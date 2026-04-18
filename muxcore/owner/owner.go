@@ -267,7 +267,10 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
 		tokenHandshake:         cfg.TokenHandshake,
-		rejectionLogger:        newRejectionLogger(logger),
+		// rejectionLogger is created lazily below, only when tokenHandshake is
+		// enabled — legacy/test owners with tokenHandshake=false never rate-limit
+		// anything, so the per-Owner ticker goroutine adds cost without value
+		// (measurable scheduler pressure on CI under -race with many owners).
 		autoClassification:     snap.Classification,
 		classificationSource:   snap.ClassificationSource,
 		classificationReason:   snap.ClassificationReason,
@@ -283,6 +286,10 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		backgroundSpawnCh:      make(chan struct{}),
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
+
+	if o.tokenHandshake {
+		o.rejectionLogger = newRejectionLogger(logger)
+	}
 
 	// Pre-populate caches from snapshot
 	if snap.CachedInit != "" {
@@ -502,7 +509,10 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
 		tokenHandshake:         cfg.TokenHandshake,
-		rejectionLogger:        newRejectionLogger(logger),
+		// rejectionLogger is created lazily below, only when tokenHandshake is
+		// enabled — legacy/test owners with tokenHandshake=false never rate-limit
+		// anything, so the per-Owner ticker goroutine adds cost without value
+		// (measurable scheduler pressure on CI under -race with many owners).
 		classified:             make(chan struct{}),
 		initReady:              make(chan struct{}),
 		progressOwners:         make(map[string]int),
@@ -514,6 +524,10 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		done:                   make(chan struct{}),
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
+
+	if o.tokenHandshake {
+		o.rejectionLogger = newRejectionLogger(logger)
+	}
 
 	// Wire notifier into sessionHandler if it supports NotifierAware.
 	if o.sessionHandler != nil {
@@ -1629,7 +1643,18 @@ func (o *Owner) acceptLoop() {
 		// so Close() can forcefully disconnect the IPC connection.
 		s.SetCloser(conn)
 		if token != "" {
-			o.sessionMgr.Bind(token, s) // sets s.Cwd from pre-registered token
+			// Bind consumes the token and sets s.Cwd from the pre-registered
+			// session data. It can return false if the token was swept by
+			// SweepExpiredPending (TTL) between IsPreRegistered and Bind.
+			// In that edge case, reject the connection instead of adding a
+			// session with no Cwd (which would produce invalid project routing).
+			if !o.sessionMgr.Bind(token, s) {
+				peerPID := readPeerPID(conn)
+				o.rejectionLogger.Log(o.logger, peerPID)
+				o.logger.Printf("accept: token expired between pre-check and bind (pid=%d)", peerPID)
+				s.Close()
+				continue
+			}
 		}
 		o.AddSession(s)
 	}
