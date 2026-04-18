@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -276,5 +277,91 @@ func TestDeserializeOwnerWithClassification(t *testing.T) {
 	}
 	if len(got.Sessions) != 1 {
 		t.Errorf("sessions = %d, want 1", len(got.Sessions))
+	}
+}
+
+// TestOwnerSnapshotOldRoundTrip verifies that a v0.20.x snapshot (no handoff fields)
+// deserializes correctly and re-marshals without emitting the new fields.
+func TestOwnerSnapshotOldRoundTrip(t *testing.T) {
+	// Simulate a v0.20.x snapshot JSON that has NO handoff fields.
+	oldJSON := []byte(`{"server_id":"srv-001","command":"uvx","args":["--from","serena"],"cwd":"/dev/project","cwd_set":["/dev/project"],"mode":"cwd"}`)
+
+	var got snapshot.OwnerSnapshot
+	if err := json.Unmarshal(oldJSON, &got); err != nil {
+		t.Fatalf("Unmarshal old snapshot: %v", err)
+	}
+
+	// New fields must default to zero-values.
+	if got.UpstreamPID != 0 {
+		t.Errorf("UpstreamPID = %d, want 0", got.UpstreamPID)
+	}
+	if got.HandoffSocketPath != "" {
+		t.Errorf("HandoffSocketPath = %q, want empty", got.HandoffSocketPath)
+	}
+	if got.SpawnPgid != 0 {
+		t.Errorf("SpawnPgid = %d, want 0", got.SpawnPgid)
+	}
+
+	// Re-marshal: omitempty must suppress zero-value new fields.
+	out, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	outStr := string(out)
+	if strings.Contains(outStr, "upstream_pid") {
+		t.Errorf("re-marshaled output must NOT contain upstream_pid when zero, got: %s", outStr)
+	}
+	if strings.Contains(outStr, "handoff_socket_path") {
+		t.Errorf("re-marshaled output must NOT contain handoff_socket_path when empty, got: %s", outStr)
+	}
+	if strings.Contains(outStr, "spawn_pgid") {
+		t.Errorf("re-marshaled output must NOT contain spawn_pgid when zero, got: %s", outStr)
+	}
+}
+
+// TestOwnerSnapshotNewRoundTrip verifies that new handoff fields marshal and
+// unmarshal correctly when populated.
+func TestOwnerSnapshotNewRoundTrip(t *testing.T) {
+	original := snapshot.OwnerSnapshot{
+		ServerID:          "srv-002",
+		Command:           "aimux",
+		Cwd:               "/dev/aimux",
+		CwdSet:            []string{"/dev/aimux"},
+		Mode:              "shared",
+		UpstreamPID:       12345,
+		HandoffSocketPath: "/tmp/mcp-mux-handoff.sock",
+		SpawnPgid:         12345,
+	}
+
+	out, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	outStr := string(out)
+
+	// New fields must appear in the marshaled output.
+	if !strings.Contains(outStr, "upstream_pid") {
+		t.Errorf("marshaled output must contain upstream_pid, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "handoff_socket_path") {
+		t.Errorf("marshaled output must contain handoff_socket_path, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "spawn_pgid") {
+		t.Errorf("marshaled output must contain spawn_pgid, got: %s", outStr)
+	}
+
+	// Round-trip: unmarshal back and verify all three fields match.
+	var got snapshot.OwnerSnapshot
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.UpstreamPID != 12345 {
+		t.Errorf("UpstreamPID = %d, want 12345", got.UpstreamPID)
+	}
+	if got.HandoffSocketPath != "/tmp/mcp-mux-handoff.sock" {
+		t.Errorf("HandoffSocketPath = %q, want %q", got.HandoffSocketPath, "/tmp/mcp-mux-handoff.sock")
+	}
+	if got.SpawnPgid != 12345 {
+		t.Errorf("SpawnPgid = %d, want 12345", got.SpawnPgid)
 	}
 }
