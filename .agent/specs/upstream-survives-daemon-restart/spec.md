@@ -192,7 +192,11 @@ transferring FDs. Prevents an attacker spawning a rogue daemon mid-upgrade to st
 
 Measured: time from old daemon receives `graceful-restart` → last FD delivered to successor
 → successor accepting shim reconnects. 99th-percentile target on reference hardware
-(4-core, 16 GB): 2 seconds. Per-upstream overhead MUST scale linearly, not quadratically.
+(4-core, 16 GB): 2 seconds for up to 15 upstreams. Per-upstream overhead MUST scale linearly,
+not quadratically. Beyond 15 upstreams, handoff time scales at O(N) — approximately ~130ms
+per additional upstream (50 upstreams → ~7s; 100 upstreams → ~13s). No hard cap; during the
+handoff window, shim reconnect queues extend normally (resilient-client backoff already
+handles). See C5 in Clarifications.
 
 ### NFR-2: Platform coverage — Linux + macOS + Windows parity
 
@@ -259,9 +263,9 @@ acceptable since that process is exiting anyway; successor-side leaks MUST NOT o
   spawns a fresh one.
 - [ ] US2-AC2: FR-1 handoff machinery is NOT invoked for `mux_restart` — it is a deliberate
   kill, not a lifecycle transition.
-- [ ] US2-AC3: `mux_restart --graceful <sid>` (new flag) triggers FR-1 handoff within the
-  same daemon instance — upstream stays alive, owner replaced in place. **OPEN QUESTION:**
-  is `--graceful` useful? See Open Questions.
+- [ ] US2-AC3: (REMOVED per C3 — `--graceful` flag deferred to follow-up spec.) `mux_restart`
+  has no graceful variant in this release. Graceful upstream preservation is reachable only
+  via `upgrade --restart`.
 
 ### US3: Idle reaper becomes a soft-close (P1)
 
@@ -318,6 +322,14 @@ session registries, cached embeddings).
   observes owner is in `handoff_in_progress` state and defers eviction.
 - **Token handshake file inaccessible.** FR-11: successor fails handshake, falls back to
   FR-8. Alarm-level log.
+- **Upstream is mid-spawn when handoff begins** (C6). Old daemon's `HandleGracefulRestart`
+  waits up to 10s for any in-flight `SpawnUpstreamBackground` goroutine (existing
+  `owner.backgroundSpawnCh` signal) to complete. Completed in time → transfer normally.
+  Timeout → per-upstream handoff aborts (FR-7); FR-8 fallback for that one upstream.
+- **Upstream holds external sockets/pipes (database, HTTP client)** (C7). External FDs are
+  upstream-owned and live inside its process memory. We transfer only the stdin/stdout JSON-RPC
+  pipe. The upstream process itself is preserved → its internal connection state (DB pool,
+  HTTP keep-alives) is preserved with it. This is the definitional benefit of process survival.
 
 ## Out of Scope
 
@@ -384,20 +396,31 @@ session registries, cached embeddings).
 
 ## Open Questions
 
-- **Q1:** [NEEDS CLARIFICATION] Should `mux_restart <sid>` grow a `--graceful` flag
-  (US2-AC3) that re-spawns owner while keeping upstream alive, or is graceful restart only
-  triggered via daemon-level `upgrade --restart`? **Recommendation:** defer `--graceful` to
-  a follow-up; `mux_restart` stays a hard-restart to preserve operator intent clarity.
-- **Q2:** [NEEDS CLARIFICATION] Windows Job Object handoff — Windows provides
-  `AssignProcessToJobObject` only for processes not already in a terminal job. If the old
-  daemon's job object has `KILL_ON_JOB_CLOSE`, children die regardless of `BREAKAWAY_OK`
-  on the spawning flag. Must we spawn upstreams in their OWN Job Object from birth (with
-  the daemon holding a process-handle reference rather than a job-object reference)?
-  **Recommendation:** yes — upstream Job Object model diverges from daemon Job Object.
-- **Q3:** [NEEDS CLARIFICATION] FD passing on macOS — launchd interactions. If daemon is
-  started as a launchd-managed LaunchAgent, the new-daemon process may be launchd-spawned
-  rather than fork-ed from the old daemon. Does SCM_RIGHTS still reach it through a well-known
-  control socket? **Recommendation:** yes (tested pattern on nginx+launchd), but CI must cover.
+All Q1–Q3 + clarification-session additions resolved via `/nvmd-clarify --auto` on 2026-04-19 — see Clarifications section below.
+
+## Clarifications
+
+### Session 2026-04-19 (--auto, recommended answers applied)
+
+| # | Category | Question | Resolution | Severity |
+|---|----------|----------|------------|----------|
+| C1 | 11 Constraints/Tradeoffs | Windows Job Object ownership model — upstream in daemon's job (KILL_ON_JOB_CLOSE kills children) vs upstream in own job? | Upstream process gets its OWN Job Object at spawn time. Daemon holds a process handle only. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` applied to the upstream's own job (so tree-kill on genuine crash still works), but daemon's own job is completely decoupled. Handoff transfers the process handle via `DuplicateHandle`; successor daemon opens its own handle to the running upstream by PID. | CRITICAL |
+| C2 | 11 Constraints/Tradeoffs | macOS launchd — if daemon runs as LaunchAgent, new-daemon is launchd-spawned, not fork-ed. Does SCM_RIGHTS reach it? | YES. SCM_RIGHTS is a kernel-level FD transfer over AF_UNIX; works between arbitrary processes regardless of spawn parentage. CI coverage MUST include a launchd-spawn scenario (plist-driven new daemon). Degraded fallback (FR-8) engages if launchd starts the new daemon before the old daemon has completed FD serialization — old daemon detects rendezvous timeout (5s default) and falls back. | HIGH |
+| C3 | 1 Functional Scope | `mux_restart <sid> --graceful` flag — add now or defer? | DEFER. `mux_restart` stays a hard-restart (US2-AC1, US2-AC2) to preserve operator intent clarity. Graceful upstream preservation is ONLY reachable via daemon-level `upgrade --restart`. Follow-up spec may add `--graceful` if operator feedback demands it. US2-AC3 REMOVED from acceptance criteria. | LOW |
+| C4 | 8 Security | FR-11 handoff token — algorithm, lifetime, storage? Reuse FR-28 post-audit-remediation token infrastructure? | YES, reuse FR-28 infrastructure. Handoff token: 128-bit random (same `generateToken` helper as FR-28), written by old daemon to `{daemon_state_dir}/handoff.tok` with 0600 permissions (same `sockperm` discipline as FR-29), lifetime bounded by handoff window (≤ 30s) and deleted on handoff completion. Successor daemon reads the file and presents the token on first `handoff_control` connect. Same SessionManager pre-register pattern reused for session context carryover. | MEDIUM |
+| C5 | 6 Performance/Scale | NFR-1 says <2s for 15 upstreams. Upper bound for N upstreams? Hard cap? | NO hard cap, linear scaling. NFR-1 guarantees `< 2s for up to 15 upstreams`. Beyond 15: handoff time scales linearly with upstream count (O(N) FD transfers + O(N) PID-reattach verifications). For 50 upstreams: ~7s expected; for 100: ~13s. During the handoff window, shim reconnect queues extend normally (resilient-client already handles). No resource exhaustion path — just longer upgrade windows. Documented in NFR-1 body. | MEDIUM |
+| C6 | 4 Data Lifecycle | Handoff window behavior for a newly-spawning upstream (spawn in progress when `upgrade --restart` fires)? | WAIT then transfer. Old daemon's `HandleGracefulRestart` blocks up to 10s for in-flight `SpawnUpstreamBackground` goroutines to complete (owner.backgroundSpawnCh signal already used elsewhere for this). If spawn completes within 10s → transfer normally. If timeout → abort that one upstream's handoff (FR-7 per-upstream atomic), fall back to FR-8 for that upstream only. | MEDIUM |
+| C7 | 10 Edge Cases | Upstream that holds open sockets/pipes to external services (database, HTTP) — what happens on handoff? | NOTHING — external FDs are upstream-owned. We transfer upstream process's stdin/stdout (the JSON-RPC pipe to the daemon). Upstream's internal FDs (DB connections, HTTP sockets) stay intact in the running process. This IS the point: the upstream process itself is preserved, so its internal state (including open connections) is preserved. | LOW |
+| C8 | 14 Miscellaneous | Old daemon process termination timing — after handoff complete, when exactly does it exit? | After successor daemon acknowledges `handoff_complete` for every transferred upstream, old daemon closes `handoff_control` socket and calls `os.Exit(0)` within 1s. `upgrade --restart` command waits for old-daemon PID to disappear (up to 20s polling already implemented at `main.go:543-552`) before proceeding. | LOW |
+
+### Resolution summary
+
+- **FR-1, FR-2, FR-3, FR-7, FR-8** — now fully constrained by C1, C4, C6.
+- **FR-11** — concrete implementation via C4: reuse FR-28 `generateToken` + `sockperm.Listen`.
+- **NFR-1** — stated upper-bound behavior via C5.
+- **US2-AC3** — REMOVED per C3. Replacement note added.
+- **Edge Cases** — C6 + C7 merged into existing Edge Cases block.
+- **Platform constraints** — C2 documented CI requirement for macOS launchd scenario.
 
 ## Rule of Three Override
 
