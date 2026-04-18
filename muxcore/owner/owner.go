@@ -37,9 +37,9 @@ import (
 
 // Type aliases for session and snapshot types used throughout owner.
 type (
-	Session        = session.Session
-	SessionManager = session.Manager
-	OwnerSnapshot  = snapshot.OwnerSnapshot
+	Session         = session.Session
+	SessionManager  = session.Manager
+	OwnerSnapshot   = snapshot.OwnerSnapshot
 	SessionSnapshot = snapshot.SessionSnapshot
 )
 
@@ -92,18 +92,18 @@ type InflightRequest struct {
 // Owner is the multiplexer core. It manages a single upstream process and
 // routes requests from multiple downstream sessions through it.
 type Owner struct {
-	upstream *upstream.Process
-	ipcPath  string
-	cwd      string          // primary working directory (from first spawn)
-	cwdSet   map[string]bool // all known cwds (for multi-project roots/list)
-	command     string            // upstream command (for status/restart)
-	args        []string          // upstream args (for status/restart)
-	env         map[string]string // upstream env captured at spawn (for background respawn)
+	upstream       *upstream.Process
+	ipcPath        string
+	cwd            string                                                             // primary working directory (from first spawn)
+	cwdSet         map[string]bool                                                    // all known cwds (for multi-project roots/list)
+	command        string                                                             // upstream command (for status/restart)
+	args           []string                                                           // upstream args (for status/restart)
+	env            map[string]string                                                  // upstream env captured at spawn (for background respawn)
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
-	sessionHandler muxcore.SessionHandler                                            // structured in-process handler (nil = pipe or subprocess)
-	serverID string          // server identity hash
-	listener net.Listener
-	logger   *log.Logger
+	sessionHandler muxcore.SessionHandler                                             // structured in-process handler (nil = pipe or subprocess)
+	serverID       string                                                             // server identity hash
+	listener       net.Listener
+	logger         *log.Logger
 
 	onZeroSessions       func(serverID string)
 	onUpstreamExit       func(serverID string)
@@ -129,27 +129,28 @@ type Owner struct {
 	initReadyOnce        sync.Once
 
 	sessionMgr             *SessionManager
-	tokenHandshake         bool                // true when daemon manages this owner (shims send token)
+	tokenHandshake         bool // true when daemon manages this owner (shims send token)
+	rejectionLogger        *rejectionLogger
 	progressOwners         map[string]int      // progressToken → session ID for targeted routing
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
 	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
 	progressTracker *progress.Tracker // dedup state for synthetic progress emission
 
-	upstreamDead     atomic.Bool // set when upstream exits; prevents sending to dead pipe
-	methodTags       sync.Map    // remapped request ID (string) -> method name
-	inflightTracker  sync.Map    // remapped request ID (string) -> *InflightRequest
-	timedOutIDs      sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
-	pendingRequests  atomic.Int64
-	drainTimeout     time.Duration // from x-mux.drainTimeout capability; 0 = use default
-	toolTimeoutNs      atomic.Int64 // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
-	idleTimeoutNs      atomic.Int64 // from x-mux.idleTimeout capability; 0 = use daemon default
-	progressIntervalNs atomic.Int64 // from x-mux.progressInterval capability; stored as nanoseconds; 0 = use default (5s)
-	lastActivityNs   atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
-	busyMu           sync.Mutex
-	busyDeclarations map[string]busyDeclaration // busy_id → declaration (long-running work signal)
-	startTime        time.Time
-	controlServer    *control.Server
+	upstreamDead       atomic.Bool // set when upstream exits; prevents sending to dead pipe
+	methodTags         sync.Map    // remapped request ID (string) -> method name
+	inflightTracker    sync.Map    // remapped request ID (string) -> *InflightRequest
+	timedOutIDs        sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
+	pendingRequests    atomic.Int64
+	drainTimeout       time.Duration // from x-mux.drainTimeout capability; 0 = use default
+	toolTimeoutNs      atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
+	idleTimeoutNs      atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
+	progressIntervalNs atomic.Int64  // from x-mux.progressInterval capability; stored as nanoseconds; 0 = use default (5s)
+	lastActivityNs     atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
+	busyMu             sync.Mutex
+	busyDeclarations   map[string]busyDeclaration // busy_id → declaration (long-running work signal)
+	startTime          time.Time
+	controlServer      *control.Server
 
 	shutdownOnce      sync.Once
 	closeListenerOnce sync.Once
@@ -266,6 +267,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
 		tokenHandshake:         cfg.TokenHandshake,
+		rejectionLogger:        newRejectionLogger(logger),
 		autoClassification:     snap.Classification,
 		classificationSource:   snap.ClassificationSource,
 		classificationReason:   snap.ClassificationReason,
@@ -500,6 +502,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
 		tokenHandshake:         cfg.TokenHandshake,
+		rejectionLogger:        newRejectionLogger(logger),
 		classified:             make(chan struct{}),
 		initReady:              make(chan struct{}),
 		progressOwners:         make(map[string]int),
@@ -1612,6 +1615,12 @@ func (o *Owner) acceptLoop() {
 		var reader io.Reader = conn
 		if o.tokenHandshake {
 			token, reader = readToken(conn)
+			if token == "" || !o.sessionMgr.IsPreRegistered(token) {
+				peerPID := readPeerPID(conn)
+				o.rejectionLogger.Log(o.logger, peerPID)
+				conn.Close()
+				continue
+			}
 		}
 		// reader may be io.MultiReader if readToken prepended unconsumed bytes.
 		// conn is always the writer and closer.
@@ -1800,6 +1809,10 @@ func (o *Owner) Shutdown() {
 		o.mu.Unlock()
 		if up != nil {
 			up.Close()
+		}
+
+		if o.rejectionLogger != nil {
+			o.rejectionLogger.Close()
 		}
 
 		o.logger.Printf("owner shut down")

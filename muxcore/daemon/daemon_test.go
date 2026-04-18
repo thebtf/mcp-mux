@@ -212,15 +212,22 @@ func TestDaemonSetPersistent(t *testing.T) {
 func TestDaemonMultiSessionSharing(t *testing.T) {
 	d := testDaemon(t)
 
-	// 1. Spawn owner for mock_server via daemon.
-	ipcPath, sid, _, err := d.Spawn(control.Request{
+	// 1. Spawn owner for mock_server via daemon — Spawn returns a pre-registered
+	// handshake token that the shim presents on IPC dial. Each shim gets its own
+	// token; shared-owner mode ensures both tokens route to the same Owner.
+	req := control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
 		Mode:    "global",
-	})
+	}
+	ipcPath, sid, token1, err := d.Spawn(req)
 	if err != nil {
-		t.Fatalf("Spawn() error: %v", err)
+		t.Fatalf("Spawn() 1 error: %v", err)
+	}
+	_, _, token2, err := d.Spawn(req)
+	if err != nil {
+		t.Fatalf("Spawn() 2 error: %v", err)
 	}
 	if ipcPath == "" || sid == "" {
 		t.Fatal("Spawn() returned empty ipcPath or sid")
@@ -247,31 +254,29 @@ func TestDaemonMultiSessionSharing(t *testing.T) {
 
 	// 2. Connect two IPC clients to the owner's socket.
 	// The IPC listener may not be ready immediately after Spawn returns, so retry briefly.
-	var conn1, conn2 *ipcConn
-	for i := 0; i < 50; i++ {
-		c, dialErr := ipc.Dial(ipcPath)
-		if dialErr == nil {
-			conn1 = &ipcConn{conn: c, scanner: bufio.NewScanner(c)}
-			break
+	// Each shim sends its pre-registered token as the first newline-terminated line
+	// (FR-28: acceptLoop rejects connections with missing/invalid token).
+	dialWithToken := func(token string) *ipcConn {
+		t.Helper()
+		for i := 0; i < 50; i++ {
+			c, dialErr := ipc.Dial(ipcPath)
+			if dialErr != nil {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			if _, writeErr := fmt.Fprintf(c, "%s\n", token); writeErr != nil {
+				c.Close()
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return &ipcConn{conn: c, scanner: bufio.NewScanner(c)}
 		}
-		time.Sleep(100 * time.Millisecond)
+		t.Fatalf("failed to dial IPC path %s with token after retries", ipcPath)
+		return nil
 	}
-	if conn1 == nil {
-		t.Fatalf("failed to dial IPC path %s after retries", ipcPath)
-	}
+	conn1 := dialWithToken(token1)
 	defer conn1.conn.Close()
-
-	for i := 0; i < 50; i++ {
-		c, dialErr := ipc.Dial(ipcPath)
-		if dialErr == nil {
-			conn2 = &ipcConn{conn: c, scanner: bufio.NewScanner(c)}
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if conn2 == nil {
-		t.Fatalf("failed to dial second IPC connection to %s", ipcPath)
-	}
+	conn2 := dialWithToken(token2)
 	defer conn2.conn.Close()
 
 	// Wait for both sessions to be registered by the owner's accept loop.
