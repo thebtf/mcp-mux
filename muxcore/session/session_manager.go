@@ -30,10 +30,10 @@ const pendingTokenTTL = 2 * time.Minute
 //
 // Thread-safe: all methods are safe for concurrent use.
 type Manager struct {
-	sessions   map[int]*Context      // session ID → context
-	inflight   map[string]int        // remapped request ID → session ID
+	sessions   map[int]*Context           // session ID → context
+	inflight   map[string]int             // remapped request ID → session ID
 	pending    map[string]*pendingSession // token → session data (pre-registered, consumed on Bind)
-	lastActive map[int]time.Time     // session ID → time of last TrackRequest call
+	lastActive map[int]time.Time          // session ID → time of last TrackRequest call
 	mu         sync.RWMutex
 }
 
@@ -83,6 +83,21 @@ func (sm *Manager) PreRegister(token, cwd string, env map[string]string) {
 		Env:       env,
 		CreatedAt: time.Now(),
 	}
+}
+
+// IsPreRegistered reports whether the given token has been pre-registered but
+// not yet consumed by a successful Bind. This is a side-effect-free read used
+// by Owner.acceptLoop (FR-28) to gate connections before session construction.
+//
+// Rejection does NOT consume the token (C2): only a successful Bind does. This
+// allows transient-failure retry on the legitimate client path (e.g., client
+// closes socket mid-handshake and reconnects) without forcing re-registration
+// via the control socket.
+func (sm *Manager) IsPreRegistered(token string) bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	_, ok := sm.pending[token]
+	return ok
 }
 
 // SweepExpiredPending removes pending tokens older than pendingTokenTTL.

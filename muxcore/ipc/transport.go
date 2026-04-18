@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/sockperm"
 )
 
 const dialTimeout = 500 * time.Millisecond
@@ -22,7 +24,7 @@ func Listen(path string) (net.Listener, error) {
 		return nil, fmt.Errorf("ipc: remove stale socket %s: %w", path, err)
 	}
 
-	ln, err := net.Listen("unix", path)
+	ln, err := sockperm.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("ipc: listen %s: %w", path, err)
 	}

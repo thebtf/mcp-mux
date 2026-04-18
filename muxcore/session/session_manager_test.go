@@ -67,6 +67,26 @@ func TestPreRegisterBind(t *testing.T) {
 	}
 }
 
+func TestIsPreRegistered(t *testing.T) {
+	sm := NewManager()
+
+	sm.PreRegister("tok-pending", "/project/g", nil)
+
+	if !sm.IsPreRegistered("tok-pending") {
+		t.Fatal("IsPreRegistered returned false for pre-registered token")
+	}
+
+	s := &Session{ID: 8}
+	sm.RegisterSession(s, "")
+	if ok := sm.Bind("tok-pending", s); !ok {
+		t.Fatal("Bind returned false for a pre-registered token")
+	}
+
+	if sm.IsPreRegistered("tok-pending") {
+		t.Fatal("IsPreRegistered returned true after token was consumed")
+	}
+}
+
 func TestTrackCompleteRequest(t *testing.T) {
 	sm := NewManager()
 
