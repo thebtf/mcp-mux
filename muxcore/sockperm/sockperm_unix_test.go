@@ -116,8 +116,19 @@ func TestSockperm_UmaskRestored(t *testing.T) {
 	defer ln1.Close()
 	defer os.Remove(path1)
 
-	// After sockperm.Listen, the umask should be restored to original.
-	// A plain net.Listen should produce a non-0600 mode (typically 0755 with umask 022).
+	// Direct verification: probe the umask right after sockperm.Listen. If the
+	// Unix wrapper's defer-restore behaved correctly, the umask equals the
+	// pre-call snapshot. If we observe a different value, the mutex/defer is
+	// broken regardless of what the second listener's mode tells us below.
+	restored := syscall.Umask(0)
+	syscall.Umask(restored)
+	if restored != currentUmask {
+		t.Fatalf("umask after sockperm.Listen = %04o, want %04o (not restored)", restored, currentUmask)
+	}
+
+	// Indirect verification: a plain net.Listen should produce a non-0600 mode
+	// (typically 0755 with umask 022). This catches subtle regressions where
+	// umask is restored but to a wrong value earlier in the call chain.
 	ln2, err := net.Listen("unix", path2)
 	if err != nil {
 		t.Fatal(err)
