@@ -41,9 +41,10 @@ func TestOwnerSingleSession(t *testing.T) {
 	clientR, serverW := io.Pipe()
 	serverR, clientW := io.Pipe()
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -67,9 +68,10 @@ func TestOwnerWithMockServer(t *testing.T) {
 	clientR, serverW := io.Pipe()
 	serverR, clientW := io.Pipe()
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -109,9 +111,10 @@ func TestOwnerWithMockServer(t *testing.T) {
 func TestOwnerMultipleSessions(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -164,9 +167,10 @@ func TestOwnerMultipleSessions(t *testing.T) {
 func TestOwnerIPCClient(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -224,9 +228,10 @@ func TestOwnerIPCClient(t *testing.T) {
 func TestSessionDisconnectDoesNotCrashOwner(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -261,9 +266,10 @@ func TestSessionDisconnectDoesNotCrashOwner(t *testing.T) {
 func TestOwnerCachesInitializeAndToolsList(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -310,9 +316,10 @@ func TestOwnerCachesInitializeAndToolsList(t *testing.T) {
 func TestOwnerReplaysCachedResponses(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -359,9 +366,10 @@ func TestOwnerReplaysCachedResponses(t *testing.T) {
 func TestOwnerStatusIncludesClassification(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -413,9 +421,10 @@ func TestOwnerStatusIncludesClassification(t *testing.T) {
 func TestServerPingHandledLocally(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -456,9 +465,10 @@ func TestServerPingHandledLocally(t *testing.T) {
 func TestSamplingRequestRoutedToSession(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -514,9 +524,10 @@ func TestSamplingRequestRoutedToSession(t *testing.T) {
 func TestCancelledNotificationIDRemapped(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -559,9 +570,10 @@ func TestCancelledNotificationIDRemapped(t *testing.T) {
 func TestCachedInitSuppressesInitializedNotification(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -619,9 +631,10 @@ func TestCachedInitSuppressesInitializedNotification(t *testing.T) {
 func TestPromptsListCachedAndReplayed(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	cmd, args := mockServerArgs()
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Command: cmd,
+		Args:    args,
 		IPCPath: ipcPath,
 		Logger:  testLogger(t),
 	})
@@ -717,25 +730,55 @@ func sendReq(t *testing.T, w io.Writer, id int, method, params string) {
 	}
 }
 
+// readRespTimeout is the per-response deadline for pipe-based owner tests.
+// 30s was the historical value. The 180s headroom is a safety net on top of
+// the TestMain pre-build (see main_test.go): pre-building mock_server once
+// already eliminates the dominant per-test `go run` compile latency, but
+// extra margin protects against CI scheduler pauses, GC stalls, and coverage
+// instrumentation overhead (observed on ubuntu-latest coverage job where
+// instrumented mock_server runs + concurrent test parallelism pushed a single
+// readResp past 90s). Happy-path readResp still finishes in <1s.
+const readRespTimeout = 180 * time.Second
+
+// scanResult carries the outcome of one scanner.Scan() invocation into the
+// select loop below. Capturing the error separately lets the helper fail
+// the test with a clear diagnostic instead of returning an empty byte slice
+// on EOF/scan error (which downstream would surface as a confusing
+// json.Unmarshal failure).
+type scanResult struct {
+	ok   bool
+	line string
+	err  error
+}
+
 func readResp(t *testing.T, r io.Reader) []byte {
 	t.Helper()
 	scanner := bufio.NewScanner(r)
-	done := make(chan bool, 1)
-	var line string
+	done := make(chan scanResult, 1)
 	go func() {
-		if scanner.Scan() {
-			line = scanner.Text()
-		}
-		done <- true
+		ok := scanner.Scan()
+		done <- scanResult{ok: ok, line: scanner.Text(), err: scanner.Err()}
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("readResp timeout")
-	}
+	// time.NewTimer + defer Stop() releases the 90s timer immediately on the
+	// happy path instead of parking it until expiry (the time.After pattern
+	// keeps the underlying timer alive until it fires or GC collects it).
+	timer := time.NewTimer(readRespTimeout)
+	defer timer.Stop()
 
-	return []byte(line)
+	select {
+	case res := <-done:
+		if !res.ok {
+			if res.err != nil {
+				t.Fatalf("readResp scanner error: %v", res.err)
+			}
+			t.Fatal("readResp: scanner returned EOF before any data")
+		}
+		return []byte(res.line)
+	case <-timer.C:
+		t.Fatalf("readResp timeout after %s", readRespTimeout)
+	}
+	return nil // unreachable: both select arms either return or t.Fatalf
 }
 
 func assertResponseID(t *testing.T, resp []byte, expectedID int) {
