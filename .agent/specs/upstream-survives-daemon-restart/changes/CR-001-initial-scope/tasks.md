@@ -7,11 +7,11 @@
 
 ## Phase 0: Planning
 
-- [ ] P001 Confirm executor tiers for all tasks via 5-question Anti-Bypass gate
+- [x] P001 Confirm executor tiers for all tasks via 5-question Anti-Bypass gate
   AC: each task below has an [EXECUTOR] marker · MAIN-tier count ≤5 · aimux-tier tasks have explicit TDD note · swap body→return null ⇒ N/A (planning)
-- [ ] P002 Resolve risks R1 + R2 from plan.md (macOS launchd, Windows Job Object nested semantics)
+- [x] P002 Resolve risks R1 + R2 from plan.md (macOS launchd, Windows Job Object nested semantics)
   AC: CI matrix entries for macOS launchd + Windows Server 2022 + Windows 11 added to `.github/workflows/ci.yml` · mitigation documented in plan.md Unknowns & Risks · swap body→return null ⇒ N/A
-- [ ] P003 Verify FR-28 (`generateToken`, `SessionManager.PreRegister`) + FR-29 (`sockperm.Listen`) surfaces remain stable for reuse
+- [x] P003 Verify FR-28 (`generateToken`, `SessionManager.PreRegister`) + FR-29 (`sockperm.Listen`) surfaces remain stable for reuse
   AC: no new imports of internal FR-28/FR-29 symbols required · reuse surface documented in plan.md Tech Stack · swap body→return null ⇒ N/A
 
 ## Phase 1: Foundation (platform-agnostic)
@@ -237,3 +237,4 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
