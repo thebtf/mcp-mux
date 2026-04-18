@@ -20,6 +20,64 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/procgroup"
 )
 
+// lineBuffer is a mutex-protected deque of lines for buffering stdout.
+// A drain goroutine pushes lines; ReadLine pops them.
+type lineBuffer struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	lines [][]byte
+	done  bool
+	err   error // scanner error, if any; set once by markDoneWithErr
+}
+
+func newLineBuffer() *lineBuffer {
+	lb := &lineBuffer{}
+	lb.cond = sync.NewCond(&lb.mu)
+	return lb
+}
+
+func (lb *lineBuffer) push(line []byte) {
+	lb.mu.Lock()
+	lb.lines = append(lb.lines, line)
+	lb.mu.Unlock()
+	lb.cond.Signal()
+}
+
+// markDoneWithErr marks the buffer as drained and records any scanner error.
+// Callers should pass scanner.Err() so that ReadLine can surface the real
+// failure instead of a misleading io.EOF when the scanner stopped due to an
+// oversized line or other I/O error.
+func (lb *lineBuffer) markDoneWithErr(err error) {
+	lb.mu.Lock()
+	lb.done = true
+	lb.err = err
+	lb.mu.Unlock()
+	lb.cond.Broadcast()
+}
+
+// pop blocks until a line is available or the buffer is drained.
+// Returns the scanner error (if any) in preference to io.EOF once the buffer
+// is empty, so callers can distinguish a clean EOF from a scan failure.
+func (lb *lineBuffer) pop() ([]byte, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	for len(lb.lines) == 0 && !lb.done {
+		lb.cond.Wait()
+	}
+	if len(lb.lines) == 0 {
+		if lb.err != nil {
+			return nil, lb.err
+		}
+		return nil, io.EOF
+	}
+
+	line := lb.lines[0]
+	lb.lines[0] = nil // clear reference so GC can reclaim the backing array slot
+	lb.lines = lb.lines[1:]
+	return line, nil
+}
+
 // Process represents a running upstream MCP server process.
 type Process struct {
 	proc   *procgroup.Process
@@ -27,7 +85,7 @@ type Process struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	scanner *bufio.Scanner
+	lineBuf *lineBuffer
 
 	mu           sync.Mutex
 	closed       bool
@@ -75,6 +133,26 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		Done: make(chan struct{}),
 	}
 
+	// Use os.Pipe() for stdout instead of cmd.StdoutPipe(). StdoutPipe's docs
+	// forbid reading concurrently with cmd.Wait — Wait closes the pipe's read
+	// side and any unread data in the pipe buffer is lost on close. With
+	// os.Pipe we own both ends: the child process writes to stdoutW (cmd.Stdout),
+	// we read from stdoutR, and the pipe stays open until we close it
+	// ourselves in the drain goroutine. Wait no longer races with reads.
+	//
+	// Stdin can still use StdinPipe: the caller drives writes and the pipe
+	// close is an intentional shutdown signal, not a race.
+	//
+	// Stderr uses StderrPipe but is synchronized the same way as stdout:
+	// a stderrDrained channel ensures proc.Wait() is only called after the
+	// stderr scanner goroutine has finished reading. Without that ordering,
+	// Cmd.Wait() closes the StderrPipe while the scanner may still be reading,
+	// which can silently drop the last lines of crash diagnostics.
+	stdoutR, stdoutW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		return nil, fmt.Errorf("upstream: os.Pipe: %w", pipeErr)
+	}
+
 	// Capture pipe handles inside the PreStart callback so procgroup still owns
 	// the exec.Cmd lifecycle (platform isolation, job object, tree kill).
 	var captureErr error
@@ -83,16 +161,13 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		Args:    args,
 		Dir:     cwd,
 		Env:     merged,
-		// Stdin/Stdout/Stderr are left nil here; pipes are set up in PreStart.
+		// stdout: use our own pipe (see rationale above). stdin / stderr
+		// still use exec.Cmd's built-in pipes.
+		Stdout: stdoutW,
 		PreStart: func(cmd *exec.Cmd) error {
 			stdin, err := cmd.StdinPipe()
 			if err != nil {
 				captureErr = fmt.Errorf("upstream: stdin pipe: %w", err)
-				return captureErr
-			}
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				captureErr = fmt.Errorf("upstream: stdout pipe: %w", err)
 				return captureErr
 			}
 			stderr, err := cmd.StderrPipe()
@@ -101,7 +176,7 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 				return captureErr
 			}
 			p.stdin = stdin
-			p.stdout = stdout
+			p.stdout = stdoutR
 			p.stderr = stderr
 			return nil
 		},
@@ -109,23 +184,61 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 
 	proc, err := procgroup.Spawn(opts)
 	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return nil, fmt.Errorf("upstream: spawn %s: %w", command, err)
 	}
 	if captureErr != nil {
 		// Should not happen — Spawn already propagates PreStart errors — but be safe.
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		_ = proc.Kill()
 		return nil, captureErr
 	}
 
-	p.proc = proc
-	p.scanner = bufio.NewScanner(p.stdout)
-	p.scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+	// Close our copy of the write end — the child inherited its own copy via
+	// exec. When the child exits, its write end closes; our drain goroutine's
+	// Scanner then sees EOF naturally. Without this close, the pipe never
+	// reaches EOF because one writer (us) remains open forever.
+	_ = stdoutW.Close()
 
-	// Bridge procgroup's done channel into upstream's Done channel and capture
-	// the exit error.
+	p.proc = proc
+	p.lineBuf = newLineBuffer()
+
+	// stdoutDrained and stderrDrained are closed by their respective drain
+	// goroutines once the scanner has finished and markDoneWithErr has been
+	// called. The Wait goroutine blocks on both before calling proc.Wait(),
+	// guaranteeing that all output is consumed before the OS reclaims the
+	// pipes. Without this ordering, Cmd.Wait() closes the pipes (stdout via
+	// our os.Pipe close, stderr via StderrPipe's internal close) while the
+	// scanners may still be reading, causing data loss or spurious errors.
+	stdoutDrained := make(chan struct{})
+	stderrDrained := make(chan struct{})
+
+	// Drain stdout into an internal buffer before the OS pipe is closed.
+	// ReadLine reads from memory, not directly from cmd.StdoutPipe, so
+	// proc.Wait() no longer races with external readers.
 	go func() {
-		p.ExitErr = proc.Wait()
-		close(p.Done)
+		defer close(stdoutDrained)
+		defer func() { _ = p.stdout.Close() }()
+		scanner := bufio.NewScanner(p.stdout)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			cp := make([]byte, len(line))
+			copy(cp, line)
+			p.lineBuf.push(cp)
+		}
+		// Propagate real scanner errors (e.g., bufio.ErrTooLong) so ReadLine
+		// surfaces them instead of io.EOF. But cmd.StdoutPipe closes on
+		// process exit and the scanner then returns os.ErrClosed ("read |N:
+		// file already closed") — that is the expected clean-close path, not
+		// a failure, so normalise it to nil (pop() will return io.EOF).
+		err := scanner.Err()
+		if errors.Is(err, os.ErrClosed) {
+			err = nil
+		}
+		p.lineBuf.markDoneWithErr(err)
 	}()
 
 	// Forward stderr to logger (prefix with [upstream]) so diagnostics are visible.
@@ -135,7 +248,12 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// When the caller supplies a logger, route stderr there — the daemon runs
 	// detached with os.Stderr discarded, so writing to os.Stderr would drop
 	// every crash diagnostic (the exact failure mode we are fixing here).
+	//
+	// close(stderrDrained) signals the Wait goroutine below that all stderr
+	// output has been consumed; proc.Wait() is only called after both drain
+	// goroutines have finished (see stdoutDrained/stderrDrained ordering).
 	go func() {
+		defer close(stderrDrained)
 		scanner := bufio.NewScanner(p.stderr)
 		scanner.Buffer(make([]byte, 64*1024), 64*1024) // 64KB — handles any build output line
 		for scanner.Scan() {
@@ -145,6 +263,17 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 				fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", proc.PID(), scanner.Text())
 			}
 		}
+	}()
+
+	// Bridge procgroup's done channel into upstream's Done channel and capture
+	// the exit error. Wait for both drain goroutines to finish before calling
+	// proc.Wait() — this ensures stdout and stderr are fully consumed before
+	// the OS reclaims the pipes, preventing data loss and spurious errors.
+	go func() {
+		<-stdoutDrained
+		<-stderrDrained
+		p.ExitErr = proc.Wait()
+		close(p.Done)
 	}()
 
 	return p, nil
@@ -173,38 +302,10 @@ func (p *Process) WriteLine(data []byte) error {
 }
 
 // ReadLine reads the next line from the upstream process stdout.
-// Returns io.EOF when the process closes stdout.
-//
-// Error normalisation: exec.Cmd.StdoutPipe is documented to close the pipe
-// after cmd.Wait() returns, and we run Wait in a background goroutine (see
-// Start's "bridge procgroup's done channel" block). A caller that dials
-// ReadLine AFTER Wait has closed the pipe sees "read |0: file already
-// closed" from os.ErrClosed. Semantically this is EOF: no more bytes will
-// ever arrive. Map it so callers can short-circuit on io.EOF without
-// stringy matches (upstream package and product code already treat EOF as
-// clean end-of-stream — see muxcore/owner/owner.go readUpstream).
-//
-// This normalisation does NOT mask the deeper race (Wait concurrently
-// closing the pipe with ReadLine); it just prevents a misleading error
-// surface. Documented with full root-cause analysis in TECHNICAL_DEBT.md
-// under "upstream.Start Wait-vs-ReadLine race".
+// Returns io.EOF when the process has exited and all output has been consumed.
+// All lines written before process exit are available even after Done is closed.
 func (p *Process) ReadLine() ([]byte, error) {
-	if p.scanner.Scan() {
-		// Return a copy to avoid scanner buffer reuse issues
-		line := p.scanner.Bytes()
-		result := make([]byte, len(line))
-		copy(result, line)
-		return result, nil
-	}
-
-	if err := p.scanner.Err(); err != nil {
-		if errors.Is(err, os.ErrClosed) {
-			return nil, io.EOF
-		}
-		return nil, fmt.Errorf("upstream: read: %w", err)
-	}
-
-	return nil, io.EOF
+	return p.lineBuf.pop()
 }
 
 // Close terminates the upstream process gracefully.
@@ -277,12 +378,31 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 	stdoutR, stdoutW := io.Pipe()
 
 	p := &Process{
-		stdin:  stdinW,
-		stdout: stdoutR,
-		Done:   make(chan struct{}),
+		stdin:   stdinW,
+		stdout:  stdoutR,
+		Done:    make(chan struct{}),
+		lineBuf: newLineBuffer(),
 	}
-	p.scanner = bufio.NewScanner(stdoutR)
-	p.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	go func() {
+		scanner := bufio.NewScanner(stdoutR)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			cp := make([]byte, len(line))
+			copy(cp, line)
+			p.lineBuf.push(cp)
+		}
+		// Propagate real scanner errors (e.g., bufio.ErrTooLong) but normalise
+		// the expected clean-close path — io.Pipe.CloseWithError produces
+		// io.ErrClosedPipe when the handler exits; os.ErrClosed when stdin
+		// closure cascades — neither is a real failure.
+		err := scanner.Err()
+		if errors.Is(err, os.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+			err = nil
+		}
+		p.lineBuf.markDoneWithErr(err)
+	}()
 
 	go func() {
 		// handler runs until it returns or ctx is cancelled.

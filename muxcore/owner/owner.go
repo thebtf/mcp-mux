@@ -2674,9 +2674,10 @@ func (o *Owner) classifyFromCapabilities(initJSON []byte) {
 func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 	o.mu.RLock()
 	alreadyClassified := o.classificationSource != ""
+	classSrc := o.classificationSource // capture inside lock for safe use after unlock
 	o.mu.RUnlock()
 	if alreadyClassified {
-		o.logger.Printf("skipping tool classification — already classified via %s", o.classificationSource)
+		o.logger.Printf("skipping tool classification — already classified via %s", classSrc)
 		return
 	}
 

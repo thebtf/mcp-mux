@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"io"
 	"log"
 	"runtime"
 	"strings"
@@ -263,5 +264,53 @@ func TestEnvironmentPassing(t *testing.T) {
 	}
 	if !strings.Contains(string(line), "mux_value_123") {
 		t.Errorf("ReadLine() = %q, want contains 'mux_value_123'", string(line))
+	}
+}
+
+// TestStart_FastExitPreservesStdout verifies all stdout lines from a
+// fast-exiting upstream are readable via ReadLine even after Done is closed.
+// Regression test for the Wait-vs-ReadLine race (TECHNICAL_DEBT.md).
+func TestStart_FastExitPreservesStdout(t *testing.T) {
+	var cmd string
+	var args []string
+	if runtime.GOOS == "windows" {
+		cmd = "cmd"
+		args = []string{"/c", "echo line1 && echo line2"}
+	} else {
+		cmd = "sh"
+		args = []string{"-c", "printf 'line1\nline2\n'"}
+	}
+
+	p, err := Start(cmd, args, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	defer p.Close()
+
+	select {
+	case <-p.Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("process did not exit within timeout")
+	}
+
+	line1, err := p.ReadLine()
+	if err != nil {
+		t.Fatalf("ReadLine() line1 error: %v (race? process already exited)", err)
+	}
+	if !strings.Contains(string(line1), "line1") {
+		t.Errorf("line1 = %q, want contains 'line1'", string(line1))
+	}
+
+	line2, err := p.ReadLine()
+	if err != nil {
+		t.Fatalf("ReadLine() line2 error: %v", err)
+	}
+	if !strings.Contains(string(line2), "line2") {
+		t.Errorf("line2 = %q, want contains 'line2'", string(line2))
+	}
+
+	_, err = p.ReadLine()
+	if err != io.EOF {
+		t.Errorf("ReadLine() after all lines = %v, want io.EOF", err)
 	}
 }
