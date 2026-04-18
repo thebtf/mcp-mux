@@ -26,6 +26,7 @@ type lineBuffer struct {
 	cond  *sync.Cond
 	lines [][]byte
 	done  bool
+	err   error // scanner error, if any; set once by markDoneWithErr
 }
 
 func newLineBuffer() *lineBuffer {
@@ -41,14 +42,21 @@ func (lb *lineBuffer) push(line []byte) {
 	lb.cond.Signal()
 }
 
-func (lb *lineBuffer) markDone() {
+// markDoneWithErr marks the buffer as drained and records any scanner error.
+// Callers should pass scanner.Err() so that ReadLine can surface the real
+// failure instead of a misleading io.EOF when the scanner stopped due to an
+// oversized line or other I/O error.
+func (lb *lineBuffer) markDoneWithErr(err error) {
 	lb.mu.Lock()
 	lb.done = true
+	lb.err = err
 	lb.mu.Unlock()
 	lb.cond.Broadcast()
 }
 
 // pop blocks until a line is available or the buffer is drained.
+// Returns the scanner error (if any) in preference to io.EOF once the buffer
+// is empty, so callers can distinguish a clean EOF from a scan failure.
 func (lb *lineBuffer) pop() ([]byte, error) {
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
@@ -57,10 +65,14 @@ func (lb *lineBuffer) pop() ([]byte, error) {
 		lb.cond.Wait()
 	}
 	if len(lb.lines) == 0 {
+		if lb.err != nil {
+			return nil, lb.err
+		}
 		return nil, io.EOF
 	}
 
 	line := lb.lines[0]
+	lb.lines[0] = nil // clear reference so GC can reclaim the backing array slot
 	lb.lines = lb.lines[1:]
 	return line, nil
 }
@@ -177,7 +189,9 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 			copy(cp, line)
 			p.lineBuf.push(cp)
 		}
-		p.lineBuf.markDone()
+		// Propagate scanner.Err() so ReadLine returns the real failure
+		// (e.g., bufio.ErrTooLong for an oversized line) instead of io.EOF.
+		p.lineBuf.markDoneWithErr(scanner.Err())
 	}()
 
 	// Bridge procgroup's done channel into upstream's Done channel and capture
@@ -323,7 +337,9 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 			copy(cp, line)
 			p.lineBuf.push(cp)
 		}
-		p.lineBuf.markDone()
+		// Propagate scanner.Err() so ReadLine surfaces protocol violations
+		// (e.g., oversized lines) rather than a misleading io.EOF.
+		p.lineBuf.markDoneWithErr(scanner.Err())
 	}()
 
 	go func() {
