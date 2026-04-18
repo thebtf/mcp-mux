@@ -157,9 +157,13 @@ func TestAcceptLoop_ConcurrentTokenMix(t *testing.T) {
 	for _, conn := range conns[n:] {
 		conn.Close()
 	}
-	for _, conn := range conns[:n] {
-		defer conn.Close()
-	}
+	t.Cleanup(func() {
+		for _, conn := range conns[:n] {
+			if conn != nil {
+				conn.Close()
+			}
+		}
+	})
 
 	waitForCondition(t, 200*time.Millisecond, func() bool {
 		return sessionCount(o) == n

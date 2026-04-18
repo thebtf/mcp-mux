@@ -284,13 +284,13 @@ Before any task is marked complete, verify:
   [EXECUTOR: sonnet]
 
 ### T6.6 FR-29: Hardened socket-listen wrapper
-- [ ] Create `muxcore/internal/sockperm/sockperm.go` (package `sockperm`) — exported `Listen(network, addr string) (net.Listener, error)`
+- [ ] Create `muxcore/sockperm/sockperm.go` (package `sockperm`) — exported `Listen(network, addr string) (net.Listener, error)`
 - [ ] `sockperm.Listen` delegates to `listenWithMode(network, addr, 0600)` from build-tag files
-- [ ] Create `muxcore/internal/sockperm/sockperm_unix.go` (`//go:build unix`) — uses package-level `sync.Mutex` + `syscall.Umask(0177)`-wrapped `net.Listen`, restores original umask on defer
-- [ ] Create `muxcore/internal/sockperm/sockperm_windows.go` (`//go:build windows`) — no-op wrapper, delegates directly to `net.Listen`. **MANDATORY** package-level doc comment per C5 citing Windows 10 1803+ AF_UNIX default DACL behavior.
+- [ ] Create `muxcore/sockperm/sockperm_unix.go` (`//go:build unix`) — uses package-level `sync.Mutex` + `syscall.Umask(0177)`-wrapped `net.Listen`, restores original umask on defer
+- [ ] Create `muxcore/sockperm/sockperm_windows.go` (`//go:build windows`) — no-op wrapper, delegates directly to `net.Listen`. **MANDATORY** package-level doc comment per C5 citing Windows 10 1803+ AF_UNIX default DACL behavior.
 - [ ] Rationale in Unix file comment: "syscall.Umask is process-global. The mutex is required — two goroutines calling Listen concurrently could race: G1 sets umask(0177), G2 sets umask(0177), G1 restores original, G2 creates socket with wrong umask."
 - [ ] Verify `go build ./muxcore/...`
-  AC: package compiles on Unix + Windows · build tags resolve correctly (`go list -f '{{.GoFiles}}' ./muxcore/internal/sockperm`) · Unix file has mutex · Windows file has doc comment citing C5 text verbatim · swap sockperm.Listen → plain net.Listen ⇒ FR-29 perm tests MUST fail
+  AC: package compiles on Unix + Windows · build tags resolve correctly (`go list -f '{{.GoFiles}}' ./muxcore/sockperm`) · Unix file has mutex · Windows file has doc comment citing C5 text verbatim · swap sockperm.Listen → plain net.Listen ⇒ FR-29 perm tests MUST fail
   [EXECUTOR: sonnet]
 
 ### T6.7 FR-29: Migrate 4 call sites
@@ -298,19 +298,19 @@ Before any task is marked complete, verify:
 - [ ] `muxcore/serverid/serverid.go:195` — same
 - [ ] `cmd/mcp-mux/daemon.go:67` — same (daemon control socket)
 - [ ] `muxcore/ipc/transport.go:25` — same (engine-consumer IPC — absorbs FR-9)
-- [ ] Add import `"github.com/thebtf/mcp-mux/muxcore/internal/sockperm"` to each file (or use `muxcore.Listen` if preferred public re-export — decide in implementation)
+- [ ] Add import `"github.com/thebtf/mcp-mux/muxcore/sockperm"` to each file (or use `muxcore.Listen` if preferred public re-export — decide in implementation)
 - [ ] Verify `go build ./...` root module + `go build ./...` muxcore submodule
 - [ ] `go vet ./...` both modules
   AC: 4 call sites migrated · `grep -rn "net.Listen(\"unix\"" muxcore/ cmd/` returns 0 for these 4 paths · all builds pass · swap sockperm.Listen → net.Listen in any one file ⇒ that site's perm test MUST fail
   [EXECUTOR: sonnet]
 
 ### T6.8 FR-29: Regression tests (unix-only)
-- [ ] Create `muxcore/internal/sockperm/sockperm_unix_test.go` (`//go:build unix`)
+- [ ] Create `muxcore/sockperm/sockperm_unix_test.go` (`//go:build unix`)
 - [ ] Case A: single `sockperm.Listen("unix", tempPath)` → `os.Stat(tempPath)`, assert `info.Mode() & 0777 == 0600`
 - [ ] Case B: 50 concurrent goroutines, each calls `sockperm.Listen` on its own temp path → all 50 files `mode == 0600` (proves mutex serializes)
 - [ ] Case C: restored-umask test — wrap-then-direct-call: call `sockperm.Listen`, then `net.Listen("unix", other)` → assert `other` has a "normal" mode (NOT 0600), proving the umask was restored
 - [ ] Cleanup: `os.Remove(path)` after each subtest; use `t.TempDir()` for the base path
-- [ ] Run: `go test -count=1 -race -run 'TestSockperm' ./muxcore/internal/sockperm/...` (on WSL if native Windows)
+- [ ] Run: `go test -count=1 -race -run 'TestSockperm' ./muxcore/sockperm/...` (on WSL if native Windows)
   AC: 3 test cases · race test passes with `-race` (Unix only) · skipped on Windows via build tag · swap umask(0177) → umask(0) ⇒ case A MUST fail
   [EXECUTOR: sonnet]
 

@@ -303,11 +303,11 @@ Call sites to fix (all must be covered):
 3. `cmd/mcp-mux/daemon.go:67` (daemon control socket)
 4. `muxcore/ipc/transport.go:25` (engine-consumer IPC socket — absorbs FR-9)
 
-Windows: `syscall.Umask` is not available. Implementation MUST use build tags (`socket_perms_unix.go` + `socket_perms_windows.go`) so Windows continues to rely on ACLs. Unix file: active. Windows file: no-op stub that returns `nil`. Per C5, `socket_perms_windows.go` MUST include a package-level doc comment citing verified behavior: *"On Windows 10 1803+ AF_UNIX sockets inherit the creating process's default DACL, granting access only to the owner SID and LocalSystem. Named pipes created via `net.Listen(\"unix\", path)` on Windows follow the same model. No `Umask`-equivalent API is needed."* This prevents a future reviewer from mistakenly adding a Windows-side permission-tightening hack.
+Windows: `syscall.Umask` is not available. Implementation MUST use build tags (`sockperm_unix.go` + `sockperm_windows.go`) so Windows continues to rely on ACLs. Unix file: active. Windows file: no-op wrapper that delegates to `net.Listen` without `umask` changes. Per C5, `sockperm_windows.go` MUST include a package-level doc comment citing verified behavior: *"On Windows 10 1803+ AF_UNIX sockets inherit the creating process's default DACL, granting access only to the owner SID and LocalSystem. Named pipes created via `net.Listen(\"unix\", path)` on Windows follow the same model. No `Umask`-equivalent API is needed."* This prevents a future reviewer from mistakenly adding a Windows-side permission-tightening hack.
 
 **Regression test MUST (build tag `!windows`):**
-- Unit test per call site: create the listener via the hardened wrapper, `os.Stat(path)`, assert `mode & 0777 == 0600`.
-- Race test: 50 concurrent `net.Listen` calls across a fake socket path — assert all 50 sockets have `mode == 0600` (proves the mutex is correctly serializing).
+- Unit test per call site: create the listener via `sockperm.Listen`, `os.Stat(path)`, assert `mode & 0777 == 0600`.
+- Race test: 50 concurrent `sockperm.Listen` calls across unique socket paths — assert all 50 sockets have `mode == 0600` (proves the mutex is correctly serializing).
 - Cleanup: `os.Remove(path)` after each test to prevent bleed.
 
 **Backward compatibility:** On Unix the permission is tightened (0755 → 0600). Existing daemons running with 0755 sockets will continue to work after upgrade — only NEW sockets created post-upgrade are 0600. Migration note in release notes: "after v0.9.10 upgrade, restart the daemon to apply 0600 permissions to the control socket." On Windows: zero effect.

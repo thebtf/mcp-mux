@@ -247,10 +247,10 @@ FR-9 (original spec, deferred and never implemented) is **superseded** by FR-29 
 
 | Path | Purpose |
 |------|---------|
-| `muxcore/internal/sockperm/sockperm.go` | Public `Listen(network, addr string) (net.Listener, error)` — delegates to platform-specific `listenWithMode`. Doc comment cross-references FR-29 + C5. |
-| `muxcore/internal/sockperm/sockperm_unix.go` | `//go:build unix` — package-level `sync.Mutex` serializes `syscall.Umask(0177)` + `net.Listen` + restore-umask. Comment documents the umask race that motivates the mutex. |
-| `muxcore/internal/sockperm/sockperm_windows.go` | `//go:build windows` — no-op wrapper. **MANDATORY** package-level doc comment (per C5) citing Windows 10 1803+ AF_UNIX default DACL behavior verbatim. |
-| `muxcore/internal/sockperm/sockperm_unix_test.go` | `//go:build unix` — 3 test cases per T6.8 (single, 50-concurrent race, umask-restored). |
+| `muxcore/sockperm/sockperm.go` | Public `Listen(network, addr string) (net.Listener, error)` — delegates to platform-specific `listenWithMode`. Doc comment cross-references FR-29 + C5. |
+| `muxcore/sockperm/sockperm_unix.go` | `//go:build unix` — package-level `sync.Mutex` serializes `syscall.Umask(0177)` + `net.Listen` + restore-umask. Comment documents the umask race that motivates the mutex. |
+| `muxcore/sockperm/sockperm_windows.go` | `//go:build windows` — no-op wrapper. **MANDATORY** package-level doc comment (per C5) citing Windows 10 1803+ AF_UNIX default DACL behavior verbatim. |
+| `muxcore/sockperm/sockperm_unix_test.go` | `//go:build unix` — 3 test cases per T6.8 (single, 50-concurrent race, umask-restored). |
 | `muxcore/owner/peer_pid_unix.go` | `//go:build unix` — `readPeerPID(conn net.Conn) int` via `SO_PEERCRED` (`syscall.Ucred`). |
 | `muxcore/owner/peer_pid_windows.go` | `//go:build windows` — stub returning `-1`. |
 | `muxcore/owner/rejection_logger.go` | `rejectionLogger` struct — 10-entry ring buffer + mutex + 60s summary ticker (C4). |
@@ -309,24 +309,6 @@ FR-9 (original spec, deferred and never implemented) is **superseded** by FR-29 
 - [ ] Re-run `/nvmd-platform:production-ready-check --quick`: verdict READY for multi-user deployment (prior was CONDITIONALLY READY).
 - [ ] PR-E merged with all AI-review threads resolved and CI green on 3-OS matrix.
 - [ ] Security re-scan: S8-001 and S5-001 both closed.
-- findSharedOwner uses a two-phase lock pattern (snapshot under RLock,
-  scan outside) to eliminate mid-iteration lock drops. (BUG-007, PR-B)
-
-### Deferred to v0.19.4 (Unix portability)
-- Socket permissions (S9-001), snapshot HMAC signing (S7-001), and
-  Medium-severity items from the audit.
-
-### Verification
-- go build ./... clean
-- go vet ./... clean
-- go test -count=1 -race ./... all green
-- /nvmd-platform:production-ready-check WTF-points: 92 → target ≤ 20
-- mcp-mux upgrade --restart validated 3× against live daemon
-
-### Upgrade
-go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
-No API changes. Zero consumer code modifications.
-```
 
 ## Risks & Mitigations
 
