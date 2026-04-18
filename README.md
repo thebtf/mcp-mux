@@ -208,14 +208,23 @@ mcp-mux shims automatically reconnect when the daemon restarts. This means:
 
 During reconnect, the shim:
 1. Detects IPC connection loss (daemon shutdown)
-2. Buffers incoming CC requests (up to 1000 messages)
-3. Sends keepalive notifications to prevent CC timeout
+2. Drains orphaned in-flight requests — sends spec-compliant JSON-RPC error responses so CC sees
+   explicit failures for pending requests instead of silence (silence on a pending request is
+   what CC's stdio transport tears the connection down over)
+3. Buffers incoming CC requests (up to 1000 messages)
 4. Starts a new daemon via `ensureDaemon()`
 5. Re-spawns the upstream server via `spawnViaDaemon()`
 6. Replays cached `initialize` request to warm the new owner
 7. Flushes buffered requests and resumes normal proxy
 
 Reconnect timeout: 30 seconds. If reconnect fails, the shim exits and CC restarts it.
+
+> **Note on keepalives:** Earlier versions emitted synthetic `notifications/progress` with a
+> `mux-reconnect` progress token every 5 s as a keep-alive. That violated the MCP spec
+> (progress tokens must reference a client-issued `_meta.progressToken`), and Claude Code tore
+> down the stdio transport on the first unknown token — destroying the connection the shim was
+> trying to preserve. The keep-alive was removed in muxcore v0.19.6; `drainOrphanedInflight` is
+> the spec-compliant replacement.
 
 ## Session Transport Layer
 
@@ -234,6 +243,13 @@ CC → shim → [token\n] → Owner (SessionManager) → upstream
 The Owner reads the token, looks up the corresponding `Session.Cwd`, and binds the IPC connection
 to that session. From this point the session identity is authoritative — no heuristics required.
 
+**Handshake enforcement (v0.9.10+).** The Owner rejects IPC connections with an empty or
+unregistered token when daemon mode is active. Rejections are logged at owner level with the peer
+PID (no token value) and rate-limited to 10 entries per minute per owner with a suppressed-count
+summary. Pre-registered tokens are preserved on rejection, so a legitimate client that closes
+mid-handshake can reconnect without forcing the daemon to re-issue a new token. Tokens are 128-bit
+(16 random bytes from `crypto/rand`); entropy failure is fatal.
+
 ### Deterministic callback routing
 
 The `SessionManager` tracks inflight requests per session. When exactly one session has pending
@@ -245,6 +261,43 @@ This eliminates spurious mis-routing in high-concurrency scenarios.
 `roots/list` requests from the upstream are forwarded to the active CC session (the one with
 pending requests), so the server receives the real workspace roots for that session rather than a
 static fallback.
+
+## Security Model
+
+mcp-mux is designed for a **single-user local trust boundary**: any process running as the same OS
+user is implicitly trusted. Two layered defenses protect against same-machine impersonation on
+shared Unix hosts:
+
+### Application-layer: handshake enforcement
+
+The Owner `acceptLoop` rejects IPC connections with an empty or unregistered token (daemon mode).
+Combined with 128-bit `crypto/rand` tokens and single-use `Bind` semantics, this closes the only
+application-layer impersonation gap on the data socket.
+
+### OS-layer: 0600 socket permissions (Unix)
+
+All Unix domain sockets created by `ipc.Listen` and the daemon control socket go through the
+`muxcore/sockperm` package, which applies `syscall.Umask(0177)` under a package-level mutex — the
+socket file lands with mode `0600` and is only accessible to the owner UID. On Windows, AF_UNIX
+sockets inherit the creating process's default DACL (owner + LocalSystem), so no umask equivalent
+is needed and the package is a documented no-op.
+
+### What mcp-mux does NOT protect against
+
+- **Malware running under the same user account.** A process with your UID can still connect to
+  your 0600 control socket and issue its own `spawn` request to obtain a fresh pre-registered
+  token. Treat the control socket as trusted to everything running as you.
+- **Network-level adversaries.** mcp-mux uses Unix sockets / Windows AF_UNIX only — there is no
+  TCP listener. Remote attack surface is zero.
+- **Upstream MCP servers themselves.** mcp-mux is a transparent proxy; if an upstream server runs
+  `exec.Command` on attacker-controlled input, mcp-mux doesn't rewrite or sanitize that.
+
+### Multi-user deployment
+
+For shared-machine Unix hosts (multiple login users), mcp-mux v0.9.10 and later is safe for the
+cross-user boundary — the 0600 permission prevents a different user from `connect()`-ing, and the
+token handshake rejects same-user probe attempts that haven't received a pre-registered token from
+the daemon.
 
 ## Commands
 
