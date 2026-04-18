@@ -4,11 +4,72 @@ import (
 	"context"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 )
+
+// TestDecrementPending_ClampsAtZero is a regression test for the cosmetic bug
+// where `pending_requests` appeared as `-1` in mux_list output. A late
+// proactive-init response arriving after upstream death could fire Add(-1)
+// without a matching Add(1), driving the counter negative. decrementPending
+// clamps at zero while preserving correct decrement semantics otherwise.
+func TestDecrementPending_ClampsAtZero(t *testing.T) {
+	o := &Owner{}
+
+	// Balanced increments / decrements behave normally.
+	o.pendingRequests.Add(3)
+	o.decrementPending()
+	o.decrementPending()
+	if got := o.pendingRequests.Load(); got != 1 {
+		t.Errorf("after 3 Add(1) + 2 decrementPending, Load = %d, want 1", got)
+	}
+
+	// Extra decrements clamp at zero, never go negative.
+	o.decrementPending()
+	o.decrementPending()
+	o.decrementPending()
+	if got := o.pendingRequests.Load(); got != 0 {
+		t.Errorf("after extra decrements, Load = %d, want 0 (must clamp)", got)
+	}
+
+	// Sanity: single Add(1) after the clamp recovers normal counting.
+	o.pendingRequests.Add(1)
+	if got := o.pendingRequests.Load(); got != 1 {
+		t.Errorf("Add(1) after clamp, Load = %d, want 1", got)
+	}
+}
+
+// TestDecrementPending_ConcurrentSafe stresses the CompareAndSwap loop from
+// many goroutines: decrements from zero must all clamp, not race past each
+// other into negatives.
+func TestDecrementPending_ConcurrentSafe(t *testing.T) {
+	o := &Owner{}
+
+	const workers = 32
+	const perWorker = 100
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < perWorker; j++ {
+				o.decrementPending()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := o.pendingRequests.Load(); got < 0 {
+		t.Fatalf("concurrent decrements from zero produced negative counter: %d", got)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // T008: TestNewOwner_SessionHandlerOnly_NoUpstream
