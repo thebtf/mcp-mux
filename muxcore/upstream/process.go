@@ -133,6 +133,23 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		Done: make(chan struct{}),
 	}
 
+	// Use os.Pipe() for stdout instead of cmd.StdoutPipe(). StdoutPipe's docs
+	// forbid reading concurrently with cmd.Wait — Wait closes the pipe's read
+	// side and any unread data in the pipe buffer is lost on close. With
+	// os.Pipe we own both ends: the child process writes to stdoutW (cmd.Stdout),
+	// we read from stdoutR, and the pipe stays open until we close it
+	// ourselves in the drain goroutine. Wait no longer races with reads.
+	//
+	// Stdin and stderr can still use StdinPipe / StderrPipe because:
+	// - stdin: caller drives writes; pipe close is intentional shutdown signal
+	// - stderr: the drain goroutine's lifetime is bound by stderr EOF, not
+	//   Wait — the scanner pattern is race-free on stderr because it ends
+	//   when the child exits (EOF from kernel), not when Wait runs.
+	stdoutR, stdoutW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		return nil, fmt.Errorf("upstream: os.Pipe: %w", pipeErr)
+	}
+
 	// Capture pipe handles inside the PreStart callback so procgroup still owns
 	// the exec.Cmd lifecycle (platform isolation, job object, tree kill).
 	var captureErr error
@@ -141,16 +158,13 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		Args:    args,
 		Dir:     cwd,
 		Env:     merged,
-		// Stdin/Stdout/Stderr are left nil here; pipes are set up in PreStart.
+		// stdout: use our own pipe (see rationale above). stdin / stderr
+		// still use exec.Cmd's built-in pipes.
+		Stdout: stdoutW,
 		PreStart: func(cmd *exec.Cmd) error {
 			stdin, err := cmd.StdinPipe()
 			if err != nil {
 				captureErr = fmt.Errorf("upstream: stdin pipe: %w", err)
-				return captureErr
-			}
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				captureErr = fmt.Errorf("upstream: stdout pipe: %w", err)
 				return captureErr
 			}
 			stderr, err := cmd.StderrPipe()
@@ -159,7 +173,7 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 				return captureErr
 			}
 			p.stdin = stdin
-			p.stdout = stdout
+			p.stdout = stdoutR
 			p.stderr = stderr
 			return nil
 		},
@@ -167,13 +181,23 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 
 	proc, err := procgroup.Spawn(opts)
 	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return nil, fmt.Errorf("upstream: spawn %s: %w", command, err)
 	}
 	if captureErr != nil {
 		// Should not happen — Spawn already propagates PreStart errors — but be safe.
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		_ = proc.Kill()
 		return nil, captureErr
 	}
+
+	// Close our copy of the write end — the child inherited its own copy via
+	// exec. When the child exits, its write end closes; our drain goroutine's
+	// Scanner then sees EOF naturally. Without this close, the pipe never
+	// reaches EOF because one writer (us) remains open forever.
+	_ = stdoutW.Close()
 
 	p.proc = proc
 	p.lineBuf = newLineBuffer()
