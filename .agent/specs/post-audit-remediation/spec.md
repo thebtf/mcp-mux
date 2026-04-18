@@ -2,9 +2,10 @@
 
 **Slug:** post-audit-remediation
 **Created:** 2026-04-15
-**Status:** Active
+**Status:** Implemented
 **Author:** AI Agent (reviewed by user)
 **Last Amendment:** 2026-04-18 (PRC-2026-04-18: S8-001 token enforcement + S5-001 multi-socket 0600 expansion)
+**Shipped:** 2026-04-18 — `muxcore/v0.20.4` + `mcp-mux/v0.9.10` (PR #71, commit `58502d5`)
 
 > **Provenance:** Specified by claude-opus-4-6[1m] on 2026-04-15.
 > Evidence from: `.agent/reports/2026-04-15-production-readiness.md` (the audit report this spec directly addresses), `.agent/reports/2026-04-15-bug-hunting-report.md`, `.agent/reports/2026-04-15-security-scan-report.md`, and manual source verification during audit Phase 4 (owner.go:896, daemon.go:435, owner.go:1395–1404, owner.go:1742–1797, owner.go:1824–1837 read directly).
