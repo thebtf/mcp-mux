@@ -208,8 +208,9 @@ mcp-mux shims automatically reconnect when the daemon restarts. This means:
 
 During reconnect, the shim:
 1. Detects IPC connection loss (daemon shutdown)
-2. Drains orphaned in-flight requests — sends spec-compliant JSON-RPC error responses to CC so it
-   times out on unanswered requests (not on silence), matching MCP's natural keep-alive contract
+2. Drains orphaned in-flight requests — sends spec-compliant JSON-RPC error responses so CC sees
+   explicit failures for pending requests instead of silence (silence on a pending request is
+   what CC's stdio transport tears the connection down over)
 3. Buffers incoming CC requests (up to 1000 messages)
 4. Starts a new daemon via `ensureDaemon()`
 5. Re-spawns the upstream server via `spawnViaDaemon()`
@@ -284,9 +285,8 @@ is needed and the package is a documented no-op.
 ### What mcp-mux does NOT protect against
 
 - **Malware running under the same user account.** A process with your UID can still connect to
-  your 0600 socket and read your pre-registered tokens from the daemon log. Treat the control
-  socket the same way you treat your shell's `~/.bash_history` — trusted to everything running as
-  you.
+  your 0600 control socket and issue its own `spawn` request to obtain a fresh pre-registered
+  token. Treat the control socket as trusted to everything running as you.
 - **Network-level adversaries.** mcp-mux uses Unix sockets / Windows AF_UNIX only — there is no
   TCP listener. Remote attack surface is zero.
 - **Upstream MCP servers themselves.** mcp-mux is a transparent proxy; if an upstream server runs
