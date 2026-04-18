@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +23,7 @@ func (noopSessionHandler) HandleRequest(context.Context, muxcore.ProjectContext,
 func newTokenHandshakeOwner(t *testing.T, logger *log.Logger) (*Owner, string) {
 	t.Helper()
 
-	socketPath := filepath.Join(t.TempDir(), "owner.sock")
+	socketPath := shortSocketPath(t)
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}

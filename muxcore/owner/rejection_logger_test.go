@@ -3,6 +3,7 @@ package owner
 import (
 	"bytes"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,27 @@ func (sb *safeBuffer) String() string {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 	return sb.buf.String()
+}
+
+// shortSocketPath returns a short Unix-socket path in the OS temp root
+// (avoids macOS's 104-byte sockaddr_un.sun_path limit that t.TempDir() can
+// easily exceed when the test name is long). Mirrors the daemon_test helper.
+// The returned path does NOT exist on disk — the caller's Listen creates it.
+func shortSocketPath(t interface {
+	Helper()
+	Fatalf(format string, args ...interface{})
+	Cleanup(f func())
+}) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "mux-test-*.sock")
+	if err != nil {
+		t.Fatalf("shortSocketPath: CreateTemp: %v", err)
+	}
+	path := f.Name()
+	_ = f.Close()
+	_ = os.Remove(path)
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
 }
 
 func TestRejectionLogger_RateLimit(t *testing.T) {

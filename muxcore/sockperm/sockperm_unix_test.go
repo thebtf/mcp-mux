@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 	"testing"
@@ -14,15 +13,31 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/sockperm"
 )
 
+// shortSocketPath returns a short Unix-socket path in the OS temp root.
+// macOS enforces a 104-byte limit on sockaddr_un.sun_path; t.TempDir() paths
+// under `/var/folders/.../T/TestName.../NNN/` easily exceed this and fail
+// net.Listen with `bind: invalid argument`. CreateTemp in the empty-dir root
+// keeps the path short (typically ~60-80 bytes). Mirrors daemon_test helper.
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	f, err := os.CreateTemp("", "sockperm-*.sock")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	path := f.Name()
+	_ = f.Close()
+	_ = os.Remove(path)
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
+}
+
 func TestSockperm_SingleListen_Mode0600(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.sock")
+	path := shortSocketPath(t)
 	ln, err := sockperm.Listen("unix", path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	defer os.Remove(path)
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -36,17 +51,16 @@ func TestSockperm_SingleListen_Mode0600(t *testing.T) {
 
 func TestSockperm_Concurrent50_AllMode0600(t *testing.T) {
 	const n = 50
-	// Pre-create all 50 paths before launching goroutines. If a goroutine
-	// called t.TempDir() concurrently with another goroutine's sockperm.Listen,
-	// the umask=0177 window would affect MkdirTemp — the new directory would
-	// land with mode 0700 & ~0177 = 0600 (no exec bit), and the subsequent
-	// bind would fail with "permission denied". Pre-creating all dirs under
-	// a single t.TempDir() (which itself ran before any umask manipulation)
-	// avoids the race: the sockperm mutex only covers Listen, not MkdirTemp.
-	baseDir := t.TempDir()
+	// Pre-create all 50 paths before launching goroutines. Two races are
+	// possible if per-goroutine MkdirTemp / TempDir runs concurrently with
+	// another goroutine's sockperm.Listen (which sets umask=0177):
+	//   - Linux: MkdirTemp subdir lands mode 0600 (no exec) → bind EACCES.
+	//   - macOS: TempDir paths are very long (>104 bytes with test name)
+	//     and exceed sockaddr_un.sun_path → bind EINVAL.
+	// Pre-creating short paths via CreateTemp in the OS root dodges both.
 	paths := make([]string, n)
 	for i := 0; i < n; i++ {
-		paths[i] = filepath.Join(baseDir, fmt.Sprintf("sock-%02d.sock", i))
+		paths[i] = shortSocketPath(t)
 	}
 
 	var wg sync.WaitGroup
@@ -92,9 +106,8 @@ func TestSockperm_UmaskRestored(t *testing.T) {
 		t.Skip("process umask is already 0177; test cannot distinguish restored from not-restored")
 	}
 
-	dir := t.TempDir()
-	path1 := filepath.Join(dir, "sock1.sock")
-	path2 := filepath.Join(dir, "sock2.sock")
+	path1 := shortSocketPath(t)
+	path2 := shortSocketPath(t)
 
 	ln1, err := sockperm.Listen("unix", path1)
 	if err != nil {
