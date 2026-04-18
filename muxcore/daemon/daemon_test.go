@@ -657,7 +657,7 @@ func TestCleanStaleSockets(t *testing.T) {
 func findSharedOwnerLocked(d *Daemon, command string, args []string, env map[string]string) *OwnerEntry {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.findSharedOwner(command, args, env, "")
+	return d.findSharedOwnerLocked(command, args, env, "")
 }
 
 func TestCrashCircuitBreaker(t *testing.T) {
@@ -982,7 +982,7 @@ func TestFindSharedOwner_SkipsPlaceholdersFirstPass(t *testing.T) {
 	// placeholder channel for 5 seconds.
 	start := time.Now()
 	d.mu.Lock()
-	result := d.findSharedOwner("go", []string{"run", "foo.go"}, nil, "/tmp/test")
+	result := d.findSharedOwnerLocked("go", []string{"run", "foo.go"}, nil, "/tmp/test")
 	d.mu.Unlock()
 	elapsed := time.Since(start)
 

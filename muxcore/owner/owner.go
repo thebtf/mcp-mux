@@ -1497,12 +1497,14 @@ type ownerNotifier struct {
 	owner *Owner
 }
 
+// Notify dispatches notifications for a project with best-effort semantics.
+// best effort; failures logged at session level.
 func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
 	// Collect ALL sessions matching projectID under RLock, then release before
-	// WriteRaw — s.WriteRaw may block up to 30 s on a slow IPC consumer (session
-	// write deadline). Holding o.mu.RLock() during that wait stalls every goroutine
-	// needing o.mu.Lock() (addSession, removeSession, cacheResponse, progress token
-	// cleanup). This pattern mirrors Broadcast below.
+	// SendNotification to avoid blocking on slow IPC consumers.
+	// Holding o.mu.RLock() during SendNotification would still stall
+	// goroutines needing o.mu.Lock() (addSession, removeSession, cacheResponse,
+	// progress token cleanup), so lock scopes stay short.
 	//
 	// In Shared mode multiple CC sessions can share the same Cwd (same project),
 	// so we must notify ALL of them, not just the first one found (which would be
@@ -1518,13 +1520,10 @@ func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
 	if len(targets) == 0 {
 		return fmt.Errorf("no session found for project %s", projectID)
 	}
-	var lastErr error
 	for _, s := range targets {
-		if err := s.WriteRaw(notification); err != nil {
-			lastErr = err
-		}
+		s.SendNotification(notification)
 	}
-	return lastErr
+	return nil
 }
 
 func (n *ownerNotifier) Broadcast(notification []byte) {
@@ -1535,7 +1534,7 @@ func (n *ownerNotifier) Broadcast(notification []byte) {
 	}
 	n.owner.mu.RUnlock()
 	for _, s := range sessions {
-		s.WriteRaw(notification)
+		s.SendNotification(notification)
 	}
 }
 
@@ -1544,6 +1543,7 @@ func (o *Owner) removeSession(s *Session) {
 	o.mu.Lock()
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
+	var removedTokens []string
 	// Clean up progress tokens owned by this session (FIX 1: session died
 	// before its tool call completed — prevent permanent reaper veto).
 	for token, ownerID := range o.progressOwners {
@@ -1552,9 +1552,13 @@ func (o *Owner) removeSession(s *Session) {
 			delete(o.progressOwners, token)
 			delete(o.progressTokenRequestID, token)
 			delete(o.requestToTokens, reqID)
+			removedTokens = append(removedTokens, token)
 		}
 	}
 	o.mu.Unlock()
+	if len(removedTokens) > 0 {
+		o.progressTracker.Cleanup(removedTokens)
+	}
 
 	o.sessionMgr.RemoveSession(s.ID)
 	o.touchActivity()

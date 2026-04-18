@@ -384,14 +384,15 @@ func cleanStaleSockets(logger *log.Logger) int {
 	return cleaned
 }
 
-// generateToken creates a 16-character hex handshake token (8 random bytes).
-func generateToken() string {
-	b := make([]byte, 8)
+// generateToken creates a 32-character hex handshake token (16 random bytes, 128-bit).
+// Returns an error if crypto/rand is unavailable; callers must not use a predictable
+// fallback token.
+func generateToken() (string, error) {
+	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		// Fallback: use a deterministic but unique value.
-		return hex.EncodeToString([]byte(fmt.Sprintf("%016x", time.Now().UnixNano())))
+		return "", fmt.Errorf("generateToken: crypto/rand unavailable: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }
 
 // Spawn creates or returns an existing owner for the given server identity.
@@ -461,7 +462,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	}
 
 	// Generate handshake token upfront — valid for this spawn call only.
-	token := generateToken()
+	token, err := generateToken()
+	if err != nil {
+		return "", "", "", fmt.Errorf("spawn: %w", err)
+	}
 
 	// Circuit breaker: reject spawn if the upstream has been crash-looping.
 	// This prevents infinite respawn loops (shim reconnect → spawn → crash → repeat)
@@ -605,7 +609,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	//    across different CWDs — every process has exactly one CWD, so sharing an
 	//    unclassified server with a different CWD risks context leaks.
 	if mode == serverid.ModeCwd {
-		if existing := d.findSharedOwner(req.Command, req.Args, req.Env, req.Cwd); existing != nil {
+		if existing := d.findSharedOwnerLocked(req.Command, req.Args, req.Env, req.Cwd); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
 			d.mu.Unlock()
@@ -695,7 +699,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// create the owner from cached init data (instant response to CC) and
 	// start the real upstream process in the background.
 	var o *owner.Owner
-	var err error
+	var ownerErr error
 	fromTemplate := false
 	if tmpl, ok := d.getTemplate(req.Command, req.Args); ok {
 		// Adapt template for this specific owner instance
@@ -705,9 +709,9 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		tmpl.Env = sessionEnv
 		tmpl.Mode = req.Mode
 
-		o, err = owner.NewOwnerFromSnapshot(ownerCfg, tmpl)
-		if err != nil {
-			d.logger.Printf("template spawn failed for %s: %v, falling back to fresh spawn", sid[:8], err)
+		o, ownerErr = owner.NewOwnerFromSnapshot(ownerCfg, tmpl)
+		if ownerErr != nil {
+			d.logger.Printf("template spawn failed for %s: %v, falling back to fresh spawn", sid[:8], ownerErr)
 			o = nil // fall through to fresh spawn
 		} else {
 			fromTemplate = true
@@ -717,8 +721,8 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 
 	// Fresh spawn: no template available, or template spawn failed.
 	if o == nil {
-		o, err = owner.NewOwner(ownerCfg)
-		if err != nil {
+		o, ownerErr = owner.NewOwner(ownerCfg)
+		if ownerErr != nil {
 			// Remove the placeholder and unblock any waiters.
 			d.mu.Lock()
 			if d.owners[sid] == placeholder {
@@ -726,7 +730,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			}
 			close(placeholder.creating)
 			d.mu.Unlock()
-			return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, err)
+			return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, ownerErr)
 		}
 		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
 	}
@@ -882,7 +886,7 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 	d.mu.Unlock()
 }
 
-// findSharedOwner looks for an accepting owner that matches the requested
+// findSharedOwnerLocked looks for an accepting owner that matches the requested
 // command+args and is compatible with the caller's env and cwd for shared reuse.
 // Dedup is optimistic: unclassified owners are assumed shareable. If an owner
 // later classifies as isolated, it closes its IPC listener — extra sessions get
@@ -905,7 +909,7 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // of wait cycles (at most one — placeholders only exist while someone is
 // actively creating an owner; after a full wait-and-resolve cycle, either a
 // live entry exists or no placeholder remains).
-func (d *Daemon) findSharedOwner(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
+func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
 
 	// Wait budget: at most one placeholder-wait cycle. Multiple matching
@@ -1007,6 +1011,9 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 		// Build a select that blocks on whichever signals we collected.
 		// Using nil channels in a select case blocks forever, so a single
 		// select with nil branches safely waits only on non-nil ones.
+		// Invariant: at least one of placeholder/classifyWait is non-nil (guard
+		// at line ~998 ensures this). Nil-channel cases in a select are never
+		// selected, so time.After is the fallback for the non-nil branch.
 		select {
 		case <-placeholder:
 			// Creation resolved (success or failure) — rescan.
