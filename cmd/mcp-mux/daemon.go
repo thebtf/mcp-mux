@@ -67,6 +67,7 @@ func runGlobalDaemon() {
 	logFile, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	var logger *log.Logger
 	if err == nil {
+		defer func() { _ = logFile.Close() }()
 		logger = log.New(logFile, "[mcp-muxd] ", log.LstdFlags|log.Lmicroseconds)
 		logger.Printf("=== daemon starting, debug log: %s ===", debugLogPath)
 	} else {
