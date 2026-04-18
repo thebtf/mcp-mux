@@ -245,7 +245,20 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 		d.logger.Printf("supervisor: service %q terminated: %v (restarting=%v)",
 			e.ServiceName, e.Err, e.Restarting)
 		if !e.Restarting {
-			d.logger.Printf("supervisor: service %q permanently failed — cleaning up zombie owner", e.ServiceName)
+			// suture sets Restarting=false for both real failures
+			// (FailureThreshold exceeded, panic, ErrDoNotRestart) and clean
+			// exits (Serve returned nil after Shutdown). cleanupDeadOwner
+			// runs in both cases — it removes the registry entry and the
+			// IPC socket file. But labeling a clean shutdown as
+			// "permanently failed" produced misleading cascade-like noise
+			// when many idle owners torn down after compaction or CC
+			// session close. Differentiate the log so operators can
+			// distinguish real failures from routine teardown.
+			if e.Err == nil {
+				d.logger.Printf("supervisor: service %q clean exit — removing registry entry", e.ServiceName)
+			} else {
+				d.logger.Printf("supervisor: service %q permanently failed (%v) — cleaning up zombie owner", e.ServiceName, e.Err)
+			}
 			go d.cleanupDeadOwner(e.ServiceName)
 		}
 	case suture.EventBackoff:
@@ -895,8 +908,9 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 	for {
 		// Phase 1: scan live entries for a concrete match.
 		var (
-			match       *OwnerEntry
-			placeholder chan struct{}
+			match        *OwnerEntry
+			placeholder  chan struct{}
+			classifyWait <-chan struct{} // in-flight classification of a matching entry
 		)
 		for _, entry := range d.owners {
 			if entry.Command != command {
@@ -932,6 +946,20 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 			if !cwdMatch {
 				// Different CWD — only share if owner is confirmed shareable.
 				if !entry.Owner.IsClassifiedShareable() {
+					// If classification is still in flight, remember its channel.
+					// If the owner ends up shareable we'll adopt it on rescan;
+					// if isolated we'll skip it next time and fall through to
+					// creating our own owner. This closes the race where a
+					// second CWD arrives BEFORE the first owner classifies,
+					// currently leaving two owners for the same command.
+					select {
+					case <-entry.Owner.Classified():
+						// Already classified and !shareable → truly skip.
+					default:
+						if classifyWait == nil {
+							classifyWait = entry.Owner.Classified()
+						}
+					}
 					continue
 				}
 			}
@@ -955,18 +983,26 @@ func (d *Daemon) findSharedOwner(command string, args []string, env map[string]s
 			return match
 		}
 
-		// No concrete match. If a placeholder was seen and we have wait
-		// budget, release the lock, wait for it (or time out), re-acquire,
-		// and rescan. Otherwise give up.
-		if placeholder == nil || waitsDone >= maxWaits {
+		// No concrete match. If a placeholder or in-flight classification was
+		// seen and we have wait budget, release the lock, wait for it (or
+		// time out), re-acquire, and rescan. Otherwise give up.
+		if placeholder == nil && classifyWait == nil {
+			return nil
+		}
+		if waitsDone >= maxWaits {
 			return nil
 		}
 		waitsDone++
 
 		d.mu.Unlock()
+		// Build a select that blocks on whichever signals we collected.
+		// Using nil channels in a select case blocks forever, so a single
+		// select with nil branches safely waits only on non-nil ones.
 		select {
 		case <-placeholder:
 			// Creation resolved (success or failure) — rescan.
+		case <-classifyWait:
+			// Classification resolved — rescan; owner may now be shareable.
 		case <-time.After(concurrentCreateWaitTimeout):
 			// Timed out. Re-acquire and return — caller will create new.
 			d.mu.Lock()
