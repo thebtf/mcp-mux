@@ -8,7 +8,6 @@ package upstream
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +19,52 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/procgroup"
 )
 
+// lineBuffer is a mutex-protected deque of lines for buffering stdout.
+// A drain goroutine pushes lines; ReadLine pops them.
+type lineBuffer struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	lines [][]byte
+	done  bool
+}
+
+func newLineBuffer() *lineBuffer {
+	lb := &lineBuffer{}
+	lb.cond = sync.NewCond(&lb.mu)
+	return lb
+}
+
+func (lb *lineBuffer) push(line []byte) {
+	lb.mu.Lock()
+	lb.lines = append(lb.lines, line)
+	lb.mu.Unlock()
+	lb.cond.Signal()
+}
+
+func (lb *lineBuffer) markDone() {
+	lb.mu.Lock()
+	lb.done = true
+	lb.mu.Unlock()
+	lb.cond.Broadcast()
+}
+
+// pop blocks until a line is available or the buffer is drained.
+func (lb *lineBuffer) pop() ([]byte, error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+
+	for len(lb.lines) == 0 && !lb.done {
+		lb.cond.Wait()
+	}
+	if len(lb.lines) == 0 {
+		return nil, io.EOF
+	}
+
+	line := lb.lines[0]
+	lb.lines = lb.lines[1:]
+	return line, nil
+}
+
 // Process represents a running upstream MCP server process.
 type Process struct {
 	proc   *procgroup.Process
@@ -27,7 +72,7 @@ type Process struct {
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
-	scanner *bufio.Scanner
+	lineBuf *lineBuffer
 
 	mu           sync.Mutex
 	closed       bool
@@ -118,8 +163,22 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	}
 
 	p.proc = proc
-	p.scanner = bufio.NewScanner(p.stdout)
-	p.scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+	p.lineBuf = newLineBuffer()
+
+	// Drain stdout into an internal buffer before the OS pipe is closed.
+	// ReadLine reads from memory, not directly from cmd.StdoutPipe, so
+	// proc.Wait() no longer races with external readers.
+	go func() {
+		scanner := bufio.NewScanner(p.stdout)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			cp := make([]byte, len(line))
+			copy(cp, line)
+			p.lineBuf.push(cp)
+		}
+		p.lineBuf.markDone()
+	}()
 
 	// Bridge procgroup's done channel into upstream's Done channel and capture
 	// the exit error.
@@ -173,38 +232,10 @@ func (p *Process) WriteLine(data []byte) error {
 }
 
 // ReadLine reads the next line from the upstream process stdout.
-// Returns io.EOF when the process closes stdout.
-//
-// Error normalisation: exec.Cmd.StdoutPipe is documented to close the pipe
-// after cmd.Wait() returns, and we run Wait in a background goroutine (see
-// Start's "bridge procgroup's done channel" block). A caller that dials
-// ReadLine AFTER Wait has closed the pipe sees "read |0: file already
-// closed" from os.ErrClosed. Semantically this is EOF: no more bytes will
-// ever arrive. Map it so callers can short-circuit on io.EOF without
-// stringy matches (upstream package and product code already treat EOF as
-// clean end-of-stream — see muxcore/owner/owner.go readUpstream).
-//
-// This normalisation does NOT mask the deeper race (Wait concurrently
-// closing the pipe with ReadLine); it just prevents a misleading error
-// surface. Documented with full root-cause analysis in TECHNICAL_DEBT.md
-// under "upstream.Start Wait-vs-ReadLine race".
+// Returns io.EOF when the process has exited and all output has been consumed.
+// All lines written before process exit are available even after Done is closed.
 func (p *Process) ReadLine() ([]byte, error) {
-	if p.scanner.Scan() {
-		// Return a copy to avoid scanner buffer reuse issues
-		line := p.scanner.Bytes()
-		result := make([]byte, len(line))
-		copy(result, line)
-		return result, nil
-	}
-
-	if err := p.scanner.Err(); err != nil {
-		if errors.Is(err, os.ErrClosed) {
-			return nil, io.EOF
-		}
-		return nil, fmt.Errorf("upstream: read: %w", err)
-	}
-
-	return nil, io.EOF
+	return p.lineBuf.pop()
 }
 
 // Close terminates the upstream process gracefully.
@@ -277,12 +308,23 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 	stdoutR, stdoutW := io.Pipe()
 
 	p := &Process{
-		stdin:  stdinW,
-		stdout: stdoutR,
-		Done:   make(chan struct{}),
+		stdin:   stdinW,
+		stdout:  stdoutR,
+		Done:    make(chan struct{}),
+		lineBuf: newLineBuffer(),
 	}
-	p.scanner = bufio.NewScanner(stdoutR)
-	p.scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	go func() {
+		scanner := bufio.NewScanner(stdoutR)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			cp := make([]byte, len(line))
+			copy(cp, line)
+			p.lineBuf.push(cp)
+		}
+		p.lineBuf.markDone()
+	}()
 
 	go func() {
 		// handler runs until it returns or ctx is cancelled.
