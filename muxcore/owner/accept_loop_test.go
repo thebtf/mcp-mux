@@ -101,7 +101,7 @@ func TestAcceptLoop_RejectUnknownToken(t *testing.T) {
 }
 
 func TestAcceptLoop_AcceptPreRegisteredToken(t *testing.T) {
-	var logBuffer strings.Builder
+	var logBuffer safeBuffer
 	logger := log.New(&logBuffer, "", 0)
 	o, socketPath := newTokenHandshakeOwner(t, logger)
 	o.SessionMgr().PreRegister("feedface", "/workspace/project", nil)
@@ -119,7 +119,7 @@ func TestAcceptLoop_AcceptPreRegisteredToken(t *testing.T) {
 }
 
 func TestAcceptLoop_ConcurrentTokenMix(t *testing.T) {
-	var logBuffer strings.Builder
+	var logBuffer safeBuffer
 	logger := log.New(&logBuffer, "", 0)
 	o, socketPath := newTokenHandshakeOwner(t, logger)
 

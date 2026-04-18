@@ -4,12 +4,35 @@ import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
+// safeBuffer is a mutex-guarded bytes.Buffer safe for concurrent Write from a
+// log.Logger (running on a background goroutine) and String reads from the
+// test goroutine. Standard bytes.Buffer is not safe for that pattern — under
+// `-race` the unsynchronised access is a verified data race, not a false
+// positive. Shared between rejection_logger_test.go and accept_loop_test.go.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (sb *safeBuffer) Write(p []byte) (int, error) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Write(p)
+}
+
+func (sb *safeBuffer) String() string {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.String()
+}
+
 func TestRejectionLogger_RateLimit(t *testing.T) {
-	var buf bytes.Buffer
+	var buf safeBuffer
 	logger := log.New(&buf, "", 0)
 	rl := newRejectionLogger(logger)
 	defer rl.Close()
@@ -43,7 +66,7 @@ func TestRejectionLogger_Summary(t *testing.T) {
 		rejectionLoggerNewTicker = origTicker
 	}()
 
-	var buf bytes.Buffer
+	var buf safeBuffer
 	logger := log.New(&buf, "", 0)
 	rl := newRejectionLogger(logger)
 	defer rl.Close()

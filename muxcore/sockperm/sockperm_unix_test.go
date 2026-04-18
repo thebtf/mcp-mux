@@ -36,17 +36,29 @@ func TestSockperm_SingleListen_Mode0600(t *testing.T) {
 
 func TestSockperm_Concurrent50_AllMode0600(t *testing.T) {
 	const n = 50
+	// Pre-create all 50 paths before launching goroutines. If a goroutine
+	// called t.TempDir() concurrently with another goroutine's sockperm.Listen,
+	// the umask=0177 window would affect MkdirTemp — the new directory would
+	// land with mode 0700 & ~0177 = 0600 (no exec bit), and the subsequent
+	// bind would fail with "permission denied". Pre-creating all dirs under
+	// a single t.TempDir() (which itself ran before any umask manipulation)
+	// avoids the race: the sockperm mutex only covers Listen, not MkdirTemp.
+	baseDir := t.TempDir()
+	paths := make([]string, n)
+	for i := 0; i < n; i++ {
+		paths[i] = filepath.Join(baseDir, fmt.Sprintf("sock-%02d.sock", i))
+	}
+
 	var wg sync.WaitGroup
-	errors := make(chan error, n)
+	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			dir := t.TempDir()
-			path := filepath.Join(dir, "test.sock")
+			path := paths[i]
 			ln, err := sockperm.Listen("unix", path)
 			if err != nil {
-				errors <- err
+				errs <- err
 				return
 			}
 			defer ln.Close()
@@ -54,17 +66,17 @@ func TestSockperm_Concurrent50_AllMode0600(t *testing.T) {
 
 			info, err := os.Stat(path)
 			if err != nil {
-				errors <- err
+				errs <- err
 				return
 			}
 			if got := info.Mode() & 0777; got != 0600 {
-				errors <- fmt.Errorf("goroutine %d: socket mode = %04o, want 0600", i, got)
+				errs <- fmt.Errorf("goroutine %d: socket mode = %04o, want 0600", i, got)
 			}
 		}(i)
 	}
 	wg.Wait()
-	close(errors)
-	for err := range errors {
+	close(errs)
+	for err := range errs {
 		t.Error(err)
 	}
 }
