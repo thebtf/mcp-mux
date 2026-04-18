@@ -140,11 +140,14 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// we read from stdoutR, and the pipe stays open until we close it
 	// ourselves in the drain goroutine. Wait no longer races with reads.
 	//
-	// Stdin and stderr can still use StdinPipe / StderrPipe because:
-	// - stdin: caller drives writes; pipe close is intentional shutdown signal
-	// - stderr: the drain goroutine's lifetime is bound by stderr EOF, not
-	//   Wait — the scanner pattern is race-free on stderr because it ends
-	//   when the child exits (EOF from kernel), not when Wait runs.
+	// Stdin can still use StdinPipe: the caller drives writes and the pipe
+	// close is an intentional shutdown signal, not a race.
+	//
+	// Stderr uses StderrPipe but is synchronized the same way as stdout:
+	// a stderrDrained channel ensures proc.Wait() is only called after the
+	// stderr scanner goroutine has finished reading. Without that ordering,
+	// Cmd.Wait() closes the StderrPipe while the scanner may still be reading,
+	// which can silently drop the last lines of crash diagnostics.
 	stdoutR, stdoutW, pipeErr := os.Pipe()
 	if pipeErr != nil {
 		return nil, fmt.Errorf("upstream: os.Pipe: %w", pipeErr)
@@ -202,10 +205,22 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	p.proc = proc
 	p.lineBuf = newLineBuffer()
 
+	// stdoutDrained and stderrDrained are closed by their respective drain
+	// goroutines once the scanner has finished and markDoneWithErr has been
+	// called. The Wait goroutine blocks on both before calling proc.Wait(),
+	// guaranteeing that all output is consumed before the OS reclaims the
+	// pipes. Without this ordering, Cmd.Wait() closes the pipes (stdout via
+	// our os.Pipe close, stderr via StderrPipe's internal close) while the
+	// scanners may still be reading, causing data loss or spurious errors.
+	stdoutDrained := make(chan struct{})
+	stderrDrained := make(chan struct{})
+
 	// Drain stdout into an internal buffer before the OS pipe is closed.
 	// ReadLine reads from memory, not directly from cmd.StdoutPipe, so
 	// proc.Wait() no longer races with external readers.
 	go func() {
+		defer close(stdoutDrained)
+		defer func() { _ = p.stdout.Close() }()
 		scanner := bufio.NewScanner(p.stdout)
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
 		for scanner.Scan() {
@@ -226,13 +241,6 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		p.lineBuf.markDoneWithErr(err)
 	}()
 
-	// Bridge procgroup's done channel into upstream's Done channel and capture
-	// the exit error.
-	go func() {
-		p.ExitErr = proc.Wait()
-		close(p.Done)
-	}()
-
 	// Forward stderr to logger (prefix with [upstream]) so diagnostics are visible.
 	// Buffer must be large enough for long lines (MSBuild paths, NuGet restore logs).
 	// If scanner stops reading (line too long), stderr pipe fills → upstream blocks.
@@ -240,7 +248,12 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// When the caller supplies a logger, route stderr there — the daemon runs
 	// detached with os.Stderr discarded, so writing to os.Stderr would drop
 	// every crash diagnostic (the exact failure mode we are fixing here).
+	//
+	// close(stderrDrained) signals the Wait goroutine below that all stderr
+	// output has been consumed; proc.Wait() is only called after both drain
+	// goroutines have finished (see stdoutDrained/stderrDrained ordering).
 	go func() {
+		defer close(stderrDrained)
 		scanner := bufio.NewScanner(p.stderr)
 		scanner.Buffer(make([]byte, 64*1024), 64*1024) // 64KB — handles any build output line
 		for scanner.Scan() {
@@ -250,6 +263,17 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 				fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", proc.PID(), scanner.Text())
 			}
 		}
+	}()
+
+	// Bridge procgroup's done channel into upstream's Done channel and capture
+	// the exit error. Wait for both drain goroutines to finish before calling
+	// proc.Wait() — this ensures stdout and stderr are fully consumed before
+	// the OS reclaims the pipes, preventing data loss and spurious errors.
+	go func() {
+		<-stdoutDrained
+		<-stderrDrained
+		p.ExitErr = proc.Wait()
+		close(p.Done)
 	}()
 
 	return p, nil

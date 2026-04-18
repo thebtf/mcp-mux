@@ -293,8 +293,6 @@ func TestStart_FastExitPreservesStdout(t *testing.T) {
 		t.Fatal("process did not exit within timeout")
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
 	line1, err := p.ReadLine()
 	if err != nil {
 		t.Fatalf("ReadLine() line1 error: %v (race? process already exited)", err)
