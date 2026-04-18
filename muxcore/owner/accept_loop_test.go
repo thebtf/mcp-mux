@@ -78,25 +78,38 @@ func sessionCount(o *Owner) int {
 }
 
 func TestAcceptLoop_RejectEmptyToken(t *testing.T) {
-	o, socketPath := newTokenHandshakeOwner(t, nil)
+	var logBuffer safeBuffer
+	logger := log.New(&logBuffer, "", 0)
+	o, socketPath := newTokenHandshakeOwner(t, logger)
 
 	conn := connectWithToken(t, socketPath, "")
 	conn.Close()
 
+	// Positive evidence of rejection: the rejection log entry appears. Plain
+	// `sessionCount == 0` is true from t=0 and cannot distinguish "rejected"
+	// from "acceptLoop hasn't run yet" (CodeRabbit concern).
 	waitForCondition(t, 200*time.Millisecond, func() bool {
-		return sessionCount(o) == 0
-	}, "empty-token connection should be rejected")
+		return strings.Contains(logBuffer.String(), "accept: rejected connection")
+	}, "empty-token connection should produce a rejection log entry")
+	if got := sessionCount(o); got != 0 {
+		t.Fatalf("sessionCount after reject = %d, want 0", got)
+	}
 }
 
 func TestAcceptLoop_RejectUnknownToken(t *testing.T) {
-	o, socketPath := newTokenHandshakeOwner(t, nil)
+	var logBuffer safeBuffer
+	logger := log.New(&logBuffer, "", 0)
+	o, socketPath := newTokenHandshakeOwner(t, logger)
 
 	conn := connectWithToken(t, socketPath, "cafebabe")
 	conn.Close()
 
 	waitForCondition(t, 200*time.Millisecond, func() bool {
-		return sessionCount(o) == 0
-	}, "unknown-token connection should be rejected")
+		return strings.Contains(logBuffer.String(), "accept: rejected connection")
+	}, "unknown-token connection should produce a rejection log entry")
+	if got := sessionCount(o); got != 0 {
+		t.Fatalf("sessionCount after reject = %d, want 0", got)
+	}
 }
 
 func TestAcceptLoop_AcceptPreRegisteredToken(t *testing.T) {
