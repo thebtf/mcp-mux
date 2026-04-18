@@ -251,8 +251,10 @@ FR-9 (original spec, deferred and never implemented) is **superseded** by FR-29 
 | `muxcore/sockperm/sockperm_unix.go` | `//go:build unix` — package-level `sync.Mutex` serializes `syscall.Umask(0177)` + `net.Listen` + restore-umask. Comment documents the umask race that motivates the mutex. |
 | `muxcore/sockperm/sockperm_windows.go` | `//go:build windows` — no-op wrapper. **MANDATORY** package-level doc comment (per C5) citing Windows 10 1803+ AF_UNIX default DACL behavior verbatim. |
 | `muxcore/sockperm/sockperm_unix_test.go` | `//go:build unix` — 3 test cases per T6.8 (single, 50-concurrent race, umask-restored). |
-| `muxcore/owner/peer_pid_unix.go` | `//go:build unix` — `readPeerPID(conn net.Conn) int` via `SO_PEERCRED` (`syscall.Ucred`). |
-| `muxcore/owner/peer_pid_windows.go` | `//go:build windows` — stub returning `-1`. |
+| `muxcore/owner/peer_pid_linux.go` | `//go:build linux` — `readPeerPID(conn net.Conn) int` via `SO_PEERCRED` (`syscall.Ucred`). Linux-only — `Ucred` type and `SO_PEERCRED` sockopt are Linux-specific. |
+| `muxcore/owner/peer_pid_darwin.go` | `//go:build darwin` — stub returning `-1`. macOS uses `LOCAL_PEERCRED` (different API via `getsockopt` with `xucred` struct) which is out of scope for this amendment; rejection log reads `pid=-1` on macOS. |
+| `muxcore/owner/peer_pid_other_unix.go` | `//go:build unix && !linux && !darwin` — stub returning `-1` for FreeBSD/OpenBSD/etc. Same rationale as darwin. |
+| `muxcore/owner/peer_pid_windows.go` | `//go:build windows` — stub returning `-1`. No `SO_PEERCRED` equivalent. |
 | `muxcore/owner/rejection_logger.go` | `rejectionLogger` struct — 10-entry ring buffer + mutex + 60s summary ticker (C4). |
 | `muxcore/owner/accept_loop_test.go` | 4 table cases + concurrent race case + rate-limit case (T6.5). |
 

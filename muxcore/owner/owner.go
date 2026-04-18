@@ -1649,9 +1649,12 @@ func (o *Owner) acceptLoop() {
 			// In that edge case, reject the connection instead of adding a
 			// session with no Cwd (which would produce invalid project routing).
 			if !o.sessionMgr.Bind(token, s) {
+				// Token was swept by SweepExpiredPending (TTL) or consumed by a
+				// concurrent shim between IsPreRegistered and Bind. Counted +
+				// logged by rejectionLogger.Log; do not emit a second direct
+				// Printf — that would bypass the 10/min/owner rate limit.
 				peerPID := readPeerPID(conn)
 				o.rejectionLogger.Log(o.logger, peerPID)
-				o.logger.Printf("accept: token expired between pre-check and bind (pid=%d)", peerPID)
 				s.Close()
 				continue
 			}
