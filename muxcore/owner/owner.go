@@ -1117,13 +1117,18 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	// Atomically claim the inflight entry. If the watchdog claimed it first,
 	// the timedOutIDs check above would have caught it — but we double-check
 	// via LoadAndDelete here to handle any concurrent claim race safely.
-	if _, claimed := o.inflightTracker.LoadAndDelete(string(msg.ID)); !claimed {
-		// Inflight already gone — either watchdog claimed it between checks,
-		// or this is a proactive/untracked response (mux-init-0, mux-init-1).
-		// Still process cache + routing because proactive responses aren't
-		// tracked in inflight but DO need caching.
+	//
+	// decrementPending is conditional: only decrement if we successfully claimed
+	// the inflight entry, OR if this is a proactive ID (mux-init-0/1) which is
+	// never stored in inflightTracker but always has a corresponding Add(1).
+	// If !claimed and not proactive, the watchdog already claimed and decremented
+	// — calling decrementPending here would cause a double-decrement that drives
+	// pendingRequests below the true in-flight count, causing HandleShutdown to
+	// drain too early and tear down while real requests are still outstanding.
+	_, claimed := o.inflightTracker.LoadAndDelete(string(msg.ID))
+	if claimed || isProactiveID(msg.ID) {
+		o.decrementPending()
 	}
-	o.decrementPending()
 	o.sessionMgr.CompleteRequest(string(msg.ID))
 
 	// Clean up any progress tokens registered for this request (FIX 1).
@@ -1753,8 +1758,15 @@ func (o *Owner) drainInflightRequests() {
 		if writeErr := session.WriteRaw([]byte(errResp)); writeErr != nil {
 			o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
 		}
-		o.decrementPending()
-		o.inflightTracker.Delete(entry.RemappedID)
+		// Use LoadAndDelete to atomically claim the inflightTracker entry.
+		// If the watchdog already claimed it (LoadAndDelete returns false), skip
+		// the decrement — the watchdog already decremented. Without this guard a
+		// concurrent watchdog timeout during upstream teardown causes a
+		// double-decrement that drives pendingRequests below the real in-flight
+		// count, making HandleShutdown drain too early.
+		if _, claimed := o.inflightTracker.LoadAndDelete(entry.RemappedID); claimed {
+			o.decrementPending()
+		}
 	}
 }
 

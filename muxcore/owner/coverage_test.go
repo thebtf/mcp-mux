@@ -1210,6 +1210,11 @@ func TestDrainInflightRequests_SendsError(t *testing.T) {
 	// Remap format for numeric id: "s{N}:n:42"
 	remappedStr := fmt.Sprintf("s%d:n:42", s.ID)
 	o.sessionMgr.TrackRequest(remappedStr, s.ID)
+	// Also store in inflightTracker — drainInflightRequests now uses
+	// LoadAndDelete on inflightTracker to guard against watchdog double-decrement.
+	// Without this entry the drain skips the decrement (correct: watchdog would
+	// have already claimed it), so the test must mirror the real request path.
+	o.inflightTracker.Store(remappedStr, &InflightRequest{Method: "tools/call", SessionID: s.ID})
 	o.pendingRequests.Add(1)
 
 	// Call drain
@@ -1228,6 +1233,41 @@ func TestDrainInflightRequests_SendsError(t *testing.T) {
 	}
 	if o.pendingRequests.Load() != 0 {
 		t.Errorf("drainInflightRequests: pendingRequests = %d, want 0", o.pendingRequests.Load())
+	}
+}
+
+// TestDrainInflightRequests_WatchdogClaimedNoDoubleDecrement verifies that
+// drainInflightRequests does not double-decrement pendingRequests when the
+// watchdog has already claimed an inflight entry (LoadAndDelete on
+// inflightTracker returns false). The counter must stay at 1 — the watchdog
+// path is responsible for the decrement in that case.
+func TestDrainInflightRequests_WatchdogClaimedNoDoubleDecrement(t *testing.T) {
+	o := newMinimalOwner()
+	o.sessionMgr = NewSessionManager()
+
+	var buf safeBuf
+	s := NewSession(strings.NewReader(""), &buf)
+
+	o.mu.Lock()
+	o.sessions[s.ID] = s
+	o.mu.Unlock()
+	o.sessionMgr.RegisterSession(s, "")
+
+	remappedStr := fmt.Sprintf("s%d:n:99", s.ID)
+	o.sessionMgr.TrackRequest(remappedStr, s.ID)
+	// Simulate watchdog already claimed: inflightTracker has NO entry for this ID.
+	// pendingRequests is at 1 — the watchdog owns the decrement.
+	o.pendingRequests.Add(1)
+
+	// drain should see the session-manager entry but skip the decrement because
+	// inflightTracker.LoadAndDelete returns false.
+	o.drainInflightRequests()
+
+	// Counter must remain 1: the watchdog has not decremented yet in this
+	// simulated scenario (or will decrement independently). The important
+	// invariant is that drain does NOT touch it when it cannot claim the entry.
+	if got := o.pendingRequests.Load(); got != 1 {
+		t.Errorf("double-decrement guard failed: pendingRequests = %d, want 1 (watchdog owns the decrement)", got)
 	}
 }
 
