@@ -31,7 +31,7 @@
 - [x] T005 [P] [EXECUTOR: sonnet] Implement termination-cause classifier in `muxcore/daemon/termination.go`
   AC: `classifyTermination(suture.Event) TerminationCause` returns one of {PlannedHandoff, UpstreamCrash, OperatorStop, IdleEviction, DaemonPanic} · distinguishes clean exit (ErrDoNotRestart or nil err) from crash (non-nil non-ErrDoNotRestart err) · 5 unit tests covering each class · swap body→return null ⇒ tests MUST fail
 
-- [ ] T006 [EXECUTOR: sonnet] Platform-agnostic handoff state machine skeleton in `muxcore/daemon/handoff.go`
+- [x] T006 [EXECUTOR: sonnet] Platform-agnostic handoff state machine skeleton in `muxcore/daemon/handoff.go`
   AC: `performHandoff(ctx, socketPath, tokenPath) (HandoffResult, error)` + `receiveHandoff(ctx, socketPath, tokenPath) ([]string, error)` compile with platform FD-send/recv stubbed via interface `fdConn` · interface methods: `SendFDs`, `RecvFDs`, `WriteJSON`, `ReadJSON` · stub impl returns `errors.New("not implemented on this platform")` · 3 unit tests using mock fdConn: hello/ready/transfer sequence, version reject, token reject · swap body→return null ⇒ tests MUST fail
 
 - [ ] T007 [EXECUTOR: sonnet] Handoff token handshake in `muxcore/daemon/handoff.go` reusing FR-28 primitives
@@ -237,6 +237,7 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
 
 
 
