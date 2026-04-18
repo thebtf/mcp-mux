@@ -29,7 +29,18 @@ All items from the 2026-04-08 debt batch have been resolved:
 
 ## Open items
 
-(none)
+### 2026-04-18: FLAKE-UBUNTU-CI-TestOwnerMultipleSessions
+
+**What:** `TestOwnerMultipleSessions` in `muxcore/owner/mux_test.go` times out at 30s consistently on ubuntu-latest in CI. Passes locally on Windows in 0.4s and on macOS CI every run.
+
+**Why deferred:** Cannot reproduce locally on Windows; fixing requires investigation on a Linux environment. Not tied to any recent change — the flake was visible on PR #65/#66/#67 master-push CI (same test, same 30s timeout). Does not affect production correctness; it only blocks green-CI-on-push.
+
+**Impact:** Every merge-to-master CI run is red on ubuntu-latest. Masks any real Ubuntu-specific regression that might land next. Accumulates noise in the run history.
+
+**Context:** Test uses `go run ../../testdata/mock_server.go` which spawns a subprocess. Suspect: subprocess cold-start timing on Linux CI runners under concurrent test load + the PR #67 drain-goroutine changes interacting with `go run` compile cache timing. First concrete failure: CI run 24592642184 (v0.19.4-era). Most recent: 24606721806 (PR #68).
+
+**Suggested fix path:** (1) Reproduce in a Linux Docker container locally, (2) add explicit sync in the test to wait for upstream readiness before sending requests, (3) or split the test into Windows/Linux variants with longer timeout on Linux.
+
 
 <!--
 Resolved items are not tracked in this file; see git history + GH releases for audit trail.
