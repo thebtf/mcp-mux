@@ -57,17 +57,21 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.19.3)
+## muxcore Library API (v0.20.4)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
+go get github.com/thebtf/mcp-mux/muxcore@v0.20.4
 ```
 
-v0.19.3 is a concurrency-correctness release on top of v0.19.2. Fixes 7
-post-audit findings (4 P1 blockers + 3 P2 High). No API changes — zero
-consumer code modifications required. Drop-in upgrade.
+v0.20.4 is the multi-user hardening release on top of v0.20.3. Closes the
+2 HIGH security findings from the 2026-04-18 PRC audit (S8-001 token
+handshake enforcement, S5-001 Unix socket 0600 permissions). Ships FR-28
+and FR-29 from the post-audit-remediation spec amendment. No breaking API
+changes — two additive exports (`muxcore.ListenUnix`, `SessionManager.IsPreRegistered`).
+
+For historical v0.19.3 concurrency fixes, see [muxcore/v0.19.3 release notes](https://github.com/thebtf/mcp-mux/releases/tag/muxcore%2Fv0.19.3).
 
 | Fix | Where | Severity |
 |-----|-------|----------|
