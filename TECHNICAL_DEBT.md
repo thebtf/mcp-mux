@@ -23,10 +23,18 @@ All items from the 2026-04-08 debt batch have been resolved:
 
 ---
 
+## In progress
+
+(none)
+
 ## Open items
 
+(none)
+
+## Recently resolved
+
 ### 2026-04-18: `upstream.Start` Wait-vs-ReadLine race (muxcore/upstream)
-**Status: FIXED** — branch `fix/upstream-drain-race`.
 
-**Fix:** Replaced direct-from-pipe `bufio.Scanner` with an internal `lineBuffer` (mutex + cond-var protected deque). A drain goroutine reads all stdout lines into the buffer before the pipe closes. `ReadLine()` reads from the buffer, not the OS pipe. `cmd.Wait()` no longer races with our scanner because we no longer read from the pipe in `ReadLine`. Regression test `TestStart_FastExitPreservesStdout` added.
+**Status:** FIXED in PR #67 (squash commit `30d6314`).
 
+**Fix:** Replaced direct-from-pipe `bufio.Scanner` with an internal `lineBuffer` (mutex + cond-var protected deque). A drain goroutine reads all stdout lines into the buffer before the pipe closes. `ReadLine()` reads from the buffer, not the OS pipe. `cmd.Wait()` no longer races with our scanner because we no longer read from the pipe in `ReadLine`. Followup commits on the same PR added explicit `os.Pipe()` for stdout ownership, drain-goroutine synchronization via `stdoutDrained`/`stderrDrained` channels before `proc.Wait()`, FD-leak close on the pipe read end, and a race fix for unlocked `o.classificationSource` read in `classifyFromToolList`. Regression test `TestStart_FastExitPreservesStdout`.

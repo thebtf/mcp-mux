@@ -69,25 +69,25 @@
 **Goal:** OnProjectConnect/Disconnect hooks, NotificationHandler, Notifier for targeted delivery.
 **Independent Test:** Handler logs connect/disconnect events in order. Handler sends notification to one session, only that session receives it.
 
-- [ ] T012 [US2] Implement OnProjectConnect call in Owner session accept path
+- [x] T012 [US2] Implement OnProjectConnect call in Owner session accept path
   AC: after IPC handshake in session accept loop → if handler.(ProjectLifecycle) → call OnProjectConnect(ProjectContext) · called once per session · swap body→return null ⇒ tests MUST fail
 
-- [ ] T013 [US2] Implement OnProjectDisconnect call in Owner removeSession path
+- [x] T013 [US2] Implement OnProjectDisconnect call in Owner removeSession path
   AC: in removeSession (existing cleanup) → if handler.(ProjectLifecycle) → call OnProjectDisconnect(projectID) · called with same ID as OnProjectConnect · called exactly once per session · swap body→return null ⇒ tests MUST fail
 
-- [ ] T014 [US3] Implement ownerNotifier struct in muxcore/owner/owner.go
+- [x] T014 [US3] Implement ownerNotifier struct in muxcore/owner/owner.go
   AC: implements Notifier interface · Notify(projectID, data): lookup session by project ID → write to IPC, return error if not found · Broadcast(data): write to all sessions · swap body→return null ⇒ tests MUST fail
 
-- [ ] T015 [US3] Wire SetNotifier in Owner construction
+- [x] T015 [US3] Wire SetNotifier in Owner construction
   AC: in NewOwner/NewOwnerFromSnapshot: if handler.(NotifierAware) → call SetNotifier(ownerNotifier) · called once at startup · swap body→return null ⇒ tests MUST fail
 
-- [ ] T016 [US2] Implement NotificationHandler dispatch in Owner
+- [x] T016 [US2] Implement NotificationHandler dispatch in Owner
   AC: in handleSessionRequest notification branch: if handler.(NotificationHandler) → call HandleNotification(ctx, ProjectContext, notification) · handlers that don't implement it → Owner handles cancelled internally, drops others · swap body→return null ⇒ tests MUST fail
 
-- [ ] T017 [US2][US3] Tests for lifecycle and notifications
+- [x] T017 [US2][US3] Tests for lifecycle and notifications
   AC: TestOnProjectConnect_CalledOnSessionJoin · TestOnProjectDisconnect_CalledOnSessionLeave · TestOnProjectDisconnect_SameIDAConnect · TestNotifier_TargetedDelivery (notify session A, session B doesn't receive) · TestNotifier_InvalidProjectID_ReturnsError · TestNotifier_Broadcast · TestNotificationHandler_Cancelled · 7+ tests · swap body→return null ⇒ tests MUST fail
 
-- [ ] G003 VERIFY Phase 3 (T012–T017) — BLOCKED until T012–T017 all [x]
+- [x] G003 VERIFY Phase 3 (T012–T017) — BLOCKED until T012–T017 all [x]
   RUN: `go test -count=1 ./muxcore/owner/...`. Code review on lifecycle and notification changes.
   CHECK: Connect before first request. Disconnect after last. Notify to disconnected → error. Concurrent safe.
   ENFORCE: Zero stubs. Zero TODOs. Independent test passes.
@@ -150,16 +150,16 @@
 
 ## Phase 6: Polish
 
-- [ ] T025 Benchmark SessionHandler dispatch vs pipe path in muxcore/owner/bench_test.go
+- [x] T025 Benchmark SessionHandler dispatch vs pipe path in muxcore/owner/bench_test.go
   AC: BenchmarkDispatchPipe (legacy Handler) · BenchmarkDispatchSessionHandler (new path) · SessionHandler path no slower than pipe · results documented in PR description · swap body→return null ⇒ tests MUST fail
 
-- [ ] T026 Update AGENTS.md with SessionHandler API documentation
+- [x] T026 Update AGENTS.md with SessionHandler API documentation
   AC: ProjectContext, SessionHandler, optional interfaces documented · migration guide from Handler to SessionHandler · consumer example code
 
-- [ ] T027 Update .agent/CONTINUITY.md with new version state
+- [x] T027 Update .agent/CONTINUITY.md with new version state
   AC: muxcore consumer API section updated with SessionHandler example · version bumped
 
-- [ ] G006 VERIFY Phase 6 (T025–T027) — BLOCKED until T025–T027 all [x]
+- [x] G006 VERIFY Phase 6 (T025–T027) — BLOCKED until T025–T027 all [x]
   RUN: Read docs, verify accuracy against implemented code.
   CHECK: Examples compile. Migration guide is correct.
   RESOLVE: Fix inaccuracies.
