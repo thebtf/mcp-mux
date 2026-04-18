@@ -80,17 +80,12 @@ func TestRejectionLogger_RateLimit(t *testing.T) {
 }
 
 func TestRejectionLogger_Summary(t *testing.T) {
-	origTicker := rejectionLoggerNewTicker
-	rejectionLoggerNewTicker = func(time.Duration) *time.Ticker {
-		return time.NewTicker(10 * time.Millisecond)
-	}
-	defer func() {
-		rejectionLoggerNewTicker = origTicker
-	}()
-
 	var buf safeBuffer
 	logger := log.New(&buf, "", 0)
-	rl := newRejectionLogger(logger)
+	// Use a 10ms summary interval so the test runs quickly. Injected as a
+	// constructor parameter (not a global swap) so -race does not flag the
+	// summaryLoop goroutine reading a value being mutated by the test thread.
+	rl := newRejectionLoggerWithInterval(logger, 10*time.Millisecond)
 	defer rl.Close()
 
 	for i := 0; i < 15; i++ {

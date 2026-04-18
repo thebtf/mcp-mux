@@ -9,18 +9,30 @@ import (
 // rejectionLogger rate-limits per-rejection log entries (C4: max 10 per 60s window).
 // The rejection itself is never rate-limited — only the log emission.
 type rejectionLogger struct {
-	mu         sync.Mutex
-	timestamps [10]time.Time // ring buffer of the last 10 logged rejections
-	pos        int           // next write position in ring buffer
-	suppressed int64         // count of suppressed entries since last summary
-	done       chan struct{}
+	mu              sync.Mutex
+	timestamps      [10]time.Time // ring buffer of the last 10 logged rejections
+	pos             int           // next write position in ring buffer
+	suppressed      int64         // count of suppressed entries since last summary
+	done            chan struct{}
+	closeOnce       sync.Once     // ensures Close is idempotent (double-close cannot panic)
+	summaryInterval time.Duration // cadence for summary line; 60s in prod, fast in tests
 }
 
-var rejectionLoggerNewTicker = time.NewTicker
+// summaryInterval is the cadence at which the rejection logger emits a
+// "N rejections suppressed" summary line when the per-minute cap has been hit.
+// Exposed as a parameter (not a package global) so tests can accelerate it
+// without racing against the summaryLoop goroutine — the previous global-swap
+// pattern tripped -race on Windows/Linux CI.
+const defaultRejectionSummaryInterval = 60 * time.Second
 
 func newRejectionLogger(logger *log.Logger) *rejectionLogger {
+	return newRejectionLoggerWithInterval(logger, defaultRejectionSummaryInterval)
+}
+
+func newRejectionLoggerWithInterval(logger *log.Logger, interval time.Duration) *rejectionLogger {
 	rl := &rejectionLogger{
-		done: make(chan struct{}),
+		done:            make(chan struct{}),
+		summaryInterval: interval,
 	}
 	go rl.summaryLoop(logger)
 	return rl
@@ -51,12 +63,15 @@ func (rl *rejectionLogger) Log(logger *log.Logger, pid int) {
 }
 
 // Close stops the background summary goroutine.
+// Safe to call multiple times — subsequent calls are no-ops.
 func (rl *rejectionLogger) Close() {
-	close(rl.done)
+	rl.closeOnce.Do(func() {
+		close(rl.done)
+	})
 }
 
 func (rl *rejectionLogger) summaryLoop(logger *log.Logger) {
-	ticker := rejectionLoggerNewTicker(60 * time.Second)
+	ticker := time.NewTicker(rl.summaryInterval)
 	defer ticker.Stop()
 	for {
 		select {
