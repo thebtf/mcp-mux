@@ -731,12 +731,14 @@ func sendReq(t *testing.T, w io.Writer, id int, method, params string) {
 }
 
 // readRespTimeout is the per-response deadline for pipe-based owner tests.
-// 30s was the historical value. The 90s headroom is a safety net on top of
+// 30s was the historical value. The 180s headroom is a safety net on top of
 // the TestMain pre-build (see main_test.go): pre-building mock_server once
 // already eliminates the dominant per-test `go run` compile latency, but
-// extra margin protects against CI scheduler pauses, GC stalls, and other
-// non-compile slow paths. Happy-path readResp still finishes in <1s.
-const readRespTimeout = 90 * time.Second
+// extra margin protects against CI scheduler pauses, GC stalls, and coverage
+// instrumentation overhead (observed on ubuntu-latest coverage job where
+// instrumented mock_server runs + concurrent test parallelism pushed a single
+// readResp past 90s). Happy-path readResp still finishes in <1s.
+const readRespTimeout = 180 * time.Second
 
 // scanResult carries the outcome of one scanner.Scan() invocation into the
 // select loop below. Capturing the error separately lets the helper fail
