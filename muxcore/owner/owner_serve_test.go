@@ -82,10 +82,15 @@ func TestOwnerServe_BlocksUntilCancel(t *testing.T) {
 	}
 }
 
-// TestOwnerServe_ReturnsNilOnCleanShutdown verifies that if Shutdown
-// is called externally while Serve is waiting, Serve returns nil —
-// telling suture not to restart.
-func TestOwnerServe_ReturnsNilOnCleanShutdown(t *testing.T) {
+// TestOwnerServe_ReturnsErrDoNotRestartOnCleanShutdown verifies that if
+// Shutdown is called externally while Serve is waiting, Serve returns
+// suture.ErrDoNotRestart — the correct signal for "permanently done, do
+// not restart AND do not emit a clean-exit event". Returning nil here
+// used to make suture schedule a restart AND fire a clean-exit hook,
+// which triggered supervisorEventHook → cleanupDeadOwner → destruction
+// of any fresh replacement Owner at the same server ID, reproducing as
+// a tight restart-loop on mcp-mux upgrade --restart.
+func TestOwnerServe_ReturnsErrDoNotRestartOnCleanShutdown(t *testing.T) {
 	o := newMinimalOwner()
 	o.controlServer = nil
 	o.upstream = mockLiveUpstream() // prevent early return from upstream-dead path
@@ -98,13 +103,13 @@ func TestOwnerServe_ReturnsNilOnCleanShutdown(t *testing.T) {
 	// Give Serve time to enter blocking select
 	time.Sleep(50 * time.Millisecond)
 
-	// Call Shutdown — closes o.done, Serve returns nil
+	// Call Shutdown — closes o.done, Serve returns suture.ErrDoNotRestart.
 	o.Shutdown()
 
 	select {
 	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Serve after Shutdown returned %v, want nil", err)
+		if !errors.Is(err, suture.ErrDoNotRestart) {
+			t.Errorf("Serve after Shutdown returned %v, want suture.ErrDoNotRestart", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Serve did not return after Shutdown")

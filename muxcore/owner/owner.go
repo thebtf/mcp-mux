@@ -1866,7 +1866,10 @@ func (o *Owner) Serve(ctx context.Context) error {
 			o.Shutdown()
 			return ctx.Err()
 		case <-o.done:
-			return nil
+			// Owner already shut down — tell suture not to restart and do not
+			// emit a clean-exit event that would trigger cleanupDeadOwner on a
+			// freshly-spawned replacement at the same server ID.
+			return suture.ErrDoNotRestart
 		}
 	}
 
@@ -1883,7 +1886,7 @@ func (o *Owner) Serve(ctx context.Context) error {
 		// would return error → suture restart → immediate return → tight CPU spin.
 		select {
 		case <-o.done:
-			return nil // owner already shut down — clean exit, no restart
+			return suture.ErrDoNotRestart // owner already shut down — tell suture not to restart
 		default:
 		}
 		select {
@@ -1913,8 +1916,8 @@ func (o *Owner) Serve(ctx context.Context) error {
 			o.Shutdown()
 			return ctx.Err()
 		case <-o.done:
-			// Owner already shut down cleanly (external Shutdown call, mux_stop, etc.)
-			return nil
+			// Owner already shut down — tell suture not to restart, do not emit clean-exit event
+			return suture.ErrDoNotRestart
 		case <-deadCh:
 			// Same logic as the non-blocking check above.
 			o.mu.RLock()

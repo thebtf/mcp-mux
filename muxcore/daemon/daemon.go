@@ -254,11 +254,20 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 			// when many idle owners torn down after compaction or CC
 			// session close. Differentiate the log so operators can
 			// distinguish real failures from routine teardown.
-			if e.Err == nil {
-				d.logger.Printf("supervisor: service %q clean exit — removing registry entry", e.ServiceName)
-			} else {
-				d.logger.Printf("supervisor: service %q permanently failed (%v) — cleaning up zombie owner", e.ServiceName, e.Err)
+			// suture v4 types EventServiceTerminate.Err as interface{}, so
+			// errors.Is requires a type-assertion first.
+			errVal, _ := e.Err.(error)
+			if e.Err == nil || errors.Is(errVal, suture.ErrDoNotRestart) {
+				// Clean exit or controlled shutdown: onUpstreamExit/Remove already deleted the registry entry.
+				// Calling cleanupDeadOwner here would destroy a freshly-spawned replacement
+				// at the same server ID — the root cause of the supervisor restart-loop storm.
+				// Skip cleanup entirely; the entry is already gone or owned by a live replacement.
+				// ErrDoNotRestart is non-nil but is returned by Serve() when o.done is already closed
+				// (the double-death case), so it must be treated the same as a clean exit here.
+				d.logger.Printf("supervisor: service %q clean exit — no cleanup needed", e.ServiceName)
+				return
 			}
+			d.logger.Printf("supervisor: service %q permanently failed (%v) — cleaning up zombie owner", e.ServiceName, e.Err)
 			go d.cleanupDeadOwner(e.ServiceName)
 		}
 	case suture.EventBackoff:

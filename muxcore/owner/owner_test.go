@@ -2,6 +2,7 @@ package owner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thejerf/suture/v4"
 )
 
 // TestDecrementPending_ClampsAtZero is a regression test for the cosmetic bug
@@ -180,8 +182,10 @@ func TestNewOwner_SessionHandlerOnly_NoUpstream(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestServe_SessionHandlerOnly_BlocksUntilDone verifies that Serve blocks
-// (does not return immediately) on a SessionHandler-only owner, returns nil
-// on Shutdown(), and completes quickly without stuck goroutines.
+// (does not return immediately) on a SessionHandler-only owner, returns
+// suture.ErrDoNotRestart on Shutdown() (not nil — a nil return would emit a
+// clean-exit event that triggers cleanupDeadOwner and destroys any freshly-
+// spawned replacement at the same server ID), and completes quickly.
 func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
@@ -214,13 +218,16 @@ func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 
 	start := time.Now()
 
-	// Call Shutdown — Serve should return nil (clean exit, no restart).
+	// Call Shutdown — Serve should return ErrDoNotRestart (not nil).
+	// Returning nil would emit a clean-exit event that triggers cleanupDeadOwner,
+	// which can destroy a freshly-spawned replacement at the same server ID —
+	// the root cause of the supervisor restart-loop storm.
 	o.Shutdown()
 
 	select {
 	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Serve returned %v after Shutdown, want nil", err)
+		if !errors.Is(err, suture.ErrDoNotRestart) {
+			t.Errorf("Serve returned %v after Shutdown, want suture.ErrDoNotRestart", err)
 		}
 		elapsed := time.Since(start)
 		if elapsed > 200*time.Millisecond {
@@ -236,5 +243,45 @@ func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 		// Expected
 	case <-time.After(500 * time.Millisecond):
 		t.Error("done channel not closed after Shutdown")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T010: TestServe_ReturnsErrDoNotRestartAfterShutdown
+// ---------------------------------------------------------------------------
+
+// TestServe_ReturnsErrDoNotRestartAfterShutdown is the regression test for the
+// supervisor restart-loop storm (see .agent/reports/2026-04-18-supervisor-restart-loop.md).
+//
+// Root cause: when suture retried Serve() on an already-shut-down owner, the
+// early guard returned nil ("clean exit"), causing suture to fire a
+// EventServiceTerminate{Err:nil} event. supervisorEventHook then called
+// cleanupDeadOwner unconditionally, which destroyed any freshly-spawned
+// replacement owner at the same server ID. The fix: return
+// suture.ErrDoNotRestart instead of nil, so suture stops cycling the owner
+// without emitting a clean-exit event.
+//
+// This test verifies that calling Serve() on an owner whose done channel is
+// already closed returns suture.ErrDoNotRestart (not nil).
+func TestServe_ReturnsErrDoNotRestartAfterShutdown(t *testing.T) {
+	// Create a minimal owner with only the done channel initialized.
+	// The main for-loop in Serve() hits the non-blocking done guard first,
+	// so no upstream, listener, or sessions are needed.
+	o := &Owner{
+		done: make(chan struct{}),
+	}
+	// Simulate a Shutdown() call — close done without going through the full
+	// Shutdown() method, which requires a properly initialized owner.
+	close(o.done)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	got := o.Serve(ctx)
+
+	// Pre-fix: returned nil (clean exit) → triggered cleanupDeadOwner storm.
+	// Post-fix: returns ErrDoNotRestart → suture stops cycling, no cleanup event.
+	if got != suture.ErrDoNotRestart {
+		t.Errorf("Serve on shut-down owner returned %v, want suture.ErrDoNotRestart", got)
 	}
 }
