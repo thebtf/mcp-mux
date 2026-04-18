@@ -2,8 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 // fdConn abstracts over platform-specific FD transfer channels (Unix socket
@@ -198,4 +202,58 @@ func receiveHandoff(ctx context.Context, conn fdConn, token string) (received []
 		return nil, fmt.Errorf("receiveHandoff: send handoff_ack: %w", err)
 	}
 	return received, nil
+}
+
+// writeHandoffToken generates a 128-bit handoff token and writes it to
+// {dir}/mcp-mux-handoff.tok with 0600 perms. Returns (token, path, err).
+// The caller MUST delete the file after the handoff window closes —
+// use deleteHandoffToken for idempotent cleanup.
+func writeHandoffToken(dir string) (token string, path string, err error) {
+	token, err = generateToken()
+	if err != nil {
+		return "", "", fmt.Errorf("handoff: generate token: %w", err)
+	}
+	path = filepath.Join(dir, "mcp-mux-handoff.tok")
+	// os.WriteFile with 0600 perm. On Windows the perm is advisory;
+	// matches the existing daemon token discipline.
+	if err := os.WriteFile(path, []byte(token), 0600); err != nil {
+		return "", "", fmt.Errorf("handoff: write token to %s: %w", path, err)
+	}
+	return token, path, nil
+}
+
+// readHandoffToken reads a previously written handoff token.
+func readHandoffToken(path string) (token string, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("handoff: read token: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// deleteHandoffToken removes the token file if it exists. Idempotent —
+// missing file is NOT an error. Call from defer in performHandoff.
+func deleteHandoffToken(path string) error {
+	err := os.Remove(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("handoff: delete token: %w", err)
+	}
+	return nil
+}
+
+// verifyHandoffToken reads a HelloMsg from conn, validates the protocol
+// version, then constant-time compares the token. Returns
+// ErrProtocolVersionMismatch OR ErrTokenMismatch on failure.
+func verifyHandoffToken(conn fdConn, expected string) error {
+	var hello HelloMsg
+	if err := conn.ReadJSON(&hello); err != nil {
+		return fmt.Errorf("handoff: read hello: %w", err)
+	}
+	if err := validateProtocolVersion(hello.ProtocolVersion); err != nil {
+		return err
+	}
+	if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(expected)) != 1 {
+		return ErrTokenMismatch
+	}
+	return nil
 }
