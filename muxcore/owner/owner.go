@@ -1866,7 +1866,10 @@ func (o *Owner) Serve(ctx context.Context) error {
 			o.Shutdown()
 			return ctx.Err()
 		case <-o.done:
-			return nil
+			// Owner already shut down — tell suture not to restart and do not
+			// emit a clean-exit event that would trigger cleanupDeadOwner on a
+			// freshly-spawned replacement at the same server ID.
+			return suture.ErrDoNotRestart
 		}
 	}
 

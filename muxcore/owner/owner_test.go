@@ -2,6 +2,7 @@ package owner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -181,8 +182,10 @@ func TestNewOwner_SessionHandlerOnly_NoUpstream(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestServe_SessionHandlerOnly_BlocksUntilDone verifies that Serve blocks
-// (does not return immediately) on a SessionHandler-only owner, returns nil
-// on Shutdown(), and completes quickly without stuck goroutines.
+// (does not return immediately) on a SessionHandler-only owner, returns
+// suture.ErrDoNotRestart on Shutdown() (not nil — a nil return would emit a
+// clean-exit event that triggers cleanupDeadOwner and destroys any freshly-
+// spawned replacement at the same server ID), and completes quickly.
 func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
@@ -215,13 +218,16 @@ func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 
 	start := time.Now()
 
-	// Call Shutdown — Serve should return nil (clean exit, no restart).
+	// Call Shutdown — Serve should return ErrDoNotRestart (not nil).
+	// Returning nil would emit a clean-exit event that triggers cleanupDeadOwner,
+	// which can destroy a freshly-spawned replacement at the same server ID —
+	// the root cause of the supervisor restart-loop storm.
 	o.Shutdown()
 
 	select {
 	case err := <-errCh:
-		if err != nil {
-			t.Errorf("Serve returned %v after Shutdown, want nil", err)
+		if !errors.Is(err, suture.ErrDoNotRestart) {
+			t.Errorf("Serve returned %v after Shutdown, want suture.ErrDoNotRestart", err)
 		}
 		elapsed := time.Since(start)
 		if elapsed > 200*time.Millisecond {
