@@ -96,6 +96,14 @@ type Process struct {
 	stderr     io.ReadCloser
 	stdinFile  *os.File // raw OS file for Detach; nil for handler-based processes
 	stdoutFile *os.File // raw OS file for Detach; nil for handler-based processes
+	// stdinFD / stdoutFD cache the OS file descriptors captured ONCE at
+	// PreStart time — before any reader/writer goroutine touches the File
+	// objects. Calling (*os.File).Fd() from Detach() at runtime would race
+	// with the spawn goroutine's internal reads/writes on the same file
+	// (observed on CI ubuntu -race: TestDetach_DoubleDetach). Caching at
+	// spawn time eliminates the race.
+	stdinFD  uintptr
+	stdoutFD uintptr
 
 	lineBuf *lineBuffer
 
@@ -196,8 +204,10 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 			// on all supported platforms; the type assertion is defensive.
 			if f, ok := stdin.(*os.File); ok {
 				p.stdinFile = f
+				p.stdinFD = f.Fd() // cache pre-goroutine (NFR-5, race-safe)
 			}
 			p.stdoutFile = stdoutR
+			p.stdoutFD = stdoutR.Fd() // cache pre-goroutine (race-safe)
 			return nil
 		},
 	}
@@ -414,11 +424,15 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 
 	pid = p.proc.PID()
 
+	// Return cached FDs (captured in PreStart, race-safe). Calling
+	// (*os.File).Fd() here would race with the spawn goroutines' Read/Write
+	// on the same file objects — observed on ubuntu -race as a data race
+	// between os.(*File).fd() and os.(*File).Fd() in TestDetach_DoubleDetach.
 	if p.stdinFile != nil {
-		stdinFD = p.stdinFile.Fd()
+		stdinFD = p.stdinFD
 	}
 	if p.stdoutFile != nil {
-		stdoutFD = p.stdoutFile.Fd()
+		stdoutFD = p.stdoutFD
 	}
 
 	return pid, stdinFD, stdoutFD, nil
