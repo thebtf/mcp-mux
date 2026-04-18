@@ -16,7 +16,7 @@
 
 ## Phase 1: Foundation (platform-agnostic)
 
-- [ ] T001 [EXECUTOR: sonnet] Add `Detach() (pid int, stdin, stdout uintptr, err error)` to `muxcore/upstream/process.go`
+- [x] T001 [EXECUTOR: sonnet] Add `Detach() (pid int, stdin, stdout uintptr, err error)` to `muxcore/upstream/process.go`
   AC: method returns valid FDs without invoking `GracefulKill` · sets `p.detached = true` to prevent subsequent `Close()` from signaling · returns error if already closed OR already detached · 3 unit tests (happy path / double-detach / detach-after-close) in `process_test.go` · swap body→return null ⇒ tests MUST fail
 
 - [ ] T002 [EXECUTOR: sonnet] Add `ShutdownForHandoff() (HandoffPayload, error)` to `muxcore/owner/owner.go`
@@ -237,5 +237,6 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
 
 
