@@ -37,7 +37,7 @@
 - [x] T007 [EXECUTOR: sonnet] Handoff token handshake in `muxcore/daemon/handoff.go` reusing FR-28 primitives
   AC: `writeHandoffToken(dir string) (token, path string, err error)` uses `generateToken()` + writes file with 0600 perms via existing `sockperm` pattern · `verifyHandoffToken(conn net.Conn, expected string)` reads Hello msg, constant-time compare, returns error on mismatch · token file deleted after handoff window · 3 unit tests covering write/verify/mismatch · swap body→return null ⇒ tests MUST fail
 
-- [ ] G001 VERIFY Phase 1 (T001–T007) — BLOCKED until T001–T007 all [x]
+- [x] G001 VERIFY Phase 1 (T001–T007) — BLOCKED until T001–T007 all [x]
   RUN: `go test ./muxcore/upstream/... ./muxcore/owner/... ./muxcore/daemon/... ./muxcore/snapshot/...`. Call Skill("nvmd-platform:code-reviewer") on every file touched.
   CHECK: Every new method has anti-stub coverage (tests fail if body returns zero-value). Protocol v1 is wire-format-stable.
   ENFORCE: Zero stubs. Zero TODOs. Zero "platform not yet implemented" comments in non-platform files.
@@ -237,6 +237,7 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
 
 
 
