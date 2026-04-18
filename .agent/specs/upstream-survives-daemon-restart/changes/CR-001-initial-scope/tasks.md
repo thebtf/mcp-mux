@@ -28,7 +28,7 @@
 - [x] T004 [P] [EXECUTOR: sonnet] Extend `OwnerSnapshot` + `DaemonSnapshot` in `muxcore/snapshot/snapshot.go` with `UpstreamPID`, `HandoffSocketPath`, `SpawnPgid`
   AC: new fields default to zero-values on absence (backwards-compat read) · existing v0.20.x snapshots deserialize without error · 2 unit tests: old snapshot round-trip + new snapshot round-trip · swap body→return null ⇒ tests MUST fail
 
-- [ ] T005 [P] [EXECUTOR: sonnet] Implement termination-cause classifier in `muxcore/daemon/termination.go`
+- [x] T005 [P] [EXECUTOR: sonnet] Implement termination-cause classifier in `muxcore/daemon/termination.go`
   AC: `classifyTermination(suture.Event) TerminationCause` returns one of {PlannedHandoff, UpstreamCrash, OperatorStop, IdleEviction, DaemonPanic} · distinguishes clean exit (ErrDoNotRestart or nil err) from crash (non-nil non-ErrDoNotRestart err) · 5 unit tests covering each class · swap body→return null ⇒ tests MUST fail
 
 - [ ] T006 [EXECUTOR: sonnet] Platform-agnostic handoff state machine skeleton in `muxcore/daemon/handoff.go`
@@ -237,6 +237,7 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
 
 
 
