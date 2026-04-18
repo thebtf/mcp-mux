@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"sync"
@@ -50,7 +51,13 @@ func (p *Process) SetDrainTimeout(d time.Duration) {
 // When env is non-empty, it is used as the complete process environment (converted from map to slice).
 // When env is nil/empty, the current process environment (os.Environ()) is used as fallback.
 // If cwd is non-empty, the child process runs in that directory.
-func Start(command string, args []string, env map[string]string, cwd string) (*Process, error) {
+//
+// If logger is non-nil, upstream stderr is forwarded to it (one log.Printf per line,
+// prefix "[upstream:PID] "). If logger is nil, stderr is forwarded to os.Stderr of the
+// calling process. In daemon mode os.Stderr is typically discarded (daemon is detached
+// with cmd.Stderr=nil), so upstream crash diagnostics get lost — callers running under
+// a daemon MUST pass a logger to preserve stderr.
+func Start(command string, args []string, env map[string]string, cwd string, logger *log.Logger) (*Process, error) {
 	var merged []string
 	if len(env) > 0 {
 		// Full session env provided — use it directly, no os.Environ() merge.
@@ -124,11 +131,19 @@ func Start(command string, args []string, env map[string]string, cwd string) (*P
 	// Forward stderr to logger (prefix with [upstream]) so diagnostics are visible.
 	// Buffer must be large enough for long lines (MSBuild paths, NuGet restore logs).
 	// If scanner stops reading (line too long), stderr pipe fills → upstream blocks.
+	//
+	// When the caller supplies a logger, route stderr there — the daemon runs
+	// detached with os.Stderr discarded, so writing to os.Stderr would drop
+	// every crash diagnostic (the exact failure mode we are fixing here).
 	go func() {
 		scanner := bufio.NewScanner(p.stderr)
 		scanner.Buffer(make([]byte, 64*1024), 64*1024) // 64KB — handles any build output line
 		for scanner.Scan() {
-			fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", proc.PID(), scanner.Text())
+			if logger != nil {
+				logger.Printf("[upstream:%d] %s", proc.PID(), scanner.Text())
+			} else {
+				fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", proc.PID(), scanner.Text())
+			}
 		}
 	}()
 

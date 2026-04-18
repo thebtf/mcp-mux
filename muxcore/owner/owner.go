@@ -96,8 +96,9 @@ type Owner struct {
 	ipcPath  string
 	cwd      string          // primary working directory (from first spawn)
 	cwdSet   map[string]bool // all known cwds (for multi-project roots/list)
-	command     string          // upstream command (for status/restart)
-	args        []string        // upstream args (for status/restart)
+	command     string            // upstream command (for status/restart)
+	args        []string          // upstream args (for status/restart)
+	env         map[string]string // upstream env captured at spawn (for background respawn)
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
 	sessionHandler muxcore.SessionHandler                                            // structured in-process handler (nil = pipe or subprocess)
 	serverID string          // server identity hash
@@ -251,6 +252,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		cwdSet:                 cwdSet,
 		command:                cfg.Command,
 		args:                   cfg.Args,
+		env:                    cfg.Env,
 		handlerFunc:            cfg.HandlerFunc,
 		sessionHandler:         cfg.SessionHandler,
 		serverID:               cfg.ServerID,
@@ -360,7 +362,16 @@ func (o *Owner) SpawnUpstreamBackground() {
 			proc = upstream.NewProcessFromHandler(context.Background(), o.handlerFunc)
 			o.logger.Printf("background handler spawn: in-process (no subprocess)")
 		} else {
-			proc, err = upstream.Start(o.command, o.args, nil, o.cwd)
+			// CRITICAL: pass o.env (captured at owner creation), NOT nil.
+			// upstream.Start treats nil env as "inherit daemon os.Environ()",
+			// which loses MCP-config-specific vars like CCLSP_CONFIG_PATH that
+			// only exist in the spawning shim's env, not in the daemon's.
+			// Observed failure: cclsp respawn emits
+			//   "Error: configPath is required when CCLSP_CONFIG_PATH environment variable is not set"
+			// on background respawn (first spawn used ownerCfg.Env correctly;
+			// this path dropped it). Causes 3+ minute recovery loops while
+			// suture retries via FailureBackoff.
+			proc, err = upstream.Start(o.command, o.args, o.env, o.cwd, o.logger)
 		}
 		if err != nil {
 			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
@@ -453,7 +464,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger.Printf("owner: started in-process handler (no subprocess)")
 	} else {
 		var err error
-		proc, err = upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd)
+		proc, err = upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd, logger)
 		if err != nil {
 			return nil, fmt.Errorf("owner: start upstream: %w", err)
 		}
@@ -475,6 +486,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
 		command:                cfg.Command,
 		args:                   cfg.Args,
+		env:                    cfg.Env,
 		handlerFunc:            cfg.HandlerFunc,
 		sessionHandler:         cfg.SessionHandler,
 		serverID:               cfg.ServerID,

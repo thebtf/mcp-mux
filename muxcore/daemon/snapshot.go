@@ -100,10 +100,18 @@ func (d *Daemon) loadSnapshot() int {
 
 		// Capture loop variables for closure.
 		cmd, args := ownerSnap.Command, ownerSnap.Args
+		// Merge daemon os.Environ() into the snapshotted env on restore. A
+		// pre-fix daemon may have serialised an owner with a trimmed shim env
+		// (missing GITHUB_PERSONAL_ACCESS_TOKEN, etc.); without this merge,
+		// loading that snapshot after the fix would re-install the trimmed
+		// env and session-aware upstreams would fail with "No GitHub token
+		// available for session ..." until the next cold spawn. Daemon env
+		// values fill gaps but cannot override whatever the snapshot stored.
+		restoredEnv := mergeEnv(ownerSnap.Env)
 		o, err := owner.NewOwnerFromSnapshot(owner.OwnerConfig{
 			Command:        cmd,
 			Args:           args,
-			Env:            ownerSnap.Env,
+			Env:            restoredEnv,
 			Cwd:            ownerSnap.Cwd,
 			IPCPath:        ipcPath,
 			ControlPath:    controlPath,
@@ -150,7 +158,7 @@ func (d *Daemon) loadSnapshot() int {
 			Args:         ownerSnap.Args,
 			Cwd:          ownerSnap.Cwd,
 			Mode:         ownerSnap.Mode,
-			Env:          ownerSnap.Env,
+			Env:          restoredEnv,
 			Persistent:   ownerSnap.Persistent,
 			LastSession:  time.Now(),
 			IdleTimeout:  d.ownerIdleTimeout,

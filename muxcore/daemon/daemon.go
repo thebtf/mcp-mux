@@ -612,12 +612,26 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 
 	ipcPath := serverid.IPCPath(sid, "")
 
-	// Pass full session env to the owner. No diff — the owner and upstream
-	// receive exactly the environment the CC session had. This prevents env
-	// leaks between sessions and ensures session-aware servers see all vars.
-	sessionEnv := req.Env
+	// Pass full session env to the owner. Shim-supplied vars WIN; daemon env
+	// fills gaps. Rationale: some shims are launched by tools that strip
+	// inherited vars (observed: CC sessions started in certain worktree paths
+	// arrive with 18-25 vars instead of 130+, missing GITHUB_PERSONAL_ACCESS_TOKEN
+	// and other credentials). Session-aware upstreams (e.g. pr-review-mcp) then
+	// fail with "No GitHub token available for session ...". Merging from the
+	// daemon's own os.Environ() (which was snapshotted at daemon start from the
+	// user env) fills the gap without overriding anything the shim did send.
+	sessionEnv := mergeEnv(req.Env)
 	if len(sessionEnv) > 0 {
-		d.logger.Printf("owner %s: session env %d vars", sid[:8], len(sessionEnv))
+		// Log presence (NOT values) of common credential keys so env-passthrough
+		// regressions remain visible. `shim_vars` is the pre-merge count — that
+		// is the one that regresses when CC sends a short env. `total` reflects
+		// what the upstream actually sees after the daemon-env fallback.
+		d.logger.Printf("owner %s: session env shim_vars=%d total=%d (github_pat=%v gh_token=%v openai_key=%v anthropic_key=%v)",
+			sid[:8], len(req.Env), len(sessionEnv),
+			sessionEnv["GITHUB_PERSONAL_ACCESS_TOKEN"] != "",
+			sessionEnv["GH_TOKEN"] != "" || sessionEnv["GITHUB_TOKEN"] != "",
+			sessionEnv["OPENAI_API_KEY"] != "",
+			sessionEnv["ANTHROPIC_API_KEY"] != "")
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
@@ -701,10 +715,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	serviceToken := d.supervisor.Add(o)
 
 	// Promote the placeholder to a real entry and signal waiters.
+	// Store the merged env (not raw req.Env) so snapshot save and dedup
+	// checks see the same credential-complete view that the upstream and
+	// session already got. Otherwise a daemon restart would round-trip
+	// trimmed env through the snapshot and re-surface the original bug.
 	d.mu.Lock()
 	placeholder.Owner = o
 	placeholder.Mode = req.Mode
-	placeholder.Env = req.Env
+	placeholder.Env = sessionEnv
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout
 	placeholder.serviceToken = serviceToken
@@ -718,7 +736,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		o.SpawnUpstreamBackground()
 	}
 
-	o.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+	// PreRegister with the MERGED env (not raw req.Env) so the session — bound
+	// to this token on handshake — sees daemon-filled credentials too.
+	// owner.go:~815 gates muxEnv injection on `len(s.Env) > 0` and sends s.Env
+	// as _meta.muxEnv; session-aware upstreams (pr-review-mcp etc.) look up
+	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
+	// env would leave muxEnv missing the token even though the owner/upstream
+	// process has it via mergeEnv above.
+	o.SessionMgr().PreRegister(token, req.Cwd, sessionEnv)
 	return ipcPath, sid, token, nil
 }
 
@@ -965,6 +990,33 @@ func argsEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// mergeEnv combines a shim-supplied env with the daemon's own os.Environ().
+// Shim-supplied entries win on key collision (per-session credentials and cwd
+// vars must override anything inherited by the daemon). Any key missing from
+// the shim env is filled from the daemon env.
+//
+// Why: some shim launch paths arrive with a drastically trimmed environment
+// (observed in CC sessions started in certain worktree layouts: ~18-25 vars
+// instead of the usual 130+), missing GITHUB_PERSONAL_ACCESS_TOKEN and other
+// credentials. Session-aware upstreams (pr-review-mcp, etc.) then surface
+// "No GitHub token available for session ..." errors and CC marks the server
+// `failed` in `/mcp`. Filling from the daemon's own env (captured from the
+// user environment at daemon start) restores the missing credentials without
+// overriding anything the shim did send. shim-supplied nil map → daemon env
+// returned directly.
+func mergeEnv(shimEnv map[string]string) map[string]string {
+	merged := make(map[string]string, len(shimEnv)+64)
+	for _, e := range os.Environ() {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			merged[e[:i]] = e[i+1:]
+		}
+	}
+	for k, v := range shimEnv {
+		merged[k] = v
+	}
+	return merged
 }
 
 // envCompatible returns true if two env maps have no conflicting values

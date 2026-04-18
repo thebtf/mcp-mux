@@ -460,6 +460,56 @@ func daemonAssertID(t *testing.T, resp []byte, expectedID int) {
 	}
 }
 
+// TestMergeEnv verifies that shim-supplied vars WIN over daemon vars on
+// key collision, and missing keys are filled from the daemon env. Regression
+// test for the case where CC sessions started in certain worktree layouts
+// arrive with a trimmed env (observed: ~18 vars vs usual 130+) missing
+// GITHUB_PERSONAL_ACCESS_TOKEN — session-aware upstreams then surface
+// "No GitHub token available for session" and CC marks the server failed.
+func TestMergeEnv(t *testing.T) {
+	// Seed a daemon-env variable we can look for. Restore on exit so parallel
+	// tests aren't affected.
+	const probeKey = "MCP_MUX_MERGE_PROBE"
+	const probeVal = "from-daemon-env-9f13"
+	t.Setenv(probeKey, probeVal)
+
+	t.Run("fallback fills missing key", func(t *testing.T) {
+		shim := map[string]string{"SOMETHING_ELSE": "shim"}
+		got := mergeEnv(shim)
+		if got[probeKey] != probeVal {
+			t.Errorf("merged[%s] = %q, want %q (daemon env should fill gap)", probeKey, got[probeKey], probeVal)
+		}
+		if got["SOMETHING_ELSE"] != "shim" {
+			t.Errorf("merged[SOMETHING_ELSE] = %q, want shim-supplied value", got["SOMETHING_ELSE"])
+		}
+	})
+
+	t.Run("shim overrides daemon on key collision", func(t *testing.T) {
+		shim := map[string]string{probeKey: "from-shim-override"}
+		got := mergeEnv(shim)
+		if got[probeKey] != "from-shim-override" {
+			t.Errorf("merged[%s] = %q, want shim override to win", probeKey, got[probeKey])
+		}
+	})
+
+	t.Run("nil shim env yields daemon env", func(t *testing.T) {
+		got := mergeEnv(nil)
+		if got[probeKey] != probeVal {
+			t.Errorf("merged[%s] = %q, want daemon env preserved when shim is nil", probeKey, got[probeKey])
+		}
+		if len(got) == 0 {
+			t.Error("merged env is empty; daemon env should be non-empty")
+		}
+	})
+
+	t.Run("empty shim env yields daemon env", func(t *testing.T) {
+		got := mergeEnv(map[string]string{})
+		if got[probeKey] != probeVal {
+			t.Errorf("merged[%s] = %q, want daemon env preserved when shim is empty", probeKey, got[probeKey])
+		}
+	})
+}
+
 func TestEnvTransient(t *testing.T) {
 	testCases := []struct {
 		name string
