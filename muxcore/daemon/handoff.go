@@ -79,6 +79,11 @@ type HandoffUpstream struct {
 // Returns HandoffResult with per-upstream outcome. Total error only on
 // protocol-level failures (token reject, version mismatch, conn drop).
 func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []HandoffUpstream) (HandoffResult, error) {
+	// ctx is reserved for future deadline/cancellation propagation to conn
+	// reads and writes (T009). Currently fdConn does not expose a deadline API;
+	// callers should set a deadline on the underlying transport before calling.
+	_ = ctx
+
 	// Step 1: Read Hello from successor.
 	var hello HelloMsg
 	if err := conn.ReadJSON(&hello); err != nil {
@@ -88,8 +93,10 @@ func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []
 	if err := validateProtocolVersion(hello.ProtocolVersion); err != nil {
 		return HandoffResult{Phase: "hello"}, err
 	}
-	// Step 3: Validate token.
-	if hello.Token != token {
+	// Step 3: Validate token using constant-time comparison to prevent timing
+	// side-channels. verifyHandoffToken (used on the accept path) already does
+	// this; performHandoff must be consistent.
+	if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(token)) != 1 {
 		return HandoffResult{Phase: "hello"}, ErrTokenMismatch
 	}
 	// Step 4: Send Ready listing all upstreams.
@@ -143,6 +150,9 @@ func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []
 // Returns the list of upstreams successfully received; callers use this to
 // bind them to re-created Owner instances.
 func receiveHandoff(ctx context.Context, conn fdConn, token string) (received []HandoffUpstream, err error) {
+	// ctx is reserved for future deadline/cancellation propagation (T009).
+	_ = ctx
+
 	// Step 1: Send Hello with token.
 	if err := conn.WriteJSON(NewHelloMsg(token)); err != nil {
 		return nil, fmt.Errorf("receiveHandoff: send hello: %w", err)
