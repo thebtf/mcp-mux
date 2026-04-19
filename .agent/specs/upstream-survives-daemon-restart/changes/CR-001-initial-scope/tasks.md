@@ -63,16 +63,16 @@
 - [ ] T011 [P] [EXECUTOR: sonnet] PID ownership verification in `muxcore/daemon/handoff_unix.go`
   AC: `verifyPIDOwner(pid int) error` checks Linux `/proc/{pid}/status` for matching UID · on macOS: uses `proc_pidinfo` via cgo-free `golang.org/x/sys/unix` · on BSD: `kill(pid, 0) + sysctl` fallback · rejects cross-user PIDs with typed error · 3 unit tests (own process accepted, PID 1 rejected on non-root, invalid PID rejected) · swap body→return null ⇒ tests MUST fail
 
-- [ ] T012 [P] [EXECUTOR: sonnet] Integration test: two-process handoff roundtrip on Linux in new file `muxcore/daemon/handoff_integration_linux_test.go`
+- [x] T012 [P] [EXECUTOR: sonnet] Integration test: two-process handoff roundtrip on Linux in new file `muxcore/daemon/handoff_integration_linux_test.go`
   AC: test spawns real mock upstream · forks "old" + "new" daemon goroutines in same test binary · full protocol roundtrip: Hello→Ready→FdTransfer→Ack→Done→HandoffAck · new daemon writes to transferred stdin, reads from transferred stdout, asserts JSON-RPC response · swap body→return null ⇒ tests MUST fail
 
-- [ ] T013 [P] [EXECUTOR: sonnet] Integration test: macOS launchd-style successor spawn in `muxcore/daemon/handoff_integration_darwin_test.go` (`//go:build darwin`)
+- [x] T013 [P] [EXECUTOR: sonnet] Integration test: macOS launchd-style successor spawn in `muxcore/daemon/handoff_integration_darwin_test.go` (`//go:build darwin`)
   AC: successor daemon started via `exec.Command` with clean env (simulating launchd plist) · handoff succeeds · asserts successor is NOT in old daemon's process group · swap body→return null ⇒ tests MUST fail
 
-- [ ] T014 [EXECUTOR: sonnet] Wire Unix platform impl into `performHandoff` / `receiveHandoff` (remove stubs from T006)
+- [x] T014 [EXECUTOR: sonnet] Wire Unix platform impl into `performHandoff` / `receiveHandoff` (remove stubs from T006)
   AC: `//go:build unix` build tag resolution picks `handoff_unix.go` implementations · T012 integration test green · swap body→return null ⇒ T012 fails
 
-- [ ] G002 VERIFY Phase 2 (T008–T014) — BLOCKED until T008–T014 all [x]
+- [x] G002 VERIFY Phase 2 (T008–T014) — BLOCKED until T008–T014 all [x]
   RUN: `go test ./muxcore/upstream/ ./muxcore/daemon/ -run Handoff -tags unix -v`. Call Skill("nvmd-platform:code-reviewer") on `handoff_unix.go` + `spawn_unix.go`.
   CHECK: SCM_RIGHTS roundtrip works on Linux runner and macOS runner. Circuit breaker does NOT increment on successful handoff.
   ENFORCE: Zero stubs. Setpgid fires on every upstream spawn (verified by PGID check).
@@ -237,6 +237,7 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
 
 
 

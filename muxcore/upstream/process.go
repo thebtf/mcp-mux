@@ -104,6 +104,10 @@ type Process struct {
 	// spawn time eliminates the race.
 	stdinFD  uintptr
 	stdoutFD uintptr
+	// spawnPgid is the process group ID of the spawned upstream. On Unix,
+	// Setpgid=true causes the child's PGID to equal its PID (kernel guarantee).
+	// Set after procgroup.Spawn returns successfully. Zero for handler-based processes.
+	spawnPgid int
 
 	lineBuf *lineBuffer
 
@@ -208,6 +212,7 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 			}
 			p.stdoutFile = stdoutR
 			p.stdoutFD = stdoutR.Fd() // cache pre-goroutine (race-safe)
+			cmd.SysProcAttr = applyUnixSpawnAttrs(cmd.SysProcAttr)
 			return nil
 		},
 	}
@@ -233,6 +238,12 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	_ = stdoutW.Close()
 
 	p.proc = proc
+	// On Unix, Setpgid=true guarantees PGID == PID after spawn.
+	// We read proc.PID() to stay within the procgroup abstraction.
+	// spawnPgid is zero for handler-based processes.
+	if pid := proc.PID(); pid != 0 {
+		p.spawnPgid = pid
+	}
 	p.lineBuf = newLineBuffer()
 
 	// stdoutDrained and stderrDrained are closed by their respective drain

@@ -115,7 +115,13 @@ func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []
 			aborted = append(aborted, u.ServerID)
 			continue
 		}
-		// Transfer FDs out-of-band.
+		// Transfer FDs out-of-band. The actual FdTransferMsg metadata was
+		// sent via WriteJSON above — SCM_RIGHTS carries only the handle
+		// numbers themselves, no additional header bytes. Linux accepts
+		// SCM_RIGHTS with 0-byte data on SOCK_STREAM; macOS/BSD may
+		// reject. The Unix impl (unixFDConn) uses a 1-byte sentinel
+		// internally on platforms that require it. Call with nil header
+		// from the protocol layer.
 		if err := conn.SendFDs([]uintptr{u.StdinFD, u.StdoutFD}, nil); err != nil {
 			// Drain the AckTransfer the successor may send (best-effort).
 			var ack AckTransferMsg
