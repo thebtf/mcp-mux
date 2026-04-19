@@ -7,6 +7,22 @@ import (
 	"time"
 )
 
+// setupTestHandoffTimeouts overrides the package-level handoff timeout
+// variables to 50 ms so tests exercise the timeout/fallback path quickly
+// without relying on production-scale delays.  The original values are
+// restored automatically via t.Cleanup.
+func setupTestHandoffTimeouts(t *testing.T) {
+	t.Helper()
+	origAccept := handoffAcceptTimeout
+	origTotal := handoffTotalTimeout
+	handoffAcceptTimeout = 50 * time.Millisecond
+	handoffTotalTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		handoffAcceptTimeout = origAccept
+		handoffTotalTimeout = origTotal
+	})
+}
+
 // TestHandoffFallbackOnAcceptTimeout verifies that HandleGracefulRestart returns
 // a valid snapshot path and nil error even when no successor daemon connects
 // within the accept timeout — i.e. the FR-8 fallback path is transparent to
@@ -22,15 +38,7 @@ import (
 //  2. snapshotPath is non-empty — snapshot serialization succeeded.
 //  3. The daemon continues to the Shutdown path (go d.Shutdown()) regardless.
 func TestHandoffFallbackOnAcceptTimeout(t *testing.T) {
-	// Override timeouts so the test completes quickly.
-	origAccept := handoffAcceptTimeout
-	origTotal := handoffTotalTimeout
-	handoffAcceptTimeout = 50 * time.Millisecond
-	handoffTotalTimeout = 50 * time.Millisecond
-	t.Cleanup(func() {
-		handoffAcceptTimeout = origAccept
-		handoffTotalTimeout = origTotal
-	})
+	setupTestHandoffTimeouts(t)
 
 	d := testDaemon(t) // helper defined in daemon_test.go
 
@@ -56,14 +64,7 @@ func TestHandoffFallbackOnAcceptTimeout(t *testing.T) {
 // Uses testDaemonWithLog (helper added in F80-4 / T022) to capture daemon
 // log output into a thread-safe buffer and grep it after the call returns.
 func TestHandoffFallback_LogMarker(t *testing.T) {
-	origAccept := handoffAcceptTimeout
-	origTotal := handoffTotalTimeout
-	handoffAcceptTimeout = 50 * time.Millisecond
-	handoffTotalTimeout = 50 * time.Millisecond
-	t.Cleanup(func() {
-		handoffAcceptTimeout = origAccept
-		handoffTotalTimeout = origTotal
-	})
+	setupTestHandoffTimeouts(t)
 
 	d, logBuf := testDaemonWithLog(t)
 
@@ -104,14 +105,7 @@ func TestHandoffFallback_LogMarker(t *testing.T) {
 // but asserts the counter delta in HandleStatus output rather than log
 // content.
 func TestHandoffFallback_CounterIncrement(t *testing.T) {
-	origAccept := handoffAcceptTimeout
-	origTotal := handoffTotalTimeout
-	handoffAcceptTimeout = 50 * time.Millisecond
-	handoffTotalTimeout = 50 * time.Millisecond
-	t.Cleanup(func() {
-		handoffAcceptTimeout = origAccept
-		handoffTotalTimeout = origTotal
-	})
+	setupTestHandoffTimeouts(t)
 
 	d := testDaemon(t)
 
@@ -153,14 +147,7 @@ func TestHandoffFallback_CounterIncrement(t *testing.T) {
 // TestHandoffFallback_StatusCountersExposed verifies the counters reach
 // HandleStatus output (the API verify-handoff.sh / .ps1 rely on).
 func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
-	origAccept := handoffAcceptTimeout
-	origTotal := handoffTotalTimeout
-	handoffAcceptTimeout = 50 * time.Millisecond
-	handoffTotalTimeout = 50 * time.Millisecond
-	t.Cleanup(func() {
-		handoffAcceptTimeout = origAccept
-		handoffTotalTimeout = origTotal
-	})
+	setupTestHandoffTimeouts(t)
 
 	d := testDaemon(t)
 
@@ -183,7 +170,10 @@ func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
 	t.Cleanup(func() { _ = os.Remove(snapshotPath) })
 
 	after := d.HandleStatus()
-	hoff1, _ := after["handoff"].(map[string]any)
+	hoff1, ok := after["handoff"].(map[string]any)
+	if !ok {
+		t.Fatalf("HandleStatus missing 'handoff' sub-map after restart; got %T", after["handoff"])
+	}
 
 	// attempted and fallback both visible via HandleStatus as uint64 (json-safe).
 	attemptedVal, _ := hoff1["attempted"].(uint64)
@@ -202,14 +192,7 @@ func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
 // restore from. Without this, a handoff failure would lose both in-flight
 // requests AND the cached init/tools templates.
 func TestHandoffFallback_SnapshotAlwaysWritten(t *testing.T) {
-	origAccept := handoffAcceptTimeout
-	origTotal := handoffTotalTimeout
-	handoffAcceptTimeout = 50 * time.Millisecond
-	handoffTotalTimeout = 50 * time.Millisecond
-	t.Cleanup(func() {
-		handoffAcceptTimeout = origAccept
-		handoffTotalTimeout = origTotal
-	})
+	setupTestHandoffTimeouts(t)
 
 	d := testDaemon(t)
 
