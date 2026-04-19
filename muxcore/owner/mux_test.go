@@ -145,9 +145,32 @@ func TestOwnerMultipleSessions(t *testing.T) {
 	sendReq(t, c1W, 1, "tools/call", `{"name":"echo","arguments":{"message":"from-session1"}}`)
 	sendReq(t, c2W, 1, "tools/call", `{"name":"echo","arguments":{"message":"from-session2"}}`)
 
-	// Each session should get the correct response with id=1
-	resp1 := readResp(t, c1R)
-	resp2 := readResp(t, c2R)
+	// Each session should get the correct response with id=1.
+	// Read both pipes in parallel so a routing race between the two sessions
+	// cannot hang the test for readRespTimeout (180s) on a single blocked
+	// read. Each goroutine owns its pipe and reports via channel; main
+	// goroutine waits for both with an outer timeout.
+	type readOut struct {
+		b   []byte
+		err error
+	}
+	r1Ch := make(chan readOut, 1)
+	r2Ch := make(chan readOut, 1)
+	go func() { r1Ch <- readOut{b: readResp(t, c1R)} }()
+	go func() { r2Ch <- readOut{b: readResp(t, c2R)} }()
+	var resp1, resp2 []byte
+	outer := time.NewTimer(30 * time.Second)
+	defer outer.Stop()
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-r1Ch:
+			resp1 = r.b
+		case r := <-r2Ch:
+			resp2 = r.b
+		case <-outer.C:
+			t.Fatalf("response timeout after 30s; resp1=%q resp2=%q", resp1, resp2)
+		}
+	}
 
 	assertResponseID(t, resp1, 1)
 	assertResponseID(t, resp2, 1)
