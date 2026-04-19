@@ -195,8 +195,8 @@ func (u *unixFDConn) SendFDs(fds []uintptr, header []byte) error {
 		// The nil sockaddr argument is valid for a connected stream socket.
 		firstN, sendErr = syscall.SendmsgN(int(fd), header, rights, nil, 0)
 		if errors.Is(sendErr, syscall.EAGAIN) || errors.Is(sendErr, syscall.EWOULDBLOCK) {
-			sendErr = nil  // not a terminal error; poller will retry when writable
-			return false   // wait until writable and retry
+			sendErr = nil // not a terminal error; poller will retry when writable
+			return false  // wait until writable and retry
 		}
 		return true // syscall complete, release the raw fd
 	})

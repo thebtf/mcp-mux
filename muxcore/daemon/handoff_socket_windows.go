@@ -41,3 +41,9 @@ func setSuccessorDetached(cmd *exec.Cmd) {
 		HideWindow:    true,
 	}
 }
+
+// dialHandoff connects to a handoff named pipe previously bound by listenHandoff.
+// Caller owns the returned conn's lifetime.
+func dialHandoff(socketPath string, timeout time.Duration) (fdConn, error) {
+	return dialHandoffWindows(socketPath, timeout)
+}

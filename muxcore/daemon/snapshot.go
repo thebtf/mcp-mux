@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
@@ -68,6 +70,58 @@ func DeserializeSnapshot(logger interface{ Printf(string, ...any) }) (*DaemonSna
 	return mcpsnapshot.Deserialize(logger)
 }
 
+// dialHandoffHook is overridable by tests to inject a mock fdConn instead of
+// dialing a real socket. Production code always leaves this nil.
+var dialHandoffHook func(socketPath string, timeout time.Duration) (fdConn, error)
+
+// tryHandoffReceive checks for MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET
+// env vars. If both are set, dials the handoff socket, authenticates with the token,
+// and receives the list of upstream FDs from the old daemon.
+// Returns nil on any failure (FR-8 fallback: caller uses SpawnUpstreamBackground for all owners).
+func (d *Daemon) tryHandoffReceive(ctx context.Context) map[string]HandoffUpstream {
+	tokenPath := os.Getenv("MCPMUX_HANDOFF_TOKEN_PATH")
+	socketPath := os.Getenv("MCPMUX_HANDOFF_SOCKET")
+
+	if tokenPath == "" || socketPath == "" {
+		return nil
+	}
+
+	defer deleteHandoffToken(tokenPath) //nolint:errcheck
+
+	token, err := readHandoffToken(tokenPath)
+	if err != nil {
+		d.logger.Printf("handoff.receive.fail reason=%v", err)
+		return nil
+	}
+
+	dialFn := dialHandoff
+	if dialHandoffHook != nil {
+		dialFn = dialHandoffHook
+	}
+	conn, err := dialFn(socketPath, 2*time.Second)
+	if err != nil {
+		d.logger.Printf("handoff.receive.fail reason=%v", err)
+		return nil
+	}
+	defer conn.Close() //nolint:errcheck
+
+	receiveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	received, err := receiveHandoff(receiveCtx, conn, token)
+	if err != nil {
+		d.logger.Printf("handoff.receive.fail reason=%v", err)
+		return nil
+	}
+
+	result := make(map[string]HandoffUpstream, len(received))
+	for _, hu := range received {
+		result[hu.ServerID] = hu
+	}
+	d.logger.Printf("handoff.receive.ok upstreams=%d", len(result))
+	return result
+}
+
 // loadSnapshot checks for a snapshot file and restores owners from it.
 // Called on daemon startup. If no snapshot exists, returns 0 (cold start).
 // Returns the number of owners restored.
@@ -80,6 +134,11 @@ func (d *Daemon) loadSnapshot() int {
 	if snap == nil {
 		return 0 // cold start
 	}
+
+	// Check for handoff env vars. If both are set, receive transferred FDs from
+	// the old daemon instead of respawning upstreams from scratch (FR-1 to FR-3).
+	// Returns nil if env vars are absent or handoff fails (FR-8 fallback for all owners).
+	handoffMap := d.tryHandoffReceive(context.Background())
 
 	restored := 0
 	for _, ownerSnap := range snap.Owners {
@@ -98,8 +157,6 @@ func (d *Daemon) loadSnapshot() int {
 			ownerSnap.CwdSet = []string{ownerSnap.Cwd}
 		}
 
-		// Capture loop variables for closure.
-		cmd, args := ownerSnap.Command, ownerSnap.Args
 		// Merge daemon os.Environ() into the snapshotted env on restore. A
 		// pre-fix daemon may have serialised an owner with a trimmed shim env
 		// (missing GITHUB_PERSONAL_ACCESS_TOKEN, etc.); without this merge,
@@ -108,7 +165,8 @@ func (d *Daemon) loadSnapshot() int {
 		// available for session ..." until the next cold spawn. Daemon env
 		// values fill gaps but cannot override whatever the snapshot stored.
 		restoredEnv := mergeEnv(ownerSnap.Env)
-		o, err := owner.NewOwnerFromSnapshot(owner.OwnerConfig{
+		cmd, args := ownerSnap.Command, ownerSnap.Args
+		cfg := owner.OwnerConfig{
 			Command:        cmd,
 			Args:           args,
 			Env:            restoredEnv,
@@ -137,10 +195,43 @@ func (d *Daemon) loadSnapshot() int {
 				d.updateTemplate(cmd, args, s)
 			},
 			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
-		}, ownerSnap)
-		if err != nil {
-			d.logger.Printf("snapshot: failed to restore owner %s (%s): %v", sid[:8], ownerSnap.Command, err)
-			continue
+		}
+
+		var o *owner.Owner
+		reattachedFromHandoff := false
+
+		// FR-7 partial fallback: attempt handoff reattach if this serverID was received.
+		if hu, ok := handoffMap[sid]; ok {
+			cfg.CachedClassification = ownerSnap.Classification
+			payload := owner.HandoffPayload{
+				ServerID: sid,
+				PID:      hu.PID,
+				StdinFD:  hu.StdinFD,
+				StdoutFD: hu.StdoutFD,
+				Command:  hu.Command,
+				Args:     ownerSnap.Args,
+				Cwd:      ownerSnap.Cwd,
+			}
+			var handoffErr error
+			o, handoffErr = owner.NewOwnerFromHandoff(cfg, payload)
+			if handoffErr != nil {
+				d.logger.Printf("snapshot: handoff reattach failed for %s: %v — falling back to spawn",
+					sid[:8], handoffErr)
+				o = nil
+			} else {
+				reattachedFromHandoff = true
+				d.logger.Printf("snapshot: reattached owner %s from handoff (pid=%d)", sid[:8], hu.PID)
+			}
+		}
+
+		// Legacy path: restore from snapshot (runs when handoff not available or failed).
+		if o == nil {
+			var snapErr error
+			o, snapErr = owner.NewOwnerFromSnapshot(cfg, ownerSnap)
+			if snapErr != nil {
+				d.logger.Printf("snapshot: failed to restore owner %s (%s): %v", sid[:8], ownerSnap.Command, snapErr)
+				continue
+			}
 		}
 
 		// Register with supervisor BEFORE inserting into owners map so that
@@ -171,8 +262,10 @@ func (d *Daemon) loadSnapshot() int {
 			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
 		}
 
-		// Spawn upstream in background — refreshes caches when ready.
-		o.SpawnUpstreamBackground()
+		// Only spawn a fresh upstream when not reattached from handoff.
+		if !reattachedFromHandoff {
+			o.SpawnUpstreamBackground()
+		}
 
 		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)
 		restored++
