@@ -1838,6 +1838,36 @@ func (o *Owner) Shutdown() {
 	})
 }
 
+// SoftShutdown performs the same cleanup as Shutdown (closes listener, sessions,
+// control server) but instead of calling upstream.Close() it calls
+// upstream.SoftClose(timeout) — giving the upstream a chance to exit cleanly
+// via stdin close before resorting to SIGTERM/SIGKILL.
+//
+// Returns the upstream exit code (0 = clean) and any kill-escalation error.
+// Used by the idle reaper (US3) to avoid SIGKILL on polite upstreams.
+func (o *Owner) SoftShutdown(timeout time.Duration) (int, error) {
+	exitCode := 0
+	var exitErr error
+
+	o.shutdownOnce.Do(func() {
+		o.teardownExceptUpstream()
+
+		o.mu.Lock()
+		up := o.upstream
+		o.mu.Unlock()
+		if up != nil {
+			exitCode, exitErr = up.SoftClose(timeout)
+		}
+
+		o.logger.Printf("owner soft shut down (upstream exit code %d)", exitCode)
+
+		// Signal done AFTER cleanup.
+		close(o.done)
+	})
+
+	return exitCode, exitErr
+}
+
 // Done returns a channel closed when the owner has shut down.
 func (o *Owner) Done() <-chan struct{} {
 	return o.done

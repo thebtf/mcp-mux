@@ -20,6 +20,84 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/procgroup"
 )
 
+// SoftClose closes the upstream process gracefully via stdin close, waiting up
+// to timeout for voluntary exit before escalating to GracefulKill.
+//
+// Graceful soft-close sequence (US3):
+//  1. Close stdin — polite MCP shutdown signal (well-behaved servers exit on EOF).
+//  2. Wait up to timeout for voluntary exit. Default 30s when called by the reaper.
+//  3. If still alive after timeout: proc.GracefulKill(3s) — SIGTERM→wait→SIGKILL.
+//
+// Returns the upstream exit code (0 = clean voluntary exit, non-zero = forced)
+// and any error from the kill escalation. A non-nil error signals that a forced
+// kill occurred (either GracefulKill failed, kill succeeded after timeout, or the
+// handler did not exit within timeout).
+// Safe to call after Close() — returns (0, nil) if already closed or detached.
+func (p *Process) SoftClose(timeout time.Duration) (int, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0, nil
+	}
+	if p.detached {
+		p.mu.Unlock()
+		return 0, nil
+	}
+	p.closed = true
+	p.mu.Unlock()
+
+	// Release the Windows Job Object handle (no-op on non-Windows).
+	releaseJobHandle(p)
+
+	// Phase 1: close stdin — polite MCP shutdown signal.
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
+
+	// Phase 2: wait for voluntary exit.
+	select {
+	case <-p.Done:
+		// Exited cleanly on its own.
+		return softCloseExitCode(p.ExitErr), nil
+	case <-time.After(timeout):
+	}
+
+	// Phase 3: timeout — escalate to GracefulKill.
+	if p.proc != nil {
+		killErr := p.proc.GracefulKill(3 * time.Second)
+		// Wait for the process to fully exit so ExitErr is populated.
+		select {
+		case <-p.Done:
+		case <-time.After(5 * time.Second):
+			return -1, fmt.Errorf("upstream: process did not exit after GracefulKill")
+		}
+		if killErr != nil {
+			return softCloseExitCode(p.ExitErr), killErr
+		}
+		// GracefulKill succeeded but we still escalated past the voluntary-exit window.
+		// Return a non-nil error so callers (SoftShutdown, SoftRemove) can detect the
+		// forced-kill path even when GracefulKill itself had no error.
+		return softCloseExitCode(p.ExitErr), fmt.Errorf("upstream: forced kill after soft-close timeout")
+	}
+
+	// In-process handler did not exit within timeout.
+	return -1, fmt.Errorf("upstream: handler did not exit after %v", timeout)
+}
+
+// softCloseExitCode extracts the process exit code from a Wait() error.
+// Returns 0 for nil (clean exit), the numeric exit code for *exec.ExitError,
+// and 1 for any other non-nil error.
+func softCloseExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return 1
+}
+
 // ErrAlreadyClosed is returned by Detach if the process has already been closed.
 var ErrAlreadyClosed = errors.New("upstream: process already closed")
 

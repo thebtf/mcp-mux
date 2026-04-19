@@ -807,6 +807,53 @@ func (d *Daemon) Remove(serverID string) error {
 	return supErr
 }
 
+// SoftRemove performs a graceful shutdown of the named owner, giving the upstream
+// up to 30 seconds to exit cleanly via stdin close before escalating to SIGTERM/SIGKILL.
+//
+// Use Remove (hard kill) for operator-requested restarts; use SoftRemove for idle
+// eviction so upstreams can flush caches, close files, and exit with code 0 (US3).
+func (d *Daemon) SoftRemove(serverID string) error {
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if !ok {
+		d.mu.Unlock()
+		return fmt.Errorf("server %s not found", serverID)
+	}
+	if entry.Owner == nil {
+		// Placeholder still being created — do not remove.
+		d.mu.Unlock()
+		return fmt.Errorf("server %s is still being created", serverID)
+	}
+	delete(d.owners, serverID)
+	token := entry.serviceToken
+	d.mu.Unlock()
+
+	// Remove from supervisor BEFORE SoftShutdown to prevent suture from
+	// interpreting the shutdown as a failure and attempting restart.
+	var supErr error
+	if d.supervisor != nil {
+		if err := d.supervisor.RemoveAndWait(token, 2*time.Second); err != nil {
+			supErr = fmt.Errorf("soft-remove owner %s from supervisor: %w", serverID[:8], err)
+			d.logger.Printf("warning: %v", supErr)
+		}
+	}
+
+	// Soft shutdown: stdin close → 30s wait → GracefulKill fallback.
+	exitCode, err := entry.Owner.SoftShutdown(30 * time.Second)
+	if err != nil {
+		d.logger.Printf("soft-removed owner %s: forced kill (exit=%d err=%v)", serverID[:8], exitCode, err)
+	} else if exitCode == 0 {
+		d.logger.Printf("soft-removed owner %s: upstream exited cleanly (code 0)", serverID[:8])
+	} else {
+		d.logger.Printf("soft-removed owner %s: upstream exited with code %d", serverID[:8], exitCode)
+	}
+
+	if supErr != nil {
+		return supErr
+	}
+	return nil
+}
+
 // HandleSpawn implements control.DaemonHandler.
 func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error) {
 	return d.Spawn(req)
