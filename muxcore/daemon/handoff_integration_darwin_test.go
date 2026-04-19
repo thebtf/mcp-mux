@@ -48,6 +48,9 @@ func TestHandoffDarwin_Successor(t *testing.T) {
 	if len(received) != 1 {
 		t.Fatalf("expected 1 received upstream, got %d", len(received))
 	}
+	if received[0].ServerID != "s1" {
+		t.Fatalf("received[0].ServerID = %q, want %q", received[0].ServerID, "s1")
+	}
 }
 
 // TestHandoffDarwin_LaunchdStyleSpawn spawns a child test process via
@@ -169,7 +172,7 @@ func TestHandoffDarwin_LaunchdStyleSpawn(t *testing.T) {
 		_ = cmd.Process.Kill()
 		t.Fatalf("performHandoff: %v\n\nchild output:\n%s", err, outBuf.String())
 	}
-	if len(result.Transferred) != 1 {
+	if len(result.Transferred) != 1 || result.Transferred[0] != "s1" {
 		_ = cmd.Process.Kill()
 		t.Errorf("Transferred: %v, want [s1]\n\nchild output:\n%s",
 			result.Transferred, outBuf.String())
