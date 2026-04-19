@@ -203,3 +203,54 @@ func TestWindowsFDConn_SendFDs_NoTargetPID(t *testing.T) {
 		t.Fatal("expected error when targetPID not set")
 	}
 }
+
+func TestListenDialHandoffWindows_Factory(t *testing.T) {
+	var nameBuf [8]byte
+	_, _ = rand.Read(nameBuf[:])
+	pipeName := "fac-" + hex.EncodeToString(nameBuf[:])
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var serverErr error
+	go func() {
+		defer wg.Done()
+		conn, err := listenHandoffWindows(pipeName, 3*time.Second)
+		if err != nil {
+			serverErr = err
+			return
+		}
+		defer conn.Close()
+		var msg map[string]string
+		serverErr = conn.ReadJSON(&msg)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	client, err := dialHandoffWindows(pipeName, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	if err := client.WriteJSON(map[string]string{"ping": "yes"}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	wg.Wait()
+	if serverErr != nil {
+		t.Fatalf("server: %v", serverErr)
+	}
+}
+
+func TestListenHandoffWindows_AcceptTimeout(t *testing.T) {
+	var nameBuf [8]byte
+	_, _ = rand.Read(nameBuf[:])
+	pipeName := "timeout-" + hex.EncodeToString(nameBuf[:])
+
+	start := time.Now()
+	_, err := listenHandoffWindows(pipeName, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed > 1*time.Second {
+		t.Errorf("timeout took too long: %s", elapsed)
+	}
+}

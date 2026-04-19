@@ -99,6 +99,11 @@ func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []
 	if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(token)) != 1 {
 		return HandoffResult{Phase: "hello"}, ErrTokenMismatch
 	}
+	// Platform hook: Windows uses the successor PID for DuplicateHandle.
+	// Unix ignores (unixFDConn does not implement SetTargetPID).
+	if setter, ok := conn.(interface{ SetTargetPID(int) }); ok {
+		setter.SetTargetPID(hello.SourcePID)
+	}
 	// Step 4: Send Ready listing all upstreams.
 	refs := make([]UpstreamRef, len(upstreams))
 	for i, u := range upstreams {
@@ -160,7 +165,7 @@ func receiveHandoff(ctx context.Context, conn fdConn, token string) (received []
 	_ = ctx
 
 	// Step 1: Send Hello with token.
-	if err := conn.WriteJSON(NewHelloMsg(token)); err != nil {
+	if err := conn.WriteJSON(NewHelloMsgWithPID(token, os.Getpid())); err != nil {
 		return nil, fmt.Errorf("receiveHandoff: send hello: %w", err)
 	}
 	// Step 2: Read Ready; record upstream list.

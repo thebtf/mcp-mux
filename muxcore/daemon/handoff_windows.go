@@ -207,3 +207,42 @@ func (w *windowsFDConn) RecvFDs() ([]uintptr, []byte, error) {
 }
 
 func (w *windowsFDConn) Close() error { return w.conn.Close() }
+
+// listenHandoffWindows binds a named pipe and accepts one connection within
+// the handoff window.
+func listenHandoffWindows(pipeName string, acceptTimeout time.Duration) (fdConn, error) {
+	ln, err := listenHandoffPipe(pipeName)
+	if err != nil {
+		return nil, fmt.Errorf("handoff listen win: %w", err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	var conn net.Conn
+	var acceptErr error
+	go func() {
+		defer close(done)
+		conn, acceptErr = ln.Accept()
+	}()
+
+	select {
+	case <-done:
+		if acceptErr != nil {
+			return nil, fmt.Errorf("handoff accept win: %w", acceptErr)
+		}
+		return newWindowsFDConn(conn), nil
+	case <-time.After(acceptTimeout):
+		_ = ln.Close()
+		<-done
+		return nil, fmt.Errorf("handoff accept win: timeout after %s", acceptTimeout)
+	}
+}
+
+// dialHandoffWindows connects to a named pipe created by listenHandoffWindows.
+func dialHandoffWindows(pipeName string, dialTimeout time.Duration) (fdConn, error) {
+	conn, err := dialHandoffPipe(pipeName, dialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("handoff dial win: %w", err)
+	}
+	return newWindowsFDConn(conn), nil
+}
