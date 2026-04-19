@@ -64,6 +64,14 @@ type OwnerEntry struct {
 	// creating is closed when Owner transitions from nil (placeholder) to a real
 	// owner.  It is non-nil only while the placeholder is being created.
 	creating chan struct{}
+	// terminationHint is consulted by supervisorEventHook when the suture
+	// service for this owner fires EventServiceTerminate. Callers that know
+	// they are tearing down an owner for a specific reason (planned handoff,
+	// idle eviction, operator stop) MUST set this field under d.mu before
+	// removing the owner from the supervisor, so structured logs classify
+	// the cause correctly instead of defaulting to HintNone.
+	// In-memory only — not serialized.
+	terminationHint TerminationHint
 }
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
@@ -253,10 +261,13 @@ func New(cfg Config) (*Daemon, error) {
 // for observability and debugging.
 func (d *Daemon) supervisorEventHook(event suture.Event) {
 	// classifyTermination maps the suture event to a TerminationCause for
-	// structured logging (FR-5 / T025). HintNone is used here because the hook
-	// only sees the event; callers like HandleGracefulRestart set hints via
-	// per-owner state before removing from the supervisor.
-	cause := classifyTermination(event, HintNone)
+	// structured logging (FR-5 / T025). Callers that tear down owners for a
+	// known reason (HandleGracefulRestart → HintPlannedHandoff, reaper →
+	// HintIdleEviction, Remove → HintOperatorStop) record the reason on the
+	// owning OwnerEntry.terminationHint before removing the service. The hook
+	// resolves that hint via the service name embedded in the event.
+	hint := d.terminationHintForEvent(event)
+	cause := classifyTermination(event, hint)
 	switch e := event.(type) {
 	case suture.EventServicePanic:
 		d.logger.Printf("supervisor.terminated service=%q cause=%s panic=%v", e.ServiceName, cause, e.PanicMsg)
@@ -298,6 +309,46 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 	default:
 		// Unknown event type — ignore silently
 	}
+}
+
+// terminationHintForEvent resolves the TerminationHint recorded on the
+// OwnerEntry matching the suture event's service name. Returns HintNone
+// when the event has no service name, when no owner matches the name
+// prefix, or when no hint was recorded. Callers (supervisorEventHook) use
+// the returned hint to classify EventServiceTerminate causes beyond the
+// generic "service exited" default. Matches cleanupDeadOwner's service-name
+// parsing convention ("owner[XXXXXXXX command args]").
+func (d *Daemon) terminationHintForEvent(event suture.Event) TerminationHint {
+	var serviceName string
+	switch e := event.(type) {
+	case suture.EventServiceTerminate:
+		serviceName = e.ServiceName
+	case suture.EventServicePanic:
+		serviceName = e.ServiceName
+	default:
+		return HintNone
+	}
+
+	const prefix = "owner["
+	idx := strings.Index(serviceName, prefix)
+	if idx < 0 {
+		return HintNone
+	}
+	rest := serviceName[idx+len(prefix):]
+	spaceIdx := strings.IndexByte(rest, ' ')
+	if spaceIdx < 0 {
+		return HintNone
+	}
+	sidPrefix := rest[:spaceIdx]
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for s, entry := range d.owners {
+		if strings.HasPrefix(s, sidPrefix) {
+			return entry.terminationHint
+		}
+	}
+	return HintNone
 }
 
 // cleanupDeadOwner finds and removes a permanently-failed owner from the registry.
@@ -1077,6 +1128,19 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
 		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
+
+	// Tag every live owner with HintPlannedHandoff before shutdown so the
+	// supervisor event hook classifies their terminations as
+	// TermPlannedHandoff rather than the generic TermOperatorStop/clean-exit
+	// default. Applies on both the successful handoff path (FDs already
+	// detached) and the FR-8 fallback path (kill-and-respawn) — in both
+	// cases the teardown is operator-initiated as part of a graceful
+	// restart, which is the semantics HintPlannedHandoff captures.
+	d.mu.Lock()
+	for _, entry := range d.owners {
+		entry.terminationHint = HintPlannedHandoff
+	}
+	d.mu.Unlock()
 
 	go d.Shutdown()
 	return snapshotPath, nil
