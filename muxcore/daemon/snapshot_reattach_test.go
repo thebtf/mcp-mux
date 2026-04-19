@@ -161,32 +161,34 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenFile.Name())
 	t.Setenv("MCPMUX_HANDOFF_SOCKET", "/mock/socket") // intercepted by hook
 
-	d := testDaemon(t)
+	d, logBuf := testDaemonWithLog(t)
 	restored := d.loadSnapshot()
 	if restored != 1 {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
 
-	var entry *OwnerEntry
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		d.mu.RLock()
-		entry = d.owners[sid]
-		d.mu.RUnlock()
-		if entry != nil && entry.Owner != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if entry == nil || entry.Owner == nil {
-		t.Fatal("owner not found in d.owners after handoff reattach (polled 2s)")
+	// Assert the handoff path was taken via structural log inspection rather
+	// than polling d.owners. The supervisor goroutine started by
+	// supervisor.Add(o) can race through o.Serve() → proactive-init write
+	// failure → OnUpstreamExit → delete(d.owners, sid) fast enough on
+	// Windows scheduling that the entry is never observable in any poll
+	// iteration. The daemon's per-owner "reattached from handoff" marker,
+	// emitted inside loadSnapshot itself (snapshot.go line 223), is
+	// recorded unconditionally before the supervisor goroutine can remove
+	// the entry, so log inspection is race-free.
+	logs := logBuf.String()
+
+	wantHandoff := "snapshot: reattached owner " + sid[:8] + " from handoff"
+	if !strings.Contains(logs, wantHandoff) {
+		t.Errorf("expected log %q (handoff path marker), not found.\nLogs:\n%s",
+			wantHandoff, logs)
 	}
 
-	// Verify owner was constructed via handoff path: classification_source == "handoff".
-	status := entry.Owner.Status()
-	classSource, _ := status["classification_source"].(string)
-	if classSource != "handoff" {
-		t.Errorf("classification_source = %q, want %q (handoff path not used)", classSource, "handoff")
+	// "handoff.receive.ok upstreams=1" proves the receive side consumed the
+	// mock conn pair end-to-end (token auth, protocol version, 1 FdTransfer).
+	if !strings.Contains(logs, "handoff.receive.ok upstreams=1") {
+		t.Errorf("expected %q in logs, not found.\nLogs:\n%s",
+			"handoff.receive.ok upstreams=1", logs)
 	}
 }
 
@@ -234,7 +236,7 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenFile.Name())
 	t.Setenv("MCPMUX_HANDOFF_SOCKET", "/nonexistent/path/to/socket.sock")
 
-	d := testDaemon(t)
+	d, logBuf := testDaemonWithLog(t)
 	restored := d.loadSnapshot()
 
 	// FR-8 fallback: must restore owner via legacy path (SpawnUpstreamBackground).
@@ -242,26 +244,31 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners (want 1); FR-8 fallback failed", restored)
 	}
 
-	var entry *OwnerEntry
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		d.mu.RLock()
-		entry = d.owners[sid]
-		d.mu.RUnlock()
-		if entry != nil && entry.Owner != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if entry == nil || entry.Owner == nil {
-		t.Fatal("owner not found in d.owners after FR-8 fallback (polled 2s)")
+	// Structural log assertions replace the d.owners poll (which races with
+	// OnUpstreamExit on fast schedulers — see F80-4 and the happy-path fix
+	// above). On the FR-8 fallback path the daemon logs exactly the markers
+	// we assert below; the ephemeral d.owners entry is irrelevant to the
+	// contract this test verifies.
+	logs := logBuf.String()
+
+	// Positive: legacy spawn path.
+	wantLegacy := "snapshot: restored owner " + sid[:8]
+	if !strings.Contains(logs, wantLegacy) {
+		t.Errorf("expected log %q (legacy restore marker), not found.\nLogs:\n%s",
+			wantLegacy, logs)
 	}
 
-	// Owner must NOT have been reattached via handoff (socket was unreachable).
-	status := entry.Owner.Status()
-	classSource, _ := status["classification_source"].(string)
-	if classSource == "handoff" {
-		t.Error("classification_source = 'handoff' but socket was unreachable; expected legacy path")
+	// Positive: handoff receive failed, falling back.
+	if !strings.Contains(logs, "handoff.receive.fail") {
+		t.Errorf("expected %q in logs (FR-8 trigger), not found.\nLogs:\n%s",
+			"handoff.receive.fail", logs)
+	}
+
+	// Negative: handoff reattach must NOT have happened.
+	dontWantHandoff := "snapshot: reattached owner " + sid[:8] + " from handoff"
+	if strings.Contains(logs, dontWantHandoff) {
+		t.Errorf("did not expect %q (socket was unreachable, handoff must fail).\nLogs:\n%s",
+			dontWantHandoff, logs)
 	}
 }
 
