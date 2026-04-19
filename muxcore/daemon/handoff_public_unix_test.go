@@ -68,13 +68,19 @@ func TestPerformHandoff_PublicAPI(t *testing.T) {
 		serverCh <- serverOut{result: result, err: err}
 	}()
 
-	// Give the listener a moment to bind before dialing.
-	time.Sleep(50 * time.Millisecond)
-
 	// Client (new-daemon side): dial + ReceiveHandoff via PUBLIC API.
-	newConn, err := dialHandoffUnix(socketPath, 2*time.Second)
+	// Retry loop eliminates the flaky time.Sleep "wait for listener" pattern
+	// and tolerates up to 100ms of bind latency on slow CI runners.
+	var newConn fdConn
+	for i := 0; i < 10; i++ {
+		newConn, err = dialHandoffUnix(socketPath, 2*time.Second)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err != nil {
-		t.Fatalf("dialHandoffUnix: %v", err)
+		t.Fatalf("dialHandoffUnix after 10 retries: %v", err)
 	}
 	defer newConn.Close()
 

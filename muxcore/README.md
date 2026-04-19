@@ -26,8 +26,9 @@ import (
     "github.com/thebtf/mcp-mux/muxcore/daemon"
 )
 
-// Predecessor (old daemon) — called after accepting a connection from the successor:
-func predecessor(conn *net.UnixConn, token string, upstreams []daemon.HandoffUpstream) {
+// Predecessor (old daemon) — called after accepting a connection from the successor.
+// `conn` must be a *net.UnixConn on Unix or a *winio named-pipe conn on Windows.
+func predecessor(conn net.Conn, token string, upstreams []daemon.HandoffUpstream) {
     result, err := daemon.PerformHandoff(context.Background(), conn, token, upstreams)
     if err != nil {
         // ErrTokenMismatch, ErrProtocolVersionMismatch, or transport error
@@ -38,8 +39,9 @@ func predecessor(conn *net.UnixConn, token string, upstreams []daemon.HandoffUps
     _ = result
 }
 
-// Successor (new daemon) — called after dialing the predecessor's handoff socket:
-func successor(conn *net.UnixConn, token string) {
+// Successor (new daemon) — called after dialing the predecessor's handoff socket.
+// `conn` must be a *net.UnixConn on Unix or a *winio named-pipe conn on Windows.
+func successor(conn net.Conn, token string) {
     upstreams, err := daemon.ReceiveHandoff(context.Background(), conn, token)
     if err != nil {
         return
