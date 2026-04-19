@@ -87,7 +87,11 @@ func closeUpstreamJob(job windows.Handle) {
 // On failure, logs a warning but does not abort — upstream still runs
 // without the custom job (graceful degradation per AC8).
 func afterSpawnWindows(p *Process, pid int) {
-	handle, err := windows.OpenProcess(windows.PROCESS_ALL_ACCESS, false, uint32(pid))
+	// F75-11: least privilege — AssignProcessToJobObject requires only
+	// PROCESS_SET_QUOTA and PROCESS_TERMINATE (MSDN), NOT PROCESS_ALL_ACCESS.
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		false, uint32(pid))
 	if err != nil {
 		log.Printf("[upstream] WARNING: OpenProcess pid=%d for job assignment: %v", pid, err)
 		return

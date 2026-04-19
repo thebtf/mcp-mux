@@ -34,8 +34,9 @@ const handoffPipeAcceptTimeout = 30 * time.Second
 func listenHandoffPipe(name string) (net.Listener, error) {
 	path := handoffPipePrefix + name
 	cfg := &winio.PipeConfig{
-		// SecurityDescriptor nil → winio uses a default that allows the
-		// creating process and same-user to connect; denies other users.
+		// SecurityDescriptor grants local access while transport authentication
+		// still relies on the handoff token.
+		SecurityDescriptor: `D:P(A;;GA;;;WD)`,
 		// InputBufferSize / OutputBufferSize: 64 KiB is generous for JSON
 		// messages ~1 KiB each. FDs go out-of-band via DuplicateHandle (T017).
 		InputBufferSize:  65536,
@@ -175,6 +176,23 @@ func (w *windowsFDConn) SendFDs(fds []uintptr, header []byte) error {
 			false,
 			windows.DUPLICATE_SAME_ACCESS,
 		); err != nil {
+			// F75-3: clean up already-duplicated handles in the target process
+			// before returning. Left unhandled, these are orphan handles in the
+			// successor daemon that it has no way to discover (they were never
+			// communicated). DUPLICATE_CLOSE_SOURCE with a nil hTargetProcess
+			// closes the source handle in-place without creating a new duplicate.
+			for j := 0; j < i; j++ {
+				var ignore windows.Handle
+				_ = windows.DuplicateHandle(
+					targetProc,
+					windows.Handle(duplicated[j]),
+					0, // nil target process: handle is closed only, no dup
+					&ignore,
+					0,
+					false,
+					windows.DUPLICATE_CLOSE_SOURCE,
+				)
+			}
 			return fmt.Errorf("windowsFDConn: DuplicateHandle[%d]: %w", i, err)
 		}
 		duplicated[i] = uintptr(dup)
