@@ -102,8 +102,9 @@ type Process struct {
 	// with the spawn goroutine's internal reads/writes on the same file
 	// (observed on CI ubuntu -race: TestDetach_DoubleDetach). Caching at
 	// spawn time eliminates the race.
-	stdinFD  uintptr
-	stdoutFD uintptr
+	stdinFD   uintptr
+	stdoutFD  uintptr
+	jobHandle uintptr // Windows: per-upstream Job Object handle (0 on non-Windows or if creation failed)
 
 	lineBuf *lineBuffer
 
@@ -231,6 +232,10 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// Scanner then sees EOF naturally. Without this close, the pipe never
 	// reaches EOF because one writer (us) remains open forever.
 	_ = stdoutW.Close()
+
+	// Windows: assign upstream to its own Job Object for per-process kill
+	// semantics (C1). No-op on non-Windows (see spawn_other.go).
+	afterSpawnWindows(p, proc.PID())
 
 	p.proc = proc
 	p.lineBuf = newLineBuffer()
