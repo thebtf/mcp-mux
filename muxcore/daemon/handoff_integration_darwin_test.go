@@ -26,6 +26,12 @@ func TestHandoffDarwin_Successor(t *testing.T) {
 	}
 	token := os.Getenv("DAEMON_HANDOFF_SUCCESSOR_TOKEN")
 
+	// Hold briefly so the parent has a window to snapshot our PGID before
+	// we exit. Without this, the json.Decoder read path completes handoff
+	// so fast that the successor process disappears before the parent's
+	// syscall.Getpgid fires (observed on macos-latest CI under Go 1.25.9).
+	time.Sleep(300 * time.Millisecond)
+
 	// Dial the socket opened by the parent (old daemon side).
 	conn, err := dialHandoffUnix(socketPath, 5*time.Second)
 	if err != nil {
