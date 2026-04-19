@@ -335,24 +335,38 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners, want 2 (sid1 via handoff, sid2 via legacy)", restored)
 	}
 
-	// Poll both entries (async supervisor insertion — see F80-1).
+	// Capture each entry independently. sid2 goes through the legacy spawn
+	// path with "echo two" which exits after ~1ms — onUpstreamExit fires
+	// and removes d.owners[sid2] almost immediately. Requiring both owners
+	// to be visible in the SAME poll iteration would race on fast macOS
+	// scheduling (sid2 is already gone by the time sid1 is observed).
+	// Capture each pointer once when it first appears; the Owner struct
+	// survives subsequent removal from the map so Status() is still safe.
 	var entry1, entry2 *OwnerEntry
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		d.mu.RLock()
-		entry1 = d.owners[sid1]
-		entry2 = d.owners[sid2]
+		if entry1 == nil {
+			if e := d.owners[sid1]; e != nil && e.Owner != nil {
+				entry1 = e
+			}
+		}
+		if entry2 == nil {
+			if e := d.owners[sid2]; e != nil && e.Owner != nil {
+				entry2 = e
+			}
+		}
 		d.mu.RUnlock()
-		if entry1 != nil && entry1.Owner != nil && entry2 != nil && entry2.Owner != nil {
+		if entry1 != nil && entry2 != nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if entry1 == nil || entry1.Owner == nil {
-		t.Fatal("sid1 not found in d.owners after partial handoff (polled 2s)")
+	if entry1 == nil {
+		t.Fatal("sid1 never appeared in d.owners after partial handoff (polled 2s)")
 	}
-	if entry2 == nil || entry2.Owner == nil {
-		t.Fatal("sid2 not found in d.owners after partial handoff (polled 2s)")
+	if entry2 == nil {
+		t.Fatal("sid2 never appeared in d.owners after partial handoff (polled 2s)")
 	}
 
 	// sid1: transferred via handoff → classification_source == "handoff"
