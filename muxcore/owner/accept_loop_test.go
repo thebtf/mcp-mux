@@ -178,12 +178,15 @@ func TestAcceptLoop_ConcurrentTokenMix(t *testing.T) {
 		}
 	})
 
-	waitForCondition(t, 200*time.Millisecond, func() bool {
+	waitForCondition(t, 500*time.Millisecond, func() bool {
 		return sessionCount(o) == n
 	}, "10 valid connections should be accepted")
 
-	rejections := strings.Count(logBuffer.String(), "accept: rejected connection")
-	if rejections != n {
-		t.Fatalf("reject log entries: got %d, want %d; logs: %q", rejections, n, logBuffer.String())
-	}
+	// Rejections are processed by async goroutines in the accept loop; poll
+	// the log buffer instead of sampling it once. Without this, the test was
+	// flaky on slower CI runners (observed as TestAcceptLoop_ConcurrentTokenMix
+	// "reject log entries: got <10" on Windows/coverage jobs).
+	waitForCondition(t, 500*time.Millisecond, func() bool {
+		return strings.Count(logBuffer.String(), "accept: rejected connection") == n
+	}, fmt.Sprintf("want %d reject log entries", n))
 }

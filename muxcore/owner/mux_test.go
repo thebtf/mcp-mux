@@ -145,9 +145,32 @@ func TestOwnerMultipleSessions(t *testing.T) {
 	sendReq(t, c1W, 1, "tools/call", `{"name":"echo","arguments":{"message":"from-session1"}}`)
 	sendReq(t, c2W, 1, "tools/call", `{"name":"echo","arguments":{"message":"from-session2"}}`)
 
-	// Each session should get the correct response with id=1
-	resp1 := readResp(t, c1R)
-	resp2 := readResp(t, c2R)
+	// Each session should get the correct response with id=1.
+	// Read both pipes in parallel so a routing race between the two sessions
+	// cannot hang the test for readRespTimeout (180s) on a single blocked
+	// read. Each goroutine owns its pipe and reports via channel; main
+	// goroutine waits for both with an outer timeout.
+	type readOut struct {
+		b   []byte
+		err error
+	}
+	r1Ch := make(chan readOut, 1)
+	r2Ch := make(chan readOut, 1)
+	go func() { r1Ch <- readOut{b: readResp(t, c1R)} }()
+	go func() { r2Ch <- readOut{b: readResp(t, c2R)} }()
+	var resp1, resp2 []byte
+	outer := time.NewTimer(30 * time.Second)
+	defer outer.Stop()
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-r1Ch:
+			resp1 = r.b
+		case r := <-r2Ch:
+			resp2 = r.b
+		case <-outer.C:
+			t.Fatalf("response timeout after 30s; resp1=%q resp2=%q", resp1, resp2)
+		}
+	}
 
 	assertResponseID(t, resp1, 1)
 	assertResponseID(t, resp2, 1)
@@ -486,14 +509,31 @@ func TestSamplingRequestRoutedToSession(t *testing.T) {
 	// to the client and wait for the client to respond before completing.
 	sendReq(t, clientW, 5, "tools/call", `{"name":"request_sampling","arguments":{}}`)
 
-	// The client should receive the sampling/createMessage request from the server
-	samplingReq := readResp(t, clientR)
+	// The client should receive the sampling/createMessage request from the
+	// server. Under -race on slower CI runners, messages can arrive in
+	// unexpected order (mock_server's scanner.Scan may time out before the
+	// test sends the response, causing the mock to emit the tool result
+	// before the sampling request is routed to the client). Read until we
+	// find the sampling request or time out via readResp's own deadline.
+	var samplingReq []byte
 	var samplingMsg map[string]json.RawMessage
-	if err := json.Unmarshal(samplingReq, &samplingMsg); err != nil {
-		t.Fatalf("unmarshal sampling request: %v", err)
+	var stashedToolResp []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		msg := readResp(t, clientR)
+		var peek map[string]json.RawMessage
+		if err := json.Unmarshal(msg, &peek); err != nil {
+			t.Fatalf("unmarshal peek: %v", err)
+		}
+		if string(peek["method"]) == `"sampling/createMessage"` {
+			samplingReq = msg
+			samplingMsg = peek
+			break
+		}
+		// Not sampling — must be an early tool response (id=5); stash for later.
+		stashedToolResp = msg
 	}
-	if string(samplingMsg["method"]) != `"sampling/createMessage"` {
-		t.Fatalf("expected sampling/createMessage, got: %s", string(samplingReq))
+	if samplingReq == nil {
+		t.Fatalf("never received sampling/createMessage (last message stashed: %s)", stashedToolResp)
 	}
 
 	// Client responds to the sampling request
@@ -506,8 +546,13 @@ func TestSamplingRequestRoutedToSession(t *testing.T) {
 		t.Fatalf("write sampling response: %v", err)
 	}
 
-	// Now the tool call result should arrive
-	toolResp := readResp(t, clientR)
+	// Now the tool call result should arrive (or has already arrived out of order above)
+	var toolResp []byte
+	if stashedToolResp != nil {
+		toolResp = stashedToolResp
+	} else {
+		toolResp = readResp(t, clientR)
+	}
 	assertResponseID(t, toolResp, 5)
 	var toolObj map[string]json.RawMessage
 	if err := json.Unmarshal(toolResp, &toolObj); err != nil {
