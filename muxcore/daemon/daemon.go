@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
@@ -110,6 +111,18 @@ type Daemon struct {
 	zombieDetectedRestore int
 
 	shutdownOnce sync.Once
+
+	// stats holds atomic handoff counters exposed via HandleStatus (NFR-4 / T025).
+	stats handoffStats
+}
+
+// handoffStats holds atomic counters for handoff lifecycle observability.
+// Fields are sync/atomic.Uint64 for lockless reads from HandleStatus.
+type handoffStats struct {
+	attempted   atomic.Uint64
+	transferred atomic.Uint64
+	aborted     atomic.Uint64
+	fallback    atomic.Uint64
 }
 
 // Config holds daemon startup parameters.
@@ -239,12 +252,17 @@ func New(cfg Config) (*Daemon, error) {
 // service failures, restarts, backoffs, and permanent failures. Logs them
 // for observability and debugging.
 func (d *Daemon) supervisorEventHook(event suture.Event) {
+	// classifyTermination maps the suture event to a TerminationCause for
+	// structured logging (FR-5 / T025). HintNone is used here because the hook
+	// only sees the event; callers like HandleGracefulRestart set hints via
+	// per-owner state before removing from the supervisor.
+	cause := classifyTermination(event, HintNone)
 	switch e := event.(type) {
 	case suture.EventServicePanic:
-		d.logger.Printf("supervisor: service %q PANIC: %v", e.ServiceName, e.PanicMsg)
+		d.logger.Printf("supervisor.terminated service=%q cause=%s panic=%v", e.ServiceName, cause, e.PanicMsg)
 	case suture.EventServiceTerminate:
-		d.logger.Printf("supervisor: service %q terminated: %v (restarting=%v)",
-			e.ServiceName, e.Err, e.Restarting)
+		d.logger.Printf("supervisor.terminated service=%q cause=%s err=%v restarting=%v",
+			e.ServiceName, cause, e.Err, e.Restarting)
 		if !e.Restarting {
 			// suture sets Restarting=false for both real failures
 			// (FailureThreshold exceeded, panic, ErrDoNotRestart) and clean
@@ -957,6 +975,8 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 //   - ErrProtocolVersionMismatch (binary skew — FR-6)
 //   - Any other performHandoff protocol error (conn drop, JSON decode failure)
 func (d *Daemon) attemptHandoff() error {
+	d.stats.attempted.Add(1)
+	startedAt := time.Now()
 	baseDir := os.TempDir()
 
 	// Write handoff token (FR-11). Token is deleted via defer on both paths.
@@ -969,6 +989,8 @@ func (d *Daemon) attemptHandoff() error {
 	// Compute socket path before starting the listener goroutine; the path
 	// is also passed to the successor via MCPMUX_HANDOFF_SOCKET.
 	socketPath := handoffSocketPath(baseDir)
+
+	d.logger.Printf("handoff.start socket=%s token_path=%s", socketPath, tokenPath)
 
 	// Start listening BEFORE spawning successor so the socket/pipe exists
 	// when the successor process starts and tries to dial. listenHandoff
@@ -1027,8 +1049,11 @@ func (d *Daemon) attemptHandoff() error {
 		return fmt.Errorf("protocol error: %w", err)
 	}
 
-	d.logger.Printf("handoff.complete: transferred=%v aborted=%v phase=%s",
-		result.Transferred, result.Aborted, result.Phase)
+	d.stats.transferred.Add(uint64(len(result.Transferred)))
+	d.stats.aborted.Add(uint64(len(result.Aborted)))
+	d.logger.Printf("handoff.complete transferred=%d aborted=%d phase=%s duration_ms=%d",
+		len(result.Transferred), len(result.Aborted), result.Phase,
+		time.Since(startedAt).Milliseconds())
 	return nil
 }
 
@@ -1049,6 +1074,7 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
 	// the fallback log line; callers never see a handoff error — FR-8 is silent
 	// to the control-plane caller (it still gets a valid snapshot path).
 	if handoffErr := d.attemptHandoff(); handoffErr != nil {
+		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
 
@@ -1094,6 +1120,12 @@ func (d *Daemon) HandleStatus() map[string]any {
 		"idle_timeout":             d.idleTimeout.String(),
 		"zombie_detections_spawn":  d.zombieDetectedSpawn,
 		"zombie_detections_restore": d.zombieDetectedRestore,
+		"handoff": map[string]any{
+			"attempted":   d.stats.attempted.Load(),
+			"transferred": d.stats.transferred.Load(),
+			"aborted":     d.stats.aborted.Load(),
+			"fallback":    d.stats.fallback.Load(),
+		},
 	}
 }
 
