@@ -3,8 +3,8 @@
 package daemon
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"syscall"
@@ -14,13 +14,24 @@ import (
 )
 
 // unixFDConn implements fdConn using an AF_UNIX socket with SCM_RIGHTS
-// ancillary messages for out-of-band FD transfer. Wire format for normal
-// messages: newline-delimited JSON over the data channel. FD transfer
-// messages carry SCM_RIGHTS ancillary data alongside a header on the data
-// channel within the same Sendmsg call (atomic delivery).
+// ancillary messages for out-of-band FD transfer.
+//
+// Read path uses raw Recvmsg (via SyscallConn) for ALL reads — both JSON
+// messages AND FD transfers. Mixing bufio.Reader with raw Recvmsg causes
+// the bufio layer to read ahead into bytes that belong to subsequent
+// SCM_RIGHTS datagrams, corrupting the stream. Buffer leftovers (bytes
+// received past a newline on a JSON read) are cached in rbuf for the
+// next call.
+//
+// Write path uses raw Sendmsg for FD transfer only; plain Write for JSON
+// (the runtime poller serialises plain Writes, which is fine since they
+// never carry ancillary data).
 type unixFDConn struct {
 	conn *net.UnixConn
-	br   *bufio.Reader
+	// rbuf holds bytes that arrived past the end of the last JSON line —
+	// either a partial next message, or the 1-byte sentinel attached to
+	// an SCM_RIGHTS datagram. Consumed first by ReadJSON / RecvFDs.
+	rbuf []byte
 }
 
 // newUnixFDConn wraps an existing *net.UnixConn. Caller owns the lifetime.
@@ -45,22 +56,64 @@ func (u *unixFDConn) WriteJSON(v any) error {
 	return nil
 }
 
-// ReadJSON reads one newline-delimited JSON message from the connection.
-// Lazy-initialises a bufio.Reader on first call; the reader is cached for
-// subsequent reads on the same connection.
-func (u *unixFDConn) ReadJSON(v any) error {
-	if u.br == nil {
-		u.br = bufio.NewReader(u.conn)
-	}
-	line, err := u.br.ReadBytes('\n')
+// recvmsgOnce runs a single syscall.Recvmsg inside raw.Read, handling
+// EAGAIN correctly (returning false from the callback tells the poller
+// to wait for readability, then invoke the callback again). Returns
+// (dataN, oobN, err) where err is the final syscall error, if any, after
+// all EAGAIN retries completed.
+func (u *unixFDConn) recvmsgOnce(dataBuf, oobBuf []byte) (int, int, error) {
+	raw, err := u.conn.SyscallConn()
 	if err != nil {
-		return fmt.Errorf("unixFDConn: read line: %w", err)
+		return 0, 0, fmt.Errorf("unixFDConn: syscall conn: %w", err)
 	}
-	line = line[:len(line)-1] // strip trailing newline
-	if err := json.Unmarshal(line, v); err != nil {
-		return fmt.Errorf("unixFDConn: unmarshal %q: %w", line, err)
+	var dataN, oobN int
+	var rerr error
+	err = raw.Read(func(fd uintptr) bool {
+		n, oobn, _, _, e := syscall.Recvmsg(int(fd), dataBuf, oobBuf, 0)
+		if errors.Is(e, syscall.EAGAIN) || errors.Is(e, syscall.EWOULDBLOCK) {
+			return false // not ready — poller will re-invoke when readable
+		}
+		dataN, oobN, rerr = n, oobn, e
+		return true
+	})
+	if err != nil {
+		return 0, 0, fmt.Errorf("unixFDConn: raw read: %w", err)
 	}
-	return nil
+	return dataN, oobN, rerr
+}
+
+// ReadJSON reads one newline-delimited JSON message via raw Recvmsg.
+// Buffers any bytes past the newline into u.rbuf for subsequent calls.
+func (u *unixFDConn) ReadJSON(v any) error {
+	const chunk = 4096
+	for {
+		if i := indexNewline(u.rbuf); i >= 0 {
+			line := u.rbuf[:i]
+			u.rbuf = append(u.rbuf[:0], u.rbuf[i+1:]...) // shift remainder to front
+			if err := json.Unmarshal(line, v); err != nil {
+				return fmt.Errorf("unixFDConn: unmarshal %q: %w", line, err)
+			}
+			return nil
+		}
+		buf := make([]byte, chunk)
+		n, _, err := u.recvmsgOnce(buf, nil)
+		if err != nil {
+			return fmt.Errorf("unixFDConn: read: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("unixFDConn: read: unexpected EOF (rbuf=%d)", len(u.rbuf))
+		}
+		u.rbuf = append(u.rbuf, buf[:n]...)
+	}
+}
+
+func indexNewline(b []byte) int {
+	for i, c := range b {
+		if c == '\n' {
+			return i
+		}
+	}
+	return -1
 }
 
 // SendFDs transfers a slice of OS file descriptors out-of-band via SCM_RIGHTS.
@@ -114,11 +167,16 @@ func (u *unixFDConn) SendFDs(fds []uintptr, header []byte) error {
 }
 
 // RecvFDs receives file descriptors transferred via SCM_RIGHTS ancillary data
-// and returns the received FDs, the raw header bytes from the data channel, and
-// any error. Sized for up to 4 FDs (matching SendFDs expectations).
+// and returns the received FDs, the data-channel header bytes, and any error.
+// Sized for up to 4 FDs (matching SendFDs expectations).
+//
+// Because ReadJSON may have read ahead past its newline into bytes that belong
+// to the SCM_RIGHTS datagram's data portion, those buffered bytes (u.rbuf) are
+// consumed first — THEN a raw Recvmsg reads the ancillary-bearing datagram
+// (whose data portion may be a zero-or-one-byte sentinel per POSIX).
 //
 // Truncation: any failure in ParseSocketControlMessage or ParseUnixRights is
-// returned as an error — partial FD transfer is never silently accepted because
+// returned as an error — partial FD transfer is never silently accepted, since
 // it would leak FDs on the sender side.
 func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 	// OOB buffer sized for up to 4 FDs. syscall.CmsgSpace accounts for the
@@ -128,26 +186,18 @@ func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 	hdrBuf := make([]byte, 4096)
 	oobBuf := make([]byte, oobBufSize)
 
-	raw, err := u.conn.SyscallConn()
-	if err != nil {
-		return nil, nil, fmt.Errorf("unixFDConn: syscall conn: %w", err)
+	dataN, oobN, rerr := u.recvmsgOnce(hdrBuf, oobBuf)
+	if rerr != nil {
+		return nil, nil, fmt.Errorf("unixFDConn: recvmsg: %w", rerr)
 	}
 
-	var readN, oobN int
-	var readErr error
-	err = raw.Read(func(fd uintptr) bool {
-		n, oobn, _, _, e := syscall.Recvmsg(int(fd), hdrBuf, oobBuf, 0)
-		readN = n
-		oobN = oobn
-		readErr = e
-		return true
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("unixFDConn: raw read: %w", err)
+	// Prepend any leftover bytes buffered by a prior ReadJSON.
+	var combined []byte
+	if len(u.rbuf) > 0 {
+		combined = append(combined, u.rbuf...)
+		u.rbuf = u.rbuf[:0]
 	}
-	if readErr != nil {
-		return nil, nil, fmt.Errorf("unixFDConn: recvmsg: %w", readErr)
-	}
+	combined = append(combined, hdrBuf[:dataN]...)
 
 	msgs, err := syscall.ParseSocketControlMessage(oobBuf[:oobN])
 	if err != nil {
@@ -168,7 +218,7 @@ func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 		}
 	}
 
-	return fds, hdrBuf[:readN], nil
+	return fds, combined, nil
 }
 
 // Close releases the underlying socket.
