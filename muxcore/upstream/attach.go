@@ -15,7 +15,7 @@ import (
 //
 // pid is stored as spawnPgid for observability; on Unix it equals the upstream's
 // process group ID (post-Setpgid guarantee). On Windows spawnPgid is not used
-// for job management — passing 0 is acceptable there, but a real PID is preferred.
+// for job management.
 //
 // command is stored for status/logging only and does not affect behavior.
 //
@@ -24,7 +24,10 @@ import (
 // closed). There is no proc.Wait() — AttachFromFDs does not own the process
 // lifecycle and will not signal or wait for it.
 //
-// Returns an error if pid <= 0, stdinFD == 0, or stdoutFD == 0.
+// Returns an error if pid <= 0 (no handoff transfers PID 0 — Linux reserves it
+// for "no process" and Windows' PID 0 is the System Idle Process), if stdinFD
+// or stdoutFD is zero (the stdio contract never transfers fd 0/1/2), or if
+// os.NewFile rejects the handle.
 func AttachFromFDs(pid int, stdinFD, stdoutFD uintptr, command string) (*Process, error) {
 	if pid <= 0 {
 		return nil, errors.New("upstream: AttachFromFDs: pid must be > 0")
@@ -38,6 +41,9 @@ func AttachFromFDs(pid int, stdinFD, stdoutFD uintptr, command string) (*Process
 
 	stdinFile := os.NewFile(stdinFD, fmt.Sprintf("upstream-stdin-%d", pid))
 	stdoutFile := os.NewFile(stdoutFD, fmt.Sprintf("upstream-stdout-%d", pid))
+	if stdinFile == nil || stdoutFile == nil {
+		return nil, fmt.Errorf("upstream: AttachFromFDs: os.NewFile rejected handle (stdinFD=%d stdoutFD=%d)", stdinFD, stdoutFD)
+	}
 
 	p := &Process{
 		stdin:      stdinFile,

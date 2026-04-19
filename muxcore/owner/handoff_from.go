@@ -100,6 +100,8 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	// Apply cached classification if provided — skip the classify round-trip.
 	if cfg.CachedClassification != "" {
 		o.autoClassification = cfg.CachedClassification
+		o.classificationSource = "handoff"
+		o.classificationReason = nil
 		o.classifiedOnce.Do(func() { close(o.classified) })
 	}
 
@@ -126,11 +128,30 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	go o.acceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 
-	// Upstream exit detection is handled by the daemon supervisor (suture)
-	// via Owner.Serve()/upstreamDeadCh — identical path used by NewOwner.
-	// No dedicated monitoring goroutine needed here: a redundant one would
-	// leak in tests that use handler-based stubs (handler never signals
-	// proc.Done until context cancelled).
+	// Monitor upstream exit. Attached processes are NOT managed by suture
+	// (NewOwnerFromHandoff bypasses Serve()), so we need our own watcher.
+	// Select between proc.Done (real exit) and o.done (owner shutdown) so the
+	// goroutine never leaks in tests that use handler-based stubs whose
+	// proc.Done only closes via context cancellation.
+	go func() {
+		select {
+		case <-proc.Done:
+			logger.Printf("handoff upstream exited (pid=%d, cmd=%s): %v", payload.PID, payload.Command, proc.ExitErr)
+			o.initReadyOnce.Do(func() {
+				if o.initReady != nil {
+					close(o.initReady)
+				}
+			})
+			if o.onUpstreamExit != nil {
+				o.onUpstreamExit(o.serverID)
+			} else {
+				o.Shutdown()
+			}
+		case <-o.done:
+			// Owner shutdown — bail without touching initReady or onUpstreamExit.
+			return
+		}
+	}()
 
 	logger.Printf("owner reattached from handoff (pid=%d, server=%s)", payload.PID, srvID)
 	return o, nil
