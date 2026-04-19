@@ -115,8 +115,14 @@ func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []
 			aborted = append(aborted, u.ServerID)
 			continue
 		}
-		// Transfer FDs out-of-band.
-		if err := conn.SendFDs([]uintptr{u.StdinFD, u.StdoutFD}, nil); err != nil {
+		// Transfer FDs out-of-band. POSIX SCM_RIGHTS on SOCK_STREAM requires
+		// at least 1 data byte alongside the OOB control message — Linux is
+		// lenient with 0-byte data but macOS/BSD reject. Send a single
+		// sentinel byte (0x00) for wire-portability. Receiver ignores the
+		// byte (RecvFDs returns it in `header` but callers do not use it
+		// here; the actual FdTransferMsg metadata was sent via WriteJSON
+		// above).
+		if err := conn.SendFDs([]uintptr{u.StdinFD, u.StdoutFD}, []byte{0}); err != nil {
 			// Drain the AckTransfer the successor may send (best-effort).
 			var ack AckTransferMsg
 			_ = conn.ReadJSON(&ack)
