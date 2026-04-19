@@ -94,3 +94,99 @@ func TestSendFDs_EmptyFDs(t *testing.T) {
 		t.Fatal("SendFDs with empty fds should return error, got nil")
 	}
 }
+
+// TestRecvFDs_PairedWithSender completes the SCM_RIGHTS roundtrip —
+// sender from T009, receiver from T010, verifies the FD arrives valid.
+// AC4 guard: if RecvFDs returned nil, nil, nil unconditionally, len(fds)!=1
+// would fire and t.Fatalf would catch the broken implementation.
+func TestRecvFDs_PairedWithSender(t *testing.T) {
+	sender, receiver := socketpairUnixConn(t)
+
+	// Open a temp file; sender transfers its FD to receiver.
+	tmp, err := os.CreateTemp("", "scm-recv-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(tmp.Name()); _ = tmp.Close() })
+
+	content := []byte("hello from sender")
+	if _, err := tmp.Write(content); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- sender.SendFDs([]uintptr{tmp.Fd()}, []byte("header-bytes\n"))
+	}()
+
+	fds, header, err := receiver.RecvFDs()
+	if err != nil {
+		t.Fatalf("RecvFDs: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("SendFDs: %v", err)
+	}
+
+	if len(fds) != 1 {
+		t.Fatalf("expected 1 fd, got %d", len(fds))
+	}
+	if string(header) != "header-bytes\n" {
+		t.Errorf("header mismatch: %q", header)
+	}
+
+	// Verify the received FD is a valid, readable duplicate of the temp file.
+	received := os.NewFile(fds[0], "received")
+	defer received.Close()
+	if _, err := received.Seek(0, 0); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+	got := make([]byte, len(content))
+	if _, err := received.Read(got); err != nil {
+		t.Fatalf("read via received fd: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("received fd content %q != sent content %q", got, content)
+	}
+}
+
+// TestRecvFDs_TripleRoundtrip sends + receives 3 FDs in a single SCM_RIGHTS
+// message and verifies the count. AC4 guard: if RecvFDs returned nil FDs,
+// len(recv)!=3 fires immediately.
+func TestRecvFDs_TripleRoundtrip(t *testing.T) {
+	sender, receiver := socketpairUnixConn(t)
+	files := make([]*os.File, 3)
+	fds := make([]uintptr, 3)
+	for i := range files {
+		f, err := os.CreateTemp("", "scm-triple-*.tmp")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fi := f
+		t.Cleanup(func() { _ = os.Remove(fi.Name()); _ = fi.Close() })
+		files[i] = f
+		fds[i] = f.Fd()
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- sender.SendFDs(fds, []byte("triple\n")) }()
+
+	recv, header, err := receiver.RecvFDs()
+	if err != nil {
+		t.Fatalf("RecvFDs: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("SendFDs: %v", err)
+	}
+
+	if len(recv) != 3 {
+		t.Fatalf("expected 3 fds, got %d", len(recv))
+	}
+	if string(header) != "triple\n" {
+		t.Errorf("header: %q", header)
+	}
+
+	// Clean up the duplicated FDs on the receiver side.
+	for _, f := range recv {
+		_ = syscall.Close(int(f))
+	}
+}

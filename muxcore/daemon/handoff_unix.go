@@ -3,8 +3,8 @@
 package daemon
 
 import (
+	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"syscall"
@@ -17,6 +17,7 @@ import (
 // channel within the same Sendmsg call (atomic delivery).
 type unixFDConn struct {
 	conn *net.UnixConn
+	br   *bufio.Reader
 }
 
 // newUnixFDConn wraps an existing *net.UnixConn. Caller owns the lifetime.
@@ -41,9 +42,22 @@ func (u *unixFDConn) WriteJSON(v any) error {
 	return nil
 }
 
-// ReadJSON is not yet implemented; T010 will provide the full implementation.
+// ReadJSON reads one newline-delimited JSON message from the connection.
+// Lazy-initialises a bufio.Reader on first call; the reader is cached for
+// subsequent reads on the same connection.
 func (u *unixFDConn) ReadJSON(v any) error {
-	return errors.New("unixFDConn: ReadJSON not yet implemented; T010")
+	if u.br == nil {
+		u.br = bufio.NewReader(u.conn)
+	}
+	line, err := u.br.ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("unixFDConn: read line: %w", err)
+	}
+	line = line[:len(line)-1] // strip trailing newline
+	if err := json.Unmarshal(line, v); err != nil {
+		return fmt.Errorf("unixFDConn: unmarshal %q: %w", line, err)
+	}
+	return nil
 }
 
 // SendFDs transfers a slice of OS file descriptors out-of-band via SCM_RIGHTS.
@@ -96,9 +110,62 @@ func (u *unixFDConn) SendFDs(fds []uintptr, header []byte) error {
 	return nil
 }
 
-// RecvFDs is not yet implemented; T010 will provide the full implementation.
+// RecvFDs receives file descriptors transferred via SCM_RIGHTS ancillary data
+// and returns the received FDs, the raw header bytes from the data channel, and
+// any error. Sized for up to 4 FDs (matching SendFDs expectations).
+//
+// Truncation: any failure in ParseSocketControlMessage or ParseUnixRights is
+// returned as an error — partial FD transfer is never silently accepted because
+// it would leak FDs on the sender side.
 func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
-	return nil, nil, errors.New("unixFDConn: RecvFDs not yet implemented; T010")
+	// OOB buffer sized for up to 4 FDs. syscall.CmsgSpace accounts for the
+	// cmsg header and alignment padding; 4 * 4 covers 4 int-sized FDs.
+	const maxFDs = 4
+	oobBufSize := syscall.CmsgSpace(maxFDs * 4)
+	hdrBuf := make([]byte, 4096)
+	oobBuf := make([]byte, oobBufSize)
+
+	raw, err := u.conn.SyscallConn()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unixFDConn: syscall conn: %w", err)
+	}
+
+	var readN, oobN int
+	var readErr error
+	err = raw.Read(func(fd uintptr) bool {
+		n, oobn, _, _, e := syscall.Recvmsg(int(fd), hdrBuf, oobBuf, 0)
+		readN = n
+		oobN = oobn
+		readErr = e
+		return true
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("unixFDConn: raw read: %w", err)
+	}
+	if readErr != nil {
+		return nil, nil, fmt.Errorf("unixFDConn: recvmsg: %w", readErr)
+	}
+
+	msgs, err := syscall.ParseSocketControlMessage(oobBuf[:oobN])
+	if err != nil {
+		return nil, nil, fmt.Errorf("unixFDConn: parse oob: %w", err)
+	}
+
+	var fds []uintptr
+	for _, m := range msgs {
+		if m.Header.Level != syscall.SOL_SOCKET || m.Header.Type != syscall.SCM_RIGHTS {
+			continue // unknown cmsg level/type — skip safely
+		}
+		rights, perr := syscall.ParseUnixRights(&m)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("unixFDConn: parse rights: %w", perr)
+		}
+		for _, f := range rights {
+			fds = append(fds, uintptr(f))
+		}
+	}
+
+	return fds, hdrBuf[:readN], nil
 }
 
 // Close releases the underlying socket.
