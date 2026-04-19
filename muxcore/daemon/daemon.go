@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -870,14 +871,187 @@ func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
 	return "daemon shutting down"
 }
 
+// handoffAcceptTimeout is the maximum time the old daemon waits for the
+// successor daemon to dial the handoff socket. Declared as var so tests can
+// override it without recompiling with build tags.
+var handoffAcceptTimeout = 30 * time.Second
+
+// handoffTotalTimeout is the maximum time allocated to the entire performHandoff
+// protocol exchange (hello/ready/transfer/done/ack sequence). Declared as var
+// for the same test-override reason as handoffAcceptTimeout.
+var handoffTotalTimeout = 30 * time.Second
+
+// spawnSuccessor forks the current binary as a detached background process,
+// injecting MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET so the successor
+// daemon can locate the handoff socket and authenticate (FR-11). The caller does
+// NOT wait for the process — it runs independently and will dial back.
+func spawnSuccessor(tokenPath, socketPath string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("handoff: resolve executable: %w", err)
+	}
+	cmd := exec.Command(exe, "--daemon")
+	cmd.Env = append(os.Environ(),
+		"MCPMUX_HANDOFF_TOKEN_PATH="+tokenPath,
+		"MCPMUX_HANDOFF_SOCKET="+socketPath,
+	)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	// setSuccessorDetached is platform-specific (handoff_socket_unix.go / _windows.go).
+	// It mirrors engine.setDetached; importing engine from daemon would be a cycle.
+	setSuccessorDetached(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("handoff: spawn successor: %w", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		return fmt.Errorf("handoff: release successor: %w", err)
+	}
+	return nil
+}
+
+// collectHandoffUpstreams calls ShutdownForHandoff on every live owner and
+// returns the HandoffUpstream list. Owners that fail to detach are logged and
+// skipped; per-upstream atomicity (FR-7) is enforced inside performHandoff.
+// Must NOT hold d.mu while calling ShutdownForHandoff (it may block).
+func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
+	d.mu.RLock()
+	entries := make([]*OwnerEntry, 0, len(d.owners))
+	for _, e := range d.owners {
+		if e.Owner != nil {
+			entries = append(entries, e)
+		}
+	}
+	d.mu.RUnlock()
+
+	var upstreams []HandoffUpstream
+	for _, e := range entries {
+		payload, err := e.Owner.ShutdownForHandoff()
+		if err != nil {
+			d.logger.Printf("handoff: owner %s ShutdownForHandoff error: %v (skipping)",
+				e.ServerID[:8], err)
+			continue
+		}
+		upstreams = append(upstreams, HandoffUpstream{
+			ServerID: payload.ServerID,
+			Command:  payload.Command,
+			PID:      payload.PID,
+			StdinFD:  payload.StdinFD,
+			StdoutFD: payload.StdoutFD,
+		})
+	}
+	return upstreams
+}
+
+// attemptHandoff runs the old-daemon side of the two-daemon handoff protocol.
+// Returns nil if the protocol completed (transferred or FR-7 per-upstream abort).
+// Returns non-nil on any protocol-level failure — the caller logs "handoff.fallback"
+// and falls back to the legacy kill-and-respawn path (FR-8).
+//
+// FR-8 fallback trigger set (all route through the returned error):
+//   - Token write failure (crypto/rand unavailable, disk full, permission denied)
+//   - Socket bind / accept failure (path collision, permission denied)
+//   - Accept timeout exceeded (successor never connected)
+//   - Successor spawn failure (os.Executable error, exec.Start error)
+//   - ErrTokenMismatch (successor presented wrong token — FR-11)
+//   - ErrProtocolVersionMismatch (binary skew — FR-6)
+//   - Any other performHandoff protocol error (conn drop, JSON decode failure)
+func (d *Daemon) attemptHandoff() error {
+	baseDir := os.TempDir()
+
+	// Write handoff token (FR-11). Token is deleted via defer on both paths.
+	token, tokenPath, err := writeHandoffToken(baseDir)
+	if err != nil {
+		return fmt.Errorf("write token: %w", err)
+	}
+	defer deleteHandoffToken(tokenPath) //nolint:errcheck
+
+	// Compute socket path before starting the listener goroutine; the path
+	// is also passed to the successor via MCPMUX_HANDOFF_SOCKET.
+	socketPath := handoffSocketPath(baseDir)
+
+	// Start listening BEFORE spawning successor so the socket/pipe exists
+	// when the successor process starts and tries to dial. listenHandoff
+	// blocks until accept OR timeout — must run in a goroutine.
+	type connResult struct {
+		conn fdConn
+		err  error
+	}
+	connCh := make(chan connResult, 1)
+	go func() {
+		conn, err := listenHandoff(socketPath, handoffAcceptTimeout)
+		connCh <- connResult{conn, err}
+	}()
+
+	// Spawn successor with handoff credentials.
+	if spawnErr := spawnSuccessor(tokenPath, socketPath); spawnErr != nil {
+		// Do NOT drain connCh here — the listener goroutine will self-terminate
+		// once handoffAcceptTimeout expires (buffered channel prevents goroutine
+		// leak; the accepted conn, if any arrives despite the spawn failure, is
+		// closed when connCh is garbage-collected after nobody reads it).
+		return fmt.Errorf("spawn successor: %w", spawnErr)
+	}
+
+	// Wait for successor to connect (or timeout to expire).
+	cr := <-connCh
+	if cr.err != nil {
+		return fmt.Errorf("accept: %w", cr.err)
+	}
+	conn := cr.conn
+	defer conn.Close() //nolint:errcheck
+
+	// Collect HandoffUpstream list by detaching all live owners.
+	// ShutdownForHandoff detaches FDs from the Owner; they are no longer managed
+	// by any Owner after this call and must be closed explicitly by this function.
+	// Failing to close them would exhaust file descriptors and prevent upstreams
+	// from receiving EOF on their pipes if the handoff protocol fails.
+	upstreams := d.collectHandoffUpstreams()
+	defer func() {
+		for _, u := range upstreams {
+			if u.StdinFD > 2 {
+				_ = os.NewFile(u.StdinFD, "").Close()
+			}
+			if u.StdoutFD > 2 {
+				_ = os.NewFile(u.StdoutFD, "").Close()
+			}
+		}
+	}()
+
+	// Run handoff protocol with 30s deadline. The existing _ = ctx reservation
+	// in performHandoff (T009 integration) becomes meaningful here.
+	ctx, cancel := context.WithTimeout(context.Background(), handoffTotalTimeout)
+	defer cancel()
+
+	result, err := performHandoff(ctx, conn, token, upstreams)
+	if err != nil {
+		return fmt.Errorf("protocol error: %w", err)
+	}
+
+	d.logger.Printf("handoff.complete: transferred=%v aborted=%v phase=%s",
+		result.Transferred, result.Aborted, result.Phase)
+	return nil
+}
+
 // HandleGracefulRestart implements control.DaemonHandler.
-// Serializes state snapshot, then shuts down. The new daemon will load the snapshot
-// on startup and restore owners with pre-populated caches.
+// Serializes a state snapshot (used as FR-8 fallback seed and successor
+// cold-start seed), then attempts FD-passing handoff to the successor daemon
+// (FR-1/FR-2/FR-3). On any handoff failure the "handoff.fallback" log line is
+// emitted and the function falls through to legacy kill-and-respawn (FR-8).
 func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
+	// Serialize snapshot first — needed for FR-8 fallback and successor seed
+	// regardless of whether handoff succeeds.
 	snapshotPath, err := d.SerializeSnapshot()
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w", err)
 	}
+
+	// Attempt FD-passing handoff. Every identifiable failure mode routes through
+	// the fallback log line; callers never see a handoff error — FR-8 is silent
+	// to the control-plane caller (it still gets a valid snapshot path).
+	if handoffErr := d.attemptHandoff(); handoffErr != nil {
+		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
+	}
+
 	go d.Shutdown()
 	return snapshotPath, nil
 }
