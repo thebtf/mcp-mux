@@ -838,10 +838,10 @@ var handoffTotalTimeout = 30 * time.Second
 // injecting MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET so the successor
 // daemon can locate the handoff socket and authenticate (FR-11). The caller does
 // NOT wait for the process — it runs independently and will dial back.
-func spawnSuccessor(tokenPath, socketPath string) (*exec.Cmd, error) {
+func spawnSuccessor(tokenPath, socketPath string) error {
 	exe, err := os.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("handoff: resolve executable: %w", err)
+		return fmt.Errorf("handoff: resolve executable: %w", err)
 	}
 	cmd := exec.Command(exe, "--daemon")
 	cmd.Env = append(os.Environ(),
@@ -855,12 +855,12 @@ func spawnSuccessor(tokenPath, socketPath string) (*exec.Cmd, error) {
 	// It mirrors engine.setDetached; importing engine from daemon would be a cycle.
 	setSuccessorDetached(cmd)
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("handoff: spawn successor: %w", err)
+		return fmt.Errorf("handoff: spawn successor: %w", err)
 	}
 	if err := cmd.Process.Release(); err != nil {
-		return nil, fmt.Errorf("handoff: release successor: %w", err)
+		return fmt.Errorf("handoff: release successor: %w", err)
 	}
-	return cmd, nil
+	return nil
 }
 
 // collectHandoffUpstreams calls ShutdownForHandoff on every live owner and
@@ -937,7 +937,7 @@ func (d *Daemon) attemptHandoff() error {
 	}()
 
 	// Spawn successor with handoff credentials.
-	if _, spawnErr := spawnSuccessor(tokenPath, socketPath); spawnErr != nil {
+	if spawnErr := spawnSuccessor(tokenPath, socketPath); spawnErr != nil {
 		// Do NOT drain connCh here — the listener goroutine will self-terminate
 		// once handoffAcceptTimeout expires (buffered channel prevents goroutine
 		// leak; the accepted conn, if any arrives despite the spawn failure, is
@@ -954,7 +954,21 @@ func (d *Daemon) attemptHandoff() error {
 	defer conn.Close() //nolint:errcheck
 
 	// Collect HandoffUpstream list by detaching all live owners.
+	// ShutdownForHandoff detaches FDs from the Owner; they are no longer managed
+	// by any Owner after this call and must be closed explicitly by this function.
+	// Failing to close them would exhaust file descriptors and prevent upstreams
+	// from receiving EOF on their pipes if the handoff protocol fails.
 	upstreams := d.collectHandoffUpstreams()
+	defer func() {
+		for _, u := range upstreams {
+			if u.StdinFD > 2 {
+				_ = os.NewFile(u.StdinFD, "").Close()
+			}
+			if u.StdoutFD > 2 {
+				_ = os.NewFile(u.StdoutFD, "").Close()
+			}
+		}
+	}()
 
 	// Run handoff protocol with 30s deadline. The existing _ = ctx reservation
 	// in performHandoff (T009 integration) becomes meaningful here.

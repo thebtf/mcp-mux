@@ -5,6 +5,8 @@ package daemon
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -13,9 +15,14 @@ import (
 // handoffSocketPath returns a random named-pipe suffix for the handoff channel.
 // listenHandoffWindows prepends the \\.\pipe\mcp-mux-handoff- prefix.
 // Each graceful restart uses a fresh suffix to avoid stale-pipe conflicts.
+// Falls back to time+PID if crypto/rand is unavailable (extremely rare).
 func handoffSocketPath(_ string) string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// Crypto/rand unavailable — use time+PID as a deterministic fallback.
+		// Not cryptographically strong but still unique enough to avoid stale-pipe conflicts.
+		return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
 	return hex.EncodeToString(b)
 }
 
