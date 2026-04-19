@@ -5,7 +5,6 @@ package daemon
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -16,7 +15,17 @@ import (
 // calls the public wrappers instead of the private functions.
 func TestPerformHandoff_PublicAPI(t *testing.T) {
 	tmp := t.TempDir()
-	socketPath := filepath.Join(tmp, "handoff-pub.sock")
+	// macOS has a 104-byte unix socket path limit. t.TempDir() on darwin
+	// returns a ~90-byte path already. Use os.CreateTemp("", ...) so the
+	// socket lives in /tmp/ (short path).
+	sockFile, err := os.CreateTemp("", "handoff-pub-*.sock")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	socketPath := sockFile.Name()
+	_ = sockFile.Close()
+	_ = os.Remove(socketPath) // listenHandoffUnix creates the socket
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
 	token := "public-api-test-token-128bit"
 
 	// Open a temp file whose FD we will transfer end-to-end.
