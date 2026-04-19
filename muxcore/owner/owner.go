@@ -219,6 +219,12 @@ type OwnerConfig struct {
 	// Mutually exclusive with HandlerFunc and Command/Args.
 	SessionHandler muxcore.SessionHandler
 
+	// CachedClassification, if non-empty, skips the upstream classification
+	// round-trip. Used by NewOwnerFromHandoff when restoring from daemon
+	// handoff — the old daemon already classified the upstream, so the
+	// successor adopts its result directly.
+	CachedClassification classify.SharingMode
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
