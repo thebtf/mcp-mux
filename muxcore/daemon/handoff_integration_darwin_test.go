@@ -63,7 +63,17 @@ func TestHandoffDarwin_LaunchdStyleSpawn(t *testing.T) {
 	}
 
 	tmp := t.TempDir()
-	socketPath := filepath.Join(tmp, "handoff.sock")
+	// macOS has a 104-byte unix socket path limit. t.TempDir() on darwin
+	// returns a ~90-byte path already, leaving no room for the filename.
+	// Use os.CreateTemp("", ...) which places the socket in /tmp/ (short).
+	sockFile, err := os.CreateTemp("", "handoff-*.sock")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	socketPath := sockFile.Name()
+	_ = sockFile.Close()
+	_ = os.Remove(socketPath) // listenHandoffUnix creates the socket
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
 	token := "darwin-launchd-test-token"
 
 	// Open a file whose FD we'll transfer.
