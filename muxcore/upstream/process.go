@@ -384,6 +384,11 @@ func (p *Process) Close() error {
 		stdinWait = 5 * time.Second // default
 	}
 
+	// Release the Windows Job Object handle (no-op on non-Windows).
+	// Done before stdin close so the handle is freed regardless of whether
+	// the process exits cleanly or requires a forced kill below.
+	releaseJobHandle(p)
+
 	// Phase 1: close stdin — the polite MCP shutdown signal.
 	// Nil-safe for test-constructed Process values (no real process attached).
 	if p.stdin != nil {
@@ -452,6 +457,13 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 	if p.stdoutFile != nil {
 		stdoutFD = p.stdoutFD
 	}
+
+	// Release our copy of the Windows Job Object handle. On the planned-handoff
+	// path (T020), the caller must DuplicateHandle the job into the successor
+	// process BEFORE calling Detach — by this point our copy is redundant and
+	// must be freed to avoid a kernel handle leak on every spawned upstream.
+	// No-op on non-Windows (see spawn_other.go).
+	releaseJobHandle(p)
 
 	return pid, stdinFD, stdoutFD, nil
 }

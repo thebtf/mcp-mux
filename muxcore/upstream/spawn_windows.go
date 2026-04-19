@@ -43,8 +43,13 @@ func cmdApplyUnixSpawnAttrs(cmd *exec.Cmd) {}
 // is what lets the child survive. Intentional kill paths go through
 // TerminateJobObject explicitly, not via handle close.
 //
-// JOB_OBJECT_LIMIT_BREAKAWAY_OK: children spawned by the upstream can
-// escape this job (prevents cascading kills of language server subprocesses).
+// JOB_OBJECT_LIMIT_BREAKAWAY_OK: permits children spawned by the upstream to
+// escape this job when they are created with CREATE_BREAKAWAY_FROM_JOB. This
+// does NOT automatically exclude grandchildren — breakaway only happens if the
+// spawning process passes CREATE_BREAKAWAY_FROM_JOB to CreateProcess. Language
+// servers that do not use that flag will still be part of this job and will be
+// killed by TerminateJobObject. The flag is set here so that upstreams that DO
+// pass CREATE_BREAKAWAY_FROM_JOB can escape gracefully.
 func createUpstreamJob(processHandle windows.Handle) (windows.Handle, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
@@ -86,6 +91,23 @@ func createUpstreamJob(processHandle windows.Handle) (windows.Handle, error) {
 func closeUpstreamJob(job windows.Handle) {
 	if job != 0 {
 		_ = windows.CloseHandle(job)
+	}
+}
+
+// releaseJobHandle closes the daemon's copy of the per-upstream Job Object
+// handle stored in p.jobHandle, and zeroes the field. Safe to call multiple
+// times (guarded by the != 0 check). Called from Process.Close() and
+// Process.Detach() so the kernel object is released when ownership ends.
+//
+// On the planned-handoff path (T020), the caller must DuplicateHandle the job
+// into the successor process BEFORE calling releaseJobHandle — otherwise the
+// last handle closes and KILL_ON_JOB_CLOSE (if ever added) would fire.
+// Currently KILL_ON_JOB_CLOSE is absent, so closing this handle is safe even
+// without a prior duplicate; the upstream process continues running.
+func releaseJobHandle(p *Process) {
+	if p.jobHandle != 0 {
+		closeUpstreamJob(windows.Handle(p.jobHandle))
+		p.jobHandle = 0
 	}
 }
 

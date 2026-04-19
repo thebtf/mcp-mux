@@ -114,8 +114,8 @@ func TestHandoffIntegration_FullRoundtripWindows(t *testing.T) {
 		serverErr = fdc.ReadJSON(&finalAck)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
-
+	// listenHandoffPipe already returned a bound listener above, so the pipe is
+	// ready to accept before the goroutine even starts. No sleep needed.
 	conn, err := dialHandoffPipe(pipeName, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dialHandoffPipe: %v", err)

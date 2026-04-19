@@ -209,22 +209,32 @@ func TestListenDialHandoffWindows_Factory(t *testing.T) {
 	_, _ = rand.Read(nameBuf[:])
 	pipeName := "fac-" + hex.EncodeToString(nameBuf[:])
 
+	// Bind the pipe listener synchronously so it is ready before the client dials.
+	// listenHandoffPipe returns once the named pipe is bound — the client can dial
+	// immediately after without any sleep-based synchronization.
+	ln, err := listenHandoffPipe(pipeName)
+	if err != nil {
+		t.Fatalf("listenHandoffPipe: %v", err)
+	}
+	defer ln.Close()
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	var serverErr error
 	go func() {
 		defer wg.Done()
-		conn, err := listenHandoffWindows(pipeName, 3*time.Second)
+		rawConn, err := ln.Accept()
 		if err != nil {
 			serverErr = err
 			return
 		}
+		conn := newWindowsFDConn(rawConn)
 		defer conn.Close()
 		var msg map[string]string
 		serverErr = conn.ReadJSON(&msg)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// Pipe is already bound — dial immediately, no sleep needed.
 	client, err := dialHandoffWindows(pipeName, 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)

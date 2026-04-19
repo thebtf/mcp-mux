@@ -104,7 +104,7 @@
 - [x] T020 [EXECUTOR: sonnet] Wire Windows platform impl into `performHandoff` / `receiveHandoff`
   AC: `//go:build windows` tag resolution picks `handoff_windows.go` · T019 green · swap body→return null ⇒ T019 fails
 
-- [x] G003 VERIFY Phase 3 (T015–T020) — BLOCKED until T015–T020 all [x]
+- [ ] G003 VERIFY Phase 3 (T015–T020) — BLOCKED until T015–T020 all [x]
   RUN: `go test ./muxcore/upstream/ ./muxcore/daemon/ -run Handoff -tags windows -v` on Windows runner. Call Skill("nvmd-platform:code-reviewer") on `handoff_windows.go` + `spawn_windows.go`.
   CHECK: Job Object BREAKAWAY_OK verified (daemon kill leaves upstream alive). DuplicateHandle roundtrip works.
   ENFORCE: Zero stubs. Windows-specific error codes surfaced clearly to caller.

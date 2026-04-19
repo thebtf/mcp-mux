@@ -102,6 +102,10 @@ func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []
 	// Platform hook: Windows uses the successor PID for DuplicateHandle.
 	// Unix ignores (unixFDConn does not implement SetTargetPID).
 	if setter, ok := conn.(interface{ SetTargetPID(int) }); ok {
+		if hello.SourcePID <= 0 {
+			return HandoffResult{Phase: "hello"},
+				fmt.Errorf("performHandoff: invalid source_pid: %d", hello.SourcePID)
+		}
 		setter.SetTargetPID(hello.SourcePID)
 	}
 	// Step 4: Send Ready listing all upstreams.

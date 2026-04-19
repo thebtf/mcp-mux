@@ -12,3 +12,7 @@ func applyUnixSpawnAttrs(cmd *exec.Cmd) {}
 
 // afterSpawnWindows is a no-op on non-Windows platforms.
 func afterSpawnWindows(p *Process, pid int) {}
+
+// releaseJobHandle is a no-op on non-Windows platforms.
+// On Windows, this closes the per-upstream Job Object handle (see spawn_windows.go).
+func releaseJobHandle(p *Process) {}

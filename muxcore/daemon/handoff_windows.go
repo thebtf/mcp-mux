@@ -14,6 +14,11 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// maxHandoffMessageSize limits the size of a single JSON message to prevent
+// unbounded memory consumption from a misbehaving or malicious peer. 1 MiB is
+// generous for all handoff protocol messages, which are at most a few KiB each.
+const maxHandoffMessageSize = 1 << 20 // 1 MiB
+
 // handoffPipePrefix is the Windows named-pipe namespace root. All handoff
 // pipes are anonymous within this prefix; each handoff window creates a
 // unique random suffix (caller-supplied via `name`).
@@ -24,19 +29,39 @@ const handoffPipePrefix = `\\.\pipe\mcp-mux-handoff-`
 // atomic boundary — each transfer either completes or is aborted in bound time.
 const handoffPipeAcceptTimeout = 30 * time.Second
 
-// listenHandoffPipe creates a named-pipe listener restricted to the current
-// logon session via DACL. `name` is appended to handoffPipePrefix to form
-// the full pipe path (caller supplies a cryptographic random suffix).
+// currentUserSDDL returns a DACL string that grants full access exclusively to
+// the current user's SID. Used by listenHandoffPipe to enforce NFR-5: only the
+// same user account can connect to the handoff named pipe.
 //
-// Security: the DACL is taken from winio's built-in current-user template.
-// A process running as a different user cannot connect — NFR-5 security gate
-// on the transport layer (complementing FR-11 token auth).
+// Format: D:P(A;;GA;;;<SID>) — Protected DACL, Allow, Generic All, current user SID.
+// windows.GetCurrentProcessToken().GetTokenUser() provides the authoritative SID;
+// windows.SID.String() returns the canonical S-1-5-21-... form accepted by winio.
+func currentUserSDDL() (string, error) {
+	token := windows.GetCurrentProcessToken()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return "", fmt.Errorf("handoff: get current user SID: %w", err)
+	}
+	return fmt.Sprintf("D:P(A;;GA;;;%s)", user.User.Sid.String()), nil
+}
+
+// listenHandoffPipe creates a named-pipe listener restricted to the current
+// user via DACL. `name` is appended to handoffPipePrefix to form the full pipe
+// path (caller supplies a cryptographic random suffix).
+//
+// Security: the DACL is built from the current process token's user SID so
+// that only a process running under the same account can connect — NFR-5
+// security gate on the transport layer (complementing FR-11 token auth).
+// Previously used WD (World/Everyone), which violated NFR-5.
 func listenHandoffPipe(name string) (net.Listener, error) {
 	path := handoffPipePrefix + name
+	sddl, err := currentUserSDDL()
+	if err != nil {
+		return nil, err
+	}
 	cfg := &winio.PipeConfig{
-		// SecurityDescriptor grants local access while transport authentication
-		// still relies on the handoff token.
-		SecurityDescriptor: `D:P(A;;GA;;;WD)`,
+		// SecurityDescriptor restricts access to the current user only (NFR-5).
+		SecurityDescriptor: sddl,
 		// InputBufferSize / OutputBufferSize: 64 KiB is generous for JSON
 		// messages ~1 KiB each. FDs go out-of-band via DuplicateHandle (T017).
 		InputBufferSize:  65536,
@@ -134,6 +159,9 @@ func (w *windowsFDConn) ReadJSON(v any) error {
 		}
 		if buf[0] == '\n' {
 			break
+		}
+		if len(msg) >= maxHandoffMessageSize {
+			return fmt.Errorf("windowsFDConn: message exceeds max size (%d bytes)", maxHandoffMessageSize)
 		}
 		msg = append(msg, buf[0])
 	}

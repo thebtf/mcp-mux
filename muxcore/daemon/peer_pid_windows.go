@@ -11,8 +11,11 @@ import (
 )
 
 // ErrPIDForeignOwnerWin is the Windows counterpart to ErrPIDForeignOwner.
-// Same semantic: target PID belongs to a different user/session.
-var ErrPIDForeignOwnerWin = errors.New("handoff: pid not owned by current user/session")
+// Same semantic: target PID belongs to a different user account (TokenUser SID
+// mismatch). Session isolation beyond user-level is not enforced here; a process
+// running as the same user in a different logon session will pass this check.
+// NFR-5 requires only user-level isolation, which TokenUser provides.
+var ErrPIDForeignOwnerWin = errors.New("handoff: pid not owned by current user")
 
 // ErrPIDNotFoundWin — target PID does not exist or can't be opened.
 var ErrPIDNotFoundWin = errors.New("handoff: pid not found")
