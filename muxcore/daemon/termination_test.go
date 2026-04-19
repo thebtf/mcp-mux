@@ -104,3 +104,72 @@ func TestUnknownEvent(t *testing.T) {
 		t.Errorf("unknown event: got %v, want TermUnknown", got)
 	}
 }
+
+// TestTerminationHintForEvent_ResolvesPerOwnerHint verifies that
+// terminationHintForEvent parses the service name, finds the matching
+// OwnerEntry, and returns its stored terminationHint. Fixes the
+// CodeRabbit concern that supervisorEventHook was hard-coding HintNone.
+func TestTerminationHintForEvent_ResolvesPerOwnerHint(t *testing.T) {
+	d := &Daemon{owners: map[string]*OwnerEntry{}}
+	sid := "aabbccdd-hint-lookup-test"
+	d.owners[sid] = &OwnerEntry{
+		ServerID:        sid,
+		Command:         "echo",
+		terminationHint: HintPlannedHandoff,
+	}
+
+	// Service name format from suture matches cleanupDeadOwner parsing:
+	// "owner[XXXXXXXX command args]" — first 8 hex chars are the sid prefix.
+	ev := suture.EventServiceTerminate{
+		ServiceName: fmt.Sprintf("owner[%s echo]", sid[:8]),
+	}
+
+	got := d.terminationHintForEvent(ev)
+	if got != HintPlannedHandoff {
+		t.Errorf("terminationHintForEvent: got %v, want HintPlannedHandoff", got)
+	}
+
+	// Panic events also carry a service name — same resolution path.
+	evPanic := suture.EventServicePanic{
+		ServiceName: fmt.Sprintf("owner[%s echo]", sid[:8]),
+	}
+	got2 := d.terminationHintForEvent(evPanic)
+	if got2 != HintPlannedHandoff {
+		t.Errorf("terminationHintForEvent panic event: got %v, want HintPlannedHandoff", got2)
+	}
+}
+
+// TestTerminationHintForEvent_UnknownService returns HintNone when the
+// service name does not match any registered owner.
+func TestTerminationHintForEvent_UnknownService(t *testing.T) {
+	d := &Daemon{owners: map[string]*OwnerEntry{}}
+	ev := suture.EventServiceTerminate{ServiceName: "owner[deadbeef echo]"}
+	got := d.terminationHintForEvent(ev)
+	if got != HintNone {
+		t.Errorf("unknown service: got %v, want HintNone", got)
+	}
+}
+
+// TestTerminationHintForEvent_MalformedServiceName returns HintNone for
+// events whose service name does not match the "owner[XXXXXXXX ...]"
+// convention (defensive; covers future unrelated suture services).
+func TestTerminationHintForEvent_MalformedServiceName(t *testing.T) {
+	d := &Daemon{owners: map[string]*OwnerEntry{}}
+
+	// Missing "owner[" prefix.
+	ev1 := suture.EventServiceTerminate{ServiceName: "not-an-owner"}
+	if got := d.terminationHintForEvent(ev1); got != HintNone {
+		t.Errorf("no owner prefix: got %v, want HintNone", got)
+	}
+
+	// Prefix present but no closing brace/space.
+	ev2 := suture.EventServiceTerminate{ServiceName: "owner[aabbccdd"}
+	if got := d.terminationHintForEvent(ev2); got != HintNone {
+		t.Errorf("no space after sid: got %v, want HintNone", got)
+	}
+
+	// Event type with no service name at all.
+	if got := d.terminationHintForEvent(unknownEvent{}); got != HintNone {
+		t.Errorf("unknownEvent: got %v, want HintNone", got)
+	}
+}

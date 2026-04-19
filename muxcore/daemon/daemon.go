@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
@@ -63,6 +64,14 @@ type OwnerEntry struct {
 	// creating is closed when Owner transitions from nil (placeholder) to a real
 	// owner.  It is non-nil only while the placeholder is being created.
 	creating chan struct{}
+	// terminationHint is consulted by supervisorEventHook when the suture
+	// service for this owner fires EventServiceTerminate. Callers that know
+	// they are tearing down an owner for a specific reason (planned handoff,
+	// idle eviction, operator stop) MUST set this field under d.mu before
+	// removing the owner from the supervisor, so structured logs classify
+	// the cause correctly instead of defaulting to HintNone.
+	// In-memory only — not serialized.
+	terminationHint TerminationHint
 }
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
@@ -110,6 +119,18 @@ type Daemon struct {
 	zombieDetectedRestore int
 
 	shutdownOnce sync.Once
+
+	// stats holds atomic handoff counters exposed via HandleStatus (NFR-4 / T025).
+	stats handoffStats
+}
+
+// handoffStats holds atomic counters for handoff lifecycle observability.
+// Fields are sync/atomic.Uint64 for lockless reads from HandleStatus.
+type handoffStats struct {
+	attempted   atomic.Uint64
+	transferred atomic.Uint64
+	aborted     atomic.Uint64
+	fallback    atomic.Uint64
 }
 
 // Config holds daemon startup parameters.
@@ -239,12 +260,20 @@ func New(cfg Config) (*Daemon, error) {
 // service failures, restarts, backoffs, and permanent failures. Logs them
 // for observability and debugging.
 func (d *Daemon) supervisorEventHook(event suture.Event) {
+	// classifyTermination maps the suture event to a TerminationCause for
+	// structured logging (FR-5 / T025). Callers that tear down owners for a
+	// known reason (HandleGracefulRestart → HintPlannedHandoff, reaper →
+	// HintIdleEviction, Remove → HintOperatorStop) record the reason on the
+	// owning OwnerEntry.terminationHint before removing the service. The hook
+	// resolves that hint via the service name embedded in the event.
+	hint := d.terminationHintForEvent(event)
+	cause := classifyTermination(event, hint)
 	switch e := event.(type) {
 	case suture.EventServicePanic:
-		d.logger.Printf("supervisor: service %q PANIC: %v", e.ServiceName, e.PanicMsg)
+		d.logger.Printf("supervisor.terminated service=%q cause=%s panic=%v", e.ServiceName, cause, e.PanicMsg)
 	case suture.EventServiceTerminate:
-		d.logger.Printf("supervisor: service %q terminated: %v (restarting=%v)",
-			e.ServiceName, e.Err, e.Restarting)
+		d.logger.Printf("supervisor.terminated service=%q cause=%s err=%v restarting=%v",
+			e.ServiceName, cause, e.Err, e.Restarting)
 		if !e.Restarting {
 			// suture sets Restarting=false for both real failures
 			// (FailureThreshold exceeded, panic, ErrDoNotRestart) and clean
@@ -280,6 +309,46 @@ func (d *Daemon) supervisorEventHook(event suture.Event) {
 	default:
 		// Unknown event type — ignore silently
 	}
+}
+
+// terminationHintForEvent resolves the TerminationHint recorded on the
+// OwnerEntry matching the suture event's service name. Returns HintNone
+// when the event has no service name, when no owner matches the name
+// prefix, or when no hint was recorded. Callers (supervisorEventHook) use
+// the returned hint to classify EventServiceTerminate causes beyond the
+// generic "service exited" default. Matches cleanupDeadOwner's service-name
+// parsing convention ("owner[XXXXXXXX command args]").
+func (d *Daemon) terminationHintForEvent(event suture.Event) TerminationHint {
+	var serviceName string
+	switch e := event.(type) {
+	case suture.EventServiceTerminate:
+		serviceName = e.ServiceName
+	case suture.EventServicePanic:
+		serviceName = e.ServiceName
+	default:
+		return HintNone
+	}
+
+	const prefix = "owner["
+	idx := strings.Index(serviceName, prefix)
+	if idx < 0 {
+		return HintNone
+	}
+	rest := serviceName[idx+len(prefix):]
+	spaceIdx := strings.IndexByte(rest, ' ')
+	if spaceIdx < 0 {
+		return HintNone
+	}
+	sidPrefix := rest[:spaceIdx]
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	for s, entry := range d.owners {
+		if strings.HasPrefix(s, sidPrefix) {
+			return entry.terminationHint
+		}
+	}
+	return HintNone
 }
 
 // cleanupDeadOwner finds and removes a permanently-failed owner from the registry.
@@ -957,6 +1026,8 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 //   - ErrProtocolVersionMismatch (binary skew — FR-6)
 //   - Any other performHandoff protocol error (conn drop, JSON decode failure)
 func (d *Daemon) attemptHandoff() error {
+	d.stats.attempted.Add(1)
+	startedAt := time.Now()
 	baseDir := os.TempDir()
 
 	// Write handoff token (FR-11). Token is deleted via defer on both paths.
@@ -969,6 +1040,8 @@ func (d *Daemon) attemptHandoff() error {
 	// Compute socket path before starting the listener goroutine; the path
 	// is also passed to the successor via MCPMUX_HANDOFF_SOCKET.
 	socketPath := handoffSocketPath(baseDir)
+
+	d.logger.Printf("handoff.start socket=%s token_path=%s", socketPath, tokenPath)
 
 	// Start listening BEFORE spawning successor so the socket/pipe exists
 	// when the successor process starts and tries to dial. listenHandoff
@@ -1027,8 +1100,11 @@ func (d *Daemon) attemptHandoff() error {
 		return fmt.Errorf("protocol error: %w", err)
 	}
 
-	d.logger.Printf("handoff.complete: transferred=%v aborted=%v phase=%s",
-		result.Transferred, result.Aborted, result.Phase)
+	d.stats.transferred.Add(uint64(len(result.Transferred)))
+	d.stats.aborted.Add(uint64(len(result.Aborted)))
+	d.logger.Printf("handoff.complete transferred=%d aborted=%d phase=%s duration_ms=%d",
+		len(result.Transferred), len(result.Aborted), result.Phase,
+		time.Since(startedAt).Milliseconds())
 	return nil
 }
 
@@ -1049,8 +1125,22 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
 	// the fallback log line; callers never see a handoff error — FR-8 is silent
 	// to the control-plane caller (it still gets a valid snapshot path).
 	if handoffErr := d.attemptHandoff(); handoffErr != nil {
+		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
+
+	// Tag every live owner with HintPlannedHandoff before shutdown so the
+	// supervisor event hook classifies their terminations as
+	// TermPlannedHandoff rather than the generic TermOperatorStop/clean-exit
+	// default. Applies on both the successful handoff path (FDs already
+	// detached) and the FR-8 fallback path (kill-and-respawn) — in both
+	// cases the teardown is operator-initiated as part of a graceful
+	// restart, which is the semantics HintPlannedHandoff captures.
+	d.mu.Lock()
+	for _, entry := range d.owners {
+		entry.terminationHint = HintPlannedHandoff
+	}
+	d.mu.Unlock()
 
 	go d.Shutdown()
 	return snapshotPath, nil
@@ -1094,6 +1184,12 @@ func (d *Daemon) HandleStatus() map[string]any {
 		"idle_timeout":             d.idleTimeout.String(),
 		"zombie_detections_spawn":  d.zombieDetectedSpawn,
 		"zombie_detections_restore": d.zombieDetectedRestore,
+		"handoff": map[string]any{
+			"attempted":   d.stats.attempted.Load(),
+			"transferred": d.stats.transferred.Load(),
+			"aborted":     d.stats.aborted.Load(),
+			"fallback":    d.stats.fallback.Load(),
+		},
 	}
 }
 
