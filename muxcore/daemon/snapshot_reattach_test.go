@@ -75,6 +75,10 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	// Run the old-daemon (sender) side in a background goroutine.
 	// Transfer stdinR.Fd() as StdinFD and stdoutW.Fd() as StdoutFD.
 	// These are the pipe ends the upstream process would read/write.
+	// Capture the performHandoff error on a buffered channel so we can
+	// propagate sender-side failures to the test instead of relying on
+	// receiveHandoff to time out on a half-done protocol.
+	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
 			{
@@ -86,8 +90,19 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 			},
 		}
 		ctx := context.Background()
-		_, _ = performHandoff(ctx, oldDaemonConn, testToken, upstreams)
+		_, err := performHandoff(ctx, oldDaemonConn, testToken, upstreams)
+		senderErrCh <- err
 	}()
+	t.Cleanup(func() {
+		select {
+		case err := <-senderErrCh:
+			if err != nil {
+				t.Errorf("performHandoff (sender): %v", err)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Error("performHandoff (sender) did not return within 500ms")
+		}
+	})
 
 	// Install dialHandoffHook to return the successor side of the mock conn pair.
 	origHook := dialHandoffHook
@@ -138,13 +153,14 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		Owners: []mcpsnapshot.OwnerSnapshot{
 			{
-				ServerID:    sid,
-				Command:     "echo",
-				Args:        []string{"fallback"},
-				Cwd:         t.TempDir(),
-				Mode:        "global",
-				CachedInit:  "e30=",
-				CachedTools: "e30=",
+				ServerID:       sid,
+				Command:        "echo",
+				Args:           []string{"fallback"},
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeShared,
+				CachedInit:     "e30=",
+				CachedTools:    "e30=",
 			},
 		},
 	}
@@ -200,5 +216,154 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	classSource, _ := status["classification_source"].(string)
 	if classSource == "handoff" {
 		t.Error("classification_source = 'handoff' but socket was unreachable; expected legacy path")
+	}
+}
+
+// TestLoadSnapshot_Reattach_PartialHandoff exercises FR-7: when the handoff
+// delivers FDs for a subset of the snapshot's owners, the remainder MUST
+// fall through to the legacy SpawnUpstreamBackground path. The snapshot
+// lists two owners (sid1, sid2) but performHandoff only transfers sid1 —
+// so sid1 reattaches via handoff (classification_source == "handoff") and
+// sid2 comes back through the legacy path (classification_source !=
+// "handoff"). Both must be present in d.owners after loadSnapshot returns.
+func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
+	os.Remove(SnapshotPath())
+
+	sid1 := "aabbccdd-partial-handoff-sid1"
+	sid2 := "eeff0011-partial-handoff-sid2"
+	snapshot := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{
+			{
+				ServerID:       sid1,
+				Command:        "echo",
+				Args:           []string{"one"},
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeShared,
+				CachedInit:     "e30=",
+				CachedTools:    "e30=",
+			},
+			{
+				ServerID:       sid2,
+				Command:        "echo",
+				Args:           []string{"two"},
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeShared,
+				CachedInit:     "e30=",
+				CachedTools:    "e30=",
+			},
+		},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+	defer os.Remove(SnapshotPath())
+
+	tokenFile, err := os.CreateTemp("", "mcp-mux-handoff-partial-*.tok")
+	if err != nil {
+		t.Fatalf("CreateTemp token: %v", err)
+	}
+	tokenFile.Close()
+	const testToken = "partial-handoff-test-token"
+	if err := os.WriteFile(tokenFile.Name(), []byte(testToken), 0o600); err != nil {
+		t.Fatalf("WriteFile token: %v", err)
+	}
+	defer os.Remove(tokenFile.Name())
+
+	// Real pipes for sid1 only — sid2 is intentionally omitted from the
+	// handoff payload so its reattach fails and the legacy path kicks in.
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stdin: %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stdout: %v", err)
+	}
+	defer stdoutR.Close()
+	defer stdoutW.Close()
+
+	oldDaemonConn, successorConn := newMockFDConnPair()
+
+	senderErrCh := make(chan error, 1)
+	go func() {
+		upstreams := []HandoffUpstream{
+			{
+				ServerID: sid1, // Only sid1 transferred — sid2 falls through.
+				Command:  "echo",
+				PID:      os.Getpid(),
+				StdinFD:  stdinR.Fd(),
+				StdoutFD: stdoutW.Fd(),
+			},
+		}
+		_, err := performHandoff(context.Background(), oldDaemonConn, testToken, upstreams)
+		senderErrCh <- err
+	}()
+	t.Cleanup(func() {
+		select {
+		case err := <-senderErrCh:
+			if err != nil {
+				t.Errorf("performHandoff (sender): %v", err)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Error("performHandoff (sender) did not return within 500ms")
+		}
+	})
+
+	origHook := dialHandoffHook
+	dialHandoffHook = func(_ string, _ time.Duration) (fdConn, error) {
+		return successorConn, nil
+	}
+	defer func() { dialHandoffHook = origHook }()
+
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenFile.Name())
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "/mock/socket")
+
+	d := testDaemon(t)
+	restored := d.loadSnapshot()
+	if restored != 2 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 2 (sid1 via handoff, sid2 via legacy)", restored)
+	}
+
+	// Poll both entries (async supervisor insertion — see F80-1).
+	var entry1, entry2 *OwnerEntry
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.RLock()
+		entry1 = d.owners[sid1]
+		entry2 = d.owners[sid2]
+		d.mu.RUnlock()
+		if entry1 != nil && entry1.Owner != nil && entry2 != nil && entry2.Owner != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entry1 == nil || entry1.Owner == nil {
+		t.Fatal("sid1 not found in d.owners after partial handoff (polled 2s)")
+	}
+	if entry2 == nil || entry2.Owner == nil {
+		t.Fatal("sid2 not found in d.owners after partial handoff (polled 2s)")
+	}
+
+	// sid1: transferred via handoff → classification_source == "handoff"
+	status1 := entry1.Owner.Status()
+	if class1, _ := status1["classification_source"].(string); class1 != "handoff" {
+		t.Errorf("sid1 classification_source = %q, want %q (handoff path not used)", class1, "handoff")
+	}
+
+	// sid2: not in handoff payload → legacy spawn path, NOT "handoff"
+	status2 := entry2.Owner.Status()
+	if class2, _ := status2["classification_source"].(string); class2 == "handoff" {
+		t.Errorf("sid2 classification_source = %q but sid2 was not in handoff; expected legacy path", class2)
 	}
 }
