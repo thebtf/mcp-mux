@@ -38,12 +38,14 @@ func TestSoftClose_UpstreamHonorsStdinClose(t *testing.T) {
 // upstream ignores stdin close and keeps running, SoftClose falls back to
 // GracefulKill after the timeout. The process must be dead after SoftClose returns.
 func TestSoftClose_UpstreamIgnoresStdinClose_FallsBackToKill(t *testing.T) {
-	// sleep/timeout ignores stdin — it will never exit on stdin close alone.
+	// Use a command that truly ignores stdin and blocks. `timeout` on Windows
+	// rejects redirected stdin and exits immediately — breaks the test. `ping`
+	// ignores stdin on every platform and runs for N seconds.
 	var cmd string
 	var args []string
 	if runtime.GOOS == "windows" {
-		cmd = "cmd"
-		args = []string{"/c", "timeout", "/t", "30", "/nobreak"}
+		cmd = "ping"
+		args = []string{"-n", "30", "127.0.0.1"}
 	} else {
 		cmd = "sleep"
 		args = []string{"30"}
@@ -55,9 +57,14 @@ func TestSoftClose_UpstreamIgnoresStdinClose_FallsBackToKill(t *testing.T) {
 	}
 
 	// 200ms timeout — process won't exit voluntarily; GracefulKill fallback fires.
-	_, err = p.SoftClose(200 * time.Millisecond)
-	if err != nil {
-		t.Fatalf("SoftClose() fallback kill error: %v (GracefulKill should succeed)", err)
+	// Expect a non-nil error signalling the forced-kill escalation path, and a
+	// non-zero exit code confirming the process was killed rather than exiting cleanly.
+	exitCode, err := p.SoftClose(200 * time.Millisecond)
+	if err == nil {
+		t.Fatal("SoftClose() error = nil, want forced-kill signal after timeout")
+	}
+	if exitCode == 0 {
+		t.Fatalf("SoftClose() exitCode = %d, want non-zero after forced kill", exitCode)
 	}
 
 	// Process must be terminated after the forced kill path.

@@ -845,7 +845,7 @@ func (d *Daemon) SoftRemove(serverID string) error {
 	} else if exitCode == 0 {
 		d.logger.Printf("soft-removed owner %s: upstream exited cleanly (code 0)", serverID[:8])
 	} else {
-		d.logger.Printf("soft-removed owner %s: upstream forced exit (code %d)", serverID[:8], exitCode)
+		d.logger.Printf("soft-removed owner %s: upstream exited with code %d", serverID[:8], exitCode)
 	}
 
 	if supErr != nil {

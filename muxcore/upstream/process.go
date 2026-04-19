@@ -29,7 +29,9 @@ import (
 //  3. If still alive after timeout: proc.GracefulKill(3s) — SIGTERM→wait→SIGKILL.
 //
 // Returns the upstream exit code (0 = clean voluntary exit, non-zero = forced)
-// and any error from the kill escalation.
+// and any error from the kill escalation. A non-nil error signals that a forced
+// kill occurred (either GracefulKill failed, kill succeeded after timeout, or the
+// handler did not exit within timeout).
 // Safe to call after Close() — returns (0, nil) if already closed or detached.
 func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 	p.mu.Lock()
@@ -72,10 +74,14 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 		if killErr != nil {
 			return softCloseExitCode(p.ExitErr), killErr
 		}
-		return softCloseExitCode(p.ExitErr), nil
+		// GracefulKill succeeded but we still escalated past the voluntary-exit window.
+		// Return a non-nil error so callers (SoftShutdown, SoftRemove) can detect the
+		// forced-kill path even when GracefulKill itself had no error.
+		return softCloseExitCode(p.ExitErr), fmt.Errorf("upstream: forced kill after soft-close timeout")
 	}
 
-	return -1, nil
+	// In-process handler did not exit within timeout.
+	return -1, fmt.Errorf("upstream: handler did not exit after %v", timeout)
 }
 
 // softCloseExitCode extracts the process exit code from a Wait() error.
