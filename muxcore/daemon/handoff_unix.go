@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"net"
 	"syscall"
+	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/sockperm"
 )
 
 // unixFDConn implements fdConn using an AF_UNIX socket with SCM_RIGHTS
@@ -171,4 +174,47 @@ func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 // Close releases the underlying socket.
 func (u *unixFDConn) Close() error {
 	return u.conn.Close()
+}
+
+// listenHandoffUnix binds a Unix domain socket and accepts one connection
+// within the handoff window timeout. Caller owns the returned conn's lifetime.
+// Uses sockperm.Listen for 0600 permissions (FR-29 / S5-001 reuse).
+func listenHandoffUnix(socketPath string, acceptTimeout time.Duration) (fdConn, error) {
+	ln, err := sockperm.Listen("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("handoff listen: %w", err)
+	}
+	defer ln.Close()
+
+	if acceptTimeout > 0 {
+		if uln, ok := ln.(*net.UnixListener); ok {
+			_ = uln.SetDeadline(time.Now().Add(acceptTimeout))
+		}
+	}
+	conn, err := ln.Accept()
+	if err != nil {
+		return nil, fmt.Errorf("handoff accept: %w", err)
+	}
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("handoff accept: not *net.UnixConn")
+	}
+	return newUnixFDConn(uc), nil
+}
+
+// dialHandoffUnix connects to a Unix domain socket previously bound by
+// listenHandoffUnix. Caller owns the returned conn's lifetime.
+func dialHandoffUnix(socketPath string, timeout time.Duration) (fdConn, error) {
+	d := net.Dialer{Timeout: timeout}
+	conn, err := d.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("handoff dial: %w", err)
+	}
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("handoff dial: not *net.UnixConn")
+	}
+	return newUnixFDConn(uc), nil
 }
