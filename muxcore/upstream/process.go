@@ -108,6 +108,9 @@ type Process struct {
 	// Setpgid=true causes the child's PGID to equal its PID (kernel guarantee).
 	// Set after procgroup.Spawn returns successfully. Zero for handler-based processes.
 	spawnPgid int
+	// jobHandle is the Windows Job Object handle for this upstream. 0 on
+	// non-Windows or if creation failed (graceful degradation per AC8).
+	jobHandle uintptr
 
 	lineBuf *lineBuffer
 
@@ -236,6 +239,10 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// Scanner then sees EOF naturally. Without this close, the pipe never
 	// reaches EOF because one writer (us) remains open forever.
 	_ = stdoutW.Close()
+
+	// Windows: assign upstream to its own Job Object for per-process kill
+	// semantics (C1). No-op on non-Windows (see spawn_other.go).
+	afterSpawnWindows(p, proc.PID())
 
 	p.proc = proc
 	// On Unix, Setpgid=true guarantees PGID == PID after spawn.
@@ -377,6 +384,11 @@ func (p *Process) Close() error {
 		stdinWait = 5 * time.Second // default
 	}
 
+	// Release the Windows Job Object handle (no-op on non-Windows).
+	// Done before stdin close so the handle is freed regardless of whether
+	// the process exits cleanly or requires a forced kill below.
+	releaseJobHandle(p)
+
 	// Phase 1: close stdin — the polite MCP shutdown signal.
 	// Nil-safe for test-constructed Process values (no real process attached).
 	if p.stdin != nil {
@@ -445,6 +457,13 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 	if p.stdoutFile != nil {
 		stdoutFD = p.stdoutFD
 	}
+
+	// Release our copy of the Windows Job Object handle. On the planned-handoff
+	// path (T020), the caller must DuplicateHandle the job into the successor
+	// process BEFORE calling Detach — by this point our copy is redundant and
+	// must be freed to avoid a kernel handle leak on every spawned upstream.
+	// No-op on non-Windows (see spawn_other.go).
+	releaseJobHandle(p)
 
 	return pid, stdinFD, stdoutFD, nil
 }
