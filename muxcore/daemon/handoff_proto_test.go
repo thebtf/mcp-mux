@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -306,6 +307,54 @@ func TestProtocolVersionReject(t *testing.T) {
 func TestProtocolVersionAccept(t *testing.T) {
 	if err := validateProtocolVersion(HandoffProtocolVersion); err != nil {
 		t.Fatalf("validateProtocolVersion(%d) error = %v, want nil", HandoffProtocolVersion, err)
+	}
+}
+
+// TestHelloMsg_WithPID_RoundTrip verifies that NewHelloMsgWithPID sets SourcePID
+// and that it survives a JSON round-trip (required for T017 DuplicateHandle flow).
+// The SourcePID field is omitempty, so a zero PID should be absent from JSON;
+// a non-zero PID must be present and recovered after unmarshal.
+func TestHelloMsg_WithPID_RoundTrip(t *testing.T) {
+	msg := NewHelloMsgWithPID("tok", 12345)
+	if msg.SourcePID != 12345 {
+		t.Errorf("SourcePID before marshal: got %d, want 12345", msg.SourcePID)
+	}
+	if msg.Type != MsgHello {
+		t.Errorf("Type: got %q, want %q", msg.Type, MsgHello)
+	}
+	if msg.ProtocolVersion != HandoffProtocolVersion {
+		t.Errorf("ProtocolVersion: got %d, want %d", msg.ProtocolVersion, HandoffProtocolVersion)
+	}
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got HelloMsg
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SourcePID != 12345 {
+		t.Errorf("SourcePID after round-trip: got %d, want 12345", got.SourcePID)
+	}
+	if got.Token != "tok" {
+		t.Errorf("Token: got %q, want tok", got.Token)
+	}
+	if got.Type != MsgHello {
+		t.Errorf("Type: got %q, want %q", got.Type, MsgHello)
+	}
+	if got.ProtocolVersion != HandoffProtocolVersion {
+		t.Errorf("ProtocolVersion: got %d, want %d", got.ProtocolVersion, HandoffProtocolVersion)
+	}
+
+	// Verify omitempty: a zero SourcePID must not appear in JSON output.
+	zeroMsg := NewHelloMsg("tok2")
+	bZero, err := json.Marshal(zeroMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(bZero, []byte("source_pid")) {
+		t.Errorf("source_pid unexpectedly present in JSON for zero SourcePID: %s", bZero)
 	}
 }
 
