@@ -2,7 +2,7 @@ module github.com/thebtf/mcp-mux
 
 go 1.25.4
 
-require github.com/thebtf/mcp-mux/muxcore v0.20.4
+require github.com/thebtf/mcp-mux/muxcore v0.21.0
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
