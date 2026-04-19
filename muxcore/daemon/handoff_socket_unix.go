@@ -29,3 +29,9 @@ func listenHandoff(socketPath string, timeout time.Duration) (fdConn, error) {
 func setSuccessorDetached(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 }
+
+// dialHandoff connects to a handoff socket previously bound by listenHandoff.
+// Caller owns the returned conn's lifetime.
+func dialHandoff(socketPath string, timeout time.Duration) (fdConn, error) {
+	return dialHandoffUnix(socketPath, timeout)
+}
