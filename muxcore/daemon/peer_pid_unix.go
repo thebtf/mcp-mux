@@ -48,8 +48,14 @@ func verifyPIDOwner(pid int) error {
 		return fmt.Errorf("verifyPIDOwner: kill(%d, 0): %w", pid, err)
 	}
 	// Platform-specific UID read.
+	// The process may exit between kill(pid,0) and readPIDUID; on Linux that
+	// produces os.ErrNotExist (ENOENT on /proc/<pid>/status) or os.ErrPermission
+	// (EACCES). Normalize both to ErrPIDNotFound per the documented contract.
 	uid, err := readPIDUID(pid)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
+			return fmt.Errorf("%w: pid %d", ErrPIDNotFound, pid)
+		}
 		return fmt.Errorf("verifyPIDOwner: read uid for pid %d: %w", pid, err)
 	}
 	if uid != os.Getuid() {

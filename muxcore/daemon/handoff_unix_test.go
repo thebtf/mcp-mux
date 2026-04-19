@@ -107,16 +107,21 @@ func TestRecvFDs_PairedWithSender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Remove(tmp.Name()); _ = tmp.Close() })
+	tmpName := tmp.Name()
+	t.Cleanup(func() { _ = os.Remove(tmpName); _ = tmp.Close() })
 
 	content := []byte("hello from sender")
 	if _, err := tmp.Write(content); err != nil {
 		t.Fatal(err)
 	}
 
+	// Capture fd before starting the goroutine to avoid a data race with
+	// the cleanup's tmp.Close() call, which may run concurrently.
+	tmpFD := tmp.Fd()
+
 	done := make(chan error, 1)
 	go func() {
-		done <- sender.SendFDs([]uintptr{tmp.Fd()}, []byte("header-bytes\n"))
+		done <- sender.SendFDs([]uintptr{tmpFD}, []byte("header-bytes\n"))
 	}()
 
 	fds, header, err := receiver.RecvFDs()
@@ -161,10 +166,13 @@ func TestRecvFDs_TripleRoundtrip(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		fi := f
-		t.Cleanup(func() { _ = os.Remove(fi.Name()); _ = fi.Close() })
-		files[i] = f
+		// Capture fd and name before registering cleanup: t.Cleanup may run
+		// concurrently with the sender goroutine, and f.Close() races with
+		// any later f.Fd() call.
 		fds[i] = f.Fd()
+		fName := f.Name()
+		t.Cleanup(func() { _ = os.Remove(fName); _ = f.Close() })
+		files[i] = f
 	}
 
 	done := make(chan error, 1)

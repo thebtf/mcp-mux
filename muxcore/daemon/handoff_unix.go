@@ -113,26 +113,28 @@ func (u *unixFDConn) ReadJSON(v any) error {
 // recvmsgOnce runs a single syscall.Recvmsg inside raw.Read, handling
 // EAGAIN correctly (returning false from the callback tells the poller
 // to wait for readability, then invoke the callback again). Returns
-// (dataN, oobN, err) where err is the final syscall error, if any.
-func (u *unixFDConn) recvmsgOnce(dataBuf, oobBuf []byte) (int, int, error) {
+// (dataN, oobN, flags, err) where flags is the MSG_* bitmask from
+// Recvmsg (callers must check MSG_CTRUNC) and err is the final syscall
+// error, if any.
+func (u *unixFDConn) recvmsgOnce(dataBuf, oobBuf []byte) (int, int, int, error) {
 	raw, err := u.conn.SyscallConn()
 	if err != nil {
-		return 0, 0, fmt.Errorf("unixFDConn: syscall conn: %w", err)
+		return 0, 0, 0, fmt.Errorf("unixFDConn: syscall conn: %w", err)
 	}
-	var dataN, oobN int
+	var dataN, oobN, flags int
 	var rerr error
 	err = raw.Read(func(fd uintptr) bool {
-		n, oobn, _, _, e := syscall.Recvmsg(int(fd), dataBuf, oobBuf, 0)
+		n, oobn, f, _, e := syscall.Recvmsg(int(fd), dataBuf, oobBuf, 0)
 		if errors.Is(e, syscall.EAGAIN) || errors.Is(e, syscall.EWOULDBLOCK) {
 			return false // not ready — poller will re-invoke when readable
 		}
-		dataN, oobN, rerr = n, oobn, e
+		dataN, oobN, flags, rerr = n, oobn, f, e
 		return true
 	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("unixFDConn: raw read: %w", err)
+		return 0, 0, 0, fmt.Errorf("unixFDConn: raw read: %w", err)
 	}
-	return dataN, oobN, rerr
+	return dataN, oobN, flags, rerr
 }
 
 // stashFDsFromOOB parses SCM_RIGHTS ancillary data and appends extracted
@@ -192,6 +194,10 @@ func (u *unixFDConn) SendFDs(fds []uintptr, header []byte) error {
 		// SendmsgN returns the number of data bytes sent (not OOB bytes).
 		// The nil sockaddr argument is valid for a connected stream socket.
 		firstN, sendErr = syscall.SendmsgN(int(fd), header, rights, nil, 0)
+		if errors.Is(sendErr, syscall.EAGAIN) || errors.Is(sendErr, syscall.EWOULDBLOCK) {
+			sendErr = nil  // not a terminal error; poller will retry when writable
+			return false   // wait until writable and retry
+		}
 		return true // syscall complete, release the raw fd
 	})
 	if err != nil {
@@ -249,9 +255,12 @@ func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 
 	hdrBuf := make([]byte, 4096)
 	oobBuf := make([]byte, oobBufSize)
-	dataN, oobN, rerr := u.recvmsgOnce(hdrBuf, oobBuf)
+	dataN, oobN, flags, rerr := u.recvmsgOnce(hdrBuf, oobBuf)
 	if rerr != nil {
 		return nil, nil, fmt.Errorf("unixFDConn: recvmsg: %w", rerr)
+	}
+	if flags&syscall.MSG_CTRUNC != 0 {
+		return nil, nil, fmt.Errorf("unixFDConn: SCM_RIGHTS truncated (ancillary buffer too small)")
 	}
 
 	// Prepend any buffered bytes to the data-channel bytes from recvmsg.
