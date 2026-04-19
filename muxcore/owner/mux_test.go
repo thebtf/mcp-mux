@@ -486,14 +486,31 @@ func TestSamplingRequestRoutedToSession(t *testing.T) {
 	// to the client and wait for the client to respond before completing.
 	sendReq(t, clientW, 5, "tools/call", `{"name":"request_sampling","arguments":{}}`)
 
-	// The client should receive the sampling/createMessage request from the server
-	samplingReq := readResp(t, clientR)
+	// The client should receive the sampling/createMessage request from the
+	// server. Under -race on slower CI runners, messages can arrive in
+	// unexpected order (mock_server's scanner.Scan may time out before the
+	// test sends the response, causing the mock to emit the tool result
+	// before the sampling request is routed to the client). Read until we
+	// find the sampling request or time out via readResp's own deadline.
+	var samplingReq []byte
 	var samplingMsg map[string]json.RawMessage
-	if err := json.Unmarshal(samplingReq, &samplingMsg); err != nil {
-		t.Fatalf("unmarshal sampling request: %v", err)
+	var stashedToolResp []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		msg := readResp(t, clientR)
+		var peek map[string]json.RawMessage
+		if err := json.Unmarshal(msg, &peek); err != nil {
+			t.Fatalf("unmarshal peek: %v", err)
+		}
+		if string(peek["method"]) == `"sampling/createMessage"` {
+			samplingReq = msg
+			samplingMsg = peek
+			break
+		}
+		// Not sampling — must be an early tool response (id=5); stash for later.
+		stashedToolResp = msg
 	}
-	if string(samplingMsg["method"]) != `"sampling/createMessage"` {
-		t.Fatalf("expected sampling/createMessage, got: %s", string(samplingReq))
+	if samplingReq == nil {
+		t.Fatalf("never received sampling/createMessage (last message stashed: %s)", stashedToolResp)
 	}
 
 	// Client responds to the sampling request
@@ -506,8 +523,13 @@ func TestSamplingRequestRoutedToSession(t *testing.T) {
 		t.Fatalf("write sampling response: %v", err)
 	}
 
-	// Now the tool call result should arrive
-	toolResp := readResp(t, clientR)
+	// Now the tool call result should arrive (or has already arrived out of order above)
+	var toolResp []byte
+	if stashedToolResp != nil {
+		toolResp = stashedToolResp
+	} else {
+		toolResp = readResp(t, clientR)
+	}
 	assertResponseID(t, toolResp, 5)
 	var toolObj map[string]json.RawMessage
 	if err := json.Unmarshal(toolResp, &toolObj); err != nil {
