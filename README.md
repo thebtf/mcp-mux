@@ -346,16 +346,161 @@ mcp-mux upgrade
 The daemon keeps running with the old binary. New shim processes use the new binary.
 The daemon updates on next natural restart.
 
-**Graceful restart preserves:**
+**Graceful restart preserves (v0.21.0+):**
 
+- **Upstream processes themselves** — they keep running across the daemon restart, with in-flight requests intact
 - Cached MCP responses (init, tools, prompts, resources)
 - Server classification (shared/isolated/session-aware)
 - Session metadata (cwd, env)
 
-**Not preserved** (by design):
+**Only the daemon restarts** — upstreams are reattached via FD passing (Unix SCM_RIGHTS, Windows DuplicateHandle). See the next section for the lifecycle contract.
 
-- In-flight requests (get error response, retry automatically)
-- Upstream process state (re-spawned in background with proactive init)
+## Upstream Lifecycle — Survives Daemon Restart (v0.21.0+)
+
+Starting in v0.21.0, an upstream MCP server process **survives daemon restart without losing
+in-flight requests**. This restores the "drop-in MCP process manager" contract: behavioural
+equivalence to running the server as a direct child of the stdio client (the CC baseline).
+
+### The contract
+
+| Trigger | Pre-v0.21.0 | v0.21.0+ |
+|---|---|---|
+| `mcp-mux upgrade --restart` | Upstream killed + respawned, in-flight requests dropped | Upstream keeps running, new daemon reattaches FDs |
+| Daemon crash (SIGKILL) | Upstream killed with daemon | Upstream survives (Unix: own process group; Windows: Job Object without KILL_ON_JOB_CLOSE) |
+| `mux_restart <sid>` (operator-initiated) | Hard kill — unchanged | Hard kill — unchanged (explicit operator intent) |
+| Reaper idle-eviction | Hard SIGKILL | Soft-close: 30s stdin drain → SIGTERM only after timeout |
+
+### How it works
+
+**Unix (Linux, macOS, *BSD):**
+
+- Upstream spawns with `Setpgid=true` — the kernel places the child in its own process group.
+- Planned restart: old daemon opens a Unix domain socket, successor daemon connects with a 128-bit
+  shared token, FDs (stdin, stdout) transfer via the SCM_RIGHTS ancillary control message.
+- Crash: absence of a shared process group means SIGHUP/SIGTERM to the daemon doesn't cascade.
+
+**Windows:**
+
+- Each upstream gets its own anonymous Job Object with `JOB_OBJECT_LIMIT_BREAKAWAY_OK` but
+  **no** `KILL_ON_JOB_CLOSE`. The child survives daemon exit.
+- Planned restart: successor is spawned with a named-pipe address; handles are duplicated via
+  `DuplicateHandle` with `DUPLICATE_SAME_ACCESS`.
+- Crash: absence of `KILL_ON_JOB_CLOSE` plus the child not being a daemon descendant =
+  survives.
+
+### Handoff protocol
+
+Old daemon → successor handshake is JSON-over-socket with a mandatory `protocol_version: 1`
+field on every message:
+
+```
+Hello ──(token, source_pid)──>
+       <──(protocol_version check, refs list)── Ready
+FdTransfer ──(server_id, handle_meta)──>
+             <──(SCM_RIGHTS / DuplicateHandle)── AckTransfer (ok/aborted)
+       ...repeat per upstream...
+Done   ──(transferred, aborted lists)──>
+       <──(accepted)── HandoffAck
+```
+
+- **Token auth (FR-11):** constant-time compare, 128-bit random, 0600 file.
+- **Per-upstream atomicity (FR-7):** each transfer either succeeds or falls back to respawn
+  for that one upstream — other upstreams are unaffected.
+- **30s accept + total timeout** on both sides.
+- **Version skew (FR-3):** mismatched `protocol_version` → old daemon falls back to legacy
+  shutdown+respawn (FR-8).
+
+### FR-8 degraded fallback
+
+If any of the following happens, the daemon automatically falls back to the pre-v0.21.0
+kill-and-respawn path — **no upstream is lost, zero-deployment-impact guarantee (FR-9):**
+
+- Platform unsupported (socket bind failure on an exotic OS)
+- Successor spawn failure
+- Handoff socket accept timeout exceeded
+- Shared token mismatch (`ErrTokenMismatch`)
+- Protocol version mismatch (`ErrProtocolVersionMismatch`)
+- Any other `performHandoff` error
+
+All paths log `handoff.fallback reason=…` — search `mcp-mux.log` for operator diagnostics.
+After fallback the successor daemon respawns upstreams from snapshot; `drainOrphanedInflight`
+returns JSON-RPC errors to in-flight callers (same as v0.20.x).
+
+### Operator visibility
+
+New counters in `mux_list` / `HandleStatus`:
+
+| Counter | Meaning |
+|---|---|
+| `handoff_attempted` | Total `HandleGracefulRestart` invocations that entered the handoff path |
+| `handoff_transferred` | Successfully handed-off upstreams across all handoffs |
+| `handoff_aborted` | Upstreams that fell back per-upstream (FR-7) while siblings succeeded |
+| `handoff_fallback` | Whole-handoff failures that took the FR-8 respawn path |
+
+Structured log markers: `handoff.start`, `handoff.upstream.transferred`, `handoff.complete`,
+`handoff.fallback`, `handoff.receive.{start,complete,fail}`.
+
+### Migration from v0.20.x
+
+No code changes. Run `mcp-mux upgrade --restart` once — the first restart still goes through
+the legacy path (the old daemon has no handoff code). From the second restart onward,
+in-flight requests survive.
+
+Snapshot back-compat: v0.20.x `OwnerSnapshot` files load without errors; new fields
+(`UpstreamPID`, `HandoffSocketPath`, `SpawnPgid`) are `omitempty` and default to zero on
+old snapshots.
+
+### Known limitations
+
+- **First restart after v0.20.x → v0.21.0:** legacy path, in-flight requests dropped once.
+  Subsequent restarts use handoff.
+- **Per-upstream 30s transfer bound:** upstreams that don't drain within 30s fall back to
+  respawn for that entry only.
+- **macOS launchd cross-parentage:** verified via CI; spawns outside the mcp-mux process
+  tree inherit correctly.
+- **Windows `JOB_OBJECT_LIMIT_BREAKAWAY_OK` requires `CREATE_BREAKAWAY_FROM_JOB` on
+  grandchildren:** upstreams that spawn language servers without that flag will still be
+  killed by `TerminateJobObject` in the explicit-kill path.
+
+### Post-deploy verification
+
+```sh
+# Unix
+scripts/verify-handoff.sh
+
+# Windows
+scripts\verify-handoff.ps1
+```
+
+The script spawns a test daemon, triggers `upgrade --restart`, asserts all upstream PIDs
+survive across the restart, and reports any dropped FDs.
+
+### Public API (muxcore library)
+
+Consumers of the `muxcore` Go library — e.g. `aimux` — can drive the handoff protocol
+directly:
+
+```go
+import "github.com/thebtf/mcp-mux/muxcore/daemon"
+
+// Old daemon side
+result, err := daemon.PerformHandoff(ctx, conn, token, upstreams)
+
+// Successor side
+upstreams, err := daemon.ReceiveHandoff(ctx, conn, token)
+
+// Token lifecycle
+token, path, err := daemon.WriteHandoffToken(dir)
+token, err = daemon.ReadHandoffToken(path)
+defer daemon.DeleteHandoffToken(path)
+```
+
+See `muxcore/README.md` for full API docs, platform constraints, and error handling.
+
+### Reference
+
+- Spec: `.agent/specs/upstream-survives-daemon-restart/spec.md`
+- Engram: `#109` (arc resolution), `#130` (public API export for aimux-class consumers)
 
 ## Configuration
 

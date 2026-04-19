@@ -308,6 +308,77 @@ mcp-mux upgrade
 
 После обновления MCP-серверы автоматически перезапустятся при следующем вызове инструмента CC — shim переподключится к новому daemon, запущенному новым бинарником.
 
+## Жизненный цикл upstream — выживание при рестарте daemon (v0.21.0+)
+
+Начиная с v0.21.0, процесс upstream-сервера MCP **переживает рестарт daemon без потери
+активных запросов**. Это восстанавливает контракт «drop-in MCP process manager» —
+поведенческую эквивалентность запуску сервера как прямого потомка stdio-клиента
+(baseline CC).
+
+### Контракт
+
+| Триггер | До v0.21.0 | v0.21.0+ |
+|---|---|---|
+| `mcp-mux upgrade --restart` | Upstream убивался и перезапускался, активные запросы терялись | Upstream продолжает работать, новый daemon присоединяет FDs |
+| Падение daemon (SIGKILL) | Upstream убивался вместе с daemon | Upstream выживает (Unix: собственная process group; Windows: Job Object без KILL_ON_JOB_CLOSE) |
+| `mux_restart <sid>` (инициировано оператором) | Жёсткое убийство — без изменений | Жёсткое убийство — без изменений (явное намерение оператора) |
+| Idle-вытеснение reaper'ом | Жёсткий SIGKILL | Мягкое закрытие: 30s слив stdin → SIGTERM только по таймауту |
+
+### Как это работает
+
+**Unix (Linux, macOS, \*BSD):**
+
+- Upstream спавнится с `Setpgid=true` — ядро помещает потомка в собственную process group.
+- Плановый рестарт: старый daemon открывает Unix domain socket, новый daemon подключается
+  с 128-битным общим токеном, FDs (stdin, stdout) передаются через SCM_RIGHTS ancillary
+  control message.
+- Падение: отсутствие общей process group означает, что SIGHUP/SIGTERM к daemon не
+  каскадируется на upstream.
+
+**Windows:**
+
+- Каждый upstream получает собственный анонимный Job Object с
+  `JOB_OBJECT_LIMIT_BREAKAWAY_OK`, но **без** `KILL_ON_JOB_CLOSE`. Потомок выживает после
+  выхода daemon.
+- Плановый рестарт: новый daemon спавнится с именованным pipe-адресом, handles
+  дублируются через `DuplicateHandle` с `DUPLICATE_SAME_ACCESS`.
+
+### Деградация по FR-8
+
+Если что-то идёт не так — неподдерживаемая платформа, ошибка спавна нового daemon,
+таймаут accept, несоответствие токена (`ErrTokenMismatch`), несоответствие версии
+протокола (`ErrProtocolVersionMismatch`) или любая другая ошибка `performHandoff` —
+daemon автоматически откатывается на kill-and-respawn путь v0.20.x. **Ни один upstream
+не теряется, гарантия нулевого влияния при деплое (FR-9).**
+
+Все пути логируют `handoff.fallback reason=…` — ищите в `mcp-mux.log` для диагностики.
+
+### Видимость для оператора
+
+Новые счётчики в `mux_list` / `HandleStatus`: `handoff_attempted`, `handoff_transferred`,
+`handoff_aborted`, `handoff_fallback`. Структурированные маркеры логов: `handoff.start`,
+`handoff.upstream.transferred`, `handoff.complete`, `handoff.fallback`,
+`handoff.receive.{start,complete,fail}`.
+
+### Миграция с v0.20.x
+
+Изменения кода не требуются. Запустите `mcp-mux upgrade --restart` — первый рестарт
+всё ещё пройдёт по legacy-пути (у старого daemon нет handoff-кода). Начиная со второго
+рестарта, активные запросы переживают обновление. Snapshot-совместимость сохранена:
+старые файлы `OwnerSnapshot` загружаются без ошибок.
+
+### Публичный API библиотеки muxcore
+
+Потребители Go-библиотеки `muxcore` — например, `aimux` — могут управлять handoff-
+протоколом напрямую через `daemon.PerformHandoff`, `daemon.ReceiveHandoff`,
+`daemon.WriteHandoffToken`, `daemon.ReadHandoffToken`, `daemon.DeleteHandoffToken`.
+Полный API и ограничения платформ — в `muxcore/README.md`.
+
+### Ссылки
+
+- Спецификация: `.agent/specs/upstream-survives-daemon-restart/spec.md`
+- Engram: `#109` (разрешение арки), `#130` (экспорт публичного API для aimux-подобных потребителей)
+
 ## Конфигурация
 
 Вся конфигурация задаётся через переменные окружения. Файл конфигурации не требуется.
