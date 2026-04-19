@@ -55,6 +55,7 @@ type HelloMsg struct {
 	Type            MsgType `json:"type"`
 	ProtocolVersion int     `json:"protocol_version"`
 	Token           string  `json:"token"`
+	SourcePID       int     `json:"source_pid,omitempty"` // T017: Windows DuplicateHandle requires sender PID
 }
 
 // ReadyMsg is sent by the old daemon after token verification. It lists all
@@ -114,6 +115,19 @@ func NewHelloMsg(token string) HelloMsg {
 		Type:            MsgHello,
 		ProtocolVersion: HandoffProtocolVersion,
 		Token:           token,
+	}
+}
+
+// NewHelloMsgWithPID constructs a HelloMsg that includes the sender's PID.
+// Used on Windows where DuplicateHandle requires the old daemon to know the
+// successor process's PID (FR-17, T017). SourcePID is omitted from JSON when
+// zero, so existing code that uses NewHelloMsg compiles and runs unchanged.
+func NewHelloMsgWithPID(token string, pid int) HelloMsg {
+	return HelloMsg{
+		Type:            MsgHello,
+		ProtocolVersion: HandoffProtocolVersion,
+		Token:           token,
+		SourcePID:       pid,
 	}
 }
 
