@@ -98,13 +98,13 @@
 - [ ] T018 [P] [EXECUTOR: sonnet] Logon session ownership check in `muxcore/daemon/handoff_windows.go`
   AC: `verifyPIDOwner(pid uint32) error` uses `OpenProcess` + `GetTokenInformation` to retrieve logon SID · rejects cross-session PIDs · 3 unit tests (own SID accepted, SYSTEM rejected if not SYSTEM, invalid PID rejected) · swap body→return null ⇒ tests MUST fail
 
-- [ ] T019 [P] [EXECUTOR: sonnet] Integration test: two-process handoff on Windows in `muxcore/daemon/handoff_integration_windows_test.go`
+- [x] T019 [P] [EXECUTOR: sonnet] Integration test: two-process handoff on Windows in `muxcore/daemon/handoff_integration_windows_test.go`
   AC: spawns mock upstream · runs full protocol over named pipe · asserts DuplicateHandle'd stdin writes reach upstream, stdout reads return upstream's response · swap body→return null ⇒ tests MUST fail
 
-- [ ] T020 [EXECUTOR: sonnet] Wire Windows platform impl into `performHandoff` / `receiveHandoff`
+- [x] T020 [EXECUTOR: sonnet] Wire Windows platform impl into `performHandoff` / `receiveHandoff`
   AC: `//go:build windows` tag resolution picks `handoff_windows.go` · T019 green · swap body→return null ⇒ T019 fails
 
-- [ ] G003 VERIFY Phase 3 (T015–T020) — BLOCKED until T015–T020 all [x]
+- [x] G003 VERIFY Phase 3 (T015–T020) — BLOCKED until T015–T020 all [x]
   RUN: `go test ./muxcore/upstream/ ./muxcore/daemon/ -run Handoff -tags windows -v` on Windows runner. Call Skill("nvmd-platform:code-reviewer") on `handoff_windows.go` + `spawn_windows.go`.
   CHECK: Job Object BREAKAWAY_OK verified (daemon kill leaves upstream alive). DuplicateHandle roundtrip works.
   ENFORCE: Zero stubs. Windows-specific error codes surfaced clearly to caller.
@@ -237,6 +237,7 @@ Within Phase 5: T028, T029, T030, T031 are [P] — all in distinct test files. T
 - **Release blocker:** G005 must pass before `mcp-mux/v0.10.0` tag.
 - **Commit strategy:** one commit per completed T-task. GATE marks aggregate phase commit with full review pass.
 - **Platform owners:** Phase 2 → Unix-focused agent. Phase 3 → Windows-focused agent (ideally via `aimux` agent if Opus orchestrator cannot reach Windows CI from main session).
+
 
 
 
