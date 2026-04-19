@@ -1,15 +1,61 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 )
+
+// syncBuffer is a thread-safe bytes.Buffer — the daemon writes logs from
+// multiple goroutines concurrently (supervisor, reaper, owner callbacks).
+// Tests that inspect log content need serialized reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+// testDaemonWithLog constructs a daemon whose logger writes into a
+// syncBuffer in addition to stderr, so log-based assertions can inspect
+// daemon output without racing with concurrent writers.
+func testDaemonWithLog(t *testing.T) (*Daemon, *syncBuffer) {
+	t.Helper()
+	buf := &syncBuffer{}
+	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
+	logger := log.New(buf, "[daemon-test] ", log.LstdFlags)
+	d, err := New(Config{
+		ControlPath:  ctlPath,
+		GracePeriod:  1 * time.Second,
+		IdleTimeout:  5 * time.Second,
+		SkipSnapshot: true,
+		Logger:       logger,
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+	return d, buf
+}
 
 func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	os.Remove(SnapshotPath())
@@ -329,55 +375,48 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenFile.Name())
 	t.Setenv("MCPMUX_HANDOFF_SOCKET", "/mock/socket")
 
-	d := testDaemon(t)
+	d, logBuf := testDaemonWithLog(t)
 	restored := d.loadSnapshot()
 	if restored != 2 {
 		t.Fatalf("loadSnapshot() restored %d owners, want 2 (sid1 via handoff, sid2 via legacy)", restored)
 	}
 
-	// Capture each entry independently. sid2 goes through the legacy spawn
-	// path with "echo two" which exits after ~1ms — onUpstreamExit fires
-	// and removes d.owners[sid2] almost immediately. Requiring both owners
-	// to be visible in the SAME poll iteration would race on fast macOS
-	// scheduling (sid2 is already gone by the time sid1 is observed).
-	// Capture each pointer once when it first appears; the Owner struct
-	// survives subsequent removal from the map so Status() is still safe.
-	var entry1, entry2 *OwnerEntry
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		d.mu.RLock()
-		if entry1 == nil {
-			if e := d.owners[sid1]; e != nil && e.Owner != nil {
-				entry1 = e
-			}
-		}
-		if entry2 == nil {
-			if e := d.owners[sid2]; e != nil && e.Owner != nil {
-				entry2 = e
-			}
-		}
-		d.mu.RUnlock()
-		if entry1 != nil && entry2 != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if entry1 == nil {
-		t.Fatal("sid1 never appeared in d.owners after partial handoff (polled 2s)")
-	}
-	if entry2 == nil {
-		t.Fatal("sid2 never appeared in d.owners after partial handoff (polled 2s)")
+	// FR-7 is verified by structural log inspection rather than by probing
+	// d.owners — in the partial scenario both owners get removed from the
+	// map almost immediately after insertion (sid1's proactive init writes
+	// to a stub pipe with no reader and errors out; sid2 spawns "echo two"
+	// which exits cleanly after ~1ms). The code path that routes each
+	// owner through handoff vs. legacy is already complete by the time
+	// loadSnapshot returns, and daemon.Logger emits a stable marker per
+	// path: "snapshot: reattached owner <sid> from handoff" for the
+	// handoff path, "snapshot: restored owner <sid> for <cmd> <args>"
+	// for every successful registration regardless of path.
+	logs := logBuf.String()
+
+	// Positive: sid1 took the handoff path.
+	wantSid1Handoff := "snapshot: reattached owner " + sid1[:8] + " from handoff"
+	if !strings.Contains(logs, wantSid1Handoff) {
+		t.Errorf("expected log %q for sid1 (handoff path), not found.\nLogs:\n%s", wantSid1Handoff, logs)
 	}
 
-	// sid1: transferred via handoff → classification_source == "handoff"
-	status1 := entry1.Owner.Status()
-	if class1, _ := status1["classification_source"].(string); class1 != "handoff" {
-		t.Errorf("sid1 classification_source = %q, want %q (handoff path not used)", class1, "handoff")
+	// Negative: sid2 was NOT taken via handoff path.
+	dontWantSid2Handoff := "snapshot: reattached owner " + sid2[:8] + " from handoff"
+	if strings.Contains(logs, dontWantSid2Handoff) {
+		t.Errorf("did not expect log %q for sid2 — sid2 was absent from handoff payload.\nLogs:\n%s", dontWantSid2Handoff, logs)
 	}
 
-	// sid2: not in handoff payload → legacy spawn path, NOT "handoff"
-	status2 := entry2.Owner.Status()
-	if class2, _ := status2["classification_source"].(string); class2 == "handoff" {
-		t.Errorf("sid2 classification_source = %q but sid2 was not in handoff; expected legacy path", class2)
+	// Both owners must have been registered (positive check for both).
+	for _, expected := range []string{
+		"snapshot: restored owner " + sid1[:8] + " for echo [one]",
+		"snapshot: restored owner " + sid2[:8] + " for echo [two]",
+	} {
+		if !strings.Contains(logs, expected) {
+			t.Errorf("expected log %q, not found.\nLogs:\n%s", expected, logs)
+		}
+	}
+
+	// Handoff receive must have delivered exactly one upstream.
+	if !strings.Contains(logs, "handoff.receive.ok upstreams=1") {
+		t.Errorf("expected %q in logs, not found.\nLogs:\n%s", "handoff.receive.ok upstreams=1", logs)
 	}
 }
