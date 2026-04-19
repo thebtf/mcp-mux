@@ -5,14 +5,16 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/rotlog"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -56,20 +58,31 @@ func runGlobalDaemon() {
 	}
 
 	// Debug log to file — daemon is detached, stderr goes nowhere.
-	// Rotate: if log > 50MB, shift .1 → .2, current → .1, start fresh.
-	// Keeps up to ~2 days of history across restarts (3 files × 50MB max).
+	// Runtime rotation: rotlog.Writer rotates during daemon lifetime (not only on restart).
+	// Default: 50MB max size, 3 files (active + .1 + .2). Override via env vars.
 	debugLogPath := filepath.Join(os.TempDir(), "mcp-muxd-debug.log")
-	if info, err := os.Stat(debugLogPath); err == nil && info.Size() > 50*1024*1024 {
-		os.Remove(debugLogPath + ".2")
-		os.Rename(debugLogPath+".1", debugLogPath+".2")
-		os.Rename(debugLogPath, debugLogPath+".1")
+	maxMB := int64(50)
+	if v := os.Getenv("MCP_MUX_LOG_MAX_MB"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxMB = n
+		}
 	}
-	logFile, err := os.OpenFile(debugLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	maxFiles := 3
+	if v := os.Getenv("MCP_MUX_LOG_MAX_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			maxFiles = n
+		}
+	}
+	logWriter, err := rotlog.New(rotlog.Config{
+		Path:     debugLogPath,
+		MaxSize:  maxMB * 1024 * 1024,
+		MaxFiles: maxFiles,
+	})
 	var logger *log.Logger
 	if err == nil {
-		defer func() { _ = logFile.Close() }()
-		logger = log.New(logFile, "[mcp-muxd] ", log.LstdFlags|log.Lmicroseconds)
-		logger.Printf("=== daemon starting, debug log: %s ===", debugLogPath)
+		defer func() { _ = logWriter.Close() }()
+		logger = log.New(logWriter, "[mcp-muxd] ", log.LstdFlags|log.Lmicroseconds)
+		logger.Printf("=== daemon starting, debug log: %s (max=%dMB x%d) ===", debugLogPath, maxMB, maxFiles)
 	} else {
 		logger = log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
 	}
