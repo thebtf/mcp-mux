@@ -358,7 +358,7 @@ The daemon updates on next natural restart.
 ## Upstream Lifecycle — Survives Daemon Restart (v0.21.0+)
 
 Starting in v0.21.0, an upstream MCP server process **survives daemon restart without losing
-in-flight requests**. This restores the "drop-in MCP process manager" contract: behavioural
+in-flight requests**. This restores the "drop-in MCP process manager" contract: behavioral
 equivalence to running the server as a direct child of the stdio client (the CC baseline).
 
 ### The contract
@@ -422,7 +422,7 @@ kill-and-respawn path — **no upstream is lost, zero-deployment-impact guarante
 - Protocol version mismatch (`ErrProtocolVersionMismatch`)
 - Any other `performHandoff` error
 
-All paths log `handoff.fallback reason=…` — search `mcp-mux.log` for operator diagnostics.
+All paths log `handoff.fallback reason=…` — search `mcp-muxd-debug.log` for operator diagnostics.
 After fallback the successor daemon respawns upstreams from snapshot; `drainOrphanedInflight`
 returns JSON-RPC errors to in-flight callers (same as v0.20.x).
 

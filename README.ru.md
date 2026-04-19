@@ -351,7 +351,7 @@ mcp-mux upgrade
 daemon автоматически откатывается на kill-and-respawn путь v0.20.x. **Ни один upstream
 не теряется, гарантия нулевого влияния при деплое (FR-9).**
 
-Все пути логируют `handoff.fallback reason=…` — ищите в `mcp-mux.log` для диагностики.
+Все пути логируют `handoff.fallback reason=…` — ищите в `mcp-muxd-debug.log` для диагностики.
 
 ### Видимость для оператора
 
