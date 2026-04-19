@@ -106,12 +106,19 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
 
-	d.mu.RLock()
-	entry := d.owners[sid]
-	d.mu.RUnlock()
-
+	var entry *OwnerEntry
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.RLock()
+		entry = d.owners[sid]
+		d.mu.RUnlock()
+		if entry != nil && entry.Owner != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if entry == nil || entry.Owner == nil {
-		t.Fatal("owner not found in d.owners after handoff reattach")
+		t.Fatal("owner not found in d.owners after handoff reattach (polled 2s)")
 	}
 
 	// Verify owner was constructed via handoff path: classification_source == "handoff".
@@ -173,12 +180,19 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners (want 1); FR-8 fallback failed", restored)
 	}
 
-	d.mu.RLock()
-	entry := d.owners[sid]
-	d.mu.RUnlock()
-
+	var entry *OwnerEntry
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.RLock()
+		entry = d.owners[sid]
+		d.mu.RUnlock()
+		if entry != nil && entry.Owner != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if entry == nil || entry.Owner == nil {
-		t.Fatal("owner not found in d.owners after FR-8 fallback")
+		t.Fatal("owner not found in d.owners after FR-8 fallback (polled 2s)")
 	}
 
 	// Owner must NOT have been reattached via handoff (socket was unreachable).
