@@ -1816,31 +1816,13 @@ func (o *Owner) drainInflightRequests() {
 // before the process exits.
 func (o *Owner) Shutdown() {
 	o.shutdownOnce.Do(func() {
-		// Close control server first and clean up its socket
-		if o.controlServer != nil {
-			socketPath := o.controlServer.SocketPath()
-			o.controlServer.Close()
-			ipc.Cleanup(socketPath)
-		}
-
-		o.closeListener()
-
-		o.mu.Lock()
-		for _, s := range o.sessions {
-			s.Close()
-		}
-		o.sessions = make(map[int]*Session)
-		o.mu.Unlock()
+		o.teardownExceptUpstream()
 
 		o.mu.Lock()
 		up := o.upstream
 		o.mu.Unlock()
 		if up != nil {
 			up.Close()
-		}
-
-		if o.rejectionLogger != nil {
-			o.rejectionLogger.Close()
 		}
 
 		o.logger.Printf("owner shut down")

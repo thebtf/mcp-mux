@@ -38,6 +38,11 @@ type OwnerSnapshot struct {
 	CachedPrompts           string               `json:"cached_prompts,omitempty"`
 	CachedResources         string               `json:"cached_resources,omitempty"`
 	CachedResourceTemplates string               `json:"cached_resource_templates,omitempty"`
+	// Handoff fields (v0.21.0+). Zero-values = cold-spawn path (FR-8 backwards-compat).
+	// Non-zero UpstreamPID + non-empty HandoffSocketPath = reattach path (FR-1/FR-9).
+	UpstreamPID       int    `json:"upstream_pid,omitempty"`
+	HandoffSocketPath string `json:"handoff_socket_path,omitempty"`
+	SpawnPgid         int    `json:"spawn_pgid,omitempty"`
 }
 
 // SessionSnapshot captures the serializable state of a Session for graceful restart.

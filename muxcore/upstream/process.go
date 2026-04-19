@@ -20,6 +20,16 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/procgroup"
 )
 
+// ErrAlreadyClosed is returned by Detach if the process has already been closed.
+var ErrAlreadyClosed = errors.New("upstream: process already closed")
+
+// ErrAlreadyDetached is returned by Detach if Detach has already been called.
+var ErrAlreadyDetached = errors.New("upstream: process already detached")
+
+// ErrDetachUnsupported is returned by Detach when the Process is not backed
+// by an OS child process (for example, NewProcessFromHandler).
+var ErrDetachUnsupported = errors.New("upstream: detach unsupported for handler-based process")
+
 // lineBuffer is a mutex-protected deque of lines for buffering stdout.
 // A drain goroutine pushes lines; ReadLine pops them.
 type lineBuffer struct {
@@ -80,15 +90,26 @@ func (lb *lineBuffer) pop() ([]byte, error) {
 
 // Process represents a running upstream MCP server process.
 type Process struct {
-	proc   *procgroup.Process
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-	stderr io.ReadCloser
+	proc       *procgroup.Process
+	stdin      io.WriteCloser
+	stdout     io.ReadCloser
+	stderr     io.ReadCloser
+	stdinFile  *os.File // raw OS file for Detach; nil for handler-based processes
+	stdoutFile *os.File // raw OS file for Detach; nil for handler-based processes
+	// stdinFD / stdoutFD cache the OS file descriptors captured ONCE at
+	// PreStart time — before any reader/writer goroutine touches the File
+	// objects. Calling (*os.File).Fd() from Detach() at runtime would race
+	// with the spawn goroutine's internal reads/writes on the same file
+	// (observed on CI ubuntu -race: TestDetach_DoubleDetach). Caching at
+	// spawn time eliminates the race.
+	stdinFD  uintptr
+	stdoutFD uintptr
 
 	lineBuf *lineBuffer
 
 	mu           sync.Mutex
 	closed       bool
+	detached     bool
 	drainTimeout time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
 
 	// Done is closed when the process exits.
@@ -178,6 +199,15 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 			p.stdin = stdin
 			p.stdout = stdoutR
 			p.stderr = stderr
+			// Capture raw *os.File references for Detach(). stdoutR is always
+			// *os.File (from os.Pipe above). stdin from StdinPipe is also *os.File
+			// on all supported platforms; the type assertion is defensive.
+			if f, ok := stdin.(*os.File); ok {
+				p.stdinFile = f
+				p.stdinFD = f.Fd() // cache pre-goroutine (NFR-5, race-safe)
+			}
+			p.stdoutFile = stdoutR
+			p.stdoutFD = stdoutR.Fd() // cache pre-goroutine (race-safe)
 			return nil
 		},
 	}
@@ -323,6 +353,11 @@ func (p *Process) Close() error {
 		p.mu.Unlock()
 		return nil
 	}
+	if p.detached {
+		// Ownership transferred via Detach — do not signal the process.
+		p.mu.Unlock()
+		return nil
+	}
 	p.closed = true
 	stdinWait := p.drainTimeout
 	p.mu.Unlock()
@@ -359,6 +394,48 @@ func (p *Process) PID() int {
 		return p.proc.PID()
 	}
 	return 0
+}
+
+// Detach releases ownership of the upstream process without terminating it.
+// It returns the process PID and the raw OS file descriptors for stdin and
+// stdout, so that a successor daemon can reattach to the running process via
+// FD passing (Unix SCM_RIGHTS) or DuplicateHandle (Windows).
+//
+// After Detach returns successfully, the caller owns the returned file
+// descriptors and is responsible for transferring or closing them.
+// Subsequent calls to Close() are no-ops — the process is not signaled.
+//
+// Returns ErrAlreadyClosed if the process has been closed.
+// Returns ErrAlreadyDetached if Detach has already been called.
+func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return 0, 0, 0, ErrAlreadyClosed
+	}
+	if p.detached {
+		return 0, 0, 0, ErrAlreadyDetached
+	}
+	if p.proc == nil {
+		return 0, 0, 0, ErrDetachUnsupported
+	}
+	p.detached = true
+
+	pid = p.proc.PID()
+
+	// Return cached FDs (captured in PreStart, race-safe). Calling
+	// (*os.File).Fd() here would race with the spawn goroutines' Read/Write
+	// on the same file objects — observed on ubuntu -race as a data race
+	// between os.(*File).fd() and os.(*File).Fd() in TestDetach_DoubleDetach.
+	if p.stdinFile != nil {
+		stdinFD = p.stdinFD
+	}
+	if p.stdoutFile != nil {
+		stdoutFD = p.stdoutFD
+	}
+
+	return pid, stdinFD, stdoutFD, nil
 }
 
 // NewProcessFromHandler creates a Process that runs an in-process handler via
