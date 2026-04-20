@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
@@ -41,6 +42,34 @@ const (
 	// proactive MCP init handshake for the "spawn" control command.
 	spawnRPCTimeout = 30 * time.Second
 )
+
+// Mode is the runtime role of the engine selected by Run().
+type Mode int
+
+const (
+	// ModeUnset is the zero value before Run() has chosen a mode.
+	ModeUnset Mode = iota
+	// ModeDaemon is the global daemon process that manages owners.
+	ModeDaemon
+	// ModeClient is a shim that talks to an external daemon over IPC.
+	ModeClient
+	// ModeProxy is a pass-through between a parent mcp-mux shim and this process.
+	ModeProxy
+)
+
+// String returns a human-readable name for the Mode.
+func (m Mode) String() string {
+	switch m {
+	case ModeDaemon:
+		return "daemon"
+	case ModeClient:
+		return "client"
+	case ModeProxy:
+		return "proxy"
+	default:
+		return "unset"
+	}
+}
 
 // Handler is the MCP server implementation function.
 // When running in daemon mode, this is called with the upstream's stdin/stdout.
@@ -107,6 +136,11 @@ type Config struct {
 type MuxEngine struct {
 	cfg    Config
 	logger *log.Logger
+
+	mu    sync.RWMutex
+	d     *daemon.Daemon // non-nil only while runDaemon is active
+	mode  Mode
+	ready chan struct{} // closed once mode is set (and, in daemon mode, the daemon is bound)
 }
 
 // New creates a MuxEngine with the given configuration.
@@ -134,7 +168,7 @@ func New(cfg Config) (*MuxEngine, error) {
 	if cfg.Handler != nil && cfg.SessionHandler != nil {
 		logger.Printf("engine: warning: both Handler and SessionHandler set, SessionHandler takes priority")
 	}
-	return &MuxEngine{cfg: cfg, logger: logger}, nil
+	return &MuxEngine{cfg: cfg, logger: logger, ready: make(chan struct{})}, nil
 }
 
 // isDaemonMode checks whether the current process was invoked with the daemon flag.
@@ -167,6 +201,62 @@ func (e *MuxEngine) Run(ctx context.Context) error {
 		return e.runProxy(ctx)
 	}
 	return e.runClient(ctx)
+}
+
+// markReady sets the engine mode and optional daemon reference, then closes the
+// ready channel exactly once. Safe to call from any goroutine. If Run() is
+// somehow called twice, the second call is a no-op on the channel (avoids panic
+// on double-close).
+func (e *MuxEngine) markReady(mode Mode, d *daemon.Daemon) {
+	e.mu.Lock()
+	e.d = d
+	e.mode = mode
+	e.mu.Unlock()
+	// Guard against double close if Run() is invoked more than once.
+	select {
+	case <-e.ready:
+		// already closed — no-op
+	default:
+		close(e.ready)
+	}
+}
+
+// Daemon returns the live *daemon.Daemon when this engine is running in daemon
+// mode. Returns nil in client/proxy mode and before Ready() fires.
+//
+// In-process consumers (e.g., aimux health handlers) should prefer this over
+// calling control.Send against their own control socket — the socket hop is
+// avoidable and introduces failure modes (startup race, pool saturation).
+// In client/proxy mode the daemon lives in a different process; use
+// ControlSocketPath() + control.Send there.
+func (e *MuxEngine) Daemon() *daemon.Daemon {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.d
+}
+
+// Mode returns the runtime mode selected by Run().
+// Returns ModeUnset until Run() has started dispatching.
+func (e *MuxEngine) Mode() Mode {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mode
+}
+
+// Ready returns a channel closed once Run() has selected its mode and (in
+// daemon mode) the daemon is listening on its control socket. After Ready
+// fires, Mode() returns a stable non-Unset value and Daemon() returns the live
+// daemon (daemon mode) or nil (client/proxy mode).
+func (e *MuxEngine) Ready() <-chan struct{} {
+	return e.ready
+}
+
+// ControlSocketPath returns the canonical daemon control socket path for this
+// engine's Name and BaseDir. Mirrors serverid.DaemonControlPath exactly;
+// exposed so consumers do not need to import serverid directly or duplicate the
+// BaseDir/Name composition.
+func (e *MuxEngine) ControlSocketPath() string {
+	return serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 }
 
 // runDaemon starts the global daemon that manages owners and accepts IPC
@@ -203,6 +293,16 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		return fmt.Errorf("engine daemon: %w", err)
 	}
 
+	// Publish the daemon reference and signal readiness. daemon.New() has already
+	// bound the control socket, so callers that block on Ready() can immediately
+	// call Daemon() and reach a live, accepting daemon.
+	e.markReady(ModeDaemon, d)
+	defer func() {
+		e.mu.Lock()
+		e.d = nil
+		e.mu.Unlock()
+	}()
+
 	reaper := daemon.NewReaper(d, defaultReaperInterval)
 
 	select {
@@ -224,6 +324,8 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 //  3. Connect to the returned IPC socket.
 //  4. Bridge stdin/stdout ↔ IPC with automatic reconnect.
 func (e *MuxEngine) runClient(ctx context.Context) error {
+	e.markReady(ModeClient, nil)
+
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 
 	// 1. Ensure the daemon is running, starting it if necessary.
@@ -293,6 +395,8 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 // SessionHandler is set (no Handler), proxy mode is unsupported because
 // SessionHandler requires per-request dispatch, not a raw stdio bridge.
 func (e *MuxEngine) runProxy(ctx context.Context) error {
+	e.markReady(ModeProxy, nil)
+
 	// Proxy mode: we are a subprocess of an EXTERNAL parent shim (e.g. the
 	// user wrapped us via `mcp-mux <our-binary>`). The parent owns stdio and
 	// expects us to serve one request/response per MCP message.
