@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +22,7 @@ const (
 	reconnectPollInterval   = 500 * time.Millisecond
 	msgFromCCBufferSize     = 1000
 	msgFromIPCBufferSize    = 1000
+	defaultMaxRefreshAttempts = 3
 )
 
 // ReconnectFunc reconnects to the daemon and returns the new IPC path and handshake token.
@@ -33,7 +36,9 @@ type ResilientClientConfig struct {
 	Stdout           io.Writer
 	InitialIPCPath   string
 	Token            string // handshake token from initial spawn; sent to owner on connect
+	RefreshToken     ReconnectFunc
 	Reconnect        ReconnectFunc
+	MaxRefreshAttempts int
 	ReconnectTimeout time.Duration // default: 30s
 
 	// KeepaliveInterval is no longer used. Previous revisions emitted a
@@ -90,6 +95,9 @@ var ErrReconnectExit = errors.New("reconnect: exit for fresh handshake")
 func RunResilientClient(cfg ResilientClientConfig) error {
 	if cfg.ReconnectTimeout == 0 {
 		cfg.ReconnectTimeout = defaultReconnectTimeout
+	}
+	if cfg.RefreshToken != nil && cfg.MaxRefreshAttempts == 0 {
+		cfg.MaxRefreshAttempts = defaultMaxRefreshAttempts
 	}
 	if cfg.ProbeGracePeriod == 0 {
 		cfg.ProbeGracePeriod = 10 * time.Second
@@ -380,76 +388,148 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	rc.drainOrphanedInflight(stdoutMu)
 
 	deadline := time.Now().Add(rc.cfg.ReconnectTimeout)
+	if rc.cfg.RefreshToken != nil {
+		fallbackReason := ""
+		for attempt := 0; attempt < rc.cfg.MaxRefreshAttempts; attempt++ {
+			res, err := rc.awaitReconnectAttempt(deadline, stdinDone, rc.cfg.RefreshToken)
+			if err != nil {
+				if err == io.EOF {
+					return nil, io.EOF
+				}
+				if isOwnerGoneError(err) {
+					rc.log.Printf("shim.reconnect.refresh_fail reason=owner_gone")
+					fallbackReason = "owner_gone"
+					break
+				}
+				rc.log.Printf("shim.reconnect.refresh_fail reason=%s", refreshFailureReason(err))
+				continue
+			}
+
+			conn, reason, err := rc.finishReconnect(res.path, res.token, stdoutMu)
+			if err != nil {
+				rc.log.Printf("shim.reconnect.refresh_fail reason=%s", reason)
+				if reason == "owner_gone" {
+					fallbackReason = "owner_gone"
+					break
+				}
+				continue
+			}
+
+			rc.log.Printf("shim.reconnect.refresh_ok owner=%s", ownerPrefixFromIPCPath(res.path))
+			return conn, nil
+		}
+		if fallbackReason == "" {
+			fallbackReason = "N_refresh_fail"
+		}
+		rc.log.Printf("shim.reconnect.fallback_spawn reason=%s", fallbackReason)
+	}
+
+	for {
+		res, err := rc.awaitReconnectAttempt(deadline, stdinDone, rc.cfg.Reconnect)
+		if err != nil {
+			return nil, err
+		}
+		conn, _, err := rc.finishReconnect(res.path, res.token, stdoutMu)
+		if err != nil {
+			rc.log.Printf("resilient: reconnect handshake failed: %v (retrying)", err)
+			continue
+		}
+		return conn, nil
+	}
+}
+
+func (rc *resilientClient) awaitReconnectAttempt(deadline time.Time, stdinDone <-chan error, fn ReconnectFunc) (reconnectResult, error) {
+	if fn == nil {
+		return reconnectResult{}, fmt.Errorf("resilient: reconnect function not configured")
+	}
+
+	resultCh := make(chan reconnectResult, 1)
+	go func() {
+		newPath, newToken, err := fn()
+		resultCh <- reconnectResult{path: newPath, token: newToken, err: err}
+	}()
+
 	pollTicker := time.NewTicker(reconnectPollInterval)
 	defer pollTicker.Stop()
 
-	resultCh := make(chan reconnectResult, 1)
-	pending := false // true when an async Reconnect() call is in-flight
-
 	for {
-		// Check timeout.
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("resilient: reconnect timeout after %s", rc.cfg.ReconnectTimeout)
+			return reconnectResult{}, fmt.Errorf("resilient: reconnect timeout after %s", rc.cfg.ReconnectTimeout)
 		}
 
 		select {
 		case err := <-stdinDone:
 			if err == io.EOF {
-				return nil, io.EOF
+				return reconnectResult{}, io.EOF
 			}
-			return nil, fmt.Errorf("resilient: stdin during reconnect: %w", err)
-
-		case <-pollTicker.C:
-			if pending {
-				// Previous Reconnect() call still in flight — skip this tick.
-				continue
-			}
-			pending = true
-			go func() {
-				newPath, newToken, err := rc.cfg.Reconnect()
-				resultCh <- reconnectResult{path: newPath, token: newToken, err: err}
-			}()
-
+			return reconnectResult{}, fmt.Errorf("resilient: stdin during reconnect: %w", err)
 		case res := <-resultCh:
-			pending = false
-			if res.err != nil {
-				rc.log.Printf("resilient: Reconnect() failed: %v (retrying)", res.err)
-				continue
-			}
-
-			conn, err := ipc.Dial(res.path)
-			if err != nil {
-				rc.log.Printf("resilient: dial %s failed: %v (retrying)", res.path, err)
-				continue
-			}
-
-			// Update and send the new handshake token before replaying init.
-			rc.token = res.token
-			if rc.token != "" {
-				if _, err := fmt.Fprintf(conn, "%s\n", rc.token); err != nil {
-					rc.log.Printf("resilient: send token on reconnect failed: %v (retrying)", err)
-					conn.Close()
-					continue
-				}
-			}
-
-			// Replay cached initialize request to warm new daemon.
-			if err := rc.replayInit(conn); err != nil {
-				rc.log.Printf("resilient: init replay failed: %v (retrying)", err)
-				conn.Close()
-				continue
-			}
-
-			// Flush buffered CC messages that arrived during RECONNECTING.
-			rc.flushBuffer(conn)
-
-			// Notify CC that upstream capabilities may have changed.
-			// This triggers CC to re-fetch tools/list, prompts/list, resources/list.
-			rc.sendListChangedNotifications(stdoutMu)
-
-			return conn, nil
+			return res, res.err
+		case <-pollTicker.C:
 		}
 	}
+}
+
+func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mutex) (interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}, string, error) {
+	conn, err := ipc.Dial(path)
+	if err != nil {
+		return nil, "dial", err
+	}
+
+	rc.token = token
+	if rc.token != "" {
+		if _, err := fmt.Fprintf(conn, "%s\n", rc.token); err != nil {
+			conn.Close()
+			return nil, "handshake", err
+		}
+	}
+
+	if err := rc.replayInit(conn); err != nil {
+		conn.Close()
+		return nil, "handshake", err
+	}
+
+	rc.flushBuffer(conn)
+	rc.sendListChangedNotifications(stdoutMu)
+	return conn, "", nil
+}
+
+func refreshFailureReason(err error) string {
+	if isOwnerGoneError(err) {
+		return "owner_gone"
+	}
+	if isUnknownTokenError(err) {
+		return "unknown_token"
+	}
+	return "unknown_token"
+}
+
+func isOwnerGoneError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "owner gone")
+}
+
+func isUnknownTokenError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unknown token")
+}
+
+func ownerPrefixFromIPCPath(ipcPath string) string {
+	base := filepath.Base(ipcPath)
+	base = strings.TrimSuffix(base, ".sock")
+	base = strings.TrimPrefix(base, "mcp-mux-")
+	if idx := strings.IndexByte(base, '.'); idx >= 0 {
+		base = base[:idx]
+	}
+	if len(base) > 8 {
+		base = base[:8]
+	}
+	if base == "" {
+		return "unknown"
+	}
+	return base
 }
 
 // replayInit replays the cached initialize request to the new IPC connection
