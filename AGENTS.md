@@ -194,6 +194,23 @@ Key changes:
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
 
+### v0.21.1 — Shim reconnect token refresh (F2)
+
+- **`HandleRefreshSessionToken(prevToken string) (newToken string, err error)`** added to `control.DaemonHandler` — lets a shim mint a fresh handshake token for the same owner after its original token is consumed, without triggering a full owner respawn.
+- **`session.Manager` bound history** — `Bind` now records a 30-min TTL entry keyed by token; `RegisterReconnect(prev, ownerAlive)` looks up that history and returns a new pending token, or `ErrUnknownToken` / `ErrOwnerGone`.
+- **`ResilientClientConfig.RefreshToken` + `MaxRefreshAttempts`** (default 3) — shim tries `HandleRefreshSessionToken` up to N times before falling back to the full `HandleSpawn` path. Fallback also fires immediately on `ErrOwnerGone`. Zero-value `RefreshToken` field preserves pre-F2 behaviour (skip refresh entirely).
+- **Structured markers and counters** — `shim.reconnect.refresh_ok|refresh_fail|fallback_spawn` log markers; `shim_reconnect_refreshed`, `shim_reconnect_fallback_spawned`, `shim_reconnect_gave_up` counters exposed via `HandleStatus`. Note: `fallback_spawned` increments only when `HandleSpawn` is called with `ReconnectReason == "fallback_spawn"` (v0.21.x shims only); legacy shims that call bare `HandleSpawn` are invisible to all three counters.
+- **Back-compat** — pre-v0.21.1 shims that have no knowledge of `refresh-token` are still rejected cleanly after their token is consumed; they recover via the existing `HandleSpawn` path, identical to a cold first-time spawn from the daemon's perspective.
+- **Breaking change (internal API)** — `session.Manager.Bind` signature extended from `Bind(token string, session *Session)` to `Bind(token, ownerKey string, session *Session)`. Only call site is `owner.acceptLoop`; external consumers of muxcore do not call `Bind` directly.
+
+### v0.21.2 — Engine accessors
+
+- Adds read-only accessors to the `engine.Engine` type for observability and testing: `OwnerCount()`, `SessionCount()`, `HandleStatus()`, and `Entry(serverID)`. No breaking changes; all additive.
+
+### v0.21.3 — OwnerConfig.UpstreamWriter (proposed in PR #93)
+
+- `owner.OwnerConfig.UpstreamWriter io.Writer` — optional field that, when set, replaces the default subprocess stdout pipe with a caller-supplied writer. Enables in-process upstream implementations that do not want to go through a subprocess. PR #93 is open at time of writing; adopt after merge.
+
 ## INSTRUCTION HIERARCHY
 
 ```
