@@ -722,8 +722,20 @@ func TestRespondToRootsList_WithCwd(t *testing.T) {
 
 	// Call respondToRootsList directly
 	id := json.RawMessage(`1`)
-	if err := owner.respondToRootsList(id); err != nil {
-		t.Errorf("respondToRootsList: %v", err)
+	// Retry briefly: on macOS `go run mock_server.go` may still be compiling
+	// when NewOwner returns, so upstream stdin can race as "file already closed".
+	// Probing via respondToRootsList is idempotent — it builds JSON and writes to upstream.
+	deadline := time.Now().Add(1 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = owner.respondToRootsList(id)
+		if lastErr == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Errorf("respondToRootsList (after readiness retries): %v", lastErr)
 	}
 }
 
@@ -743,8 +755,20 @@ func TestRespondToRootsList_EmptyCwd(t *testing.T) {
 	defer owner.Shutdown()
 
 	id := json.RawMessage(`2`)
-	if err := owner.respondToRootsList(id); err != nil {
-		t.Errorf("respondToRootsList (empty cwd): %v", err)
+	// Retry briefly: on macOS `go run mock_server.go` may still be compiling
+	// when NewOwner returns, so upstream stdin can race as "file already closed".
+	// Probing via respondToRootsList is idempotent — it builds JSON and writes to upstream.
+	deadline := time.Now().Add(1 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = owner.respondToRootsList(id)
+		if lastErr == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if lastErr != nil {
+		t.Errorf("respondToRootsList (empty cwd) (after readiness retries): %v", lastErr)
 	}
 }
 

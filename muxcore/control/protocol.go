@@ -8,6 +8,8 @@ package control
 import "encoding/json"
 
 // Request is a control plane command sent by the CLI to an owner or daemon.
+// Supported daemon commands include "spawn", "remove", "graceful-restart",
+// and "refresh-token".
 type Request struct {
 	Cmd            string            `json:"cmd"`
 	DrainTimeoutMs int               `json:"drain_timeout_ms,omitempty"`
@@ -18,6 +20,13 @@ type Request struct {
 	Cwd     string            `json:"cwd,omitempty"`
 	Mode    string            `json:"mode,omitempty"` // "cwd", "global", "isolated"
 	Env     map[string]string `json:"env,omitempty"`
+	// ReconnectReason marks reconnect-related control requests such as a
+	// fallback spawn or final give-up report.
+	ReconnectReason string `json:"reconnect_reason,omitempty"`
+
+	// PrevToken is the previously consumed session token used by the daemon's
+	// "refresh-token" command to mint a fresh reconnect token for the same owner.
+	PrevToken string `json:"prev_token,omitempty"`
 }
 
 // Response is the reply to a control command.
@@ -42,4 +51,6 @@ type DaemonHandler interface {
 	HandleSpawn(req Request) (ipcPath, serverID, token string, err error)
 	HandleRemove(serverID string) error
 	HandleGracefulRestart(drainTimeoutMs int) (snapshotPath string, err error)
+	HandleRefreshSessionToken(prevToken string) (newToken string, err error)
+	HandleReconnectGiveUp(reason string) error
 }

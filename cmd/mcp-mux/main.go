@@ -180,6 +180,27 @@ func main() {
 					time.Since(spawnStart), daemonIPC)
 				logger.Printf("shim startup step=resilient_begin path=%q total_before_client=%v",
 					daemonIPC, time.Since(shimStart))
+				// currentToken tracks the most-recently-minted session token.
+				// It must be a mutable variable captured by the closure so that
+				// each successful refresh updates the token used by subsequent
+				// refresh attempts. Using the original daemonToken directly would
+				// cause the second refresh to send a stale (already-consumed) token,
+				// triggering an "unknown token" error and a premature spawn fallback.
+				currentToken := daemonToken
+				refreshFn := func() (string, string, error) {
+					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
+					time.Sleep(jitter)
+
+					if err := ensureDaemon(logger); err != nil {
+						return "", "", err
+					}
+					newToken, err := refreshTokenViaDaemon(currentToken, logger)
+					if err != nil {
+						return "", "", err
+					}
+					currentToken = newToken
+					return daemonIPC, newToken, nil
+				}
 				reconnectFn := func() (string, string, error) {
 					// Retry ensureDaemon with jitter to avoid thundering herd.
 					// Multiple shims reconnecting simultaneously compete for lock;
@@ -190,7 +211,7 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", err
 					}
-					return spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+					return spawnViaDaemonWithReason(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger)
 				}
 				resilientStart := time.Now()
 				if err := owner.RunResilientClient(owner.ResilientClientConfig{
@@ -198,9 +219,13 @@ func main() {
 					Stdout:         os.Stdout,
 					InitialIPCPath: daemonIPC,
 					Token:          daemonToken,
+					RefreshToken:   refreshFn,
 					Reconnect:      reconnectFn,
 					Logger:         logger,
 				}); err != nil {
+					if strings.Contains(err.Error(), "reconnect timeout") {
+						reportReconnectGiveUp("timeout", logger)
+					}
 					logger.Printf("shim startup step=resilient_end status=error duration=%v err=%q total=%v",
 						time.Since(resilientStart), err.Error(), time.Since(shimStart))
 					os.Exit(1)

@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,8 +12,10 @@ import (
 	"testing"
 	"time"
 
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -50,6 +54,50 @@ func testDaemon(t *testing.T) *Daemon {
 	}
 	t.Cleanup(func() { d.Shutdown() })
 	return d
+}
+
+type noopSessionHandler struct{}
+
+func (noopSessionHandler) HandleRequest(context.Context, muxcore.ProjectContext, []byte) ([]byte, error) {
+	return []byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`), nil
+}
+
+func testReconnectOwner(t *testing.T, sid string) *owner.Owner {
+	t.Helper()
+	ipcPath := shortSocketPath(t, "refresh.sock")
+	o, err := owner.NewOwner(owner.OwnerConfig{
+		IPCPath:        ipcPath,
+		ServerID:       sid,
+		SessionHandler: noopSessionHandler{},
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error: %v", err)
+	}
+	t.Cleanup(func() { o.Shutdown() })
+	return o
+}
+
+func seedReconnectHistory(t *testing.T, o *owner.Owner, token, cwd string, env map[string]string) {
+	t.Helper()
+	sess := &owner.Session{ID: 1}
+	o.SessionMgr().RegisterSession(sess, "")
+	o.SessionMgr().PreRegister(token, cwd, env)
+	if ok := o.SessionMgr().Bind(token, o.ServerID(), sess); !ok {
+		t.Fatalf("Bind(%q) returned false", token)
+	}
+}
+
+func waitOwnerAccepting(t *testing.T, d *Daemon, sid string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.ownerIsAccepting(sid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("owner %s never became accepting", sid)
 }
 
 func TestDaemonSpawnAndStatus(t *testing.T) {
@@ -198,6 +246,161 @@ func TestDaemonSetPersistent(t *testing.T) {
 	}
 	if !entry.Persistent {
 		t.Error("Persistent should be true after SetPersistent(true)")
+	}
+}
+
+func TestDaemon_OwnerIsAccepting_States(t *testing.T) {
+	d := testDaemon(t)
+	sid := "owner-accepting-state"
+	o := testReconnectOwner(t, sid)
+
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+
+	waitOwnerAccepting(t, d, sid)
+
+	d.mu.Lock()
+	delete(d.owners, sid)
+	d.mu.Unlock()
+	if d.ownerIsAccepting(sid) {
+		t.Fatal("ownerIsAccepting() = true after owner removal")
+	}
+
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+	o.Shutdown()
+	select {
+	case <-o.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner did not shut down in time")
+	}
+	if d.ownerIsAccepting(sid) {
+		t.Fatal("ownerIsAccepting() = true after shutdown")
+	}
+}
+
+func TestHandleRefreshSessionToken_HappyPath(t *testing.T) {
+	d := testDaemon(t)
+	sid := "owner-refresh-happy"
+	o := testReconnectOwner(t, sid)
+	seedReconnectHistory(t, o, "prev-token", "/project/happy", map[string]string{"A": "B"})
+
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, sid)
+
+	newToken, err := d.HandleRefreshSessionToken("prev-token")
+	if err != nil {
+		t.Fatalf("HandleRefreshSessionToken() error = %v", err)
+	}
+	if newToken == "" || newToken == "prev-token" {
+		t.Fatalf("newToken = %q, want distinct non-empty token", newToken)
+	}
+	if !o.SessionMgr().IsPreRegistered(newToken) {
+		t.Fatal("refreshed token was not registered as pending")
+	}
+
+	sess := &owner.Session{ID: 2}
+	o.SessionMgr().RegisterSession(sess, "")
+	if ok := o.SessionMgr().Bind(newToken, sid, sess); !ok {
+		t.Fatal("Bind() failed for refreshed token")
+	}
+	if sess.Cwd != "/project/happy" {
+		t.Fatalf("session Cwd = %q, want %q", sess.Cwd, "/project/happy")
+	}
+	if sess.Env["A"] != "B" {
+		t.Fatalf("session Env[A] = %q, want %q", sess.Env["A"], "B")
+	}
+}
+
+func TestHandleRefreshSessionToken_UnknownToken(t *testing.T) {
+	d := testDaemon(t)
+	_, err := d.HandleRefreshSessionToken("missing-token")
+	if !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("HandleRefreshSessionToken() error = %v, want ErrUnknownToken", err)
+	}
+}
+
+func TestHandleRefreshSessionToken_OwnerGone(t *testing.T) {
+	d := testDaemon(t)
+	sid := "owner-refresh-gone"
+	o := testReconnectOwner(t, sid)
+	seedReconnectHistory(t, o, "prev-gone", "/project/gone", nil)
+
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, sid)
+	o.Shutdown()
+	select {
+	case <-o.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner did not shut down in time")
+	}
+
+	_, err := d.HandleRefreshSessionToken("prev-gone")
+	if !errors.Is(err, ErrOwnerGone) {
+		t.Fatalf("HandleRefreshSessionToken() error = %v, want ErrOwnerGone", err)
+	}
+}
+
+func TestHandleRefreshSessionToken_CountersIncrement(t *testing.T) {
+	d := testDaemon(t)
+	sid := "owner-refresh-counter"
+	o := testReconnectOwner(t, sid)
+	seedReconnectHistory(t, o, "prev-counter", "/project/counter", nil)
+
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, sid)
+
+	if _, err := d.HandleRefreshSessionToken("prev-counter"); err != nil {
+		t.Fatalf("HandleRefreshSessionToken() error = %v", err)
+	}
+
+	status := d.HandleStatus()
+	if got := status["shim_reconnect_refreshed"]; got != uint64(1) {
+		t.Fatalf("shim_reconnect_refreshed = %v, want 1", got)
+	}
+	if got := status["shim_reconnect_fallback_spawned"]; got != uint64(0) {
+		t.Fatalf("shim_reconnect_fallback_spawned = %v, want 0", got)
+	}
+	if got := status["shim_reconnect_gave_up"]; got != uint64(0) {
+		t.Fatalf("shim_reconnect_gave_up = %v, want 0", got)
+	}
+}
+
+func TestLegacyReconnectSpawnIncrementsFallbackCounter(t *testing.T) {
+	d := testDaemon(t)
+
+	_, _, _, err := d.HandleSpawn(control.Request{
+		Cmd:             "spawn",
+		Command:         "go",
+		Args:            []string{"run", "../../testdata/mock_server.go"},
+		Mode:            "global",
+		ReconnectReason: "fallback_spawn",
+	})
+	if err != nil {
+		t.Fatalf("HandleSpawn() error = %v", err)
+	}
+
+	if err := d.HandleReconnectGiveUp("timeout"); err != nil {
+		t.Fatalf("HandleReconnectGiveUp() error = %v", err)
+	}
+
+	status := d.HandleStatus()
+	if got := status["shim_reconnect_refreshed"]; got != uint64(0) {
+		t.Fatalf("shim_reconnect_refreshed = %v, want 0", got)
+	}
+	if got := status["shim_reconnect_fallback_spawned"]; got != uint64(1) {
+		t.Fatalf("shim_reconnect_fallback_spawned = %v, want 1", got)
+	}
+	if got := status["shim_reconnect_gave_up"]; got != uint64(1) {
+		t.Fatalf("shim_reconnect_gave_up = %v, want 1", got)
 	}
 }
 

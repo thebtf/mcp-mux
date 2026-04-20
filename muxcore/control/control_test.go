@@ -177,11 +177,16 @@ type mockDaemonHandler struct {
 	mockHandler
 	spawnCalled  bool
 	removeCalled bool
+	refreshCalled bool
+	giveUpCalled bool
 	spawnErr     error
 	removeErr    error
+	refreshErr   error
 	spawnIPCPath string
 	spawnSrvID   string
 	removeArg    string
+	refreshArg   string
+	giveUpArg    string
 }
 
 func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, error) {
@@ -210,6 +215,21 @@ func (m *mockDaemonHandler) HandleGracefulRestart(drainTimeoutMs int) (string, e
 	return "/tmp/snapshot.json", nil
 }
 
+func (m *mockDaemonHandler) HandleRefreshSessionToken(prevToken string) (string, error) {
+	m.refreshCalled = true
+	m.refreshArg = prevToken
+	if m.refreshErr != nil {
+		return "", m.refreshErr
+	}
+	return "refreshed-token", nil
+}
+
+func (m *mockDaemonHandler) HandleReconnectGiveUp(reason string) error {
+	m.giveUpCalled = true
+	m.giveUpArg = reason
+	return nil
+}
+
 // TestSocketPath verifies SocketPath returns the address used at creation.
 func TestSocketPath(t *testing.T) {
 	path := testSocketPath(t)
@@ -223,6 +243,99 @@ func TestSocketPath(t *testing.T) {
 	got := srv.SocketPath()
 	if got != path {
 		t.Errorf("SocketPath = %q, want %q", got, path)
+	}
+}
+
+func TestRefreshToken(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token"})
+	if err != nil {
+		t.Fatalf("Send refresh-token: %v", err)
+	}
+	if !handler.refreshCalled {
+		t.Fatal("refresh handler not called")
+	}
+	if handler.refreshArg != "prev-token" {
+		t.Fatalf("refreshArg = %q, want %q", handler.refreshArg, "prev-token")
+	}
+	if !resp.OK {
+		t.Fatalf("refresh-token not OK: %s", resp.Message)
+	}
+	if resp.Token != "refreshed-token" {
+		t.Fatalf("resp.Token = %q, want %q", resp.Token, "refreshed-token")
+	}
+}
+
+func TestRefreshTokenUnknownToken(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{refreshErr: fmt.Errorf("wrapped: %w", errUnknownToken)}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token"})
+	if err != nil {
+		t.Fatalf("Send refresh-token: %v", err)
+	}
+	if resp.OK {
+		t.Fatal("expected refresh-token to fail for unknown token")
+	}
+	if resp.Message != "unknown token" {
+		t.Fatalf("resp.Message = %q, want %q", resp.Message, "unknown token")
+	}
+}
+
+func TestRefreshTokenOwnerGone(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{refreshErr: fmt.Errorf("wrapped: %w", errOwnerGone)}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token"})
+	if err != nil {
+		t.Fatalf("Send refresh-token: %v", err)
+	}
+	if resp.OK {
+		t.Fatal("expected refresh-token to fail for owner gone")
+	}
+	if resp.Message != "owner gone" {
+		t.Fatalf("resp.Message = %q, want %q", resp.Message, "owner gone")
+	}
+}
+
+func TestReconnectGiveUp(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "reconnect-give-up", ReconnectReason: "timeout"})
+	if err != nil {
+		t.Fatalf("Send reconnect-give-up: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("reconnect-give-up not OK: %s", resp.Message)
+	}
+	if !handler.giveUpCalled {
+		t.Fatal("give-up handler not called")
+	}
+	if handler.giveUpArg != "timeout" {
+		t.Fatalf("giveUpArg = %q, want %q", handler.giveUpArg, "timeout")
 	}
 }
 

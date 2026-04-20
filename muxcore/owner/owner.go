@@ -154,6 +154,7 @@ type Owner struct {
 
 	shutdownOnce      sync.Once
 	closeListenerOnce sync.Once
+	isAccepting       atomic.Bool
 	listenerDone      chan struct{} // closed when IPC listener is intentionally stopped
 	done              chan struct{}
 
@@ -1609,6 +1610,9 @@ func (o *Owner) removeSession(s *Session) {
 // Now we detect the "closed" error class and exit cleanly; other errors get a
 // small backoff to prevent CPU saturation.
 func (o *Owner) acceptLoop() {
+	o.isAccepting.Store(true)
+	defer o.isAccepting.Store(false)
+
 	for {
 		conn, err := o.listener.Accept()
 		if err != nil {
@@ -1654,7 +1658,7 @@ func (o *Owner) acceptLoop() {
 			// SweepExpiredPending (TTL) between IsPreRegistered and Bind.
 			// In that edge case, reject the connection instead of adding a
 			// session with no Cwd (which would produce invalid project routing).
-			if !o.sessionMgr.Bind(token, s) {
+			if !o.sessionMgr.Bind(token, o.ServerID(), s) {
 				// Token was swept by SweepExpiredPending (TTL) or consumed by a
 				// concurrent shim between IsPreRegistered and Bind. Counted +
 				// logged by rejectionLogger.Log; do not emit a second direct
@@ -1765,6 +1769,7 @@ func (o *Owner) resetCwdSetToPrimary() (string, int) {
 // Nil-safe: owners constructed for tests may not have a listener.
 func (o *Owner) closeListener() {
 	o.closeListenerOnce.Do(func() {
+		o.isAccepting.Store(false)
 		close(o.listenerDone)
 		if o.listener != nil {
 			o.listener.Close()
@@ -1822,6 +1827,7 @@ func (o *Owner) drainInflightRequests() {
 // before the process exits.
 func (o *Owner) Shutdown() {
 	o.shutdownOnce.Do(func() {
+		o.isAccepting.Store(false)
 		o.teardownExceptUpstream()
 
 		o.mu.Lock()
@@ -2059,9 +2065,9 @@ func (o *Owner) IPCPath() string {
 	return o.ipcPath
 }
 
-// IsAccepting returns true if the IPC listener has not been explicitly closed
-// via closeListener(). This is a fast synchronization-signal check — it does
-// NOT guarantee the listener is actually reachable from a fresh dial.
+// IsAccepting returns true while the accept loop is running and the owner is
+// not in shutdown/listener-close teardown. This is a lock-free signal only —
+// it does NOT guarantee the listener is actually reachable from a fresh dial.
 //
 // Use IsReachable() when an authoritative liveness answer is required (e.g.
 // when deciding whether to hand out an IPC path to a shim that will dial it).
@@ -2072,6 +2078,13 @@ func (o *Owner) IPCPath() string {
 // states produce "dial: connection refused" for shims even though the owner
 // entry is still registered in the daemon.
 func (o *Owner) IsAccepting() bool {
+	// If the accept loop has explicitly set isAccepting true, trust it.
+	if o.isAccepting.Load() {
+		return true
+	}
+	// Fallback: check whether listenerDone has been signalled. This covers
+	// test owners and owners in the pre-acceptLoop window. If listenerDone
+	// is closed the owner explicitly shut down; otherwise treat as accepting.
 	select {
 	case <-o.listenerDone:
 		return false

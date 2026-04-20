@@ -96,6 +96,20 @@ func TestAcceptLoop_RejectEmptyToken(t *testing.T) {
 	}
 }
 
+func TestIsAccepting_TracksListenerLifecycle(t *testing.T) {
+	o, _ := newTokenHandshakeOwner(t, log.New(io.Discard, "", 0))
+
+	waitForCondition(t, time.Second, func() bool {
+		return o.IsAccepting()
+	}, "owner never became accepting")
+
+	o.closeListener()
+
+	waitForCondition(t, time.Second, func() bool {
+		return !o.IsAccepting()
+	}, "owner remained accepting after closeListener")
+}
+
 func TestAcceptLoop_RejectUnknownToken(t *testing.T) {
 	var logBuffer safeBuffer
 	logger := log.New(&logBuffer, "", 0)

@@ -2,6 +2,7 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -140,6 +141,34 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		return Response{OK: true, Message: "snapshot written, shutting down", IPCPath: snapshotPath}
 
+	case "refresh-token":
+		dh, ok := s.handler.(DaemonHandler)
+		if !ok {
+			return Response{OK: false, Message: "refresh-token not supported (not a daemon)"}
+		}
+		newToken, err := dh.HandleRefreshSessionToken(req.PrevToken)
+		if err != nil {
+			switch {
+			case matchesControlError(err, errUnknownToken):
+				return Response{OK: false, Message: "unknown token"}
+			case matchesControlError(err, errOwnerGone):
+				return Response{OK: false, Message: "owner gone"}
+			default:
+				return Response{OK: false, Message: err.Error()}
+			}
+		}
+		return Response{OK: true, Token: newToken}
+
+	case "reconnect-give-up":
+		dh, ok := s.handler.(DaemonHandler)
+		if !ok {
+			return Response{OK: false, Message: "reconnect-give-up not supported (not a daemon)"}
+		}
+		if err := dh.HandleReconnectGiveUp(req.ReconnectReason); err != nil {
+			return Response{OK: false, Message: err.Error()}
+		}
+		return Response{OK: true, Message: "recorded"}
+
 	default:
 		return Response{OK: false, Message: fmt.Sprintf("unknown command: %s", req.Cmd)}
 	}
@@ -155,6 +184,13 @@ func (s *Server) writeResponse(conn net.Conn, resp Response) {
 	if _, err := conn.Write(data); err != nil {
 		s.logger.Printf("control: write response: %v", err)
 	}
+}
+
+var errUnknownToken = errors.New("unknown token")
+var errOwnerGone = errors.New("owner gone")
+
+func matchesControlError(err error, target error) bool {
+	return errors.Is(err, target) || err.Error() == target.Error()
 }
 
 // Close stops the control server and removes the socket file.
