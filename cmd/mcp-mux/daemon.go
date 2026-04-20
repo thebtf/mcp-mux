@@ -260,18 +260,23 @@ func startDaemonProcess() error {
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path and handshake token.
 // Emits a "daemon_rpc_spawn" log line with the total RPC duration for post-mortem latency analysis.
 func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
+	return spawnViaDaemonWithReason(command, args, cwd, mode, env, "", logger)
+}
+
+func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
 	ctlPath := serverid.DaemonControlPath("", "")
 
 	// Spawn returns immediately after creating the owner — proactive init runs
 	// in background. 30s timeout covers daemon processing + upstream process start.
 	rpcStart := time.Now()
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:     "spawn",
-		Command: command,
-		Args:    args,
-		Cwd:     cwd,
-		Mode:    mode,
-		Env:     env,
+		Cmd:             "spawn",
+		Command:         command,
+		Args:            args,
+		Cwd:             cwd,
+		Mode:            mode,
+		Env:             env,
+		ReconnectReason: reconnectReason,
 	}, 30*time.Second)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
@@ -293,6 +298,54 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 	logger.Printf("daemon_rpc_spawn status=ok duration=%v server=%s ipc=%q",
 		rpcDur, shortID, resp.IPCPath)
 	return resp.IPCPath, resp.Token, nil
+}
+
+// refreshTokenViaDaemon asks the daemon to mint a fresh reconnect token for a
+// still-alive owner associated with prevToken.
+func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error) {
+	ctlPath := serverid.DaemonControlPath("", "")
+
+	rpcStart := time.Now()
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+		Cmd:       "refresh-token",
+		PrevToken: prevToken,
+	}, 5*time.Second)
+	rpcDur := time.Since(rpcStart)
+	if err != nil {
+		logger.Printf("daemon_rpc_refresh status=error duration=%v err=%q", rpcDur, err.Error())
+		return "", fmt.Errorf("refresh token via daemon: %w", err)
+	}
+	if !resp.OK {
+		logger.Printf("daemon_rpc_refresh status=not_ok duration=%v msg=%q", rpcDur, resp.Message)
+		switch resp.Message {
+		case daemon.ErrOwnerGone.Error():
+			return "", daemon.ErrOwnerGone
+		case daemon.ErrUnknownToken.Error():
+			return "", daemon.ErrUnknownToken
+		default:
+			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
+		}
+	}
+
+	logger.Printf("daemon_rpc_refresh status=ok duration=%v", rpcDur)
+	return resp.Token, nil
+}
+
+func reportReconnectGiveUp(reason string, logger *log.Logger) {
+	ctlPath := serverid.DaemonControlPath("", "")
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+		Cmd:             "reconnect-give-up",
+		ReconnectReason: reason,
+	}, 5*time.Second)
+	if err != nil {
+		logger.Printf("daemon_rpc_reconnect_give_up status=error err=%q", err.Error())
+		return
+	}
+	if !resp.OK {
+		logger.Printf("daemon_rpc_reconnect_give_up status=not_ok msg=%q", resp.Message)
+		return
+	}
+	logger.Printf("daemon_rpc_reconnect_give_up status=ok reason=%q", reason)
 }
 
 // setSysProcAttr is defined in platform-specific files:
