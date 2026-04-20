@@ -13,6 +13,27 @@ import (
 	"github.com/thejerf/suture/v4"
 )
 
+func TestOwnerServerID_AfterConstruction(t *testing.T) {
+	ipcPath := testIPCPath(t)
+
+	o, err := NewOwner(OwnerConfig{
+		IPCPath:        ipcPath,
+		SessionHandler: &mockSessionHandler{},
+		ServerID:       "test-owner-server-id",
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error: %v", err)
+	}
+	defer o.Shutdown()
+
+	if got := o.ServerID(); got == "" {
+		t.Fatal("ServerID() returned empty string")
+	} else if got != "test-owner-server-id" {
+		t.Fatalf("ServerID() = %q, want %q", got, "test-owner-server-id")
+	}
+}
+
 // TestDecrementPending_ClampsAtZero is a regression test for the cosmetic bug
 // where `pending_requests` appeared as `-1` in mux_list output. A late
 // proactive-init response arriving after upstream death could fire Add(-1)

@@ -23,6 +23,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
@@ -32,6 +33,14 @@ import (
 // retry from the top (new iteration in the retry loop). Used internally by the
 // FR-6 retry pattern that replaced the old recursive d.Spawn(req) calls.
 var errSpawnRetry = errors.New("spawn: retry requested")
+
+// ErrUnknownToken indicates that the daemon does not recognize a reconnect
+// token presented through the refresh-token control-plane path.
+var ErrUnknownToken = errors.New("unknown token")
+
+// ErrOwnerGone indicates that a reconnect token was known, but the owner it
+// belonged to is no longer alive enough to accept a refreshed bind.
+var ErrOwnerGone = errors.New("owner gone")
 
 // maxSpawnRetries bounds the retry budget in Spawn. Three iterations handle the
 // realistic cases (stuck placeholder cleanup + one isolated-mode promotion);
@@ -122,6 +131,10 @@ type Daemon struct {
 
 	// stats holds atomic handoff counters exposed via HandleStatus (NFR-4 / T025).
 	stats handoffStats
+
+	reconnectRefreshed       atomic.Uint64
+	reconnectFallbackSpawned atomic.Uint64
+	reconnectGaveUp          atomic.Uint64
 }
 
 // handoffStats holds atomic counters for handoff lifecycle observability.
@@ -177,6 +190,8 @@ type Config struct {
 	// to prevent cross-test interference from stale snapshot files.
 	SkipSnapshot bool
 }
+
+var _ control.DaemonHandler = (*Daemon)(nil)
 
 // New creates and starts a new Daemon with a control server.
 func New(cfg Config) (*Daemon, error) {
@@ -926,7 +941,11 @@ func (d *Daemon) SoftRemove(serverID string) error {
 
 // HandleSpawn implements control.DaemonHandler.
 func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error) {
-	return d.Spawn(req)
+	ipcPath, serverID, token, err := d.Spawn(req)
+	if err == nil && req.ReconnectReason == "fallback_spawn" {
+		d.reconnectFallbackSpawned.Add(1)
+	}
+	return ipcPath, serverID, token, err
 }
 
 // HandleRemove implements control.DaemonHandler.
@@ -938,6 +957,13 @@ func (d *Daemon) HandleRemove(serverID string) error {
 func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
 	go d.Shutdown()
 	return "daemon shutting down"
+}
+
+// HandleReconnectGiveUp records that a shim exhausted its reconnect budget and
+// could not recover.
+func (d *Daemon) HandleReconnectGiveUp(reason string) error {
+	d.reconnectGaveUp.Add(1)
+	return nil
 }
 
 // handoffAcceptTimeout is the maximum time the old daemon waits for the
@@ -1146,6 +1172,39 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
 	return snapshotPath, nil
 }
 
+// HandleRefreshSessionToken implements control.DaemonHandler.
+func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
+	if prevToken == "" {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+		return "", ErrUnknownToken
+	}
+
+	entry, ownerKey := d.lookupReconnectOwner(prevToken)
+	if entry == nil || entry.Owner == nil {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+		return "", ErrUnknownToken
+	}
+
+	newToken, err := entry.Owner.SessionMgr().RegisterReconnect(prevToken, d.ownerIsAccepting)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrUnknownToken):
+			d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+			return "", ErrUnknownToken
+		case errors.Is(err, session.ErrOwnerGone):
+			d.logger.Printf("shim.reconnect.refresh_fail reason=owner_gone")
+			return "", ErrOwnerGone
+		default:
+			d.logger.Printf("shim.reconnect.refresh_fail reason=internal")
+			return "", err
+		}
+	}
+
+	d.reconnectRefreshed.Add(1)
+	d.logger.Printf("shim.reconnect.refresh_ok owner=%s", shortServerID(ownerKey))
+	return newToken, nil
+}
+
 // HandleStatus implements control.CommandHandler.
 func (d *Daemon) HandleStatus() map[string]any {
 	d.mu.RLock()
@@ -1182,6 +1241,9 @@ func (d *Daemon) HandleStatus() map[string]any {
 		"servers":                  servers,
 		"owner_idle_timeout":       d.ownerIdleTimeout.String(),
 		"idle_timeout":             d.idleTimeout.String(),
+		"shim_reconnect_refreshed": d.reconnectRefreshed.Load(),
+		"shim_reconnect_fallback_spawned": d.reconnectFallbackSpawned.Load(),
+		"shim_reconnect_gave_up":   d.reconnectGaveUp.Load(),
 		"zombie_detections_spawn":  d.zombieDetectedSpawn,
 		"zombie_detections_restore": d.zombieDetectedRestore,
 		"handoff": map[string]any{
@@ -1191,6 +1253,51 @@ func (d *Daemon) HandleStatus() map[string]any {
 			"fallback":    d.stats.fallback.Load(),
 		},
 	}
+}
+
+func (d *Daemon) ownerIsAccepting(serverID string) bool {
+	d.mu.RLock()
+	entry, ok := d.owners[serverID]
+	d.mu.RUnlock()
+	if !ok || entry == nil || entry.Owner == nil {
+		return false
+	}
+	if !entry.Owner.IsAccepting() {
+		return false
+	}
+	select {
+	case <-entry.Owner.Done():
+		return false
+	default:
+		return true
+	}
+}
+
+func (d *Daemon) lookupReconnectOwner(prevToken string) (*OwnerEntry, string) {
+	d.mu.RLock()
+	entries := make([]*OwnerEntry, 0, len(d.owners))
+	for _, entry := range d.owners {
+		entries = append(entries, entry)
+	}
+	d.mu.RUnlock()
+
+	for _, entry := range entries {
+		if entry == nil || entry.Owner == nil {
+			continue
+		}
+		ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(prevToken)
+		if ok {
+			return entry, ownerKey
+		}
+	}
+	return nil, ""
+}
+
+func shortServerID(serverID string) string {
+	if len(serverID) > 8 {
+		return serverID[:8]
+	}
+	return serverID
 }
 
 // SetPersistent marks an owner as persistent (survives zero-session periods).

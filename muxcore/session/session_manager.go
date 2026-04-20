@@ -1,6 +1,9 @@
 package session
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"sync"
 	"time"
 )
@@ -19,10 +22,28 @@ type pendingSession struct {
 	CreatedAt time.Time // for TTL expiry — orphan tokens are swept if shim never connects
 }
 
+type boundHistory struct {
+	OwnerKey string
+	Cwd      string
+	Env      map[string]string
+	BoundAt  time.Time
+	LastUsed time.Time
+}
+
 // pendingTokenTTL is the maximum time a pre-registered token lives before
 // being swept. Must be long enough to cover slow CC startup + daemon spawn
 // + shim dial, but short enough to prevent memory leaks from orphan spawns.
 const pendingTokenTTL = 2 * time.Minute
+
+const boundTokenTTL = 30 * time.Minute
+
+// ErrUnknownToken indicates that a reconnect was requested for a token the
+// manager has never seen or has already expired from history.
+var ErrUnknownToken = errors.New("unknown token")
+
+// ErrOwnerGone indicates that a reconnect was requested for a known token, but
+// the original owner is no longer alive enough to accept a fresh bind.
+var ErrOwnerGone = errors.New("owner gone")
 
 // Manager tracks active sessions, their working directories,
 // and in-flight upstream request correlations. It replaces the
@@ -33,6 +54,7 @@ type Manager struct {
 	sessions   map[int]*Context           // session ID → context
 	inflight   map[string]int             // remapped request ID → session ID
 	pending    map[string]*pendingSession // token → session data (pre-registered, consumed on Bind)
+	bound      map[string]*boundHistory   // consumed token → owner/session history for reconnect refresh
 	lastActive map[int]time.Time          // session ID → time of last TrackRequest call
 	mu         sync.RWMutex
 }
@@ -43,6 +65,7 @@ func NewManager() *Manager {
 		sessions:   make(map[int]*Context),
 		inflight:   make(map[string]int),
 		pending:    make(map[string]*pendingSession),
+		bound:      make(map[string]*boundHistory),
 		lastActive: make(map[int]time.Time),
 	}
 }
@@ -80,7 +103,7 @@ func (sm *Manager) PreRegister(token, cwd string, env map[string]string) {
 	defer sm.mu.Unlock()
 	sm.pending[token] = &pendingSession{
 		Cwd:       cwd,
-		Env:       env,
+		Env:       cloneEnv(env),
 		CreatedAt: time.Now(),
 	}
 }
@@ -118,6 +141,23 @@ func (sm *Manager) SweepExpiredPending() int {
 	return swept
 }
 
+// SweepExpiredBound removes consumed-token reconnect history older than
+// boundTokenTTL since the last successful use. Returns the number of swept
+// entries.
+func (sm *Manager) SweepExpiredBound() int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	now := time.Now()
+	swept := 0
+	for token, hist := range sm.bound {
+		if now.Sub(hist.LastUsed) > boundTokenTTL {
+			delete(sm.bound, token)
+			swept++
+		}
+	}
+	return swept
+}
+
 // PendingCount returns the number of pending (pre-registered but not yet bound) tokens.
 // Exposed for observability (mux_list --verbose).
 func (sm *Manager) PendingCount() int {
@@ -129,7 +169,7 @@ func (sm *Manager) PendingCount() int {
 // Bind resolves a token to session metadata (cwd, env) and sets them on the session.
 // Returns false if the token was not found (already consumed or never registered).
 // The token is consumed on first use.
-func (sm *Manager) Bind(token string, session *Session) bool {
+func (sm *Manager) Bind(token, ownerKey string, session *Session) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -139,15 +179,93 @@ func (sm *Manager) Bind(token string, session *Session) bool {
 	}
 	delete(sm.pending, token)
 
+	now := time.Now()
+	env := cloneEnv(ps.Env)
+	sm.bound[token] = &boundHistory{
+		OwnerKey: ownerKey,
+		Cwd:      ps.Cwd,
+		Env:      env,
+		BoundAt:  now,
+		LastUsed: now,
+	}
+
 	session.Cwd = ps.Cwd
-	session.Env = ps.Env
+	session.Env = cloneEnv(env)
 
 	// Update Context if the session is already registered.
 	if ctx, exists := sm.sessions[session.ID]; exists {
 		ctx.Cwd = ps.Cwd
-		ctx.Env = ps.Env
+		ctx.Env = cloneEnv(env)
 	}
 	return true
+}
+
+// LookupHistory returns reconnect history for a previously bound token.
+// Returns ok=false when the token is unknown or expired.
+func (sm *Manager) LookupHistory(prev string) (ownerKey, cwd string, env map[string]string, ok bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	hist, exists := sm.bound[prev]
+	if !exists {
+		return "", "", nil, false
+	}
+	if time.Since(hist.LastUsed) > boundTokenTTL {
+		return "", "", nil, false
+	}
+	return hist.OwnerKey, hist.Cwd, cloneEnv(hist.Env), true
+}
+
+// RegisterReconnect mints a fresh pending token for a previously bound owner
+// if that owner is still alive. ownerAlive is invoked without holding sm.mu.
+func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bool) (string, error) {
+	sm.mu.Lock()
+	hist, exists := sm.bound[prev]
+	if !exists || time.Since(hist.LastUsed) > boundTokenTTL {
+		if exists && time.Since(hist.LastUsed) > boundTokenTTL {
+			delete(sm.bound, prev)
+		}
+		sm.mu.Unlock()
+		return "", ErrUnknownToken
+	}
+	ownerKey := hist.OwnerKey
+	cwd := hist.Cwd
+	env := cloneEnv(hist.Env)
+	sm.mu.Unlock()
+
+	if !ownerAlive(ownerKey) {
+		return "", ErrOwnerGone
+	}
+
+	token, err := generateToken()
+	if err != nil {
+		return "", err
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	hist, exists = sm.bound[prev]
+	if !exists || time.Since(hist.LastUsed) > boundTokenTTL {
+		if exists && time.Since(hist.LastUsed) > boundTokenTTL {
+			delete(sm.bound, prev)
+		}
+		return "", ErrUnknownToken
+	}
+	hist.LastUsed = time.Now()
+	now := time.Now()
+	sm.pending[token] = &pendingSession{
+		Cwd:       cwd,
+		Env:       cloneEnv(env),
+		CreatedAt: now,
+	}
+	sm.bound[token] = &boundHistory{
+		OwnerKey: ownerKey,
+		Cwd:      cwd,
+		Env:      cloneEnv(env),
+		BoundAt:  now,
+		LastUsed: now,
+	}
+	return token, nil
 }
 
 // TrackRequest records that a remapped request ID belongs to a session.
@@ -235,4 +353,23 @@ func (sm *Manager) SessionCount() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.sessions)
+}
+
+func cloneEnv(env map[string]string) map[string]string {
+	if env == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(env))
+	for k, v := range env {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func generateToken() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
