@@ -746,8 +746,9 @@ func TestRespondToRootsList_WithCwd(t *testing.T) {
 	if len(parsed.Result.Roots) == 0 {
 		t.Fatalf("no roots in response")
 	}
-	if parsed.Result.Roots[0].URI == "" {
-		t.Errorf("empty URI in first root entry")
+	wantURI := pathToFileURI(serverid.CanonicalizePath(cwd))
+	if parsed.Result.Roots[0].URI != wantURI {
+		t.Errorf("root URI = %q, want %q", parsed.Result.Roots[0].URI, wantURI)
 	}
 }
 
@@ -790,8 +791,12 @@ func TestRespondToRootsList_EmptyCwd(t *testing.T) {
 	if len(parsed.Result.Roots) == 0 {
 		t.Fatalf("no roots in response (empty-cwd fallback to os.Getwd() should produce one)")
 	}
-	if parsed.Result.Roots[0].URI == "" {
-		t.Errorf("empty URI in first root entry")
+	// With Cwd:"", NewOwner stores CanonicalizePath("") in cwdSet, which resolves to
+	// the process working directory (filepath.Abs("") == os.Getwd()). So the expected
+	// URI is the canonical process cwd, not the os.Getwd() fallback code path.
+	wantURI := pathToFileURI(serverid.CanonicalizePath(""))
+	if parsed.Result.Roots[0].URI != wantURI {
+		t.Errorf("root URI = %q, want %q", parsed.Result.Roots[0].URI, wantURI)
 	}
 }
 
@@ -813,8 +818,12 @@ func TestRespondWithError(t *testing.T) {
 	}
 	defer owner.Shutdown()
 
+	// Use a message with backslashes, quotes, and a newline to exercise the
+	// JSON escaping path. This catches regressions like the H1 bug from v0.19.3
+	// where Windows paths (C:\Users\foo) and embedded quotes produced invalid JSON.
+	wantMsg := `C:\Users\foo\bar: "access denied"` + "\n(see logs)"
 	id := json.RawMessage(`5`)
-	if err := owner.respondWithError(id, -32603, "test error"); err != nil {
+	if err := owner.respondWithError(id, -32603, wantMsg); err != nil {
 		t.Fatalf("respondWithError: %v", err)
 	}
 
@@ -835,8 +844,8 @@ func TestRespondWithError(t *testing.T) {
 	if parsed.Error.Code != -32603 {
 		t.Errorf("error.code=%d, want -32603", parsed.Error.Code)
 	}
-	if parsed.Error.Message != "test error" {
-		t.Errorf("error.message=%q, want %q", parsed.Error.Message, "test error")
+	if parsed.Error.Message != wantMsg {
+		t.Errorf("error.message=%q, want %q (check JSON escaping of backslashes/quotes/newline)", parsed.Error.Message, wantMsg)
 	}
 }
 

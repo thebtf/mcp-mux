@@ -227,6 +227,15 @@ type OwnerConfig struct {
 	// JSON-building methods (e.g. respondToRootsList) without the
 	// subprocess-timing flake class introduced by "go run mock_server.go".
 	//
+	// Lifecycle limitations (test-only mode):
+	//   - InitReady() never closes (no proactive init is sent; upstream is nil).
+	//   - Serve() returns ErrDoNotRestart immediately via closedChan.
+	//   - classified channel never closes; Classified() blocks forever.
+	// These constraints are acceptable because tests call respond* methods
+	// directly and never drive the daemon Spawn/Serve lifecycle. Do NOT use
+	// UpstreamWriter in production code or integration tests that rely on
+	// InitReady(), Classified(), or Serve() behaviour.
+	//
 	// Zero value (nil) preserves the normal subprocess-upstream path used by
 	// production and by integration tests that need a real upstream lifecycle
 	// (crash loop, reap, snapshot reattach).
@@ -2302,11 +2311,22 @@ func (o *Owner) touchActivity() {
 func (o *Owner) writeUpstream(data []byte) error {
 	o.touchActivity()
 	if o.upstreamWriter != nil {
-		if _, err := o.upstreamWriter.Write(data); err != nil {
-			return fmt.Errorf("upstream writer: write: %w", err)
-		}
-		if _, err := o.upstreamWriter.Write([]byte("\n")); err != nil {
-			return fmt.Errorf("upstream writer: write newline: %w", err)
+		// Combine data + newline into a single allocation so a single Write
+		// call can emit both atomically. This prevents short-write interleaving:
+		// io.Writer may return n < len(p) without an error, and two separate
+		// Write calls could produce a truncated or split JSON-RPC frame.
+		line := make([]byte, 0, len(data)+1)
+		line = append(line, data...)
+		line = append(line, '\n')
+		for written := 0; written < len(line); {
+			n, err := o.upstreamWriter.Write(line[written:])
+			if err != nil {
+				return fmt.Errorf("upstream writer: write: %w", err)
+			}
+			if n <= 0 {
+				return fmt.Errorf("upstream writer: write: %w", io.ErrShortWrite)
+			}
+			written += n
 		}
 		return nil
 	}
