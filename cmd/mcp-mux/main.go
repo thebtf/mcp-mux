@@ -180,6 +180,13 @@ func main() {
 					time.Since(spawnStart), daemonIPC)
 				logger.Printf("shim startup step=resilient_begin path=%q total_before_client=%v",
 					daemonIPC, time.Since(shimStart))
+				// currentToken tracks the most-recently-minted session token.
+				// It must be a mutable variable captured by the closure so that
+				// each successful refresh updates the token used by subsequent
+				// refresh attempts. Using the original daemonToken directly would
+				// cause the second refresh to send a stale (already-consumed) token,
+				// triggering an "unknown token" error and a premature spawn fallback.
+				currentToken := daemonToken
 				refreshFn := func() (string, string, error) {
 					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
 					time.Sleep(jitter)
@@ -187,10 +194,11 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", err
 					}
-					newToken, err := refreshTokenViaDaemon(daemonToken, logger)
+					newToken, err := refreshTokenViaDaemon(currentToken, logger)
 					if err != nil {
 						return "", "", err
 					}
+					currentToken = newToken
 					return daemonIPC, newToken, nil
 				}
 				reconnectFn := func() (string, string, error) {

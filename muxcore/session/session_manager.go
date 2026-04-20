@@ -251,8 +251,8 @@ func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bo
 		}
 		return "", ErrUnknownToken
 	}
-	hist.LastUsed = time.Now()
 	now := time.Now()
+	hist.LastUsed = now
 	sm.pending[token] = &pendingSession{
 		Cwd:       cwd,
 		Env:       cloneEnv(env),

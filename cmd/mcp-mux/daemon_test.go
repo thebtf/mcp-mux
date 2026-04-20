@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"os"
 	"testing"
@@ -77,7 +78,7 @@ func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
 	defer srv.Close()
 
 	_, err = refreshTokenViaDaemon("prev-token", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
-	if err != daemon.ErrOwnerGone {
+	if !errors.Is(err, daemon.ErrOwnerGone) {
 		t.Fatalf("refreshTokenViaDaemon() error = %v, want %v", err, daemon.ErrOwnerGone)
 	}
 }
@@ -95,7 +96,7 @@ func TestRefreshTokenViaDaemonUnknownToken(t *testing.T) {
 	defer srv.Close()
 
 	_, err = refreshTokenViaDaemon("prev-token", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
-	if err != daemon.ErrUnknownToken {
+	if !errors.Is(err, daemon.ErrUnknownToken) {
 		t.Fatalf("refreshTokenViaDaemon() error = %v, want %v", err, daemon.ErrUnknownToken)
 	}
 }

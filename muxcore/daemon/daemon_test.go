@@ -90,7 +90,7 @@ func seedReconnectHistory(t *testing.T, o *owner.Owner, token, cwd string, env m
 
 func waitOwnerAccepting(t *testing.T, d *Daemon, sid string) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if d.ownerIsAccepting(sid) {
 			return

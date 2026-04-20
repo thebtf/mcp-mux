@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -284,11 +283,3 @@ func TestOwnerPrefixFromIPCPath(t *testing.T) {
 	}
 }
 
-func closeNetConn(t *testing.T, conn net.Conn) {
-	t.Helper()
-	if conn != nil {
-		if err := conn.Close(); err != nil {
-			t.Fatalf("conn.Close() error: %v", err)
-		}
-	}
-}

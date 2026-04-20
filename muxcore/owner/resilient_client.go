@@ -505,7 +505,7 @@ func refreshFailureReason(err error) string {
 	if isUnknownTokenError(err) {
 		return "unknown_token"
 	}
-	return "unknown_token"
+	return "other"
 }
 
 func isOwnerGoneError(err error) bool {

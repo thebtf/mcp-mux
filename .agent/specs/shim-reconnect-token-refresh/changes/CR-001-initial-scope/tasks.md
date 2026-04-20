@@ -177,7 +177,7 @@ Discovery notes:
 - [ ] T026 [P] [EXECUTOR: sonnet] Update `D:/Dev/mcp-mux/AGENTS.md` muxcore section with v0.21.1 bullet describing F2.
   AC: one-paragraph blurb + "No breaking API changes" statement · Bind signature change called out explicitly for in-tree consumers. NOTE: Not completed — deferred as follow-up after PR merge; AGENTS.md on master requires a separate PR touching only master.
 - [x] T027 [P] [EXECUTOR: sonnet] Ensure Skill("code-review", "lite") clean across all modified files (final sweep).
-  AC: report recorded under `.agent/reports/code-review-f2-final.md` · zero HIGH findings unresolved.
+  AC: report recorded under `.agent/reports/2026-04-20-code-review-f2-final.md` · zero HIGH findings unresolved.
 
 - [ ] G009 VERIFY Phase 9 (T026–T027) — BLOCKED: T026 deferred; T027 [x]; whole-tree build/vet/test green (verified in close-out pass). G009 left open only because T026 is deferred.
   RUN: `go build ./...`, `go test ./... -race -count=1`, `go vet ./...`.

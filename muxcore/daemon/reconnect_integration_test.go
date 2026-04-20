@@ -14,7 +14,7 @@ func TestReconnectRefreshPreservesOwner(t *testing.T) {
 	o := testReconnectOwner(t, sid)
 
 	initialReader, initialWriter := io.Pipe()
-	defer initialWriter.Close()
+	defer initialWriter.Close() // safety net for early returns; explicit Close at line 36 handles the normal path
 	initial := owner.NewSession(initialReader, io.Discard)
 	initial.ID = 1
 	o.SessionMgr().RegisterSession(initial, "")
