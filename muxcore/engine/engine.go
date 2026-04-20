@@ -137,10 +137,11 @@ type MuxEngine struct {
 	cfg    Config
 	logger *log.Logger
 
-	mu    sync.RWMutex
-	d     *daemon.Daemon // non-nil only while runDaemon is active
-	mode  Mode
-	ready chan struct{} // closed once mode is set (and, in daemon mode, the daemon is bound)
+	mu        sync.RWMutex
+	d         *daemon.Daemon // non-nil only while runDaemon is active
+	mode      Mode
+	ready     chan struct{} // closed once mode is set (and, in daemon mode, the daemon is bound)
+	readyOnce sync.Once    // ensures ready is closed exactly once, even under concurrent markReady calls
 }
 
 // New creates a MuxEngine with the given configuration.
@@ -204,21 +205,17 @@ func (e *MuxEngine) Run(ctx context.Context) error {
 }
 
 // markReady sets the engine mode and optional daemon reference, then closes the
-// ready channel exactly once. Safe to call from any goroutine. If Run() is
-// somehow called twice, the second call is a no-op on the channel (avoids panic
-// on double-close).
+// ready channel exactly once. Safe to call from any goroutine concurrently.
+// sync.Once guarantees the channel is closed exactly once regardless of how
+// many goroutines call markReady simultaneously — eliminating the TOCTOU race
+// that the prior select-based guard had (mutex released before select, so two
+// goroutines could both observe the channel open and both call close).
 func (e *MuxEngine) markReady(mode Mode, d *daemon.Daemon) {
 	e.mu.Lock()
 	e.d = d
 	e.mode = mode
 	e.mu.Unlock()
-	// Guard against double close if Run() is invoked more than once.
-	select {
-	case <-e.ready:
-		// already closed — no-op
-	default:
-		close(e.ready)
-	}
+	e.readyOnce.Do(func() { close(e.ready) })
 }
 
 // Daemon returns the live *daemon.Daemon when this engine is running in daemon
