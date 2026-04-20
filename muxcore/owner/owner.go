@@ -101,6 +101,7 @@ type Owner struct {
 	env            map[string]string                                                  // upstream env captured at spawn (for background respawn)
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
 	sessionHandler muxcore.SessionHandler                                             // structured in-process handler (nil = pipe or subprocess)
+	upstreamWriter io.Writer                                                          // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID       string                                                             // server identity hash
 	listener       net.Listener
 	logger         *log.Logger
@@ -219,6 +220,17 @@ type OwnerConfig struct {
 	// instead of routing through a pipe or subprocess.
 	// Mutually exclusive with HandlerFunc and Command/Args.
 	SessionHandler muxcore.SessionHandler
+
+	// UpstreamWriter, when non-nil, overrides the subprocess upstream.
+	// NewOwner will skip spawning Command and writeUpstream will route bytes
+	// into this writer instead. Intended for tests that exercise pure
+	// JSON-building methods (e.g. respondToRootsList) without the
+	// subprocess-timing flake class introduced by "go run mock_server.go".
+	//
+	// Zero value (nil) preserves the normal subprocess-upstream path used by
+	// production and by integration tests that need a real upstream lifecycle
+	// (crash loop, reap, snapshot reattach).
+	UpstreamWriter io.Writer
 
 	// CachedClassification, if non-empty, skips the upstream classification
 	// round-trip. Used by NewOwnerFromHandoff when restoring from daemon
@@ -469,9 +481,15 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger = log.Default()
 	}
 
-	// Spawn upstream — either in-process handler, subprocess, or neither (SessionHandler-only).
+	// Spawn upstream — either in-process handler, subprocess, injected writer, or neither (SessionHandler-only).
 	var proc *upstream.Process
-	if cfg.SessionHandler != nil && cfg.HandlerFunc == nil {
+	if cfg.UpstreamWriter != nil {
+		// Writer-injection mode: skip subprocess spawn entirely.
+		// writeUpstream routes bytes directly into the caller's writer.
+		// Intended for tests that exercise pure JSON-building methods without
+		// the subprocess-timing flake class. No upstream process, no exit event.
+		logger.Printf("owner: writer-injection mode (no subprocess)")
+	} else if cfg.SessionHandler != nil && cfg.HandlerFunc == nil {
 		// SessionHandler-only: no upstream process needed.
 		// Requests dispatch directly via dispatchToSessionHandler.
 		logger.Printf("owner: SessionHandler-only mode (no upstream process)")
@@ -505,6 +523,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		env:                    cfg.Env,
 		handlerFunc:            cfg.HandlerFunc,
 		sessionHandler:         cfg.SessionHandler,
+		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		listener:               ln,
 		logger:                 logger,
@@ -2276,8 +2295,21 @@ func (o *Owner) touchActivity() {
 // SessionHandler-only owners never call writeUpstream — requests dispatch
 // directly via dispatchToSessionHandler, and notification forwarding
 // returns early when o.upstream == nil.
+//
+// Writer-injection mode (upstreamWriter != nil): bytes are written directly
+// to the injected writer followed by a newline, mirroring upstream.WriteLine
+// semantics. Used by tests to capture output without a subprocess.
 func (o *Owner) writeUpstream(data []byte) error {
 	o.touchActivity()
+	if o.upstreamWriter != nil {
+		if _, err := o.upstreamWriter.Write(data); err != nil {
+			return fmt.Errorf("upstream writer: write: %w", err)
+		}
+		if _, err := o.upstreamWriter.Write([]byte("\n")); err != nil {
+			return fmt.Errorf("upstream writer: write newline: %w", err)
+		}
+		return nil
+	}
 	return o.upstream.WriteLine(data)
 }
 
