@@ -18,7 +18,12 @@ const dialTimeout = 500 * time.Millisecond
 
 // Listen creates an IPC listener at the given path.
 // Any stale socket file is removed before listening.
+// Returns an error if another process is actively serving on path.
 func Listen(path string) (net.Listener, error) {
+	if IsAvailable(path) {
+		return nil, fmt.Errorf("ipc: listener already active at %s (another process is serving)", path)
+	}
+
 	// Remove stale socket file if it exists
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("ipc: remove stale socket %s: %w", path, err)

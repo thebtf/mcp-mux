@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -225,3 +226,60 @@ func TestMultipleClients(t *testing.T) {
 func createFile(path string) (*os.File, error) {
 	return os.Create(path)
 }
+
+func TestListen_RefusesWhenAlreadyActive(t *testing.T) {
+	path := socketPath(t)
+
+	// First Listen — must succeed.
+	ln1, err := Listen(path)
+	if err != nil {
+		t.Fatalf("first Listen() error: %v", err)
+	}
+	defer ln1.Close()
+
+	// Accept connections so IsAvailable's Dial can complete the handshake.
+	go func() {
+		for {
+			conn, err := ln1.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	// Second Listen on the same active path — must fail.
+	ln2, err := Listen(path)
+	if err == nil {
+		ln2.Close()
+		t.Fatal("second Listen() expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "listener already active") {
+		t.Errorf("expected 'listener already active' in error, got: %v", err)
+	}
+
+	// First listener must still work after the refused second attempt.
+	conn, err := Dial(path)
+	if err != nil {
+		t.Fatalf("Dial() after refused second Listen() error: %v", err)
+	}
+	conn.Close()
+}
+
+func TestListen_SucceedsOnStalePath(t *testing.T) {
+	path := socketPath(t)
+
+	// Write a stale file at path (nothing is listening on it).
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+
+	// Listen must succeed: IsAvailable returns false (nothing to connect to),
+	// then Remove strips the stale file, then the real listener binds.
+	ln, err := Listen(path)
+	if err != nil {
+		t.Fatalf("Listen() on stale path error: %v", err)
+	}
+	ln.Close()
+}
+

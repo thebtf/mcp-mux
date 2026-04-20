@@ -559,9 +559,31 @@ func runUpgrade(restart bool) {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  warning: shutdown failed: %v\n", err)
 			}
+			fmt.Fprintf(os.Stderr, "  Waiting for old daemon to exit...")
+			for i := 0; i < 20; i++ {
+				time.Sleep(500 * time.Millisecond)
+				if !isDaemonRunning(ctlPath) {
+					fmt.Fprintln(os.Stderr, " done.")
+					break
+				}
+				if i == 19 {
+					fmt.Fprintln(os.Stderr, " timeout (daemon may still be shutting down).")
+				}
+			}
 		} else if !resp.OK {
 			fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
 			control.Send(ctlPath, control.Request{Cmd: "shutdown"})
+			fmt.Fprintf(os.Stderr, "  Waiting for old daemon to exit...")
+			for i := 0; i < 20; i++ {
+				time.Sleep(500 * time.Millisecond)
+				if !isDaemonRunning(ctlPath) {
+					fmt.Fprintln(os.Stderr, " done.")
+					break
+				}
+				if i == 19 {
+					fmt.Fprintln(os.Stderr, " timeout (daemon may still be shutting down).")
+				}
+			}
 		} else {
 			fmt.Fprintf(os.Stderr, "  snapshot written. Waiting for daemon to exit...")
 			// Poll until old daemon is fully dead.
