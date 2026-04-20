@@ -699,120 +699,181 @@ func TestRunClient_DialFailure(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// respondToRootsList — triggered via roots/list request from upstream
-// (need a mock upstream that sends roots/list)
-// We call the method directly as it's on an owner with a fake upstream pipe.
+// respondToRootsList — pure JSON-building method tests via writer injection.
+// No subprocess spawned: UpstreamWriter captures output into a bytes.Buffer.
+// This eliminates the "go run mock_server.go" subprocess-timing flake class
+// (NewOwner used to return before `go run` had attached stdin, causing the
+// first writeUpstream to race the compile with "file already closed").
 // ---------------------------------------------------------------------------
 
 func TestRespondToRootsList_WithCwd(t *testing.T) {
 	ipcPath := testIPCPath(t)
 	cwd := t.TempDir()
 
+	var buf bytes.Buffer
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
-		IPCPath: ipcPath,
-		Cwd:     cwd,
-		Logger:  testLogger(t),
+		UpstreamWriter: &buf,
+		IPCPath:        ipcPath,
+		Cwd:            cwd,
+		Logger:         testLogger(t),
 	})
 	if err != nil {
-		t.Fatalf("NewOwner() error: %v", err)
+		t.Fatalf("NewOwner: %v", err)
 	}
 	defer owner.Shutdown()
 
-	// Call respondToRootsList directly
 	id := json.RawMessage(`1`)
-	// Retry briefly: on macOS `go run mock_server.go` may still be compiling
-	// when NewOwner returns, so upstream stdin can race as "file already closed".
-	// Probing via respondToRootsList is idempotent — it builds JSON and writes to upstream.
-	deadline := time.Now().Add(1 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		lastErr = owner.respondToRootsList(id)
-		if lastErr == nil {
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
+	if err := owner.respondToRootsList(id); err != nil {
+		t.Fatalf("respondToRootsList: %v", err)
 	}
-	if lastErr != nil {
-		t.Errorf("respondToRootsList (after readiness retries): %v", lastErr)
+
+	var parsed struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  struct {
+			Roots []struct {
+				URI  string `json:"uri"`
+				Name string `json:"name,omitempty"`
+			} `json:"roots"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("malformed JSON: %v\npayload: %s", err, buf.String())
+	}
+	if parsed.JSONRPC != "2.0" {
+		t.Errorf("jsonrpc=%q, want 2.0", parsed.JSONRPC)
+	}
+	if len(parsed.Result.Roots) == 0 {
+		t.Fatalf("no roots in response")
+	}
+	if parsed.Result.Roots[0].URI == "" {
+		t.Errorf("empty URI in first root entry")
 	}
 }
 
 func TestRespondToRootsList_EmptyCwd(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	var buf bytes.Buffer
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
-		IPCPath: ipcPath,
-		Cwd:     "", // empty — should use os.Getwd()
-		Logger:  testLogger(t),
+		UpstreamWriter: &buf,
+		IPCPath:        ipcPath,
+		Cwd:            "", // empty — respondToRootsList falls back to os.Getwd()
+		Logger:         testLogger(t),
 	})
 	if err != nil {
-		t.Fatalf("NewOwner() error: %v", err)
+		t.Fatalf("NewOwner: %v", err)
 	}
 	defer owner.Shutdown()
 
 	id := json.RawMessage(`2`)
-	// Retry briefly: on macOS `go run mock_server.go` may still be compiling
-	// when NewOwner returns, so upstream stdin can race as "file already closed".
-	// Probing via respondToRootsList is idempotent — it builds JSON and writes to upstream.
-	deadline := time.Now().Add(1 * time.Second)
-	var lastErr error
-	for time.Now().Before(deadline) {
-		lastErr = owner.respondToRootsList(id)
-		if lastErr == nil {
-			break
-		}
-		time.Sleep(25 * time.Millisecond)
+	if err := owner.respondToRootsList(id); err != nil {
+		t.Fatalf("respondToRootsList (empty cwd): %v", err)
 	}
-	if lastErr != nil {
-		t.Errorf("respondToRootsList (empty cwd) (after readiness retries): %v", lastErr)
+
+	var parsed struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  struct {
+			Roots []struct {
+				URI  string `json:"uri"`
+				Name string `json:"name,omitempty"`
+			} `json:"roots"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("malformed JSON: %v\npayload: %s", err, buf.String())
+	}
+	if parsed.JSONRPC != "2.0" {
+		t.Errorf("jsonrpc=%q, want 2.0", parsed.JSONRPC)
+	}
+	if len(parsed.Result.Roots) == 0 {
+		t.Fatalf("no roots in response (empty-cwd fallback to os.Getwd() should produce one)")
+	}
+	if parsed.Result.Roots[0].URI == "" {
+		t.Errorf("empty URI in first root entry")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// respondWithError and respondToElicitationCancel — call directly
+// respondWithError and respondToElicitationCancel — writer-injection path.
 // ---------------------------------------------------------------------------
 
 func TestRespondWithError(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	var buf bytes.Buffer
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
-		IPCPath: ipcPath,
-		Logger:  testLogger(t),
+		UpstreamWriter: &buf,
+		IPCPath:        ipcPath,
+		Logger:         testLogger(t),
 	})
 	if err != nil {
-		t.Fatalf("NewOwner() error: %v", err)
+		t.Fatalf("NewOwner: %v", err)
 	}
 	defer owner.Shutdown()
 
 	id := json.RawMessage(`5`)
 	if err := owner.respondWithError(id, -32603, "test error"); err != nil {
-		t.Errorf("respondWithError: %v", err)
+		t.Fatalf("respondWithError: %v", err)
+	}
+
+	var parsed struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("malformed JSON: %v\npayload: %s", err, buf.String())
+	}
+	if parsed.JSONRPC != "2.0" {
+		t.Errorf("jsonrpc=%q, want 2.0", parsed.JSONRPC)
+	}
+	if parsed.Error.Code != -32603 {
+		t.Errorf("error.code=%d, want -32603", parsed.Error.Code)
+	}
+	if parsed.Error.Message != "test error" {
+		t.Errorf("error.message=%q, want %q", parsed.Error.Message, "test error")
 	}
 }
 
 func TestRespondToElicitationCancel(t *testing.T) {
 	ipcPath := testIPCPath(t)
 
+	var buf bytes.Buffer
 	owner, err := NewOwner(OwnerConfig{
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server.go"},
-		IPCPath: ipcPath,
-		Logger:  testLogger(t),
+		UpstreamWriter: &buf,
+		IPCPath:        ipcPath,
+		Logger:         testLogger(t),
 	})
 	if err != nil {
-		t.Fatalf("NewOwner() error: %v", err)
+		t.Fatalf("NewOwner: %v", err)
 	}
 	defer owner.Shutdown()
 
 	id := json.RawMessage(`6`)
 	if err := owner.respondToElicitationCancel(id); err != nil {
-		t.Errorf("respondToElicitationCancel: %v", err)
+		t.Fatalf("respondToElicitationCancel: %v", err)
+	}
+
+	var parsed struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  struct {
+			Action string `json:"action"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("malformed JSON: %v\npayload: %s", err, buf.String())
+	}
+	if parsed.JSONRPC != "2.0" {
+		t.Errorf("jsonrpc=%q, want 2.0", parsed.JSONRPC)
+	}
+	if parsed.Result.Action != "cancel" {
+		t.Errorf("result.action=%q, want %q", parsed.Result.Action, "cancel")
 	}
 }
 
