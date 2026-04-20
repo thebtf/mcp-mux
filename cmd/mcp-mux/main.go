@@ -559,22 +559,13 @@ func runUpgrade(restart bool) {
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  warning: shutdown failed: %v\n", err)
 			}
+			waitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
 		} else if !resp.OK {
 			fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
 			control.Send(ctlPath, control.Request{Cmd: "shutdown"})
+			waitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
 		} else {
-			fmt.Fprintf(os.Stderr, "  snapshot written. Waiting for daemon to exit...")
-			// Poll until old daemon is fully dead.
-			for i := 0; i < 20; i++ {
-				time.Sleep(500 * time.Millisecond)
-				if !isDaemonRunning(ctlPath) {
-					fmt.Fprintln(os.Stderr, " done.")
-					break
-				}
-				if i == 19 {
-					fmt.Fprintln(os.Stderr, " timeout (daemon may still be shutting down).")
-				}
-			}
+			waitForDaemonExit(ctlPath, "  snapshot written. Waiting for daemon to exit...")
 		}
 
 		// Clean up stale daemon control socket — old daemon may not have removed it.
@@ -608,6 +599,21 @@ func runUpgrade(restart bool) {
 	} else {
 		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
 	}
+}
+
+// waitForDaemonExit polls isDaemonRunning until it returns false or 10s elapse.
+// Prints prefix on entry, " done." on success, " timeout (...)" on timeout.
+// Checks before sleeping, so a daemon that already exited returns immediately.
+func waitForDaemonExit(ctlPath, prefix string) {
+	fmt.Fprint(os.Stderr, prefix)
+	for i := 0; i < 20; i++ {
+		if !isDaemonRunning(ctlPath) {
+			fmt.Fprintln(os.Stderr, " done.")
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Fprintln(os.Stderr, " timeout (daemon may still be shutting down).")
 }
 
 // collectEnv returns the current process environment as a map.

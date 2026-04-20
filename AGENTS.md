@@ -207,6 +207,18 @@ Key changes:
 
 - Adds read-only accessors to the `engine.Engine` type for observability and testing: `OwnerCount()`, `SessionCount()`, `HandleStatus()`, and `Entry(serverID)`. No breaking changes; all additive.
 
+### v0.21.4 — Defensive ipc.Listen + upgrade --restart split-state fix
+
+- **`ipc.Listen` now refuses to rebind an actively-served path.** Before removing the stale socket file and calling `sockperm.Listen`, `Listen` calls `IsAvailable`. If a live listener is detected, it returns `"ipc: listener already active at <path> (another process is serving)"`. Callers that previously relied on silent socket-steal semantics will now receive a loud error instead. This is a breaking behavioural change, but such reliance was always a bug — a second `Listen` on an active path would have silently disconnected all existing clients. The guard turns that into a diagnosable failure; the caller (snapshot restore, owner startup) can log and skip the conflicting owner rather than corrupting it.
+
+- **`upgrade --restart` fallback-shutdown branch now waits for old daemon exit.** Before spawning the new daemon, `runUpgrade` mirrors the graceful-restart branch's 20×500 ms `isDaemonRunning` poll into both fallback sub-branches (`graceful-restart not available` and `graceful-restart failed`). Prevents the race where the new daemon rebinds per-owner sockets via `ipc.Listen` while the old daemon's Owner structs and `sessionMgr` are still live, causing shim handshake tokens registered in the new daemon to be routed to the old daemon's accept loop and rejected.
+
+- **No API changes.** Both fixes are additive or strictly defensive. `ipc.Listen` signature is unchanged; callers that passed a stale-file path continue to work. The poll loop in `runUpgrade` is internal to the binary.
+
+- **Bundled release:** muxcore/v0.21.4 + v0.21.4 binary.
+
+- **Investigation:** `.agent/debug/upgrade-restart-split-state/investigation.md`
+
 ### v0.21.3 — OwnerConfig.UpstreamWriter (proposed in PR #93)
 
 - `owner.OwnerConfig.UpstreamWriter io.Writer` — optional field that, when set, replaces the default subprocess stdout pipe with a caller-supplied writer. Enables in-process upstream implementations that do not want to go through a subprocess. PR #93 is open at time of writing; adopt after merge.
