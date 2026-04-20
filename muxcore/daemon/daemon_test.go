@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -401,6 +402,106 @@ func TestLegacyReconnectSpawnIncrementsFallbackCounter(t *testing.T) {
 	}
 	if got := status["shim_reconnect_gave_up"]; got != uint64(1) {
 		t.Fatalf("shim_reconnect_gave_up = %v, want 1", got)
+	}
+}
+
+// TestDaemon_LegacyShimFallbackAfterTokenConsumed asserts back-compat for
+// pre-v0.21.1 shims that have no knowledge of the refresh-token control
+// command (SC-3 requirement).
+//
+// Semantic contract under test:
+//
+//   - A truly legacy shim calls HandleSpawn with NO ReconnectReason field
+//     (the zero value, "") after its pre-registered token is consumed.
+//   - HandleSpawn succeeds and returns a fresh ipcPath + serverID + token,
+//     exactly as it did before F2.
+//   - The shim_reconnect_fallback_spawned counter is NOT incremented, because
+//     that counter only ticks when HandleSpawn is called with
+//     ReconnectReason == "fallback_spawn" — a signal only v0.21.x shims emit.
+//   - shim_reconnect_refreshed and shim_reconnect_gave_up also stay 0:
+//     the legacy shim never calls HandleRefreshSessionToken or
+//     HandleReconnectGiveUp.
+//
+// This distinction is intentional: the counters track the v0.21.x reconnect
+// protocol usage, not the legacy spawn path. A legacy shim recovery is
+// therefore invisible to the counters — it looks identical to a first-time
+// spawn from the daemon's perspective.
+func TestDaemon_LegacyShimFallbackAfterTokenConsumed(t *testing.T) {
+	d := testDaemon(t)
+	sid := "owner-legacy-shim-fallback"
+	o := testReconnectOwner(t, sid)
+
+	// Seed a token that has already been consumed (Bind was called).
+	// This simulates the state after a first successful IPC handshake:
+	// the token is gone from pending[], living only in bound[].
+	seedReconnectHistory(t, o, "consumed-token", "/project/legacy", map[string]string{"X": "Y"})
+
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, sid)
+
+	// Capture goroutine count after full setup, before HandleSpawn.
+	// This baseline already includes the daemon, owner, and control-server goroutines.
+	goroutinesBefore := runtime.NumGoroutine()
+
+	// The legacy shim's token is now consumed. Its IPC connection drops and it
+	// reconnects by calling HandleSpawn with no ReconnectReason — the pre-F2
+	// behaviour. It does NOT call HandleRefreshSessionToken.
+	ipcPath, newSID, newToken, err := d.HandleSpawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+		// Deliberately no ReconnectReason — legacy shim does not set this field.
+	})
+	if err != nil {
+		t.Fatalf("HandleSpawn() (legacy path) error = %v", err)
+	}
+	if ipcPath == "" {
+		t.Error("HandleSpawn() returned empty ipcPath")
+	}
+	if newSID == "" {
+		t.Error("HandleSpawn() returned empty serverID")
+	}
+	if newToken == "" {
+		t.Error("HandleSpawn() returned empty token")
+	}
+
+	// Counter assertions — the key semantic point of T025:
+	//
+	//   shim_reconnect_fallback_spawned stays 0 because no ReconnectReason was set.
+	//   Only v0.21.x shims that explicitly signal "fallback_spawn" increment this counter.
+	//
+	//   shim_reconnect_refreshed stays 0 because the legacy path never calls
+	//   HandleRefreshSessionToken.
+	//
+	//   shim_reconnect_gave_up stays 0 because the legacy path never calls
+	//   HandleReconnectGiveUp.
+	//
+	// The counters track v0.21.x reconnect-protocol usage, not the legacy spawn
+	// path. A legacy shim recovery is invisible to all three counters — from the
+	// daemon's perspective it looks identical to a cold first-time spawn.
+	status := d.HandleStatus()
+	if got := status["shim_reconnect_refreshed"]; got != uint64(0) {
+		t.Errorf("shim_reconnect_refreshed = %v, want 0 (legacy shim never calls HandleRefreshSessionToken)", got)
+	}
+	if got := status["shim_reconnect_fallback_spawned"]; got != uint64(0) {
+		t.Errorf("shim_reconnect_fallback_spawned = %v, want 0 (legacy shim omits ReconnectReason)", got)
+	}
+	if got := status["shim_reconnect_gave_up"]; got != uint64(0) {
+		t.Errorf("shim_reconnect_gave_up = %v, want 0 (legacy shim never calls HandleReconnectGiveUp)", got)
+	}
+
+	// No goroutine leak introduced by HandleSpawn itself: allow 200ms for any
+	// transient goroutines to settle, then verify the delta against the
+	// post-setup baseline is small. HandleSpawn is synchronous; any goroutine
+	// growth beyond a small buffer indicates a leak in the spawn path.
+	time.Sleep(200 * time.Millisecond)
+	goroutinesAfter := runtime.NumGoroutine()
+	delta := goroutinesAfter - goroutinesBefore
+	if delta > 15 {
+		t.Errorf("goroutine leak after HandleSpawn: before=%d after=%d delta=%d", goroutinesBefore, goroutinesAfter, delta)
 	}
 }
 
