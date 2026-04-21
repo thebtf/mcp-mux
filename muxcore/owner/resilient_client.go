@@ -25,6 +25,20 @@ const (
 	defaultMaxRefreshAttempts = 3
 )
 
+// StdinEOFPolicy controls shim behavior when stdin returns EOF.
+type StdinEOFPolicy int
+
+const (
+	// StdinEOFEagerExit drains in-flight requests then exits (default).
+	// Suitable for MCP lifecycle where stdin close = shutdown signal.
+	StdinEOFEagerExit StdinEOFPolicy = iota
+
+	// StdinEOFWaitForDisconnect ignores stdin EOF entirely.
+	// Exit only on IPC disconnect or stdout dead.
+	// Suitable for engine consumers where stdin is an internal pipe.
+	StdinEOFWaitForDisconnect
+)
+
 // ReconnectFunc reconnects to the daemon and returns the new IPC path and handshake token.
 // Called when the IPC connection to the owner breaks.
 // Must handle: ensureDaemon + spawnViaDaemon + return ipcPath, token.
@@ -40,6 +54,7 @@ type ResilientClientConfig struct {
 	Reconnect        ReconnectFunc
 	MaxRefreshAttempts int
 	ReconnectTimeout time.Duration // default: 30s
+	StdinEOFPolicy   StdinEOFPolicy // default: EagerExit (drain pending, then exit)
 
 	// KeepaliveInterval is no longer used. Previous revisions emitted a
 	// synthetic notifications/progress with progressToken="mux-reconnect"
@@ -237,6 +252,13 @@ func (rc *resilientClient) runProxy(conn interface {
 		// Wait for: IPC EOF (reconnect), CC stdin EOF (exit), or stdout dead (CC gone).
 		select {
 		case err := <-stdinDone:
+			// WaitForDisconnect: stdin EOF is not an exit signal.
+			if rc.cfg.StdinEOFPolicy == StdinEOFWaitForDisconnect && err == io.EOF {
+				rc.log.Printf("resilient: stdin EOF (policy=wait_for_disconnect), continuing")
+				stdinDone = nil // prevent re-firing; exit via ipcEOF or stdoutDead
+				continue
+			}
+
 			if err == io.EOF && rc.cfg.ProbeGracePeriod > 0 &&
 				time.Since(rc.startTime) < rc.cfg.ProbeGracePeriod &&
 				!rc.ipcMsgSent.Load() {
@@ -252,10 +274,37 @@ func (rc *resilientClient) runProxy(conn interface {
 					rc.log.Printf("resilient: probe grace expired, exiting")
 				}
 			} else if err == io.EOF {
-				rc.log.Printf("resilient: stdin EOF after %.1fs (data_sent=%v), exiting immediately",
-					time.Since(rc.startTime).Seconds(), rc.ipcMsgSent.Load())
+				pending := rc.countInflight()
+				if pending > 0 {
+					rc.log.Printf("resilient: stdin EOF with %d in-flight request(s), draining (max 5s)", pending)
+					deadline := time.After(5 * time.Second)
+					ticker := time.NewTicker(50 * time.Millisecond)
+				drain:
+					for {
+						select {
+						case <-deadline:
+							rc.log.Printf("resilient: drain timeout, %d response(s) lost", rc.countInflight())
+							break drain
+						case <-rc.stdoutDead:
+							rc.log.Printf("resilient: stdout dead during drain, exiting")
+							break drain
+						case <-ipcEOF:
+							rc.log.Printf("resilient: IPC disconnected during drain")
+							break drain
+						case <-ticker.C:
+							if rc.countInflight() == 0 {
+								rc.log.Printf("resilient: drain complete, all responses delivered")
+								break drain
+							}
+						}
+					}
+					ticker.Stop()
+				} else {
+					rc.log.Printf("resilient: stdin EOF after %.1fs, no pending requests, exiting",
+						time.Since(rc.startTime).Seconds())
+				}
 			}
-			// Exit — either normal disconnect, probe confirmed dead, or grace expired.
+			// Exit — either normal disconnect, probe confirmed dead, grace expired, or drain done.
 			conn.Close()
 			if err == io.EOF {
 				return nil
@@ -672,6 +721,16 @@ func (rc *resilientClient) drainOrphanedInflight(stdoutMu *sync.Mutex) {
 	if stdoutBroken {
 		rc.log.Printf("resilient: drainOrphanedInflight: stdout broken — CC may hang on the remaining orphaned requests")
 	}
+}
+
+// countInflight returns the number of in-flight requests currently tracked.
+func (rc *resilientClient) countInflight() int {
+	count := 0
+	rc.inflight.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 // extractRequestID returns the JSON "id" field from a request message (has "method").
