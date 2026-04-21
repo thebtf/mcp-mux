@@ -195,24 +195,37 @@ func TestStdinEOF_DrainPending(t *testing.T) {
 	// Step 4: release the pending response.
 	close(releaseCh)
 
-	// Step 5: wait for the tools/call response to reach CC stdout BEFORE closing
-	// the pipe. runStdoutWriter goroutine is still running after shim exits and
-	// will deliver the response; we must not close ccStdoutW prematurely.
-	select {
-	case <-toolsRespSeen:
-		t.Logf("tools/call response delivered to CC stdout")
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout: tools/call response not seen on CC stdout after releasing drain")
+	// Step 5: verify ORDERING — shim must NOT exit before the response is delivered.
+	// Race both channels: toolsRespSeen should fire first (or simultaneously).
+	// If errCh fires before toolsRespSeen, the drain exited too early.
+	shimExitedFirst := false
+	responseDelivered := false
+	for !responseDelivered {
+		select {
+		case <-toolsRespSeen:
+			t.Logf("tools/call response delivered to CC stdout")
+			responseDelivered = true
+		case err := <-errCh:
+			if !responseDelivered {
+				shimExitedFirst = true
+				t.Errorf("ORDERING VIOLATION: shim exited (err=%v) BEFORE tools/call response was delivered to stdout", err)
+			}
+			// Continue to wait for response even if shim exited (stdout writer goroutine may still deliver)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout: tools/call response not seen on CC stdout after releasing drain")
+		}
 	}
 
-	// Step 6: shim exits cleanly after drain (may have already exited by now).
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Errorf("shim exited with unexpected error: %v", err)
+	// Step 6: shim exits cleanly after response delivery.
+	if !shimExitedFirst {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Errorf("shim exited with unexpected error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout: shim did not exit after drain complete")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout: shim did not exit after drain complete")
 	}
 
 	// Close the stdout pipe to unblock the scanner goroutine.

@@ -250,13 +250,17 @@ func (rc *resilientClient) runProxy(conn interface {
 		go rc.runIPCWriter(conn, ipcEOF, writerDone)
 
 		// Wait for: IPC EOF (reconnect), CC stdin EOF (exit), or stdout dead (CC gone).
+		// Inner loop allows WaitForDisconnect to re-enter select without restarting
+		// the outer for (which would spawn duplicate IPC reader/writer goroutines).
+		reconnect := false
+		for !reconnect {
 		select {
 		case err := <-stdinDone:
 			// WaitForDisconnect: stdin EOF is not an exit signal.
 			if rc.cfg.StdinEOFPolicy == StdinEOFWaitForDisconnect && err == io.EOF {
-				rc.log.Printf("resilient: stdin EOF (policy=wait_for_disconnect), continuing")
-				stdinDone = nil // prevent re-firing; exit via ipcEOF or stdoutDead
-				continue
+				rc.log.Printf("resilient: stdin EOF (policy=wait_for_disconnect), ignoring")
+				stdinDone = nil // nil channel is never selected — permanently disables this case
+				continue        // re-enters inner select loop, NOT outer for
 			}
 
 			if err == io.EOF && rc.cfg.ProbeGracePeriod > 0 &&
@@ -292,7 +296,7 @@ func (rc *resilientClient) runProxy(conn interface {
 							rc.log.Printf("resilient: IPC disconnected during drain")
 							break drain
 						case <-ticker.C:
-							if rc.countInflight() == 0 {
+							if rc.countInflight() == 0 && len(rc.msgFromIPC) == 0 {
 								rc.log.Printf("resilient: drain complete, all responses delivered")
 								break drain
 							}
@@ -330,8 +334,9 @@ func (rc *resilientClient) runProxy(conn interface {
 			}
 			conn = newConn
 			rc.log.Printf("resilient: reconnected, resuming proxy")
-			// Loop back to CONNECTED state.
+			reconnect = true // exit inner select loop → outer for spawns new IPC goroutines
 		}
+		} // end inner select loop
 	}
 }
 
@@ -349,11 +354,6 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 		data := make([]byte, len(line))
 		copy(data, line)
 
-		// Clear inflight tracking when we receive a response (has "id" + "result"/"error")
-		if id := extractResponseID(data); id != "" {
-			rc.inflight.Delete(id)
-		}
-
 		select {
 		case rc.msgFromIPC <- data:
 		default:
@@ -364,6 +364,13 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 			default:
 			}
 			rc.msgFromIPC <- data
+		}
+
+		// Clear inflight AFTER the message is buffered in msgFromIPC.
+		// This ensures the drain loop sees inflight > 0 until the response
+		// is at least in the channel, preventing premature drain exit.
+		if id := extractResponseID(data); id != "" {
+			rc.inflight.Delete(id)
 		}
 	}
 
