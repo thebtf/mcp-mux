@@ -130,6 +130,12 @@ type Config struct {
 	// Set to true for ephemeral daemons (tests, one-shot tools) that should
 	// not rehydrate state from prior runs.
 	SkipSnapshot bool
+
+	// StdinEOFPolicy controls shim behavior when stdin returns EOF.
+	// Default (zero value): EagerExit — drain in-flight requests, then exit.
+	// Set to owner.StdinEOFWaitForDisconnect for engine consumers where
+	// stdin is an internal pipe (not a CC shutdown signal).
+	StdinEOFPolicy owner.StdinEOFPolicy
 }
 
 // MuxEngine manages the muxcore multiplexer lifecycle.
@@ -378,6 +384,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		InitialIPCPath: ipcPath,
 		Token:          token,
 		Reconnect:      reconnectFn,
+		StdinEOFPolicy: e.cfg.StdinEOFPolicy,
 		Logger:         e.logger,
 	})
 }
