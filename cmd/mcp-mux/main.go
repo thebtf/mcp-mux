@@ -18,6 +18,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -501,6 +502,18 @@ func runUpgrade(restart bool) {
 		os.Exit(1)
 	}
 
+	// Guard: verify staged binary differs from current to prevent no-op upgrades.
+	// go build -o mcp-mux.exe silently fails when the daemon holds the file lock,
+	// leaving the staged binary identical to the running one.
+	if sameFile(exe, pendingPath) {
+		fmt.Fprintln(os.Stderr, "error: staged binary is identical to current binary (no-op upgrade).")
+		fmt.Fprintln(os.Stderr, "This usually means `go build -o mcp-mux.exe` failed silently because")
+		fmt.Fprintln(os.Stderr, "the daemon process holds a lock on the file. Build to the staging path:")
+		fmt.Fprintf(os.Stderr, "  go build -o %s ./cmd/mcp-mux\n", pendingPath)
+		fmt.Fprintln(os.Stderr, "Then run: mcp-mux upgrade --restart")
+		os.Exit(1)
+	}
+
 	// Zero-downtime upgrade: rename-swap binary WITHOUT stopping daemon or killing connections.
 	//
 	// On Windows, a running exe CAN be renamed (not deleted/overwritten).
@@ -620,6 +633,37 @@ func waitForDaemonExit(ctlPath, prefix string) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	fmt.Fprintln(os.Stderr, " timeout (daemon may still be shutting down).")
+}
+
+// sameFile returns true if two files have the same size and SHA-256 hash.
+func sameFile(a, b string) bool {
+	infoA, errA := os.Stat(a)
+	infoB, errB := os.Stat(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	if infoA.Size() != infoB.Size() {
+		return false
+	}
+	hashA, errA := fileHash(a)
+	hashB, errB := fileHash(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return hashA == hashB
+}
+
+func fileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // collectEnv returns the current process environment as a map.
