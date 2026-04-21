@@ -137,30 +137,16 @@ func main() {
 		return
 	}
 
-	// Fast path: per-server IPC socket exists → connect as client (works with both legacy and daemon).
-	// Log the probe result + duration so post-mortem can distinguish fast-path hits from misses.
-	// Uses %q for path (may contain spaces/quotes on Windows) and %q for err
-	// so grep/awk over the jsonl parses reliably.
-	ipcProbeStart := time.Now()
-	ipcAvail := ipc.IsAvailable(ipcPath)
-	logger.Printf("shim startup step=ipc_probe result=%v duration=%v path=%q",
-		ipcAvail, time.Since(ipcProbeStart), ipcPath)
-	if ipcAvail {
-		runClientStart := time.Now()
-		logger.Printf("shim startup step=run_client_begin target=existing_owner path=%q", ipcPath)
-		if err := owner.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
-			logger.Printf("shim startup step=run_client_end status=error duration=%v err=%q total=%v",
-				time.Since(runClientStart), err.Error(), time.Since(shimStart))
-			os.Exit(1)
-		}
-		logger.Printf("shim startup step=run_client_end status=ok duration=%v total=%v reason=stdin_closed",
-			time.Since(runClientStart), time.Since(shimStart))
-		return
-	}
-
 	// Daemon mode (default): shim → daemon → spawn → connect
 	// Disable with MCP_MUX_NO_DAEMON=1 to fall back to legacy per-session owner.
-	if os.Getenv("MCP_MUX_NO_DAEMON") != "1" {
+	//
+	// Important: daemon mode MUST run before any direct IPC shortcut. A reused
+	// daemon-managed owner requires a one-time handshake token, and only the
+	// daemon's spawn path can mint and pre-register that token for the shim.
+	// Connecting directly to the owner's IPC socket skips that registration and
+	// gets rejected as "invalid/missing token".
+	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
+	if !noDaemon {
 		ensureStart := time.Now()
 		if err := ensureDaemon(logger); err != nil {
 			logger.Printf("shim startup step=ensure_daemon status=error duration=%v err=%q fallback=legacy_owner",
@@ -235,6 +221,26 @@ func main() {
 				return
 			}
 		}
+	}
+
+	// Legacy compatibility fallback: connect directly only after daemon mode is
+	// explicitly disabled or the daemon path failed. This path has no handshake
+	// token, so it is only safe for legacy owners.
+	ipcProbeStart := time.Now()
+	ipcAvail := ipc.IsAvailable(ipcPath)
+	logger.Printf("shim startup step=ipc_probe result=%v duration=%v path=%q",
+		ipcAvail, time.Since(ipcProbeStart), ipcPath)
+	if ipcAvail {
+		runClientStart := time.Now()
+		logger.Printf("shim startup step=run_client_begin target=existing_owner path=%q", ipcPath)
+		if err := owner.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
+			logger.Printf("shim startup step=run_client_end status=error duration=%v err=%q total=%v",
+				time.Since(runClientStart), err.Error(), time.Since(shimStart))
+			os.Exit(1)
+		}
+		logger.Printf("shim startup step=run_client_end status=ok duration=%v total=%v reason=stdin_closed",
+			time.Since(runClientStart), time.Since(shimStart))
+		return
 	}
 
 	// Legacy fallback: become owner directly (MCP_MUX_NO_DAEMON=1)
