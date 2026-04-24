@@ -62,8 +62,16 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.20.4
+go get github.com/thebtf/mcp-mux/muxcore@v0.21.7
 ```
+
+v0.21.7 fixes `spawnSuccessor` hardcoding `"--daemon"` instead of using
+`engine.Config.DaemonFlag` (default `"--muxcore-daemon"`). The mismatch
+caused the successor process to enter client mode during graceful restart,
+so `tryHandoffReceive` never ran and handoff always fell back to
+kill-and-respawn after 30s. No breaking API changes — `daemon.Config`
+gains an additive `DaemonFlag string` field; empty value preserves
+pre-v0.21.7 behavior.
 
 v0.20.4 is the multi-user hardening release on top of v0.20.3. Closes the
 2 HIGH security findings from the 2026-04-18 PRC audit (S8-001 token
@@ -193,6 +201,12 @@ Key changes:
 1. **DaemonControlPath** — if you call it directly, add name parameter: `DaemonControlPath(baseDir, "engram")`
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
+
+### v0.21.7 — Fix spawnSuccessor DaemonFlag hardcode (#99)
+
+- `spawnSuccessor` hardcoded `"--daemon"` as the successor CLI flag. `engine.isDaemonMode()` checks `cfg.DaemonFlag` (default `"--muxcore-daemon"`). Mismatch caused successor to enter client mode — `tryHandoffReceive` never ran — graceful restart always fell back to kill-and-respawn after 30s.
+- **Fix:** `daemon.Config` gains `DaemonFlag string` field. `engine.runDaemon` passes `e.cfg.DaemonFlag`. `spawnSuccessor` uses configured flag. Empty value defaults to `"--daemon"` for backward compat.
+- **No breaking changes.** Additive field only.
 
 ### v0.21.1 — Shim reconnect token refresh (F2)
 
