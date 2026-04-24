@@ -291,6 +291,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		SkipSnapshot:     e.cfg.SkipSnapshot,
 		HandlerFunc:      handlerFunc,
 		SessionHandler:   e.cfg.SessionHandler,
+		DaemonFlag:       e.cfg.DaemonFlag,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)

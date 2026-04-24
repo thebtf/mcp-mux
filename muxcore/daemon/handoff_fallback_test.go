@@ -29,9 +29,9 @@ func setupTestHandoffTimeouts(t *testing.T) {
 // the control-plane caller.
 //
 // Failure mode simulated: listenHandoff accept times out because spawnSuccessor
-// forks a real binary with --daemon but the binary in the test environment is
-// the test binary itself, which does not implement the successor handshake.
-// The accept timeout (overridden to 50 ms) fires before any connection arrives.
+// forks a real binary with the configured DaemonFlag but the binary in the test
+// environment is the test binary itself, which does not implement the successor
+// handshake. The accept timeout (overridden to 50 ms) fires before any connection arrives.
 //
 // This test asserts:
 //  1. HandleGracefulRestart returns (snapshotPath, nil) — not an error.

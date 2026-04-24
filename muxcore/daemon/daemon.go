@@ -115,6 +115,10 @@ type Daemon struct {
 	// creating an infinite respawn loop that burns CPU.
 	crashTracker map[string][]time.Time
 
+	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
+	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
+	daemonFlag string
+
 	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
 	// gate in spawnOnce tore down a registered owner because IsReachable()
 	// returned false despite IsAccepting() reporting open. Counter is
@@ -189,6 +193,13 @@ type Config struct {
 	// SkipSnapshot disables snapshot loading on startup. Used by tests
 	// to prevent cross-test interference from stale snapshot files.
 	SkipSnapshot bool
+
+	// DaemonFlag is the CLI flag that identifies daemon mode when present in
+	// os.Args. Set by engine from engine.Config.DaemonFlag. spawnSuccessor
+	// passes this flag to the successor process so isDaemonMode() matches.
+	// If empty, defaults to "--daemon" for backward compatibility with
+	// pre-v0.21.7 callers that don't set it.
+	DaemonFlag string
 }
 
 var _ control.DaemonHandler = (*Daemon)(nil)
@@ -213,6 +224,10 @@ func New(cfg Config) (*Daemon, error) {
 	if idleTimeout == 0 {
 		idleTimeout = 5 * time.Minute
 	}
+	daemonFlag := cfg.DaemonFlag
+	if daemonFlag == "" {
+		daemonFlag = "--daemon"
+	}
 
 	supCtx, supCancel := context.WithCancel(context.Background())
 	d := &Daemon{
@@ -227,6 +242,7 @@ func New(cfg Config) (*Daemon, error) {
 		supervisorCancel: supCancel,
 		handlerFunc:      cfg.HandlerFunc,
 		sessionHandler:   cfg.SessionHandler,
+		daemonFlag:       daemonFlag,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -980,12 +996,12 @@ var handoffTotalTimeout = 30 * time.Second
 // injecting MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET so the successor
 // daemon can locate the handoff socket and authenticate (FR-11). The caller does
 // NOT wait for the process — it runs independently and will dial back.
-func spawnSuccessor(tokenPath, socketPath string) error {
+func spawnSuccessor(tokenPath, socketPath, daemonFlag string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("handoff: resolve executable: %w", err)
 	}
-	cmd := exec.Command(exe, "--daemon")
+	cmd := exec.Command(exe, daemonFlag)
 	cmd.Env = append(os.Environ(),
 		"MCPMUX_HANDOFF_TOKEN_PATH="+tokenPath,
 		"MCPMUX_HANDOFF_SOCKET="+socketPath,
@@ -1083,7 +1099,7 @@ func (d *Daemon) attemptHandoff() error {
 	}()
 
 	// Spawn successor with handoff credentials.
-	if spawnErr := spawnSuccessor(tokenPath, socketPath); spawnErr != nil {
+	if spawnErr := spawnSuccessor(tokenPath, socketPath, d.daemonFlag); spawnErr != nil {
 		// Do NOT drain connCh here — the listener goroutine will self-terminate
 		// once handoffAcceptTimeout expires (buffered channel prevents goroutine
 		// leak; the accepted conn, if any arrives despite the spawn failure, is

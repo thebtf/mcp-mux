@@ -101,6 +101,41 @@ func waitOwnerAccepting(t *testing.T, d *Daemon, sid string) {
 	t.Fatalf("owner %s never became accepting", sid)
 }
 
+func TestDaemonFlag_ConfigPropagation(t *testing.T) {
+	ctlPath := shortSocketPath(t, "daemonflag.ctl.sock")
+	d1, err := New(Config{
+		ControlPath:  ctlPath,
+		GracePeriod:  1 * time.Second,
+		IdleTimeout:  5 * time.Second,
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
+		DaemonFlag:   "--muxcore-daemon",
+	})
+	if err != nil {
+		t.Fatalf("New() with custom DaemonFlag: %v", err)
+	}
+	if d1.daemonFlag != "--muxcore-daemon" {
+		t.Errorf("daemonFlag = %q, want %q", d1.daemonFlag, "--muxcore-daemon")
+	}
+	d1.Shutdown()
+
+	ctlPath2 := shortSocketPath(t, "daemonflag2.ctl.sock")
+	d2, err := New(Config{
+		ControlPath:  ctlPath2,
+		GracePeriod:  1 * time.Second,
+		IdleTimeout:  5 * time.Second,
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("New() with empty DaemonFlag: %v", err)
+	}
+	if d2.daemonFlag != "--daemon" {
+		t.Errorf("daemonFlag = %q, want %q (default)", d2.daemonFlag, "--daemon")
+	}
+	d2.Shutdown()
+}
+
 func TestDaemonSpawnAndStatus(t *testing.T) {
 	d := testDaemon(t)
 
