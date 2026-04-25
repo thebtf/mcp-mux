@@ -34,7 +34,7 @@ func setupTestHandoffTimeouts(t *testing.T) {
 // handshake. The accept timeout (overridden to 50 ms) fires before any connection arrives.
 //
 // This test asserts:
-//  1. HandleGracefulRestart returns (snapshotPath, nil) — not an error.
+//  1. HandleGracefulRestart returns (snapshotPath, nil, nil) — not an error.
 //  2. snapshotPath is non-empty — snapshot serialization succeeded.
 //  3. The daemon continues to the Shutdown path (go d.Shutdown()) regardless.
 func TestHandoffFallbackOnAcceptTimeout(t *testing.T) {
@@ -43,7 +43,7 @@ func TestHandoffFallbackOnAcceptTimeout(t *testing.T) {
 	d := testDaemon(t) // helper defined in daemon_test.go
 
 	// HandleGracefulRestart MUST succeed (FR-8 fallback is transparent to caller).
-	snapshotPath, err := d.HandleGracefulRestart(0)
+	snapshotPath, _, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart() returned error %v; want nil (FR-8 fallback should be transparent)", err)
 	}
@@ -68,7 +68,7 @@ func TestHandoffFallback_LogMarker(t *testing.T) {
 
 	d, logBuf := testDaemonWithLog(t)
 
-	snapshotPath, err := d.HandleGracefulRestart(0)
+	snapshotPath, _, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestHandoffFallback_CounterIncrement(t *testing.T) {
 	before := d.stats.fallback.Load()
 	beforeAttempted := d.stats.attempted.Load()
 
-	snapshotPath, err := d.HandleGracefulRestart(0)
+	snapshotPath, _, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
 		}
 	}
 
-	snapshotPath, err := d.HandleGracefulRestart(0)
+	snapshotPath, _, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestHandoffFallback_SnapshotAlwaysWritten(t *testing.T) {
 
 	d := testDaemon(t)
 
-	snapshotPath, err := d.HandleGracefulRestart(0)
+	snapshotPath, _, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}

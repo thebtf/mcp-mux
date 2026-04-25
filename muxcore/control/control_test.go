@@ -211,8 +211,8 @@ func (m *mockDaemonHandler) HandleRemove(serverID string) error {
 	return m.removeErr
 }
 
-func (m *mockDaemonHandler) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
-	return "/tmp/snapshot.json", nil
+func (m *mockDaemonHandler) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
+	return "/tmp/snapshot.json", nil, nil
 }
 
 func (m *mockDaemonHandler) HandleRefreshSessionToken(prevToken string) (string, error) {

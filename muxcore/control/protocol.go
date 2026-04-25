@@ -50,7 +50,7 @@ type DaemonHandler interface {
 	CommandHandler
 	HandleSpawn(req Request) (ipcPath, serverID, token string, err error)
 	HandleRemove(serverID string) error
-	HandleGracefulRestart(drainTimeoutMs int) (snapshotPath string, err error)
+	HandleGracefulRestart(drainTimeoutMs int) (snapshotPath string, afterResponse func(), err error)
 	HandleRefreshSessionToken(prevToken string) (newToken string, err error)
 	HandleReconnectGiveUp(reason string) error
 }

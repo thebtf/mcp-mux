@@ -29,7 +29,7 @@ func (h *refreshTestHandler) HandleSpawn(control.Request) (string, string, strin
 
 func (h *refreshTestHandler) HandleRemove(string) error { return nil }
 
-func (h *refreshTestHandler) HandleGracefulRestart(int) (string, error) { return "", nil }
+func (h *refreshTestHandler) HandleGracefulRestart(int) (string, func(), error) { return "", nil, nil }
 
 func (h *refreshTestHandler) HandleRefreshSessionToken(prevToken string) (string, error) {
 	h.prevToken = prevToken

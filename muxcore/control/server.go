@@ -84,93 +84,96 @@ func (s *Server) handleConn(conn net.Conn) {
 	// Dispatch runs the handler (e.g. graceful-restart may take longer than
 	// clientDeadline). Set the write deadline only after dispatch returns so
 	// it bounds only the I/O write, not handler execution.
-	resp := s.dispatch(req)
+	resp, afterFn := s.dispatch(req)
 	if err := conn.SetWriteDeadline(time.Now().Add(clientDeadline)); err != nil {
 		s.logger.Printf("control: set write deadline: %v", err)
 		return
 	}
 	s.writeResponse(conn, resp)
+	if afterFn != nil {
+		afterFn()
+	}
 }
 
-func (s *Server) dispatch(req Request) Response {
+func (s *Server) dispatch(req Request) (Response, func()) {
 	switch req.Cmd {
 	case "ping":
-		return Response{OK: true, Message: "pong"}
+		return Response{OK: true, Message: "pong"}, nil
 
 	case "shutdown":
 		msg := s.handler.HandleShutdown(req.DrainTimeoutMs)
-		return Response{OK: true, Message: msg}
+		return Response{OK: true, Message: msg}, nil
 
 	case "status":
 		status := s.handler.HandleStatus()
 		data, err := json.Marshal(status)
 		if err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("marshal status: %v", err)}
+			return Response{OK: false, Message: fmt.Sprintf("marshal status: %v", err)}, nil
 		}
-		return Response{OK: true, Data: data}
+		return Response{OK: true, Data: data}, nil
 
 	case "spawn":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
-			return Response{OK: false, Message: "spawn not supported (not a daemon)"}
+			return Response{OK: false, Message: "spawn not supported (not a daemon)"}, nil
 		}
 		ipcPath, serverID, token, err := dh.HandleSpawn(req)
 		if err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}
+			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}, nil
 		}
-		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID, Token: token}
+		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID, Token: token}, nil
 
 	case "remove":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
-			return Response{OK: false, Message: "remove not supported (not a daemon)"}
+			return Response{OK: false, Message: "remove not supported (not a daemon)"}, nil
 		}
 		if err := dh.HandleRemove(req.Command); err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("remove: %v", err)}
+			return Response{OK: false, Message: fmt.Sprintf("remove: %v", err)}, nil
 		}
-		return Response{OK: true, Message: "removed"}
+		return Response{OK: true, Message: "removed"}, nil
 
 	case "graceful-restart":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
-			return Response{OK: false, Message: "graceful-restart not supported (not a daemon)"}
+			return Response{OK: false, Message: "graceful-restart not supported (not a daemon)"}, nil
 		}
-		snapshotPath, err := dh.HandleGracefulRestart(req.DrainTimeoutMs)
+		snapshotPath, afterFn, err := dh.HandleGracefulRestart(req.DrainTimeoutMs)
 		if err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("graceful-restart: %v", err)}
+			return Response{OK: false, Message: fmt.Sprintf("graceful-restart: %v", err)}, nil
 		}
-		return Response{OK: true, Message: "snapshot written, shutting down", IPCPath: snapshotPath}
+		return Response{OK: true, Message: "snapshot written, shutting down", IPCPath: snapshotPath}, afterFn
 
 	case "refresh-token":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
-			return Response{OK: false, Message: "refresh-token not supported (not a daemon)"}
+			return Response{OK: false, Message: "refresh-token not supported (not a daemon)"}, nil
 		}
 		newToken, err := dh.HandleRefreshSessionToken(req.PrevToken)
 		if err != nil {
 			switch {
 			case matchesControlError(err, errUnknownToken):
-				return Response{OK: false, Message: "unknown token"}
+				return Response{OK: false, Message: "unknown token"}, nil
 			case matchesControlError(err, errOwnerGone):
-				return Response{OK: false, Message: "owner gone"}
+				return Response{OK: false, Message: "owner gone"}, nil
 			default:
-				return Response{OK: false, Message: err.Error()}
+				return Response{OK: false, Message: err.Error()}, nil
 			}
 		}
-		return Response{OK: true, Token: newToken}
+		return Response{OK: true, Token: newToken}, nil
 
 	case "reconnect-give-up":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
-			return Response{OK: false, Message: "reconnect-give-up not supported (not a daemon)"}
+			return Response{OK: false, Message: "reconnect-give-up not supported (not a daemon)"}, nil
 		}
 		if err := dh.HandleReconnectGiveUp(req.ReconnectReason); err != nil {
-			return Response{OK: false, Message: err.Error()}
+			return Response{OK: false, Message: err.Error()}, nil
 		}
-		return Response{OK: true, Message: "recorded"}
+		return Response{OK: true, Message: "recorded"}, nil
 
 	default:
-		return Response{OK: false, Message: fmt.Sprintf("unknown command: %s", req.Cmd)}
+		return Response{OK: false, Message: fmt.Sprintf("unknown command: %s", req.Cmd)}, nil
 	}
 }
 

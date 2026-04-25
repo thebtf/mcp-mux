@@ -1209,12 +1209,12 @@ func (d *Daemon) attemptHandoff() error {
 // cold-start seed), then attempts FD-passing handoff to the successor daemon
 // (FR-1/FR-2/FR-3). On any handoff failure the "handoff.fallback" log line is
 // emitted and the function falls through to legacy kill-and-respawn (FR-8).
-func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
+func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
 	// Serialize snapshot first — needed for FR-8 fallback and successor seed
 	// regardless of whether handoff succeeds.
 	snapshotPath, err := d.SerializeSnapshot()
 	if err != nil {
-		return "", fmt.Errorf("snapshot: %w", err)
+		return "", nil, fmt.Errorf("snapshot: %w", err)
 	}
 
 	// Attempt FD-passing handoff. Every identifiable failure mode routes through
@@ -1238,8 +1238,7 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, error) {
 	}
 	d.mu.Unlock()
 
-	go d.Shutdown()
-	return snapshotPath, nil
+	return snapshotPath, func() { go d.Shutdown() }, nil
 }
 
 // HandleRefreshSessionToken implements control.DaemonHandler.
