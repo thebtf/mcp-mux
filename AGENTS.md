@@ -62,8 +62,16 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.21.8
+go get github.com/thebtf/mcp-mux/muxcore@v0.21.9
 ```
+
+v0.21.9 fixes graceful-restart response race — `HandleGracefulRestart`
+called `go d.Shutdown()` before the control handler wrote the response.
+On Windows AF_UNIX, data was lost in the kernel buffer on process exit.
+Fix: `HandleGracefulRestart` returns an `afterResponse func()` callback;
+control server writes response first, then invokes the callback.
+**Breaking:** `DaemonHandler.HandleGracefulRestart` signature gains a
+third return value `afterResponse func()`.
 
 v0.21.8 fixes control socket conflict during graceful restart handoff.
 `daemon.New()` bound the control socket before `loadSnapshot`/`tryHandoffReceive`
@@ -204,6 +212,13 @@ Key changes:
 1. **DaemonControlPath** — if you call it directly, add name parameter: `DaemonControlPath(baseDir, "engram")`
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
+
+### v0.21.9 — Defer shutdown until after response write (#99)
+
+- `HandleGracefulRestart` called `go d.Shutdown()` before the control handler wrote the response. On Windows AF_UNIX, data in the kernel send buffer is lost on process exit → caller sees `i/o timeout` instead of confirmation.
+- **Fix:** `HandleGracefulRestart` returns `afterResponse func()` callback. Control server writes response first, then invokes callback.
+- **Breaking:** `DaemonHandler.HandleGracefulRestart` signature: `(int) (string, func(), error)`. Consumers must update implementations and mocks.
+- **Combined with v0.21.7 + v0.21.8:** all three fixes required for end-to-end graceful restart with confirmed response.
 
 ### v0.21.8 — Defer control socket binding in handoff mode (#99)
 
