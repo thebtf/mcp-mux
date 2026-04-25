@@ -62,14 +62,15 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.21.9
+go get github.com/thebtf/mcp-mux/muxcore@v0.21.10
 ```
 
-v0.21.9 fixes graceful-restart response race — `HandleGracefulRestart`
-called `go d.Shutdown()` before the control handler wrote the response.
-On Windows AF_UNIX, data was lost in the kernel buffer on process exit.
-Fix: `HandleGracefulRestart` returns an `afterResponse func()` callback;
-control server writes response first, then invokes the callback.
+v0.21.10 fixes conn flush before shutdown — explicit `conn.Close()` before
+`afterFn()` ensures response reaches the caller. v0.21.9's `afterFn`
+callback was necessary but insufficient: `defer conn.Close()` never ran
+because Shutdown completed instantly post-handoff, killing the goroutine.
+
+v0.21.9 introduced the `afterResponse func()` callback pattern.
 **Breaking:** `DaemonHandler.HandleGracefulRestart` signature gains a
 third return value `afterResponse func()`.
 
@@ -212,6 +213,12 @@ Key changes:
 1. **DaemonControlPath** — if you call it directly, add name parameter: `DaemonControlPath(baseDir, "engram")`
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
+
+### v0.21.10 — Flush conn before afterFn (#99)
+
+- v0.21.9 `afterFn` ran after `writeResponse` but `defer conn.Close()` never executed — post-handoff Shutdown completes instantly (0 owners), process exits, goroutine killed, kernel send buffer lost.
+- **Fix:** explicit `conn.Close()` before `afterFn()` in `handleConn`. 1 line.
+- **No breaking changes.** No API changes.
 
 ### v0.21.9 — Defer shutdown until after response write (#99)
 
