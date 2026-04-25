@@ -91,6 +91,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	s.writeResponse(conn, resp)
 	if afterFn != nil {
+		conn.Close()
 		afterFn()
 	}
 }
