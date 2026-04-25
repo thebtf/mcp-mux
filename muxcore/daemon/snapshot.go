@@ -197,6 +197,13 @@ func (d *Daemon) loadSnapshot() int {
 			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 		}
 
+		// During handoff, predecessor's owner sockets may still be active.
+		// Unconditionally remove them — predecessor is shutting down (#101).
+		if isHandoffMode() {
+			os.Remove(ipcPath)
+			os.Remove(controlPath)
+		}
+
 		var o *owner.Owner
 		reattachedFromHandoff := false
 
