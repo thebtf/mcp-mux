@@ -88,15 +88,23 @@ func (s *Server) handleConn(conn net.Conn) {
 	// clientDeadline). Set the write deadline only after dispatch returns so
 	// it bounds only the I/O write, not handler execution.
 	resp, afterFn := s.dispatch(req)
+	hasAfterFn := afterFn != nil
+	if hasAfterFn {
+		s.logger.Printf("control.handleConn cmd=%s phase=dispatch_done", req.Cmd)
+	}
 	if err := conn.SetWriteDeadline(time.Now().Add(clientDeadline)); err != nil {
 		s.logger.Printf("control: set write deadline: %v", err)
 		return
 	}
 	s.writeResponse(conn, resp)
-	if afterFn != nil {
+	if hasAfterFn {
+		s.logger.Printf("control.handleConn cmd=%s phase=write_done", req.Cmd)
 		conn.Close()
+		s.logger.Printf("control.handleConn cmd=%s phase=close_done", req.Cmd)
 		time.Sleep(50 * time.Millisecond)
+		s.logger.Printf("control.handleConn cmd=%s phase=calling_afterFn", req.Cmd)
 		afterFn()
+		s.logger.Printf("control.handleConn cmd=%s phase=afterFn_returned", req.Cmd)
 	}
 }
 
@@ -212,7 +220,9 @@ func (s *Server) Close() {
 	s.mu.Unlock()
 
 	s.listener.Close()
+	s.logger.Printf("control.Close: listener closed, waiting for active handlers...")
 	s.wg.Wait()
+	s.logger.Printf("control.Close: all handlers done")
 }
 
 // SocketPath returns the socket path from the underlying listener.
