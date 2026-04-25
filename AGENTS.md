@@ -62,16 +62,19 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.21.7
+go get github.com/thebtf/mcp-mux/muxcore@v0.21.8
 ```
 
+v0.21.8 fixes control socket conflict during graceful restart handoff.
+`daemon.New()` bound the control socket before `loadSnapshot`/`tryHandoffReceive`
+— predecessor still held it → successor failed → handoff never reached.
+Fix: in handoff mode (env vars present), `loadSnapshot`/`tryHandoffReceive`
+run first, then `retryControlBind` polls until predecessor releases the
+socket. Non-handoff path unchanged. No breaking API changes.
+
 v0.21.7 fixes `spawnSuccessor` hardcoding `"--daemon"` instead of using
-`engine.Config.DaemonFlag` (default `"--muxcore-daemon"`). The mismatch
-caused the successor process to enter client mode during graceful restart,
-so `tryHandoffReceive` never ran and handoff always fell back to
-kill-and-respawn after 30s. No breaking API changes — `daemon.Config`
-gains an additive `DaemonFlag string` field; empty value preserves
-pre-v0.21.7 behavior.
+`engine.Config.DaemonFlag` (default `"--muxcore-daemon"`). Both v0.21.7
+and v0.21.8 are required for graceful restart to work end-to-end.
 
 v0.20.4 is the multi-user hardening release on top of v0.20.3. Closes the
 2 HIGH security findings from the 2026-04-18 PRC audit (S8-001 token
@@ -201,6 +204,13 @@ Key changes:
 1. **DaemonControlPath** — if you call it directly, add name parameter: `DaemonControlPath(baseDir, "engram")`
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
+
+### v0.21.8 — Defer control socket binding in handoff mode (#99)
+
+- `daemon.New()` bound the control socket **before** `loadSnapshot`/`tryHandoffReceive`. Predecessor still holds socket → successor fails → handoff never reached → 30s fallback.
+- **Fix:** in handoff mode (env vars present), `loadSnapshot`/`tryHandoffReceive` run first, then `retryControlBind` polls (500ms × 60 = 30s max) until predecessor releases the socket via `Shutdown()`. Non-handoff path unchanged.
+- **No breaking changes.** Internal constructor reordering only.
+- **Combined with v0.21.7:** both fixes required for graceful restart to work end-to-end (v0.21.7 = DaemonFlag, v0.21.8 = socket ordering).
 
 ### v0.21.7 — Fix spawnSuccessor DaemonFlag hardcode (#99)
 
