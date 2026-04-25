@@ -62,7 +62,7 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.21.10
+go get github.com/thebtf/mcp-mux/muxcore@v0.21.19
 ```
 
 v0.21.10 fixes conn flush before shutdown — explicit `conn.Close()` before
