@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -1456,5 +1458,58 @@ func TestFindSharedOwner_NoArgsJoinCollision(t *testing.T) {
 	}
 	if match.ServerID != seedSID {
 		t.Errorf("findSharedOwner returned serverID %q, want %q", match.ServerID, seedSID)
+	}
+}
+
+// TestDaemonNew_HandoffMode_DefersControlBind verifies that when handoff env
+// vars are present, daemon.New() defers control socket binding and retries
+// after the predecessor releases it. Regression test for #99 follow-up.
+func TestDaemonNew_HandoffMode_DefersControlBind(t *testing.T) {
+	// Override retry params for fast test.
+	origInterval := controlBindRetryInterval
+	origAttempts := controlBindMaxAttempts
+	controlBindRetryInterval = 50 * time.Millisecond
+	controlBindMaxAttempts = 20
+	t.Cleanup(func() {
+		controlBindRetryInterval = origInterval
+		controlBindMaxAttempts = origAttempts
+	})
+
+	ctlPath := shortSocketPath(t, "handoff-defer.ctl.sock")
+
+	// Simulate predecessor holding the control socket.
+	predecessor, err := net.Listen("unix", ctlPath)
+	if err != nil {
+		t.Fatalf("listen predecessor socket: %v", err)
+	}
+
+	// Release predecessor after a short delay (simulating Shutdown).
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		predecessor.Close()
+		os.Remove(ctlPath)
+	}()
+
+	// Set handoff env vars so daemon.New enters handoff mode.
+	tokenPath := filepath.Join(t.TempDir(), "handoff-token")
+	os.WriteFile(tokenPath, []byte("test-token"), 0600)
+	socketPath := filepath.Join(t.TempDir(), "handoff.sock")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenPath)
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", socketPath)
+
+	d, err := New(Config{
+		ControlPath: ctlPath,
+		GracePeriod: 1 * time.Second,
+		IdleTimeout: 5 * time.Second,
+		Logger:      testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("New() in handoff mode: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	// Verify the daemon bound the control socket successfully.
+	if d.ctlSrv == nil {
+		t.Error("ctlSrv is nil — control socket was not bound")
 	}
 }

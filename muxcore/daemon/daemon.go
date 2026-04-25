@@ -257,26 +257,39 @@ func New(cfg Config) (*Daemon, error) {
 		EventHook: d.supervisorEventHook,
 	})
 
-	ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
-	if err != nil {
-		// Cancel supervisor context to prevent leak of the context goroutine.
-		supCancel()
-		return nil, fmt.Errorf("daemon: control server: %w", err)
+	// In handoff mode (successor during graceful restart), loadSnapshot must run
+	// BEFORE binding the control socket — the predecessor still holds it.
+	// After tryHandoffReceive completes, the predecessor starts Shutdown() which
+	// releases the socket. retryControlBind polls until it becomes available.
+	if isHandoffMode() && !cfg.SkipSnapshot {
+		if restored := d.loadSnapshot(); restored > 0 {
+			logger.Printf("startup: restored %d owners from snapshot (handoff mode)", restored)
+		}
+		if err := d.retryControlBind(cfg.ControlPath); err != nil {
+			supCancel()
+			return nil, fmt.Errorf("daemon: %w", err)
+		}
+		logger.Printf("daemon started, control socket: %s (handoff mode)", cfg.ControlPath)
+	} else {
+		ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
+		if err != nil {
+			// Cancel supervisor context to prevent leak of the context goroutine.
+			supCancel()
+			return nil, fmt.Errorf("daemon: control server: %w", err)
+		}
+		d.ctlSrv = ctlSrv
+		logger.Printf("daemon started, control socket: %s", cfg.ControlPath)
+		if !cfg.SkipSnapshot {
+			if restored := d.loadSnapshot(); restored > 0 {
+				logger.Printf("startup: restored %d owners from snapshot", restored)
+			}
+		}
 	}
-	d.ctlSrv = ctlSrv
-	logger.Printf("daemon started, control socket: %s", cfg.ControlPath)
 
 	// Clean up stale socket files from previous daemon crashes/kills.
 	cleaned := cleanStaleSockets(logger)
 	if cleaned > 0 {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
-	}
-
-	// Load snapshot from graceful restart (if available)
-	if !cfg.SkipSnapshot {
-		if restored := d.loadSnapshot(); restored > 0 {
-			logger.Printf("startup: restored %d owners from snapshot", restored)
-		}
 	}
 
 	// Start supervisor AFTER snapshot load so restored owners are already added.
@@ -991,6 +1004,47 @@ var handoffAcceptTimeout = 30 * time.Second
 // protocol exchange (hello/ready/transfer/done/ack sequence). Declared as var
 // for the same test-override reason as handoffAcceptTimeout.
 var handoffTotalTimeout = 30 * time.Second
+
+// controlBindRetryInterval is the pause between successive control-socket bind
+// attempts in handoff mode. Declared as var so tests can shrink it.
+var controlBindRetryInterval = 500 * time.Millisecond
+
+// controlBindMaxAttempts caps the number of bind retries in handoff mode.
+// At 500 ms/attempt this gives up to 30 s for the predecessor to release the
+// socket. Declared as var so tests can override it.
+var controlBindMaxAttempts = 60
+
+// isHandoffMode reports whether this process was launched as a successor daemon
+// during a graceful restart. Both env vars must be present for the handoff
+// protocol to proceed.
+func isHandoffMode() bool {
+	return os.Getenv("MCPMUX_HANDOFF_TOKEN_PATH") != "" &&
+		os.Getenv("MCPMUX_HANDOFF_SOCKET") != ""
+}
+
+// retryControlBind polls for the control socket to become available and binds
+// it. Used in handoff mode where the predecessor daemon still holds the socket
+// when the successor starts. The predecessor calls Shutdown() after completing
+// the handoff protocol, releasing the socket file; retryControlBind detects
+// that and completes the bind.
+func (d *Daemon) retryControlBind(socketPath string) error {
+	for i := range controlBindMaxAttempts {
+		ctlSrv, err := control.NewServer(socketPath, d, d.logger)
+		if err == nil {
+			d.ctlSrv = ctlSrv
+			if i > 0 {
+				d.logger.Printf("handoff.control_bind retries=%d", i)
+			}
+			return nil
+		}
+		if i == 0 {
+			d.logger.Printf("handoff.control_bind_wait predecessor still holds socket, retrying...")
+		}
+		time.Sleep(controlBindRetryInterval)
+	}
+	return fmt.Errorf("daemon: control socket not available after %d attempts (%v)",
+		controlBindMaxAttempts, time.Duration(controlBindMaxAttempts)*controlBindRetryInterval)
+}
 
 // spawnSuccessor forks the current binary as a detached background process,
 // injecting MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET so the successor
