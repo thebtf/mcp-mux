@@ -101,7 +101,6 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.logger.Printf("control.handleConn cmd=%s phase=write_done", req.Cmd)
 		conn.Close()
 		s.logger.Printf("control.handleConn cmd=%s phase=close_done", req.Cmd)
-		time.Sleep(50 * time.Millisecond)
 		s.logger.Printf("control.handleConn cmd=%s phase=calling_afterFn", req.Cmd)
 		afterFn()
 		s.logger.Printf("control.handleConn cmd=%s phase=afterFn_returned", req.Cmd)
