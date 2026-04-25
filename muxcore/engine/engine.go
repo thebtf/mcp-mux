@@ -268,14 +268,11 @@ func (e *MuxEngine) ControlSocketPath() string {
 func (e *MuxEngine) runDaemon(ctx context.Context) error {
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 
-	// Clean stale control socket from a previous daemon crash.
-	// On Windows, Unix domain socket files persist after process death.
-	// Without cleanup, the new daemon cannot bind → startup fails.
-	if _, err := os.Stat(ctlPath); err == nil {
-		if !isDaemonRunning(ctlPath) {
-			os.Remove(ctlPath)
-			e.logger.Printf("removed stale daemon socket: %s", ctlPath)
-		}
+	// Remove stale control socket from a previous daemon crash (#100).
+	// On Windows, AF_UNIX socket files persist after process death.
+	// Unconditional: if we reached runDaemon, this process IS the daemon.
+	if err := os.Remove(ctlPath); err == nil {
+		e.logger.Printf("removed stale daemon socket: %s", ctlPath)
 	}
 
 	// SessionHandler takes priority over Handler when both are set.
