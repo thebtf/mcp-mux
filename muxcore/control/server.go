@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
@@ -95,12 +94,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	s.writeResponse(conn, resp)
 	if afterFn != nil {
-		if uc, ok := conn.(*net.UnixConn); ok {
-			uc.CloseWrite()
-		}
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		io.Copy(io.Discard, conn)
 		conn.Close()
+		time.Sleep(50 * time.Millisecond)
 		afterFn()
 	}
 }
