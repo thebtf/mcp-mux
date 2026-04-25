@@ -567,10 +567,10 @@ func runUpgrade(restart bool) {
 		// Graceful restart: serialize state snapshot, then shutdown.
 		// New daemon loads snapshot → owners restored with cached state → instant reconnect.
 		fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
-		resp, err := control.Send(ctlPath, control.Request{
+		resp, err := control.SendWithTimeout(ctlPath, control.Request{
 			Cmd:            "graceful-restart",
 			DrainTimeoutMs: 30000,
-		})
+		}, 60*time.Second)
 		if err != nil {
 			// Fallback to plain shutdown if graceful-restart not supported (old daemon)
 			fmt.Fprintf(os.Stderr, "  graceful-restart not available: %v, falling back to shutdown\n", err)
