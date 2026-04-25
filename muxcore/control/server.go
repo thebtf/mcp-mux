@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -22,6 +23,7 @@ type Server struct {
 	mu     sync.Mutex
 	closed bool
 	done   chan struct{}
+	wg     sync.WaitGroup
 }
 
 // NewServer creates and starts a control server at the given socket path.
@@ -57,11 +59,13 @@ func (s *Server) acceptLoop() {
 			continue
 		}
 
+		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
 }
 
 func (s *Server) handleConn(conn net.Conn) {
+	defer s.wg.Done()
 	defer conn.Close()
 
 	// Bound the read phase: a silent/malicious client cannot hold the goroutine
@@ -91,6 +95,8 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	s.writeResponse(conn, resp)
 	if afterFn != nil {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		io.Copy(io.Discard, conn)
 		conn.Close()
 		afterFn()
 	}
@@ -208,6 +214,7 @@ func (s *Server) Close() {
 	s.mu.Unlock()
 
 	s.listener.Close()
+	s.wg.Wait()
 }
 
 // SocketPath returns the socket path from the underlying listener.
