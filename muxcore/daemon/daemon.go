@@ -1217,6 +1217,16 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), erro
 		return "", nil, fmt.Errorf("snapshot: %w", err)
 	}
 
+	// Tag owners BEFORE attemptHandoff. collectHandoffUpstreams (inside
+	// attemptHandoff) detaches owners → supervisor fires termination events
+	// → event hook acquires d.mu. Tagging after attemptHandoff deadlocks
+	// because this goroutine also needs d.mu (#99).
+	d.mu.Lock()
+	for _, entry := range d.owners {
+		entry.terminationHint = HintPlannedHandoff
+	}
+	d.mu.Unlock()
+
 	// Attempt FD-passing handoff. Every identifiable failure mode routes through
 	// the fallback log line; callers never see a handoff error — FR-8 is silent
 	// to the control-plane caller (it still gets a valid snapshot path).
@@ -1224,19 +1234,6 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), erro
 		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
-
-	// Tag every live owner with HintPlannedHandoff before shutdown so the
-	// supervisor event hook classifies their terminations as
-	// TermPlannedHandoff rather than the generic TermOperatorStop/clean-exit
-	// default. Applies on both the successful handoff path (FDs already
-	// detached) and the FR-8 fallback path (kill-and-respawn) — in both
-	// cases the teardown is operator-initiated as part of a graceful
-	// restart, which is the semantics HintPlannedHandoff captures.
-	d.mu.Lock()
-	for _, entry := range d.owners {
-		entry.terminationHint = HintPlannedHandoff
-	}
-	d.mu.Unlock()
 
 	return snapshotPath, func() { go d.Shutdown() }, nil
 }
