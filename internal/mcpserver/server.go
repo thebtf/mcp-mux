@@ -77,7 +77,7 @@ func (s *Server) daemonCtlPath() string {
 	if s.DaemonCtlPath != "" {
 		return s.DaemonCtlPath
 	}
-	return serverid.DaemonControlPath(s.BaseDir, "mcp-mux")
+	return serverid.DaemonControlPath(s.BaseDir, s.engineName())
 }
 
 // NewServer creates a new MCP control server.
@@ -518,8 +518,14 @@ func (s *Server) resolveOwner(serverID, name string) (control.OwnerInfo, error) 
 	}
 
 	resp, err := control.Send(s.daemonCtlPath(), control.Request{Cmd: "list_owners"})
-	if err != nil || !resp.OK || resp.Data == nil {
+	if err != nil {
 		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon not reachable: %v", err)
+	}
+	if !resp.OK {
+		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon error: %s", resp.Message)
+	}
+	if resp.Data == nil {
+		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon returned empty list_owners response")
 	}
 	var listResp control.ListOwnersResponse
 	if err := json.Unmarshal(resp.Data, &listResp); err != nil {
@@ -633,7 +639,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 
 	// Reject restart when requests are in-flight unless force is set
 	if owner.Pending > 0 && !params.Force {
-		s.sendToolError(id, fmt.Sprintf("server %s has %d pending requests. Use force=true to kill them, or wait for completion.", owner.ServerID[:8], owner.Pending))
+		s.sendToolError(id, fmt.Sprintf("server %.8s has %d pending requests. Use force=true to kill them, or wait for completion.", owner.ServerID, owner.Pending))
 		return
 	}
 

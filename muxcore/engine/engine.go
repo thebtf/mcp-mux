@@ -385,6 +385,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		Token:          token,
 		Reconnect:      reconnectFn,
 		StdinEOFPolicy: e.cfg.StdinEOFPolicy,
+		EnginePrefix:   e.cfg.Name,
 		Logger:         e.logger,
 	})
 }
