@@ -46,7 +46,7 @@ func (h *refreshTestHandler) HandleListOwners(control.Request) (control.ListOwne
 }
 
 func TestRefreshTokenViaDaemon(t *testing.T) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", "mcp-mux")
 	_ = os.Remove(ctlPath)
 	t.Cleanup(func() { _ = os.Remove(ctlPath) })
 
@@ -70,7 +70,7 @@ func TestRefreshTokenViaDaemon(t *testing.T) {
 }
 
 func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", "mcp-mux")
 	_ = os.Remove(ctlPath)
 	t.Cleanup(func() { _ = os.Remove(ctlPath) })
 
@@ -88,7 +88,7 @@ func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
 }
 
 func TestRefreshTokenViaDaemonUnknownToken(t *testing.T) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", "mcp-mux")
 	_ = os.Remove(ctlPath)
 	t.Cleanup(func() { _ = os.Remove(ctlPath) })
 

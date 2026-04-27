@@ -31,14 +31,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
+
+// engineName is the stable identifier for this binary's daemon/owner namespace.
+// All serverid path helpers use this so every socket, lock, and control file
+// is scoped to mcp-mux and cannot collide with other engines (e.g. aimux).
+const engineName = "mcp-mux"
 
 func main() {
 	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
@@ -109,8 +114,8 @@ func main() {
 	command := args[0]
 	cmdArgs := args[1:]
 	sid := serverid.GenerateContextKey(mode, command, cmdArgs, nil, cwd)
-	ipcPath := serverid.IPCPath(sid, "")
-	controlPath := serverid.ControlPath(sid, "")
+	ipcPath := serverid.IPCPath("", engineName, sid)
+	controlPath := serverid.ControlPath("", engineName, sid)
 
 	// Log to stderr (CC captures) + optionally to file for debugging shim issues.
 	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
@@ -353,7 +358,7 @@ func runServe() {
 
 func runStop(drainTimeout time.Duration, force bool) {
 	// Try stopping daemon first
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Stopping daemon...")
 		drainMs := int(drainTimeout.Milliseconds())
@@ -541,7 +546,7 @@ func runUpgrade(restart bool) {
 	upgrade.CleanStale(exe)
 
 	// Report
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
@@ -549,7 +554,7 @@ func runUpgrade(restart bool) {
 		// Acquire daemon lock BEFORE sending graceful-restart.
 		// This prevents shims from spawning a competing daemon during the restart window.
 		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
-		lockPath := serverid.DaemonLockPath("", "")
+		lockPath := serverid.DaemonLockPath("", engineName)
 		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 		if lockErr == nil {
 			if flockErr := lockFile(lock); flockErr == nil {
@@ -680,7 +685,7 @@ func collectEnv() map[string]string {
 
 func runStatus() {
 	// Try daemon first
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	if isDaemonRunning(ctlPath) {
 		resp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
 		if err == nil && resp.OK && resp.Data != nil {
