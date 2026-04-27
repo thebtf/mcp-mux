@@ -1337,6 +1337,7 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	return map[string]any{
 		"daemon":                          true,
+		"pid":                             os.Getpid(),
 		"owner_count":                     len(servers), // excludes placeholders still being created
 		"servers":                         servers,
 		"owner_idle_timeout":              d.ownerIdleTimeout.String(),

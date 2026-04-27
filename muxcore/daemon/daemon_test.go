@@ -170,6 +170,15 @@ func TestDaemonSpawnAndStatus(t *testing.T) {
 	if !status["daemon"].(bool) {
 		t.Error("status daemon should be true")
 	}
+	// Status must expose daemon pid for external tooling (mux_list,
+	// mcp-launcher kill-reconnect, monitoring) — see issue #104.
+	pid, ok := status["pid"].(int)
+	if !ok {
+		t.Fatalf("status pid type = %T, want int", status["pid"])
+	}
+	if pid != os.Getpid() {
+		t.Errorf("status pid = %d, want %d", pid, os.Getpid())
+	}
 }
 
 func TestDaemonSpawnReusesExisting(t *testing.T) {
