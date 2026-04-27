@@ -18,7 +18,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T001 — `serverid` signature change
 
 **Files:** `muxcore/serverid/serverid.go`, `muxcore/serverid/serverid_test.go`
-**Status:** PENDING
+**Status:** [X] DONE — commit `ba9d4a2` on 2026-04-27
 **Depends on:** —
 **Effort:** S (mechanical)
 **Mode hint:** Sonnet
@@ -30,8 +30,8 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 
 ### T002 — `daemon.Config` extension + Daemon name field
 
-**Files:** `muxcore/daemon/daemon.go`, `muxcore/daemon/daemon_test.go`
-**Status:** PENDING
+**Files:** `muxcore/daemon/daemon.go`, `muxcore/daemon/daemon_test.go`, `muxcore/daemon/snapshot.go`, `muxcore/owner/resilient_client.go`
+**Status:** [X] DONE — commit `8ce3d10` on 2026-04-27
 **Depends on:** T001
 **Effort:** S
 **Mode hint:** Sonnet
@@ -46,7 +46,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T003 — `engine.Config.Name` validation + propagation
 
 **Files:** `muxcore/engine/engine.go`, `muxcore/engine/engine_test.go`
-**Status:** PENDING
+**Status:** [X] DONE — commit `a36ddf2` on 2026-04-27
 **Depends on:** T002
 **Effort:** S
 **Mode hint:** Sonnet
@@ -59,7 +59,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T004 — `OwnerEntry.Persistent` hydration in SessionHandler topology
 
 **Files:** `muxcore/daemon/daemon.go` (Spawn path), `muxcore/daemon/daemon_persistent_test.go` (new)
-**Status:** PENDING
+**Status:** [X] DONE — commit `ce5ffc7` on 2026-04-27
 **Depends on:** T002, T003
 **Effort:** S
 **Mode hint:** Sonnet
@@ -71,7 +71,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T005 — Reaper regression test (R2 from #103)
 
 **Files:** `muxcore/daemon/reaper_test.go`
-**Status:** PENDING
+**Status:** [X] DONE — commit `6fe6958` on 2026-04-27
 **Depends on:** T004
 **Effort:** S
 **Mode hint:** Sonnet
@@ -81,8 +81,8 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 
 ### T006 — `daemon.HandleListOwners` control RPC
 
-**Files:** `muxcore/control/protocol.go`, `muxcore/daemon/daemon.go`, `muxcore/control/server.go`, `muxcore/daemon/list_owners_test.go` (new)
-**Status:** PENDING
+**Files:** `muxcore/control/protocol.go`, `muxcore/daemon/daemon.go`, `muxcore/control/server.go`, `muxcore/daemon/list_owners_test.go` (new), `muxcore/control/control_test.go` (mock stub), `cmd/mcp-mux/daemon_test.go` (mock stub)
+**Status:** [X] DONE — commit `fa6bae2` on 2026-04-27
 **Depends on:** T002
 **Effort:** M
 **Mode hint:** Sonnet
@@ -94,7 +94,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 
 ### T007 — GATE: muxcore Phase 1 green
 
-**Status:** PENDING
+**Status:** [X] DONE — verified 2026-04-27 (19 pkg PASS, vet clean, smoke `smoke-muxd.ctl.sock` confirmed, no `mcp-mux-` legacy sockets)
 **Depends on:** T001, T002, T003, T004, T005, T006
 **Acceptance:**
 - `go test ./muxcore/...` green on Windows + Linux (CI).
@@ -107,7 +107,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T008 — `cmd/mcp-mux` adopts new `serverid` signatures + explicit Name
 
 **Files:** `cmd/mcp-mux/main.go`, `cmd/mcp-mux/daemon.go`, `cmd/mcp-mux/daemon_test.go`, `testdata/smoke_isolated.go`
-**Status:** PENDING
+**Status:** [X] DONE — commit `8ba8090` on 2026-04-27 (orchestrator fixed const-import order glitch from initial agent output)
 **Depends on:** T007
 **Effort:** S
 **Mode hint:** Sonnet
@@ -120,7 +120,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T009 — `cmd/mcp-mux` removes `"mcp-mux-"` literal in shim filter sites
 
 **Files:** `cmd/mcp-mux/main.go` (lines 396, 401, 438, 446, 710, 715, 742, 749)
-**Status:** PENDING
+**Status:** [X] DONE — commit `c4fa44f` on 2026-04-27 (11 sites → const ownSocketPrefix)
 **Depends on:** T008
 **Effort:** S
 **Mode hint:** Sonnet
@@ -133,7 +133,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T010 — `internal/mcpserver` `toolMuxList` switches to daemon RPC
 
 **Files:** `internal/mcpserver/server.go`, `internal/mcpserver/server_test.go`
-**Status:** PENDING
+**Status:** [X] DONE — commit `2ea183a` on 2026-04-27
 **Depends on:** T006, T008
 **Effort:** M
 **Mode hint:** Codex
@@ -147,7 +147,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T011 — `internal/mcpserver` `toolMuxStop` and `toolMuxRestart` switch to daemon RPC
 
 **Files:** `internal/mcpserver/server.go`, `internal/mcpserver/server_test.go`
-**Status:** PENDING
+**Status:** [X] DONE — 2026-04-27 (daemon-authoritative owner resolution + foreign-id refusal tests)
 **Depends on:** T010
 **Effort:** M
 **Mode hint:** Codex
@@ -160,7 +160,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T012 — Cross-engine integration test
 
 **Files:** `internal/mcpserver/cross_engine_integration_test.go` (new)
-**Status:** PENDING
+**Status:** [X] DONE — commit `25ccee6` on 2026-04-27 (PASS in 0.06s; cross-engine bleed proven absent)
 **Depends on:** T010, T011
 **Effort:** M
 **Mode hint:** Codex
@@ -172,7 +172,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 
 ### T013 — GATE: mcp-mux Phase 2 green
 
-**Status:** PENDING
+**Status:** [X] DONE — verified 2026-04-27 (root: 2 pkg PASS + vet clean; muxcore: 19 pkg PASS + vet clean; manual workstation smoke deferred to T019)
 **Depends on:** T008, T009, T010, T011, T012
 **Acceptance:**
 - `go test ./...` green.
@@ -184,7 +184,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T014 — AGENTS.md v0.22.0 entry
 
 **Files:** `AGENTS.md`
-**Status:** PENDING
+**Status:** [X] DONE — commit `34baa9c` on 2026-04-27
 **Depends on:** T013
 **Effort:** S
 **Mode hint:** Sonnet
@@ -197,7 +197,7 @@ CR-scoped, dependency-ordered, every task has acceptance criteria. GATE tasks se
 ### T015 — README audit pass
 
 **Files:** `README.md`, `README.ru.md`
-**Status:** PENDING
+**Status:** [X] DONE — folded into commit `34baa9c` (audit found no `mcp-mux-` literal mentions and no Persistent details to update; no-op)
 **Depends on:** T013
 **Effort:** S
 **Mode hint:** Sonnet

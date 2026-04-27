@@ -231,7 +231,7 @@ After the change, `grep -rn '"mcp-mux-"' --include='*.go'` outside of (a) `serve
 ## Dependencies
 
 - Go 1.25+ (existing project requirement).
-- mcp-launcher commit `d8f9f7c` or later, with `persist` mode, available locally for NFR-2 R3 regression.
+- mcp-launcher commit `d8f9f7c` or later, with `persist` mode, available locally for NFR-2 R3 regression. Repo `D:\Dev\mcp-launcher` is in-house tooling — modifications permitted when R3 verification needs new modes or assertions.
 - aimux v5.0.2 source available for adoption verification (Phase 3 of deployment).
 - engram source available for adoption verification (Phase 3 of deployment).
 - Existing CI green on master at the start of the arc.

@@ -96,7 +96,7 @@ Key invariant: **socket file prefix = engine.Name**. Three coexisting consumers 
 
 - **L0 (serverid):** pure functions, no I/O. Owns the FS namespace contract. No engine/daemon imports. After change, every path-producing function takes the engine name explicitly — no defaulting to `"mcp-mux"` inside L0 (defaulting is L2's responsibility).
 - **L1 (daemon, owner):** in-memory state for the live process. Crosses to FS via `serverid` only. Adopts new signatures.
-- **L2 (engine):** consumer-facing facade. Owns `Config` validation and default substitution (e.g. empty `Name` → error or default to binary name via `os.Args[0]`). Does NOT leak `serverid` into consumer API.
+- **L2 (engine):** consumer-facing facade. Owns `Config` validation: empty `Name` returns a hard error from `engine.New` (resolved in Q1, see clarifications/2026-04-27-auto.md and FR-2). No silent defaulting. Does NOT leak `serverid` into the consumer API.
 - **L3 (consumers):** import `muxcore` at the engine level, never reach into `serverid` directly. Existing direct calls in `cmd/mcp-mux/daemon.go` (`serverid.DaemonControlPath("", "")`) are L3-violations and get refactored: pass an explicit `Name="mcp-mux"`.
 
 ## 6. Data Flow

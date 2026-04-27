@@ -688,7 +688,6 @@ func TestMuxRestartNoIDOrName(t *testing.T) {
 
 func TestMuxStopNoMatchingServer(t *testing.T) {
 	baseDir := shortBaseDir(t, "mcpmux-stopnomatch-")
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
 	daemonCtlPath := filepath.Join(baseDir, "stopnomatch-muxd.ctl.sock")
 	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
@@ -714,6 +713,9 @@ func TestMuxStopNoMatchingServer(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected isError=true for non-existent server name")
 	}
+	if len(result.Content) == 0 {
+		t.Fatal("expected non-empty content for tool error")
+	}
 	if !strings.Contains(result.Content[0].Text, "no server matching 'nonexistent-server-xyzzy-12345' found") {
 		t.Fatalf("expected no-match error, got: %s", result.Content[0].Text)
 	}
@@ -721,7 +723,6 @@ func TestMuxStopNoMatchingServer(t *testing.T) {
 
 func TestMuxRestartNoMatchingServer(t *testing.T) {
 	baseDir := shortBaseDir(t, "mcpmux-restartnomatch-")
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
 	daemonCtlPath := filepath.Join(baseDir, "restartnomatch-muxd.ctl.sock")
 	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
@@ -745,6 +746,9 @@ func TestMuxRestartNoMatchingServer(t *testing.T) {
 	unmarshalResult(t, resp, &result)
 	if !result.IsError {
 		t.Fatal("expected isError=true for non-existent server name in mux_restart")
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("expected non-empty content for tool error")
 	}
 	if !strings.Contains(result.Content[0].Text, "no server matching 'nonexistent-server-xyzzy-12345' found") {
 		t.Fatalf("expected no-match error, got: %s", result.Content[0].Text)
@@ -830,27 +834,47 @@ func startFakeControlServer(t *testing.T, dir, serverID string, status map[strin
 	return srv
 }
 
-// fakeDaemonHandler implements control.DaemonHandler for testing the list_owners path.
+// fakeDaemonHandler implements control.DaemonHandler for testing the list_owners path
+// and any other DaemonHandler entry the test wants to drive. All response fields are
+// caller-configurable so tests can assert specific behaviour per entry point — no
+// "not implemented" stubs (would violate the no-stubs guideline and make later test
+// authors chase nil panics).
 type fakeDaemonHandler struct {
 	fakeHandler
 	listOwnersResp control.ListOwnersResponse
 	listOwnersErr  error
+
+	spawnServerID string
+	spawnCtlPath  string
+	spawnLockPath string
+	spawnErr      error
+
+	removeErr error
+
+	restartMsg   string
+	restartAfter func()
+	restartErr   error
+
+	refreshToken string
+	refreshErr   error
+
+	reconnectErr error
 }
 
 func (h *fakeDaemonHandler) HandleSpawn(_ control.Request) (string, string, string, error) {
-	return "", "", "", fmt.Errorf("not implemented")
+	return h.spawnServerID, h.spawnCtlPath, h.spawnLockPath, h.spawnErr
 }
 func (h *fakeDaemonHandler) HandleRemove(_ string) error {
-	return fmt.Errorf("not implemented")
+	return h.removeErr
 }
 func (h *fakeDaemonHandler) HandleGracefulRestart(_ int) (string, func(), error) {
-	return "", nil, fmt.Errorf("not implemented")
+	return h.restartMsg, h.restartAfter, h.restartErr
 }
 func (h *fakeDaemonHandler) HandleRefreshSessionToken(_ string) (string, error) {
-	return "", fmt.Errorf("not implemented")
+	return h.refreshToken, h.refreshErr
 }
 func (h *fakeDaemonHandler) HandleReconnectGiveUp(_ string) error {
-	return fmt.Errorf("not implemented")
+	return h.reconnectErr
 }
 func (h *fakeDaemonHandler) HandleListOwners(_ control.Request) (control.ListOwnersResponse, error) {
 	return h.listOwnersResp, h.listOwnersErr
@@ -1198,6 +1222,9 @@ func TestMuxRestartNoCommandInfo(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected error when server has no command info")
 	}
+	if len(result.Content) == 0 {
+		t.Fatal("expected non-empty content for tool error")
+	}
 	if !strings.Contains(result.Content[0].Text, "no command info") {
 		t.Errorf("expected 'no command info' error, got: %s", result.Content[0].Text)
 	}
@@ -1318,6 +1345,9 @@ func TestMuxRestartRefusesForeignID(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected isError=true for foreign server_id")
 	}
+	if len(result.Content) == 0 {
+		t.Fatal("expected non-empty content for tool error")
+	}
 	if !strings.Contains(result.Content[0].Text, "not managed by this mcp-mux daemon") {
 		t.Errorf("expected 'not managed by this mcp-mux daemon', got: %s", result.Content[0].Text)
 	}
@@ -1349,6 +1379,9 @@ func TestMuxStopRefusesForeignID(t *testing.T) {
 	unmarshalResult(t, resp, &result)
 	if !result.IsError {
 		t.Fatal("expected isError=true for foreign server_id in mux_stop")
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("expected non-empty content for tool error")
 	}
 	if !strings.Contains(result.Content[0].Text, "not managed by this mcp-mux daemon") {
 		t.Errorf("expected 'not managed by this mcp-mux daemon', got: %s", result.Content[0].Text)

@@ -47,6 +47,17 @@ type Server struct {
 	logger        *log.Logger
 	BaseDir       string // directory scanned for .ctl.sock files; empty = os.TempDir()
 	DaemonCtlPath string // injectable daemon control path; empty = serverid.DaemonControlPath("", "mcp-mux")
+	EngineName    string // engine name used to build owner socket paths; empty = "mcp-mux"
+}
+
+// engineName returns the engine name used to build owner socket paths.
+// Defaults to "mcp-mux" when EngineName is unset; tests for foreign engines
+// (e.g. cross_engine_integration_test.go) override this to "aimux-test".
+func (s *Server) engineName() string {
+	if s.EngineName != "" {
+		return s.EngineName
+	}
+	return "mcp-mux"
 }
 
 // socketDir returns the directory to scan for .ctl.sock files.
@@ -535,10 +546,27 @@ func (s *Server) resolveOwner(serverID, name string) (control.OwnerInfo, error) 
 	if len(matches) == 0 {
 		return control.OwnerInfo{}, fmt.Errorf("no server matching '%s' found", name)
 	}
-	if len(matches) > 1 {
-		return control.OwnerInfo{}, fmt.Errorf("'%s' matches %d servers — use server_id", name, len(matches))
+
+	// Project-scoping: prefer matches that belong to this session's cwd. Restored
+	// from pre-T011 resolveServerID — the regression was flagged by Gemini on PR #105.
+	myCwd, _ := os.Getwd()
+	myCwd = strings.ToLower(filepath.Clean(myCwd))
+	var myCwdMatches []control.OwnerInfo
+	for _, m := range matches {
+		if s.ownerInfoHasCwd(m, myCwd) {
+			myCwdMatches = append(myCwdMatches, m)
+		}
 	}
-	return matches[0], nil
+	if len(myCwdMatches) == 1 {
+		return myCwdMatches[0], nil
+	}
+	if len(myCwdMatches) > 1 {
+		return control.OwnerInfo{}, fmt.Errorf("'%s' matches %d servers in this project — use server_id", name, len(myCwdMatches))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return control.OwnerInfo{}, fmt.Errorf("'%s' matches %d servers (none in this project) — be more specific or use server_id", name, len(matches))
 }
 
 // toolMuxStop stops a specific server.
@@ -559,7 +587,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", owner.ServerID))
+	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
 
 	drainMs := 30000
 	timeout := 35 * time.Second
@@ -609,7 +637,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", owner.ServerID))
+	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
 
 	// Stop the server
 	drainMs := 30000
@@ -632,7 +660,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify the old owner is gone
-	if ipc.IsAvailable(filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.sock", owner.ServerID))) {
+	if ipc.IsAvailable(serverid.IPCPath(s.socketDir(), s.engineName(), owner.ServerID)) {
 		// Still alive — drain might be in progress, wait more
 		time.Sleep(2 * time.Second)
 	}
@@ -649,6 +677,12 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	daemonArgs = append(daemonArgs, owner.Args...)
 
 	cmd := exec.Command(exe, daemonArgs...)
+	// Preserve the original owner's cwd so the respawn lands in the same project
+	// directory. Critical for servers with relative config paths or per-project
+	// state. Empty owner.Cwd → fall through to control-server's default cwd.
+	if owner.Cwd != "" {
+		cmd.Dir = owner.Cwd
+	}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
