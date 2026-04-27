@@ -24,8 +24,8 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
-	"github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/session"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
@@ -86,10 +86,10 @@ type OwnerEntry struct {
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
 type Daemon struct {
-	mu          sync.RWMutex
-	owners      map[string]*OwnerEntry
-	logger      *log.Logger
-	ctlSrv      *control.Server
+	mu             sync.RWMutex
+	owners         map[string]*OwnerEntry
+	logger         *log.Logger
+	ctlSrv         *control.Server
 	done           chan struct{}
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	sessionHandler muxcore.SessionHandler
@@ -99,16 +99,16 @@ type Daemon struct {
 	// tokens, no busy declarations) before the reaper removes it. Default 10m.
 	// Overridable per-owner via x-mux.idleTimeout capability.
 	ownerIdleTimeout time.Duration
-	idleTimeout      time.Duration // daemon-level auto-exit timeout (zero owners + zero sessions)
+	idleTimeout      time.Duration                        // daemon-level auto-exit timeout (zero owners + zero sessions)
 	templateCache    map[string]mcpsnapshot.OwnerSnapshot // command+args key → cached init data
 
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
 	// supervisor.Remove in daemon.Remove. Context-cancelled on Shutdown.
-	supervisor    *suture.Supervisor
-	supervisorCtx context.Context
+	supervisor       *suture.Supervisor
+	supervisorCtx    context.Context
 	supervisorCancel context.CancelFunc
-	supervisorErr <-chan error
+	supervisorErr    <-chan error
 
 	// crashTracker records recent crash timestamps per command key.
 	// Used by Spawn() as a circuit breaker: if an upstream crashes too many
@@ -122,7 +122,8 @@ type Daemon struct {
 
 	// name is the engine instance name from Config.Name (e.g. "mcp-mux", "aimux").
 	// Used to scope IPC socket file paths and stale-socket cleanup to this engine.
-	name string
+	name       string
+	persistent bool
 
 	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
 	// gate in spawnOnce tore down a registered owner because IsReachable()
@@ -259,6 +260,7 @@ func New(cfg Config) (*Daemon, error) {
 		sessionHandler:   cfg.SessionHandler,
 		daemonFlag:       daemonFlag,
 		name:             cfg.Name,
+		persistent:       cfg.Persistent,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -897,6 +899,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout
 	placeholder.serviceToken = serviceToken
+	placeholder.Persistent = d.persistent
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
@@ -1333,16 +1336,16 @@ func (d *Daemon) HandleStatus() map[string]any {
 	}
 
 	return map[string]any{
-		"daemon":                   true,
-		"owner_count":              len(servers), // excludes placeholders still being created
-		"servers":                  servers,
-		"owner_idle_timeout":       d.ownerIdleTimeout.String(),
-		"idle_timeout":             d.idleTimeout.String(),
-		"shim_reconnect_refreshed": d.reconnectRefreshed.Load(),
+		"daemon":                          true,
+		"owner_count":                     len(servers), // excludes placeholders still being created
+		"servers":                         servers,
+		"owner_idle_timeout":              d.ownerIdleTimeout.String(),
+		"idle_timeout":                    d.idleTimeout.String(),
+		"shim_reconnect_refreshed":        d.reconnectRefreshed.Load(),
 		"shim_reconnect_fallback_spawned": d.reconnectFallbackSpawned.Load(),
-		"shim_reconnect_gave_up":   d.reconnectGaveUp.Load(),
-		"zombie_detections_spawn":  d.zombieDetectedSpawn,
-		"zombie_detections_restore": d.zombieDetectedRestore,
+		"shim_reconnect_gave_up":          d.reconnectGaveUp.Load(),
+		"zombie_detections_spawn":         d.zombieDetectedSpawn,
+		"zombie_detections_restore":       d.zombieDetectedRestore,
 		"handoff": map[string]any{
 			"attempted":   d.stats.attempted.Load(),
 			"transferred": d.stats.transferred.Load(),
