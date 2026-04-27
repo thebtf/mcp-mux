@@ -501,8 +501,14 @@ func TestPromptsGetInvalidParams(t *testing.T) {
 
 func TestOwnerInfoHasCwd(t *testing.T) {
 	s := &Server{logger: log.New(os.Stderr, "", 0)}
-	cwd := strings.ToLower(filepath.Clean(os.TempDir()))
-	otherCwd := strings.ToLower(filepath.Clean(filepath.Join(os.TempDir(), "..", "mcp-mux-owner-has-cwd-other")))
+	cwd := normalizeCwd(os.TempDir())
+	otherCwd := normalizeCwd(filepath.Join(os.TempDir(), "..", "mcp-mux-owner-has-cwd-other"))
+	matchingCwd := normalizeCwd(os.TempDir())
+
+	// caseInsensitiveMatch: on Windows the engine deliberately lowercases
+	// paths (NTFS is case-preserving but case-insensitive). On Linux/macOS
+	// path comparison is byte-exact, so /TMP and /tmp are distinct projects.
+	caseInsensitiveMatch := runtime.GOOS == "windows"
 
 	tests := []struct {
 		name string
@@ -510,13 +516,23 @@ func TestOwnerInfoHasCwd(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "primary cwd matches case-insensitively",
+			name: "primary cwd matches when case-folded (Windows only)",
 			info: control.OwnerInfo{Cwd: strings.ToUpper(cwd)},
+			want: caseInsensitiveMatch,
+		},
+		{
+			name: "cwd_set match relies on case-folding (Windows only)",
+			info: control.OwnerInfo{Cwd: otherCwd, CwdSet: []string{otherCwd, strings.ToUpper(cwd)}},
+			want: caseInsensitiveMatch,
+		},
+		{
+			name: "primary cwd matches exactly",
+			info: control.OwnerInfo{Cwd: matchingCwd},
 			want: true,
 		},
 		{
-			name: "cwd_set contains match",
-			info: control.OwnerInfo{Cwd: otherCwd, CwdSet: []string{otherCwd, strings.ToUpper(cwd)}},
+			name: "cwd_set contains exact match",
+			info: control.OwnerInfo{Cwd: otherCwd, CwdSet: []string{otherCwd, matchingCwd}},
 			want: true,
 		},
 		{
