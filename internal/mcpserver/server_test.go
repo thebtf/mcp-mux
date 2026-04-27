@@ -482,43 +482,43 @@ func TestPromptsGetInvalidParams(t *testing.T) {
 	}
 }
 
-func TestOwnerHasCwd(t *testing.T) {
+func TestOwnerInfoHasCwd(t *testing.T) {
 	s := &Server{logger: log.New(os.Stderr, "", 0)}
 	cwd := strings.ToLower(filepath.Clean(os.TempDir()))
 	otherCwd := strings.ToLower(filepath.Clean(filepath.Join(os.TempDir(), "..", "mcp-mux-owner-has-cwd-other")))
 
 	tests := []struct {
 		name string
-		data map[string]any
+		info control.OwnerInfo
 		want bool
 	}{
 		{
 			name: "primary cwd matches case-insensitively",
-			data: map[string]any{"cwd": strings.ToUpper(cwd)},
+			info: control.OwnerInfo{Cwd: strings.ToUpper(cwd)},
 			want: true,
 		},
 		{
 			name: "cwd_set contains match",
-			data: map[string]any{"cwd_set": []any{otherCwd, strings.ToUpper(cwd)}},
+			info: control.OwnerInfo{Cwd: otherCwd, CwdSet: []string{otherCwd, strings.ToUpper(cwd)}},
 			want: true,
 		},
 		{
 			name: "missing cwd and cwd_set",
-			data: map[string]any{},
+			info: control.OwnerInfo{},
 			want: false,
 		},
 		{
 			name: "primary cwd does not match",
-			data: map[string]any{"cwd": otherCwd},
+			info: control.OwnerInfo{Cwd: otherCwd},
 			want: false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := s.ownerHasCwd(tc.data, cwd)
+			got := s.ownerInfoHasCwd(tc.info, cwd)
 			if got != tc.want {
-				t.Fatalf("ownerHasCwd() = %v, want %v", got, tc.want)
+				t.Fatalf("ownerInfoHasCwd() = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -604,7 +604,7 @@ func TestMuxStopNoIDOrName(t *testing.T) {
 	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
-	// Call mux_stop with empty server_id and name — resolveServerID returns an error.
+	// Call mux_stop with empty server_id and name — resolveOwner returns an error.
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"mux_stop","arguments":{}}}`)
 	line := readLine(t, clientR)
 	resp := parseResponse(t, line)
@@ -652,7 +652,7 @@ func TestMuxRestartNoIDOrName(t *testing.T) {
 	clientW, clientR, _, _ := newTestServer(t)
 	defer clientW.Close()
 
-	// Call mux_restart with empty arguments — resolveServerID returns an error.
+	// Call mux_restart with empty arguments — resolveOwner returns an error.
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"mux_restart","arguments":{}}}`)
 	line := readLine(t, clientR)
 	resp := parseResponse(t, line)
@@ -670,7 +670,16 @@ func TestMuxRestartNoIDOrName(t *testing.T) {
 }
 
 func TestMuxStopNoMatchingServer(t *testing.T) {
-	clientW, clientR, _, _ := newTestServer(t)
+	baseDir, err := os.MkdirTemp("", "mcpmux-stopnomatch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	daemonCtlPath := filepath.Join(baseDir, "stopnomatch-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
 	defer clientW.Close()
 
 	// Call mux_stop with a name that matches no running server.
@@ -691,10 +700,22 @@ func TestMuxStopNoMatchingServer(t *testing.T) {
 	if !result.IsError {
 		t.Fatal("expected isError=true for non-existent server name")
 	}
+	if !strings.Contains(result.Content[0].Text, "no server matching 'nonexistent-server-xyzzy-12345' found") {
+		t.Fatalf("expected no-match error, got: %s", result.Content[0].Text)
+	}
 }
 
 func TestMuxRestartNoMatchingServer(t *testing.T) {
-	clientW, clientR, _, _ := newTestServer(t)
+	baseDir, err := os.MkdirTemp("", "mcpmux-restartnomatch-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	daemonCtlPath := filepath.Join(baseDir, "restartnomatch-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
 	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":35,"method":"tools/call","params":{"name":"mux_restart","arguments":{"name":"nonexistent-server-xyzzy-12345"}}}`)
@@ -706,10 +727,16 @@ func TestMuxRestartNoMatchingServer(t *testing.T) {
 
 	var result struct {
 		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
 	}
 	unmarshalResult(t, resp, &result)
 	if !result.IsError {
 		t.Fatal("expected isError=true for non-existent server name in mux_restart")
+	}
+	if !strings.Contains(result.Content[0].Text, "no server matching 'nonexistent-server-xyzzy-12345' found") {
+		t.Fatalf("expected no-match error, got: %s", result.Content[0].Text)
 	}
 }
 
@@ -832,6 +859,24 @@ func startFakeDaemonControlServer(t *testing.T, socketPath string, resp control.
 	}
 	t.Cleanup(func() { srv.Close() })
 	return srv
+}
+
+// newTestServerFull creates a Server with both DaemonCtlPath and BaseDir set.
+func newTestServerFull(t *testing.T, daemonCtlPath, baseDir string) (clientW io.WriteCloser, clientR io.Reader, done chan error) {
+	t.Helper()
+	serverR, clientW := io.Pipe()
+	clientR, serverW := io.Pipe()
+	logger := log.New(os.Stderr, "[mcpserver-test] ", 0)
+	srv := NewServer(serverR, serverW, logger)
+	srv.BaseDir = baseDir
+	srv.DaemonCtlPath = daemonCtlPath
+	done = make(chan error, 1)
+	go func() {
+		err := srv.Run()
+		serverW.Close()
+		done <- err
+	}()
+	return clientW, clientR, done
 }
 
 // newTestServerWithDaemonCtl creates a Server with a specific DaemonCtlPath for testing.
@@ -963,15 +1008,25 @@ func TestMuxListVerbose(t *testing.T) {
 
 func TestMuxStopWithFakeServer(t *testing.T) {
 	sid := "ddee112233445566"
-	clientW, clientR, _, baseDir := newTestServer(t)
-	defer clientW.Close()
+	baseDir, err := os.MkdirTemp("", "mcpmux-stop-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
-	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command":       "uvx",
-		"args":          []string{"stop-test"},
-		"session_count": 1,
-		"mux_version":   "test",
+	daemonCtlPath := filepath.Join(baseDir, "test-stop-muxd.ctl.sock")
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{ServerID: sid, Command: "uvx", Args: []string{"stop-test"}, Sessions: 1},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+	startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command": "uvx", "args": []string{"stop-test"},
 	})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
 
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"mux_stop","arguments":{"server_id":"%s"}}}`, sid))
@@ -997,15 +1052,25 @@ func TestMuxStopWithFakeServer(t *testing.T) {
 
 func TestMuxStopByName(t *testing.T) {
 	sid := "aabb112233445566"
-	clientW, clientR, _, baseDir := newTestServer(t)
-	defer clientW.Close()
+	baseDir, err := os.MkdirTemp("", "mcpmux-stopname-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
-	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command":       "uvx",
-		"args":          []string{"unique-name-for-stop-test"},
-		"session_count": 1,
-		"mux_version":   "test",
+	daemonCtlPath := filepath.Join(baseDir, "test-stopname-muxd.ctl.sock")
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{ServerID: sid, Command: "uvx", Args: []string{"unique-name-for-stop-test"}, Sessions: 1},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+	startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command": "uvx", "args": []string{"unique-name-for-stop-test"},
 	})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"mux_stop","arguments":{"name":"unique-name-for-stop-test"}}}`)
 	line := readLine(t, clientR)
@@ -1027,17 +1092,25 @@ func TestMuxStopByName(t *testing.T) {
 
 func TestMuxRestartWithFakeServer(t *testing.T) {
 	sid := "ffaa112233445566"
-	clientW, clientR, _, baseDir := newTestServer(t)
-	defer clientW.Close()
+	baseDir, err := os.MkdirTemp("", "mcpmux-restart-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
-	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command":       "uvx",
-		"args":          []string{"restart-test"},
-		"session_count": 1,
-		"mux_version":   "test",
+	daemonCtlPath := filepath.Join(baseDir, "test-restart-muxd.ctl.sock")
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{ServerID: sid, Command: "uvx", Args: []string{"restart-test"}, Sessions: 1},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+	startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command": "uvx", "args": []string{"restart-test"},
 	})
 
-	// force=true to skip drain wait
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"mux_restart","arguments":{"server_id":"%s","force":true}}}`, sid))
 	line := readLine(t, clientR)
@@ -1053,16 +1126,13 @@ func TestMuxRestartWithFakeServer(t *testing.T) {
 	}
 	unmarshalResult(t, resp, &result)
 
-	// Restart may succeed (spawn new daemon) or fail at exec.Command
-	// Either way, it should have gotten past status+shutdown successfully
 	if result.IsError {
-		// Accept failure at exec.Command stage — still covers status+shutdown paths
 		text := result.Content[0].Text
-		if strings.Contains(text, "unreachable") || strings.Contains(text, "no command info") {
-			t.Fatalf("restart failed too early (status/shutdown stage): %s", text)
+		if strings.Contains(text, "unreachable") || strings.Contains(text, "no command info") || strings.Contains(text, "not managed") {
+			t.Fatalf("restart failed at resolve stage: %s", text)
 		}
+		// exec.Command spawn failure is acceptable in test environment
 	} else {
-		// Success — includes "restarted:" prefix
 		if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "restarted") {
 			t.Errorf("expected 'restarted' in success message, got: %v", result.Content)
 		}
@@ -1071,15 +1141,25 @@ func TestMuxRestartWithFakeServer(t *testing.T) {
 
 func TestMuxRestartByName(t *testing.T) {
 	sid := "ffbb112233445566"
-	clientW, clientR, _, baseDir := newTestServer(t)
-	defer clientW.Close()
+	baseDir, err := os.MkdirTemp("", "mcpmux-restartname-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
-	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command":       "node",
-		"args":          []string{"unique-restart-by-name-test.js"},
-		"session_count": 1,
-		"mux_version":   "test",
+	daemonCtlPath := filepath.Join(baseDir, "test-restartname-muxd.ctl.sock")
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{ServerID: sid, Command: "node", Args: []string{"unique-restart-by-name-test.js"}, Sessions: 1},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+	startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command": "node", "args": []string{"unique-restart-by-name-test.js"},
 	})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
 
 	sendLine(t, clientW, `{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"mux_restart","arguments":{"name":"unique-restart-by-name-test","force":true}}}`)
 	line := readLine(t, clientR)
@@ -1095,10 +1175,9 @@ func TestMuxRestartByName(t *testing.T) {
 	}
 	unmarshalResult(t, resp, &result)
 
-	// Accept both success and exec.Command failure — covers resolveServerID+status+shutdown paths
 	if result.IsError {
 		text := result.Content[0].Text
-		if strings.Contains(text, "no server matching") {
+		if strings.Contains(text, "no server matching") || strings.Contains(text, "not managed") {
 			t.Fatalf("restart by name failed to resolve: %s", text)
 		}
 	}
@@ -1106,14 +1185,23 @@ func TestMuxRestartByName(t *testing.T) {
 
 func TestMuxRestartNoCommandInfo(t *testing.T) {
 	sid := "ffcc112233445566"
-	clientW, clientR, _, baseDir := newTestServer(t)
-	defer clientW.Close()
+	baseDir, err := os.MkdirTemp("", "mcpmux-nocmd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
-	// Status returns no command field — should fail with "has no command info"
-	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
-		"session_count": 1,
-		"mux_version":   "test",
-	})
+	daemonCtlPath := filepath.Join(baseDir, "test-nocmd-muxd.ctl.sock")
+	// Daemon returns owner with empty Command
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{ServerID: sid, Command: "", Args: nil, Sessions: 1},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
 
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"mux_restart","arguments":{"server_id":"%s"}}}`, sid))
@@ -1139,15 +1227,25 @@ func TestMuxRestartNoCommandInfo(t *testing.T) {
 
 func TestMuxStopForce(t *testing.T) {
 	sid := "ffdd112233445566"
-	clientW, clientR, _, baseDir := newTestServer(t)
-	defer clientW.Close()
+	baseDir, err := os.MkdirTemp("", "mcpmux-stopforce-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
-	_ = startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command":       "uvx",
-		"args":          []string{"force-stop-test"},
-		"session_count": 1,
-		"mux_version":   "test",
+	daemonCtlPath := filepath.Join(baseDir, "test-stopforce-muxd.ctl.sock")
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{ServerID: sid, Command: "uvx", Args: []string{"force-stop-test"}, Sessions: 1},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+	startFakeControlServer(t, baseDir, sid, map[string]any{
+		"command": "uvx", "args": []string{"force-stop-test"},
 	})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
 
 	sendLine(t, clientW, fmt.Sprintf(
 		`{"jsonrpc":"2.0","id":48,"method":"tools/call","params":{"name":"mux_stop","arguments":{"server_id":"%s","force":true}}}`, sid))
@@ -1219,5 +1317,78 @@ func TestMuxListFilterByCwd(t *testing.T) {
 	}
 	if strings.Contains(text, "other-server") {
 		t.Errorf("filtered mux_list should NOT contain other-server, got: %s", text)
+	}
+}
+
+func TestMuxRestartRefusesForeignID(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "mcpmux-foreign-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	daemonCtlPath := filepath.Join(baseDir, "foreign-test-muxd.ctl.sock")
+	// Empty owners list — any server_id is foreign
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	foreignID := "deadbeef12345678"
+	sendLine(t, clientW, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"mux_restart","arguments":{"server_id":"%s"}}}`, foreignID))
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 50)
+	assertNoError(t, resp)
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if !result.IsError {
+		t.Fatal("expected isError=true for foreign server_id")
+	}
+	if !strings.Contains(result.Content[0].Text, "not managed by this mcp-mux daemon") {
+		t.Errorf("expected 'not managed by this mcp-mux daemon', got: %s", result.Content[0].Text)
+	}
+}
+
+func TestMuxStopRefusesForeignID(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "mcpmux-stopforeign-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	daemonCtlPath := filepath.Join(baseDir, "stopforeign-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	foreignID := "deadbeef87654321"
+	sendLine(t, clientW, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"mux_stop","arguments":{"server_id":"%s"}}}`, foreignID))
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 51)
+	assertNoError(t, resp)
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if !result.IsError {
+		t.Fatal("expected isError=true for foreign server_id in mux_stop")
+	}
+	if !strings.Contains(result.Content[0].Text, "not managed by this mcp-mux daemon") {
+		t.Errorf("expected 'not managed by this mcp-mux daemon', got: %s", result.Content[0].Text)
 	}
 }

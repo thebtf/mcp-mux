@@ -58,12 +58,15 @@ func (s *Server) socketDir() string {
 }
 
 // daemonCtlPath returns the path to the mcp-mux daemon control socket.
-// Uses DaemonCtlPath if set, otherwise defaults to the standard path.
+// Uses DaemonCtlPath if set, otherwise composes from BaseDir + engine name "mcp-mux".
+// BaseDir matters for test isolation: a test fixture sets BaseDir to a temp dir so
+// daemonCtlPath() points at a non-existent socket inside that temp dir, not at the
+// real workstation daemon's socket in os.TempDir().
 func (s *Server) daemonCtlPath() string {
 	if s.DaemonCtlPath != "" {
 		return s.DaemonCtlPath
 	}
-	return serverid.DaemonControlPath("", "mcp-mux")
+	return serverid.DaemonControlPath(s.BaseDir, "mcp-mux")
 }
 
 // NewServer creates a new MCP control server.
@@ -483,27 +486,6 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	s.sendToolResult(id, string(result))
 }
 
-// ownerHasCwd checks if an owner's status data contains a given cwd in its cwdSet or primary cwd.
-func (s *Server) ownerHasCwd(data map[string]any, cwd string) bool {
-	// Check primary cwd
-	if primary, ok := data["cwd"].(string); ok {
-		if strings.ToLower(filepath.Clean(primary)) == cwd {
-			return true
-		}
-	}
-	// Check cwdSet (array of strings in status response)
-	if cwdSet, ok := data["cwd_set"].([]any); ok {
-		for _, c := range cwdSet {
-			if cs, ok := c.(string); ok {
-				if strings.ToLower(filepath.Clean(cs)) == cwd {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 // ownerInfoHasCwd checks if an OwnerInfo matches a given cwd (case-insensitive, cleaned paths).
 func (s *Server) ownerInfoHasCwd(info control.OwnerInfo, cwd string) bool {
 	if strings.ToLower(filepath.Clean(info.Cwd)) == cwd {
@@ -515,6 +497,48 @@ func (s *Server) ownerInfoHasCwd(info control.OwnerInfo, cwd string) bool {
 		}
 	}
 	return false
+}
+
+// resolveOwner resolves a server by exact server_id or name substring via the daemon's list_owners RPC.
+// Returns the matching OwnerInfo or an error if not found or daemon unavailable.
+func (s *Server) resolveOwner(serverID, name string) (control.OwnerInfo, error) {
+	if serverID == "" && name == "" {
+		return control.OwnerInfo{}, fmt.Errorf("provide either server_id or name")
+	}
+
+	resp, err := control.Send(s.daemonCtlPath(), control.Request{Cmd: "list_owners"})
+	if err != nil || !resp.OK || resp.Data == nil {
+		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon not reachable: %v", err)
+	}
+	var listResp control.ListOwnersResponse
+	if err := json.Unmarshal(resp.Data, &listResp); err != nil {
+		return control.OwnerInfo{}, fmt.Errorf("invalid list_owners response: %v", err)
+	}
+
+	if serverID != "" {
+		for _, owner := range listResp.Owners {
+			if owner.ServerID == serverID {
+				return owner, nil
+			}
+		}
+		return control.OwnerInfo{}, fmt.Errorf("server_id %s is not managed by this mcp-mux daemon", serverID)
+	}
+
+	needle := strings.ToLower(name)
+	var matches []control.OwnerInfo
+	for _, owner := range listResp.Owners {
+		haystack := strings.ToLower(owner.Command + " " + strings.Join(owner.Args, " "))
+		if strings.Contains(haystack, needle) {
+			matches = append(matches, owner)
+		}
+	}
+	if len(matches) == 0 {
+		return control.OwnerInfo{}, fmt.Errorf("no server matching '%s' found", name)
+	}
+	if len(matches) > 1 {
+		return control.OwnerInfo{}, fmt.Errorf("'%s' matches %d servers — use server_id", name, len(matches))
+	}
+	return matches[0], nil
 }
 
 // toolMuxStop stops a specific server.
@@ -529,13 +553,13 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	serverID, err := s.resolveServerID(params.ServerID, params.Name)
+	owner, err := s.resolveOwner(params.ServerID, params.Name)
 	if err != nil {
 		s.sendToolError(id, err.Error())
 		return
 	}
 
-	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
+	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", owner.ServerID))
 
 	drainMs := 30000
 	timeout := 35 * time.Second
@@ -549,7 +573,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		DrainTimeoutMs: drainMs,
 	}, timeout)
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", serverID, err))
+		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
 		return
 	}
 
@@ -568,36 +592,24 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	serverID, err := s.resolveServerID(params.ServerID, params.Name)
+	owner, err := s.resolveOwner(params.ServerID, params.Name)
 	if err != nil {
 		s.sendToolError(id, err.Error())
 		return
 	}
 
-	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
-
-	// Get current status to learn command + args
-	statusResp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
-	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("server %s unreachable: %v", serverID, err))
-		return
-	}
-
-	var statusData struct {
-		Command         string   `json:"command"`
-		Args            []string `json:"args"`
-		PendingRequests int      `json:"pending_requests"`
-	}
-	if err := json.Unmarshal(statusResp.Data, &statusData); err != nil || statusData.Command == "" {
-		s.sendToolError(id, fmt.Sprintf("server %s has no command info", serverID))
+	if owner.Command == "" {
+		s.sendToolError(id, fmt.Sprintf("server %s has no command info", owner.ServerID))
 		return
 	}
 
 	// Reject restart when requests are in-flight unless force is set
-	if statusData.PendingRequests > 0 && !params.Force {
-		s.sendToolError(id, fmt.Sprintf("server %s has %d pending requests. Use force=true to kill them, or wait for completion.", serverID[:8], statusData.PendingRequests))
+	if owner.Pending > 0 && !params.Force {
+		s.sendToolError(id, fmt.Sprintf("server %s has %d pending requests. Use force=true to kill them, or wait for completion.", owner.ServerID[:8], owner.Pending))
 		return
 	}
+
+	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", owner.ServerID))
 
 	// Stop the server
 	drainMs := 30000
@@ -612,7 +624,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		DrainTimeoutMs: drainMs,
 	}, timeout)
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", params.ServerID, err))
+		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
 		return
 	}
 
@@ -620,7 +632,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify the old owner is gone
-	if ipc.IsAvailable(filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.sock", params.ServerID))) {
+	if ipc.IsAvailable(filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.sock", owner.ServerID))) {
 		// Still alive — drain might be in progress, wait more
 		time.Sleep(2 * time.Second)
 	}
@@ -633,8 +645,8 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	}
 
 	daemonArgs := []string{"--daemon"}
-	daemonArgs = append(daemonArgs, statusData.Command)
-	daemonArgs = append(daemonArgs, statusData.Args...)
+	daemonArgs = append(daemonArgs, owner.Command)
+	daemonArgs = append(daemonArgs, owner.Args...)
 
 	cmd := exec.Command(exe, daemonArgs...)
 	cmd.Stdin = nil
@@ -649,107 +661,10 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	go cmd.Wait()
 
 	warning := ""
-	if params.Force && statusData.PendingRequests > 0 {
-		warning = fmt.Sprintf("WARNING: force restart killed %d pending requests. ", statusData.PendingRequests)
+	if params.Force && owner.Pending > 0 {
+		warning = fmt.Sprintf("WARNING: force restart killed %d pending requests. ", owner.Pending)
 	}
 	s.sendToolResult(id, fmt.Sprintf("%srestarted: stopped (%s), new daemon PID %d", warning, stopResp.Message, cmd.Process.Pid))
-}
-
-// resolveServerID returns a server ID from either an explicit ID or a name substring match.
-// If name is provided, scans all running instances and matches against command+args (case-insensitive).
-// Prefers servers belonging to this CC session's project (by cwd).
-// Fails if neither is provided, or if name matches zero or multiple servers after cwd filtering.
-func (s *Server) resolveServerID(serverID, name string) (string, error) {
-	if serverID != "" {
-		return serverID, nil
-	}
-	if name == "" {
-		return "", fmt.Errorf("provide either server_id or name")
-	}
-
-	myCwd, _ := os.Getwd()
-	myCwd = strings.ToLower(filepath.Clean(myCwd))
-	name = strings.ToLower(name)
-	tmpDir := s.socketDir()
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		return "", fmt.Errorf("read temp dir: %v", err)
-	}
-
-	type candidate struct {
-		sid    string
-		hasCwd bool // true if this server belongs to our cwd
-	}
-	var candidates []candidate
-	for _, entry := range entries {
-		fname := entry.Name()
-		if !strings.HasPrefix(fname, "mcp-mux-") || !strings.HasSuffix(fname, ".ctl.sock") {
-			continue
-		}
-
-		path := filepath.Join(tmpDir, fname)
-		sid := strings.TrimPrefix(strings.TrimSuffix(fname, ".ctl.sock"), "mcp-mux-")
-
-		resp, err := control.Send(path, control.Request{Cmd: "status"})
-		if err != nil || !resp.OK || resp.Data == nil {
-			continue
-		}
-
-		var data map[string]any
-		if err := json.Unmarshal(resp.Data, &data); err != nil {
-			continue
-		}
-
-		// Match against command + args concatenated
-		cmd, ok := data["command"].(string)
-		if !ok {
-			s.logger.Printf("server %s status has invalid 'command' field, skipping", sid)
-			continue
-		}
-		var args []string
-		if rawArgs, ok := data["args"].([]any); ok {
-			for _, a := range rawArgs {
-				if as, ok := a.(string); ok {
-					args = append(args, as)
-				}
-			}
-		}
-		haystack := strings.ToLower(cmd + " " + strings.Join(args, " "))
-		if strings.Contains(haystack, name) {
-			candidates = append(candidates, candidate{
-				sid:    sid,
-				hasCwd: s.ownerHasCwd(data, myCwd),
-			})
-		}
-	}
-
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("no server matching '%s' found", name)
-	}
-
-	// Prefer servers belonging to this session's cwd
-	var myCwdMatches []string
-	var allMatches []string
-	for _, c := range candidates {
-		allMatches = append(allMatches, c.sid)
-		if c.hasCwd {
-			myCwdMatches = append(myCwdMatches, c.sid)
-		}
-	}
-
-	// If exactly one match in our cwd — use it (even if there are others)
-	if len(myCwdMatches) == 1 {
-		return myCwdMatches[0], nil
-	}
-	// If multiple in our cwd — still ambiguous
-	if len(myCwdMatches) > 1 {
-		return "", fmt.Errorf("'%s' matches %d servers in this project — use server_id", name, len(myCwdMatches))
-	}
-	// No cwd match — fall back to all matches
-	if len(allMatches) == 1 {
-		return allMatches[0], nil
-	}
-	return "", fmt.Errorf("'%s' matches %d servers (none in this project) — be more specific or use server_id", name, len(allMatches))
 }
 
 // --- JSON-RPC response helpers ---
