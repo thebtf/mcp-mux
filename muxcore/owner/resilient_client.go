@@ -66,6 +66,11 @@ type ResilientClientConfig struct {
 
 	ProbeGracePeriod time.Duration // default: 10s; 0 disables probe detection
 	Logger           *log.Logger
+
+	// EnginePrefix is the engine name used as the prefix in IPC socket filenames
+	// (e.g. "mcp-mux", "aimux"). When empty, defaults to "mcp-mux" for backward
+	// compatibility with pre-v0.22 callers that don't set it.
+	EnginePrefix string
 }
 
 // initCache stores the first initialize request and response for replay on reconnect.
@@ -464,7 +469,7 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				continue
 			}
 
-			rc.log.Printf("shim.reconnect.refresh_ok owner=%s", ownerPrefixFromIPCPath(res.path))
+			rc.log.Printf("shim.reconnect.refresh_ok owner=%s", rc.ownerPrefixFromIPCPath(res.path))
 			return conn, nil
 		}
 		if fallbackReason == "" {
@@ -565,10 +570,19 @@ func isUnknownTokenError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unknown token")
 }
 
-func ownerPrefixFromIPCPath(ipcPath string) string {
+// ownerPrefixFromIPCPath extracts the short server-ID prefix (up to 8 chars)
+// from an IPC socket path for use in log messages. Strips the engine prefix
+// from rc.cfg.EnginePrefix (defaulting to "mcp-mux" for backward compat).
+// Converted to method to avoid the hardcoded "mcp-mux-" literal — engine name
+// is now caller-supplied via ResilientClientConfig.EnginePrefix.
+func (rc *resilientClient) ownerPrefixFromIPCPath(ipcPath string) string {
+	enginePrefix := rc.cfg.EnginePrefix
+	if enginePrefix == "" {
+		enginePrefix = "mcp-mux"
+	}
 	base := filepath.Base(ipcPath)
 	base = strings.TrimSuffix(base, ".sock")
-	base = strings.TrimPrefix(base, "mcp-mux-")
+	base = strings.TrimPrefix(base, enginePrefix+"-")
 	if idx := strings.IndexByte(base, '.'); idx >= 0 {
 		base = base[:idx]
 	}

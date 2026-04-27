@@ -970,9 +970,14 @@ func TestFindSharedOwnerEnvFiltering(t *testing.T) {
 func TestCleanStaleSockets(t *testing.T) {
 	const staleSocketCount = 3
 
+	tmpDir := t.TempDir()
+	orig := cleanStaleSocketsDir
+	cleanStaleSocketsDir = tmpDir
+	t.Cleanup(func() { cleanStaleSocketsDir = orig })
+
 	paths := make([]string, 0, staleSocketCount)
 	for i := 0; i < staleSocketCount; i++ {
-		f, err := os.CreateTemp(os.TempDir(), "mcp-mux-*-test.ctl.sock")
+		f, err := os.CreateTemp(tmpDir, "mcp-mux-*-test.ctl.sock")
 		if err != nil {
 			t.Fatalf("CreateTemp() error: %v", err)
 		}
@@ -980,11 +985,10 @@ func TestCleanStaleSockets(t *testing.T) {
 		if err := f.Close(); err != nil {
 			t.Fatalf("Close() error: %v", err)
 		}
-		t.Cleanup(func() { os.Remove(path) })
 		paths = append(paths, path)
 	}
 
-	cleaned := cleanStaleSockets(testLogger(t))
+	cleaned := cleanStaleSockets("mcp-mux", testLogger(t))
 	if cleaned != staleSocketCount {
 		t.Fatalf("cleanStaleSockets() = %d, want %d", cleaned, staleSocketCount)
 	}
@@ -998,6 +1002,38 @@ func TestCleanStaleSockets(t *testing.T) {
 			t.Fatalf("Stat(%q) error = %v, want not exist", path, err)
 		}
 	}
+}
+
+// TestCleanStaleSocketsNameScope verifies that cleanStaleSockets scoped to
+// "aimux-test" does NOT remove sockets belonging to other engines ("mcp-mux").
+func TestCleanStaleSocketsNameScope(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Override the scan directory for this test.
+	orig := cleanStaleSocketsDir
+	cleanStaleSocketsDir = tmpDir
+	t.Cleanup(func() { cleanStaleSocketsDir = orig })
+
+	// Seed files: one owned by "aimux-test", one owned by "mcp-mux".
+	aimuxSocket := filepath.Join(tmpDir, "aimux-test-abc12345.ctl.sock")
+	mcpMuxSocket := filepath.Join(tmpDir, "mcp-mux-stale-1.ctl.sock")
+	if err := os.WriteFile(aimuxSocket, []byte("placeholder"), 0600); err != nil {
+		t.Fatalf("seed aimux socket: %v", err)
+	}
+	if err := os.WriteFile(mcpMuxSocket, []byte("placeholder"), 0600); err != nil {
+		t.Fatalf("seed mcp-mux socket: %v", err)
+	}
+
+	cleanStaleSockets("aimux-test", testLogger(t))
+
+	// The mcp-mux socket MUST NOT be removed — it belongs to a different engine.
+	if _, err := os.Stat(mcpMuxSocket); os.IsNotExist(err) {
+		t.Errorf("mcp-mux-stale-1.ctl.sock was removed by cleanStaleSockets(\"aimux-test\") — foreign-prefix isolation violated")
+	}
+	t.Logf("mcp-mux socket preserved: %v", func() bool {
+		_, err := os.Stat(mcpMuxSocket)
+		return err == nil
+	}())
 }
 
 func findSharedOwnerLocked(d *Daemon, command string, args []string, env map[string]string) *OwnerEntry {

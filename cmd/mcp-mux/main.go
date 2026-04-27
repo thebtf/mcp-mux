@@ -31,14 +31,23 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
+
+// engineName is the stable identifier for this binary's daemon/owner namespace.
+// All serverid path helpers use this so every socket, lock, and control file
+// is scoped to mcp-mux and cannot collide with other engines (e.g. aimux).
+const engineName = "mcp-mux"
+
+// ownSocketPrefix is the prefix for all temp socket/lock files owned by this engine.
+// Derived from engineName — single source of truth; use this constant, not the raw string.
+const ownSocketPrefix = engineName + "-"
 
 func main() {
 	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
@@ -109,8 +118,8 @@ func main() {
 	command := args[0]
 	cmdArgs := args[1:]
 	sid := serverid.GenerateContextKey(mode, command, cmdArgs, nil, cwd)
-	ipcPath := serverid.IPCPath(sid, "")
-	controlPath := serverid.ControlPath(sid, "")
+	ipcPath := serverid.IPCPath("", engineName, sid)
+	controlPath := serverid.ControlPath("", engineName, sid)
 
 	// Log to stderr (CC captures) + optionally to file for debugging shim issues.
 	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
@@ -269,8 +278,8 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 		// In isolated mode, embed PID into the server ID portion (before extension)
 		// so suffix matching (.sock, .ctl.sock) still works for stop/status commands.
 		pidSuffix := fmt.Sprintf("-%d", os.Getpid())
-		effectiveIPCPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.sock", sid, pidSuffix))
-		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.ctl.sock", sid, pidSuffix))
+		effectiveIPCPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s%s%s.sock", ownSocketPrefix, sid, pidSuffix))
+		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s%s%s.ctl.sock", ownSocketPrefix, sid, pidSuffix))
 	}
 
 	o, err := owner.NewOwner(owner.OwnerConfig{
@@ -353,7 +362,7 @@ func runServe() {
 
 func runStop(drainTimeout time.Duration, force bool) {
 	// Try stopping daemon first
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Stopping daemon...")
 		drainMs := int(drainTimeout.Milliseconds())
@@ -394,12 +403,12 @@ func runStop(drainTimeout time.Duration, force bool) {
 	// Phase 1: Stop instances with control sockets (new protocol)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".ctl.sock") {
 			continue
 		}
 
 		path := filepath.Join(tmpDir, name)
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), ownSocketPrefix)
 		shortID := id
 		if len(shortID) > 8 {
 			shortID = shortID[:8]
@@ -418,7 +427,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 		}, clientTimeout)
 		if err != nil {
 			_ = os.Remove(path)
-			dataPath := filepath.Join(tmpDir, fmt.Sprintf("mcp-mux-%s.sock", id))
+			dataPath := filepath.Join(tmpDir, fmt.Sprintf("%s%s.sock", ownSocketPrefix, id))
 			_ = os.Remove(dataPath)
 			stale++
 			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", shortID)
@@ -436,7 +445,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	// Phase 2: Fallback for old instances without control sockets
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
 		// Skip control sockets (already handled) and lock files
@@ -444,7 +453,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 			continue
 		}
 
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), ownSocketPrefix)
 		if handled[id] {
 			continue // already stopped via control socket
 		}
@@ -541,7 +550,7 @@ func runUpgrade(restart bool) {
 	upgrade.CleanStale(exe)
 
 	// Report
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
@@ -549,7 +558,7 @@ func runUpgrade(restart bool) {
 		// Acquire daemon lock BEFORE sending graceful-restart.
 		// This prevents shims from spawning a competing daemon during the restart window.
 		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
-		lockPath := serverid.DaemonLockPath("", "")
+		lockPath := serverid.DaemonLockPath("", engineName)
 		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 		if lockErr == nil {
 			if flockErr := lockFile(lock); flockErr == nil {
@@ -680,7 +689,7 @@ func collectEnv() map[string]string {
 
 func runStatus() {
 	// Try daemon first
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	if isDaemonRunning(ctlPath) {
 		resp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
 		if err == nil && resp.OK && resp.Data != nil {
@@ -708,12 +717,12 @@ func runStatus() {
 	// Phase 1: Query instances with control sockets (rich status)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".ctl.sock") {
 			continue
 		}
 
 		path := filepath.Join(tmpDir, name)
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), ownSocketPrefix)
 		shortID := id
 		if len(shortID) > 8 {
 			shortID = shortID[:8]
@@ -740,14 +749,14 @@ func runStatus() {
 	// Phase 2: Fallback for old instances (basic active/stale check)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
 		if strings.HasSuffix(name, ".ctl.sock") || strings.HasSuffix(name, ".lock") {
 			continue
 		}
 
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), ownSocketPrefix)
 		if handled[id] {
 			continue
 		}

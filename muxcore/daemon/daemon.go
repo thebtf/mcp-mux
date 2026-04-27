@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,8 +24,8 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
-	"github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/session"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
@@ -85,10 +86,10 @@ type OwnerEntry struct {
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
 type Daemon struct {
-	mu          sync.RWMutex
-	owners      map[string]*OwnerEntry
-	logger      *log.Logger
-	ctlSrv      *control.Server
+	mu             sync.RWMutex
+	owners         map[string]*OwnerEntry
+	logger         *log.Logger
+	ctlSrv         *control.Server
 	done           chan struct{}
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	sessionHandler muxcore.SessionHandler
@@ -98,16 +99,16 @@ type Daemon struct {
 	// tokens, no busy declarations) before the reaper removes it. Default 10m.
 	// Overridable per-owner via x-mux.idleTimeout capability.
 	ownerIdleTimeout time.Duration
-	idleTimeout      time.Duration // daemon-level auto-exit timeout (zero owners + zero sessions)
+	idleTimeout      time.Duration                        // daemon-level auto-exit timeout (zero owners + zero sessions)
 	templateCache    map[string]mcpsnapshot.OwnerSnapshot // command+args key → cached init data
 
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
 	// supervisor.Remove in daemon.Remove. Context-cancelled on Shutdown.
-	supervisor    *suture.Supervisor
-	supervisorCtx context.Context
+	supervisor       *suture.Supervisor
+	supervisorCtx    context.Context
 	supervisorCancel context.CancelFunc
-	supervisorErr <-chan error
+	supervisorErr    <-chan error
 
 	// crashTracker records recent crash timestamps per command key.
 	// Used by Spawn() as a circuit breaker: if an upstream crashes too many
@@ -118,6 +119,11 @@ type Daemon struct {
 	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
+
+	// name is the engine instance name from Config.Name (e.g. "mcp-mux", "aimux").
+	// Used to scope IPC socket file paths and stale-socket cleanup to this engine.
+	name       string
+	persistent bool
 
 	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
 	// gate in spawnOnce tore down a registered owner because IsReachable()
@@ -200,6 +206,16 @@ type Config struct {
 	// If empty, defaults to "--daemon" for backward compatibility with
 	// pre-v0.21.7 callers that don't set it.
 	DaemonFlag string
+
+	// Name is the engine instance name (e.g. "mcp-mux", "aimux", "engram").
+	// Used to scope IPC socket file names and stale-socket cleanup to this
+	// engine only. Empty string is valid (library is pure); callers that want
+	// FS isolation across multiple engine types must set this.
+	Name string
+
+	// Persistent overrides per-owner Persistent detection. When true, all owners
+	// managed by this daemon are treated as persistent (not evicted on idle).
+	Persistent bool
 }
 
 var _ control.DaemonHandler = (*Daemon)(nil)
@@ -243,6 +259,8 @@ func New(cfg Config) (*Daemon, error) {
 		handlerFunc:      cfg.HandlerFunc,
 		sessionHandler:   cfg.SessionHandler,
 		daemonFlag:       daemonFlag,
+		name:             cfg.Name,
+		persistent:       cfg.Persistent,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -287,7 +305,7 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	// Clean up stale socket files from previous daemon crashes/kills.
-	cleaned := cleanStaleSockets(logger)
+	cleaned := cleanStaleSockets(d.name, logger)
 	if cleaned > 0 {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
 	}
@@ -461,10 +479,20 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	d.mu.Unlock()
 }
 
-// cleanStaleSockets removes mcp-mux-*.ctl.sock and mcp-mux-*.sock files from
-// the temp directory that are not reachable (leftover from daemon crash/kill).
-func cleanStaleSockets(logger *log.Logger) int {
-	tmpDir := os.TempDir()
+// cleanStaleSocketsDir overrides the directory scanned by cleanStaleSockets.
+// Zero value ("") means os.TempDir(). Override in tests to use a temp dir.
+var cleanStaleSocketsDir = ""
+
+// cleanStaleSockets removes engine-scoped *.ctl.sock and *.sock files from the
+// temp directory that are not reachable (leftover from daemon crash/kill).
+// Only files whose names start with engineName+"-" are considered; sockets
+// belonging to other engines are left untouched.
+func cleanStaleSockets(engineName string, logger *log.Logger) int {
+	prefix := engineName + "-"
+	tmpDir := cleanStaleSocketsDir
+	if tmpDir == "" {
+		tmpDir = os.TempDir()
+	}
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return 0
@@ -472,8 +500,13 @@ func cleanStaleSockets(logger *log.Logger) int {
 	cleaned := 0
 	for _, entry := range entries {
 		name := entry.Name()
-		// Match mcp-mux sockets (mcp-mux-*.sock) and engine daemon sockets (*-muxd.ctl.sock)
-		isMuxSocket := strings.HasPrefix(name, "mcp-mux-") && strings.HasSuffix(name, ".sock")
+		// Only consider sockets that belong to this engine (scoped by prefix).
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		// Match IPC data sockets (*-<id>.sock) and control sockets (*-<id>.ctl.sock
+		// and *-muxd.ctl.sock).
+		isMuxSocket := strings.HasSuffix(name, ".sock")
 		isDaemonSocket := strings.HasSuffix(name, "-muxd.ctl.sock")
 		if !isMuxSocket && !isDaemonSocket {
 			continue
@@ -750,7 +783,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	d.owners[sid] = placeholder
 	d.mu.Unlock()
 
-	ipcPath := serverid.IPCPath(sid, "")
+	ipcPath := serverid.IPCPath("", d.name, sid)
 
 	// Pass full session env to the owner. Shim-supplied vars WIN; daemon env
 	// fills gaps. Rationale: some shims are launched by tools that strip
@@ -775,7 +808,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
-	controlPath := serverid.ControlPath(sid, "")
+	controlPath := serverid.ControlPath("", d.name, sid)
 	ownerCfg := owner.OwnerConfig{
 		Command:        req.Command,
 		Args:           req.Args,
@@ -866,6 +899,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout
 	placeholder.serviceToken = serviceToken
+	placeholder.Persistent = d.persistent
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
@@ -1302,16 +1336,16 @@ func (d *Daemon) HandleStatus() map[string]any {
 	}
 
 	return map[string]any{
-		"daemon":                   true,
-		"owner_count":              len(servers), // excludes placeholders still being created
-		"servers":                  servers,
-		"owner_idle_timeout":       d.ownerIdleTimeout.String(),
-		"idle_timeout":             d.idleTimeout.String(),
-		"shim_reconnect_refreshed": d.reconnectRefreshed.Load(),
+		"daemon":                          true,
+		"owner_count":                     len(servers), // excludes placeholders still being created
+		"servers":                         servers,
+		"owner_idle_timeout":              d.ownerIdleTimeout.String(),
+		"idle_timeout":                    d.idleTimeout.String(),
+		"shim_reconnect_refreshed":        d.reconnectRefreshed.Load(),
 		"shim_reconnect_fallback_spawned": d.reconnectFallbackSpawned.Load(),
-		"shim_reconnect_gave_up":   d.reconnectGaveUp.Load(),
-		"zombie_detections_spawn":  d.zombieDetectedSpawn,
-		"zombie_detections_restore": d.zombieDetectedRestore,
+		"shim_reconnect_gave_up":          d.reconnectGaveUp.Load(),
+		"zombie_detections_spawn":         d.zombieDetectedSpawn,
+		"zombie_detections_restore":       d.zombieDetectedRestore,
 		"handoff": map[string]any{
 			"attempted":   d.stats.attempted.Load(),
 			"transferred": d.stats.transferred.Load(),
@@ -1319,6 +1353,91 @@ func (d *Daemon) HandleStatus() map[string]any {
 			"fallback":    d.stats.fallback.Load(),
 		},
 	}
+}
+
+// HandleListOwners returns a snapshot of all active owners, capped at 200 entries,
+// sorted by server_id ascending for deterministic output. Placeholder entries
+// (Owner == nil) are excluded. Satisfies control.DaemonHandler.
+func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersResponse, error) {
+	const maxOwners = 200
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Collect server IDs, skipping placeholder entries.
+	sids := make([]string, 0, len(d.owners))
+	for sid, entry := range d.owners {
+		if entry.Owner == nil {
+			continue
+		}
+		sids = append(sids, sid)
+	}
+	sort.Strings(sids)
+
+	truncated := false
+	if len(sids) > maxOwners {
+		sids = sids[:maxOwners]
+		truncated = true
+	}
+
+	owners := make([]control.OwnerInfo, 0, len(sids))
+	for _, sid := range sids {
+		entry := d.owners[sid]
+		if entry == nil || entry.Owner == nil {
+			continue
+		}
+		s := entry.Owner.Status()
+
+		cwd, _ := s["cwd"].(string)
+		muxVer, _ := s["mux_version"].(string)
+		classification, _ := s["auto_classification"].(string)
+
+		sessions := 0
+		switch v := s["session_count"].(type) {
+		case int:
+			sessions = v
+		case float64:
+			sessions = int(v)
+		case int64:
+			sessions = int(v)
+		}
+
+		pending := 0
+		switch v := s["pending_requests"].(type) {
+		case int64:
+			pending = int(v)
+		case float64:
+			pending = int(v)
+		case int:
+			pending = v
+		}
+
+		var cwdSet []string
+		switch v := s["cwd_set"].(type) {
+		case []string:
+			cwdSet = v
+		case []any:
+			for _, c := range v {
+				if cs, ok := c.(string); ok {
+					cwdSet = append(cwdSet, cs)
+				}
+			}
+		}
+
+		owners = append(owners, control.OwnerInfo{
+			ServerID:       sid,
+			Command:        entry.Command,
+			Args:           entry.Args,
+			Cwd:            cwd,
+			CwdSet:         cwdSet,
+			Sessions:       sessions,
+			Pending:        pending,
+			Classification: classification,
+			MuxVersion:     muxVer,
+			Persistent:     entry.Persistent,
+		})
+	}
+
+	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil
 }
 
 func (d *Daemon) ownerIsAccepting(serverID string) bool {

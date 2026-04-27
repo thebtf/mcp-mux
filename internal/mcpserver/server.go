@@ -14,11 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 // instructions is injected into the initialize response so the connecting agent
@@ -41,10 +43,22 @@ Quick start: call mux_list to see what's running, then use server_id from the ou
 
 // Server is a minimal MCP server that provides control plane tools and prompts.
 type Server struct {
-	reader  *bufio.Scanner
-	writer  io.Writer
-	logger  *log.Logger
-	BaseDir string // directory scanned for .ctl.sock files; empty = os.TempDir()
+	reader        *bufio.Scanner
+	writer        io.Writer
+	logger        *log.Logger
+	BaseDir       string // directory scanned for .ctl.sock files; empty = os.TempDir()
+	DaemonCtlPath string // injectable daemon control path; empty = serverid.DaemonControlPath("", "mcp-mux")
+	EngineName    string // engine name used to build owner socket paths; empty = "mcp-mux"
+}
+
+// engineName returns the engine name used to build owner socket paths.
+// Defaults to "mcp-mux" when EngineName is unset; tests for foreign engines
+// (e.g. cross_engine_integration_test.go) override this to "aimux-test".
+func (s *Server) engineName() string {
+	if s.EngineName != "" {
+		return s.EngineName
+	}
+	return "mcp-mux"
 }
 
 // socketDir returns the directory to scan for .ctl.sock files.
@@ -53,6 +67,18 @@ func (s *Server) socketDir() string {
 		return s.BaseDir
 	}
 	return os.TempDir()
+}
+
+// daemonCtlPath returns the path to the mcp-mux daemon control socket.
+// Uses DaemonCtlPath if set, otherwise composes from BaseDir + engine name "mcp-mux".
+// BaseDir matters for test isolation: a test fixture sets BaseDir to a temp dir so
+// daemonCtlPath() points at a non-existent socket inside that temp dir, not at the
+// real workstation daemon's socket in os.TempDir().
+func (s *Server) daemonCtlPath() string {
+	if s.DaemonCtlPath != "" {
+		return s.DaemonCtlPath
+	}
+	return serverid.DaemonControlPath(s.BaseDir, s.engineName())
 }
 
 // NewServer creates a new MCP control server.
@@ -400,7 +426,7 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 	}
 }
 
-// toolMuxList scans all .ctl.sock files and queries status from each.
+// toolMuxList queries the mcp-mux daemon for all managed owners via the list_owners RPC.
 // By default filters to servers belonging to this CC session's project (by cwd).
 // Set all=true to see all servers across all projects.
 func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
@@ -412,60 +438,59 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 		_ = json.Unmarshal(args, &params)
 	}
 
-	// Determine this session's cwd for filtering
 	myCwd, _ := os.Getwd()
-	myCwd = strings.ToLower(filepath.Clean(myCwd))
+	myCwd = normalizeCwd(myCwd)
 
-	tmpDir := s.socketDir()
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("read temp dir: %v", err))
+	resp, err := control.Send(s.daemonCtlPath(), control.Request{Cmd: "list_owners"})
+	if err != nil || !resp.OK || resp.Data == nil {
+		result, _ := json.Marshal(map[string]any{
+			"servers": []any{},
+			"note":    "local mcp-mux daemon not running — start it with `mcp-mux daemon` or invoke any mcp-mux-wrapped tool to auto-spawn",
+		})
+		s.sendToolResult(id, string(result))
+		return
+	}
+
+	var listResp control.ListOwnersResponse
+	if err := json.Unmarshal(resp.Data, &listResp); err != nil {
+		result, _ := json.Marshal(map[string]any{
+			"servers": []any{},
+			"note":    "local mcp-mux daemon not running — start it with `mcp-mux daemon` or invoke any mcp-mux-wrapped tool to auto-spawn",
+		})
+		s.sendToolResult(id, string(result))
 		return
 	}
 
 	var servers []map[string]any
-
-	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
-			continue
-		}
-
-		path := filepath.Join(tmpDir, name)
-		serverID := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
-
-		resp, err := control.Send(path, control.Request{Cmd: "status"})
-		if err != nil {
-			continue // skip unreachable
-		}
-
-		if resp.OK && resp.Data != nil {
-			var data map[string]any
-			if err := json.Unmarshal(resp.Data, &data); err == nil {
-				// Filter by cwd unless all=true
-				if !params.All && myCwd != "" {
-					if !s.ownerHasCwd(data, myCwd) {
-						continue
-					}
-				}
-
-				if params.Verbose {
-					data["server_id"] = serverID
-					servers = append(servers, data)
-				} else {
-					// Compact: only key fields
-					compact := map[string]any{
-						"server_id": serverID,
-						"command":   data["command"],
-						"args":      data["args"],
-						"sessions":  data["session_count"],
-						"pending":   data["pending_requests"],
-						"class":     data["auto_classification"],
-						"version":   data["mux_version"],
-					}
-					servers = append(servers, compact)
-				}
+	for _, owner := range listResp.Owners {
+		if !params.All && myCwd != "" {
+			if !s.ownerInfoHasCwd(owner, myCwd) {
+				continue
 			}
+		}
+		if params.Verbose {
+			servers = append(servers, map[string]any{
+				"server_id":      owner.ServerID,
+				"command":        owner.Command,
+				"args":           owner.Args,
+				"cwd":            owner.Cwd,
+				"cwd_set":        owner.CwdSet,
+				"sessions":       owner.Sessions,
+				"pending":        owner.Pending,
+				"classification": owner.Classification,
+				"mux_version":    owner.MuxVersion,
+				"persistent":     owner.Persistent,
+			})
+		} else {
+			servers = append(servers, map[string]any{
+				"server_id": owner.ServerID,
+				"command":   owner.Command,
+				"args":      owner.Args,
+				"sessions":  owner.Sessions,
+				"pending":   owner.Pending,
+				"class":     owner.Classification,
+				"version":   owner.MuxVersion,
+			})
 		}
 	}
 
@@ -473,25 +498,115 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	s.sendToolResult(id, string(result))
 }
 
-// ownerHasCwd checks if an owner's status data contains a given cwd in its cwdSet or primary cwd.
-func (s *Server) ownerHasCwd(data map[string]any, cwd string) bool {
-	// Check primary cwd
-	if primary, ok := data["cwd"].(string); ok {
-		if strings.ToLower(filepath.Clean(primary)) == cwd {
+// normalizeCwd cleans a path and lowercases only on Windows. Linux/macOS
+// filesystems are case-sensitive — lowercasing there would collapse `/Repo`
+// and `/repo` into one project namespace and let resolveOwner pick a foreign
+// owner. Empty input → empty output (callers treat empty as "no filter").
+func normalizeCwd(p string) string {
+	if p == "" {
+		return ""
+	}
+	p = filepath.Clean(p)
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+	}
+	return p
+}
+
+// ownerInfoHasCwd checks if an OwnerInfo matches a given cwd. Caller passes the
+// already-normalized cwd; this helper normalizes the OwnerInfo paths to the
+// same convention before comparing.
+func (s *Server) ownerInfoHasCwd(info control.OwnerInfo, cwd string) bool {
+	if cwd == "" {
+		return false
+	}
+	if normalizeCwd(info.Cwd) == cwd {
+		return true
+	}
+	for _, c := range info.CwdSet {
+		if normalizeCwd(c) == cwd {
 			return true
 		}
 	}
-	// Check cwdSet (array of strings in status response)
-	if cwdSet, ok := data["cwd_set"].([]any); ok {
-		for _, c := range cwdSet {
-			if cs, ok := c.(string); ok {
-				if strings.ToLower(filepath.Clean(cs)) == cwd {
-					return true
-				}
+	return false
+}
+
+// resolveOwner resolves a server by exact server_id or name substring via the daemon's list_owners RPC.
+// Returns the matching OwnerInfo or an error if not found or daemon unavailable.
+func (s *Server) resolveOwner(serverID, name string) (control.OwnerInfo, error) {
+	if serverID == "" && name == "" {
+		return control.OwnerInfo{}, fmt.Errorf("provide either server_id or name")
+	}
+
+	resp, err := control.Send(s.daemonCtlPath(), control.Request{Cmd: "list_owners"})
+	if err != nil {
+		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon not reachable: %v", err)
+	}
+	if !resp.OK {
+		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon error: %s", resp.Message)
+	}
+	if resp.Data == nil {
+		return control.OwnerInfo{}, fmt.Errorf("mcp-mux daemon returned empty list_owners response")
+	}
+	var listResp control.ListOwnersResponse
+	if err := json.Unmarshal(resp.Data, &listResp); err != nil {
+		return control.OwnerInfo{}, fmt.Errorf("invalid list_owners response: %v", err)
+	}
+
+	if serverID != "" {
+		// Accept full server_id OR the 8-char shorthand documented in mux-guide.
+		// Exact match wins; otherwise prefix match resolves uniquely or rejects
+		// as ambiguous.
+		var prefixMatches []control.OwnerInfo
+		for _, owner := range listResp.Owners {
+			if owner.ServerID == serverID {
+				return owner, nil
+			}
+			if strings.HasPrefix(owner.ServerID, serverID) {
+				prefixMatches = append(prefixMatches, owner)
 			}
 		}
+		if len(prefixMatches) == 1 {
+			return prefixMatches[0], nil
+		}
+		if len(prefixMatches) > 1 {
+			return control.OwnerInfo{}, fmt.Errorf("server_id %s is ambiguous — use the full id", serverID)
+		}
+		return control.OwnerInfo{}, fmt.Errorf("server_id %s is not managed by this mcp-mux daemon", serverID)
 	}
-	return false
+
+	needle := strings.ToLower(name)
+	var matches []control.OwnerInfo
+	for _, owner := range listResp.Owners {
+		haystack := strings.ToLower(owner.Command + " " + strings.Join(owner.Args, " "))
+		if strings.Contains(haystack, needle) {
+			matches = append(matches, owner)
+		}
+	}
+	if len(matches) == 0 {
+		return control.OwnerInfo{}, fmt.Errorf("no server matching '%s' found", name)
+	}
+
+	// Project-scoping: prefer matches that belong to this session's cwd. Restored
+	// from pre-T011 resolveServerID — the regression was flagged by Gemini on PR #105.
+	myCwd, _ := os.Getwd()
+	myCwd = normalizeCwd(myCwd)
+	var myCwdMatches []control.OwnerInfo
+	for _, m := range matches {
+		if s.ownerInfoHasCwd(m, myCwd) {
+			myCwdMatches = append(myCwdMatches, m)
+		}
+	}
+	if len(myCwdMatches) == 1 {
+		return myCwdMatches[0], nil
+	}
+	if len(myCwdMatches) > 1 {
+		return control.OwnerInfo{}, fmt.Errorf("'%s' matches %d servers in this project — use server_id", name, len(myCwdMatches))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return control.OwnerInfo{}, fmt.Errorf("'%s' matches %d servers (none in this project) — be more specific or use server_id", name, len(matches))
 }
 
 // toolMuxStop stops a specific server.
@@ -506,13 +621,13 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	serverID, err := s.resolveServerID(params.ServerID, params.Name)
+	owner, err := s.resolveOwner(params.ServerID, params.Name)
 	if err != nil {
 		s.sendToolError(id, err.Error())
 		return
 	}
 
-	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
+	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
 
 	drainMs := 30000
 	timeout := 35 * time.Second
@@ -526,7 +641,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		DrainTimeoutMs: drainMs,
 	}, timeout)
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", serverID, err))
+		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
 		return
 	}
 
@@ -545,36 +660,24 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	serverID, err := s.resolveServerID(params.ServerID, params.Name)
+	owner, err := s.resolveOwner(params.ServerID, params.Name)
 	if err != nil {
 		s.sendToolError(id, err.Error())
 		return
 	}
 
-	ctlPath := filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.ctl.sock", serverID))
-
-	// Get current status to learn command + args
-	statusResp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
-	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("server %s unreachable: %v", serverID, err))
-		return
-	}
-
-	var statusData struct {
-		Command         string   `json:"command"`
-		Args            []string `json:"args"`
-		PendingRequests int      `json:"pending_requests"`
-	}
-	if err := json.Unmarshal(statusResp.Data, &statusData); err != nil || statusData.Command == "" {
-		s.sendToolError(id, fmt.Sprintf("server %s has no command info", serverID))
+	if owner.Command == "" {
+		s.sendToolError(id, fmt.Sprintf("server %s has no command info", owner.ServerID))
 		return
 	}
 
 	// Reject restart when requests are in-flight unless force is set
-	if statusData.PendingRequests > 0 && !params.Force {
-		s.sendToolError(id, fmt.Sprintf("server %s has %d pending requests. Use force=true to kill them, or wait for completion.", serverID[:8], statusData.PendingRequests))
+	if owner.Pending > 0 && !params.Force {
+		s.sendToolError(id, fmt.Sprintf("server %.8s has %d pending requests. Use force=true to kill them, or wait for completion.", owner.ServerID, owner.Pending))
 		return
 	}
+
+	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
 
 	// Stop the server
 	drainMs := 30000
@@ -589,7 +692,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		DrainTimeoutMs: drainMs,
 	}, timeout)
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", params.ServerID, err))
+		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
 		return
 	}
 
@@ -597,7 +700,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify the old owner is gone
-	if ipc.IsAvailable(filepath.Join(s.socketDir(), fmt.Sprintf("mcp-mux-%s.sock", params.ServerID))) {
+	if ipc.IsAvailable(serverid.IPCPath(s.socketDir(), s.engineName(), owner.ServerID)) {
 		// Still alive — drain might be in progress, wait more
 		time.Sleep(2 * time.Second)
 	}
@@ -610,10 +713,16 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	}
 
 	daemonArgs := []string{"--daemon"}
-	daemonArgs = append(daemonArgs, statusData.Command)
-	daemonArgs = append(daemonArgs, statusData.Args...)
+	daemonArgs = append(daemonArgs, owner.Command)
+	daemonArgs = append(daemonArgs, owner.Args...)
 
 	cmd := exec.Command(exe, daemonArgs...)
+	// Preserve the original owner's cwd so the respawn lands in the same project
+	// directory. Critical for servers with relative config paths or per-project
+	// state. Empty owner.Cwd → fall through to control-server's default cwd.
+	if owner.Cwd != "" {
+		cmd.Dir = owner.Cwd
+	}
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -626,107 +735,10 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	go cmd.Wait()
 
 	warning := ""
-	if params.Force && statusData.PendingRequests > 0 {
-		warning = fmt.Sprintf("WARNING: force restart killed %d pending requests. ", statusData.PendingRequests)
+	if params.Force && owner.Pending > 0 {
+		warning = fmt.Sprintf("WARNING: force restart killed %d pending requests. ", owner.Pending)
 	}
 	s.sendToolResult(id, fmt.Sprintf("%srestarted: stopped (%s), new daemon PID %d", warning, stopResp.Message, cmd.Process.Pid))
-}
-
-// resolveServerID returns a server ID from either an explicit ID or a name substring match.
-// If name is provided, scans all running instances and matches against command+args (case-insensitive).
-// Prefers servers belonging to this CC session's project (by cwd).
-// Fails if neither is provided, or if name matches zero or multiple servers after cwd filtering.
-func (s *Server) resolveServerID(serverID, name string) (string, error) {
-	if serverID != "" {
-		return serverID, nil
-	}
-	if name == "" {
-		return "", fmt.Errorf("provide either server_id or name")
-	}
-
-	myCwd, _ := os.Getwd()
-	myCwd = strings.ToLower(filepath.Clean(myCwd))
-	name = strings.ToLower(name)
-	tmpDir := s.socketDir()
-	entries, err := os.ReadDir(tmpDir)
-	if err != nil {
-		return "", fmt.Errorf("read temp dir: %v", err)
-	}
-
-	type candidate struct {
-		sid    string
-		hasCwd bool // true if this server belongs to our cwd
-	}
-	var candidates []candidate
-	for _, entry := range entries {
-		fname := entry.Name()
-		if !strings.HasPrefix(fname, "mcp-mux-") || !strings.HasSuffix(fname, ".ctl.sock") {
-			continue
-		}
-
-		path := filepath.Join(tmpDir, fname)
-		sid := strings.TrimPrefix(strings.TrimSuffix(fname, ".ctl.sock"), "mcp-mux-")
-
-		resp, err := control.Send(path, control.Request{Cmd: "status"})
-		if err != nil || !resp.OK || resp.Data == nil {
-			continue
-		}
-
-		var data map[string]any
-		if err := json.Unmarshal(resp.Data, &data); err != nil {
-			continue
-		}
-
-		// Match against command + args concatenated
-		cmd, ok := data["command"].(string)
-		if !ok {
-			s.logger.Printf("server %s status has invalid 'command' field, skipping", sid)
-			continue
-		}
-		var args []string
-		if rawArgs, ok := data["args"].([]any); ok {
-			for _, a := range rawArgs {
-				if as, ok := a.(string); ok {
-					args = append(args, as)
-				}
-			}
-		}
-		haystack := strings.ToLower(cmd + " " + strings.Join(args, " "))
-		if strings.Contains(haystack, name) {
-			candidates = append(candidates, candidate{
-				sid:    sid,
-				hasCwd: s.ownerHasCwd(data, myCwd),
-			})
-		}
-	}
-
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("no server matching '%s' found", name)
-	}
-
-	// Prefer servers belonging to this session's cwd
-	var myCwdMatches []string
-	var allMatches []string
-	for _, c := range candidates {
-		allMatches = append(allMatches, c.sid)
-		if c.hasCwd {
-			myCwdMatches = append(myCwdMatches, c.sid)
-		}
-	}
-
-	// If exactly one match in our cwd — use it (even if there are others)
-	if len(myCwdMatches) == 1 {
-		return myCwdMatches[0], nil
-	}
-	// If multiple in our cwd — still ambiguous
-	if len(myCwdMatches) > 1 {
-		return "", fmt.Errorf("'%s' matches %d servers in this project — use server_id", name, len(myCwdMatches))
-	}
-	// No cwd match — fall back to all matches
-	if len(allMatches) == 1 {
-		return allMatches[0], nil
-	}
-	return "", fmt.Errorf("'%s' matches %d servers (none in this project) — be more specific or use server_id", name, len(allMatches))
 }
 
 // --- JSON-RPC response helpers ---

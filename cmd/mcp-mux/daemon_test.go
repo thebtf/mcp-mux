@@ -41,8 +41,12 @@ func (h *refreshTestHandler) HandleRefreshSessionToken(prevToken string) (string
 
 func (h *refreshTestHandler) HandleReconnectGiveUp(string) error { return nil }
 
+func (h *refreshTestHandler) HandleListOwners(control.Request) (control.ListOwnersResponse, error) {
+	return control.ListOwnersResponse{}, nil
+}
+
 func TestRefreshTokenViaDaemon(t *testing.T) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", "mcp-mux")
 	_ = os.Remove(ctlPath)
 	t.Cleanup(func() { _ = os.Remove(ctlPath) })
 
@@ -66,7 +70,7 @@ func TestRefreshTokenViaDaemon(t *testing.T) {
 }
 
 func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", "mcp-mux")
 	_ = os.Remove(ctlPath)
 	t.Cleanup(func() { _ = os.Remove(ctlPath) })
 
@@ -84,7 +88,7 @@ func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
 }
 
 func TestRefreshTokenViaDaemonUnknownToken(t *testing.T) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", "mcp-mux")
 	_ = os.Remove(ctlPath)
 	t.Cleanup(func() { _ = os.Remove(ctlPath) })
 

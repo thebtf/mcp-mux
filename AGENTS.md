@@ -57,13 +57,80 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.20.4)
+## muxcore Library API (v0.22.0)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.21.19
+go get github.com/thebtf/mcp-mux/muxcore@v0.22.0
 ```
+
+### v0.22.0 — multi-tenant FS isolation + Persistent propagation (#102, #103)
+
+**BREAKING CHANGES.** Engine name now scopes the FS namespace for owner sockets.
+Two muxcore consumers on one host (e.g. mcp-mux + aimux) no longer share the
+literal `"mcp-mux-"` prefix and cannot interfere with each other.
+
+| Change | Migration |
+|--------|-----------|
+| `serverid.IPCPath(id, baseDir)` → `serverid.IPCPath(baseDir, name, id)` | Pass engine name as the second argument. Format becomes `{baseDir}/{name}-{id}.sock`. |
+| `serverid.ControlPath(id, baseDir)` → `serverid.ControlPath(baseDir, name, id)` | Same — argument-order change + new name parameter. |
+| `serverid.LockPath(id, baseDir)` → `serverid.LockPath(baseDir, name, id)` | Same. |
+| `engine.Config.Name` is now MANDATORY | `engine.New(Config{Name: "..."})` — empty Name returns error: `"muxcore: engine.Config.Name is required (was empty); pass a name unique to this binary, e.g. \"aimux\", \"mcp-mux\", \"engram\""`. No silent default. |
+| `daemon.Config.Name string` (additive) | The engine layer now passes `cfg.Name` through to `daemon.Config.Name`. Internal callers are updated; library consumers that construct `daemon.Config` directly must set `Name`. |
+| `daemon.Config.Persistent bool` (additive) | The engine layer now passes `cfg.Persistent` through. Closes #103: SessionHandler-topology owners now hydrate `OwnerEntry.Persistent` from this field. Subprocess topology continues to derive Persistent from the upstream's `x-mux.persistent` capability — both paths converge on `OwnerEntry.Persistent` before the reaper reads it. |
+| `daemon.HandleListOwners` control RPC (new) | New `Cmd: "list_owners"` returns `ListOwnersResponse{Owners []OwnerInfo, Truncated bool}`. mcp-mux's `mux_list/mux_stop/mux_restart` now query this RPC instead of FS-scanning TEMP — closes #102. |
+| `cleanStaleSockets` is now name-scoped | A daemon with `Name="aimux"` no longer touches `mcp-mux-*` sockets in TEMP. Foreign-prefix sockets are left alone; only own-prefix unreachable sockets are cleaned. |
+
+**Migration for aimux:**
+
+```go
+eng, err := engine.New(engine.Config{
+    Name:           "aimux",  // REQUIRED — empty returns error in v0.22.0
+    Persistent:     true,     // now actually propagates to OwnerEntry (#103 fix)
+    SessionHandler: srv.SessionHandler(),
+    // Command/Args optional — SessionHandler topology runs in-process
+})
+```
+
+After upgrade, `mcp-launcher persist` regression should report PASS where it
+previously FAILed.
+
+**Migration for engram:**
+
+```go
+eng, err := engine.New(engine.Config{
+    Name: "engram",  // REQUIRED in v0.22.0
+    // ...rest unchanged
+})
+```
+
+**Cross-version coexistence:** v0.22 mcp-mux daemon coexists cleanly on the
+same host with a v0.21 aimux. The v0.22 daemon's `cleanStaleSockets` only
+matches own-prefix sockets, so the v0.21 aimux's `mcp-mux-*` files remain
+intact. Operator-side, `mux_list` from the v0.22 mcp-mux no longer sees those
+files — it asks the daemon, not the filesystem.
+
+**Migration is non-incremental.** v0.21.x consumers cannot consume
+muxcore/v0.22.0 without updating call sites for the three `serverid` functions
+and adding `Name` to `engine.Config`. Pin via Go modules until ready.
+
+**Tests landed in this release:**
+- `TestNewRejectsEmptyName` (engine) — empty Name diagnostic
+- `TestPersistentPropagatesToDaemonConfig` (engine) — propagation
+- `TestSessionHandlerOwnerInheritsPersistent` (daemon) — R1 from #103
+- `TestReaperRespectsConfigPersistent` (daemon) — R2 from #103
+- `TestHandleListOwners` + `TestHandleListOwners_Truncated` (daemon) — RPC shape + 200-cap
+- `TestCleanStaleSocketsNameScope` (daemon) — foreign-prefix preservation
+- `TestCrossEngineIsolation` (mcpserver integration) — end-to-end FS partition proof
+- `TestMuxStopRefusesForeignID` + `TestMuxRestartRefusesForeignID` (mcpserver) — operator footgun closed
+
+**R3 mcp-launcher persist regression** is in-house tooling (`D:\Dev\mcp-launcher`)
+— consumer-side verification step run during T019/T021 deployment phases.
+
+---
+
+### v0.21.10 — control flush before afterFn
 
 v0.21.10 fixes conn flush before shutdown — explicit `conn.Close()` before
 `afterFn()` ensures response reaches the caller. v0.21.9's `afterFn`

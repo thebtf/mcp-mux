@@ -230,6 +230,10 @@ func (m *mockDaemonHandler) HandleReconnectGiveUp(reason string) error {
 	return nil
 }
 
+func (m *mockDaemonHandler) HandleListOwners(req Request) (ListOwnersResponse, error) {
+	return ListOwnersResponse{}, nil
+}
+
 // TestSocketPath verifies SocketPath returns the address used at creation.
 func TestSocketPath(t *testing.T) {
 	path := testSocketPath(t)

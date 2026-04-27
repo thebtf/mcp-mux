@@ -184,6 +184,21 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		}
 		return Response{OK: true, Message: "recorded"}, nil
 
+	case "list_owners":
+		dh, ok := s.handler.(DaemonHandler)
+		if !ok {
+			return Response{OK: false, Message: "list_owners not supported (not a daemon)"}, nil
+		}
+		result, err := dh.HandleListOwners(req)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("list_owners: %v", err)}, nil
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("marshal list_owners: %v", err)}, nil
+		}
+		return Response{OK: true, Data: data}, nil
+
 	default:
 		return Response{OK: false, Message: fmt.Sprintf("unknown command: %s", req.Cmd)}, nil
 	}

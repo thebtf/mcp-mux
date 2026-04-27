@@ -22,7 +22,7 @@ import (
 // `mcp-mux daemon` subcommand. The daemon manages all upstream MCP servers,
 // accepts spawn requests via its control socket, and auto-exits after idle timeout.
 func runGlobalDaemon() {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	// Single-daemon validation: if another daemon is already running on this
 	// control socket, exit immediately instead of competing.
@@ -92,6 +92,7 @@ func runGlobalDaemon() {
 		OwnerIdleTimeout: ownerIdleTimeout,
 		IdleTimeout:      idleTimeout,
 		Logger:           logger,
+		Name:             engineName,
 	})
 	if err != nil {
 		logger.Fatalf("failed to start daemon: %v", err)
@@ -122,7 +123,7 @@ func runGlobalDaemon() {
 // Emits structured "ensure_daemon substep=<name>" log lines so the shim's
 // startup timeline can be reconstructed from the CC mcp-logs jsonl.
 func ensureDaemon(logger *log.Logger) error {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	// Fast path: daemon already running (no lock needed).
 	// Log lines use key=value with no trailing prose so post-mortem grep/awk
@@ -138,7 +139,7 @@ func ensureDaemon(logger *log.Logger) error {
 
 	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
 	// Lock file is NOT deleted — it persists for coordination across shims.
-	lockPath := serverid.DaemonLockPath("", "")
+	lockPath := serverid.DaemonLockPath("", engineName)
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
@@ -264,7 +265,7 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 }
 
 func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	// Spawn returns immediately after creating the owner — proactive init runs
 	// in background. 30s timeout covers daemon processing + upstream process start.
@@ -303,7 +304,7 @@ func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, e
 // refreshTokenViaDaemon asks the daemon to mint a fresh reconnect token for a
 // still-alive owner associated with prevToken.
 func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	rpcStart := time.Now()
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
@@ -332,7 +333,7 @@ func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error)
 }
 
 func reportReconnectGiveUp(reason string, logger *log.Logger) {
-	ctlPath := serverid.DaemonControlPath("", "")
+	ctlPath := serverid.DaemonControlPath("", engineName)
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:             "reconnect-give-up",
 		ReconnectReason: reason,
