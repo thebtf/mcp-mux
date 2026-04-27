@@ -45,6 +45,10 @@ import (
 // is scoped to mcp-mux and cannot collide with other engines (e.g. aimux).
 const engineName = "mcp-mux"
 
+// ownSocketPrefix is the prefix for all temp socket/lock files owned by this engine.
+// Derived from engineName — single source of truth; use this constant, not the raw string.
+const ownSocketPrefix = engineName + "-"
+
 func main() {
 	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
 	if len(os.Args) > 1 {
@@ -274,8 +278,8 @@ func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.
 		// In isolated mode, embed PID into the server ID portion (before extension)
 		// so suffix matching (.sock, .ctl.sock) still works for stop/status commands.
 		pidSuffix := fmt.Sprintf("-%d", os.Getpid())
-		effectiveIPCPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.sock", sid, pidSuffix))
-		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("mcp-mux-%s%s.ctl.sock", sid, pidSuffix))
+		effectiveIPCPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s%s%s.sock", ownSocketPrefix, sid, pidSuffix))
+		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s%s%s.ctl.sock", ownSocketPrefix, sid, pidSuffix))
 	}
 
 	o, err := owner.NewOwner(owner.OwnerConfig{
@@ -399,12 +403,12 @@ func runStop(drainTimeout time.Duration, force bool) {
 	// Phase 1: Stop instances with control sockets (new protocol)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".ctl.sock") {
 			continue
 		}
 
 		path := filepath.Join(tmpDir, name)
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), ownSocketPrefix)
 		shortID := id
 		if len(shortID) > 8 {
 			shortID = shortID[:8]
@@ -423,7 +427,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 		}, clientTimeout)
 		if err != nil {
 			_ = os.Remove(path)
-			dataPath := filepath.Join(tmpDir, fmt.Sprintf("mcp-mux-%s.sock", id))
+			dataPath := filepath.Join(tmpDir, fmt.Sprintf("%s%s.sock", ownSocketPrefix, id))
 			_ = os.Remove(dataPath)
 			stale++
 			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", shortID)
@@ -441,7 +445,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	// Phase 2: Fallback for old instances without control sockets
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
 		// Skip control sockets (already handled) and lock files
@@ -449,7 +453,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 			continue
 		}
 
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), ownSocketPrefix)
 		if handled[id] {
 			continue // already stopped via control socket
 		}
@@ -713,12 +717,12 @@ func runStatus() {
 	// Phase 1: Query instances with control sockets (rich status)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".ctl.sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".ctl.sock") {
 			continue
 		}
 
 		path := filepath.Join(tmpDir, name)
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), ownSocketPrefix)
 		shortID := id
 		if len(shortID) > 8 {
 			shortID = shortID[:8]
@@ -745,14 +749,14 @@ func runStatus() {
 	// Phase 2: Fallback for old instances (basic active/stale check)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "mcp-mux-") || !strings.HasSuffix(name, ".sock") {
+		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".sock") {
 			continue
 		}
 		if strings.HasSuffix(name, ".ctl.sock") || strings.HasSuffix(name, ".lock") {
 			continue
 		}
 
-		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), "mcp-mux-")
+		id := strings.TrimPrefix(strings.TrimSuffix(name, ".sock"), ownSocketPrefix)
 		if handled[id] {
 			continue
 		}
