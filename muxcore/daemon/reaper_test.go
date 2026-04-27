@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,6 +92,59 @@ func TestReaperPersistentSurvivesGrace(t *testing.T) {
 
 	if d.OwnerCount() != 1 {
 		t.Errorf("persistent owner was removed, OwnerCount() = %d", d.OwnerCount())
+	}
+}
+
+func TestReaperRespectsConfigPersistent(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "[reaper-test] ", 0)
+	ctlPath := shortSocketPath(t, "persistent.ctl.sock")
+	d, err := New(Config{
+		ControlPath:      ctlPath,
+		IdleTimeout:      5 * time.Second,
+		OwnerIdleTimeout: 100 * time.Millisecond,
+		SkipSnapshot:     true,
+		Logger:           logger,
+		Persistent:       true,
+		SessionHandler:   noopSessionHandler{},
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	_, sid, _, err := d.Spawn(control.Request{
+		Cmd:  "spawn",
+		Args: []string{t.Name()},
+		Mode: "global",
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+
+	d.mu.Lock()
+	entry := d.owners[sid]
+	if entry == nil {
+		d.mu.Unlock()
+		t.Fatal("owner entry not found after Spawn")
+	}
+	entry.LastSession = time.Now().Add(-1 * time.Second)
+	d.mu.Unlock()
+
+	time.Sleep(150 * time.Millisecond)
+
+	r := &Reaper{daemon: d, logger: logger}
+	if affected := r.sweep(); affected != 0 {
+		t.Fatalf("sweep() affected %d owners, want 0 for persistent owner", affected)
+	}
+	if d.OwnerCount() != 1 {
+		t.Fatalf("OwnerCount() = %d after sweep, want 1", d.OwnerCount())
+	}
+	if got := d.Entry(sid); got == nil || !got.Persistent {
+		t.Fatal("persistent owner lost after sweep")
+	}
+	if logOutput := logs.String(); strings.Contains(logOutput, "soft-removing") || strings.Contains(logOutput, "upstream dead with 0 sessions, removing") {
+		t.Fatalf("reaper log indicates eviction for persistent owner: %s", logOutput)
 	}
 }
 
