@@ -8,12 +8,34 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 )
+
+// shortBaseDir returns a fresh temp directory whose path is short enough to host
+// AF_UNIX socket files. On macOS the default os.TempDir() lands under
+// /var/folders/.../T/<TestName>NNNN/, easily breaking the 104-byte limit on
+// `bind(2)` for AF_UNIX paths once the test appends a socket name. We force
+// /tmp on darwin so paths fit. On other platforms the default is fine.
+//
+// Cleanup runs via t.Cleanup. Caller treats the return as an opaque base dir.
+func shortBaseDir(t *testing.T, prefix string) string {
+	t.Helper()
+	parent := ""
+	if runtime.GOOS == "darwin" {
+		parent = "/tmp"
+	}
+	dir, err := os.MkdirTemp(parent, prefix)
+	if err != nil {
+		t.Fatalf("shortBaseDir(%q): %v", prefix, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
 
 // newTestServer creates a Server wired to an io.Pipe pair and returns
 // the client-side reader/writer, a done channel, and an isolated base directory
@@ -22,12 +44,7 @@ import (
 func newTestServer(t *testing.T) (clientW io.WriteCloser, clientR io.Reader, done chan error, baseDir string) {
 	t.Helper()
 
-	var err error
-	baseDir, err = os.MkdirTemp("", "mcpmux-")
-	if err != nil {
-		t.Fatalf("newTestServer: MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir = shortBaseDir(t, "mcpmux-")
 
 	// clientW -> serverR  (test writes requests, server reads them)
 	serverR, clientW := io.Pipe()
@@ -670,10 +687,7 @@ func TestMuxRestartNoIDOrName(t *testing.T) {
 }
 
 func TestMuxStopNoMatchingServer(t *testing.T) {
-	baseDir, err := os.MkdirTemp("", "mcpmux-stopnomatch-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	baseDir := shortBaseDir(t, "mcpmux-stopnomatch-")
 	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
 	daemonCtlPath := filepath.Join(baseDir, "stopnomatch-muxd.ctl.sock")
@@ -706,10 +720,7 @@ func TestMuxStopNoMatchingServer(t *testing.T) {
 }
 
 func TestMuxRestartNoMatchingServer(t *testing.T) {
-	baseDir, err := os.MkdirTemp("", "mcpmux-restartnomatch-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	baseDir := shortBaseDir(t, "mcpmux-restartnomatch-")
 	t.Cleanup(func() { os.RemoveAll(baseDir) })
 
 	daemonCtlPath := filepath.Join(baseDir, "restartnomatch-muxd.ctl.sock")
@@ -882,12 +893,7 @@ func newTestServerFull(t *testing.T, daemonCtlPath, baseDir string) (clientW io.
 // newTestServerWithDaemonCtl creates a Server with a specific DaemonCtlPath for testing.
 func newTestServerWithDaemonCtl(t *testing.T, daemonCtlPath string) (clientW io.WriteCloser, clientR io.Reader, done chan error, baseDir string) {
 	t.Helper()
-	var err error
-	baseDir, err = os.MkdirTemp("", "mcpmux-")
-	if err != nil {
-		t.Fatalf("newTestServerWithDaemonCtl: MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir = shortBaseDir(t, "mcpmux-")
 
 	serverR, clientW := io.Pipe()
 	clientR, serverW := io.Pipe()
@@ -909,11 +915,7 @@ func newTestServerWithDaemonCtl(t *testing.T, daemonCtlPath string) (clientW io.
 
 func TestMuxListWithFakeServer(t *testing.T) {
 	sid := "aabbccdd11223344"
-	baseDir, err := os.MkdirTemp("", "mcpmux-daemon-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-daemon-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -961,11 +963,7 @@ func TestMuxListWithFakeServer(t *testing.T) {
 
 func TestMuxListVerbose(t *testing.T) {
 	sid := "eeff001122334455"
-	baseDir, err := os.MkdirTemp("", "mcpmux-daemon-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-daemon-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1008,11 +1006,7 @@ func TestMuxListVerbose(t *testing.T) {
 
 func TestMuxStopWithFakeServer(t *testing.T) {
 	sid := "ddee112233445566"
-	baseDir, err := os.MkdirTemp("", "mcpmux-stop-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-stop-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-stop-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1052,11 +1046,7 @@ func TestMuxStopWithFakeServer(t *testing.T) {
 
 func TestMuxStopByName(t *testing.T) {
 	sid := "aabb112233445566"
-	baseDir, err := os.MkdirTemp("", "mcpmux-stopname-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-stopname-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-stopname-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1092,11 +1082,7 @@ func TestMuxStopByName(t *testing.T) {
 
 func TestMuxRestartWithFakeServer(t *testing.T) {
 	sid := "ffaa112233445566"
-	baseDir, err := os.MkdirTemp("", "mcpmux-restart-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-restart-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-restart-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1141,11 +1127,7 @@ func TestMuxRestartWithFakeServer(t *testing.T) {
 
 func TestMuxRestartByName(t *testing.T) {
 	sid := "ffbb112233445566"
-	baseDir, err := os.MkdirTemp("", "mcpmux-restartname-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-restartname-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-restartname-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1185,11 +1167,7 @@ func TestMuxRestartByName(t *testing.T) {
 
 func TestMuxRestartNoCommandInfo(t *testing.T) {
 	sid := "ffcc112233445566"
-	baseDir, err := os.MkdirTemp("", "mcpmux-nocmd-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-nocmd-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-nocmd-muxd.ctl.sock")
 	// Daemon returns owner with empty Command
@@ -1227,11 +1205,7 @@ func TestMuxRestartNoCommandInfo(t *testing.T) {
 
 func TestMuxStopForce(t *testing.T) {
 	sid := "ffdd112233445566"
-	baseDir, err := os.MkdirTemp("", "mcpmux-stopforce-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-stopforce-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-stopforce-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1269,11 +1243,7 @@ func TestMuxStopForce(t *testing.T) {
 func TestMuxListFilterByCwd(t *testing.T) {
 	myCwd, _ := os.Getwd()
 
-	baseDir, err := os.MkdirTemp("", "mcpmux-daemon-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-daemon-")
 
 	daemonCtlPath := filepath.Join(baseDir, "test-muxd.ctl.sock")
 	owners := control.ListOwnersResponse{
@@ -1321,11 +1291,7 @@ func TestMuxListFilterByCwd(t *testing.T) {
 }
 
 func TestMuxRestartRefusesForeignID(t *testing.T) {
-	baseDir, err := os.MkdirTemp("", "mcpmux-foreign-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-foreign-")
 
 	daemonCtlPath := filepath.Join(baseDir, "foreign-test-muxd.ctl.sock")
 	// Empty owners list — any server_id is foreign
@@ -1358,11 +1324,7 @@ func TestMuxRestartRefusesForeignID(t *testing.T) {
 }
 
 func TestMuxStopRefusesForeignID(t *testing.T) {
-	baseDir, err := os.MkdirTemp("", "mcpmux-stopforeign-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(baseDir) })
+	baseDir := shortBaseDir(t, "mcpmux-stopforeign-")
 
 	daemonCtlPath := filepath.Join(baseDir, "stopforeign-muxd.ctl.sock")
 	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})

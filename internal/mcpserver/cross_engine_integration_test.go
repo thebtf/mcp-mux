@@ -43,8 +43,8 @@ func TestCrossEngineIsolation(t *testing.T) {
 
 	// Two distinct BaseDirs provide FS namespace partitioning — the core
 	// invariant being tested. Each engine's socket files are scoped to its own dir.
-	dir1 := t.TempDir()
-	dir2 := t.TempDir()
+	dir1 := shortBaseDir(t, "ceisol1-")
+	dir2 := shortBaseDir(t, "ceisol2-")
 
 	logger := log.New(os.Stderr, "[cross-engine-test] ", 0)
 
