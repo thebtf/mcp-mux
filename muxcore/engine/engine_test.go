@@ -653,6 +653,44 @@ func TestEngine_DaemonModeExposesDaemon(t *testing.T) {
 	}
 }
 
+// TestNewRejectsEmptyName verifies that New returns an error with the exact
+// required message when cfg.Name is empty.
+func TestNewRejectsEmptyName(t *testing.T) {
+	cfg := Config{
+		Command: "echo",
+		// Name intentionally omitted (empty string)
+	}
+	e, err := New(cfg)
+	if err == nil {
+		t.Fatal("New() expected error for empty Name, got nil")
+	}
+	if e != nil {
+		t.Fatal("New() expected nil engine on error, got non-nil")
+	}
+	const wantMsg = `muxcore: engine.Config.Name is required (was empty); pass a name unique to this binary, e.g. "aimux", "mcp-mux", "engram"`
+	if err.Error() != wantMsg {
+		t.Errorf("New() error message mismatch:\n  got:  %q\n  want: %q", err.Error(), wantMsg)
+	}
+}
+
+// TestPersistentPropagatesToDaemonConfig verifies that engine.New preserves
+// cfg.Persistent in the engine config, which runDaemon then passes through to
+// daemon.Config{Persistent: true}.
+func TestPersistentPropagatesToDaemonConfig(t *testing.T) {
+	cfg := Config{
+		Name:           "test-persistent",
+		SessionHandler: noopSessionHandler{},
+		Persistent:     true,
+	}
+	e, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+	if !e.cfg.Persistent {
+		t.Error("engine.cfg.Persistent = false, want true — Persistent not preserved by New()")
+	}
+}
+
 // TestEngine_ProxyModeReady verifies that runProxy calls markReady(ModeProxy)
 // before invoking the handler, so Ready() fires and Mode() == ModeProxy.
 func TestEngine_ProxyModeReady(t *testing.T) {

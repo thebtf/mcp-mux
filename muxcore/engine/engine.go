@@ -154,7 +154,7 @@ type MuxEngine struct {
 // Validates config and applies defaults.
 func New(cfg Config) (*MuxEngine, error) {
 	if cfg.Name == "" {
-		return nil, fmt.Errorf("engine: Name is required")
+		return nil, fmt.Errorf("muxcore: engine.Config.Name is required (was empty); pass a name unique to this binary, e.g. \"aimux\", \"mcp-mux\", \"engram\"")
 	}
 	if cfg.Command == "" && cfg.Handler == nil && cfg.SessionHandler == nil {
 		return nil, fmt.Errorf("engine: Command, Handler, or SessionHandler is required")
@@ -289,6 +289,8 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		HandlerFunc:      handlerFunc,
 		SessionHandler:   e.cfg.SessionHandler,
 		DaemonFlag:       e.cfg.DaemonFlag,
+		Name:             e.cfg.Name,
+		Persistent:       e.cfg.Persistent,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)
