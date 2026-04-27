@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -438,7 +439,7 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	}
 
 	myCwd, _ := os.Getwd()
-	myCwd = strings.ToLower(filepath.Clean(myCwd))
+	myCwd = normalizeCwd(myCwd)
 
 	resp, err := control.Send(s.daemonCtlPath(), control.Request{Cmd: "list_owners"})
 	if err != nil || !resp.OK || resp.Data == nil {
@@ -497,13 +498,33 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	s.sendToolResult(id, string(result))
 }
 
-// ownerInfoHasCwd checks if an OwnerInfo matches a given cwd (case-insensitive, cleaned paths).
+// normalizeCwd cleans a path and lowercases only on Windows. Linux/macOS
+// filesystems are case-sensitive — lowercasing there would collapse `/Repo`
+// and `/repo` into one project namespace and let resolveOwner pick a foreign
+// owner. Empty input → empty output (callers treat empty as "no filter").
+func normalizeCwd(p string) string {
+	if p == "" {
+		return ""
+	}
+	p = filepath.Clean(p)
+	if runtime.GOOS == "windows" {
+		p = strings.ToLower(p)
+	}
+	return p
+}
+
+// ownerInfoHasCwd checks if an OwnerInfo matches a given cwd. Caller passes the
+// already-normalized cwd; this helper normalizes the OwnerInfo paths to the
+// same convention before comparing.
 func (s *Server) ownerInfoHasCwd(info control.OwnerInfo, cwd string) bool {
-	if strings.ToLower(filepath.Clean(info.Cwd)) == cwd {
+	if cwd == "" {
+		return false
+	}
+	if normalizeCwd(info.Cwd) == cwd {
 		return true
 	}
 	for _, c := range info.CwdSet {
-		if strings.ToLower(filepath.Clean(c)) == cwd {
+		if normalizeCwd(c) == cwd {
 			return true
 		}
 	}
@@ -533,10 +554,23 @@ func (s *Server) resolveOwner(serverID, name string) (control.OwnerInfo, error) 
 	}
 
 	if serverID != "" {
+		// Accept full server_id OR the 8-char shorthand documented in mux-guide.
+		// Exact match wins; otherwise prefix match resolves uniquely or rejects
+		// as ambiguous.
+		var prefixMatches []control.OwnerInfo
 		for _, owner := range listResp.Owners {
 			if owner.ServerID == serverID {
 				return owner, nil
 			}
+			if strings.HasPrefix(owner.ServerID, serverID) {
+				prefixMatches = append(prefixMatches, owner)
+			}
+		}
+		if len(prefixMatches) == 1 {
+			return prefixMatches[0], nil
+		}
+		if len(prefixMatches) > 1 {
+			return control.OwnerInfo{}, fmt.Errorf("server_id %s is ambiguous — use the full id", serverID)
 		}
 		return control.OwnerInfo{}, fmt.Errorf("server_id %s is not managed by this mcp-mux daemon", serverID)
 	}
@@ -556,7 +590,7 @@ func (s *Server) resolveOwner(serverID, name string) (control.OwnerInfo, error) 
 	// Project-scoping: prefer matches that belong to this session's cwd. Restored
 	// from pre-T011 resolveServerID — the regression was flagged by Gemini on PR #105.
 	myCwd, _ := os.Getwd()
-	myCwd = strings.ToLower(filepath.Clean(myCwd))
+	myCwd = normalizeCwd(myCwd)
 	var myCwdMatches []control.OwnerInfo
 	for _, m := range matches {
 		if s.ownerInfoHasCwd(m, myCwd) {
