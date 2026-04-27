@@ -455,6 +455,14 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 					fallbackReason = "owner_gone"
 					break
 				}
+				if isUnknownTokenError(err) {
+					// New daemon (e.g. after hard-kill + respawn) has no record
+					// of our session token; further refresh attempts will fail
+					// identically. Break early and fall back to fresh spawn.
+					rc.log.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+					fallbackReason = "unknown_token"
+					break
+				}
 				rc.log.Printf("shim.reconnect.refresh_fail reason=%s", refreshFailureReason(err))
 				continue
 			}
