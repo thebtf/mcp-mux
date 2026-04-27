@@ -41,6 +41,10 @@ func (h *refreshTestHandler) HandleRefreshSessionToken(prevToken string) (string
 
 func (h *refreshTestHandler) HandleReconnectGiveUp(string) error { return nil }
 
+func (h *refreshTestHandler) HandleListOwners(control.Request) (control.ListOwnersResponse, error) {
+	return control.ListOwnersResponse{}, nil
+}
+
 func TestRefreshTokenViaDaemon(t *testing.T) {
 	ctlPath := serverid.DaemonControlPath("", "")
 	_ = os.Remove(ctlPath)

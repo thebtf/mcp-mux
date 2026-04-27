@@ -45,6 +45,26 @@ type CommandHandler interface {
 	HandleStatus() map[string]interface{}
 }
 
+// OwnerInfo contains summary data for a single managed owner returned by list_owners.
+type OwnerInfo struct {
+	ServerID       string   `json:"server_id"`
+	Command        string   `json:"command"`
+	Args           []string `json:"args"`
+	Cwd            string   `json:"cwd"`
+	CwdSet         []string `json:"cwd_set"`
+	Sessions       int      `json:"sessions"`
+	Pending        int      `json:"pending"`
+	Classification string   `json:"classification"`
+	MuxVersion     string   `json:"mux_version"`
+	Persistent     bool     `json:"persistent"`
+}
+
+// ListOwnersResponse is the response payload for the "list_owners" daemon RPC.
+type ListOwnersResponse struct {
+	Owners    []OwnerInfo `json:"owners"`
+	Truncated bool        `json:"truncated"`
+}
+
 // DaemonHandler extends CommandHandler with daemon-specific commands.
 type DaemonHandler interface {
 	CommandHandler
@@ -53,4 +73,5 @@ type DaemonHandler interface {
 	HandleGracefulRestart(drainTimeoutMs int) (snapshotPath string, afterResponse func(), err error)
 	HandleRefreshSessionToken(prevToken string) (newToken string, err error)
 	HandleReconnectGiveUp(reason string) error
+	HandleListOwners(req Request) (ListOwnersResponse, error)
 }

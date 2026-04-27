@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1349,6 +1350,91 @@ func (d *Daemon) HandleStatus() map[string]any {
 			"fallback":    d.stats.fallback.Load(),
 		},
 	}
+}
+
+// HandleListOwners returns a snapshot of all active owners, capped at 200 entries,
+// sorted by server_id ascending for deterministic output. Placeholder entries
+// (Owner == nil) are excluded. Satisfies control.DaemonHandler.
+func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersResponse, error) {
+	const maxOwners = 200
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	// Collect server IDs, skipping placeholder entries.
+	sids := make([]string, 0, len(d.owners))
+	for sid, entry := range d.owners {
+		if entry.Owner == nil {
+			continue
+		}
+		sids = append(sids, sid)
+	}
+	sort.Strings(sids)
+
+	truncated := false
+	if len(sids) > maxOwners {
+		sids = sids[:maxOwners]
+		truncated = true
+	}
+
+	owners := make([]control.OwnerInfo, 0, len(sids))
+	for _, sid := range sids {
+		entry := d.owners[sid]
+		if entry == nil || entry.Owner == nil {
+			continue
+		}
+		s := entry.Owner.Status()
+
+		cwd, _ := s["cwd"].(string)
+		muxVer, _ := s["mux_version"].(string)
+		classification, _ := s["auto_classification"].(string)
+
+		sessions := 0
+		switch v := s["session_count"].(type) {
+		case int:
+			sessions = v
+		case float64:
+			sessions = int(v)
+		case int64:
+			sessions = int(v)
+		}
+
+		pending := 0
+		switch v := s["pending_requests"].(type) {
+		case int64:
+			pending = int(v)
+		case float64:
+			pending = int(v)
+		case int:
+			pending = v
+		}
+
+		var cwdSet []string
+		switch v := s["cwd_set"].(type) {
+		case []string:
+			cwdSet = v
+		case []any:
+			for _, c := range v {
+				if cs, ok := c.(string); ok {
+					cwdSet = append(cwdSet, cs)
+				}
+			}
+		}
+
+		owners = append(owners, control.OwnerInfo{
+			ServerID:       sid,
+			Command:        entry.Command,
+			Args:           entry.Args,
+			Cwd:            cwd,
+			CwdSet:         cwdSet,
+			Sessions:       sessions,
+			Pending:        pending,
+			Classification: classification,
+			MuxVersion:     muxVer,
+			Persistent:     entry.Persistent,
+		})
+	}
+
+	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil
 }
 
 func (d *Daemon) ownerIsAccepting(serverID string) bool {
