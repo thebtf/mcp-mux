@@ -278,7 +278,13 @@ func TestReconnect_NoGoroutineLeakOnRefreshTimeout(t *testing.T) {
 
 func TestOwnerPrefixFromIPCPath(t *testing.T) {
 	path := filepath.Join(os.TempDir(), "mcp-mux-1234567890abcdef.sock")
-	if got := ownerPrefixFromIPCPath(path); got != "12345678" {
+	// ownerPrefixFromIPCPath is now a method; build a minimal resilientClient
+	// with default EnginePrefix (empty = "mcp-mux") to exercise the same path.
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{EnginePrefix: ""},
+		log: log.New(io.Discard, "", 0),
+	}
+	if got := rc.ownerPrefixFromIPCPath(path); got != "12345678" {
 		t.Fatalf("ownerPrefixFromIPCPath() = %q, want %q", got, "12345678")
 	}
 }

@@ -119,6 +119,10 @@ type Daemon struct {
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
 
+	// name is the engine instance name from Config.Name (e.g. "mcp-mux", "aimux").
+	// Used to scope IPC socket file paths and stale-socket cleanup to this engine.
+	name string
+
 	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
 	// gate in spawnOnce tore down a registered owner because IsReachable()
 	// returned false despite IsAccepting() reporting open. Counter is
@@ -200,6 +204,16 @@ type Config struct {
 	// If empty, defaults to "--daemon" for backward compatibility with
 	// pre-v0.21.7 callers that don't set it.
 	DaemonFlag string
+
+	// Name is the engine instance name (e.g. "mcp-mux", "aimux", "engram").
+	// Used to scope IPC socket file names and stale-socket cleanup to this
+	// engine only. Empty string is valid (library is pure); callers that want
+	// FS isolation across multiple engine types must set this.
+	Name string
+
+	// Persistent overrides per-owner Persistent detection. When true, all owners
+	// managed by this daemon are treated as persistent (not evicted on idle).
+	Persistent bool
 }
 
 var _ control.DaemonHandler = (*Daemon)(nil)
@@ -243,6 +257,7 @@ func New(cfg Config) (*Daemon, error) {
 		handlerFunc:      cfg.HandlerFunc,
 		sessionHandler:   cfg.SessionHandler,
 		daemonFlag:       daemonFlag,
+		name:             cfg.Name,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -287,7 +302,7 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	// Clean up stale socket files from previous daemon crashes/kills.
-	cleaned := cleanStaleSockets(logger)
+	cleaned := cleanStaleSockets(d.name, logger)
 	if cleaned > 0 {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
 	}
@@ -461,10 +476,20 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	d.mu.Unlock()
 }
 
-// cleanStaleSockets removes mcp-mux-*.ctl.sock and mcp-mux-*.sock files from
-// the temp directory that are not reachable (leftover from daemon crash/kill).
-func cleanStaleSockets(logger *log.Logger) int {
-	tmpDir := os.TempDir()
+// cleanStaleSocketsDir overrides the directory scanned by cleanStaleSockets.
+// Zero value ("") means os.TempDir(). Override in tests to use a temp dir.
+var cleanStaleSocketsDir = ""
+
+// cleanStaleSockets removes engine-scoped *.ctl.sock and *.sock files from the
+// temp directory that are not reachable (leftover from daemon crash/kill).
+// Only files whose names start with engineName+"-" are considered; sockets
+// belonging to other engines are left untouched.
+func cleanStaleSockets(engineName string, logger *log.Logger) int {
+	prefix := engineName + "-"
+	tmpDir := cleanStaleSocketsDir
+	if tmpDir == "" {
+		tmpDir = os.TempDir()
+	}
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return 0
@@ -472,8 +497,13 @@ func cleanStaleSockets(logger *log.Logger) int {
 	cleaned := 0
 	for _, entry := range entries {
 		name := entry.Name()
-		// Match mcp-mux sockets (mcp-mux-*.sock) and engine daemon sockets (*-muxd.ctl.sock)
-		isMuxSocket := strings.HasPrefix(name, "mcp-mux-") && strings.HasSuffix(name, ".sock")
+		// Only consider sockets that belong to this engine (scoped by prefix).
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		// Match IPC data sockets (*-<id>.sock) and control sockets (*-<id>.ctl.sock
+		// and *-muxd.ctl.sock).
+		isMuxSocket := strings.HasSuffix(name, ".sock")
 		isDaemonSocket := strings.HasSuffix(name, "-muxd.ctl.sock")
 		if !isMuxSocket && !isDaemonSocket {
 			continue
@@ -750,7 +780,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	d.owners[sid] = placeholder
 	d.mu.Unlock()
 
-	ipcPath := serverid.IPCPath(sid, "")
+	ipcPath := serverid.IPCPath("", d.name, sid)
 
 	// Pass full session env to the owner. Shim-supplied vars WIN; daemon env
 	// fills gaps. Rationale: some shims are launched by tools that strip
@@ -775,7 +805,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
-	controlPath := serverid.ControlPath(sid, "")
+	controlPath := serverid.ControlPath("", d.name, sid)
 	ownerCfg := owner.OwnerConfig{
 		Command:        req.Command,
 		Args:           req.Args,
