@@ -450,9 +450,13 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				if err == io.EOF {
 					return nil, io.EOF
 				}
-				if isOwnerGoneError(err) {
-					rc.log.Printf("shim.reconnect.refresh_fail reason=owner_gone")
-					fallbackReason = "owner_gone"
+				// Terminal refresh errors (owner_gone, unknown_token) cannot
+				// be resolved by retrying — every attempt would fail identically.
+				// Break early and fall back to fresh spawn. Other errors are
+				// treated as transient and retried up to MaxRefreshAttempts.
+				if reason := terminalRefreshErrorReason(err); reason != "" {
+					rc.log.Printf("shim.reconnect.refresh_fail reason=%s", reason)
+					fallbackReason = reason
 					break
 				}
 				rc.log.Printf("shim.reconnect.refresh_fail reason=%s", refreshFailureReason(err))
@@ -568,6 +572,21 @@ func isOwnerGoneError(err error) bool {
 
 func isUnknownTokenError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unknown token")
+}
+
+// terminalRefreshErrorReason returns a non-empty fallback reason if err is
+// known to be unrecoverable across retries (the new daemon will never accept
+// the cached token regardless of how many times we ask). Returns "" for
+// transient errors that should be retried up to MaxRefreshAttempts.
+func terminalRefreshErrorReason(err error) string {
+	switch {
+	case isOwnerGoneError(err):
+		return "owner_gone"
+	case isUnknownTokenError(err):
+		return "unknown_token"
+	default:
+		return ""
+	}
 }
 
 // ownerPrefixFromIPCPath extracts the short server-ID prefix (up to 8 chars)

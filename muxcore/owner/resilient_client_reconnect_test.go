@@ -115,7 +115,11 @@ func TestReconnect_RefreshesAndSucceeds(t *testing.T) {
 	}
 }
 
-func TestReconnect_FallsBackToSpawnAfterNRejects(t *testing.T) {
+func TestReconnect_ImmediateSpawnOnUnknownToken(t *testing.T) {
+	// After daemon hard-kill + respawn, the new daemon has no record of the
+	// old session token. Refresh must break early instead of retrying all
+	// MaxRefreshAttempts times — every retry would fail identically since
+	// the new daemon's session manager is empty for this token.
 	var logs bytes.Buffer
 	logger := log.New(&logs, "", 0)
 	rc := newReconnectClient(t, io.Discard, logger)
@@ -143,8 +147,8 @@ func TestReconnect_FallsBackToSpawnAfterNRejects(t *testing.T) {
 	}
 	defer closeReconnectConn(t, conn)
 
-	if refreshCalls != 3 {
-		t.Fatalf("refreshCalls = %d, want 3", refreshCalls)
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1 (early break on unknown_token)", refreshCalls)
 	}
 	if reconnectCalls != 1 {
 		t.Fatalf("reconnectCalls = %d, want 1", reconnectCalls)
@@ -153,11 +157,54 @@ func TestReconnect_FallsBackToSpawnAfterNRejects(t *testing.T) {
 		t.Fatalf("rc.token = %q, want %q", rc.token, "spawn-token")
 	}
 	logText := logs.String()
-	if strings.Count(logText, "shim.reconnect.refresh_fail reason=unknown_token") != 3 {
-		t.Fatalf("refresh_fail logs = %d, want 3; logs=%q", strings.Count(logText, "shim.reconnect.refresh_fail reason=unknown_token"), logText)
+	if strings.Count(logText, "shim.reconnect.refresh_fail reason=unknown_token") != 1 {
+		t.Fatalf("refresh_fail logs = %d, want 1; logs=%q", strings.Count(logText, "shim.reconnect.refresh_fail reason=unknown_token"), logText)
 	}
-	if !strings.Contains(logText, "shim.reconnect.fallback_spawn reason=N_refresh_fail") {
-		t.Fatalf("missing fallback_spawn log, got %q", logText)
+	if !strings.Contains(logText, "shim.reconnect.fallback_spawn reason=unknown_token") {
+		t.Fatalf("missing fallback_spawn reason=unknown_token log, got %q", logText)
+	}
+}
+
+func TestReconnect_FallsBackToSpawnAfterNTransientFailures(t *testing.T) {
+	// Generic transient errors (neither unknown_token nor owner_gone) must
+	// retry up to MaxRefreshAttempts before falling back to spawn — this
+	// preserves the original retry path for transient issues like network
+	// blips or server-side temporary failures.
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	rc := newReconnectClient(t, io.Discard, logger)
+	rc.token = "prev-token"
+
+	spawnPath := tempReconnectSocketPath(t, "abcdef123456")
+	srv, _ := startEchoIPCServer(t, spawnPath)
+	defer srv.closeAll()
+
+	stdinDone := make(chan error)
+	refreshCalls := 0
+	reconnectCalls := 0
+	rc.cfg.RefreshToken = func() (string, string, error) {
+		refreshCalls++
+		return "", "", errors.New("transient: connection refused")
+	}
+	rc.cfg.Reconnect = func() (string, string, error) {
+		reconnectCalls++
+		return spawnPath, "spawn-token", nil
+	}
+
+	conn, err := rc.reconnect(&sync.Mutex{}, stdinDone)
+	if err != nil {
+		t.Fatalf("reconnect() error = %v", err)
+	}
+	defer closeReconnectConn(t, conn)
+
+	if refreshCalls != 3 {
+		t.Fatalf("refreshCalls = %d, want 3 (transient errors must retry)", refreshCalls)
+	}
+	if reconnectCalls != 1 {
+		t.Fatalf("reconnectCalls = %d, want 1", reconnectCalls)
+	}
+	if !strings.Contains(logs.String(), "shim.reconnect.fallback_spawn reason=N_refresh_fail") {
+		t.Fatalf("missing fallback_spawn reason=N_refresh_fail log, got %q", logs.String())
 	}
 }
 
