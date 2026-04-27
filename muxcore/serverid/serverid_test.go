@@ -44,34 +44,79 @@ func TestComputeEmptyFallback(t *testing.T) {
 }
 
 func TestIPCPath(t *testing.T) {
-	path := IPCPath("abc123def456", "")
-	if !strings.HasSuffix(path, ".sock") {
-		t.Errorf("IPCPath = %q, want .sock suffix", path)
+	customDir := t.TempDir()
+	tests := []struct {
+		name     string
+		wantFile string
+	}{
+		{name: "mcp-mux", wantFile: "mcp-mux-abc123def456.sock"},
+		{name: "aimux", wantFile: "aimux-abc123def456.sock"},
+		{name: "aimux-dev", wantFile: "aimux-dev-abc123def456.sock"},
+		{name: "", wantFile: "-abc123def456.sock"},
 	}
-	if !strings.Contains(path, "mcp-mux-abc123def456") {
-		t.Errorf("IPCPath = %q, missing server ID", path)
+	for _, tt := range tests {
+		t.Run("name="+tt.name, func(t *testing.T) {
+			path := IPCPath(customDir, tt.name, "abc123def456")
+			if filepath.Base(path) != tt.wantFile {
+				t.Errorf("IPCPath(%q, %q, %q) base = %q, want %q", customDir, tt.name, "abc123def456", filepath.Base(path), tt.wantFile)
+			}
+			if filepath.Dir(path) != customDir {
+				t.Errorf("IPCPath dir = %q, want %q", filepath.Dir(path), customDir)
+			}
+		})
 	}
 }
 
 func TestControlPath(t *testing.T) {
-	path := ControlPath("abc123def456", "")
-	if !strings.HasSuffix(path, ".ctl.sock") {
-		t.Errorf("ControlPath = %q, want .ctl.sock suffix", path)
+	customDir := t.TempDir()
+	tests := []struct {
+		name     string
+		wantFile string
+	}{
+		{name: "mcp-mux", wantFile: "mcp-mux-abc123def456.ctl.sock"},
+		{name: "aimux", wantFile: "aimux-abc123def456.ctl.sock"},
+		{name: "aimux-dev", wantFile: "aimux-dev-abc123def456.ctl.sock"},
+		{name: "", wantFile: "-abc123def456.ctl.sock"},
 	}
-	if !strings.Contains(path, "mcp-mux-abc123def456") {
-		t.Errorf("ControlPath = %q, missing server ID", path)
+	for _, tt := range tests {
+		t.Run("name="+tt.name, func(t *testing.T) {
+			path := ControlPath(customDir, tt.name, "abc123def456")
+			if filepath.Base(path) != tt.wantFile {
+				t.Errorf("ControlPath(%q, %q, %q) base = %q, want %q", customDir, tt.name, "abc123def456", filepath.Base(path), tt.wantFile)
+			}
+			if filepath.Dir(path) != customDir {
+				t.Errorf("ControlPath dir = %q, want %q", filepath.Dir(path), customDir)
+			}
+		})
 	}
 }
 
 func TestLockPath(t *testing.T) {
-	path := LockPath("test123", "")
-	if !strings.Contains(path, "mcp-mux-test123.lock") {
-		t.Errorf("LockPath = %q, missing expected pattern", path)
+	customDir := t.TempDir()
+	tests := []struct {
+		name     string
+		wantFile string
+	}{
+		{name: "mcp-mux", wantFile: "mcp-mux-test123.lock"},
+		{name: "aimux", wantFile: "aimux-test123.lock"},
+		{name: "aimux-dev", wantFile: "aimux-dev-test123.lock"},
+		{name: "", wantFile: "-test123.lock"},
+	}
+	for _, tt := range tests {
+		t.Run("name="+tt.name, func(t *testing.T) {
+			path := LockPath(customDir, tt.name, "test123")
+			if filepath.Base(path) != tt.wantFile {
+				t.Errorf("LockPath(%q, %q, %q) base = %q, want %q", customDir, tt.name, "test123", filepath.Base(path), tt.wantFile)
+			}
+			if filepath.Dir(path) != customDir {
+				t.Errorf("LockPath dir = %q, want %q", filepath.Dir(path), customDir)
+			}
+		})
 	}
 }
 
 func TestIPCPath_EmptyBaseDir(t *testing.T) {
-	path := IPCPath("abc123", "")
+	path := IPCPath("", "mcp-mux", "abc123")
 	tmpDir := os.TempDir()
 	// macOS: os.TempDir() returns the /var/folders/... alias while the value
 	// that reaches the socket path may be resolved through /private/... —
@@ -88,16 +133,19 @@ func TestIPCPath_EmptyBaseDir(t *testing.T) {
 	if gotDir != tmpDir {
 		t.Errorf("IPCPath with empty baseDir: got dir %q, want os.TempDir() %q", gotDir, tmpDir)
 	}
+	if filepath.Base(path) != "mcp-mux-abc123.sock" {
+		t.Errorf("IPCPath base = %q, want mcp-mux-abc123.sock", filepath.Base(path))
+	}
 }
 
 func TestIPCPath_CustomBaseDir(t *testing.T) {
 	customDir := t.TempDir()
-	path := IPCPath("abc123", customDir)
+	path := IPCPath(customDir, "mcp-mux", "abc123")
 	if filepath.Dir(path) != customDir {
 		t.Errorf("IPCPath with custom baseDir: got dir %q, want %q", filepath.Dir(path), customDir)
 	}
-	if !strings.Contains(path, "mcp-mux-abc123.sock") {
-		t.Errorf("IPCPath = %q, missing expected filename", path)
+	if filepath.Base(path) != "mcp-mux-abc123.sock" {
+		t.Errorf("IPCPath = %q, want filename mcp-mux-abc123.sock", path)
 	}
 }
 

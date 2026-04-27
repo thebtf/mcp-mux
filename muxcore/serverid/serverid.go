@@ -184,21 +184,24 @@ func resolveBaseDir(baseDir string) string {
 }
 
 // IPCPath returns the platform-specific IPC endpoint path for a given server ID.
-// When baseDir is empty, os.TempDir() is used.
-func IPCPath(id string, baseDir string) string {
-	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.sock", id))
+// Format: "{baseDir}/{name}-{id}.sock". When baseDir is empty, os.TempDir() is used.
+// Empty name produces "-{id}.sock" (library is pure; callers supply the name).
+func IPCPath(baseDir, name, id string) string {
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("%s-%s.sock", name, id))
 }
 
 // ControlPath returns the control socket path for a given server ID.
-// When baseDir is empty, os.TempDir() is used.
-func ControlPath(id string, baseDir string) string {
-	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.ctl.sock", id))
+// Format: "{baseDir}/{name}-{id}.ctl.sock". When baseDir is empty, os.TempDir() is used.
+// Empty name produces "-{id}.ctl.sock" (library is pure; callers supply the name).
+func ControlPath(baseDir, name, id string) string {
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("%s-%s.ctl.sock", name, id))
 }
 
 // LockPath returns the lock file path used for owner election.
-// When baseDir is empty, os.TempDir() is used.
-func LockPath(id string, baseDir string) string {
-	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("mcp-mux-%s.lock", id))
+// Format: "{baseDir}/{name}-{id}.lock". When baseDir is empty, os.TempDir() is used.
+// Empty name produces "-{id}.lock" (library is pure; callers supply the name).
+func LockPath(baseDir, name, id string) string {
+	return filepath.Join(resolveBaseDir(baseDir), fmt.Sprintf("%s-%s.lock", name, id))
 }
 
 // DaemonControlPath returns the control socket path for a named daemon.
