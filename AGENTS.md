@@ -88,17 +88,10 @@ eng, err := engine.New(engine.Config{
     Args: os.Args[1:],
     OnInject: func(inject func([]byte) error) {
         sink.SetSendFunc(func(frame []byte) error {
-            err := inject(frame)
-            switch {
-            case err == nil:
-                return nil
-            case errors.Is(err, owner.ErrInjectFull):
-                return err
-            case errors.Is(err, owner.ErrInjectClosed):
-                return err
-            default:
-                return err
-            }
+            // inject returns nil on success, owner.ErrInjectFull under
+            // backpressure, or owner.ErrInjectClosed after the proxy exits.
+            // Caller decides drop vs retry vs stop sending; we surface as-is.
+            return inject(frame)
         })
     },
     Logger: logger,

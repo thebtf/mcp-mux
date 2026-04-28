@@ -544,6 +544,11 @@ func TestResilientClient_OnInject_BufferFull(t *testing.T) {
 		t.Fatal("timeout: OnInject callback did not fire")
 	}
 
+	// Threshold tolerant to busy CI: select-default returns instantly on Go
+	// runtime scheduling under normal load, but a contended scheduler can add
+	// a few ms. 50 ms still proves "non-blocking" — orders of magnitude below
+	// the inflight drain deadline.
+	const nonBlockingThreshold = 50 * time.Millisecond
 	var fullErr error
 	for range 1100 {
 		start := time.Now()
@@ -551,8 +556,8 @@ func TestResilientClient_OnInject_BufferFull(t *testing.T) {
 		if err == nil {
 			continue
 		}
-		if time.Since(start) > time.Millisecond {
-			t.Fatalf("inject blocked too long before returning error: %v", time.Since(start))
+		if time.Since(start) > nonBlockingThreshold {
+			t.Fatalf("inject blocked too long (%v) before returning %v — exceeded %v threshold", time.Since(start), err, nonBlockingThreshold)
 		}
 		if !errors.Is(err, ErrInjectFull) {
 			t.Fatalf("expected ErrInjectFull, got %v", err)

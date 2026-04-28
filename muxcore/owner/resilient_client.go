@@ -101,7 +101,6 @@ type resilientClient struct {
 	initCache  initCache
 	inflight   sync.Map // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
 	closed     atomic.Bool
-	injectOnce sync.Once
 	log        *log.Logger
 }
 
@@ -163,26 +162,32 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 			conn.Close()
 			return fmt.Errorf("resilient client: send token: %w", err)
 		}
-		if cfg.OnInject != nil {
-			rc.injectOnce.Do(func() {
-				inject := func(b []byte) error {
-					if rc.closed.Load() {
-						rc.log.Printf("proxy.inject.dropped reason=closed")
-						return ErrInjectClosed
-					}
-					select {
-					case rc.msgFromCC <- b:
-						rc.log.Printf("proxy.inject.delivered bytes=%d", len(b))
-						return nil
-					default:
-						rc.log.Printf("proxy.inject.dropped reason=full")
-						return ErrInjectFull
-					}
-				}
-				rc.log.Printf("proxy.inject.armed")
-				go cfg.OnInject(inject)
-			})
+	}
+
+	// Wire OnInject after handshake (if any). Lives outside the token branch so
+	// the callback fires for token-less consumers too. RunResilientClient is
+	// invoked once per ResilientClient lifecycle, so this code path itself
+	// already provides the single-fire guarantee — no sync.Once needed.
+	if cfg.OnInject != nil {
+		inject := func(b []byte) error {
+			if rc.closed.Load() {
+				rc.log.Printf("proxy.inject.dropped reason=closed")
+				return ErrInjectClosed
+			}
+			// Copy the caller's buffer — they may reuse or pool it after inject returns.
+			data := make([]byte, len(b))
+			copy(data, b)
+			select {
+			case rc.msgFromCC <- data:
+				rc.log.Printf("proxy.inject.delivered bytes=%d", len(b))
+				return nil
+			default:
+				rc.log.Printf("proxy.inject.dropped reason=full")
+				return ErrInjectFull
+			}
 		}
+		rc.log.Printf("proxy.inject.armed")
+		go cfg.OnInject(inject)
 	}
 
 	// stdinReader: reads CC stdin, sends raw message bytes to msgFromCC.
