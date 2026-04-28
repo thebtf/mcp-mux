@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	defaultReconnectTimeout = 30 * time.Second
-	reconnectPollInterval   = 500 * time.Millisecond
-	msgFromCCBufferSize     = 1000
-	msgFromIPCBufferSize    = 1000
+	defaultReconnectTimeout   = 30 * time.Second
+	reconnectPollInterval     = 500 * time.Millisecond
+	msgFromCCBufferSize       = 1000
+	msgFromIPCBufferSize      = 1000
 	defaultMaxRefreshAttempts = 3
 )
 
@@ -46,15 +46,21 @@ type ReconnectFunc func() (ipcPath string, token string, err error)
 
 // ResilientClientConfig configures the resilient shim proxy.
 type ResilientClientConfig struct {
-	Stdin            io.Reader
-	Stdout           io.Writer
-	InitialIPCPath   string
-	Token            string // handshake token from initial spawn; sent to owner on connect
-	RefreshToken     ReconnectFunc
-	Reconnect        ReconnectFunc
+	Stdin          io.Reader
+	Stdout         io.Writer
+	InitialIPCPath string
+	Token          string // handshake token from initial spawn; sent to owner on connect
+	// OnInject, when non-nil, is invoked exactly once after the initial IPC
+	// handshake completes. The closure pushes raw JSON-RPC frames into msgFromCC
+	// via select-default semantics. Single-fire across reconnects. Closure is
+	// safe for concurrent use, lifecycle-aware (returns ErrInjectClosed after
+	// proxy exit). Zero value (nil) preserves pre-v0.23 behavior.
+	OnInject           func(inject func([]byte) error)
+	RefreshToken       ReconnectFunc
+	Reconnect          ReconnectFunc
 	MaxRefreshAttempts int
-	ReconnectTimeout time.Duration // default: 30s
-	StdinEOFPolicy   StdinEOFPolicy // default: EagerExit (drain pending, then exit)
+	ReconnectTimeout   time.Duration  // default: 30s
+	StdinEOFPolicy     StdinEOFPolicy // default: EagerExit (drain pending, then exit)
 
 	// KeepaliveInterval is no longer used. Previous revisions emitted a
 	// synthetic notifications/progress with progressToken="mux-reconnect"
@@ -84,24 +90,29 @@ type initCache struct {
 // resilientClient holds the runtime state for RunResilientClient.
 type resilientClient struct {
 	cfg        ResilientClientConfig
-	token      string     // current handshake token; updated on reconnect
-	msgFromCC  chan []byte // stdin → proxy (buffered 1000)
-	msgFromIPC chan []byte // ipc → stdout (buffered 1000)
-	ipcEOF      chan struct{} // closed when IPC reader detects EOF/error
-	stdoutDead  chan struct{} // closed when CC stdout pipe breaks
-	stdoutOnce  sync.Once    // ensures stdoutDead is closed once
-	startTime   time.Time    // when the client started (for probe detection)
-	ipcMsgSent  atomic.Bool  // true after first IPC→stdout message forwarded (disables probe detection)
-	initCache   initCache
-	inflight    sync.Map     // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
-	log         *log.Logger
+	token      string        // current handshake token; updated on reconnect
+	msgFromCC  chan []byte   // stdin → proxy (buffered 1000)
+	msgFromIPC chan []byte   // ipc → stdout (buffered 1000)
+	ipcEOF     chan struct{} // closed when IPC reader detects EOF/error
+	stdoutDead chan struct{} // closed when CC stdout pipe breaks
+	stdoutOnce sync.Once     // ensures stdoutDead is closed once
+	startTime  time.Time     // when the client started (for probe detection)
+	ipcMsgSent atomic.Bool   // true after first IPC→stdout message forwarded (disables probe detection)
+	initCache  initCache
+	inflight   sync.Map // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
+	closed     atomic.Bool
+	log        *log.Logger
 }
 
 // ErrReconnectExit is returned by reconnect when the shim should exit
 // so CC restarts it with a fresh MCP handshake.
 // ErrReconnectExit is returned when the shim should exit after successful reconnect
 // so CC restarts it with a fresh MCP handshake.
-var ErrReconnectExit = errors.New("reconnect: exit for fresh handshake")
+var (
+	ErrInjectFull    = errors.New("muxcore: inject buffer full")
+	ErrInjectClosed  = errors.New("muxcore: inject channel closed")
+	ErrReconnectExit = errors.New("reconnect: exit for fresh handshake")
+)
 
 // RunResilientClient proxies CC stdio ↔ IPC with automatic reconnect on IPC failure.
 //
@@ -137,6 +148,7 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 		startTime:  time.Now(),
 		log:        logger,
 	}
+	defer rc.closed.Store(true)
 
 	// Connect to initial IPC path.
 	conn, err := ipc.Dial(cfg.InitialIPCPath)
@@ -150,6 +162,32 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 			conn.Close()
 			return fmt.Errorf("resilient client: send token: %w", err)
 		}
+	}
+
+	// Wire OnInject after handshake (if any). Lives outside the token branch so
+	// the callback fires for token-less consumers too. RunResilientClient is
+	// invoked once per ResilientClient lifecycle, so this code path itself
+	// already provides the single-fire guarantee — no sync.Once needed.
+	if cfg.OnInject != nil {
+		inject := func(b []byte) error {
+			if rc.closed.Load() {
+				rc.log.Printf("proxy.inject.dropped reason=closed")
+				return ErrInjectClosed
+			}
+			// Copy the caller's buffer — they may reuse or pool it after inject returns.
+			data := make([]byte, len(b))
+			copy(data, b)
+			select {
+			case rc.msgFromCC <- data:
+				rc.log.Printf("proxy.inject.delivered bytes=%d", len(b))
+				return nil
+			default:
+				rc.log.Printf("proxy.inject.dropped reason=full")
+				return ErrInjectFull
+			}
+		}
+		rc.log.Printf("proxy.inject.armed")
+		go cfg.OnInject(inject)
 	}
 
 	// stdinReader: reads CC stdin, sends raw message bytes to msgFromCC.

@@ -57,13 +57,53 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.22.0)
+## muxcore Library API (v0.23.0)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.22.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.23.0
 ```
+
+### v0.23.0 — engine.Config.OnInject for fire-and-forget IPC frame injection (#107)
+
+**No breaking changes.** `OnInject == nil` is the zero value and preserves
+pre-v0.23 behavior for non-adopting consumers.
+
+| API | Semantics |
+|-----|-----------|
+| `engine.Config.OnInject` | Additive passthrough callback. Called once with `inject func([]byte) error` after the initial shim→owner handshake completes. |
+| `owner.ResilientClientConfig.OnInject` | Real wiring point in the resilient shim. Injected frames enter the existing `msgFromCC` path and preserve FIFO ordering with normal CC traffic. |
+| `owner.ErrInjectFull` | Sentinel returned when the `msgFromCC` buffer is saturated. Non-blocking backpressure signal; callers decide drop vs retry. |
+| `owner.ErrInjectClosed` | Sentinel returned after the resilient proxy exits. Further inject attempts become lifecycle-aware no-ops. |
+
+**Migration:** Existing consumers (aimux ≤v0.22.0, engram, mcp-launcher) require zero source change. `OnInject == nil` is the zero value.
+
+**Migration for aimux:**
+
+```go
+eng, err := engine.New(engine.Config{
+    Name: "aimux",
+    Command: os.Args[0],
+    Args: os.Args[1:],
+    OnInject: func(inject func([]byte) error) {
+        sink.SetSendFunc(func(frame []byte) error {
+            // inject returns nil on success, owner.ErrInjectFull under
+            // backpressure, or owner.ErrInjectClosed after the proxy exits.
+            // Caller decides drop vs retry vs stop sending; we surface as-is.
+            return inject(frame)
+        })
+    },
+    Logger: logger,
+})
+if err != nil {
+    return err
+}
+```
+
+**Tests landed in this release:**
+- `TestResilientClient_OnInject_DeliversFrames`
+- `TestResilientClient_OnInject_BufferFull`
 
 ### v0.22.0 — multi-tenant FS isolation + Persistent propagation (#102, #103)
 
@@ -261,7 +301,7 @@ only the atomic file rename.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.23.0
 ```
 
 Key changes to adopt:
