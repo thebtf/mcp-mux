@@ -124,6 +124,10 @@ type Config struct {
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 
+	// OnInject forwards to owner.ResilientClientConfig.OnInject. See owner package
+	// for closure semantics. Zero value (nil) preserves pre-v0.23 behavior.
+	OnInject func(inject func([]byte) error)
+
 	// SkipSnapshot disables daemon snapshot loading on startup.
 	// Zero value (false) means snapshots are enabled — the normal production
 	// behaviour used by aimux / engram / mcp-mux.
@@ -147,7 +151,7 @@ type MuxEngine struct {
 	d         *daemon.Daemon // non-nil only while runDaemon is active
 	mode      Mode
 	ready     chan struct{} // closed once mode is set (and, in daemon mode, the daemon is bound)
-	readyOnce sync.Once    // ensures ready is closed exactly once, even under concurrent markReady calls
+	readyOnce sync.Once     // ensures ready is closed exactly once, even under concurrent markReady calls
 }
 
 // New creates a MuxEngine with the given configuration.
@@ -383,6 +387,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		Stdout:         os.Stdout,
 		InitialIPCPath: ipcPath,
 		Token:          token,
+		OnInject:       e.cfg.OnInject,
 		Reconnect:      reconnectFn,
 		StdinEOFPolicy: e.cfg.StdinEOFPolicy,
 		EnginePrefix:   e.cfg.Name,

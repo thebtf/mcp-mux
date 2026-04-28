@@ -3,6 +3,7 @@ package owner
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -165,7 +166,7 @@ func TestResilientClient_ReconnectAfterIPCClose(t *testing.T) {
 	}
 
 	cfg := ResilientClientConfig{
-		ProbeGracePeriod: time.Nanosecond,
+		ProbeGracePeriod:  time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -276,7 +277,7 @@ func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 	}
 
 	cfg := ResilientClientConfig{
-		ProbeGracePeriod: time.Nanosecond,
+		ProbeGracePeriod:  time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -361,6 +362,225 @@ func TestResilientClient_BufferDuringReconnect(t *testing.T) {
 	}
 }
 
+func TestResilientClient_OnInject_DeliversFrames(t *testing.T) {
+	path := newTestIPCPath(t)
+	_, recv := startEchoIPCServer(t, path)
+
+	ccStdinR, ccStdinW := io.Pipe()
+	ccStdoutR, ccStdoutW := io.Pipe()
+
+	injectCh := make(chan func([]byte) error, 1)
+
+	cfg := ResilientClientConfig{
+		ProbeGracePeriod:  time.Nanosecond,
+		Stdin:             ccStdinR,
+		Stdout:            ccStdoutW,
+		InitialIPCPath:    path,
+		Token:             "test-token",
+		ReconnectTimeout:  10 * time.Second,
+		KeepaliveInterval: 10 * time.Second,
+		Logger:            resilientTestLogger(t),
+		OnInject: func(inject func([]byte) error) {
+			injectCh <- inject
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunResilientClient(cfg)
+	}()
+
+	stdoutLines := make(chan string, 10)
+	go func() {
+		scanner := bufio.NewScanner(ccStdoutR)
+		for scanner.Scan() {
+			stdoutLines <- scanner.Text()
+		}
+	}()
+
+	var inject func([]byte) error
+	select {
+	case inject = <-injectCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: OnInject callback did not fire")
+	}
+
+	notify := []byte(`{"jsonrpc":"2.0","method":"notifications/test"}`)
+	if err := inject(notify); err != nil {
+		t.Fatalf("inject returned error: %v", err)
+	}
+
+	seenMethods := make([]string, 0, 2)
+	timeout := time.After(5 * time.Second)
+	for len(seenMethods) < 1 {
+		select {
+		case line := <-recv:
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			methodRaw, ok := msg["method"]
+			if !ok {
+				continue
+			}
+			method := strings.Trim(string(methodRaw), `"`)
+			seenMethods = append(seenMethods, method)
+			if method != "notifications/test" {
+				t.Fatalf("expected injected notification first, got %q", method)
+			}
+		case <-timeout:
+			t.Fatal("timeout: IPC server did not receive injected frame")
+		}
+	}
+
+	ping := `{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}`
+	fmt.Fprintf(ccStdinW, "%s\n", ping)
+
+	gotPing := false
+	timeout = time.After(5 * time.Second)
+	for !gotPing {
+		select {
+		case line := <-recv:
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &msg); err != nil {
+				continue
+			}
+			methodRaw, ok := msg["method"]
+			if !ok {
+				continue
+			}
+			method := strings.Trim(string(methodRaw), `"`)
+			if method == "ping" {
+				gotPing = true
+			}
+		case <-timeout:
+			t.Fatal("timeout: IPC server did not receive subsequent ping")
+		}
+	}
+
+	select {
+	case line := <-stdoutLines:
+		if !strings.Contains(line, `"id":2`) {
+			t.Fatalf("expected ping response on stdout, got %q", line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: did not receive ping response on stdout")
+	}
+
+	select {
+	case <-injectCh:
+		t.Fatal("OnInject fired more than once")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	ccStdinW.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil on stdin close, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: RunResilientClient did not exit")
+	}
+}
+
+func TestResilientClient_OnInject_BufferFull(t *testing.T) {
+	path := newTestIPCPath(t)
+
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen %s: %v", path, err)
+	}
+	defer func() {
+		ln.Close()
+		os.Remove(path)
+	}()
+
+	blockConn := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		if unixConn, ok := conn.(*net.UnixConn); ok {
+			_ = unixConn.SetReadBuffer(1)
+		}
+		blockConn <- conn
+		select {}
+	}()
+
+	ccStdinR, ccStdinW := io.Pipe()
+	ccStdoutR, ccStdoutW := io.Pipe()
+
+	injectCh := make(chan func([]byte) error, 1)
+
+	cfg := ResilientClientConfig{
+		ProbeGracePeriod:  time.Nanosecond,
+		Stdin:             ccStdinR,
+		Stdout:            ccStdoutW,
+		InitialIPCPath:    path,
+		Token:             "test-token",
+		ReconnectTimeout:  10 * time.Second,
+		KeepaliveInterval: 10 * time.Second,
+		Logger:            log.New(io.Discard, "", 0),
+		OnInject: func(inject func([]byte) error) {
+			injectCh <- inject
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunResilientClient(cfg)
+	}()
+
+	go func() {
+		io.Copy(io.Discard, ccStdoutR)
+	}()
+
+	var inject func([]byte) error
+	select {
+	case inject = <-injectCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout: OnInject callback did not fire")
+	}
+
+	var fullErr error
+	for range 1100 {
+		start := time.Now()
+		err := inject([]byte("{}\n"))
+		if err == nil {
+			continue
+		}
+		if time.Since(start) > time.Millisecond {
+			t.Fatalf("inject blocked too long before returning error: %v", time.Since(start))
+		}
+		if !errors.Is(err, ErrInjectFull) {
+			t.Fatalf("expected ErrInjectFull, got %v", err)
+		}
+		fullErr = err
+		break
+	}
+	if fullErr == nil {
+		t.Fatal("expected at least one ErrInjectFull from inject")
+	}
+
+	// Unblock the IPC server connection so runIPCWriter can drain msgFromCC
+	// after stdin closes. Without this, the runProxy 5s drain deadline can be
+	// exceeded by the saturated buffer + slow blocked writer.
+	select {
+	case conn := <-blockConn:
+		conn.Close()
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ccStdinW.Close()
+	select {
+	case <-errCh:
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout: RunResilientClient did not exit")
+	}
+}
+
 // TestResilientClient_TimeoutExits verifies that RunResilientClient returns an
 // error when the ReconnectFunc always fails and the timeout expires.
 func TestResilientClient_TimeoutExits(t *testing.T) {
@@ -378,7 +598,7 @@ func TestResilientClient_TimeoutExits(t *testing.T) {
 	const shortTimeout = 2 * time.Second
 
 	cfg := ResilientClientConfig{
-		ProbeGracePeriod: time.Nanosecond,
+		ProbeGracePeriod:  time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
@@ -527,7 +747,7 @@ func TestResilientClient_InitReplayOnReconnect(t *testing.T) {
 	}
 
 	cfg := ResilientClientConfig{
-		ProbeGracePeriod: time.Nanosecond,
+		ProbeGracePeriod:  time.Nanosecond,
 		Stdin:             ccStdinR,
 		Stdout:            ccStdoutW,
 		InitialIPCPath:    path1,
