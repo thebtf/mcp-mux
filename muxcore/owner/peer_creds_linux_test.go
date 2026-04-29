@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 )
@@ -49,6 +50,8 @@ func TestPeerCreds_LoopbackPID_Linux(t *testing.T) {
 	case srv = <-accepted:
 	case err := <-errCh:
 		t.Fatalf("Accept: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Accept timeout")
 	}
 	defer srv.Close()
 

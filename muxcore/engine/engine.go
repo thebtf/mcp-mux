@@ -148,10 +148,15 @@ type Config struct {
 	// every handshake-complete session is allowed.
 	//
 	// Returning AuthDeny closes the connection with a JSON-RPC -32000 error
-	// carrying SessionAuth.Reason. No upstream process is spawned, no
-	// session is added to the owner's session table, no frames count
-	// against shared resources — denial is zero-cost beyond the handshake
-	// and the credential extraction.
+	// carrying SessionAuth.Reason. The denied session is NOT added to the
+	// owner's session table and no frames are dispatched. The upstream
+	// process, however, is a per-OWNER resource (NewOwner spawns it on
+	// owner creation), not per-session — denial avoids per-session cost
+	// (session-table entry, dispatch goroutines, _meta routing state) but
+	// does not stop or reclaim the upstream process when other authorized
+	// sessions are still attached to the same owner. Consumer-level code
+	// that must gate upstream spawn entirely should refuse to register
+	// the OwnerConfig with the daemon until the first AuthAllow lands.
 	//
 	// Returning AuthAllow stamps SessionMeta.TenantID + SessionMeta.AuthorizedAt
 	// and the session proceeds normally. Empty TenantID with AuthAllow is

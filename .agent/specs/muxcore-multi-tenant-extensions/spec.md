@@ -44,7 +44,7 @@ Accept → readToken → IsPreRegistered → Bind(token, ownerKey) → AddSessio
 The four extensions inject hooks at three points:
 1. **Between Bind and AddSession** — populate `ConnInfo`, run `AuthorizeSession` (deny path closes connection with JSON-RPC -32000 before any upstream resource allocation)
 2. **At the start of `handleDownstreamMessage`** — invoke `OnFrameReceived` (sync ≤1 ms, fail-open on timeout)
-3. **At dispatch time** — type-assert `*WithConnInfo` interfaces; pass cached `ConnInfo` if implemented; fall through to legacy handler signature otherwise
+3. **At dispatch time** — type-assert `*WithSessionMeta` interfaces; pass cached `SessionMeta` if implemented; fall through to legacy handler signature otherwise
 
 ## Domain Modeling
 
@@ -109,13 +109,13 @@ Peer-credential extraction MUST NOT add more than 200 µs to accept-loop latency
 `OnFrameReceived` callback execution MUST be bounded at 1 ms per frame. Implementation MUST measure and emit a log marker on overrun. Fail-open semantics (FR-4) prevent reader-goroutine starvation by misbehaving callbacks.
 
 ### NFR-3: Backward compatibility — observable behavior
-With `cfg.AuthorizeSession == nil` AND `cfg.OnFrameReceived == nil` AND no handler implementing `*WithConnInfo`: muxcore engine accept-loop, dispatch path, message ordering, error codes, log markers, and snapshot/restore behavior MUST be byte-identical to muxcore/v0.23.0 (verified by replay test against captured v0.23.0 trace).
+With `cfg.AuthorizeSession == nil` AND `cfg.OnFrameReceived == nil` AND no handler implementing `*WithSessionMeta`: muxcore engine accept-loop, dispatch path, message ordering, error codes, log markers, and snapshot/restore behavior MUST be byte-identical to muxcore/v0.23.0 (verified by replay test against captured v0.23.0 trace).
 
 ### NFR-4: Cross-platform parity
 All four extensions (FR-1..FR-4) MUST behave equivalently across Linux, Windows, Darwin runtimes. Platform-specific code is confined to `peer_pid_*.go` / `peer_uid_*.go` build-tagged files. Test suite MUST pass on all three CI runners.
 
 ### NFR-5: Type safety — interface upgrade pattern
-Optional handler upgrades MUST use compile-time interface assertion (`if h, ok := o.sessionHandler.(SessionHandlerWithConnInfo); ok { … }`), consistent with existing muxcore patterns (`NotificationHandler`, `ProjectLifecycle`, `NotifierAware`). Runtime reflection MUST NOT be used.
+Optional handler upgrades MUST use compile-time interface assertion (`if h, ok := o.sessionHandler.(SessionHandlerWithSessionMeta); ok { … }`), consistent with existing muxcore patterns (`NotificationHandler`, `ProjectLifecycle`, `NotifierAware`). Runtime reflection MUST NOT be used.
 
 ### NFR-6: Observability
 Every new code path MUST emit a structured log marker with consistent prefix `mux.session.auth.` (for AuthorizeSession lifecycle) or `mux.frame.hook.` (for OnFrameReceived lifecycle). Markers list: `auth_invoked sid=N`, `auth_allow sid=N tenant=X`, `auth_deny sid=N reason=Y`, `auth_panic sid=N`, `frame_hook_pass sid=N`, `frame_hook_drop sid=N method=M`, `frame_hook_error sid=N method=M`, `frame_hook_timeout sid=N method=M elapsed_us=K`, `frame_hook_panic sid=N`. Counters MUST be exposed via `HandleStatus` JSON snapshot.

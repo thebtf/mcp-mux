@@ -32,12 +32,12 @@ graph TD
     Verdict -->|Drop| Discard[silent drop]
     Verdict -->|Error| Resp32004[JSON-RPC -32004]
 
-    Dispatch -->|notification| NotifPath{handler implements<br/>WithConnInfo?}
-    NotifPath -->|yes| HandleNotificationWithConnInfo
+    Dispatch -->|notification| NotifPath{handler implements<br/>WithSessionMeta?}
+    NotifPath -->|yes| HandleNotificationWithSessionMeta
     NotifPath -->|no, legacy| HandleNotification
 
-    Dispatch -->|request| ReqPath{handler implements<br/>WithConnInfo?}
-    ReqPath -->|yes| HandleRequestWithConnInfo
+    Dispatch -->|request| ReqPath{handler implements<br/>WithSessionMeta?}
+    ReqPath -->|yes| HandleRequestWithSessionMeta
     ReqPath -->|no, legacy| HandleRequest
 
     style Authorize fill:#fbb
@@ -64,7 +64,7 @@ graph TD
 | `owner/peer_uid_unix.go` | UID via `SO_PEERCRED` (Linux) / `getpeereid` (Darwin) | stdlib | Infrastructure |
 | `owner.acceptLoop` (modified) | After Bind: populate ConnInfo, run AuthorizeSession, cache verdict | existing + new | Entry |
 | `owner.handleDownstreamMessage` (modified) | Pre-dispatch OnFrameReceived hook | existing + new | Entry |
-| `owner.dispatchToSessionHandler` (modified) | Type-assert `*WithConnInfo`, fall through to legacy if absent | existing + new | Use case |
+| `owner.dispatchToSessionHandler` (modified) | Type-assert `*WithSessionMeta`, fall through to legacy if absent | existing + new | Use case |
 | `owner.Session.meta` (new field) | Cached SessionMeta (Conn + TenantID + AuthorizedAt) for session lifetime — populated at accept, mutated once on AuthAllow, immutable after | `SessionMeta`, `SessionAuth` | State |
 
 ## 4. Layer boundaries
@@ -84,12 +84,12 @@ Dependency rule: domain types (`ConnInfo`) знают о NULL зависимос
 1. CC connects → owner.acceptLoop accepts conn
 2. readToken(conn) → token extracted, IsPreRegistered checked
 3. NewSession(reader, conn); sessionMgr.Bind(token, ownerKey, s)  [s.Cwd, s.Env populated]
-4. peerCreds(conn) → ConnInfo{PeerPid, PeerUid, Platform}; cached in s.connInfo
+4. peerCreds(conn) → ConnInfo{PeerPid, PeerUid, Platform}; cached on s.meta via SetMeta(SessionMeta{Conn: info})
 5. if cfg.AuthorizeSession != nil:
-     verdict := cfg.AuthorizeSession(ctx, s.connInfo, project)
+     verdict := cfg.AuthorizeSession(ctx, s.Meta().Conn, project)
      if verdict.Decision == AuthDeny:
-         write -32000 JSON-RPC error; close conn; return  [STOP — no AddSession, no upstream spawn]
-     s.connInfo.TenantID = verdict.TenantID; cached
+         write -32000 JSON-RPC error; close conn; return  [STOP — no AddSession; upstream is per-owner, may already be running]
+     s.SetMeta(SessionMeta{Conn: info, TenantID: verdict.TenantID, AuthorizedAt: time.Now()})
 6. AddSession(s); readSession goroutine started
 7. Message arrives → handleDownstreamMessage(s, msg)
 8. if cfg.OnFrameReceived != nil:
@@ -99,8 +99,8 @@ Dependency rule: domain types (`ConnInfo`) знают о NULL зависимос
        FrameDrop:  return  [silent]
        FrameError: write -32004 JSON-RPC error; return
 9. msg.IsRequest() → dispatchToSessionHandler(s, msg)
-10. if h, ok := o.sessionHandler.(SessionHandlerWithConnInfo); ok:
-       resp = h.HandleRequestWithConnInfo(ctx, project, s.connInfo, msg.Raw)
+10. if h, ok := o.sessionHandler.(SessionHandlerWithSessionMeta); ok:
+       resp = h.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
     else:
        resp = o.sessionHandler.HandleRequest(ctx, project, msg.Raw)  [legacy fallback]
 11. s.WriteRaw(resp)
@@ -116,7 +116,7 @@ Dependency rule: domain types (`ConnInfo`) знают о NULL зависимос
 
 ### Primary data store
 
-None. ConnInfo + SessionAuth verdict live в памяти на Session (`s.connInfo`). Без persistence — авторизация повторно отрабатывает на каждом fresh accept (новый token = новый authorize).
+None. ConnInfo + SessionAuth verdict live в памяти на Session (`s.meta` via `Meta()`/`SetMeta()`). Без persistence — авторизация повторно отрабатывает на каждом fresh accept (новый token = новый authorize).
 
 ### Client/server boundary
 
@@ -135,7 +135,7 @@ Client = mcp-mux shim (downstream CC session). Server = mcp-mux daemon (Owner). 
 
 **Status:** Accepted
 **Context:** GH #109/#110 предлагают 2 опции — interface upgrade (A) или поле в `ProjectContext` (B). `ProjectContext` — value object с deterministic-from-CWD hash; добавление per-connection ConnInfo загрязнит его и сломает `compare by ID` инвариант.
-**Decision:** Option A. `NotificationHandlerWithConnInfo` + `SessionHandlerWithConnInfo` как optional interfaces, type-assert в Owner. Соответствует существующему шаблону (`NotificationHandler`, `ProjectLifecycle`, `NotifierAware` — все упгрейды).
+**Decision:** Option A — interface-upgrade (now realised as `*WithSessionMeta`; ADR-004 revised the type from `*WithConnInfo` to `*WithSessionMeta`). `NotificationHandlerWithSessionMeta` + `SessionHandlerWithSessionMeta` как optional interfaces, type-assert в Owner. Соответствует существующему шаблону (`NotificationHandler`, `ProjectLifecycle`, `NotifierAware` — все упгрейды).
 **Consequences:** + Compile-time opt-in, type-safe, zero-cost для legacy consumers. + Симметрия со всем остальным API. − Два пути dispatch (legacy + new) — но oba проверены через простой type-assert, no runtime cost.
 **Reversibility:** REVERSIBLE — interfaces additive, можно убрать в v0.25 deprecation cycle если ошибка.
 
@@ -143,7 +143,7 @@ Client = mcp-mux shim (downstream CC session). Server = mcp-mux daemon (Owner). 
 
 **Status:** Accepted
 **Context:** PID/UID требуют syscall. Извлекать per-frame = N×syscall на каждое сообщение. Также TOCTOU — conn может закрыться между accept и dispatch.
-**Decision:** Вычисляем `peerCreds(conn)` один раз в `acceptLoop` сразу после `Bind`. Кэшируем в `Session.connInfo`. Все dispatch'и читают cached value. Платформенные данные стабильны на время сессии.
+**Decision:** Вычисляем `peerCreds(conn)` один раз в `acceptLoop` сразу после `Bind`. Кэшируем в `Session.meta` (через `SetMeta`); читатели берут копию через `Meta()`. Все dispatch'и читают cached value. Платформенные данные стабильны на время сессии.
 **Consequences:** + Zero per-frame overhead. + No TOCTOU — конн уже мёртв к моменту чтения, ConnInfo всё равно валиден (peer был при accept). + AuthorizeSession и handlers видят одно и то же значение. − Если pid/uid реально меняется (process re-exec) — мы не заметим. Это acceptable: тенант определяется при connect, не per-frame.
 **Reversibility:** REVERSIBLE.
 
@@ -151,7 +151,7 @@ Client = mcp-mux shim (downstream CC session). Server = mcp-mux daemon (Owner). 
 
 **Status:** Accepted
 **Context:** GH #111 требует pre-dispatch gate. Re-running на каждый frame избыточно (аутентификация peer не меняется в рамках сессии) и создаёт конкурентность.
-**Decision:** AuthorizeSession вызывается ровно один раз в `acceptLoop` после Bind, до AddSession. SessionAuth.TenantID копируется в `s.connInfo.TenantID`. Last-write-wins нет — single-write.
+**Decision:** AuthorizeSession вызывается ровно один раз в `acceptLoop` после Bind, до AddSession. SessionAuth.TenantID копируется в `s.meta.TenantID` через повторный `SetMeta`. Last-write-wins нет — single-write.
 **Consequences:** + Простая модель. + Никаких race conditions. + Deny path — отсутствие записи в `o.sessions`, никакого upstream spawn'а, никакой нагрузки. − Re-authorization невозможна без disconnect/reconnect — acceptable для multi-tenant модели.
 **Reversibility:** REVERSIBLE.
 
@@ -218,10 +218,10 @@ Handler signatures: `HandleRequestWithSessionMeta(ctx, project, meta SessionMeta
 
 | Pattern | Where | Why |
 |---------|-------|-----|
-| **Interface upgrade (optional capability)** | `*WithConnInfo` interfaces | Уже доминирующий шаблон в muxcore (`NotificationHandler`, `ProjectLifecycle`, `NotifierAware`). Compile-time opt-in. Zero-cost для legacy. |
+| **Interface upgrade (optional capability)** | `*WithSessionMeta` interfaces | Уже доминирующий шаблон в muxcore (`NotificationHandler`, `ProjectLifecycle`, `NotifierAware`). Compile-time opt-in. Zero-cost для legacy. |
 | **Value object** | `ConnInfo`, `SessionAuth`, `FrameAction` | Pure data, safe to copy/compare. Нет behavior — поведение в callbacks. |
 | **Callback hook (Strategy)** | `engine.Config.AuthorizeSession`, `OnFrameReceived` | Consumer-defined policy, library-provided wiring. Standard Go config-callback idiom (`http.Server.ConnState`). |
-| **Cache at accept** | `Session.connInfo` populated in acceptLoop | Avoid per-frame syscall + TOCTOU. |
+| **Cache at accept** | `Session.meta` populated in acceptLoop via `SetMeta` | Avoid per-frame syscall + TOCTOU. |
 | **Fail-open on hook timeout** | OnFrameReceived ≤1ms budget | Library не должна block на bad consumer. Документированный contract. |
 | **Single-shot authorization** | AuthorizeSession runs once | Auth result стабилен в рамках сессии — re-running избыточен. |
 

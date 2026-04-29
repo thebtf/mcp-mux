@@ -256,6 +256,13 @@ type OwnerConfig struct {
 	// AuthDeny closes the connection with JSON-RPC -32000 and never adds
 	// the session; AuthAllow stamps SessionMeta.TenantID + AuthorizedAt.
 	// Panics are recovered and treated as AuthDeny{Reason: "authorize panic"}.
+	// The callback's ctx is bound to the owner's lifecycle: cancelling
+	// it (via Owner.Shutdown) interrupts in-flight authorization RPCs.
+	// AuthDeny prevents per-session resource cost (session-table insert,
+	// dispatch goroutines, frame routing state) but does NOT stop the
+	// upstream process — upstream is per-OWNER and spawns at NewOwner
+	// time, before the first session arrives. Use a daemon-level
+	// pre-spawn check if you must gate upstream creation entirely.
 	// nil-default preserves pre-v0.24 behaviour.
 	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
@@ -1803,10 +1810,36 @@ func (o *Owner) acceptLoop() {
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
-			verdict := invokeAuthorize(o.authorizeSession, info, project, s.ID, o.logger)
+			verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+
+			// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
+			// MAJOR review on PR #113). The pre-callback check at the top
+			// of the authorize block closes the gap up to the call, but a
+			// long-running callback (external RPC, slow tenant lookup) can
+			// outlast o.done. Without this re-check, AuthAllow would still
+			// reach AddSession during teardown, registering a session in a
+			// shutting-down owner.
+			select {
+			case <-o.done:
+				o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
+				conn.Close()
+				s.Close()
+				continue
+			default:
+			}
 
 			if verdict.Decision == muxcore.AuthDeny {
-				if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, verdict.Reason); marshalErr == nil {
+				// Apply the documented "empty Reason → stable fallback"
+				// contract from session_auth.go SessionAuth godoc. Without
+				// this fallback the JSON-RPC error.message would be an
+				// empty string and consumers' deny-categorisation logic
+				// (which keys off Reason) would silently bucket every
+				// such denial together. CodeRabbit MINOR on PR #113.
+				reason := verdict.Reason
+				if reason == "" {
+					reason = "session not authorized"
+				}
+				if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, reason); marshalErr == nil {
 					// Write the JSON-RPC -32000 error directly to the conn
 					// (not through s.WriteRaw — the session is being torn
 					// down, no need for the buffered-writer/bufio path).
@@ -1814,7 +1847,7 @@ func (o *Owner) acceptLoop() {
 				} else {
 					o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
 				}
-				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, verdict.Reason)
+				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
 				conn.Close()
 				s.Close()
 				continue
@@ -1834,10 +1867,15 @@ func (o *Owner) acceptLoop() {
 	}
 }
 
-// invokeAuthorize calls cb under a defer/recover guard. Panic is logged with
-// the panic value and converted to AuthDeny{Reason: "authorize panic"}; the
-// daemon continues accepting subsequent connections.
+// invokeAuthorize calls cb under a defer/recover guard with an owner-bound
+// context. Cancellation propagates from o.done, so a long-running callback
+// (external RPC, slow tenant lookup) can observe shutdown via ctx.Done()
+// and abort early instead of running to completion against a teardown.
+// Panic is logged with the panic value and converted to
+// AuthDeny{Reason: "authorize panic"}; the daemon continues accepting
+// subsequent connections.
 func invokeAuthorize(
+	o *Owner,
 	cb func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth,
 	info muxcore.ConnInfo,
 	project muxcore.ProjectContext,
@@ -1850,7 +1888,16 @@ func invokeAuthorize(
 			verdict = muxcore.SessionAuth{Decision: muxcore.AuthDeny, Reason: "authorize panic"}
 		}
 	}()
-	return cb(context.Background(), info, project)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-o.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return cb(ctx, info, project)
 }
 
 // frameHookBudget is the per-frame OnFrameReceived deadline (NFR-2).

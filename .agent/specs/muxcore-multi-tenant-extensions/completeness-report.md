@@ -62,4 +62,5 @@ All amendments tagged `[CHECKLIST-ADDED 2026-04-29 / CHK###]` for traceability.
 
 ## Auto-Forward
 
-`Skill("nvmd-platform:nvmd-tasks", "muxcore-multi-tenant-extensions")` invoked next.
+> Next step in the SpecKit pipeline: `nvmd-tasks` for spec
+> `muxcore-multi-tenant-extensions`.
