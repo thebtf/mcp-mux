@@ -6,7 +6,6 @@ package owner
 import (
 	"net"
 	"os"
-	"path/filepath"
 	"testing"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
@@ -19,7 +18,10 @@ import (
 // (UID/GID). For an in-process client goroutine that peer == this test
 // process.
 func TestPeerCreds_LoopbackPID_Darwin(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "peercreds.sock")
+	// macOS sockaddr_un.sun_path limit is 104 bytes — t.TempDir() resolves
+	// to /var/folders/<deep>/<test-name>/<n>/ which can exceed the limit.
+	// shortSocketPath returns a path under $TMPDIR root that fits.
+	sockPath := shortSocketPath(t)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("Listen unix: %v", err)

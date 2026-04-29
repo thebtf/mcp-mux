@@ -6,7 +6,6 @@ package owner
 import (
 	"net"
 	"os"
-	"path/filepath"
 	"testing"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
@@ -18,7 +17,10 @@ import (
 // returns the credentials of the connecting peer; for an in-process client
 // goroutine that peer == this test process.
 func TestPeerCreds_LoopbackPID_Linux(t *testing.T) {
-	sockPath := filepath.Join(t.TempDir(), "peercreds.sock")
+	// Linux sockaddr_un.sun_path limit is 108 bytes; use shortSocketPath
+	// for parity with peer_creds_darwin_test.go (which needs the shorter
+	// path under macOS's stricter 104-byte limit).
+	sockPath := shortSocketPath(t)
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		t.Fatalf("Listen unix: %v", err)
