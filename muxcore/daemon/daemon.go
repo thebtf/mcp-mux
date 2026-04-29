@@ -129,6 +129,11 @@ type Daemon struct {
 	// Owner created by this daemon. nil = no gate (pre-v0.24 behaviour).
 	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
+	// onFrameReceived is forwarded from Config.OnFrameReceived to every
+	// Owner created by this daemon. nil = no per-frame hook (pre-v0.24
+	// behaviour).
+	onFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
+
 	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
 	// gate in spawnOnce tore down a registered owner because IsReachable()
 	// returned false despite IsAccepting() reporting open. Counter is
@@ -227,6 +232,13 @@ type Config struct {
 	// nil-default preserves pre-v0.24 behaviour. See engine.Config.AuthorizeSession
 	// for the full semantics; this field is the daemon-layer passthrough.
 	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+
+	// OnFrameReceived, when non-nil, is forwarded to every Owner created by
+	// this daemon. Owners invoke the callback in handleDownstreamMessage on
+	// the reader goroutine for every inbound frame BEFORE dispatch.
+	// nil-default preserves pre-v0.24 behaviour. See
+	// engine.Config.OnFrameReceived for the full semantics.
+	OnFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
 }
 
 var _ control.DaemonHandler = (*Daemon)(nil)
@@ -273,6 +285,7 @@ func New(cfg Config) (*Daemon, error) {
 		name:             cfg.Name,
 		persistent:       cfg.Persistent,
 		authorizeSession: cfg.AuthorizeSession,
+		onFrameReceived:  cfg.OnFrameReceived,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -833,6 +846,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		HandlerFunc:      d.handlerFunc,
 		SessionHandler:   d.sessionHandler,
 		AuthorizeSession: d.authorizeSession,
+		OnFrameReceived:  d.onFrameReceived,
 		OnZeroSessions: func(serverID string) {
 			d.onZeroSessions(serverID)
 		},

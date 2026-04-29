@@ -116,6 +116,12 @@ type Owner struct {
 	// gate (pre-v0.24 behaviour). Read-only after construction.
 	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
+	// onFrameReceived is the optional per-frame admission hook forwarded
+	// from engine.Config. handleDownstreamMessage invokes it on every
+	// inbound frame with a 1 ms budget. nil = no hook (pre-v0.24 behaviour).
+	// Read-only after construction.
+	onFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
+
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
 	cachedInitSessions   map[int]bool // sessions that received a cached (replayed) initialize response
@@ -252,6 +258,13 @@ type OwnerConfig struct {
 	// nil-default preserves pre-v0.24 behaviour.
 	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
+	// OnFrameReceived, when non-nil, is invoked by handleDownstreamMessage
+	// for every inbound frame BEFORE dispatch with a 1 ms callback budget
+	// (overrun → FramePass; panic → FramePass). See
+	// engine.Config.OnFrameReceived for the full semantics.
+	// nil-default preserves pre-v0.24 behaviour.
+	OnFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -297,6 +310,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
 		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
@@ -547,6 +561,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
 		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
