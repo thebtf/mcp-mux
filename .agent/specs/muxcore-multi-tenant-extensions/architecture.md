@@ -50,9 +50,10 @@ graph TD
 
 | Component | Responsibility | Dependencies | Layer |
 |-----------|---------------|--------------|-------|
-| `muxcore.ConnInfo` | OS-level peer identity value object: `PeerPid int, PeerUid int, Platform string, TenantID string` | — | Domain (value type) |
-| `muxcore.NotificationHandlerWithConnInfo` | Optional interface — extends `NotificationHandler` with ConnInfo arg | `NotificationHandler` | Adapter |
-| `muxcore.SessionHandlerWithConnInfo` | Optional interface — extends `SessionHandler` with ConnInfo arg | `SessionHandler` | Adapter |
+| `muxcore.ConnInfo` | OS-level peer identity value object: `PeerPid int, PeerUid int, Platform string` (OS facts ONLY — see ADR-004 revised) | — | Domain (value type) |
+| `muxcore.SessionMeta` | Session metadata combining `Conn ConnInfo, TenantID string, AuthorizedAt time.Time`. Discriminator `AuthorizedAt.IsZero()` signals "not authorized". | `ConnInfo` | Domain (value type) |
+| `muxcore.NotificationHandlerWithSessionMeta` | Optional interface — extends `NotificationHandler` with SessionMeta arg | `NotificationHandler`, `SessionMeta` | Adapter |
+| `muxcore.SessionHandlerWithSessionMeta` | Optional interface — extends `SessionHandler` with SessionMeta arg | `SessionHandler`, `SessionMeta` | Adapter |
 | `muxcore.SessionAuth` | Authorize verdict: `Decision AuthDecision, TenantID string, Reason string` | `ConnInfo` | Domain |
 | `muxcore.FrameAction` | Per-frame verdict: `FramePass / FrameDrop / FrameError` | — | Domain |
 | `engine.Config.AuthorizeSession` | Optional callback `func(ctx, ConnInfo, ProjectContext) SessionAuth` | `ConnInfo`, `SessionAuth` | Use case |
@@ -64,7 +65,7 @@ graph TD
 | `owner.acceptLoop` (modified) | After Bind: populate ConnInfo, run AuthorizeSession, cache verdict | existing + new | Entry |
 | `owner.handleDownstreamMessage` (modified) | Pre-dispatch OnFrameReceived hook | existing + new | Entry |
 | `owner.dispatchToSessionHandler` (modified) | Type-assert `*WithConnInfo`, fall through to legacy if absent | existing + new | Use case |
-| `owner.Session.connInfo` (new field) | Cached ConnInfo + cached AuthVerdict for session lifetime | `ConnInfo`, `SessionAuth` | State |
+| `owner.Session.meta` (new field) | Cached SessionMeta (Conn + TenantID + AuthorizedAt) for session lifetime — populated at accept, mutated once on AuthAllow, immutable after | `SessionMeta`, `SessionAuth` | State |
 
 ## 4. Layer boundaries
 
@@ -125,7 +126,7 @@ Client = mcp-mux shim (downstream CC session). Server = mcp-mux daemon (Owner). 
 
 - Library shipped as Go module: `go get github.com/thebtf/mcp-mux/muxcore@v0.24.0`
 - Binary `mcp-mux` rebuilt с новой версией muxcore — deploy командой `mcp-mux upgrade --restart`
-- Backward compat: `cfg.AuthorizeSession == nil` + `cfg.OnFrameReceived == nil` + handler без `*WithConnInfo` interface = байт-идентичное поведение pre-v0.24
+- Backward compat: `cfg.AuthorizeSession == nil` + `cfg.OnFrameReceived == nil` + handler без `*WithSessionMeta` interface = байт-идентичное поведение pre-v0.24
 - Downstream adoption: aimux migration ~50 LOC (wire AuthorizeSession + OnFrameReceived + upgrade handler interface). engram = no-op.
 
 ## 7. ADR list
@@ -154,13 +155,33 @@ Client = mcp-mux shim (downstream CC session). Server = mcp-mux daemon (Owner). 
 **Consequences:** + Простая модель. + Никаких race conditions. + Deny path — отсутствие записи в `o.sessions`, никакого upstream spawn'а, никакой нагрузки. − Re-authorization невозможна без disconnect/reconnect — acceptable для multi-tenant модели.
 **Reversibility:** REVERSIBLE.
 
-### ADR-004: TenantID — поле в ConnInfo, не отдельный struct
+### ADR-004 (REVISED 2026-04-29 by nvmd-clarify C1): SessionMeta with embedded ConnInfo
 
-**Status:** Accepted
-**Context:** Куда положить `TenantID`? (a) ConnInfo (смешивает OS facts + consumer policy); (b) ProjectContext (нарушает его инвариант); (c) новый struct `SessionMeta`.
-**Decision:** В ConnInfo. Документируем: "TenantID — consumer-set, populated by AuthorizeSession; zero string when AuthorizeSession not configured". OS-derived поля (`PeerPid`, `PeerUid`) и consumer-derived (`TenantID`) совместно — "credential-derived identity" одной сессии. Симметрия с issue spec'ом #109.
-**Consequences:** + Один struct, одна точка чтения у handlers. + Issue spec'у соответствует напрямую. − Concept-mixing (OS vs consumer). Mitigation — godoc на каждом поле явно.
-**Reversibility:** PARTIALLY REVERSIBLE — переезд в `SessionMeta` потребует migration v0.25.
+**Status:** Accepted (revised — initial draft was Option A `ConnInfo.TenantID`, replaced with Option C `SessionMeta`)
+**Context:** Куда положить `TenantID` + future Roles/AuthorizedAt/Claims? (a) ConnInfo (смешивает OS facts + consumer policy); (b) ProjectContext (нарушает его CWD-hash invariant); (c) новый struct `SessionMeta` с embedded ConnInfo.
+**Decision:** Option C — `SessionMeta` с embedded `ConnInfo`.
+```go
+type ConnInfo struct {                 // OS facts ONLY
+    PeerPid  int
+    PeerUid  int
+    Platform string
+}
+
+type SessionMeta struct {
+    Conn         ConnInfo               // embedded by value
+    TenantID     string                 // "" if AuthorizeSession not configured
+    AuthorizedAt time.Time              // zero if not authorized — discriminator
+}
+```
+Handler signatures: `HandleRequestWithSessionMeta(ctx, project, meta SessionMeta, req []byte)` + `HandleNotificationWithSessionMeta(ctx, project, meta SessionMeta, notif []byte)`. AuthorizeSession callback receives `ConnInfo` (not SessionMeta) — at authorize time TenantID is what the callback PRODUCES.
+**Consequences:**
+- ✅ Clean separation — ConnInfo = OS, SessionMeta = policy + auth metadata.
+- ✅ Extensibility — v0.25+ can add `Roles []string`, `Claims map[string]any`, `AuthExpiry time.Time` to SessionMeta without breaking ConnInfo or handler signatures.
+- ✅ Discriminator — `meta.AuthorizedAt.IsZero()` явно сигналит "session was never authorized" (no magic empty-TenantID check). Hyrum's-Law trap closed.
+- ✅ Issue spec compatibility — #111 wording "extend ProjectContext OR include in ConnInfo" is design preference, not invariant. SessionMeta satisfies both intents (carries ConnInfo by embedding, adds tenant identity).
+- ❌ Two structs instead of one — consumer reads `meta.Conn.PeerPid` instead of `conn.PeerPid`. Tradeoff accepted for clarity.
+- ❌ Two interface types — `*WithSessionMeta` (not `*WithConnInfo`).
+**Reversibility:** REVERSIBLE during v0.24.0 dev cycle; once v0.24.0 ships locked in until v0.25+.
 
 ### ADR-005: OnFrameReceived sync на reader goroutine, fail-open ≤1ms
 
