@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 )
 
@@ -44,6 +45,35 @@ type Session struct {
 	notifCh      chan []byte // async notification send buffer (drained by drainNotifications goroutine)
 	done         chan struct{}
 	closed       atomic.Bool
+
+	// metaMu guards meta. Owner.acceptLoop populates meta once after Bind
+	// succeeds (Conn populated; TenantID + AuthorizedAt remain zero) and
+	// optionally mutates it once more on AuthorizeSession AuthAllow. Every
+	// dispatch goroutine reads via Meta() — copy-on-read keeps callers from
+	// observing partial writes.
+	metaMu sync.Mutex
+	meta   muxcore.SessionMeta
+}
+
+// Meta returns a copy of the session's cached SessionMeta. The zero value
+// is returned until Owner.acceptLoop populates Conn (T011) and, optionally,
+// engine.Config.AuthorizeSession populates TenantID + AuthorizedAt (Phase 2).
+// Safe to call from any goroutine.
+func (s *Session) Meta() muxcore.SessionMeta {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	return s.meta
+}
+
+// SetMeta replaces the session's cached SessionMeta atomically. Intended to
+// be called at most twice per session: once after IPC Bind succeeds (Conn
+// populated) and once on AuthorizeSession AuthAllow (TenantID + AuthorizedAt
+// populated). Safe to call from any goroutine but Owner enforces the
+// "set-twice" discipline at the call site.
+func (s *Session) SetMeta(m muxcore.SessionMeta) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	s.meta = m
 }
 
 // NewSession creates a session from a reader/writer pair.

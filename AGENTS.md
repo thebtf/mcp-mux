@@ -57,13 +57,104 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.23.0)
+## muxcore Library API (v0.24.0)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.23.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.24.0
 ```
+
+### v0.24.0 — multi-tenant extensions: ConnInfo + SessionMeta + AuthorizeSession + OnFrameReceived (#109, #110, #111, #112)
+
+**No breaking changes.** All four extensions are additive — nil-default
+callbacks and optional interface upgrades preserve pre-v0.24 behavior
+byte-identically for non-adopting consumers.
+
+| API | Semantics |
+|-----|-----------|
+| `muxcore.ConnInfo` | New value type carrying OS-level peer identity (`PeerPid`, `PeerUid`, `Platform`). Populated once at accept time via `peerCreds(conn)` on Linux (SO_PEERCRED), Windows (`GetNamedPipeClientProcessId` via the `Fd()` exposed by `*go-winio.win32File`), and macOS (LOCAL_PEERPID + GetsockoptXucred). Zero-value semantics: `PeerPid==0`/`PeerUid==0` ≡ "unavailable". Stable platform identifier constants: `PlatformLinuxUnix`, `PlatformWindowsNamedPipe`, `PlatformDarwinUnix`, `PlatformUnknown`. |
+| `muxcore.SessionMeta` | New value type combining `Conn ConnInfo` (OS facts) with `TenantID string` + `AuthorizedAt time.Time` (consumer-policy fields produced by AuthorizeSession). `IsAuthorized()` discriminator distinguishes "callback not configured" (zero `AuthorizedAt`) from "AuthAllow with empty TenantID" (legitimate per FR-3). |
+| `muxcore.AuthDecision` + `muxcore.SessionAuth` | New types backing AuthorizeSession verdicts (`AuthAllow`, `AuthDeny`). |
+| `muxcore.FrameAction` | New type backing OnFrameReceived verdicts (`FramePass=0`, `FrameDrop=1`, `FrameError=2`). Numeric ordering preserves fail-open semantics — `FramePass` is the zero value, returned on timeout / panic / nil callback. |
+| `muxcore.NotificationHandlerWithSessionMeta` | Optional handler upgrade — receives `SessionMeta` on every notification. Owner type-asserts at dispatch; handlers satisfying both legacy and `*WithSessionMeta` see ONLY the WithSessionMeta path (EC-7). |
+| `muxcore.SessionHandlerWithSessionMeta` | Optional handler upgrade — receives `SessionMeta` on every request. Same dispatch precedence as above. |
+| `engine.Config.AuthorizeSession` | Single-shot per-session admission gate. Invoked AFTER IPC handshake / peer-creds extraction and BEFORE AddSession. AuthDeny closes the connection with JSON-RPC -32000 + reason and never spawns upstream. AuthAllow stamps SessionMeta.TenantID + AuthorizedAt. Panics recovered → AuthDeny{Reason:"authorize panic"}. |
+| `engine.Config.OnFrameReceived` | Per-frame inbound admission hook. Synchronous on reader goroutine, 1ms budget (overrun → FramePass), panic-safe (panic → FramePass). FrameDrop = silent discard; FrameError = JSON-RPC -32004 with msg.ID preserved; FramePass = normal dispatch. Scope is INBOUND ONLY (CHK014) — outbound responses and synthetic notifications are not intercepted. |
+
+**Migration:** Existing consumers (aimux, engram, mcp-launcher) require zero source change. All callbacks default to nil; both new handler interfaces are optional upgrades.
+
+**Migration for aimux (multi-tenant adoption):**
+
+```go
+import muxcore "github.com/thebtf/mcp-mux/muxcore"
+
+// Optional handler upgrade — consume meta.Conn / meta.TenantID inside
+// every dispatch.
+type aimuxHandler struct{ /* ... */ }
+
+func (h *aimuxHandler) HandleRequest(ctx context.Context, p muxcore.ProjectContext, req []byte) ([]byte, error) {
+    // legacy fallback — used only by sessions that bypassed the
+    // *WithSessionMeta dispatch path
+    return nil, fmt.Errorf("legacy dispatch not supported")
+}
+
+func (h *aimuxHandler) HandleRequestWithSessionMeta(
+    ctx context.Context,
+    p muxcore.ProjectContext,
+    meta muxcore.SessionMeta,
+    req []byte,
+) ([]byte, error) {
+    // meta.Conn.PeerPid / meta.Conn.PeerUid / meta.Conn.Platform
+    // meta.TenantID — if AuthorizeSession was wired
+    return doWork(ctx, p, meta, req)
+}
+
+eng, err := engine.New(engine.Config{
+    Name:           "aimux",
+    SessionHandler: &aimuxHandler{},
+
+    // Pre-dispatch admission gate — runs once per session.
+    AuthorizeSession: func(ctx context.Context, conn muxcore.ConnInfo, p muxcore.ProjectContext) muxcore.SessionAuth {
+        tenant, ok := lookupTenant(conn.PeerPid)
+        if !ok {
+            return muxcore.SessionAuth{Decision: muxcore.AuthDeny, Reason: "tenant_not_enrolled"}
+        }
+        return muxcore.SessionAuth{Decision: muxcore.AuthAllow, TenantID: tenant}
+    },
+
+    // Per-frame admission hook — runs on every inbound request/notification.
+    // Sync on reader goroutine, 1ms budget. Heavy work belongs elsewhere.
+    OnFrameReceived: func(sessionID string, frameSize int, method string) muxcore.FrameAction {
+        if rateLimiter.Allow(sessionID) {
+            return muxcore.FramePass
+        }
+        return muxcore.FrameError // -32004 to client; no dispatch
+    },
+
+    Logger: logger,
+})
+if err != nil {
+    return err
+}
+```
+
+**Cross-platform peer-credential extraction:**
+
+| Platform | PeerPid source | PeerUid source |
+|----------|----------------|----------------|
+| Linux | `SO_PEERCRED` ucred (existing) | `SO_PEERCRED` ucred (shared `readPeerUcred` helper — one syscall returns Pid+Uid+Gid) |
+| Windows (named pipe) | `GetNamedPipeClientProcessId(Fd())` via `interface{ Fd() uintptr }` assertion — winio's `*win32File` already exposes Fd publicly via embedding (no fork required) | always 0 (Windows has no UID concept comparable to Unix) |
+| Darwin | `getsockopt(SOL_LOCAL, LOCAL_PEERPID)` | `GetsockoptXucred(SOL_LOCAL, LOCAL_PEERCRED)` — kernel xucred struct (Getpeereid is not exposed by `x/sys/unix`) |
+
+**Tests landed in this release:**
+- Phase 1 (`G001`): `TestPeerCreds_LoopbackPID_Linux`, `TestPeerCreds_LoopbackPID_Windows`, `TestPeerCreds_LoopbackPID_Darwin`, `TestDispatch_WithSessionMetaPreferredOverLegacy`, `TestDispatch_LegacyHandlerByteIdentical_v23`
+- Phase 2 (`G002`): `TestAuthorize_DenyClosesConnection`, `TestAuthorize_AllowPopulatesSessionMeta`, `TestAuthorize_NilConfigUnchangedDispatch`, `TestAuthorize_PanicTreatedAsDeny`, `TestAuthorize_AllowEmptyTenantIdLegitimate`, `TestAuthorize_DenyNoUpstreamSpawn`
+- Phase 3 (`G003`): `TestFrameHook_PassDispatchesNormally`, `TestFrameHook_DropSilentDiscard`, `TestFrameHook_ErrorRespondsWithJSONRPC`, `TestFrameHook_TimeoutGracefulDegradation`, `TestFrameHook_PanicTreatedAsPass`, `TestFrameHook_NilUnchangedDispatch`, `TestFrameHook_OutboundFramesNotIntercepted`, `TestFrameHook_OverheadP99`, `BenchmarkFrameHook_NoopOverhead` (804 ns/op — well under spec's 100µs budget)
+
+**Cross-version coexistence:** v0.24.0 daemon coexists with pre-v0.24 consumers. nil-default for every new field preserves the v0.23 dispatch path byte-identically. v0.24 consumers can opt in incrementally — adopt `*WithSessionMeta` interfaces first, then `AuthorizeSession`, then `OnFrameReceived` independently as policy needs arise.
+
+---
 
 ### v0.23.0 — engine.Config.OnInject for fire-and-forget IPC frame injection (#107)
 

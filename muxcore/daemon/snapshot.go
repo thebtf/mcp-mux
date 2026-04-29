@@ -175,6 +175,14 @@ func (d *Daemon) loadSnapshot() int {
 			ControlPath:    controlPath,
 			ServerID:       sid,
 			TokenHandshake: true,
+			// Forward v0.24 multi-tenant callbacks to restored owners. Fresh
+			// spawn in spawnOnce already does this; without it, snapshot/
+			// handoff-restored owners would silently lose AuthorizeSession +
+			// OnFrameReceived after a graceful daemon restart, breaking the
+			// pre-dispatch admission gate and per-frame hook for the
+			// reattached upstream. Closes CodeRabbit CRIT review on PR #113.
+			AuthorizeSession: d.authorizeSession,
+			OnFrameReceived:  d.onFrameReceived,
 			OnZeroSessions: func(serverID string) {
 				d.onZeroSessions(serverID)
 			},

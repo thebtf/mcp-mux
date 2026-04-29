@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -101,6 +102,13 @@ type Owner struct {
 	env            map[string]string                                                  // upstream env captured at spawn (for background respawn)
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
 	sessionHandler muxcore.SessionHandler                                             // structured in-process handler (nil = pipe or subprocess)
+	// Cached *WithSessionMeta type assertions, populated once when
+	// sessionHandler is wired in NewOwner / NewOwnerFromSnapshot /
+	// NewOwnerFromHandoff. Hot-path dispatch reads these directly instead
+	// of re-running the assertion on every frame (CodeRabbit nitpick on
+	// PR #113). nil = handler does not implement the upgrade.
+	notificationHandlerWithMeta muxcore.NotificationHandlerWithSessionMeta
+	sessionHandlerWithMeta      muxcore.SessionHandlerWithSessionMeta
 	upstreamWriter io.Writer                                                          // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID       string                                                             // server identity hash
 	listener       net.Listener
@@ -110,6 +118,17 @@ type Owner struct {
 	onUpstreamExit       func(serverID string)
 	onPersistentDetected func(serverID string)
 	onCacheReady         func(serverID string)
+
+	// authorizeSession is the optional pre-dispatch session-admission gate
+	// forwarded from engine.Config / daemon.Config / OwnerConfig. nil = no
+	// gate (pre-v0.24 behaviour). Read-only after construction.
+	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+
+	// onFrameReceived is the optional per-frame admission hook forwarded
+	// from engine.Config. handleDownstreamMessage invokes it on every
+	// inbound frame with a 1 ms budget. nil = no hook (pre-v0.24 behaviour).
+	// Read-only after construction.
+	onFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
 
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
@@ -238,6 +257,29 @@ type OwnerConfig struct {
 	// successor adopts its result directly.
 	CachedClassification classify.SharingMode
 
+	// AuthorizeSession, when non-nil, gates every accepted session BEFORE
+	// AddSession is called. acceptLoop invokes the callback with peer
+	// credentials + project context and acts on the returned SessionAuth:
+	// AuthDeny closes the connection with JSON-RPC -32000 and never adds
+	// the session; AuthAllow stamps SessionMeta.TenantID + AuthorizedAt.
+	// Panics are recovered and treated as AuthDeny{Reason: "authorize panic"}.
+	// The callback's ctx is bound to the owner's lifecycle: cancelling
+	// it (via Owner.Shutdown) interrupts in-flight authorization RPCs.
+	// AuthDeny prevents per-session resource cost (session-table insert,
+	// dispatch goroutines, frame routing state) but does NOT stop the
+	// upstream process — upstream is per-OWNER and spawns at NewOwner
+	// time, before the first session arrives. Use a daemon-level
+	// pre-spawn check if you must gate upstream creation entirely.
+	// nil-default preserves pre-v0.24 behaviour.
+	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+
+	// OnFrameReceived, when non-nil, is invoked by handleDownstreamMessage
+	// for every inbound frame BEFORE dispatch with a 1 ms callback budget
+	// (overrun → FramePass; panic → FramePass). See
+	// engine.Config.OnFrameReceived for the full semantics.
+	// nil-default preserves pre-v0.24 behaviour.
+	OnFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -282,6 +324,8 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
@@ -309,6 +353,9 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	if o.tokenHandshake {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
+
+	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
+	o.cacheHandlerInterfaces()
 
 	// Pre-populate caches from snapshot
 	if snap.CachedInit != "" {
@@ -531,6 +578,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
@@ -554,6 +603,9 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	if o.tokenHandshake {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
+
+	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
+	o.cacheHandlerInterfaces()
 
 	// Wire notifier into sessionHandler if it supports NotifierAware.
 	if o.sessionHandler != nil {
@@ -747,6 +799,41 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
+	// OnFrameReceived hook (FR-4 / NFR-2) — invoked synchronously on the
+	// reader goroutine for every inbound frame, AFTER IsNotification /
+	// IsRequest classification but BEFORE any dispatch / cache replay /
+	// upstream forwarding. nil-default skips the hook entirely (byte-
+	// identical to v0.23). Scope is inbound-only (CHK014): outbound
+	// responses written by SessionHandler and synthetic notifications
+	// generated by the Owner never enter this function.
+	switch o.invokeFrameHook(s, msg) {
+	case muxcore.FrameDrop:
+		// Silent discard — no dispatch, no client response.
+		return nil
+	case muxcore.FrameError:
+		// JSON-RPC 2.0 §4.1 forbids any response (including errors) to a
+		// notification. When the hook returns FrameError for a notification
+		// we degrade to silent FrameDrop semantics — emitting `{"id":null,
+		// ...}` would produce a structurally valid JSON-RPC response but
+		// violate the protocol's notification contract and confuse strict
+		// clients. Documented as the "FrameError on notification → drop"
+		// rule (Gemini code review #113).
+		if msg.IsNotification() {
+			o.logger.Printf("frame_hook_error_on_notification_dropped sid=%d method=%s", s.ID, msg.Method)
+			return nil
+		}
+		// Request path: respond with -32004 ('rate limited') preserving
+		// msg.ID so the client can correlate the failure with the
+		// originating request.
+		errBytes, marshalErr := buildJSONRPCErrorBytes(msg.ID, -32004, "rate limited")
+		if marshalErr != nil {
+			o.logger.Printf("frame_hook_error_marshal sid=%d method=%s err=%v", s.ID, msg.Method, marshalErr)
+			return nil
+		}
+		return s.WriteRaw(errBytes)
+	}
+	// FramePass (zero value, default) — fall through to normal dispatch.
+
 	switch {
 	case msg.IsNotification():
 		// Suppress notifications/initialized for sessions that received a cached initialize response
@@ -763,14 +850,21 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		if msg.Method == "notifications/cancelled" {
 			return o.forwardCancelledNotification(s, msg)
 		}
-		// NotificationHandler dispatch for SessionHandler mode
+		// NotificationHandler dispatch for SessionHandler mode. Prefer the
+		// *WithSessionMeta upgrade when implemented (FR-1, EC-7) — handlers
+		// that satisfy both interfaces see ONLY the WithSessionMeta path.
+		// Cached at owner construction (cacheHandlerInterfaces) so the
+		// per-frame hot path skips a type assertion (CodeRabbit nitpick).
 		if o.sessionHandler != nil {
-			if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
-				project := muxcore.ProjectContext{
-					ID:  muxcore.ProjectContextID(s.Cwd),
-					Cwd: s.Cwd,
-					Env: s.Env,
-				}
+			project := muxcore.ProjectContext{
+				ID:  muxcore.ProjectContextID(s.Cwd),
+				Cwd: s.Cwd,
+				Env: s.Env,
+			}
+			if o.notificationHandlerWithMeta != nil {
+				meta := s.Meta()
+				go o.notificationHandlerWithMeta.HandleNotificationWithSessionMeta(context.Background(), project, meta, msg.Raw)
+			} else if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
 				go nh.HandleNotification(context.Background(), project, msg.Raw)
 			}
 			return nil // notifications don't need forwarding to upstream
@@ -951,7 +1045,18 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 			}
 		}()
 
-		resp, err := o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
+		// Prefer the *WithSessionMeta upgrade when implemented (FR-2, EC-7) —
+		// handlers that satisfy both interfaces see ONLY the WithSessionMeta
+		// path. Cached at owner construction (cacheHandlerInterfaces) so
+		// the per-frame hot path skips a type assertion (CodeRabbit
+		// nitpick on PR #113).
+		var resp []byte
+		var err error
+		if o.sessionHandlerWithMeta != nil {
+			resp, err = o.sessionHandlerWithMeta.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
+		} else {
+			resp, err = o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
+		}
 		if err != nil {
 			// Route through buildJSONRPCErrorBytes so error messages with JSON-special
 			// characters (quotes, backslashes, newlines, Windows paths, control bytes)
@@ -1688,7 +1793,208 @@ func (o *Owner) acceptLoop() {
 				continue
 			}
 		}
+
+		// Populate cached SessionMeta with OS-level peer credentials before
+		// dispatch (FR-5/FR-6). Unconditional — token-handshake-disabled
+		// callers (EC-6) still receive Conn populated; AuthorizeSession
+		// optionally mutates TenantID + AuthorizedAt from this baseline.
+		// peerCreds normalises -1 sentinels to 0.
+		info := peerCreds(conn)
+		s.SetMeta(muxcore.SessionMeta{Conn: info})
+		o.logger.Printf("peer_creds_extracted sid=%d pid=%d uid=%d platform=%s",
+			s.ID, info.PeerPid, info.PeerUid, info.Platform)
+
+		// AuthorizeSession gate (FR-3). Single-shot per session; runs after
+		// peer-creds extraction and BEFORE AddSession. nil = no gate
+		// (byte-identical to v0.23 dispatch path).
+		//
+		// Shutdown handling (CHK015 / EC-11): if owner.done fires before
+		// the callback runs, refuse the session without invoking.
+		// Panic guard: any panic inside the callback is recovered and
+		// treated as AuthDeny{Reason: "authorize panic"} — the daemon
+		// continues accepting subsequent connections.
+		if o.authorizeSession != nil {
+			select {
+			case <-o.done:
+				o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+				conn.Close()
+				s.Close()
+				continue
+			default:
+			}
+
+			project := muxcore.ProjectContext{
+				ID:  muxcore.ProjectContextID(s.Cwd),
+				Cwd: s.Cwd,
+				Env: s.Env,
+			}
+			verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+
+			// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
+			// MAJOR review on PR #113). The pre-callback check at the top
+			// of the authorize block closes the gap up to the call, but a
+			// long-running callback (external RPC, slow tenant lookup) can
+			// outlast o.done. Without this re-check, AuthAllow would still
+			// reach AddSession during teardown, registering a session in a
+			// shutting-down owner.
+			select {
+			case <-o.done:
+				o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
+				conn.Close()
+				s.Close()
+				continue
+			default:
+			}
+
+			if verdict.Decision == muxcore.AuthDeny {
+				// Apply the documented "empty Reason → stable fallback"
+				// contract from session_auth.go SessionAuth godoc. Without
+				// this fallback the JSON-RPC error.message would be an
+				// empty string and consumers' deny-categorisation logic
+				// (which keys off Reason) would silently bucket every
+				// such denial together. CodeRabbit MINOR on PR #113.
+				reason := verdict.Reason
+				if reason == "" {
+					reason = "session not authorized"
+				}
+				if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, reason); marshalErr == nil {
+					// Write the JSON-RPC -32000 error directly to the conn
+					// (not through s.WriteRaw — the session is being torn
+					// down, no need for the buffered-writer/bufio path).
+					_, _ = conn.Write(append(errBytes, '\n'))
+				} else {
+					o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
+				}
+				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
+				conn.Close()
+				s.Close()
+				continue
+			}
+
+			// AuthAllow: stamp tenant + authorized timestamp on cached meta.
+			// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
+			s.SetMeta(muxcore.SessionMeta{
+				Conn:         info,
+				TenantID:     verdict.TenantID,
+				AuthorizedAt: time.Now(),
+			})
+			o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
+		}
+
 		o.AddSession(s)
+	}
+}
+
+// invokeAuthorize calls cb under a defer/recover guard with an owner-bound
+// context. Cancellation propagates from o.done, so a long-running callback
+// (external RPC, slow tenant lookup) can observe shutdown via ctx.Done()
+// and abort early instead of running to completion against a teardown.
+// Panic is logged with the panic value and converted to
+// AuthDeny{Reason: "authorize panic"}; the daemon continues accepting
+// subsequent connections.
+func invokeAuthorize(
+	o *Owner,
+	cb func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth,
+	info muxcore.ConnInfo,
+	project muxcore.ProjectContext,
+	sid int,
+	logger *log.Logger,
+) (verdict muxcore.SessionAuth) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("auth_panic sid=%d recovered=%v", sid, r)
+			verdict = muxcore.SessionAuth{Decision: muxcore.AuthDeny, Reason: "authorize panic"}
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-o.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return cb(ctx, info, project)
+}
+
+// frameHookBudget is the per-frame OnFrameReceived deadline (NFR-2).
+// Overrun is treated as FramePass to keep the reader goroutine moving;
+// the late callback completion is logged but its returned action is dropped.
+const frameHookBudget = 1 * time.Millisecond
+
+// cacheHandlerInterfaces resolves the optional *WithSessionMeta interface
+// upgrades exactly once at owner construction. Hot-path dispatch
+// (handleDownstreamMessage / dispatchToSessionHandler) reads the resulting
+// fields directly instead of re-running the type assertion on every frame.
+// Safe to call multiple times — repeated calls overwrite with the same
+// values. Invoked after o.sessionHandler is wired by every constructor
+// path (NewOwner, NewOwnerFromSnapshot, newOwnerWithProcess from handoff).
+func (o *Owner) cacheHandlerInterfaces() {
+	if o.sessionHandler == nil {
+		o.notificationHandlerWithMeta = nil
+		o.sessionHandlerWithMeta = nil
+		return
+	}
+	if h, ok := o.sessionHandler.(muxcore.NotificationHandlerWithSessionMeta); ok {
+		o.notificationHandlerWithMeta = h
+	}
+	if h, ok := o.sessionHandler.(muxcore.SessionHandlerWithSessionMeta); ok {
+		o.sessionHandlerWithMeta = h
+	}
+}
+
+// invokeFrameHook runs o.onFrameReceived under a 1 ms cancellation-free
+// timeout (the callback continues running after timeout but its result is
+// discarded — Go has no kill-goroutine primitive). Panics are recovered;
+// timeout / panic / nil all map to FramePass (fail-open per FR-4 / NFR-2).
+//
+// Hot-path notes (Gemini code review #113):
+//   - strconv.Itoa replaces fmt.Sprintf("%d", ...) — avoids fmt's reflection
+//     pipeline and the *fmt.pp pool churn on every frame.
+//   - time.NewTimer + Stop replaces time.After — time.After leaks a
+//     unstoppable timer for `frameHookBudget` after the fast-path branch
+//     wins, which under load creates GC pressure proportional to frame
+//     rate. NewTimer + Stop returns the timer to the pool on the success
+//     path.
+//   - The done channel is buffered (cap=1) so a callback returning AFTER
+//     the budget elapses does not deadlock its goroutine on send. The
+//     verdict is silently dropped; we already logged frame_hook_timeout.
+//   - We accept the goroutine-per-frame cost as the price of NFR-2's
+//     hard 1 ms budget. A pure-synchronous variant (suggested by Gemini)
+//     would remove the budget entirely, requiring a spec amendment.
+func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameAction {
+	if o.onFrameReceived == nil {
+		return muxcore.FramePass
+	}
+	sid := strconv.Itoa(s.ID)
+	method := msg.Method
+	frameSize := len(msg.Raw)
+
+	done := make(chan muxcore.FrameAction, 1) // buffered so a late return never blocks the goroutine
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				o.logger.Printf("frame_hook_panic sid=%s method=%s recovered=%v", sid, method, r)
+				done <- muxcore.FramePass
+			}
+		}()
+		done <- o.onFrameReceived(sid, frameSize, method)
+	}()
+
+	timer := time.NewTimer(frameHookBudget)
+	select {
+	case action := <-done:
+		if !timer.Stop() {
+			// Timer already fired; drain its channel so the runtime can
+			// reclaim the timer immediately instead of holding it until GC.
+			<-timer.C
+		}
+		return action
+	case <-timer.C:
+		o.logger.Printf("frame_hook_timeout sid=%s method=%s elapsed_ms_min=%d",
+			sid, method, int64(frameHookBudget/time.Millisecond))
+		return muxcore.FramePass
 	}
 }
 

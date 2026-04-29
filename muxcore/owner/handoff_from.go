@@ -77,6 +77,8 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
@@ -96,6 +98,9 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	if o.tokenHandshake {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
+
+	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
+	o.cacheHandlerInterfaces()
 
 	// Apply cached classification if provided — skip the classify round-trip.
 	if cfg.CachedClassification != "" {
