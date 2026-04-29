@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -790,8 +791,20 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		// Silent discard — no dispatch, no client response.
 		return nil
 	case muxcore.FrameError:
-		// JSON-RPC -32004 ('rate limited') response preserving msg.ID so
-		// the client can correlate the failure with the originating request.
+		// JSON-RPC 2.0 §4.1 forbids any response (including errors) to a
+		// notification. When the hook returns FrameError for a notification
+		// we degrade to silent FrameDrop semantics — emitting `{"id":null,
+		// ...}` would produce a structurally valid JSON-RPC response but
+		// violate the protocol's notification contract and confuse strict
+		// clients. Documented as the "FrameError on notification → drop"
+		// rule (Gemini code review #113).
+		if msg.IsNotification() {
+			o.logger.Printf("frame_hook_error_on_notification_dropped sid=%d method=%s", s.ID, msg.Method)
+			return nil
+		}
+		// Request path: respond with -32004 ('rate limited') preserving
+		// msg.ID so the client can correlate the failure with the
+		// originating request.
 		errBytes, marshalErr := buildJSONRPCErrorBytes(msg.ID, -32004, "rate limited")
 		if marshalErr != nil {
 			o.logger.Printf("frame_hook_error_marshal sid=%d method=%s err=%v", s.ID, msg.Method, marshalErr)
@@ -1849,11 +1862,26 @@ const frameHookBudget = 1 * time.Millisecond
 // timeout (the callback continues running after timeout but its result is
 // discarded — Go has no kill-goroutine primitive). Panics are recovered;
 // timeout / panic / nil all map to FramePass (fail-open per FR-4 / NFR-2).
+//
+// Hot-path notes (Gemini code review #113):
+//   - strconv.Itoa replaces fmt.Sprintf("%d", ...) — avoids fmt's reflection
+//     pipeline and the *fmt.pp pool churn on every frame.
+//   - time.NewTimer + Stop replaces time.After — time.After leaks a
+//     unstoppable timer for `frameHookBudget` after the fast-path branch
+//     wins, which under load creates GC pressure proportional to frame
+//     rate. NewTimer + Stop returns the timer to the pool on the success
+//     path.
+//   - The done channel is buffered (cap=1) so a callback returning AFTER
+//     the budget elapses does not deadlock its goroutine on send. The
+//     verdict is silently dropped; we already logged frame_hook_timeout.
+//   - We accept the goroutine-per-frame cost as the price of NFR-2's
+//     hard 1 ms budget. A pure-synchronous variant (suggested by Gemini)
+//     would remove the budget entirely, requiring a spec amendment.
 func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameAction {
 	if o.onFrameReceived == nil {
 		return muxcore.FramePass
 	}
-	sid := fmt.Sprintf("%d", s.ID)
+	sid := strconv.Itoa(s.ID)
 	method := msg.Method
 	frameSize := len(msg.Raw)
 
@@ -1868,10 +1896,16 @@ func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameA
 		done <- o.onFrameReceived(sid, frameSize, method)
 	}()
 
+	timer := time.NewTimer(frameHookBudget)
 	select {
 	case action := <-done:
+		if !timer.Stop() {
+			// Timer already fired; drain its channel so the runtime can
+			// reclaim the timer immediately instead of holding it until GC.
+			<-timer.C
+		}
 		return action
-	case <-time.After(frameHookBudget):
+	case <-timer.C:
 		o.logger.Printf("frame_hook_timeout sid=%s method=%s elapsed_ms_min=%d",
 			sid, method, int64(frameHookBudget/time.Millisecond))
 		return muxcore.FramePass

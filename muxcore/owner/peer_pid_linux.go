@@ -34,11 +34,26 @@ func readPeerUcred(conn net.Conn) (*syscall.Ucred, bool) {
 }
 
 // readPeerPID returns the peer process ID from a Unix domain socket connection
-// using SO_PEERCRED. Linux-specific; only called from acceptLoop. Returns -1
-// on any error (transport mismatch, syscall failure).
+// using SO_PEERCRED. Linux-specific; called from acceptLoop only on the
+// rejection-logging path (failed handshake), where pid alone is sufficient.
+// The dispatch-time path uses readPeerCreds (combined PID+UID, single syscall)
+// instead. Returns -1 on any error (transport mismatch, syscall failure).
 func readPeerPID(conn net.Conn) int {
 	if u, ok := readPeerUcred(conn); ok {
 		return int(u.Pid)
 	}
 	return -1
+}
+
+// readPeerCreds returns peer (pid, uid) from a Unix domain socket connection
+// using a SINGLE SO_PEERCRED getsockopt call. Replaces the v0.24 dispatcher
+// double-syscall pattern flagged by Gemini code review (#113); the Linux
+// kernel returns the full ucred struct per call so reading pid and uid
+// separately wastes a syscall. Returns (-1, -1) on transport mismatch or
+// syscall failure.
+func readPeerCreds(conn net.Conn) (pid, uid int) {
+	if u, ok := readPeerUcred(conn); ok {
+		return int(u.Pid), int(u.Uid)
+	}
+	return -1, -1
 }

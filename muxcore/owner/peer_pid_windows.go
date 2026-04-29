@@ -13,7 +13,9 @@ import (
 // connection. winio's *win32File embeds a publicly-readable file descriptor via
 // Fd() uintptr (architecture.md ADR-006); we type-assert the pipe through the
 // minimal `interface{ Fd() uintptr }` surface and call
-// windows.GetNamedPipeClientProcessId on the resulting handle.
+// windows.GetNamedPipeClientProcessId on the resulting handle. Used from
+// acceptLoop only on the rejection-logging path; the dispatch-time path uses
+// readPeerCreds.
 //
 // Returns -1 when:
 //   - conn does not expose Fd() (unexpected transport)
@@ -31,4 +33,15 @@ func readPeerPID(conn net.Conn) int {
 		return -1
 	}
 	return int(pid)
+}
+
+// readPeerCreds returns peer (pid, uid) for a winio named-pipe connection on
+// Windows. PID comes from GetNamedPipeClientProcessId; uid is fixed at 0
+// because the Windows security model has no Unix-equivalent UID concept
+// (see peer_uid_windows.go). Returns (-1, 0) on transport mismatch or
+// GetNamedPipeClientProcessId failure — uid is intentionally NOT a sentinel
+// on Windows because zero is the documented stable value, not a failure
+// signal. peerCreds normalises -1 to 0 per the "0 == unavailable" contract.
+func readPeerCreds(conn net.Conn) (pid, uid int) {
+	return readPeerPID(conn), 0
 }
