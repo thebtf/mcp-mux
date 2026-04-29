@@ -50,6 +50,39 @@ type NotificationHandler interface {
 	HandleNotification(ctx context.Context, project ProjectContext, notification []byte)
 }
 
+// NotificationHandlerWithSessionMeta is the optional upgrade of
+// NotificationHandler that also receives the session's SessionMeta. Owner
+// performs a single type-assertion on the registered SessionHandler at
+// dispatch time: if the assertion succeeds, HandleNotificationWithSessionMeta
+// is called and HandleNotification is NOT called for the same frame (per
+// FR-1, EC-7 — handlers implementing both see only the WithSessionMeta path).
+//
+// SessionMeta is captured once at accept time (see Owner.acceptLoop wiring)
+// and reused unchanged for every request and notification on the same
+// session. PeerPid/PeerUid/Platform reflect the OS-level peer identity at
+// connection establishment; TenantID and AuthorizedAt reflect the verdict
+// of engine.Config.AuthorizeSession (zero values when the callback is not
+// configured).
+type NotificationHandlerWithSessionMeta interface {
+	NotificationHandler
+	HandleNotificationWithSessionMeta(ctx context.Context, project ProjectContext, meta SessionMeta, notification []byte)
+}
+
+// SessionHandlerWithSessionMeta is the optional upgrade of SessionHandler
+// that also receives the session's SessionMeta on every request. Owner
+// performs a single type-assertion on the registered SessionHandler at
+// dispatch time: if the assertion succeeds, HandleRequestWithSessionMeta
+// is called and HandleRequest is NOT called for the same frame (FR-2, EC-7).
+//
+// SessionMeta is identical for every request and every notification on the
+// same session — populated once at accept time and reused for the session's
+// lifetime. Implementations MUST treat zero PeerPid/PeerUid as "unavailable"
+// (peerCreds extraction failure or unsupported transport) rather than
+// "process 0" / "root".
+type SessionHandlerWithSessionMeta interface {
+	HandleRequestWithSessionMeta(ctx context.Context, project ProjectContext, meta SessionMeta, request []byte) (response []byte, err error)
+}
+
 // Notifier allows the handler to push notifications to specific CC sessions.
 type Notifier interface {
 	// Notify sends a JSON-RPC notification to a specific project session.
