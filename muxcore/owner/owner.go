@@ -763,14 +763,19 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		if msg.Method == "notifications/cancelled" {
 			return o.forwardCancelledNotification(s, msg)
 		}
-		// NotificationHandler dispatch for SessionHandler mode
+		// NotificationHandler dispatch for SessionHandler mode. Prefer the
+		// *WithSessionMeta upgrade when implemented (FR-1, EC-7) — handlers
+		// that satisfy both interfaces see ONLY the WithSessionMeta path.
 		if o.sessionHandler != nil {
-			if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
-				project := muxcore.ProjectContext{
-					ID:  muxcore.ProjectContextID(s.Cwd),
-					Cwd: s.Cwd,
-					Env: s.Env,
-				}
+			project := muxcore.ProjectContext{
+				ID:  muxcore.ProjectContextID(s.Cwd),
+				Cwd: s.Cwd,
+				Env: s.Env,
+			}
+			if nh, ok := o.sessionHandler.(muxcore.NotificationHandlerWithSessionMeta); ok {
+				meta := s.Meta()
+				go nh.HandleNotificationWithSessionMeta(context.Background(), project, meta, msg.Raw)
+			} else if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
 				go nh.HandleNotification(context.Background(), project, msg.Raw)
 			}
 			return nil // notifications don't need forwarding to upstream
@@ -951,7 +956,15 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 			}
 		}()
 
-		resp, err := o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
+		// Prefer the *WithSessionMeta upgrade when implemented (FR-2, EC-7) —
+		// handlers that satisfy both interfaces see ONLY the WithSessionMeta path.
+		var resp []byte
+		var err error
+		if h, ok := o.sessionHandler.(muxcore.SessionHandlerWithSessionMeta); ok {
+			resp, err = h.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
+		} else {
+			resp, err = o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
+		}
 		if err != nil {
 			// Route through buildJSONRPCErrorBytes so error messages with JSON-special
 			// characters (quotes, backslashes, newlines, Windows paths, control bytes)
