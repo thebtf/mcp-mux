@@ -797,3 +797,170 @@ func TestNotifier_MultiSessionSameProject(t *testing.T) {
 		t.Errorf("sessB did not receive notification; got: %q", lineB)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SessionMeta dispatch tests (T014, T015)
+// ---------------------------------------------------------------------------
+
+// mockMetaRequest captures one HandleRequestWithSessionMeta invocation.
+type mockMetaRequest struct {
+	project muxcore.ProjectContext
+	meta    muxcore.SessionMeta
+	request []byte
+}
+
+// mockSessionHandlerBoth implements BOTH HandleRequest (legacy) AND
+// HandleRequestWithSessionMeta (upgrade). EC-7 requires Owner to dispatch
+// only the WithSessionMeta path on such handlers.
+type mockSessionHandlerBoth struct {
+	mockSessionHandler
+	metaMu       sync.Mutex
+	metaRequests []mockMetaRequest
+}
+
+func (m *mockSessionHandlerBoth) HandleRequestWithSessionMeta(
+	_ context.Context,
+	p muxcore.ProjectContext,
+	meta muxcore.SessionMeta,
+	req []byte,
+) ([]byte, error) {
+	m.metaMu.Lock()
+	m.metaRequests = append(m.metaRequests, mockMetaRequest{project: p, meta: meta, request: req})
+	m.metaMu.Unlock()
+	return []byte(`{"jsonrpc":"2.0","id":"1","result":"meta-handled"}`), nil
+}
+
+func (m *mockSessionHandlerBoth) capturedMeta() []mockMetaRequest {
+	m.metaMu.Lock()
+	defer m.metaMu.Unlock()
+	out := make([]mockMetaRequest, len(m.metaRequests))
+	copy(out, m.metaRequests)
+	return out
+}
+
+// TestDispatch_WithSessionMetaPreferredOverLegacy (T014) — when a handler
+// implements both legacy HandleRequest and HandleRequestWithSessionMeta,
+// Owner must dispatch via the WithSessionMeta path exclusively (FR-2, EC-7).
+func TestDispatch_WithSessionMetaPreferredOverLegacy(t *testing.T) {
+	h := &mockSessionHandlerBoth{}
+	o := newDispatchOwner(h)
+	sess, buf := newTestSession("/project-meta")
+	defer sess.Close()
+
+	expectedMeta := muxcore.SessionMeta{
+		Conn: muxcore.ConnInfo{
+			PeerPid:  1234,
+			PeerUid:  5678,
+			Platform: muxcore.PlatformLinuxUnix,
+		},
+		TenantID:     "tenant-alpha",
+		AuthorizedAt: time.Now(),
+	}
+	sess.SetMeta(expectedMeta)
+
+	msg := parseMessage([]byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`))
+	if err := o.dispatchToSessionHandler(sess, msg); err != nil {
+		t.Fatalf("dispatch error: %v", err)
+	}
+
+	line := waitForWrite(t, buf, 2*time.Second)
+	if !strings.Contains(line, "meta-handled") {
+		t.Errorf("expected meta-handled response, got %q", line)
+	}
+
+	metaCalls := h.capturedMeta()
+	legacyCalls := h.captured()
+	if len(metaCalls) != 1 {
+		t.Fatalf("expected 1 WithSessionMeta call, got %d", len(metaCalls))
+	}
+	if len(legacyCalls) != 0 {
+		t.Fatalf("expected 0 legacy HandleRequest calls (EC-7), got %d", len(legacyCalls))
+	}
+
+	got := metaCalls[0].meta
+	if got.Conn.PeerPid != expectedMeta.Conn.PeerPid {
+		t.Errorf("PeerPid: got %d, want %d", got.Conn.PeerPid, expectedMeta.Conn.PeerPid)
+	}
+	if got.Conn.PeerUid != expectedMeta.Conn.PeerUid {
+		t.Errorf("PeerUid: got %d, want %d", got.Conn.PeerUid, expectedMeta.Conn.PeerUid)
+	}
+	if got.Conn.Platform != expectedMeta.Conn.Platform {
+		t.Errorf("Platform: got %q, want %q", got.Conn.Platform, expectedMeta.Conn.Platform)
+	}
+	if got.TenantID != expectedMeta.TenantID {
+		t.Errorf("TenantID: got %q, want %q", got.TenantID, expectedMeta.TenantID)
+	}
+	if !got.IsAuthorized() {
+		t.Error("expected IsAuthorized() == true")
+	}
+}
+
+// TestDispatch_LegacyHandlerByteIdentical_v23 (T015) — legacy-only handler
+// (HandleRequest only) must be dispatched unchanged. SessionMeta is cached
+// regardless but never reaches the handler. Backward-compat regression for
+// FR-7/NFR-3.
+func TestDispatch_LegacyHandlerByteIdentical_v23(t *testing.T) {
+	h := &mockSessionHandler{}
+	o := newDispatchOwner(h)
+	sess, buf := newTestSession("/project-legacy")
+	defer sess.Close()
+
+	// Populate SessionMeta as acceptLoop (T011) would. The legacy handler
+	// must NOT see it; the cache exists but the dispatch path is unchanged.
+	sess.SetMeta(muxcore.SessionMeta{
+		Conn: muxcore.ConnInfo{
+			PeerPid:  4321,
+			Platform: muxcore.PlatformLinuxUnix,
+		},
+	})
+
+	methods := []string{"tools/list", "prompts/list", "resources/list", "initialize", "tools/call"}
+	for i, m := range methods {
+		msg := parseMessage([]byte(fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":"%d","method":"%s","params":{}}`, i+1, m,
+		)))
+		if err := o.dispatchToSessionHandler(sess, msg); err != nil {
+			t.Fatalf("dispatch %s: %v", m, err)
+		}
+	}
+
+	// Wait for all 5 async responses.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(h.captured()) == 5 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	captured := h.captured()
+	if len(captured) != 5 {
+		t.Fatalf("expected 5 HandleRequest calls, got %d", len(captured))
+	}
+
+	// Each captured request must carry only ProjectContext + raw bytes —
+	// the legacy 3-arg signature is unchanged.
+	for i, r := range captured {
+		if r.project.Cwd != "/project-legacy" {
+			t.Errorf("call %d: Cwd=%q, want /project-legacy", i, r.project.Cwd)
+		}
+		if len(r.request) == 0 {
+			t.Errorf("call %d: empty request bytes", i)
+		}
+	}
+
+	// SessionMeta cached unchanged — not consumed by legacy dispatch but
+	// available to mid-session AuthorizeSession or future *WithSessionMeta
+	// upgrades.
+	cached := sess.Meta()
+	if cached.Conn.PeerPid != 4321 {
+		t.Errorf("expected cached PeerPid=4321, got %d", cached.Conn.PeerPid)
+	}
+	if cached.Conn.Platform != muxcore.PlatformLinuxUnix {
+		t.Errorf("expected cached Platform=%q, got %q",
+			muxcore.PlatformLinuxUnix, cached.Conn.Platform)
+	}
+
+	// Drain any responses written so the session's notification queue is clean.
+	_ = buf
+}
