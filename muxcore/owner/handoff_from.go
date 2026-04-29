@@ -99,6 +99,9 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
 
+	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
+	o.cacheHandlerInterfaces()
+
 	// Apply cached classification if provided — skip the classify round-trip.
 	if cfg.CachedClassification != "" {
 		o.autoClassification = cfg.CachedClassification

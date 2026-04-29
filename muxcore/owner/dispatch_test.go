@@ -111,7 +111,7 @@ func (m *mockSessionHandler) captured() []mockRequest {
 // newDispatchOwner builds a minimal Owner wired with the given SessionHandler.
 // No upstream process, no IPC listener — just enough to call dispatchToSessionHandler.
 func newDispatchOwner(h muxcore.SessionHandler) *Owner {
-	return &Owner{
+	o := &Owner{
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		progressOwners:         make(map[string]int),
@@ -124,6 +124,11 @@ func newDispatchOwner(h muxcore.SessionHandler) *Owner {
 		done:                   make(chan struct{}),
 		listenerDone:           make(chan struct{}),
 	}
+	// Mirror the production constructors — populate the *WithSessionMeta
+	// type-assertion cache so dispatch tests exercise the same fast path
+	// the daemon uses in production.
+	o.cacheHandlerInterfaces()
+	return o
 }
 
 // newTestSession creates a Session whose responses are captured in buf.

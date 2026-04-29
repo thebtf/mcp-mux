@@ -102,6 +102,13 @@ type Owner struct {
 	env            map[string]string                                                  // upstream env captured at spawn (for background respawn)
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error // in-process MCP handler (nil = subprocess)
 	sessionHandler muxcore.SessionHandler                                             // structured in-process handler (nil = pipe or subprocess)
+	// Cached *WithSessionMeta type assertions, populated once when
+	// sessionHandler is wired in NewOwner / NewOwnerFromSnapshot /
+	// NewOwnerFromHandoff. Hot-path dispatch reads these directly instead
+	// of re-running the assertion on every frame (CodeRabbit nitpick on
+	// PR #113). nil = handler does not implement the upgrade.
+	notificationHandlerWithMeta muxcore.NotificationHandlerWithSessionMeta
+	sessionHandlerWithMeta      muxcore.SessionHandlerWithSessionMeta
 	upstreamWriter io.Writer                                                          // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID       string                                                             // server identity hash
 	listener       net.Listener
@@ -346,6 +353,9 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	if o.tokenHandshake {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
+
+	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
+	o.cacheHandlerInterfaces()
 
 	// Pre-populate caches from snapshot
 	if snap.CachedInit != "" {
@@ -594,6 +604,9 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
 
+	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
+	o.cacheHandlerInterfaces()
+
 	// Wire notifier into sessionHandler if it supports NotifierAware.
 	if o.sessionHandler != nil {
 		if na, ok := o.sessionHandler.(muxcore.NotifierAware); ok {
@@ -840,15 +853,17 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		// NotificationHandler dispatch for SessionHandler mode. Prefer the
 		// *WithSessionMeta upgrade when implemented (FR-1, EC-7) — handlers
 		// that satisfy both interfaces see ONLY the WithSessionMeta path.
+		// Cached at owner construction (cacheHandlerInterfaces) so the
+		// per-frame hot path skips a type assertion (CodeRabbit nitpick).
 		if o.sessionHandler != nil {
 			project := muxcore.ProjectContext{
 				ID:  muxcore.ProjectContextID(s.Cwd),
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
-			if nh, ok := o.sessionHandler.(muxcore.NotificationHandlerWithSessionMeta); ok {
+			if o.notificationHandlerWithMeta != nil {
 				meta := s.Meta()
-				go nh.HandleNotificationWithSessionMeta(context.Background(), project, meta, msg.Raw)
+				go o.notificationHandlerWithMeta.HandleNotificationWithSessionMeta(context.Background(), project, meta, msg.Raw)
 			} else if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
 				go nh.HandleNotification(context.Background(), project, msg.Raw)
 			}
@@ -1031,11 +1046,14 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 		}()
 
 		// Prefer the *WithSessionMeta upgrade when implemented (FR-2, EC-7) —
-		// handlers that satisfy both interfaces see ONLY the WithSessionMeta path.
+		// handlers that satisfy both interfaces see ONLY the WithSessionMeta
+		// path. Cached at owner construction (cacheHandlerInterfaces) so
+		// the per-frame hot path skips a type assertion (CodeRabbit
+		// nitpick on PR #113).
 		var resp []byte
 		var err error
-		if h, ok := o.sessionHandler.(muxcore.SessionHandlerWithSessionMeta); ok {
-			resp, err = h.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
+		if o.sessionHandlerWithMeta != nil {
+			resp, err = o.sessionHandlerWithMeta.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
 		} else {
 			resp, err = o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
 		}
@@ -1904,6 +1922,27 @@ func invokeAuthorize(
 // Overrun is treated as FramePass to keep the reader goroutine moving;
 // the late callback completion is logged but its returned action is dropped.
 const frameHookBudget = 1 * time.Millisecond
+
+// cacheHandlerInterfaces resolves the optional *WithSessionMeta interface
+// upgrades exactly once at owner construction. Hot-path dispatch
+// (handleDownstreamMessage / dispatchToSessionHandler) reads the resulting
+// fields directly instead of re-running the type assertion on every frame.
+// Safe to call multiple times — repeated calls overwrite with the same
+// values. Invoked after o.sessionHandler is wired by every constructor
+// path (NewOwner, NewOwnerFromSnapshot, newOwnerWithProcess from handoff).
+func (o *Owner) cacheHandlerInterfaces() {
+	if o.sessionHandler == nil {
+		o.notificationHandlerWithMeta = nil
+		o.sessionHandlerWithMeta = nil
+		return
+	}
+	if h, ok := o.sessionHandler.(muxcore.NotificationHandlerWithSessionMeta); ok {
+		o.notificationHandlerWithMeta = h
+	}
+	if h, ok := o.sessionHandler.(muxcore.SessionHandlerWithSessionMeta); ok {
+		o.sessionHandlerWithMeta = h
+	}
+}
 
 // invokeFrameHook runs o.onFrameReceived under a 1 ms cancellation-free
 // timeout (the callback continues running after timeout but its result is
