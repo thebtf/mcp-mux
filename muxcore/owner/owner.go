@@ -1688,6 +1688,17 @@ func (o *Owner) acceptLoop() {
 				continue
 			}
 		}
+
+		// Populate cached SessionMeta with OS-level peer credentials before
+		// dispatch (FR-5/FR-6). Unconditional — token-handshake-disabled
+		// callers (EC-6) still receive Conn populated; AuthorizeSession
+		// (Phase 2) optionally mutates TenantID + AuthorizedAt from this
+		// baseline. peerCreds normalises -1 sentinels to 0.
+		info := peerCreds(conn)
+		s.SetMeta(muxcore.SessionMeta{Conn: info})
+		o.logger.Printf("peer_creds_extracted sid=%d pid=%d uid=%d platform=%s",
+			s.ID, info.PeerPid, info.PeerUid, info.Platform)
+
 		o.AddSession(s)
 	}
 }
