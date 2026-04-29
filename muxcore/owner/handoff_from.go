@@ -77,6 +77,7 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
+		authorizeSession:       cfg.AuthorizeSession,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),

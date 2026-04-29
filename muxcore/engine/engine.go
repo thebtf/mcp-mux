@@ -140,6 +140,26 @@ type Config struct {
 	// Set to owner.StdinEOFWaitForDisconnect for engine consumers where
 	// stdin is an internal pipe (not a CC shutdown signal).
 	StdinEOFPolicy owner.StdinEOFPolicy
+
+	// AuthorizeSession, when non-nil, is invoked once per session AFTER the
+	// initial IPC handshake completes (peer credentials populated on
+	// SessionMeta.Conn) and BEFORE any frame is dispatched to SessionHandler
+	// or NotificationHandler. Default (nil) preserves pre-v0.24 behaviour —
+	// every handshake-complete session is allowed.
+	//
+	// Returning AuthDeny closes the connection with a JSON-RPC -32000 error
+	// carrying SessionAuth.Reason. No upstream process is spawned, no
+	// session is added to the owner's session table, no frames count
+	// against shared resources — denial is zero-cost beyond the handshake
+	// and the credential extraction.
+	//
+	// Returning AuthAllow stamps SessionMeta.TenantID + SessionMeta.AuthorizedAt
+	// and the session proceeds normally. Empty TenantID with AuthAllow is
+	// legitimate (FR-3 amendment CHK013).
+	//
+	// Panics inside the callback are recovered and treated as
+	// AuthDeny{Reason: "authorize panic"} — the daemon never crashes.
+	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 }
 
 // MuxEngine manages the muxcore multiplexer lifecycle.
@@ -295,6 +315,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		DaemonFlag:       e.cfg.DaemonFlag,
 		Name:             e.cfg.Name,
 		Persistent:       e.cfg.Persistent,
+		AuthorizeSession: e.cfg.AuthorizeSession,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)

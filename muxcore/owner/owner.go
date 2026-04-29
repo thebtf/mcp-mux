@@ -111,6 +111,11 @@ type Owner struct {
 	onPersistentDetected func(serverID string)
 	onCacheReady         func(serverID string)
 
+	// authorizeSession is the optional pre-dispatch session-admission gate
+	// forwarded from engine.Config / daemon.Config / OwnerConfig. nil = no
+	// gate (pre-v0.24 behaviour). Read-only after construction.
+	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
 	cachedInitSessions   map[int]bool // sessions that received a cached (replayed) initialize response
@@ -238,6 +243,15 @@ type OwnerConfig struct {
 	// successor adopts its result directly.
 	CachedClassification classify.SharingMode
 
+	// AuthorizeSession, when non-nil, gates every accepted session BEFORE
+	// AddSession is called. acceptLoop invokes the callback with peer
+	// credentials + project context and acts on the returned SessionAuth:
+	// AuthDeny closes the connection with JSON-RPC -32000 and never adds
+	// the session; AuthAllow stamps SessionMeta.TenantID + AuthorizedAt.
+	// Panics are recovered and treated as AuthDeny{Reason: "authorize panic"}.
+	// nil-default preserves pre-v0.24 behaviour.
+	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 }
@@ -282,6 +296,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
+		authorizeSession:       cfg.AuthorizeSession,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),
@@ -531,6 +546,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
 		onCacheReady:           cfg.OnCacheReady,
+		authorizeSession:       cfg.AuthorizeSession,
 		sessions:               make(map[int]*Session),
 		cachedInitSessions:     make(map[int]bool),
 		sessionMgr:             NewSessionManager(),

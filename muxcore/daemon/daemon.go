@@ -125,6 +125,10 @@ type Daemon struct {
 	name       string
 	persistent bool
 
+	// authorizeSession is forwarded from Config.AuthorizeSession to every
+	// Owner created by this daemon. nil = no gate (pre-v0.24 behaviour).
+	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+
 	// zombieDetectedSpawn counts how many times the FR-4 spawn-time health
 	// gate in spawnOnce tore down a registered owner because IsReachable()
 	// returned false despite IsAccepting() reporting open. Counter is
@@ -216,6 +220,13 @@ type Config struct {
 	// Persistent overrides per-owner Persistent detection. When true, all owners
 	// managed by this daemon are treated as persistent (not evicted on idle).
 	Persistent bool
+
+	// AuthorizeSession, when non-nil, is forwarded to every Owner created by
+	// this daemon. Owners invoke the callback in acceptLoop after IPC
+	// handshake / peer-credential extraction and before AddSession.
+	// nil-default preserves pre-v0.24 behaviour. See engine.Config.AuthorizeSession
+	// for the full semantics; this field is the daemon-layer passthrough.
+	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 }
 
 var _ control.DaemonHandler = (*Daemon)(nil)
@@ -261,6 +272,7 @@ func New(cfg Config) (*Daemon, error) {
 		daemonFlag:       daemonFlag,
 		name:             cfg.Name,
 		persistent:       cfg.Persistent,
+		authorizeSession: cfg.AuthorizeSession,
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -817,9 +829,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		IPCPath:        ipcPath,
 		ControlPath:    controlPath,
 		ServerID:       sid,
-		TokenHandshake: true, // daemon-managed owners: shims send a handshake token
-		HandlerFunc:    d.handlerFunc,
-		SessionHandler: d.sessionHandler,
+		TokenHandshake:   true, // daemon-managed owners: shims send a handshake token
+		HandlerFunc:      d.handlerFunc,
+		SessionHandler:   d.sessionHandler,
+		AuthorizeSession: d.authorizeSession,
 		OnZeroSessions: func(serverID string) {
 			d.onZeroSessions(serverID)
 		},
