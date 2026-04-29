@@ -1721,15 +1721,85 @@ func (o *Owner) acceptLoop() {
 		// Populate cached SessionMeta with OS-level peer credentials before
 		// dispatch (FR-5/FR-6). Unconditional — token-handshake-disabled
 		// callers (EC-6) still receive Conn populated; AuthorizeSession
-		// (Phase 2) optionally mutates TenantID + AuthorizedAt from this
-		// baseline. peerCreds normalises -1 sentinels to 0.
+		// optionally mutates TenantID + AuthorizedAt from this baseline.
+		// peerCreds normalises -1 sentinels to 0.
 		info := peerCreds(conn)
 		s.SetMeta(muxcore.SessionMeta{Conn: info})
 		o.logger.Printf("peer_creds_extracted sid=%d pid=%d uid=%d platform=%s",
 			s.ID, info.PeerPid, info.PeerUid, info.Platform)
 
+		// AuthorizeSession gate (FR-3). Single-shot per session; runs after
+		// peer-creds extraction and BEFORE AddSession. nil = no gate
+		// (byte-identical to v0.23 dispatch path).
+		//
+		// Shutdown handling (CHK015 / EC-11): if owner.done fires before
+		// the callback runs, refuse the session without invoking.
+		// Panic guard: any panic inside the callback is recovered and
+		// treated as AuthDeny{Reason: "authorize panic"} — the daemon
+		// continues accepting subsequent connections.
+		if o.authorizeSession != nil {
+			select {
+			case <-o.done:
+				o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+				conn.Close()
+				s.Close()
+				continue
+			default:
+			}
+
+			project := muxcore.ProjectContext{
+				ID:  muxcore.ProjectContextID(s.Cwd),
+				Cwd: s.Cwd,
+				Env: s.Env,
+			}
+			verdict := invokeAuthorize(o.authorizeSession, info, project, s.ID, o.logger)
+
+			if verdict.Decision == muxcore.AuthDeny {
+				if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, verdict.Reason); marshalErr == nil {
+					// Write the JSON-RPC -32000 error directly to the conn
+					// (not through s.WriteRaw — the session is being torn
+					// down, no need for the buffered-writer/bufio path).
+					_, _ = conn.Write(append(errBytes, '\n'))
+				} else {
+					o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
+				}
+				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, verdict.Reason)
+				conn.Close()
+				s.Close()
+				continue
+			}
+
+			// AuthAllow: stamp tenant + authorized timestamp on cached meta.
+			// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
+			s.SetMeta(muxcore.SessionMeta{
+				Conn:         info,
+				TenantID:     verdict.TenantID,
+				AuthorizedAt: time.Now(),
+			})
+			o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
+		}
+
 		o.AddSession(s)
 	}
+}
+
+// invokeAuthorize calls cb under a defer/recover guard. Panic is logged with
+// the panic value and converted to AuthDeny{Reason: "authorize panic"}; the
+// daemon continues accepting subsequent connections.
+func invokeAuthorize(
+	cb func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth,
+	info muxcore.ConnInfo,
+	project muxcore.ProjectContext,
+	sid int,
+	logger *log.Logger,
+) (verdict muxcore.SessionAuth) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("auth_panic sid=%d recovered=%v", sid, r)
+			verdict = muxcore.SessionAuth{Decision: muxcore.AuthDeny, Reason: "authorize panic"}
+		}
+	}()
+	return cb(context.Background(), info, project)
 }
 
 // HandleShutdown implements control.CommandHandler.
