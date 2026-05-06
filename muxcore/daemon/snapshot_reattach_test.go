@@ -272,6 +272,72 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	}
 }
 
+func TestLoadSnapshot_SessionHandlerRestoreDoesNotSpawnCommand(t *testing.T) {
+	os.Remove(SnapshotPath())
+
+	sid := "b86e71a0093a84a9-sessionhandler-snapshot"
+	snapshot := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{
+			{
+				ServerID:       sid,
+				Command:        "definitely-not-a-real-sessionhandler-snapshot-command",
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeShared,
+				CachedInit:     "e30=",
+				CachedTools:    "e30=",
+			},
+		},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+	defer os.Remove(SnapshotPath())
+
+	buf := &syncBuffer{}
+	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
+	logger := log.New(buf, "[daemon-test] ", log.LstdFlags)
+	d, err := New(Config{
+		ControlPath:    ctlPath,
+		GracePeriod:    1 * time.Second,
+		IdleTimeout:    5 * time.Second,
+		SkipSnapshot:   true,
+		SessionHandler: noopSessionHandler{},
+		Logger:         logger,
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	if restored := d.loadSnapshot(); restored != 1 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logs := buf.String()
+		if strings.Contains(logs, "background SessionHandler-only spawn: no upstream process") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("missing SessionHandler-only no-op marker in logs:\n%s", logs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	logs := buf.String()
+	if strings.Contains(logs, "background upstream spawn failed") {
+		t.Fatalf("snapshot restore attempted snapshotted command for SessionHandler owner:\n%s", logs)
+	}
+}
+
 // TestLoadSnapshot_Reattach_PartialHandoff exercises FR-7: when the handoff
 // delivers FDs for a subset of the snapshot's owners, the remainder MUST
 // fall through to the legacy SpawnUpstreamBackground path. The snapshot

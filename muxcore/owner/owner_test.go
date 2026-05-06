@@ -1,9 +1,11 @@
 package owner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -264,6 +266,87 @@ func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 		// Expected
 	case <-time.After(500 * time.Millisecond):
 		t.Error("done channel not closed after Shutdown")
+	}
+}
+
+func TestSpawnUpstreamBackground_SessionHandlerOnly_NoSubprocess(t *testing.T) {
+	ipcPath := testIPCPath(t)
+	var logs bytes.Buffer
+
+	snap := OwnerSnapshot{
+		ServerID: "test-sessionhandler-background-spawn",
+		Command:  "definitely-not-a-real-sessionhandler-upstream-command",
+		Cwd:      t.TempDir(),
+		CwdSet:   []string{},
+		Mode:     "global",
+	}
+
+	handler := &mockSessionHandler{}
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		Command:        snap.Command,
+		Cwd:            snap.Cwd,
+		IPCPath:        ipcPath,
+		ServerID:       snap.ServerID,
+		SessionHandler: handler,
+		Logger:         log.New(&logs, "[test] ", 0),
+	}, snap)
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot() error: %v", err)
+	}
+	defer o.Shutdown()
+
+	bgCh := o.backgroundSpawnCh
+	if bgCh == nil {
+		t.Fatal("snapshot owner should start with pending backgroundSpawnCh")
+	}
+
+	o.SpawnUpstreamBackground()
+
+	select {
+	case <-bgCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SessionHandler-only background spawn did not finish")
+	}
+
+	o.mu.RLock()
+	upstream := o.upstream
+	backgroundSpawnCh := o.backgroundSpawnCh
+	o.mu.RUnlock()
+	if upstream != nil {
+		t.Fatalf("SessionHandler-only background spawn created upstream: %v", upstream)
+	}
+	if backgroundSpawnCh != nil {
+		t.Fatal("SessionHandler-only background spawn did not clear backgroundSpawnCh")
+	}
+
+	logText := logs.String()
+	if strings.Contains(logText, "background upstream spawn failed") {
+		t.Fatalf("SessionHandler-only background spawn attempted subprocess:\n%s", logText)
+	}
+	if !strings.Contains(logText, "background SessionHandler-only spawn: no upstream process") {
+		t.Fatalf("missing SessionHandler-only no-op marker in logs:\n%s", logText)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- o.Serve(context.Background())
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-errCh:
+		t.Fatalf("Serve returned immediately for restored SessionHandler-only owner: %v", err)
+	default:
+	}
+
+	o.Shutdown()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, suture.ErrDoNotRestart) {
+			t.Fatalf("Serve returned %v after Shutdown, want suture.ErrDoNotRestart", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Shutdown")
 	}
 }
 

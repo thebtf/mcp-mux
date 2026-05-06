@@ -109,10 +109,10 @@ type Owner struct {
 	// PR #113). nil = handler does not implement the upgrade.
 	notificationHandlerWithMeta muxcore.NotificationHandlerWithSessionMeta
 	sessionHandlerWithMeta      muxcore.SessionHandlerWithSessionMeta
-	upstreamWriter io.Writer                                                          // injected writer (non-nil = skip subprocess, write directly; tests only)
-	serverID       string                                                             // server identity hash
-	listener       net.Listener
-	logger         *log.Logger
+	upstreamWriter              io.Writer // injected writer (non-nil = skip subprocess, write directly; tests only)
+	serverID                    string    // server identity hash
+	listener                    net.Listener
+	logger                      *log.Logger
 
 	onZeroSessions       func(serverID string)
 	onUpstreamExit       func(serverID string)
@@ -309,27 +309,27 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	}
 
 	o := &Owner{
-		ipcPath:                cfg.IPCPath,
-		cwd:                    cfg.Cwd,
-		cwdSet:                 cwdSet,
-		command:                cfg.Command,
-		args:                   cfg.Args,
-		env:                    cfg.Env,
-		handlerFunc:            cfg.HandlerFunc,
-		sessionHandler:         cfg.SessionHandler,
-		serverID:               cfg.ServerID,
-		listener:               ln,
-		logger:                 logger,
-		onZeroSessions:         cfg.OnZeroSessions,
-		onUpstreamExit:         cfg.OnUpstreamExit,
-		onPersistentDetected:   cfg.OnPersistentDetected,
-		onCacheReady:           cfg.OnCacheReady,
-		authorizeSession:       cfg.AuthorizeSession,
-		onFrameReceived:        cfg.OnFrameReceived,
-		sessions:               make(map[int]*Session),
-		cachedInitSessions:     make(map[int]bool),
-		sessionMgr:             NewSessionManager(),
-		tokenHandshake:         cfg.TokenHandshake,
+		ipcPath:              cfg.IPCPath,
+		cwd:                  cfg.Cwd,
+		cwdSet:               cwdSet,
+		command:              cfg.Command,
+		args:                 cfg.Args,
+		env:                  cfg.Env,
+		handlerFunc:          cfg.HandlerFunc,
+		sessionHandler:       cfg.SessionHandler,
+		serverID:             cfg.ServerID,
+		listener:             ln,
+		logger:               logger,
+		onZeroSessions:       cfg.OnZeroSessions,
+		onUpstreamExit:       cfg.OnUpstreamExit,
+		onPersistentDetected: cfg.OnPersistentDetected,
+		onCacheReady:         cfg.OnCacheReady,
+		authorizeSession:     cfg.AuthorizeSession,
+		onFrameReceived:      cfg.OnFrameReceived,
+		sessions:             make(map[int]*Session),
+		cachedInitSessions:   make(map[int]bool),
+		sessionMgr:           NewSessionManager(),
+		tokenHandshake:       cfg.TokenHandshake,
 		// rejectionLogger is created lazily below, only when tokenHandshake is
 		// enabled — legacy/test owners with tokenHandshake=false never rate-limit
 		// anything, so the per-Owner ticker goroutine adds cost without value
@@ -429,6 +429,16 @@ func (o *Owner) SpawnUpstreamBackground() {
 		case <-o.done:
 			return
 		default:
+		}
+		if o.sessionHandler != nil && o.handlerFunc == nil {
+			o.logger.Printf("background SessionHandler-only spawn: no upstream process")
+			o.mu.Lock()
+			if o.backgroundSpawnCh != nil {
+				close(o.backgroundSpawnCh)
+				o.backgroundSpawnCh = nil
+			}
+			o.mu.Unlock()
+			return
 		}
 
 		var proc *upstream.Process
@@ -561,29 +571,29 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	}
 
 	o := &Owner{
-		upstream:               proc,
-		ipcPath:                cfg.IPCPath,
-		cwd:                    cfg.Cwd,
-		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
-		command:                cfg.Command,
-		args:                   cfg.Args,
-		env:                    cfg.Env,
-		handlerFunc:            cfg.HandlerFunc,
-		sessionHandler:         cfg.SessionHandler,
-		upstreamWriter:         cfg.UpstreamWriter,
-		serverID:               cfg.ServerID,
-		listener:               ln,
-		logger:                 logger,
-		onZeroSessions:         cfg.OnZeroSessions,
-		onUpstreamExit:         cfg.OnUpstreamExit,
-		onPersistentDetected:   cfg.OnPersistentDetected,
-		onCacheReady:           cfg.OnCacheReady,
-		authorizeSession:       cfg.AuthorizeSession,
-		onFrameReceived:        cfg.OnFrameReceived,
-		sessions:               make(map[int]*Session),
-		cachedInitSessions:     make(map[int]bool),
-		sessionMgr:             NewSessionManager(),
-		tokenHandshake:         cfg.TokenHandshake,
+		upstream:             proc,
+		ipcPath:              cfg.IPCPath,
+		cwd:                  cfg.Cwd,
+		cwdSet:               map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
+		command:              cfg.Command,
+		args:                 cfg.Args,
+		env:                  cfg.Env,
+		handlerFunc:          cfg.HandlerFunc,
+		sessionHandler:       cfg.SessionHandler,
+		upstreamWriter:       cfg.UpstreamWriter,
+		serverID:             cfg.ServerID,
+		listener:             ln,
+		logger:               logger,
+		onZeroSessions:       cfg.OnZeroSessions,
+		onUpstreamExit:       cfg.OnUpstreamExit,
+		onPersistentDetected: cfg.OnPersistentDetected,
+		onCacheReady:         cfg.OnCacheReady,
+		authorizeSession:     cfg.AuthorizeSession,
+		onFrameReceived:      cfg.OnFrameReceived,
+		sessions:             make(map[int]*Session),
+		cachedInitSessions:   make(map[int]bool),
+		sessionMgr:           NewSessionManager(),
+		tokenHandshake:       cfg.TokenHandshake,
 		// rejectionLogger is created lazily below, only when tokenHandshake is
 		// enabled — legacy/test owners with tokenHandshake=false never rate-limit
 		// anything, so the per-Owner ticker goroutine adds cost without value
