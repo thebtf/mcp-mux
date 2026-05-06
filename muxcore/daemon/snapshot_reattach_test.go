@@ -124,6 +124,8 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	// Capture the performHandoff error on a buffered channel so we can
 	// propagate sender-side failures to the test instead of relying on
 	// receiveHandoff to time out on a half-done protocol.
+	stdinFD := dupFDForHandoff(t, stdinR)
+	stdoutFD := dupFDForHandoff(t, stdoutW)
 	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
@@ -131,8 +133,8 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 				ServerID: sid,
 				Command:  "echo",
 				PID:      os.Getpid(), // valid PID > 0; not verified by AttachFromFDs
-				StdinFD:  stdinR.Fd(),
-				StdoutFD: stdoutW.Fd(),
+				StdinFD:  stdinFD,
+				StdoutFD: stdoutFD,
 			},
 		}
 		ctx := context.Background()
@@ -414,6 +416,8 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 
 	oldDaemonConn, successorConn := newMockFDConnPair()
 
+	stdinFD := dupFDForHandoff(t, stdinR)
+	stdoutFD := dupFDForHandoff(t, stdoutW)
 	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
@@ -421,8 +425,8 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 				ServerID: sid1, // Only sid1 transferred — sid2 falls through.
 				Command:  "echo",
 				PID:      os.Getpid(),
-				StdinFD:  stdinR.Fd(),
-				StdoutFD: stdoutW.Fd(),
+				StdinFD:  stdinFD,
+				StdoutFD: stdoutFD,
 			},
 		}
 		_, err := performHandoff(context.Background(), oldDaemonConn, testToken, upstreams)
