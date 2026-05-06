@@ -2,11 +2,13 @@ package control
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -175,18 +177,18 @@ func TestSendWithTimeout(t *testing.T) {
 // mockDaemonHandler implements both CommandHandler and DaemonHandler for testing.
 type mockDaemonHandler struct {
 	mockHandler
-	spawnCalled  bool
-	removeCalled bool
+	spawnCalled   bool
+	removeCalled  bool
 	refreshCalled bool
-	giveUpCalled bool
-	spawnErr     error
-	removeErr    error
-	refreshErr   error
-	spawnIPCPath string
-	spawnSrvID   string
-	removeArg    string
-	refreshArg   string
-	giveUpArg    string
+	giveUpCalled  bool
+	spawnErr      error
+	removeErr     error
+	refreshErr    error
+	spawnIPCPath  string
+	spawnSrvID    string
+	removeArg     string
+	refreshArg    string
+	giveUpArg     string
 }
 
 func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, error) {
@@ -601,6 +603,100 @@ func TestCloseIdempotent(t *testing.T) {
 
 	srv.Close()
 	srv.Close() // second close must be a no-op, not a panic
+}
+
+type panicAcceptListener struct {
+	value any
+}
+
+func (l panicAcceptListener) Accept() (net.Conn, error) {
+	panic(l.value)
+}
+
+func (l panicAcceptListener) Close() error {
+	return nil
+}
+
+func (l panicAcceptListener) Addr() net.Addr {
+	return dummyAddr("panic-listener")
+}
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string {
+	return "test"
+}
+
+func (a dummyAddr) String() string {
+	return string(a)
+}
+
+func TestAcceptLoopClosedServerRecoversAcceptPanic(t *testing.T) {
+	srv := &Server{
+		listener: panicAcceptListener{value: "The handle is invalid."},
+		logger:   testLogger(t),
+		done:     make(chan struct{}),
+	}
+	srv.closed = true
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.acceptLoop()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("acceptLoop did not exit after closed-listener panic")
+	}
+}
+
+func TestAcceptLoopUnexpectedPanicPropagates(t *testing.T) {
+	srv := &Server{
+		listener: panicAcceptListener{value: "unexpected accept panic"},
+		logger:   testLogger(t),
+		done:     make(chan struct{}),
+	}
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("acceptLoop swallowed unexpected panic")
+		}
+	}()
+
+	srv.acceptLoop()
+}
+
+type errorAcceptListener struct {
+	err error
+}
+
+func (l errorAcceptListener) Accept() (net.Conn, error) {
+	return nil, l.err
+}
+
+func (l errorAcceptListener) Close() error {
+	return nil
+}
+
+func (l errorAcceptListener) Addr() net.Addr {
+	return dummyAddr("error-listener")
+}
+
+func TestAcceptLoopUnexpectedNetErrClosedLogs(t *testing.T) {
+	var buf bytes.Buffer
+	srv := &Server{
+		listener: errorAcceptListener{err: net.ErrClosed},
+		logger:   log.New(&buf, "", 0),
+		done:     make(chan struct{}),
+	}
+
+	srv.acceptLoop()
+
+	if got := buf.String(); !strings.Contains(got, "unexpected listener close") {
+		t.Fatalf("missing unexpected close log, got %q", got)
+	}
 }
 
 // TestControlServer_ReadDeadlineFiresOnSilentClient is a regression test for FR-5.

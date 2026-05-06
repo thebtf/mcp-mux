@@ -45,13 +45,24 @@ func NewServer(socketPath string, handler CommandHandler, logger *log.Logger) (*
 }
 
 func (s *Server) acceptLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.isClosed() {
+				s.logger.Printf("control: accept loop exiting after listener close panic: %v", r)
+				return
+			}
+			panic(r)
+		}
+	}()
+
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
-			s.mu.Lock()
-			closed := s.closed
-			s.mu.Unlock()
-			if closed {
+			if s.isClosed() {
+				return
+			}
+			if errors.Is(err, net.ErrClosed) {
+				s.logger.Printf("control: accept loop exiting after unexpected listener close: %v", err)
 				return
 			}
 			s.logger.Printf("control: accept error: %v", err)
@@ -61,6 +72,12 @@ func (s *Server) acceptLoop() {
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}
+}
+
+func (s *Server) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 func (s *Server) handleConn(conn net.Conn) {
