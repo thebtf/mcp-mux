@@ -175,6 +175,8 @@ func (d *Daemon) loadSnapshot() int {
 			ControlPath:    controlPath,
 			ServerID:       sid,
 			TokenHandshake: true,
+			HandlerFunc:    d.handlerFunc,
+			SessionHandler: d.sessionHandler,
 			// Forward v0.24 multi-tenant callbacks to restored owners. Fresh
 			// spawn in spawnOnce already does this; without it, snapshot/
 			// handoff-restored owners would silently lose AuthorizeSession +

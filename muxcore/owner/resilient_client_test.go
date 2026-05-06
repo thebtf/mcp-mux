@@ -485,63 +485,13 @@ func TestResilientClient_OnInject_DeliversFrames(t *testing.T) {
 }
 
 func TestResilientClient_OnInject_BufferFull(t *testing.T) {
-	path := newTestIPCPath(t)
-
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		t.Fatalf("listen %s: %v", path, err)
-	}
-	defer func() {
-		ln.Close()
-		os.Remove(path)
-	}()
-
-	blockConn := make(chan net.Conn, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		if unixConn, ok := conn.(*net.UnixConn); ok {
-			_ = unixConn.SetReadBuffer(1)
-		}
-		blockConn <- conn
-		select {}
-	}()
-
-	ccStdinR, ccStdinW := io.Pipe()
-	ccStdoutR, ccStdoutW := io.Pipe()
-
-	injectCh := make(chan func([]byte) error, 1)
-
-	cfg := ResilientClientConfig{
-		ProbeGracePeriod:  time.Nanosecond,
-		Stdin:             ccStdinR,
-		Stdout:            ccStdoutW,
-		InitialIPCPath:    path,
-		Token:             "test-token",
-		ReconnectTimeout:  10 * time.Second,
-		KeepaliveInterval: 10 * time.Second,
-		Logger:            log.New(io.Discard, "", 0),
-		OnInject: func(inject func([]byte) error) {
-			injectCh <- inject
-		},
+	rc := &resilientClient{
+		msgFromCC: make(chan []byte, 1),
+		log:       log.New(io.Discard, "", 0),
 	}
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- RunResilientClient(cfg)
-	}()
-
-	go func() {
-		io.Copy(io.Discard, ccStdoutR)
-	}()
-
-	var inject func([]byte) error
-	select {
-	case inject = <-injectCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout: OnInject callback did not fire")
+	if err := rc.injectFrame([]byte("{}\n")); err != nil {
+		t.Fatalf("first injectFrame() error: %v", err)
 	}
 
 	// Threshold tolerant to busy CI: select-default returns instantly on Go
@@ -549,40 +499,14 @@ func TestResilientClient_OnInject_BufferFull(t *testing.T) {
 	// a few ms. 50 ms still proves "non-blocking" — orders of magnitude below
 	// the inflight drain deadline.
 	const nonBlockingThreshold = 50 * time.Millisecond
-	var fullErr error
-	for range 1100 {
-		start := time.Now()
-		err := inject([]byte("{}\n"))
-		if err == nil {
-			continue
-		}
-		if time.Since(start) > nonBlockingThreshold {
-			t.Fatalf("inject blocked too long (%v) before returning %v — exceeded %v threshold", time.Since(start), err, nonBlockingThreshold)
-		}
-		if !errors.Is(err, ErrInjectFull) {
-			t.Fatalf("expected ErrInjectFull, got %v", err)
-		}
-		fullErr = err
-		break
+	start := time.Now()
+	err := rc.injectFrame([]byte("{}\n"))
+	if time.Since(start) > nonBlockingThreshold {
+		t.Fatalf("injectFrame blocked too long (%v) before returning %v — exceeded %v threshold",
+			time.Since(start), err, nonBlockingThreshold)
 	}
-	if fullErr == nil {
-		t.Fatal("expected at least one ErrInjectFull from inject")
-	}
-
-	// Unblock the IPC server connection so runIPCWriter can drain msgFromCC
-	// after stdin closes. Without this, the runProxy 5s drain deadline can be
-	// exceeded by the saturated buffer + slow blocked writer.
-	select {
-	case conn := <-blockConn:
-		conn.Close()
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	ccStdinW.Close()
-	select {
-	case <-errCh:
-	case <-time.After(15 * time.Second):
-		t.Fatal("timeout: RunResilientClient did not exit")
+	if !errors.Is(err, ErrInjectFull) {
+		t.Fatalf("expected ErrInjectFull, got %v", err)
 	}
 }
 

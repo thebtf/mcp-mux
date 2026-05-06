@@ -169,25 +169,8 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 	// invoked once per ResilientClient lifecycle, so this code path itself
 	// already provides the single-fire guarantee — no sync.Once needed.
 	if cfg.OnInject != nil {
-		inject := func(b []byte) error {
-			if rc.closed.Load() {
-				rc.log.Printf("proxy.inject.dropped reason=closed")
-				return ErrInjectClosed
-			}
-			// Copy the caller's buffer — they may reuse or pool it after inject returns.
-			data := make([]byte, len(b))
-			copy(data, b)
-			select {
-			case rc.msgFromCC <- data:
-				rc.log.Printf("proxy.inject.delivered bytes=%d", len(b))
-				return nil
-			default:
-				rc.log.Printf("proxy.inject.dropped reason=full")
-				return ErrInjectFull
-			}
-		}
 		rc.log.Printf("proxy.inject.armed")
-		go cfg.OnInject(inject)
+		go cfg.OnInject(rc.injectFrame)
 	}
 
 	// stdinReader: reads CC stdin, sends raw message bytes to msgFromCC.
@@ -695,6 +678,24 @@ func (rc *resilientClient) replayInit(conn interface {
 	}
 	rc.log.Printf("resilient: discarded init replay response (%d bytes)", len(buf))
 	return nil
+}
+
+func (rc *resilientClient) injectFrame(b []byte) error {
+	if rc.closed.Load() {
+		rc.log.Printf("proxy.inject.dropped reason=closed")
+		return ErrInjectClosed
+	}
+	// Copy the caller's buffer — they may reuse or pool it after inject returns.
+	data := make([]byte, len(b))
+	copy(data, b)
+	select {
+	case rc.msgFromCC <- data:
+		rc.log.Printf("proxy.inject.delivered bytes=%d", len(b))
+		return nil
+	default:
+		rc.log.Printf("proxy.inject.dropped reason=full")
+		return ErrInjectFull
+	}
 }
 
 // sendListChangedNotifications sends *_list_changed notifications to CC after reconnect.
