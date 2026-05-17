@@ -321,11 +321,12 @@ func (e *MuxEngine) ControlSocketPath() string {
 func (e *MuxEngine) runDaemon(ctx context.Context) error {
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
 
-	// Remove stale control socket from a previous daemon crash (#100).
-	// On Windows, AF_UNIX socket files persist after process death.
-	// Unconditional: if we reached runDaemon, this process IS the daemon.
-	if err := os.Remove(ctlPath); err == nil {
-		e.logger.Printf("removed stale daemon socket: %s", ctlPath)
+	// If another daemon is already serving this engine namespace, do not unlink
+	// its control socket. ipc.Listen removes stale files after proving they are
+	// not reachable; removing here would orphan the live daemon and create a
+	// split-brain registry while its owner sockets keep serving.
+	if isDaemonRunning(ctlPath) {
+		return fmt.Errorf("engine daemon: another daemon is already running on %s", ctlPath)
 	}
 
 	// SessionHandler takes priority over Handler when both are set.

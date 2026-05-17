@@ -11,12 +11,23 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 // noopHandler is a Handler that does nothing and returns immediately.
 var noopHandler Handler = func(_ context.Context, _ io.Reader, _ io.Writer) error {
 	return nil
+}
+
+type pingOnlyControlHandler struct{}
+
+func (pingOnlyControlHandler) HandleShutdown(int) string {
+	return "shutdown ignored"
+}
+
+func (pingOnlyControlHandler) HandleStatus() map[string]interface{} {
+	return map[string]interface{}{"daemon": true}
 }
 
 // TestNew_ValidConfig verifies that New returns a non-nil engine when given a
@@ -225,6 +236,57 @@ func TestRunProxy_NoHandler(t *testing.T) {
 	ctx := context.Background()
 	if err := e.runProxy(ctx); err == nil {
 		t.Fatal("runProxy() expected error for nil Handler, got nil")
+	}
+}
+
+func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
+	name := "engine-active-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	ctlPath := serverid.DaemonControlPath("", name)
+	_ = os.Remove(ctlPath)
+	t.Cleanup(func() { _ = os.Remove(ctlPath) })
+
+	active, err := control.NewServer(ctlPath, pingOnlyControlHandler{}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("start active control server: %v", err)
+	}
+	defer active.Close()
+
+	if resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"}); err != nil || !resp.OK {
+		t.Fatalf("active control server should respond before runDaemon: resp=%+v err=%v", resp, err)
+	}
+
+	e, err := New(Config{
+		Name:         name,
+		Handler:      noopHandler,
+		SkipSnapshot: true,
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- e.runDaemon(ctx)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("runDaemon() expected active-socket error, got nil")
+		}
+		if !strings.Contains(err.Error(), "already running") {
+			t.Fatalf("runDaemon() error = %v, want already running", err)
+		}
+	case <-time.After(300 * time.Millisecond):
+		cancel()
+		err := <-errCh
+		t.Fatalf("runDaemon() stole active control socket and kept running; returned after cancel with %v", err)
+	}
+
+	if resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"}); err != nil || !resp.OK {
+		t.Fatalf("original control server should remain reachable: resp=%+v err=%v", resp, err)
 	}
 }
 
