@@ -293,10 +293,14 @@ func TestRunProxy_NoHandler(t *testing.T) {
 }
 
 func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
-	name := "engine-active-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
-	ctlPath := serverid.DaemonControlPath("", name)
-	_ = os.Remove(ctlPath)
-	t.Cleanup(func() { _ = os.Remove(ctlPath) })
+	baseDir, err := os.MkdirTemp("", "ea*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	name := "ea"
+	ctlPath := serverid.DaemonControlPath(baseDir, name)
 
 	active, err := control.NewServer(ctlPath, pingOnlyControlHandler{}, log.New(io.Discard, "", 0))
 	if err != nil {
@@ -311,6 +315,7 @@ func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
 	e, err := New(Config{
 		Name:         name,
 		Handler:      noopHandler,
+		BaseDir:      baseDir,
 		SkipSnapshot: true,
 	})
 	if err != nil {
@@ -344,10 +349,14 @@ func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
 }
 
 func TestRunClientConfiguresRefreshToken(t *testing.T) {
-	name := "engine-refresh-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
-	ctlPath := serverid.DaemonControlPath("", name)
-	_ = os.Remove(ctlPath)
-	t.Cleanup(func() { _ = os.Remove(ctlPath) })
+	baseDir, err := os.MkdirTemp("", "er*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	name := "er"
+	ctlPath := serverid.DaemonControlPath(baseDir, name)
 
 	handler := &runClientControlHandler{}
 	srv, err := control.NewServer(ctlPath, handler, log.New(io.Discard, "", 0))
@@ -360,6 +369,7 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		Name:    name,
 		Command: "test-command",
 		Args:    []string{"--flag"},
+		BaseDir: baseDir,
 	})
 	if err != nil {
 		t.Fatalf("New() unexpected error: %v", err)
