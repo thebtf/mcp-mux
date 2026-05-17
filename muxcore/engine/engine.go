@@ -22,6 +22,8 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
+var runResilientClient = owner.RunResilientClient
+
 // Internal timing defaults for the engine. Kept as named constants (not inline
 // literals) so the rationale is discoverable and future tuning has a single
 // place to change.
@@ -41,6 +43,11 @@ const (
 	// spawnRPCTimeout covers daemon processing + upstream process start +
 	// proactive MCP init handshake for the "spawn" control command.
 	spawnRPCTimeout = 30 * time.Second
+
+	// refreshRPCTimeout covers the daemon-only token refresh control command.
+	// It should not pay the upstream spawn/init budget because it only consults
+	// live owner session history and mints a token.
+	refreshRPCTimeout = 5 * time.Second
 )
 
 // Mode is the runtime role of the engine selected by Run().
@@ -421,6 +428,25 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	e.logger.Printf("engine client: connecting to %s (resilient)", ipcPath)
 
 	// 4. Bridge stdin/stdout ↔ IPC with automatic reconnect on IPC failure.
+	currentIPC := ipcPath
+	currentToken := token
+	refreshFn := func() (string, string, error) {
+		// Jitter to spread thundering-herd reconnects from concurrent shims.
+		jitter := time.Duration(os.Getpid()%500) * time.Millisecond
+		time.Sleep(jitter)
+
+		if !isDaemonRunning(ctlPath) {
+			if err := e.startDaemon(); err != nil {
+				return "", "", fmt.Errorf("engine client: refresh: start daemon: %w", err)
+			}
+		}
+		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, e.logger)
+		if err != nil {
+			return "", "", err
+		}
+		currentToken = newToken
+		return currentIPC, newToken, nil
+	}
 	reconnectFn := func() (string, string, error) {
 		// Jitter to spread thundering-herd reconnects from concurrent shims.
 		jitter := time.Duration(os.Getpid()%500) * time.Millisecond
@@ -431,15 +457,22 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 				return "", "", fmt.Errorf("engine client: reconnect: start daemon: %w", err)
 			}
 		}
-		return spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
+		newIPC, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", e.logger)
+		if err != nil {
+			return "", "", err
+		}
+		currentIPC = newIPC
+		currentToken = newToken
+		return newIPC, newToken, nil
 	}
 
-	return owner.RunResilientClient(owner.ResilientClientConfig{
+	return runResilientClient(owner.ResilientClientConfig{
 		Stdin:          os.Stdin,
 		Stdout:         os.Stdout,
 		InitialIPCPath: ipcPath,
 		Token:          token,
 		OnInject:       e.cfg.OnInject,
+		RefreshToken:   refreshFn,
 		Reconnect:      reconnectFn,
 		StdinEOFPolicy: e.cfg.StdinEOFPolicy,
 		EnginePrefix:   e.cfg.Name,
@@ -548,14 +581,19 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path
 // and handshake token for the owner that will serve our server identity.
 func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
+	return spawnViaDaemonWithReason(ctlPath, command, args, cwd, mode, env, "", logger)
+}
+
+func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
 	// spawnRPCTimeout covers daemon processing + upstream process start + proactive init.
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:     "spawn",
-		Command: command,
-		Args:    args,
-		Cwd:     cwd,
-		Mode:    mode,
-		Env:     env,
+		Cmd:             "spawn",
+		Command:         command,
+		Args:            args,
+		Cwd:             cwd,
+		Mode:            mode,
+		Env:             env,
+		ReconnectReason: reconnectReason,
 	}, spawnRPCTimeout)
 	if err != nil {
 		return "", "", fmt.Errorf("spawn via daemon: %w", err)
@@ -570,6 +608,28 @@ func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, en
 	}
 	logger.Printf("engine client: daemon spawned server %s at %s", sid, resp.IPCPath)
 	return resp.IPCPath, resp.Token, nil
+}
+
+func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (string, error) {
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+		Cmd:       "refresh-token",
+		PrevToken: prevToken,
+	}, refreshRPCTimeout)
+	if err != nil {
+		return "", fmt.Errorf("refresh token via daemon: %w", err)
+	}
+	if !resp.OK {
+		switch resp.Message {
+		case daemon.ErrOwnerGone.Error():
+			return "", daemon.ErrOwnerGone
+		case daemon.ErrUnknownToken.Error():
+			return "", daemon.ErrUnknownToken
+		default:
+			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
+		}
+	}
+	logger.Printf("engine client: refreshed reconnect token")
+	return resp.Token, nil
 }
 
 // collectEnv returns the current process environment as a map.

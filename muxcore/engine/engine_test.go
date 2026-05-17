@@ -3,15 +3,18 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -28,6 +31,56 @@ func (pingOnlyControlHandler) HandleShutdown(int) string {
 
 func (pingOnlyControlHandler) HandleStatus() map[string]interface{} {
 	return map[string]interface{}{"daemon": true}
+}
+
+type runClientControlHandler struct {
+	mu            sync.Mutex
+	spawnRequests []control.Request
+	refreshTokens []string
+}
+
+func (h *runClientControlHandler) HandleShutdown(int) string {
+	return "shutdown ignored"
+}
+
+func (h *runClientControlHandler) HandleStatus() map[string]interface{} {
+	return map[string]interface{}{"daemon": true}
+}
+
+func (h *runClientControlHandler) HandleSpawn(req control.Request) (string, string, string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.spawnRequests = append(h.spawnRequests, req)
+	if req.ReconnectReason == "fallback_spawn" {
+		return "ipc-fallback", "sid-fallback", "token-fallback", nil
+	}
+	return "ipc-initial", "sid-initial", "token-initial", nil
+}
+
+func (h *runClientControlHandler) HandleRemove(string) error {
+	return nil
+}
+
+func (h *runClientControlHandler) HandleGracefulRestart(int) (string, func(), error) {
+	return "", nil, errors.New("not implemented")
+}
+
+func (h *runClientControlHandler) HandleRefreshSessionToken(prevToken string) (string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refreshTokens = append(h.refreshTokens, prevToken)
+	if prevToken == "token-fallback" {
+		return "token-after-fallback", nil
+	}
+	return "token-refreshed", nil
+}
+
+func (h *runClientControlHandler) HandleReconnectGiveUp(string) error {
+	return nil
+}
+
+func (h *runClientControlHandler) HandleListOwners(control.Request) (control.ListOwnersResponse, error) {
+	return control.ListOwnersResponse{}, nil
 }
 
 // TestNew_ValidConfig verifies that New returns a non-nil engine when given a
@@ -287,6 +340,97 @@ func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
 
 	if resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"}); err != nil || !resp.OK {
 		t.Fatalf("original control server should remain reachable: resp=%+v err=%v", resp, err)
+	}
+}
+
+func TestRunClientConfiguresRefreshToken(t *testing.T) {
+	name := "engine-refresh-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
+	ctlPath := serverid.DaemonControlPath("", name)
+	_ = os.Remove(ctlPath)
+	t.Cleanup(func() { _ = os.Remove(ctlPath) })
+
+	handler := &runClientControlHandler{}
+	srv, err := control.NewServer(ctlPath, handler, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer srv.Close()
+
+	e, err := New(Config{
+		Name:    name,
+		Command: "test-command",
+		Args:    []string{"--flag"},
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	stopErr := errors.New("stop after capture")
+	called := false
+	origRunResilientClient := runResilientClient
+	runResilientClient = func(cfg owner.ResilientClientConfig) error {
+		called = true
+		if cfg.RefreshToken == nil {
+			t.Fatal("RefreshToken is nil; embedded engine clients cannot refresh consumed reconnect tokens")
+		}
+		if cfg.Reconnect == nil {
+			t.Fatal("Reconnect is nil")
+		}
+		if cfg.InitialIPCPath != "ipc-initial" {
+			t.Fatalf("InitialIPCPath = %q, want ipc-initial", cfg.InitialIPCPath)
+		}
+		if cfg.Token != "token-initial" {
+			t.Fatalf("Token = %q, want token-initial", cfg.Token)
+		}
+
+		path, token, err := cfg.RefreshToken()
+		if err != nil {
+			t.Fatalf("RefreshToken() error: %v", err)
+		}
+		if path != "ipc-initial" || token != "token-refreshed" {
+			t.Fatalf("RefreshToken() = (%q, %q), want (ipc-initial, token-refreshed)", path, token)
+		}
+
+		path, token, err = cfg.Reconnect()
+		if err != nil {
+			t.Fatalf("Reconnect() error: %v", err)
+		}
+		if path != "ipc-fallback" || token != "token-fallback" {
+			t.Fatalf("Reconnect() = (%q, %q), want (ipc-fallback, token-fallback)", path, token)
+		}
+
+		path, token, err = cfg.RefreshToken()
+		if err != nil {
+			t.Fatalf("RefreshToken() after fallback spawn error: %v", err)
+		}
+		if path != "ipc-fallback" || token != "token-after-fallback" {
+			t.Fatalf("RefreshToken() after fallback spawn = (%q, %q), want (ipc-fallback, token-after-fallback)", path, token)
+		}
+		return stopErr
+	}
+	defer func() { runResilientClient = origRunResilientClient }()
+
+	if err := e.runClient(context.Background()); !errors.Is(err, stopErr) {
+		t.Fatalf("runClient() error = %v, want %v", err, stopErr)
+	}
+	if !called {
+		t.Fatal("runClient did not call runResilientClient")
+	}
+
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	wantRefreshTokens := []string{"token-initial", "token-fallback"}
+	if strings.Join(handler.refreshTokens, ",") != strings.Join(wantRefreshTokens, ",") {
+		t.Fatalf("refreshTokens = %v, want %v", handler.refreshTokens, wantRefreshTokens)
+	}
+	if len(handler.spawnRequests) != 2 {
+		t.Fatalf("spawnRequests = %d, want 2", len(handler.spawnRequests))
+	}
+	if handler.spawnRequests[0].ReconnectReason != "" {
+		t.Fatalf("initial spawn ReconnectReason = %q, want empty", handler.spawnRequests[0].ReconnectReason)
+	}
+	if handler.spawnRequests[1].ReconnectReason != "fallback_spawn" {
+		t.Fatalf("fallback spawn ReconnectReason = %q, want fallback_spawn", handler.spawnRequests[1].ReconnectReason)
 	}
 }
 

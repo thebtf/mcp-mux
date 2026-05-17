@@ -176,12 +176,11 @@ func main() {
 					time.Since(spawnStart), daemonIPC)
 				logger.Printf("shim startup step=resilient_begin path=%q total_before_client=%v",
 					daemonIPC, time.Since(shimStart))
-				// currentToken tracks the most-recently-minted session token.
-				// It must be a mutable variable captured by the closure so that
-				// each successful refresh updates the token used by subsequent
-				// refresh attempts. Using the original daemonToken directly would
-				// cause the second refresh to send a stale (already-consumed) token,
-				// triggering an "unknown token" error and a premature spawn fallback.
+				// currentIPC/currentToken track the latest successful bind target.
+				// They must be mutable closure state so refresh after either a
+				// token refresh or fallback spawn uses the latest token/path rather
+				// than replaying a consumed token into "unknown token".
+				currentIPC := daemonIPC
 				currentToken := daemonToken
 				refreshFn := func() (string, string, error) {
 					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
@@ -195,7 +194,7 @@ func main() {
 						return "", "", err
 					}
 					currentToken = newToken
-					return daemonIPC, newToken, nil
+					return currentIPC, newToken, nil
 				}
 				reconnectFn := func() (string, string, error) {
 					// Retry ensureDaemon with jitter to avoid thundering herd.
@@ -207,7 +206,13 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", err
 					}
-					return spawnViaDaemonWithReason(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger)
+					newIPC, newToken, err := spawnViaDaemonWithReason(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger)
+					if err != nil {
+						return "", "", err
+					}
+					currentIPC = newIPC
+					currentToken = newToken
+					return newIPC, newToken, nil
 				}
 				resilientStart := time.Now()
 				if err := owner.RunResilientClient(owner.ResilientClientConfig{
