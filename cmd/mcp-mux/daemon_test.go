@@ -23,6 +23,16 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func shortTempDir(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", prefix+"*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 type refreshTestHandler struct {
 	refreshToken string
 	refreshErr   error
@@ -62,7 +72,7 @@ func (h *refreshTestHandler) HandleListOwners(control.Request) (control.ListOwne
 }
 
 func TestRefreshTokenViaDaemon(t *testing.T) {
-	tempDir := t.TempDir()
+	tempDir := shortTempDir(t, "rt")
 	handler := &refreshTestHandler{refreshToken: "new-token"}
 	startFakeDaemon(t, tempDir, handler)
 
@@ -79,7 +89,7 @@ func TestRefreshTokenViaDaemon(t *testing.T) {
 }
 
 func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
-	tempDir := t.TempDir()
+	tempDir := shortTempDir(t, "ro")
 	handler := &refreshTestHandler{refreshErr: daemon.ErrOwnerGone}
 	startFakeDaemon(t, tempDir, handler)
 
@@ -90,7 +100,7 @@ func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
 }
 
 func TestRefreshTokenViaDaemonUnknownToken(t *testing.T) {
-	tempDir := t.TempDir()
+	tempDir := shortTempDir(t, "ru")
 	handler := &refreshTestHandler{refreshErr: daemon.ErrUnknownToken}
 	startFakeDaemon(t, tempDir, handler)
 
@@ -140,7 +150,7 @@ func runHelperMain(t *testing.T, tempDir string, extraEnv ...string) (string, er
 }
 
 func TestMainFailsFastOnDaemonSpawnFailure(t *testing.T) {
-	tempDir := t.TempDir()
+	tempDir := shortTempDir(t, "ff")
 	startFakeDaemon(t, tempDir, &refreshTestHandler{spawnErr: errors.New("forced daemon spawn failure")})
 
 	output, err := runHelperMain(t, tempDir)
@@ -159,7 +169,7 @@ func TestMainFailsFastOnDaemonSpawnFailure(t *testing.T) {
 }
 
 func TestMainIsolatedModeStillUsesDaemon(t *testing.T) {
-	tempDir := t.TempDir()
+	tempDir := shortTempDir(t, "iso")
 	startFakeDaemon(t, tempDir, &refreshTestHandler{spawnErr: errors.New("forced isolated daemon spawn failure")})
 
 	output, err := runHelperMain(t, tempDir, "MCP_MUX_ISOLATED=1")
