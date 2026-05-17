@@ -140,13 +140,6 @@ func main() {
 	// per-server jsonl can show slow/hung sessions at a glance.
 	shimStart := time.Now()
 
-	// In isolated mode, always become owner (skip IPC check)
-	if *isolated {
-		logger.Printf("isolated mode: starting dedicated upstream")
-		runOwner(args, cwd, ipcPath, controlPath, sid, logger, true)
-		return
-	}
-
 	// Daemon mode (default): shim → daemon → spawn → connect
 	// Disable with MCP_MUX_NO_DAEMON=1 to fall back to legacy per-session owner.
 	//
@@ -159,8 +152,9 @@ func main() {
 	if !noDaemon {
 		ensureStart := time.Now()
 		if err := ensureDaemon(logger); err != nil {
-			logger.Printf("shim startup step=ensure_daemon status=error duration=%v err=%q fallback=legacy_owner",
+			logger.Printf("shim startup step=ensure_daemon status=error duration=%v err=%q daemon_required=true",
 				time.Since(ensureStart), err.Error())
+			os.Exit(1)
 		} else {
 			logger.Printf("shim startup step=ensure_daemon status=ok duration=%v",
 				time.Since(ensureStart))
@@ -169,8 +163,9 @@ func main() {
 			spawnStart := time.Now()
 			daemonIPC, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 			if err != nil {
-				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q fallback=legacy_owner",
+				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q daemon_required=true",
 					time.Since(spawnStart), err.Error())
+				os.Exit(1)
 			} else {
 				logger.Printf("shim startup step=daemon_spawn status=ok duration=%v ipc=%q",
 					time.Since(spawnStart), daemonIPC)
@@ -239,8 +234,8 @@ func main() {
 	}
 
 	// Legacy compatibility fallback: connect directly only after daemon mode is
-	// explicitly disabled or the daemon path failed. This path has no handshake
-	// token, so it is only safe for legacy owners.
+	// explicitly disabled. This path has no handshake token, so it is only safe
+	// for legacy owners.
 	ipcProbeStart := time.Now()
 	ipcAvail := ipc.IsAvailable(ipcPath)
 	logger.Printf("shim startup step=ipc_probe result=%v duration=%v path=%q",
