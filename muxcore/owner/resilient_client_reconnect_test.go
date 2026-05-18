@@ -115,6 +115,49 @@ func TestReconnect_RefreshesAndSucceeds(t *testing.T) {
 	}
 }
 
+func TestReconnect_DrainsAlreadySentInflightWithoutReplay(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	stdout := &bytes.Buffer{}
+	rc := newReconnectClient(t, stdout, logger)
+	rc.inflight.Store("99", true)
+
+	refreshPath := tempReconnectSocketPath(t, "ab12cd34ef56")
+	srv, recv := startEchoIPCServer(t, refreshPath)
+	defer srv.closeAll()
+
+	stdinDone := make(chan error)
+	rc.cfg.RefreshToken = func() (string, string, error) {
+		return refreshPath, "fresh-token", nil
+	}
+
+	conn, err := rc.reconnect(&sync.Mutex{}, stdinDone)
+	if err != nil {
+		t.Fatalf("reconnect() error = %v", err)
+	}
+	defer closeReconnectConn(t, conn)
+
+	out := stdout.String()
+	if !strings.Contains(out, `"id":99`) ||
+		!strings.Contains(out, `request lost during reconnect`) {
+		t.Fatalf("missing JSON-RPC error for already-sent in-flight request, stdout=%q", out)
+	}
+
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		select {
+		case line := <-recv:
+			if strings.Contains(line, `"id":99`) {
+				t.Fatalf("already-sent in-flight request was replayed to successor: %s", line)
+			}
+		case <-deadline:
+			// Good: reconnect drains already-sent in-flight requests by ID instead
+			// of replaying them blindly to the successor owner.
+			return
+		}
+	}
+}
+
 func TestReconnect_ImmediateSpawnOnUnknownToken(t *testing.T) {
 	// After daemon hard-kill + respawn, the new daemon has no record of the
 	// old session token. Refresh must break early instead of retrying all
@@ -335,4 +378,3 @@ func TestOwnerPrefixFromIPCPath(t *testing.T) {
 		t.Fatalf("ownerPrefixFromIPCPath() = %q, want %q", got, "12345678")
 	}
 }
-
