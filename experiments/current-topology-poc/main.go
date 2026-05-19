@@ -81,9 +81,18 @@ type ownerSnapshot struct {
 	Mode     string   `json:"mode"`
 }
 
+type predecessorOwnerSnapshot struct {
+	ServerID        string `json:"server_id"`
+	OwnerGeneration string `json:"owner_generation"`
+	OwnerSocket     string `json:"owner_socket"`
+}
+
 type daemonSnapshot struct {
-	Owners       []ownerSnapshot     `json:"owners"`
-	TokenHistory []tokenHistoryEntry `json:"token_history,omitempty"`
+	Owners                      []ownerSnapshot            `json:"owners"`
+	TokenHistory                []tokenHistoryEntry        `json:"token_history,omitempty"`
+	PredecessorPID              int                        `json:"predecessor_pid,omitempty"`
+	PredecessorDaemonGeneration string                     `json:"predecessor_daemon_generation,omitempty"`
+	PredecessorOwners           []predecessorOwnerSnapshot `json:"predecessor_owners,omitempty"`
 }
 
 type daemonState struct {
@@ -105,6 +114,10 @@ type daemonState struct {
 	lastReconnectReason  string
 	lastRefreshPrevToken string
 	lastRefreshNewToken  string
+	predecessorPID       int
+	predecessorDaemonGen string
+	predecessorOwners    []predecessorOwnerSnapshot
+	restoredOwnerCount   int
 }
 
 type ownerHello struct {
@@ -169,6 +182,7 @@ func main() {
 	pocProbeInflightReconnect := flag.Bool("poc-probe-inflight-reconnect", false, "verify in-flight and buffered requests survive daemon graceful restart")
 	pocProbeConcurrentDemux := flag.Bool("poc-probe-concurrent-demux", false, "verify concurrent out-of-order responses demux by ID across daemon graceful restart")
 	pocProbeRefreshReconnect := flag.Bool("poc-probe-refresh-reconnect", false, "verify reconnect uses refresh-token instead of fallback spawn")
+	pocProbeGenerationHandoff := flag.Bool("poc-probe-generation-handoff", false, "verify restart handoff reports predecessor and restored owner generations")
 	flag.Parse()
 
 	switch {
@@ -217,6 +231,11 @@ func main() {
 	case *pocProbeRefreshReconnect:
 		if err := probeRefreshReconnect(); err != nil {
 			fmt.Fprintf(os.Stderr, "refresh-reconnect probe failed: %v\n", err)
+			os.Exit(1)
+		}
+	case *pocProbeGenerationHandoff:
+		if err := probeGenerationHandoff(); err != nil {
+			fmt.Fprintf(os.Stderr, "generation-handoff probe failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:
@@ -364,27 +383,35 @@ func (s *daemonState) status() map[string]any {
 		ownerGeneration, _ = owners[0]["owner_generation"].(string)
 		ownerSocket, _ = owners[0]["owner_socket"].(string)
 	}
+	handoff := "none"
+	if s.predecessorPID != 0 {
+		handoff = "restored"
+	}
 	return map[string]any{
-		"ok":                      true,
-		"pid":                     s.pid,
-		"daemon_pid":              s.pid,
-		"ready":                   s.ready,
-		"daemon_generation":       s.daemonGeneration,
-		"owner_generation":        ownerGeneration,
-		"owner_socket":            ownerSocket,
-		"owner_count":             len(s.owners),
-		"owners":                  owners,
-		"pending_tickets":         len(s.tickets),
-		"token_history_size":      len(s.tokenHistory),
-		"zombie_detected":         s.zombieDetectedSpawn,
-		"fallback_spawns":         s.fallbackSpawns,
-		"refresh_requests":        s.refreshRequests,
-		"refresh_successes":       s.refreshSuccesses,
-		"last_reconnect_reason":   s.lastReconnectReason,
-		"last_refresh_prev_token": s.lastRefreshPrevToken,
-		"last_refresh_new_token":  s.lastRefreshNewToken,
-		"uptime_ms":               time.Since(s.startedAt).Milliseconds(),
-		"handoff":                 "none",
+		"ok":                            true,
+		"pid":                           s.pid,
+		"daemon_pid":                    s.pid,
+		"ready":                         s.ready,
+		"daemon_generation":             s.daemonGeneration,
+		"owner_generation":              ownerGeneration,
+		"owner_socket":                  ownerSocket,
+		"owner_count":                   len(s.owners),
+		"owners":                        owners,
+		"pending_tickets":               len(s.tickets),
+		"token_history_size":            len(s.tokenHistory),
+		"zombie_detected":               s.zombieDetectedSpawn,
+		"fallback_spawns":               s.fallbackSpawns,
+		"refresh_requests":              s.refreshRequests,
+		"refresh_successes":             s.refreshSuccesses,
+		"last_reconnect_reason":         s.lastReconnectReason,
+		"last_refresh_prev_token":       s.lastRefreshPrevToken,
+		"last_refresh_new_token":        s.lastRefreshNewToken,
+		"predecessor_pid":               s.predecessorPID,
+		"predecessor_daemon_generation": s.predecessorDaemonGen,
+		"predecessor_owners":            append([]predecessorOwnerSnapshot(nil), s.predecessorOwners...),
+		"restored_owner_count":          s.restoredOwnerCount,
+		"uptime_ms":                     time.Since(s.startedAt).Milliseconds(),
+		"handoff":                       handoff,
 	}
 }
 
@@ -1847,6 +1874,114 @@ func probeRefreshReconnect() error {
 	})
 }
 
+func probeGenerationHandoff() error {
+	if err := ensureDaemonReady(); err != nil {
+		return err
+	}
+	client, err := newProbeRPCClient()
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	if _, err := client.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"clientInfo":      map[string]any{"name": "current-topology-poc-probe", "version": "1.0.0"},
+		"capabilities":    map[string]any{},
+	}, 10*time.Second); err != nil {
+		return fmt.Errorf("initialize before generation handoff: %w", err)
+	}
+	if err := client.notify("notifications/initialized", map[string]any{}); err != nil {
+		return err
+	}
+	if _, err := client.call("tools/list", map[string]any{}, 10*time.Second); err != nil {
+		return fmt.Errorf("tools/list before generation handoff: %w", err)
+	}
+
+	beforeStatus, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	beforePID, _ := jsonNumberToInt(beforeStatus["pid"])
+	beforeGeneration, _ := beforeStatus["daemon_generation"].(string)
+	beforeOwnerGeneration, _ := beforeStatus["owner_generation"].(string)
+	beforeOwnerSocket, _ := beforeStatus["owner_socket"].(string)
+	if beforePID == 0 || beforeGeneration == "" || beforeOwnerGeneration == "" || beforeOwnerSocket == "" {
+		return fmt.Errorf("incomplete predecessor status before handoff: %v", beforeStatus)
+	}
+
+	restartResp, err := sendControl(controlPath(), "graceful-restart", nil, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("graceful-restart before generation handoff: %w", err)
+	}
+	if ok, _ := restartResp["ok"].(bool); !ok {
+		return fmt.Errorf("graceful-restart rejected before generation handoff: %v", restartResp)
+	}
+	afterStatus, err := waitSuccessorReady(beforePID, beforeGeneration, 10*time.Second)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.call("tools/call", map[string]any{
+		"name":      "topology_state",
+		"arguments": map[string]any{},
+	}, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("post-handoff request failed: %w", err)
+	}
+	payload, err := topologyToolPayload(resp)
+	if err != nil {
+		return fmt.Errorf("decode generation handoff payload: %w", err)
+	}
+
+	handoff, _ := afterStatus["handoff"].(string)
+	predecessorPID, _ := jsonNumberToInt(afterStatus["predecessor_pid"])
+	predecessorGeneration, _ := afterStatus["predecessor_daemon_generation"].(string)
+	restoredOwnerCount, _ := jsonNumberToInt(afterStatus["restored_owner_count"])
+	afterGeneration, _ := afterStatus["daemon_generation"].(string)
+	afterOwnerGeneration, _ := afterStatus["owner_generation"].(string)
+	payloadGeneration, _ := payload["daemon_generation"].(string)
+	payloadOwnerGeneration, _ := payload["owner_generation"].(string)
+	oldOwnerReachable := activeUnix(beforeOwnerSocket, 200*time.Millisecond)
+
+	handoffOK := handoff == "restored" &&
+		predecessorPID == beforePID &&
+		predecessorGeneration == beforeGeneration &&
+		restoredOwnerCount > 0 &&
+		!oldOwnerReachable &&
+		payloadGeneration == afterGeneration &&
+		payloadOwnerGeneration == afterOwnerGeneration &&
+		afterOwnerGeneration != "" &&
+		afterOwnerGeneration != beforeOwnerGeneration
+	if !handoffOK {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":                             false,
+			"probe":                          "generation_handoff",
+			"phase":                          "phase8",
+			"break_observed":                 true,
+			"before_status":                  beforeStatus,
+			"after_status":                   afterStatus,
+			"payload":                        payload,
+			"old_owner_socket_reachable":     oldOwnerReachable,
+			"predecessor_generation_matched": predecessorGeneration == beforeGeneration,
+			"handoff":                        handoff,
+		})
+		return fmt.Errorf("generation handoff guard failed: handoff=%q predecessor_pid=%d want=%d predecessor_generation=%q want=%q restored_owner_count=%d old_owner_reachable=%v payload_generation=%q after=%q payload_owner_generation=%q after_owner=%q before_owner=%q",
+			handoff, predecessorPID, beforePID, predecessorGeneration, beforeGeneration, restoredOwnerCount, oldOwnerReachable, payloadGeneration, afterGeneration, payloadOwnerGeneration, afterOwnerGeneration, beforeOwnerGeneration)
+	}
+
+	return writeJSONLine(os.Stdout, map[string]any{
+		"ok":                         true,
+		"probe":                      "generation_handoff",
+		"phase":                      "phase8",
+		"break_observed":             false,
+		"before_status":              beforeStatus,
+		"after_status":               afterStatus,
+		"payload":                    payload,
+		"old_owner_socket_reachable": false,
+	})
+}
+
 func newProbeRPCClient() (*probeRPCClient, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -2172,6 +2307,7 @@ func (s *daemonState) closeOwners() {
 func (s *daemonState) writeSnapshot() error {
 	s.mu.RLock()
 	snaps := make([]ownerSnapshot, 0, len(s.owners))
+	predecessorOwners := make([]predecessorOwnerSnapshot, 0, len(s.owners))
 	for _, entry := range s.owners {
 		snaps = append(snaps, ownerSnapshot{
 			ServerID: entry.ServerID,
@@ -2179,6 +2315,11 @@ func (s *daemonState) writeSnapshot() error {
 			Args:     append([]string(nil), entry.Args...),
 			Cwd:      entry.Cwd,
 			Mode:     entry.Mode,
+		})
+		predecessorOwners = append(predecessorOwners, predecessorOwnerSnapshot{
+			ServerID:        entry.ServerID,
+			OwnerGeneration: entry.Generation,
+			OwnerSocket:     entry.Socket,
 		})
 	}
 	history := make([]tokenHistoryEntry, 0, len(s.tokenHistory))
@@ -2192,7 +2333,13 @@ func (s *daemonState) writeSnapshot() error {
 	}
 	s.mu.RUnlock()
 
-	data, err := json.MarshalIndent(daemonSnapshot{Owners: snaps, TokenHistory: history}, "", "  ")
+	data, err := json.MarshalIndent(daemonSnapshot{
+		Owners:                      snaps,
+		TokenHistory:                history,
+		PredecessorPID:              s.pid,
+		PredecessorDaemonGeneration: s.daemonGeneration,
+		PredecessorOwners:           predecessorOwners,
+	}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -2220,6 +2367,7 @@ func (s *daemonState) restoreSnapshot() error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	restoredOwnerCount := 0
 	for _, owner := range snap.Owners {
 		req := controlRequest{
 			Command: owner.Command,
@@ -2237,6 +2385,7 @@ func (s *daemonState) restoreSnapshot() error {
 		if _, err := s.startOwnerLocked(sid, req); err != nil {
 			return err
 		}
+		restoredOwnerCount++
 	}
 	now := time.Now()
 	for _, entry := range snap.TokenHistory {
@@ -2248,6 +2397,10 @@ func (s *daemonState) restoreSnapshot() error {
 		}
 		s.tokenHistory[entry.Token] = entry
 	}
+	s.predecessorPID = snap.PredecessorPID
+	s.predecessorDaemonGen = snap.PredecessorDaemonGeneration
+	s.predecessorOwners = append([]predecessorOwnerSnapshot(nil), snap.PredecessorOwners...)
+	s.restoredOwnerCount = restoredOwnerCount
 	return nil
 }
 

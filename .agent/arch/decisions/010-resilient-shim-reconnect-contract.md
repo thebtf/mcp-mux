@@ -17,7 +17,8 @@ restart boundary.
 Why this decision is needed: the standalone current-topology PoC proves that a
 minimal topology can survive same-stdio restart, initialize replay, one
 interrupted request, one stdin-buffered next request, concurrent out-of-order
-responses, and refresh-token reconnect. Production
+responses, refresh-token reconnect, and generation-aware handoff reporting.
+Production
 `muxcore/owner/resilient_client.go` already has a richer state machine, but its
 contract intentionally differs for already-sent in-flight requests.
 
@@ -50,6 +51,7 @@ for duplicate execution risk.
 | Phase 5 | PASS | Same runner; slow request plus stdin-buffered next request both returned from successor generation | The topology can preserve a serial reconnect window, but the PoC does not model non-idempotent upstream side effects. |
 | Phase 6 | PASS | Same runner; `concurrent_demux` returned `active_calls:2`, `max_concurrent_calls:2`, `response_order:[4,3]`, both responses from successor generation | The experimental topology can support concurrent owner dispatch and out-of-order response demux by JSON-RPC ID across restart. |
 | Phase 7 | PASS | Same runner; `refresh_reconnect` returned `refresh_used:true`, `fallback_spawn_used:false`, `refresh_successes:1`, `fallback_spawns:0`, and a different refreshed token | A restored owner can be rejoined through consumed-token history without falling back to fresh spawn. |
+| Phase 8 | PASS | Same runner; `generation_handoff` returned `handoff:"restored"`, predecessor PID/generation, `restored_owner_count:1`, old owner socket unreachable, and successor-generation payload | The experimental topology can make handoff ownership explicit enough to distinguish predecessor, successor, and restored owner state. |
 
 ## First Break
 
@@ -76,6 +78,7 @@ replay initialize, and resume the same stdio process.
 | Already-sent in-flight request | `inflight`, `drainOrphanedInflight` | Production intentionally returns JSON-RPC error instead of retrying. This is safer than the PoC retry behavior for side-effecting calls. | Preserve default error response behavior; document as the production contract. Optional future policy can add method-scoped safe retry. | Test that a request already written to old IPC receives one JSON-RPC error by ID and does not get replayed to the successor by default. |
 | Token continuity | `RefreshToken`, `Reconnect`, `finishReconnect`, session token history | PoC proves the invariant with consumed-token history, but production parity still needs integration evidence across daemon restart and restored owners. | Compare production refresh-token history and fallback counters against Phase 7; keep fallback spawn as fallback-only, not the normal reconnect path. | Production test: consumed original token is refreshed to a different token, reconnect succeeds, initialize is replayed, fallback spawn counter stays zero. |
 | Concurrent response demux | owner dispatch loop, resilient client IPC reader/writer | PoC proves the invariant; production parity still needs explicit tests before changing owner concurrency. | Compare production dispatch/response tracking to Phase 6 before porting concurrency behavior. | New production test with two outstanding requests, out-of-order responses, and restart boundary. |
+| Generation-aware handoff reporting | daemon snapshot/restore, status/control reporting | PoC proves the observability invariant; production needs equivalent status/debug fields or tests that can prove predecessor/successor ownership without relying on timing. | Add production handoff evidence to restart tests: predecessor generation, successor generation, restored owner count, and old owner socket retirement. | Production test: after graceful restart, status/test harness proves restored owners are successor-owned and predecessor owner sockets are not reachable. |
 
 ## Consequences
 
@@ -96,6 +99,7 @@ and method-aware.
 | PoC stronger success behavior may be misread as production retry mandate | Phase 5 does not model side effects | Keep this ADR as the contract and encode it in tests. |
 | Production true concurrent/out-of-order dispatch remains unproven | Phase 6 is proven only in the standalone PoC | Add production parity tests before changing owner dispatch concurrency. |
 | Production refresh-token reconnect parity remains unproven | Phase 7 is proven only in the standalone PoC | Add production parity test with refresh success and fallback-spawn absence before relying on runtime smoke alone. |
+| Production handoff observability remains weak | Phase 8 is proven only in the standalone PoC | Add generation-aware evidence hooks or harness assertions before declaring graceful restart reliable. |
 | Runtime startup flakiness may also involve daemon/socket/process lifecycle outside `resilient_client.go` | This ADR focuses on shim reconnect contract | Use production parity tests plus fresh-session attach smoke after code changes. |
 
 ## Verification Plan
@@ -126,6 +130,8 @@ Regression tests:
 - concurrent out-of-order responses are demuxed by JSON-RPC ID;
 - refresh-token reconnect uses a different token and avoids fallback spawn when
   the restored owner is alive;
+- generation-aware handoff evidence distinguishes predecessor and successor
+  owner generations and proves old owner sockets are retired;
 - no `mux-reconnect` synthetic progress notification is emitted.
 
 ## Reversibility

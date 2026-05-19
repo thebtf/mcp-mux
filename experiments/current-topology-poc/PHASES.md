@@ -228,7 +228,46 @@ Current pass signal:
 This proves fallback spawn is not required when a restored owner is alive and
 the daemon has a consumed-token history entry for the existing shim.
 
+## Phase 8 - Generation-Aware Graceful Restart Handoff
+
+Status: PASS
+
+Adds explicit handoff observability:
+
+- graceful-restart snapshot records predecessor daemon PID/generation
+- snapshot records predecessor owner generation/socket per server ID
+- successor status reports `handoff:"restored"` after snapshot restore
+- successor status reports predecessor fields and `restored_owner_count`
+- probe verifies the predecessor owner socket is no longer reachable after
+  successor ready
+- probe verifies post-restart traffic returns only from the successor daemon and
+  restored owner generation
+
+Observed pre-fix break:
+
+```text
+"probe":"generation_handoff"
+"break_observed":true
+"handoff":"none"
+"predecessor_generation_matched":false
+"old_owner_socket_reachable":false
+```
+
+Current pass signal:
+
+```text
+"probe":"generation_handoff"
+"phase":"phase8"
+"break_observed":false
+"after_status":{"handoff":"restored","restored_owner_count":1,...}
+"old_owner_socket_reachable":false
+"payload":{"daemon_generation":"<successor>","owner_generation":"<restored-owner>",...}
+```
+
+This proves the PoC can make handoff generation state explicit enough to
+distinguish fresh spawn, restored owner, predecessor generation, and successor
+generation.
+
 ## Candidate Next Phases
 
-- Phase 8: generation-aware graceful restart handoff
 - Phase 9: persistent/idle reaper and upstream process lifecycle

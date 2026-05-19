@@ -177,6 +177,12 @@ try {
 
     Stop-PocDaemon
 
+    Invoke-NativeStep "generation-aware handoff" {
+        & $Binary --poc-probe-generation-handoff
+    }
+
+    Stop-PocDaemon
+
     Write-Host ""
     Write-Host "PASS current-topology PoC"
 } finally {
