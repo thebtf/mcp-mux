@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -182,10 +183,20 @@ func TestWindowsFDConn_SendFDs_NoTargetPID(t *testing.T) {
 	defer peer.Close()
 	cli := newWindowsFDConn(conn)
 	defer cli.Close()
+	tmp, err := os.CreateTemp("", "handoff-no-target-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
 	// targetPID is zero (SetTargetPID not called) — must return error immediately.
-	err := cli.SendFDs([]uintptr{0}, []byte("h"))
+	err = cli.SendFDs([]uintptr{tmp.Fd()}, []byte("h"))
 	if err == nil {
 		t.Fatal("expected error when targetPID not set")
+	}
+	if !strings.Contains(err.Error(), "targetPID not set") {
+		t.Fatalf("error = %v, want targetPID guard", err)
 	}
 }
 
