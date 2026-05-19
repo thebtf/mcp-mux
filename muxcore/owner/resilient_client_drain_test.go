@@ -2,12 +2,15 @@ package owner
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -98,6 +101,49 @@ func handleSlowEchoConn(conn net.Conn, received chan string, onRequest func(conn
 			if _, err := fmt.Fprintf(conn, "%s\n", resp); err != nil {
 				return
 			}
+		}
+	}
+}
+
+func TestReconnectDrain_NoReplayProducesSingleErrorByOriginalID(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	stdout := &bytes.Buffer{}
+	rc := newReconnectClient(t, stdout, logger)
+	rc.inflight.Store("99", true)
+
+	refreshPath := tempReconnectSocketPath(t, "feedface1234")
+	srv, recv := startEchoIPCServer(t, refreshPath)
+	defer srv.closeAll()
+
+	stdinDone := make(chan error)
+	rc.cfg.RefreshToken = func() (string, string, error) {
+		return refreshPath, "fresh-token", nil
+	}
+
+	conn, err := rc.reconnect(&sync.Mutex{}, stdinDone)
+	if err != nil {
+		t.Fatalf("reconnect() error = %v", err)
+	}
+	defer closeReconnectConn(t, conn)
+
+	out := stdout.String()
+	if got := strings.Count(out, `"id":99`); got != 1 {
+		t.Fatalf("JSON-RPC error id count = %d, want 1; stdout=%q", got, out)
+	}
+	if got := strings.Count(out, `request lost during reconnect`); got != 1 {
+		t.Fatalf("reconnect error message count = %d, want 1; stdout=%q", got, out)
+	}
+
+	deadline := time.After(100 * time.Millisecond)
+	for {
+		select {
+		case line := <-recv:
+			if strings.Contains(line, `"id":99`) {
+				t.Fatalf("already-sent in-flight request was replayed to successor: %s", line)
+			}
+		case <-deadline:
+			return
 		}
 	}
 }
