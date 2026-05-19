@@ -1253,7 +1253,7 @@ func ensureDaemonReady() error {
 		}
 
 		if !started {
-			if handoffSnapshotExists() && waitExistingControlReady(ctl, 20, 500*time.Millisecond) {
+			if waitExistingDaemonReady(ctl, 20, 500*time.Millisecond) {
 				return nil
 			}
 			if err := startDaemonProcess(false); err != nil {
@@ -1266,16 +1266,21 @@ func ensureDaemonReady() error {
 	return fmt.Errorf("daemon did not become ready before timeout")
 }
 
-func waitExistingControlReady(ctl string, attempts int, interval time.Duration) bool {
+func waitExistingDaemonReady(ctl string, attempts int, interval time.Duration) bool {
 	for i := 0; i < attempts; i++ {
+		attemptStarted := time.Now()
 		status, err := sendControl(ctl, "status", nil, 500*time.Millisecond)
 		if err == nil {
 			ready, _ := status["ready"].(bool)
 			if ready {
 				return true
 			}
+		} else if !handoffSnapshotExists() && !ipc.IsAvailable(ctl) {
+			return false
 		}
-		time.Sleep(interval)
+		if remaining := interval - time.Since(attemptStarted); remaining > 0 {
+			time.Sleep(remaining)
+		}
 	}
 	return false
 }
