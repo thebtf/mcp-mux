@@ -135,15 +135,13 @@ Current pass signal:
 "phase":"phase5"
 "break_observed":false
 "slow_payload":{"daemon_generation":"<successor>","delay_ms":900,...}
-"buffered_payload":{"daemon_generation":"<successor>","delay_ms":0,...}
+"buffered_payload":{"daemon_generation":"<successor>","delay_ms":900,...}
 ```
 
 This shows the minimal serial reconnect loop covers one interrupted in-flight
 request plus the next request already buffered into stdin. It does not prove
 true concurrent owner dispatch, out-of-order response demux, orphaned response
 drain, or refresh-token history.
-
-## Candidate Next Phases
 
 ## Phase 6 - True Concurrent Dispatch and Out-of-Order Response Demux
 
@@ -182,12 +180,55 @@ Current pass signal:
 ```
 
 This proves the PoC shim can handle multiple outstanding owner requests and
-out-of-order responses by JSON-RPC ID across daemon restart. It still does not
-model production refresh-token history, real upstream subprocess side effects,
-or production `muxcore` code imports.
+out-of-order responses by JSON-RPC ID across daemon restart. It still did not,
+by itself, model production refresh-token history, real upstream subprocess
+side effects, or production `muxcore` code imports.
+
+## Phase 7 - Session Manager History and Refresh-Token Reconnect
+
+Status: PASS
+
+Adds the first token-continuity mechanism:
+
+- daemon records consumed session tokens in a bounded history table
+- graceful-restart snapshots owner identities plus consumed-token history
+- successor restores owners with fresh owner generations and restores token
+  history for those server IDs
+- shim remembers the last consumed token for its stdio session
+- on reconnect, shim calls control `refresh-token` before using fallback spawn
+- daemon mints a fresh one-shot token for the restored owner when the previous
+  token is known and the owner is alive
+- probe proves the same stdio shim reconnects with refresh-token, replays
+  initialize, and completes post-restart traffic without fallback spawn
+
+Observed pre-fix break:
+
+```text
+"probe":"refresh_reconnect"
+"break_observed":true
+"refresh_used":false
+"fallback_spawn_used":true
+"token_changed":false
+"last_reconnect_reason":"fallback_spawn"
+```
+
+Current pass signal:
+
+```text
+"probe":"refresh_reconnect"
+"phase":"phase7"
+"break_observed":false
+"refresh_used":true
+"fallback_spawn_used":false
+"final_status":{"refresh_requests":1,"refresh_successes":1,"fallback_spawns":0,...}
+"original_token":"<prev>"
+"refreshed_token":"<different>"
+```
+
+This proves fallback spawn is not required when a restored owner is alive and
+the daemon has a consumed-token history entry for the existing shim.
 
 ## Candidate Next Phases
 
-- Phase 7: session manager history and refresh-token reconnect path
 - Phase 8: generation-aware graceful restart handoff
 - Phase 9: persistent/idle reaper and upstream process lifecycle

@@ -171,6 +171,12 @@ try {
 
     Stop-PocDaemon
 
+    Invoke-NativeStep "refresh-token reconnect" {
+        & $Binary --poc-probe-refresh-reconnect
+    }
+
+    Stop-PocDaemon
+
     Write-Host ""
     Write-Host "PASS current-topology PoC"
 } finally {

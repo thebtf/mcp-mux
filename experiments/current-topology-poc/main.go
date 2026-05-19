@@ -31,13 +31,15 @@ const (
 )
 
 type controlRequest struct {
-	Cmd      string            `json:"cmd"`
-	ServerID string            `json:"server_id,omitempty"`
-	Command  string            `json:"command,omitempty"`
-	Args     []string          `json:"args,omitempty"`
-	Cwd      string            `json:"cwd,omitempty"`
-	Mode     string            `json:"mode,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
+	Cmd             string            `json:"cmd"`
+	ServerID        string            `json:"server_id,omitempty"`
+	Command         string            `json:"command,omitempty"`
+	Args            []string          `json:"args,omitempty"`
+	Cwd             string            `json:"cwd,omitempty"`
+	Mode            string            `json:"mode,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	PrevToken       string            `json:"prev_token,omitempty"`
+	ReconnectReason string            `json:"reconnect_reason,omitempty"`
 }
 
 type ticket struct {
@@ -46,6 +48,12 @@ type ticket struct {
 	DaemonGeneration string
 	OwnerGeneration  string
 	ExpiresAt        time.Time
+}
+
+type tokenHistoryEntry struct {
+	Token     string    `json:"token"`
+	ServerID  string    `json:"server_id"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 type ownerEntry struct {
@@ -73,6 +81,11 @@ type ownerSnapshot struct {
 	Mode     string   `json:"mode"`
 }
 
+type daemonSnapshot struct {
+	Owners       []ownerSnapshot     `json:"owners"`
+	TokenHistory []tokenHistoryEntry `json:"token_history,omitempty"`
+}
+
 type daemonState struct {
 	mu sync.RWMutex
 
@@ -81,10 +94,17 @@ type daemonState struct {
 	ready            bool
 	startedAt        time.Time
 
-	owners  map[string]*ownerEntry
-	tickets map[string]ticket
+	owners       map[string]*ownerEntry
+	tickets      map[string]ticket
+	tokenHistory map[string]tokenHistoryEntry
 
-	zombieDetectedSpawn int
+	zombieDetectedSpawn  int
+	fallbackSpawns       int
+	refreshRequests      int
+	refreshSuccesses     int
+	lastReconnectReason  string
+	lastRefreshPrevToken string
+	lastRefreshNewToken  string
 }
 
 type ownerHello struct {
@@ -107,6 +127,15 @@ type probeRPCClient struct {
 	nextID  int
 }
 
+type ownerConnectInfo struct {
+	ServerID         string
+	OwnerSocket      string
+	Token            string
+	DaemonGeneration string
+	OwnerGeneration  string
+	ReconnectReason  string
+}
+
 type shimOwnerConn struct {
 	conn      net.Conn
 	reader    *bufio.Reader
@@ -114,6 +143,7 @@ type shimOwnerConn struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan ownerResponse
 	closeOnce sync.Once
+	info      ownerConnectInfo
 }
 
 type ownerResponse struct {
@@ -124,6 +154,7 @@ type ownerResponse struct {
 type shimState struct {
 	mu               sync.Mutex
 	ownerConn        *shimOwnerConn
+	lastOwner        ownerConnectInfo
 	cachedInitialize []byte
 	stdoutMu         sync.Mutex
 }
@@ -137,6 +168,7 @@ func main() {
 	pocProbeLiveReconnect := flag.Bool("poc-probe-live-reconnect", false, "verify one stdio shim survives daemon graceful restart")
 	pocProbeInflightReconnect := flag.Bool("poc-probe-inflight-reconnect", false, "verify in-flight and buffered requests survive daemon graceful restart")
 	pocProbeConcurrentDemux := flag.Bool("poc-probe-concurrent-demux", false, "verify concurrent out-of-order responses demux by ID across daemon graceful restart")
+	pocProbeRefreshReconnect := flag.Bool("poc-probe-refresh-reconnect", false, "verify reconnect uses refresh-token instead of fallback spawn")
 	flag.Parse()
 
 	switch {
@@ -182,6 +214,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "concurrent-demux probe failed: %v\n", err)
 			os.Exit(1)
 		}
+	case *pocProbeRefreshReconnect:
+		if err := probeRefreshReconnect(); err != nil {
+			fmt.Fprintf(os.Stderr, "refresh-reconnect probe failed: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		if err := runShim(context.Background()); err != nil {
 			logf("shim failed: %v", err)
@@ -213,6 +250,7 @@ func runDaemon(ctx context.Context) error {
 		startedAt:        time.Now(),
 		owners:           make(map[string]*ownerEntry),
 		tickets:          make(map[string]ticket),
+		tokenHistory:     make(map[string]tokenHistoryEntry),
 	}
 	defer state.closeOwners()
 
@@ -276,6 +314,8 @@ func handleControl(conn net.Conn, state *daemonState, stop func()) {
 		resp = state.status()
 	case "spawn":
 		resp = state.spawn(req)
+	case "refresh-token":
+		resp = state.refreshToken(req)
 	case "poison-owner":
 		resp = state.poisonOwner(req)
 	case "shutdown":
@@ -325,19 +365,26 @@ func (s *daemonState) status() map[string]any {
 		ownerSocket, _ = owners[0]["owner_socket"].(string)
 	}
 	return map[string]any{
-		"ok":                true,
-		"pid":               s.pid,
-		"daemon_pid":        s.pid,
-		"ready":             s.ready,
-		"daemon_generation": s.daemonGeneration,
-		"owner_generation":  ownerGeneration,
-		"owner_socket":      ownerSocket,
-		"owner_count":       len(s.owners),
-		"owners":            owners,
-		"pending_tickets":   len(s.tickets),
-		"zombie_detected":   s.zombieDetectedSpawn,
-		"uptime_ms":         time.Since(s.startedAt).Milliseconds(),
-		"handoff":           "none",
+		"ok":                      true,
+		"pid":                     s.pid,
+		"daemon_pid":              s.pid,
+		"ready":                   s.ready,
+		"daemon_generation":       s.daemonGeneration,
+		"owner_generation":        ownerGeneration,
+		"owner_socket":            ownerSocket,
+		"owner_count":             len(s.owners),
+		"owners":                  owners,
+		"pending_tickets":         len(s.tickets),
+		"token_history_size":      len(s.tokenHistory),
+		"zombie_detected":         s.zombieDetectedSpawn,
+		"fallback_spawns":         s.fallbackSpawns,
+		"refresh_requests":        s.refreshRequests,
+		"refresh_successes":       s.refreshSuccesses,
+		"last_reconnect_reason":   s.lastReconnectReason,
+		"last_refresh_prev_token": s.lastRefreshPrevToken,
+		"last_refresh_new_token":  s.lastRefreshNewToken,
+		"uptime_ms":               time.Since(s.startedAt).Milliseconds(),
+		"handoff":                 "none",
 	}
 }
 
@@ -374,6 +421,10 @@ func (s *daemonState) spawn(req controlRequest) map[string]any {
 	}
 
 	normalized := normalizeSpawnRequest(req)
+	if req.ReconnectReason == "fallback_spawn" {
+		s.fallbackSpawns++
+		s.lastReconnectReason = req.ReconnectReason
+	}
 	sid := serverID(normalized)
 	entry, existed := s.owners[sid]
 	if existed && !activeUnix(entry.Socket, 200*time.Millisecond) {
@@ -411,6 +462,59 @@ func (s *daemonState) spawn(req controlRequest) map[string]any {
 		"owner_socket":      entry.Socket,
 		"token":             token,
 		"expires_unix_ms":   t.ExpiresAt.UnixMilli(),
+	}
+}
+
+func (s *daemonState) refreshToken(req controlRequest) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.refreshRequests++
+	prevToken := strings.TrimSpace(req.PrevToken)
+	if prevToken == "" {
+		return map[string]any{"ok": false, "error": "missing_prev_token"}
+	}
+	history, ok := s.tokenHistory[prevToken]
+	if !ok {
+		return map[string]any{"ok": false, "error": "unknown_token"}
+	}
+	now := time.Now()
+	if now.After(history.ExpiresAt) {
+		delete(s.tokenHistory, prevToken)
+		return map[string]any{"ok": false, "error": "expired_token"}
+	}
+	entry, ok := s.owners[history.ServerID]
+	if !ok {
+		return map[string]any{"ok": false, "error": "owner_gone", "server_id": history.ServerID}
+	}
+	if !activeUnix(entry.Socket, 200*time.Millisecond) {
+		return map[string]any{"ok": false, "error": "owner_gone", "server_id": history.ServerID}
+	}
+
+	token := randomToken()
+	t := ticket{
+		Token:            token,
+		ServerID:         entry.ServerID,
+		DaemonGeneration: s.daemonGeneration,
+		OwnerGeneration:  entry.Generation,
+		ExpiresAt:        now.Add(30 * time.Second),
+	}
+	s.tickets[token] = t
+	s.refreshSuccesses++
+	s.lastReconnectReason = "refresh_token"
+	s.lastRefreshPrevToken = prevToken
+	s.lastRefreshNewToken = token
+
+	return map[string]any{
+		"ok":                true,
+		"server_id":         entry.ServerID,
+		"daemon_generation": s.daemonGeneration,
+		"owner_generation":  entry.Generation,
+		"owner_socket":      entry.Socket,
+		"token":             token,
+		"prev_token":        prevToken,
+		"expires_unix_ms":   t.ExpiresAt.UnixMilli(),
+		"refresh_used":      true,
 	}
 }
 
@@ -482,6 +586,11 @@ func (s *daemonState) consumeTicket(h ownerHello, entry *ownerEntry) (int, strin
 		return 0, "current_generation_mismatch", false
 	}
 
+	s.tokenHistory[t.Token] = tokenHistoryEntry{
+		Token:     t.Token,
+		ServerID:  t.ServerID,
+		ExpiresAt: now.Add(30 * time.Minute),
+	}
 	entry.NextSession++
 	return entry.NextSession, "", true
 }
@@ -763,8 +872,37 @@ func (s *shimState) ensureOwner() (*shimOwnerConn, error) {
 	if s.ownerConn != nil {
 		return s.ownerConn, nil
 	}
-	ownerConn, err := connectShimOwner()
+	var refreshErr error
+	if s.lastOwner.Token != "" {
+		ownerConn, err := connectShimOwnerWithRefresh(s.lastOwner.Token)
+		if err == nil {
+			if s.cachedInitialize != nil {
+				if err := ownerConn.warmInitialize(s.cachedInitialize); err != nil {
+					ownerConn.close()
+					refreshErr = err
+				} else {
+					s.ownerConn = ownerConn
+					s.lastOwner = ownerConn.info
+					return ownerConn, nil
+				}
+			} else {
+				s.ownerConn = ownerConn
+				s.lastOwner = ownerConn.info
+				return ownerConn, nil
+			}
+		} else {
+			refreshErr = err
+		}
+	}
+	reconnectReason := "initial_spawn"
+	if s.lastOwner.Token != "" {
+		reconnectReason = "fallback_spawn"
+	}
+	ownerConn, err := connectShimOwner(reconnectReason)
 	if err != nil {
+		if refreshErr != nil {
+			return nil, fmt.Errorf("%w; refresh-token failed: %v", err, refreshErr)
+		}
 		return nil, err
 	}
 	if s.cachedInitialize != nil {
@@ -774,6 +912,7 @@ func (s *shimState) ensureOwner() (*shimOwnerConn, error) {
 		}
 	}
 	s.ownerConn = ownerConn
+	s.lastOwner = ownerConn.info
 	return ownerConn, nil
 }
 
@@ -796,12 +935,16 @@ func (s *shimState) close() {
 	}
 }
 
-func connectShimOwner() (*shimOwnerConn, error) {
+func connectShimOwner(reconnectReason string) (*shimOwnerConn, error) {
 	if err := ensureDaemonReady(); err != nil {
 		return nil, err
 	}
 
-	spawnResp, err := sendControl(controlPath(), "spawn", shimSpawnExtra(), 5*time.Second)
+	extra := shimSpawnExtra()
+	if reconnectReason != "" {
+		extra["reconnect_reason"] = reconnectReason
+	}
+	spawnResp, err := sendControl(controlPath(), "spawn", extra, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("spawn: %w", err)
 	}
@@ -809,12 +952,31 @@ func connectShimOwner() (*shimOwnerConn, error) {
 		return nil, fmt.Errorf("spawn rejected: %v", spawnResp)
 	}
 
-	ownerSocket, _ := spawnResp["owner_socket"].(string)
-	token, _ := spawnResp["token"].(string)
-	daemonGen, _ := spawnResp["daemon_generation"].(string)
-	ownerGen, _ := spawnResp["owner_generation"].(string)
-	if ownerSocket == "" || token == "" || daemonGen == "" || ownerGen == "" {
-		return nil, fmt.Errorf("incomplete spawn response: %v", spawnResp)
+	return connectOwnerFromControlResponse(spawnResp, reconnectReason)
+}
+
+func connectShimOwnerWithRefresh(prevToken string) (*shimOwnerConn, error) {
+	if err := ensureDaemonReady(); err != nil {
+		return nil, err
+	}
+	resp, err := sendControl(controlPath(), "refresh-token", map[string]any{"prev_token": prevToken}, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("refresh-token: %w", err)
+	}
+	if ok, _ := resp["ok"].(bool); !ok {
+		return nil, fmt.Errorf("refresh-token rejected: %v", resp)
+	}
+	return connectOwnerFromControlResponse(resp, "refresh_token")
+}
+
+func connectOwnerFromControlResponse(resp map[string]any, reconnectReason string) (*shimOwnerConn, error) {
+	ownerSocket, _ := resp["owner_socket"].(string)
+	token, _ := resp["token"].(string)
+	daemonGen, _ := resp["daemon_generation"].(string)
+	ownerGen, _ := resp["owner_generation"].(string)
+	serverID, _ := resp["server_id"].(string)
+	if ownerSocket == "" || token == "" || daemonGen == "" || ownerGen == "" || serverID == "" {
+		return nil, fmt.Errorf("incomplete owner connection response: %v", resp)
 	}
 
 	conn, err := net.DialTimeout("unix", ownerSocket, 5*time.Second)
@@ -847,6 +1009,14 @@ func connectShimOwner() (*shimOwnerConn, error) {
 		conn:    conn,
 		reader:  reader,
 		pending: make(map[string]chan ownerResponse),
+		info: ownerConnectInfo{
+			ServerID:         serverID,
+			OwnerSocket:      ownerSocket,
+			Token:            token,
+			DaemonGeneration: daemonGen,
+			OwnerGeneration:  ownerGen,
+			ReconnectReason:  reconnectReason,
+		},
 	}
 	go ownerConn.readLoop()
 	return ownerConn, nil
@@ -1567,6 +1737,116 @@ func probeConcurrentDemux() error {
 	})
 }
 
+func probeRefreshReconnect() error {
+	if err := ensureDaemonReady(); err != nil {
+		return err
+	}
+	beforeStatus, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	beforePID, _ := jsonNumberToInt(beforeStatus["pid"])
+	beforeGeneration, _ := beforeStatus["daemon_generation"].(string)
+
+	client, err := newProbeRPCClient()
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	if _, err := client.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"clientInfo":      map[string]any{"name": "current-topology-poc-probe", "version": "1.0.0"},
+		"capabilities":    map[string]any{},
+	}, 10*time.Second); err != nil {
+		return fmt.Errorf("initialize before refresh restart: %w", err)
+	}
+	if err := client.notify("notifications/initialized", map[string]any{}); err != nil {
+		return err
+	}
+	if _, err := client.call("tools/list", map[string]any{}, 10*time.Second); err != nil {
+		return fmt.Errorf("tools/list before refresh restart: %w", err)
+	}
+
+	restartResp, err := sendControl(controlPath(), "graceful-restart", nil, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("graceful-restart before refresh reconnect: %w", err)
+	}
+	if ok, _ := restartResp["ok"].(bool); !ok {
+		return fmt.Errorf("graceful-restart rejected before refresh reconnect: %v", restartResp)
+	}
+	afterStatus, err := waitSuccessorReady(beforePID, beforeGeneration, 10*time.Second)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.call("tools/call", map[string]any{
+		"name":      "topology_state",
+		"arguments": map[string]any{},
+	}, 10*time.Second)
+	if err != nil {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":             false,
+			"probe":          "refresh_reconnect",
+			"phase":          "phase7",
+			"break_observed": true,
+			"before_pid":     beforePID,
+			"before_gen":     beforeGeneration,
+			"after_status":   afterStatus,
+			"error":          err.Error(),
+		})
+		return fmt.Errorf("same stdio session did not reconnect through refresh-token path: %w", err)
+	}
+	payload, err := topologyToolPayload(resp)
+	if err != nil {
+		return fmt.Errorf("decode refresh reconnect payload: %w", err)
+	}
+	finalStatus, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	refreshSuccesses, _ := jsonNumberToInt(finalStatus["refresh_successes"])
+	fallbackSpawns, _ := jsonNumberToInt(finalStatus["fallback_spawns"])
+	prevToken, _ := finalStatus["last_refresh_prev_token"].(string)
+	newToken, _ := finalStatus["last_refresh_new_token"].(string)
+	refreshUsed := refreshSuccesses > 0
+	fallbackUsed := fallbackSpawns > 0
+	tokenChanged := prevToken != "" && newToken != "" && prevToken != newToken
+	if !refreshUsed || fallbackUsed || !tokenChanged {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":                  false,
+			"probe":               "refresh_reconnect",
+			"phase":               "phase7",
+			"break_observed":      true,
+			"before_pid":          beforePID,
+			"before_gen":          beforeGeneration,
+			"after_status":        afterStatus,
+			"final_status":        finalStatus,
+			"payload":             payload,
+			"refresh_used":        refreshUsed,
+			"fallback_spawn_used": fallbackUsed,
+			"token_changed":       tokenChanged,
+		})
+		return fmt.Errorf("refresh-token reconnect guard failed: refresh_used=%v fallback_spawn_used=%v token_changed=%v", refreshUsed, fallbackUsed, tokenChanged)
+	}
+
+	return writeJSONLine(os.Stdout, map[string]any{
+		"ok":                  true,
+		"probe":               "refresh_reconnect",
+		"phase":               "phase7",
+		"break_observed":      false,
+		"before_pid":          beforePID,
+		"before_gen":          beforeGeneration,
+		"after_status":        afterStatus,
+		"final_status":        finalStatus,
+		"payload":             payload,
+		"refresh_used":        refreshUsed,
+		"fallback_spawn_used": fallbackUsed,
+		"original_token":      prevToken,
+		"refreshed_token":     newToken,
+	})
+}
+
 func newProbeRPCClient() (*probeRPCClient, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -1901,9 +2181,18 @@ func (s *daemonState) writeSnapshot() error {
 			Mode:     entry.Mode,
 		})
 	}
+	history := make([]tokenHistoryEntry, 0, len(s.tokenHistory))
+	now := time.Now()
+	for token, entry := range s.tokenHistory {
+		if now.After(entry.ExpiresAt) {
+			continue
+		}
+		entry.Token = token
+		history = append(history, entry)
+	}
 	s.mu.RUnlock()
 
-	data, err := json.MarshalIndent(snaps, "", "  ")
+	data, err := json.MarshalIndent(daemonSnapshot{Owners: snaps, TokenHistory: history}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -1920,21 +2209,25 @@ func (s *daemonState) restoreSnapshot() error {
 	}
 	defer os.Remove(snapshotPath())
 
-	var snaps []ownerSnapshot
-	if err := json.Unmarshal(data, &snaps); err != nil {
-		return err
+	var snap daemonSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		var legacyOwners []ownerSnapshot
+		if legacyErr := json.Unmarshal(data, &legacyOwners); legacyErr != nil {
+			return err
+		}
+		snap.Owners = legacyOwners
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, snap := range snaps {
+	for _, owner := range snap.Owners {
 		req := controlRequest{
-			Command: snap.Command,
-			Args:    append([]string(nil), snap.Args...),
-			Cwd:     snap.Cwd,
-			Mode:    snap.Mode,
+			Command: owner.Command,
+			Args:    append([]string(nil), owner.Args...),
+			Cwd:     owner.Cwd,
+			Mode:    owner.Mode,
 		}
-		sid := snap.ServerID
+		sid := owner.ServerID
 		if sid == "" {
 			sid = serverID(normalizeSpawnRequest(req))
 		}
@@ -1944,6 +2237,16 @@ func (s *daemonState) restoreSnapshot() error {
 		if _, err := s.startOwnerLocked(sid, req); err != nil {
 			return err
 		}
+	}
+	now := time.Now()
+	for _, entry := range snap.TokenHistory {
+		if entry.Token == "" || entry.ServerID == "" || now.After(entry.ExpiresAt) {
+			continue
+		}
+		if _, ok := s.owners[entry.ServerID]; !ok {
+			continue
+		}
+		s.tokenHistory[entry.Token] = entry
 	}
 	return nil
 }
