@@ -42,6 +42,9 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 			snap.Env = entry.Env
 		}
 		snap.Persistent = entry.Persistent
+		snap.OwnerGeneration = entry.OwnerGeneration
+		snap.RestoredFromGeneration = entry.RestoredFromOwnerGeneration
+		snap.RestoreSource = entry.RestoreSource
 		owners = append(owners, snap)
 
 		// Collect session metadata from this owner.
@@ -53,11 +56,12 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 	d.mu.RUnlock()
 
 	data := &DaemonSnapshot{
-		Version:    mcpsnapshot.SnapshotVersion,
-		MuxVersion: owner.Version,
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		Owners:     owners,
-		Sessions:   sessions,
+		Version:          mcpsnapshot.SnapshotVersion,
+		MuxVersion:       owner.Version,
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+		DaemonGeneration: d.daemonGeneration,
+		Owners:           owners,
+		Sessions:         sessions,
 	}
 
 	return mcpsnapshot.Serialize(data, d.logger)
@@ -258,19 +262,32 @@ func (d *Daemon) loadSnapshot() int {
 			serviceToken = d.supervisor.Add(o)
 		}
 
+		ownerGeneration, genErr := generateGeneration("owner")
+		if genErr != nil {
+			d.logger.Printf("snapshot: failed to generate owner generation for %s: %v", sid[:8], genErr)
+			continue
+		}
+		restoreSource := "snapshot_fallback"
+		if reattachedFromHandoff {
+			restoreSource = "snapshot_handoff"
+		}
+
 		d.mu.Lock()
 		d.owners[sid] = &OwnerEntry{
-			Owner:        o,
-			ServerID:     sid,
-			Command:      ownerSnap.Command,
-			Args:         ownerSnap.Args,
-			Cwd:          ownerSnap.Cwd,
-			Mode:         ownerSnap.Mode,
-			Env:          restoredEnv,
-			Persistent:   ownerSnap.Persistent,
-			LastSession:  time.Now(),
-			IdleTimeout:  d.ownerIdleTimeout,
-			serviceToken: serviceToken,
+			Owner:                       o,
+			ServerID:                    sid,
+			Command:                     ownerSnap.Command,
+			Args:                        ownerSnap.Args,
+			Cwd:                         ownerSnap.Cwd,
+			Mode:                        ownerSnap.Mode,
+			Env:                         restoredEnv,
+			Persistent:                  ownerSnap.Persistent,
+			LastSession:                 time.Now(),
+			OwnerGeneration:             ownerGeneration,
+			RestoredFromOwnerGeneration: ownerSnap.OwnerGeneration,
+			RestoreSource:               restoreSource,
+			IdleTimeout:                 d.ownerIdleTimeout,
+			serviceToken:                serviceToken,
 		}
 		d.mu.Unlock()
 
@@ -286,6 +303,9 @@ func (d *Daemon) loadSnapshot() int {
 
 		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)
 		restored++
+	}
+	if restored > 0 {
+		d.restoredOwnerCount.Add(uint64(restored))
 	}
 
 	d.logger.Printf("snapshot: restored %d/%d owners", restored, len(snap.Owners))
@@ -388,11 +408,10 @@ func (d *Daemon) runRestoreHealthGate() {
 				"zombie-listener detected: path=restore server=%s ipc=%q cmd=%q action=tear-down-and-respawn-on-demand",
 				shortSID, entry.Owner.IPCPath(), entry.Command,
 			)
-			delete(d.owners, sid)
 			d.mu.Unlock()
-			// Shutdown OUTSIDE the lock — it closes sockets, tears down
-			// upstream, and may fire callbacks back into the daemon.
-			entry.Owner.Shutdown()
+			if _, err := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonRestoreFailed, false); err != nil {
+				d.logger.Printf("post-restore health gate: cleanup failed for %s: %v", shortSID, err)
+			}
 			zombies++
 		}
 		if zombies > 0 {
