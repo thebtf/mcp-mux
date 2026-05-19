@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -499,7 +500,7 @@ func (s *daemonState) spawn(req controlRequest) map[string]any {
 	}
 	sid := serverID(normalized)
 	entry, existed := s.owners[sid]
-	if existed && !activeUnix(entry.Socket, 200*time.Millisecond) {
+	if existed && !ipc.IsAvailable(entry.Socket) {
 		s.zombieDetectedSpawn++
 		cleanupListener(entry.Listener, entry.Socket)
 		delete(s.owners, sid)
@@ -562,7 +563,7 @@ func (s *daemonState) refreshToken(req controlRequest) map[string]any {
 	if !ok {
 		return map[string]any{"ok": false, "error": "owner_gone", "server_id": history.ServerID}
 	}
-	if !activeUnix(entry.Socket, 200*time.Millisecond) {
+	if !ipc.IsAvailable(entry.Socket) {
 		return map[string]any{"ok": false, "error": "owner_gone", "server_id": history.ServerID}
 	}
 
@@ -2015,7 +2016,7 @@ func probeGenerationHandoff() error {
 	afterOwnerGeneration, _ := afterStatus["owner_generation"].(string)
 	payloadGeneration, _ := payload["daemon_generation"].(string)
 	payloadOwnerGeneration, _ := payload["owner_generation"].(string)
-	oldOwnerReachable := activeUnix(beforeOwnerSocket, 200*time.Millisecond)
+	oldOwnerReachable := ipc.IsAvailable(beforeOwnerSocket)
 
 	handoffOK := handoff == "restored" &&
 		predecessorPID == beforePID &&
@@ -2056,11 +2057,58 @@ func probeGenerationHandoff() error {
 }
 
 func probeIdleReaper() error {
+	oldRuntime, hadRuntime := os.LookupEnv(envRuntime)
+	oldControl, hadControl := os.LookupEnv(envCtlPath)
+	oldIdleTTL, hadIdleTTL := os.LookupEnv(envIdleTTLMS)
+	runtimeParent, err := filepath.Abs(filepath.Join(".", ".agent"))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(runtimeParent, 0o755); err != nil {
+		return err
+	}
+	tempRuntime, err := os.MkdirTemp(runtimeParent, "ctp-idle-*")
+	if err != nil {
+		return err
+	}
+	restoreEnv := func(key, value string, ok bool) {
+		if ok {
+			_ = os.Setenv(key, value)
+			return
+		}
+		_ = os.Unsetenv(key)
+	}
+	defer func() {
+		restoreEnv(envRuntime, oldRuntime, hadRuntime)
+		restoreEnv(envCtlPath, oldControl, hadControl)
+		restoreEnv(envIdleTTLMS, oldIdleTTL, hadIdleTTL)
+		_ = os.RemoveAll(tempRuntime)
+	}()
+
+	isolatedControl := filepath.Join(tempRuntime, "control.sock")
+	if err := os.Setenv(envRuntime, tempRuntime); err != nil {
+		return err
+	}
+	if err := os.Setenv(envCtlPath, isolatedControl); err != nil {
+		return err
+	}
 	if err := os.Setenv(envIdleTTLMS, "300"); err != nil {
 		return err
 	}
+	defer func() {
+		_, _ = sendControl(isolatedControl, "shutdown", nil, 2*time.Second)
+	}()
+
 	if err := ensureDaemonReady(); err != nil {
 		return err
+	}
+	initialStatus, err := sendControl(isolatedControl, "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	initialTTL, _ := jsonNumberToInt(initialStatus["idle_reaper_ttl_ms"])
+	if initialTTL != 300 {
+		return fmt.Errorf("idle reaper probe attached to daemon with unexpected ttl: got=%d want=300 status=%v", initialTTL, initialStatus)
 	}
 	nonPersistentReq := map[string]any{
 		"command":    "idle-reaper-probe",
@@ -2595,16 +2643,7 @@ func topologyToolPayload(resp map[string]any) (map[string]any, error) {
 func listenUnixExclusive(path string, wait time.Duration) (net.Listener, error) {
 	deadline := time.Now().Add(wait)
 	for {
-		if activeUnix(path, 200*time.Millisecond) {
-			if wait > 0 && time.Now().Before(deadline) {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			return nil, fmt.Errorf("listener already active at %s", path)
-		}
-
-		_ = os.Remove(path)
-		ln, err := net.Listen("unix", path)
+		ln, err := ipc.Listen(path)
 		if err == nil {
 			return ln, nil
 		}
@@ -2614,15 +2653,6 @@ func listenUnixExclusive(path string, wait time.Duration) (net.Listener, error) 
 		}
 		return nil, err
 	}
-}
-
-func activeUnix(path string, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("unix", path, timeout)
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
 }
 
 func cleanupListener(ln net.Listener, path string) {

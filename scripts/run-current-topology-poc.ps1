@@ -45,6 +45,7 @@ function Stop-PocDaemon {
     Remove-Item -LiteralPath (Join-Path $RuntimeDir "owners.snapshot.json") -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $RuntimeDir -Filter "*.owner.sock" -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
+    $global:LASTEXITCODE = 0
 }
 
 function Get-PocStatus {
@@ -199,6 +200,7 @@ try {
 
     Write-Host ""
     Write-Host "PASS current-topology PoC"
+    $global:LASTEXITCODE = 0
 } finally {
     Pop-Location
 }

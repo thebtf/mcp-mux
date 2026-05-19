@@ -428,7 +428,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 			DrainTimeoutMs: drainMs,
 		}, clientTimeout)
 		if err != nil {
-			dataPath := filepath.Join(tmpDir, fmt.Sprintf("%s%s.sock", ownSocketPrefix, id))
+			dataPath := serverid.IPCPath(tmpDir, engineName, id)
 			if ipc.IsAvailable(dataPath) && !force {
 				handled[id] = true
 				fmt.Fprintf(os.Stderr, "  [%s] control unavailable but data socket is live; skipping stale cleanup and legacy fallback\n", shortID)
