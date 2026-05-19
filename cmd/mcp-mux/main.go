@@ -429,8 +429,9 @@ func runStop(drainTimeout time.Duration, force bool) {
 		}, clientTimeout)
 		if err != nil {
 			dataPath := filepath.Join(tmpDir, fmt.Sprintf("%s%s.sock", ownSocketPrefix, id))
-			if ipc.IsAvailable(dataPath) {
-				fmt.Fprintf(os.Stderr, "  [%s] control unavailable but data socket is live; skipping stale cleanup\n", shortID)
+			if ipc.IsAvailable(dataPath) && !force {
+				handled[id] = true
+				fmt.Fprintf(os.Stderr, "  [%s] control unavailable but data socket is live; skipping stale cleanup and legacy fallback\n", shortID)
 				continue
 			}
 			_ = os.Remove(path)

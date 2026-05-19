@@ -263,6 +263,7 @@ func (d *Daemon) loadSnapshot() int {
 		ownerGeneration, genErr := generateGeneration("owner")
 		if genErr != nil {
 			d.logger.Printf("snapshot: failed to generate owner generation for %s: %v", sid[:8], genErr)
+			o.Shutdown()
 			continue
 		}
 		restoreSource := "snapshot_fallback"
@@ -270,8 +271,7 @@ func (d *Daemon) loadSnapshot() int {
 			restoreSource = "snapshot_handoff"
 		}
 
-		// Register with supervisor only after generation metadata is ready. If
-		// generation creation fails, the restored owner is never made runnable.
+		// Register with supervisor only after generation metadata is ready.
 		var serviceToken suture.ServiceToken
 		if d.supervisor != nil {
 			serviceToken = d.supervisor.Add(o)

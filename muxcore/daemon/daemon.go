@@ -583,8 +583,10 @@ func generateToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+var generateTokenFunc = generateToken
+
 func generateGeneration(prefix string) (string, error) {
-	token, err := generateToken()
+	token, err := generateTokenFunc()
 	if err != nil {
 		return "", err
 	}

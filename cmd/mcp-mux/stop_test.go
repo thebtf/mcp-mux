@@ -4,7 +4,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -67,18 +66,15 @@ func TestRunStopDoesNotRemoveLiveDataSocketWhenControlIsStale(t *testing.T) {
 		t.Fatal("precondition: data socket should be available before stop")
 	}
 
-	runStop(0, true)
+	runStop(0, false)
 
 	if !ipc.IsAvailable(dataPath) {
 		t.Fatal("live data socket was removed after stale control cleanup")
 	}
 	select {
 	case msg := <-messages:
-		if !strings.Contains(msg, `"method":"mux/shutdown"`) {
-			t.Fatalf("expected legacy shutdown after stale control, got %q", msg)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected legacy shutdown after stale control with live data socket")
+		t.Fatalf("unexpected legacy shutdown after live data socket was detected: %q", msg)
+	case <-time.After(250 * time.Millisecond):
 	}
 }
 

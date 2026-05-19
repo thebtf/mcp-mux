@@ -145,10 +145,31 @@ type rpcMessage struct {
 }
 
 type probeRPCClient struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	scanner *bufio.Scanner
-	nextID  int
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	scanner    *bufio.Scanner
+	nextID     int
+	mu         sync.Mutex
+	writeMu    sync.Mutex
+	pending    map[int]chan probeRPCResult
+	readErr    error
+	readerDone chan struct{}
+}
+
+type probeRPCResult struct {
+	resp map[string]any
+	err  error
+}
+
+type lockedWriter struct {
+	w  io.Writer
+	mu *sync.Mutex
+}
+
+func (lw *lockedWriter) Write(p []byte) (int, error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+	return lw.w.Write(p)
 }
 
 type ownerConnectInfo struct {
@@ -664,24 +685,25 @@ func handleOwnerSession(conn net.Conn, state *daemonState, entry *ownerEntry) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
+	writer := &lockedWriter{w: conn, mu: &sync.Mutex{}}
 	line, err := reader.ReadBytes('\n')
 	if err != nil {
 		return
 	}
 	var hello ownerHello
 	if err := json.Unmarshal(line, &hello); err != nil {
-		_ = writeJSONLine(conn, map[string]any{"ok": false, "error": "bad_owner_hello", "message": err.Error()})
+		_ = writeJSONLine(writer, map[string]any{"ok": false, "error": "bad_owner_hello", "message": err.Error()})
 		return
 	}
 
 	sessionID, rejectReason, ok := state.consumeTicket(hello, entry)
 	if !ok {
-		_ = writeJSONLine(conn, map[string]any{"ok": false, "error": rejectReason})
+		_ = writeJSONLine(writer, map[string]any{"ok": false, "error": rejectReason})
 		logf("owner rejected session token reason=%s daemon_generation=%s owner_generation=%s",
 			rejectReason, hello.DaemonGeneration, hello.OwnerGeneration)
 		return
 	}
-	if err := writeJSONLine(conn, map[string]any{"ok": true, "session_id": sessionID}); err != nil {
+	if err := writeJSONLine(writer, map[string]any{"ok": true, "session_id": sessionID}); err != nil {
 		return
 	}
 	entry.beginSession()
@@ -691,7 +713,7 @@ func handleOwnerSession(conn net.Conn, state *daemonState, entry *ownerEntry) {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			raw := append([]byte{}, line...)
-			go handleRPCLine(conn, state, entry, sessionID, raw)
+			go handleRPCLine(writer, state, entry, sessionID, raw)
 		}
 		if err != nil {
 			return
@@ -2229,12 +2251,16 @@ func newProbeRPCClient() (*probeRPCClient, error) {
 	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
-	return &probeRPCClient{
-		cmd:     cmd,
-		stdin:   stdin,
-		scanner: scanner,
-		nextID:  1,
-	}, nil
+	client := &probeRPCClient{
+		cmd:        cmd,
+		stdin:      stdin,
+		scanner:    scanner,
+		nextID:     1,
+		pending:    make(map[int]chan probeRPCResult),
+		readerDone: make(chan struct{}),
+	}
+	go client.readLoop()
+	return client, nil
 }
 
 func (c *probeRPCClient) call(method string, params any, timeout time.Duration) (map[string]any, error) {
@@ -2245,45 +2271,99 @@ func (c *probeRPCClient) call(method string, params any, timeout time.Duration) 
 	return c.readResponse(id, timeout)
 }
 
+func (c *probeRPCClient) readLoop() {
+	defer close(c.readerDone)
+
+	for c.scanner.Scan() {
+		line := append([]byte{}, c.scanner.Bytes()...)
+		var msg map[string]any
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+		gotID, ok := jsonNumberToInt(msg["id"])
+		if !ok {
+			continue
+		}
+
+		c.mu.Lock()
+		ch := c.pending[gotID]
+		c.mu.Unlock()
+		if ch == nil {
+			continue
+		}
+		select {
+		case ch <- probeRPCResult{resp: msg}:
+		default:
+		}
+	}
+
+	err := c.scanner.Err()
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	c.mu.Lock()
+	c.readErr = err
+	for _, ch := range c.pending {
+		select {
+		case ch <- probeRPCResult{err: err}:
+		default:
+		}
+	}
+	c.mu.Unlock()
+}
+
 func (c *probeRPCClient) sendRequest(method string, params any) (int, error) {
+	c.mu.Lock()
+	if c.readErr != nil {
+		err := c.readErr
+		c.mu.Unlock()
+		return 0, err
+	}
 	id := c.nextID
 	c.nextID++
-	if err := writeJSONLine(c.stdin, map[string]any{
+	c.pending[id] = make(chan probeRPCResult, 1)
+	c.mu.Unlock()
+
+	c.writeMu.Lock()
+	err := writeJSONLine(c.stdin, map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  method,
 		"params":  params,
-	}); err != nil {
+	})
+	c.writeMu.Unlock()
+	if err != nil {
+		c.unregisterResponse(id)
 		return 0, err
 	}
 	return id, nil
 }
 
-func (c *probeRPCClient) readResponse(id int, timeout time.Duration) (map[string]any, error) {
-	type result struct {
-		resp map[string]any
-		err  error
+func (c *probeRPCClient) responseChannel(id int) (<-chan probeRPCResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := c.pending[id]
+	if ch != nil {
+		return ch, nil
 	}
-	ch := make(chan result, 1)
-	go func() {
-		for c.scanner.Scan() {
-			var msg map[string]any
-			if err := json.Unmarshal(c.scanner.Bytes(), &msg); err != nil {
-				continue
-			}
-			gotID, ok := jsonNumberToInt(msg["id"])
-			if !ok || gotID != id {
-				continue
-			}
-			ch <- result{resp: msg}
-			return
-		}
-		if err := c.scanner.Err(); err != nil {
-			ch <- result{err: err}
-			return
-		}
-		ch <- result{err: io.ErrUnexpectedEOF}
-	}()
+	if c.readErr != nil {
+		return nil, c.readErr
+	}
+	return nil, fmt.Errorf("response id %d is not pending", id)
+}
+
+func (c *probeRPCClient) unregisterResponse(id int) {
+	c.mu.Lock()
+	delete(c.pending, id)
+	c.mu.Unlock()
+}
+
+func (c *probeRPCClient) readResponse(id int, timeout time.Duration) (map[string]any, error) {
+	ch, err := c.responseChannel(id)
+	if err != nil {
+		return nil, err
+	}
+	defer c.unregisterResponse(id)
 
 	select {
 	case res := <-ch:
@@ -2306,45 +2386,56 @@ func (c *probeRPCClient) readResponses(ids []int, timeout time.Duration) (map[in
 	}
 	responses := make(map[int]map[string]any, len(ids))
 	order := make([]int, 0, len(ids))
-	deadline := time.Now().Add(timeout)
-	for len(responses) < len(wanted) {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return responses, order, fmt.Errorf("timeout waiting for responses ids=%v got_order=%v", ids, order)
+	type responseEvent struct {
+		id  int
+		res probeRPCResult
+	}
+	events := make(chan responseEvent, len(ids))
+	done := make(chan struct{})
+	defer close(done)
+	defer func() {
+		for _, id := range ids {
+			c.unregisterResponse(id)
 		}
-		lineCh := make(chan []byte, 1)
-		errCh := make(chan error, 1)
-		go func() {
-			if c.scanner.Scan() {
-				lineCh <- append([]byte{}, c.scanner.Bytes()...)
-				return
-			}
-			if err := c.scanner.Err(); err != nil {
-				errCh <- err
-				return
-			}
-			errCh <- io.ErrUnexpectedEOF
-		}()
-		select {
-		case line := <-lineCh:
-			var msg map[string]any
-			if err := json.Unmarshal(line, &msg); err != nil {
-				continue
-			}
-			gotID, ok := jsonNumberToInt(msg["id"])
-			if !ok || !wanted[gotID] {
-				continue
-			}
-			if msg["error"] != nil {
-				return responses, order, fmt.Errorf("json-rpc error for id %d: %v", gotID, msg["error"])
-			}
-			if _, exists := responses[gotID]; !exists {
-				responses[gotID] = msg
-				order = append(order, gotID)
-			}
-		case err := <-errCh:
+	}()
+
+	for _, id := range ids {
+		ch, err := c.responseChannel(id)
+		if err != nil {
 			return responses, order, err
-		case <-time.After(remaining):
+		}
+		go func(id int, ch <-chan probeRPCResult) {
+			select {
+			case res := <-ch:
+				select {
+				case events <- responseEvent{id: id, res: res}:
+				case <-done:
+				}
+			case <-done:
+			}
+		}(id, ch)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for len(responses) < len(wanted) {
+		select {
+		case event := <-events:
+			if event.res.err != nil {
+				return responses, order, event.res.err
+			}
+			if !wanted[event.id] {
+				continue
+			}
+			msg := event.res.resp
+			if msg["error"] != nil {
+				return responses, order, fmt.Errorf("json-rpc error for id %d: %v", event.id, msg["error"])
+			}
+			if _, exists := responses[event.id]; !exists {
+				responses[event.id] = msg
+				order = append(order, event.id)
+			}
+		case <-timer.C:
 			return responses, order, fmt.Errorf("timeout waiting for responses ids=%v got_order=%v", ids, order)
 		}
 	}
@@ -2352,6 +2443,8 @@ func (c *probeRPCClient) readResponses(ids []int, timeout time.Duration) (map[in
 }
 
 func (c *probeRPCClient) notify(method string, params any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	return writeJSONLine(c.stdin, map[string]any{
 		"jsonrpc": "2.0",
 		"method":  method,
