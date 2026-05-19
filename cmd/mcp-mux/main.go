@@ -418,8 +418,6 @@ func runStop(drainTimeout time.Duration, force bool) {
 			shortID = shortID[:8]
 		}
 
-		handled[id] = true
-
 		clientTimeout := drainTimeout + 5*time.Second
 		if force {
 			clientTimeout = 5 * time.Second
@@ -437,11 +435,13 @@ func runStop(drainTimeout time.Duration, force bool) {
 			}
 			_ = os.Remove(path)
 			_ = os.Remove(dataPath)
+			handled[id] = true
 			stale++
 			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", shortID)
 			continue
 		}
 
+		handled[id] = true
 		if resp.OK {
 			fmt.Fprintf(os.Stderr, "  [%s] %s\n", shortID, resp.Message)
 			stopped++

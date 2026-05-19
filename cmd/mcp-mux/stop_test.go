@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestRunStopDoesNotRemoveLiveDataSocketWhenControlIsStale(t *testing.T) {
 	}
 	defer ln.Close()
 
-	accepted := make(chan net.Conn, 16)
+	messages := make(chan string, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -43,32 +44,42 @@ func TestRunStopDoesNotRemoveLiveDataSocketWhenControlIsStale(t *testing.T) {
 			if err != nil {
 				return
 			}
-			accepted <- conn
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				buf := make([]byte, 512)
+				n, _ := c.Read(buf)
+				if n > 0 {
+					select {
+					case messages <- string(buf[:n]):
+					default:
+					}
+				}
+			}(conn)
 		}
 	}()
 	t.Cleanup(func() {
 		ln.Close()
-		for {
-			select {
-			case conn := <-accepted:
-				conn.Close()
-			default:
-				return
-			}
-		}
+		<-done
 	})
 
 	if !ipc.IsAvailable(dataPath) {
 		t.Fatal("precondition: data socket should be available before stop")
 	}
-	closeAccepted(t, accepted)
 
 	runStop(0, true)
 
 	if !ipc.IsAvailable(dataPath) {
 		t.Fatal("live data socket was removed after stale control cleanup")
 	}
-	closeAccepted(t, accepted)
+	select {
+	case msg := <-messages:
+		if !strings.Contains(msg, `"method":"mux/shutdown"`) {
+			t.Fatalf("expected legacy shutdown after stale control, got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected legacy shutdown after stale control with live data socket")
+	}
 }
 
 func TestRunStopDoesNotTreatDaemonControlSocketAsOwner(t *testing.T) {
@@ -90,20 +101,5 @@ func TestRunStopDoesNotTreatDaemonControlSocketAsOwner(t *testing.T) {
 
 	if _, err := os.Stat(daemonCtlPath); err != nil {
 		t.Fatalf("daemon control socket should be ignored by owner cleanup: %v", err)
-	}
-}
-
-func closeAccepted(t *testing.T, accepted <-chan net.Conn) {
-	t.Helper()
-	deadline := time.After(500 * time.Millisecond)
-	for {
-		select {
-		case conn := <-accepted:
-			conn.Close()
-		case <-deadline:
-			return
-		default:
-			return
-		}
 	}
 }
