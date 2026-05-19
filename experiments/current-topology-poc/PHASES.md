@@ -268,6 +268,56 @@ This proves the PoC can make handoff generation state explicit enough to
 distinguish fresh spawn, restored owner, predecessor generation, and successor
 generation.
 
-## Candidate Next Phases
+## Phase 9 - Persistent/Idle Reaper and Upstream Lifecycle Classification
 
-- Phase 9: persistent/idle reaper and upstream process lifecycle
+Status: PASS
+
+Adds owner lifecycle classification and idle ownership cleanup:
+
+- spawn requests can mark an owner `persistent`
+- status reports `persistent`, `active_sessions`, `idle_reaper_ttl_ms`, and
+  `reaped_owner_count`
+- non-persistent owners with no active sessions are reaped after the configured
+  idle TTL
+- persistent owners survive the same idle TTL
+- non-persistent owners with an active owner session survive the same idle TTL
+  and are reaped only after the active session closes
+- reaping an owner removes pending spawn tickets for that owner identity
+- a non-persistent owner respawns with the same server ID and a new owner
+  generation after reaping
+- graceful restart snapshots and restores persistent owner classification
+
+Observed pre-fix break:
+
+```text
+"probe":"idle_reaper"
+"break_observed":true
+"non_persistent_reaped":false
+"persistent_survived":false
+"reaped_owner_count":0
+```
+
+Current pass signal:
+
+```text
+"probe":"idle_reaper"
+"phase":"phase9"
+"break_observed":false
+"non_persistent_reaped":true
+"persistent_survived":true
+"active_session_survived":true
+"active_reaped_after_close":true
+"persistent_restored":true
+```
+
+This proves the experimental topology can distinguish expected idle cleanup
+from lifecycle corruption. After Phase 9 the remaining uncertainty is no longer
+well served by adding more toy mechanisms; the next useful step is production
+parity in real `muxcore` tests and refactors, plus a later runtime smoke against
+real MCP upstream processes.
+
+## Production Port Boundary
+
+Next action: port the converged Phase 6-9 invariants into production `muxcore`
+tests and implementation. Do not treat the standalone PoC as a release gate by
+itself.

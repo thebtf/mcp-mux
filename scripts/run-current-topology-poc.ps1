@@ -183,6 +183,12 @@ try {
 
     Stop-PocDaemon
 
+    Invoke-NativeStep "persistent idle reaper" {
+        & $Binary --poc-probe-idle-reaper
+    }
+
+    Stop-PocDaemon
+
     Write-Host ""
     Write-Host "PASS current-topology PoC"
 } finally {

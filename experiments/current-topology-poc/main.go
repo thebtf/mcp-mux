@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +26,12 @@ const (
 	envCtlPath   = "CURRENT_TOPOLOGY_POC_CTL"
 	envRuntime   = "CURRENT_TOPOLOGY_POC_HOME"
 	envSuccessor = "CURRENT_TOPOLOGY_POC_SUCCESSOR"
+	envIdleTTLMS = "CURRENT_TOPOLOGY_POC_IDLE_TTL_MS"
 
 	daemonFlag = "--muxcore-daemon"
 	serverName = "current-topology-poc"
+
+	defaultIdleOwnerTTL = 30 * time.Second
 )
 
 type controlRequest struct {
@@ -40,6 +44,7 @@ type controlRequest struct {
 	Env             map[string]string `json:"env,omitempty"`
 	PrevToken       string            `json:"prev_token,omitempty"`
 	ReconnectReason string            `json:"reconnect_reason,omitempty"`
+	Persistent      bool              `json:"persistent,omitempty"`
 }
 
 type ticket struct {
@@ -67,18 +72,21 @@ type ownerEntry struct {
 	Listener    net.Listener
 	LastSession time.Time
 	NextSession int
+	Persistent  bool
 
 	activeMu           sync.Mutex
 	ActiveCalls        int
 	MaxConcurrentCalls int
+	ActiveSessions     int
 }
 
 type ownerSnapshot struct {
-	ServerID string   `json:"server_id"`
-	Command  string   `json:"command"`
-	Args     []string `json:"args,omitempty"`
-	Cwd      string   `json:"cwd,omitempty"`
-	Mode     string   `json:"mode"`
+	ServerID   string   `json:"server_id"`
+	Command    string   `json:"command"`
+	Args       []string `json:"args,omitempty"`
+	Cwd        string   `json:"cwd,omitempty"`
+	Mode       string   `json:"mode"`
+	Persistent bool     `json:"persistent,omitempty"`
 }
 
 type predecessorOwnerSnapshot struct {
@@ -118,6 +126,7 @@ type daemonState struct {
 	predecessorDaemonGen string
 	predecessorOwners    []predecessorOwnerSnapshot
 	restoredOwnerCount   int
+	reapedOwnerCount     int
 }
 
 type ownerHello struct {
@@ -183,6 +192,7 @@ func main() {
 	pocProbeConcurrentDemux := flag.Bool("poc-probe-concurrent-demux", false, "verify concurrent out-of-order responses demux by ID across daemon graceful restart")
 	pocProbeRefreshReconnect := flag.Bool("poc-probe-refresh-reconnect", false, "verify reconnect uses refresh-token instead of fallback spawn")
 	pocProbeGenerationHandoff := flag.Bool("poc-probe-generation-handoff", false, "verify restart handoff reports predecessor and restored owner generations")
+	pocProbeIdleReaper := flag.Bool("poc-probe-idle-reaper", false, "verify non-persistent idle owners are reaped while persistent owners survive")
 	flag.Parse()
 
 	switch {
@@ -238,6 +248,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "generation-handoff probe failed: %v\n", err)
 			os.Exit(1)
 		}
+	case *pocProbeIdleReaper:
+		if err := probeIdleReaper(); err != nil {
+			fmt.Fprintf(os.Stderr, "idle-reaper probe failed: %v\n", err)
+			os.Exit(1)
+		}
 	default:
 		if err := runShim(context.Background()); err != nil {
 			logf("shim failed: %v", err)
@@ -286,6 +301,7 @@ func runDaemon(ctx context.Context) error {
 		}
 	}
 	state.setReady()
+	go state.reapIdleOwnersLoop(shutdown)
 
 	logf("daemon ready pid=%d daemon_generation=%s ctl=%s", state.pid, state.daemonGeneration, ctl)
 
@@ -410,6 +426,8 @@ func (s *daemonState) status() map[string]any {
 		"predecessor_daemon_generation": s.predecessorDaemonGen,
 		"predecessor_owners":            append([]predecessorOwnerSnapshot(nil), s.predecessorOwners...),
 		"restored_owner_count":          s.restoredOwnerCount,
+		"reaped_owner_count":            s.reapedOwnerCount,
+		"idle_reaper_ttl_ms":            currentIdleOwnerTTL().Milliseconds(),
 		"uptime_ms":                     time.Since(s.startedAt).Milliseconds(),
 		"handoff":                       handoff,
 	}
@@ -425,6 +443,8 @@ func ownerStatus(entry *ownerEntry) map[string]any {
 	entry.activeMu.Lock()
 	activeCalls := entry.ActiveCalls
 	maxConcurrentCalls := entry.MaxConcurrentCalls
+	activeSessions := entry.ActiveSessions
+	lastSession := entry.LastSession
 	entry.activeMu.Unlock()
 	return map[string]any{
 		"server_id":            entry.ServerID,
@@ -434,7 +454,9 @@ func ownerStatus(entry *ownerEntry) map[string]any {
 		"mode":                 entry.Mode,
 		"owner_generation":     entry.Generation,
 		"owner_socket":         entry.Socket,
-		"last_session_ms":      time.Since(entry.LastSession).Milliseconds(),
+		"persistent":           entry.Persistent,
+		"active_sessions":      activeSessions,
+		"last_session_ms":      time.Since(lastSession).Milliseconds(),
 		"active_calls":         activeCalls,
 		"max_concurrent_calls": maxConcurrentCalls,
 	}
@@ -467,8 +489,10 @@ func (s *daemonState) spawn(req controlRequest) map[string]any {
 		if err != nil {
 			return map[string]any{"ok": false, "error": "owner_start_failed", "message": err.Error()}
 		}
+	} else if normalized.Persistent && !entry.Persistent {
+		entry.Persistent = true
 	}
-	entry.LastSession = time.Now()
+	entry.touchSession()
 
 	token := randomToken()
 	t := ticket{
@@ -487,6 +511,7 @@ func (s *daemonState) spawn(req controlRequest) map[string]any {
 		"daemon_generation": s.daemonGeneration,
 		"owner_generation":  entry.Generation,
 		"owner_socket":      entry.Socket,
+		"persistent":        entry.Persistent,
 		"token":             token,
 		"expires_unix_ms":   t.ExpiresAt.UnixMilli(),
 	}
@@ -583,6 +608,7 @@ func (s *daemonState) startOwnerLocked(sid string, req controlRequest) (*ownerEn
 		Socket:      ownerSock,
 		Listener:    ownerLn,
 		LastSession: time.Now(),
+		Persistent:  req.Persistent,
 	}
 	s.owners[sid] = entry
 	go acceptOwner(ownerLn, s, entry)
@@ -657,6 +683,8 @@ func handleOwnerSession(conn net.Conn, state *daemonState, entry *ownerEntry) {
 	if err := writeJSONLine(conn, map[string]any{"ok": true, "session_id": sessionID}); err != nil {
 		return
 	}
+	entry.beginSession()
+	defer entry.endSession()
 
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -777,6 +805,28 @@ func (entry *ownerEntry) endToolCall() {
 	if entry.ActiveCalls > 0 {
 		entry.ActiveCalls--
 	}
+}
+
+func (entry *ownerEntry) beginSession() {
+	entry.activeMu.Lock()
+	defer entry.activeMu.Unlock()
+	entry.ActiveSessions++
+	entry.LastSession = time.Now()
+}
+
+func (entry *ownerEntry) endSession() {
+	entry.activeMu.Lock()
+	defer entry.activeMu.Unlock()
+	if entry.ActiveSessions > 0 {
+		entry.ActiveSessions--
+	}
+	entry.LastSession = time.Now()
+}
+
+func (entry *ownerEntry) touchSession() {
+	entry.activeMu.Lock()
+	defer entry.activeMu.Unlock()
+	entry.LastSession = time.Now()
 }
 
 func statePayload(state *daemonState, entry *ownerEntry, sessionID int) map[string]any {
@@ -1982,6 +2032,181 @@ func probeGenerationHandoff() error {
 	})
 }
 
+func probeIdleReaper() error {
+	if err := os.Setenv(envIdleTTLMS, "300"); err != nil {
+		return err
+	}
+	if err := ensureDaemonReady(); err != nil {
+		return err
+	}
+	nonPersistentReq := map[string]any{
+		"command":    "idle-reaper-probe",
+		"cwd":        "idle-non-persistent",
+		"mode":       "cwd",
+		"persistent": false,
+	}
+	persistentReq := map[string]any{
+		"command":    "idle-reaper-probe",
+		"cwd":        "idle-persistent",
+		"mode":       "cwd",
+		"persistent": true,
+	}
+	activeReq := map[string]any{
+		"command":    "idle-reaper-probe",
+		"cwd":        "idle-active-session",
+		"mode":       "cwd",
+		"persistent": false,
+	}
+	nonPersistent, err := sendControl(controlPath(), "spawn", nonPersistentReq, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	persistent, err := sendControl(controlPath(), "spawn", persistentReq, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	active, err := sendControl(controlPath(), "spawn", activeReq, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	activeConn, err := connectOwnerFromControlResponse(active, "idle_reaper_probe")
+	if err != nil {
+		return err
+	}
+	nonPersistentID, _ := nonPersistent["server_id"].(string)
+	nonPersistentGeneration, _ := nonPersistent["owner_generation"].(string)
+	persistentID, _ := persistent["server_id"].(string)
+	persistentGeneration, _ := persistent["owner_generation"].(string)
+	activeID, _ := active["server_id"].(string)
+	activeGeneration, _ := active["owner_generation"].(string)
+	if nonPersistentID == "" || nonPersistentGeneration == "" || persistentID == "" || persistentGeneration == "" || activeID == "" || activeGeneration == "" {
+		activeConn.close()
+		return fmt.Errorf("incomplete idle reaper spawn response: non_persistent=%v persistent=%v active=%v", nonPersistent, persistent, active)
+	}
+
+	idleWindow := 2 * currentIdleOwnerTTL()
+	time.Sleep(idleWindow)
+	afterIdle, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		activeConn.close()
+		return err
+	}
+	nonPersistentOwner := ownerByServerID(afterIdle, nonPersistentID)
+	persistentOwner := ownerByServerID(afterIdle, persistentID)
+	activeOwner := ownerByServerID(afterIdle, activeID)
+	reapedCount, _ := jsonNumberToInt(afterIdle["reaped_owner_count"])
+	activeSessions := 0
+	if activeOwner != nil {
+		activeSessions, _ = jsonNumberToInt(activeOwner["active_sessions"])
+	}
+	nonPersistentReaped := nonPersistentOwner == nil
+	persistentSurvived := persistentOwner != nil &&
+		boolValue(persistentOwner["persistent"]) &&
+		stringValue(persistentOwner["owner_generation"]) == persistentGeneration
+	activeSessionSurvived := activeOwner != nil &&
+		stringValue(activeOwner["owner_generation"]) == activeGeneration &&
+		activeSessions > 0
+	if !nonPersistentReaped || !persistentSurvived || !activeSessionSurvived || reapedCount < 1 {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":                      false,
+			"probe":                   "idle_reaper",
+			"phase":                   "phase9",
+			"break_observed":          true,
+			"idle_ms":                 idleWindow.Milliseconds(),
+			"non_persistent_spawn":    nonPersistent,
+			"persistent_spawn":        persistent,
+			"active_spawn":            active,
+			"after_idle_status":       afterIdle,
+			"non_persistent_reaped":   nonPersistentReaped,
+			"persistent_survived":     persistentSurvived,
+			"active_session_survived": activeSessionSurvived,
+			"active_session_count":    activeSessions,
+			"reaped_owner_count":      reapedCount,
+		})
+		activeConn.close()
+		return fmt.Errorf("idle reaper guard failed: non_persistent_reaped=%v persistent_survived=%v active_session_survived=%v reaped_owner_count=%d", nonPersistentReaped, persistentSurvived, activeSessionSurvived, reapedCount)
+	}
+
+	activeConn.close()
+	time.Sleep(idleWindow)
+	afterActiveClose, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	activeOwnerAfterClose := ownerByServerID(afterActiveClose, activeID)
+	reapedAfterActiveClose, _ := jsonNumberToInt(afterActiveClose["reaped_owner_count"])
+	activeReapedAfterClose := activeOwnerAfterClose == nil && reapedAfterActiveClose >= 2
+	if !activeReapedAfterClose {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":                        false,
+			"probe":                     "idle_reaper",
+			"phase":                     "phase9",
+			"break_observed":            true,
+			"idle_ms":                   idleWindow.Milliseconds(),
+			"active_spawn":              active,
+			"after_idle_status":         afterIdle,
+			"after_active_close_status": afterActiveClose,
+			"active_session_survived":   true,
+			"active_reaped_after_close": activeReapedAfterClose,
+			"reaped_owner_count":        reapedAfterActiveClose,
+		})
+		return fmt.Errorf("idle reaper did not reap owner after active session closed: reaped_owner_count=%d active_owner=%v", reapedAfterActiveClose, activeOwnerAfterClose)
+	}
+
+	respawn, err := sendControl(controlPath(), "spawn", nonPersistentReq, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	respawnGeneration, _ := respawn["owner_generation"].(string)
+	respawnID, _ := respawn["server_id"].(string)
+	if respawnID != nonPersistentID || respawnGeneration == "" || respawnGeneration == nonPersistentGeneration {
+		return fmt.Errorf("non-persistent owner did not respawn with same server ID and new generation: first=%v respawn=%v", nonPersistent, respawn)
+	}
+
+	beforeRestart, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	beforePID, _ := jsonNumberToInt(beforeRestart["pid"])
+	beforeGeneration, _ := beforeRestart["daemon_generation"].(string)
+	restartResp, err := sendControl(controlPath(), "graceful-restart", nil, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("graceful-restart during idle reaper probe: %w", err)
+	}
+	if ok, _ := restartResp["ok"].(bool); !ok {
+		return fmt.Errorf("graceful-restart rejected during idle reaper probe: %v", restartResp)
+	}
+	afterRestart, err := waitSuccessorReady(beforePID, beforeGeneration, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	restoredPersistentOwner := ownerByServerID(afterRestart, persistentID)
+	persistentRestored := restoredPersistentOwner != nil && boolValue(restoredPersistentOwner["persistent"])
+	if !persistentRestored {
+		return fmt.Errorf("persistent owner classification not restored: persistent_id=%s after_restart=%v", persistentID, afterRestart)
+	}
+
+	return writeJSONLine(os.Stdout, map[string]any{
+		"ok":                        true,
+		"probe":                     "idle_reaper",
+		"phase":                     "phase9",
+		"break_observed":            false,
+		"idle_ms":                   idleWindow.Milliseconds(),
+		"non_persistent_spawn":      nonPersistent,
+		"persistent_spawn":          persistent,
+		"active_spawn":              active,
+		"after_idle_status":         afterIdle,
+		"after_active_close":        afterActiveClose,
+		"respawn":                   respawn,
+		"after_restart_status":      afterRestart,
+		"non_persistent_reaped":     true,
+		"persistent_survived":       true,
+		"active_session_survived":   true,
+		"active_reaped_after_close": true,
+		"persistent_restored":       true,
+	})
+}
+
 func newProbeRPCClient() (*probeRPCClient, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -2209,6 +2434,27 @@ func maxOwnerConcurrency(status map[string]any) int {
 	return maxSeen
 }
 
+func ownerByServerID(status map[string]any, serverID string) map[string]any {
+	owners, _ := status["owners"].([]any)
+	for _, owner := range owners {
+		obj, _ := owner.(map[string]any)
+		if stringValue(obj["server_id"]) == serverID {
+			return obj
+		}
+	}
+	return nil
+}
+
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func boolValue(v any) bool {
+	b, _ := v.(bool)
+	return b
+}
+
 func jsonNumberToInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -2304,17 +2550,60 @@ func (s *daemonState) closeOwners() {
 	}
 }
 
+func (s *daemonState) reapIdleOwnersLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			s.reapIdleOwners(currentIdleOwnerTTL())
+		}
+	}
+}
+
+func (s *daemonState) reapIdleOwners(ttl time.Duration) {
+	now := time.Now()
+	var cleanup []*ownerEntry
+	s.mu.Lock()
+	for sid, entry := range s.owners {
+		entry.activeMu.Lock()
+		persistent := entry.Persistent
+		activeSessions := entry.ActiveSessions
+		lastSession := entry.LastSession
+		entry.activeMu.Unlock()
+		if persistent || activeSessions > 0 || now.Sub(lastSession) < ttl {
+			continue
+		}
+		delete(s.owners, sid)
+		for token, ticket := range s.tickets {
+			if ticket.ServerID == sid {
+				delete(s.tickets, token)
+			}
+		}
+		s.reapedOwnerCount++
+		cleanup = append(cleanup, entry)
+	}
+	s.mu.Unlock()
+
+	for _, entry := range cleanup {
+		cleanupListener(entry.Listener, entry.Socket)
+	}
+}
+
 func (s *daemonState) writeSnapshot() error {
 	s.mu.RLock()
 	snaps := make([]ownerSnapshot, 0, len(s.owners))
 	predecessorOwners := make([]predecessorOwnerSnapshot, 0, len(s.owners))
 	for _, entry := range s.owners {
 		snaps = append(snaps, ownerSnapshot{
-			ServerID: entry.ServerID,
-			Command:  entry.Command,
-			Args:     append([]string(nil), entry.Args...),
-			Cwd:      entry.Cwd,
-			Mode:     entry.Mode,
+			ServerID:   entry.ServerID,
+			Command:    entry.Command,
+			Args:       append([]string(nil), entry.Args...),
+			Cwd:        entry.Cwd,
+			Mode:       entry.Mode,
+			Persistent: entry.Persistent,
 		})
 		predecessorOwners = append(predecessorOwners, predecessorOwnerSnapshot{
 			ServerID:        entry.ServerID,
@@ -2370,10 +2659,11 @@ func (s *daemonState) restoreSnapshot() error {
 	restoredOwnerCount := 0
 	for _, owner := range snap.Owners {
 		req := controlRequest{
-			Command: owner.Command,
-			Args:    append([]string(nil), owner.Args...),
-			Cwd:     owner.Cwd,
-			Mode:    owner.Mode,
+			Command:    owner.Command,
+			Args:       append([]string(nil), owner.Args...),
+			Cwd:        owner.Cwd,
+			Mode:       owner.Mode,
+			Persistent: owner.Persistent,
 		}
 		sid := owner.ServerID
 		if sid == "" {
@@ -2426,6 +2716,18 @@ func runtimeDir() string {
 	return filepath.Join(os.TempDir(), "current-topology-poc")
 }
 
+func currentIdleOwnerTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(envIdleTTLMS))
+	if raw == "" {
+		return defaultIdleOwnerTTL
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return defaultIdleOwnerTTL
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 func normalizeSpawnRequest(req controlRequest) controlRequest {
 	mode := normalizeMode(req.Mode)
 	command := req.Command
@@ -2433,11 +2735,12 @@ func normalizeSpawnRequest(req controlRequest) controlRequest {
 		command = serverName
 	}
 	return controlRequest{
-		Command: command,
-		Args:    append([]string(nil), req.Args...),
-		Cwd:     req.Cwd,
-		Mode:    mode,
-		Env:     cloneEnv(req.Env),
+		Command:    command,
+		Args:       append([]string(nil), req.Args...),
+		Cwd:        req.Cwd,
+		Mode:       mode,
+		Env:        cloneEnv(req.Env),
+		Persistent: req.Persistent,
 	}
 }
 
