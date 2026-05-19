@@ -299,7 +299,7 @@ func runDaemon(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen control: %w", err)
 	}
-	defer cleanupListener(controlLn, ctl)
+	defer func() { _ = controlLn.Close() }()
 
 	state := &daemonState{
 		pid:              os.Getpid(),
@@ -1239,17 +1239,23 @@ func bytesTrimSpace(data []byte) []byte {
 }
 
 func ensureDaemonReady() error {
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	started := false
 	for time.Now().Before(deadline) {
-		status, err := sendControl(controlPath(), "status", nil, 500*time.Millisecond)
+		ctl := controlPath()
+		status, err := sendControl(ctl, "status", nil, 500*time.Millisecond)
 		if err == nil {
 			if ready, _ := status["ready"].(bool); ready {
 				return nil
 			}
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
 
 		if !started {
+			if handoffSnapshotExists() && waitExistingControlReady(ctl, 20, 500*time.Millisecond) {
+				return nil
+			}
 			if err := startDaemonProcess(false); err != nil {
 				return err
 			}
@@ -1258,6 +1264,29 @@ func ensureDaemonReady() error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("daemon did not become ready before timeout")
+}
+
+func waitExistingControlReady(ctl string, attempts int, interval time.Duration) bool {
+	for i := 0; i < attempts; i++ {
+		status, err := sendControl(ctl, "status", nil, 500*time.Millisecond)
+		if err == nil {
+			ready, _ := status["ready"].(bool)
+			if ready {
+				return true
+			}
+		}
+		time.Sleep(interval)
+	}
+	return false
+}
+
+func handoffSnapshotExists() bool {
+	if _, err := os.Stat(snapshotPath()); err == nil {
+		return true
+	} else if os.IsNotExist(err) {
+		return false
+	}
+	return true
 }
 
 func startSuccessor() error {
