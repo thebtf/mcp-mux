@@ -141,17 +141,18 @@ func TestDaemonFlag_ConfigPropagation(t *testing.T) {
 	d2.Shutdown()
 }
 
-func TestNewRejectsEmptyName(t *testing.T) {
-	_, err := New(Config{
+func TestNewDefaultsEmptyNameForCompatibility(t *testing.T) {
+	d, err := New(Config{
 		ControlPath:  shortSocketPath(t, "noname.ctl.sock"),
 		SkipSnapshot: true,
 		Logger:       testLogger(t),
 	})
-	if err == nil {
-		t.Fatal("New() with empty Config.Name should fail")
+	if err != nil {
+		t.Fatalf("New() with empty Config.Name: %v", err)
 	}
-	if !strings.Contains(err.Error(), "Config.Name is required") {
-		t.Fatalf("New() error = %v, want Config.Name diagnostic", err)
+	defer d.Shutdown()
+	if d.name != "mcp-mux" {
+		t.Fatalf("daemon name = %q, want backward-compatible default %q", d.name, "mcp-mux")
 	}
 }
 

@@ -227,8 +227,8 @@ type Config struct {
 
 	// Name is the engine instance name (e.g. "mcp-mux", "aimux", "engram").
 	// Used to scope IPC socket file names and stale-socket cleanup to this
-	// engine only. Empty string is valid (library is pure); callers that want
-	// FS isolation across multiple engine types must set this.
+	// engine only. Empty string defaults to "mcp-mux" for backward compatibility;
+	// callers that want FS isolation across multiple engine types must set this.
 	Name string
 
 	// Persistent overrides per-owner Persistent detection. When true, all owners
@@ -254,8 +254,9 @@ var _ control.DaemonHandler = (*Daemon)(nil)
 
 // New creates and starts a new Daemon with a control server.
 func New(cfg Config) (*Daemon, error) {
-	if strings.TrimSpace(cfg.Name) == "" {
-		return nil, errors.New("daemon: Config.Name is required and must be unique to this binary")
+	name := strings.TrimSpace(cfg.Name)
+	if name == "" {
+		name = "mcp-mux"
 	}
 
 	logger := cfg.Logger
@@ -300,7 +301,7 @@ func New(cfg Config) (*Daemon, error) {
 		handlerFunc:      cfg.HandlerFunc,
 		sessionHandler:   cfg.SessionHandler,
 		daemonFlag:       daemonFlag,
-		name:             cfg.Name,
+		name:             name,
 		persistent:       cfg.Persistent,
 		daemonGeneration: daemonGeneration,
 		authorizeSession: cfg.AuthorizeSession,
