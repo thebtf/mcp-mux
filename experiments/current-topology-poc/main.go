@@ -59,6 +59,10 @@ type ownerEntry struct {
 	Listener    net.Listener
 	LastSession time.Time
 	NextSession int
+
+	activeMu           sync.Mutex
+	ActiveCalls        int
+	MaxConcurrentCalls int
 }
 
 type ownerSnapshot struct {
@@ -104,8 +108,24 @@ type probeRPCClient struct {
 }
 
 type shimOwnerConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
+	conn      net.Conn
+	reader    *bufio.Reader
+	writeMu   sync.Mutex
+	pendingMu sync.Mutex
+	pending   map[string]chan ownerResponse
+	closeOnce sync.Once
+}
+
+type ownerResponse struct {
+	data []byte
+	err  error
+}
+
+type shimState struct {
+	mu               sync.Mutex
+	ownerConn        *shimOwnerConn
+	cachedInitialize []byte
+	stdoutMu         sync.Mutex
 }
 
 func main() {
@@ -116,6 +136,7 @@ func main() {
 	pocProbeZombieOwner := flag.Bool("poc-probe-zombie-owner", false, "verify spawn replaces a registered owner with a dead listener")
 	pocProbeLiveReconnect := flag.Bool("poc-probe-live-reconnect", false, "verify one stdio shim survives daemon graceful restart")
 	pocProbeInflightReconnect := flag.Bool("poc-probe-inflight-reconnect", false, "verify in-flight and buffered requests survive daemon graceful restart")
+	pocProbeConcurrentDemux := flag.Bool("poc-probe-concurrent-demux", false, "verify concurrent out-of-order responses demux by ID across daemon graceful restart")
 	flag.Parse()
 
 	switch {
@@ -154,6 +175,11 @@ func main() {
 	case *pocProbeInflightReconnect:
 		if err := probeInflightReconnect(); err != nil {
 			fmt.Fprintf(os.Stderr, "inflight-reconnect probe failed: %v\n", err)
+			os.Exit(1)
+		}
+	case *pocProbeConcurrentDemux:
+		if err := probeConcurrentDemux(); err != nil {
+			fmt.Fprintf(os.Stderr, "concurrent-demux probe failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:
@@ -322,15 +348,21 @@ func (s *daemonState) setReady() {
 }
 
 func ownerStatus(entry *ownerEntry) map[string]any {
+	entry.activeMu.Lock()
+	activeCalls := entry.ActiveCalls
+	maxConcurrentCalls := entry.MaxConcurrentCalls
+	entry.activeMu.Unlock()
 	return map[string]any{
-		"server_id":        entry.ServerID,
-		"command":          entry.Command,
-		"args":             append([]string(nil), entry.Args...),
-		"cwd":              entry.Cwd,
-		"mode":             entry.Mode,
-		"owner_generation": entry.Generation,
-		"owner_socket":     entry.Socket,
-		"last_session_ms":  time.Since(entry.LastSession).Milliseconds(),
+		"server_id":            entry.ServerID,
+		"command":              entry.Command,
+		"args":                 append([]string(nil), entry.Args...),
+		"cwd":                  entry.Cwd,
+		"mode":                 entry.Mode,
+		"owner_generation":     entry.Generation,
+		"owner_socket":         entry.Socket,
+		"last_session_ms":      time.Since(entry.LastSession).Milliseconds(),
+		"active_calls":         activeCalls,
+		"max_concurrent_calls": maxConcurrentCalls,
 	}
 }
 
@@ -493,7 +525,8 @@ func handleOwnerSession(conn net.Conn, state *daemonState, entry *ownerEntry) {
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			handleRPCLine(conn, state, entry, sessionID, line)
+			raw := append([]byte{}, line...)
+			go handleRPCLine(conn, state, entry, sessionID, raw)
 		}
 		if err != nil {
 			return
@@ -574,18 +607,40 @@ func handleToolCall(w io.Writer, state *daemonState, entry *ownerEntry, sessionI
 	if sleepMS > 5000 {
 		sleepMS = 5000
 	}
+	entry.beginToolCall()
+	defer entry.endToolCall()
 	if sleepMS > 0 {
 		time.Sleep(time.Duration(sleepMS) * time.Millisecond)
 	}
 
 	payload := statePayload(state, entry, sessionID)
 	payload["delay_ms"] = sleepMS
+	if tag, ok := params.Arguments["tag"].(string); ok {
+		payload["tag"] = tag
+	}
 	_ = writeRPCResult(w, msg.ID, map[string]any{
 		"content": []map[string]any{
 			{"type": "text", "text": mustJSON(payload)},
 		},
 		"isError": false,
 	})
+}
+
+func (entry *ownerEntry) beginToolCall() {
+	entry.activeMu.Lock()
+	defer entry.activeMu.Unlock()
+	entry.ActiveCalls++
+	if entry.ActiveCalls > entry.MaxConcurrentCalls {
+		entry.MaxConcurrentCalls = entry.ActiveCalls
+	}
+}
+
+func (entry *ownerEntry) endToolCall() {
+	entry.activeMu.Lock()
+	defer entry.activeMu.Unlock()
+	if entry.ActiveCalls > 0 {
+		entry.ActiveCalls--
+	}
 }
 
 func statePayload(state *daemonState, entry *ownerEntry, sessionID int) map[string]any {
@@ -613,72 +668,132 @@ func (s *daemonState) versionString(entry *ownerEntry) string {
 
 func runShim(ctx context.Context) error {
 	_ = ctx
-	ownerConn, err := connectShimOwner()
-	if err != nil {
+	state := &shimState{}
+	if _, err := state.ensureOwner(); err != nil {
 		return err
 	}
-	defer ownerConn.close()
+	defer state.close()
 
-	var cachedInitialize []byte
 	stdin := bufio.NewScanner(os.Stdin)
 	stdin.Buffer(make([]byte, 1<<20), 1<<20)
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
 	for stdin.Scan() {
 		raw := append([]byte{}, stdin.Bytes()...)
 		msg, isRequest := parseRPCRequest(raw)
-		if isRequest && msg.Method == "initialize" && cachedInitialize == nil {
-			cachedInitialize = append([]byte{}, raw...)
+		if isRequest && msg.Method == "initialize" {
+			state.cacheInitialize(raw)
 		}
 
-		var lastErr error
-		for attempt := 0; attempt < 2; attempt++ {
-			if ownerConn == nil {
-				ownerConn, err = connectShimOwner()
-				if err != nil {
-					lastErr = err
-					continue
-				}
-				if cachedInitialize != nil && !(isRequest && msg.Method == "initialize") {
-					if err := ownerConn.warmInitialize(cachedInitialize); err != nil {
-						ownerConn.close()
-						ownerConn = nil
-						lastErr = err
-						continue
-					}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := state.handleShimMessage(raw, msg, isRequest); err != nil {
+				select {
+				case errCh <- err:
+				default:
 				}
 			}
+		}()
 
-			if err := writeRawLine(ownerConn.conn, raw); err != nil {
-				ownerConn.close()
-				ownerConn = nil
-				lastErr = err
-				continue
-			}
-			if !isRequest {
-				lastErr = nil
-				break
-			}
-
-			resp, err := ownerConn.readResponse(msg.ID)
-			if err != nil {
-				ownerConn.close()
-				ownerConn = nil
-				lastErr = err
-				continue
-			}
-			if err := writeRawLine(os.Stdout, resp); err != nil {
-				return err
-			}
-			lastErr = nil
-			break
-		}
-		if lastErr != nil {
-			return fmt.Errorf("shim request %s failed after reconnect retry: %w", msg.Method, lastErr)
+		select {
+		case err := <-errCh:
+			return err
+		default:
 		}
 	}
 	if err := stdin.Err(); err != nil {
 		return err
 	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
 	return nil
+}
+
+func (s *shimState) cacheInitialize(raw []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cachedInitialize == nil {
+		s.cachedInitialize = append([]byte{}, raw...)
+	}
+}
+
+func (s *shimState) handleShimMessage(raw []byte, msg rpcMessage, isRequest bool) error {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		ownerConn, err := s.ensureOwner()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if !isRequest {
+			if err := ownerConn.writeNotification(raw); err != nil {
+				s.invalidateOwner(ownerConn)
+				lastErr = err
+				continue
+			}
+			return nil
+		}
+
+		resp, err := ownerConn.roundTrip(raw, msg.ID)
+		if err != nil {
+			s.invalidateOwner(ownerConn)
+			lastErr = err
+			continue
+		}
+		s.stdoutMu.Lock()
+		err = writeRawLine(os.Stdout, resp)
+		s.stdoutMu.Unlock()
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("shim request %s failed after reconnect retry: %w", msg.Method, lastErr)
+}
+
+func (s *shimState) ensureOwner() (*shimOwnerConn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ownerConn != nil {
+		return s.ownerConn, nil
+	}
+	ownerConn, err := connectShimOwner()
+	if err != nil {
+		return nil, err
+	}
+	if s.cachedInitialize != nil {
+		if err := ownerConn.warmInitialize(s.cachedInitialize); err != nil {
+			ownerConn.close()
+			return nil, err
+		}
+	}
+	s.ownerConn = ownerConn
+	return ownerConn, nil
+}
+
+func (s *shimState) invalidateOwner(ownerConn *shimOwnerConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ownerConn == ownerConn {
+		s.ownerConn.close()
+		s.ownerConn = nil
+	}
+}
+
+func (s *shimState) close() {
+	s.mu.Lock()
+	ownerConn := s.ownerConn
+	s.ownerConn = nil
+	s.mu.Unlock()
+	if ownerConn != nil {
+		ownerConn.close()
+	}
 }
 
 func connectShimOwner() (*shimOwnerConn, error) {
@@ -728,13 +843,23 @@ func connectShimOwner() (*shimOwnerConn, error) {
 		return nil, fmt.Errorf("owner auth rejected: %v", auth)
 	}
 
-	return &shimOwnerConn{conn: conn, reader: reader}, nil
+	ownerConn := &shimOwnerConn{
+		conn:    conn,
+		reader:  reader,
+		pending: make(map[string]chan ownerResponse),
+	}
+	go ownerConn.readLoop()
+	return ownerConn, nil
 }
 
 func (c *shimOwnerConn) close() {
-	if c != nil && c.conn != nil {
-		_ = c.conn.Close()
+	if c == nil {
+		return
 	}
+	c.closeOnce.Do(func() {
+		_ = c.conn.Close()
+		c.failPending(io.ErrClosedPipe)
+	})
 }
 
 func (c *shimOwnerConn) warmInitialize(raw []byte) error {
@@ -742,24 +867,77 @@ func (c *shimOwnerConn) warmInitialize(raw []byte) error {
 	if !ok {
 		return nil
 	}
-	if err := writeRawLine(c.conn, raw); err != nil {
-		return err
-	}
-	_, err := c.readResponse(msg.ID)
+	_, err := c.roundTrip(raw, msg.ID)
 	return err
 }
 
-func (c *shimOwnerConn) readResponse(wantID json.RawMessage) ([]byte, error) {
+func (c *shimOwnerConn) roundTrip(raw []byte, wantID json.RawMessage) ([]byte, error) {
+	key := string(wantID)
+	ch := make(chan ownerResponse, 1)
+	c.pendingMu.Lock()
+	c.pending[key] = ch
+	c.pendingMu.Unlock()
+
+	c.writeMu.Lock()
+	err := writeRawLine(c.conn, raw)
+	c.writeMu.Unlock()
+	if err != nil {
+		c.deletePending(key)
+		return nil, err
+	}
+
+	select {
+	case resp := <-ch:
+		return resp.data, resp.err
+	case <-time.After(10 * time.Second):
+		c.deletePending(key)
+		return nil, fmt.Errorf("timeout waiting for owner response id %s", key)
+	}
+}
+
+func (c *shimOwnerConn) writeNotification(raw []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return writeRawLine(c.conn, raw)
+}
+
+func (c *shimOwnerConn) readLoop() {
 	for {
 		line, err := c.reader.ReadBytes('\n')
 		if err != nil {
-			return nil, err
+			c.failPending(err)
+			return
 		}
 		msg, ok := parseRPCRequest(bytesTrimSpace(line))
-		if !ok || string(msg.ID) != string(wantID) {
+		if !ok || len(msg.ID) == 0 {
 			continue
 		}
-		return bytesTrimNewline(line), nil
+		key := string(msg.ID)
+		c.pendingMu.Lock()
+		ch := c.pending[key]
+		delete(c.pending, key)
+		c.pendingMu.Unlock()
+		if ch != nil {
+			ch <- ownerResponse{data: bytesTrimNewline(line)}
+			close(ch)
+		}
+	}
+}
+
+func (c *shimOwnerConn) deletePending(key string) {
+	c.pendingMu.Lock()
+	delete(c.pending, key)
+	c.pendingMu.Unlock()
+}
+
+func (c *shimOwnerConn) failPending(err error) {
+	c.pendingMu.Lock()
+	pending := c.pending
+	c.pending = make(map[string]chan ownerResponse)
+	c.pendingMu.Unlock()
+	for _, ch := range pending {
+		ch <- ownerResponse{err: err}
+		close(ch)
 	}
 }
 
@@ -1176,8 +1354,10 @@ func probeInflightReconnect() error {
 	time.Sleep(150 * time.Millisecond)
 
 	bufferedID, err := client.sendRequest("tools/call", map[string]any{
-		"name":      "topology_state",
-		"arguments": map[string]any{},
+		"name": "topology_state",
+		"arguments": map[string]any{
+			"sleep_ms": 900,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("send buffered request: %w", err)
@@ -1195,7 +1375,7 @@ func probeInflightReconnect() error {
 		return err
 	}
 
-	slowResp, err := client.readResponse(slowID, 10*time.Second)
+	responses, responseOrder, err := client.readResponses([]int{slowID, bufferedID}, 10*time.Second)
 	if err != nil {
 		_ = writeJSONLine(os.Stdout, map[string]any{
 			"ok":             false,
@@ -1207,27 +1387,13 @@ func probeInflightReconnect() error {
 			"after_status":   afterStatus,
 			"slow_id":        slowID,
 			"buffered_id":    bufferedID,
+			"response_order": responseOrder,
 			"error":          err.Error(),
 		})
-		return fmt.Errorf("slow in-flight request did not survive daemon restart: %w", err)
+		return fmt.Errorf("in-flight requests did not survive daemon restart: %w", err)
 	}
-	bufferedResp, err := client.readResponse(bufferedID, 10*time.Second)
-	if err != nil {
-		_ = writeJSONLine(os.Stdout, map[string]any{
-			"ok":             false,
-			"probe":          "inflight_reconnect",
-			"phase":          "phase5",
-			"break_observed": true,
-			"before_pid":     beforePID,
-			"before_gen":     beforeGeneration,
-			"after_status":   afterStatus,
-			"slow_id":        slowID,
-			"buffered_id":    bufferedID,
-			"slow_response":  slowResp,
-			"error":          err.Error(),
-		})
-		return fmt.Errorf("buffered request did not survive in-flight reconnect: %w", err)
-	}
+	slowResp := responses[slowID]
+	bufferedResp := responses[bufferedID]
 
 	slowPayload, err := topologyToolPayload(slowResp)
 	if err != nil {
@@ -1261,8 +1427,143 @@ func probeInflightReconnect() error {
 		"after_status":     afterStatus,
 		"slow_id":          slowID,
 		"buffered_id":      bufferedID,
+		"response_order":   responseOrder,
 		"slow_payload":     slowPayload,
 		"buffered_payload": bufferedPayload,
+	})
+}
+
+func probeConcurrentDemux() error {
+	if err := ensureDaemonReady(); err != nil {
+		return err
+	}
+	beforeStatus, err := sendControl(controlPath(), "status", nil, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	beforePID, _ := jsonNumberToInt(beforeStatus["pid"])
+	beforeGeneration, _ := beforeStatus["daemon_generation"].(string)
+
+	client, err := newProbeRPCClient()
+	if err != nil {
+		return err
+	}
+	defer client.close()
+
+	if _, err := client.call("initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"clientInfo":      map[string]any{"name": "current-topology-poc-probe", "version": "1.0.0"},
+		"capabilities":    map[string]any{},
+	}, 10*time.Second); err != nil {
+		return fmt.Errorf("initialize before concurrent restart: %w", err)
+	}
+	if err := client.notify("notifications/initialized", map[string]any{}); err != nil {
+		return err
+	}
+	if _, err := client.call("tools/list", map[string]any{}, 10*time.Second); err != nil {
+		return fmt.Errorf("tools/list before concurrent restart: %w", err)
+	}
+
+	slowID, err := client.sendRequest("tools/call", map[string]any{
+		"name": "topology_state",
+		"arguments": map[string]any{
+			"sleep_ms": 900,
+			"tag":      "slow",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("send slow concurrent request: %w", err)
+	}
+	fastID, err := client.sendRequest("tools/call", map[string]any{
+		"name": "topology_state",
+		"arguments": map[string]any{
+			"sleep_ms": 700,
+			"tag":      "fast",
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("send fast concurrent request: %w", err)
+	}
+
+	concurrentStatus, err := waitOwnerConcurrency(2, 500*time.Millisecond)
+	if err != nil {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":             false,
+			"probe":          "concurrent_demux",
+			"phase":          "phase6",
+			"break_observed": true,
+			"before_pid":     beforePID,
+			"before_gen":     beforeGeneration,
+			"slow_id":        slowID,
+			"fast_id":        fastID,
+			"error":          err.Error(),
+		})
+		return fmt.Errorf("concurrent false-positive guard failed: %w", err)
+	}
+
+	restartResp, err := sendControl(controlPath(), "graceful-restart", nil, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("graceful-restart during concurrent requests: %w", err)
+	}
+	if ok, _ := restartResp["ok"].(bool); !ok {
+		return fmt.Errorf("graceful-restart rejected during concurrent requests: %v", restartResp)
+	}
+	afterStatus, err := waitSuccessorReady(beforePID, beforeGeneration, 10*time.Second)
+	if err != nil {
+		return err
+	}
+
+	responses, order, err := client.readResponses([]int{slowID, fastID}, 10*time.Second)
+	if err != nil {
+		_ = writeJSONLine(os.Stdout, map[string]any{
+			"ok":                false,
+			"probe":             "concurrent_demux",
+			"phase":             "phase6",
+			"break_observed":    true,
+			"before_pid":        beforePID,
+			"before_gen":        beforeGeneration,
+			"after_status":      afterStatus,
+			"concurrent_status": concurrentStatus,
+			"slow_id":           slowID,
+			"fast_id":           fastID,
+			"response_order":    order,
+			"error":             err.Error(),
+		})
+		return fmt.Errorf("concurrent responses did not survive daemon restart: %w", err)
+	}
+
+	slowPayload, err := topologyToolPayload(responses[slowID])
+	if err != nil {
+		return fmt.Errorf("decode slow concurrent response payload: %w", err)
+	}
+	fastPayload, err := topologyToolPayload(responses[fastID])
+	if err != nil {
+		return fmt.Errorf("decode fast concurrent response payload: %w", err)
+	}
+	afterGeneration, _ := afterStatus["daemon_generation"].(string)
+	slowGeneration, _ := slowPayload["daemon_generation"].(string)
+	fastGeneration, _ := fastPayload["daemon_generation"].(string)
+	if slowGeneration != afterGeneration || fastGeneration != afterGeneration {
+		return fmt.Errorf("concurrent responses completed on wrong daemon generation: slow=%s fast=%s after=%s", slowGeneration, fastGeneration, afterGeneration)
+	}
+	if len(order) < 2 || order[0] != fastID || order[1] != slowID {
+		return fmt.Errorf("response order false-positive guard failed: order=%v fast_id=%d slow_id=%d", order, fastID, slowID)
+	}
+
+	return writeJSONLine(os.Stdout, map[string]any{
+		"ok":                true,
+		"probe":             "concurrent_demux",
+		"phase":             "phase6",
+		"break_observed":    false,
+		"before_pid":        beforePID,
+		"before_gen":        beforeGeneration,
+		"after_status":      afterStatus,
+		"concurrent_status": concurrentStatus,
+		"slow_id":           slowID,
+		"fast_id":           fastID,
+		"response_order":    order,
+		"slow_payload":      slowPayload,
+		"fast_payload":      fastPayload,
 	})
 }
 
@@ -1357,6 +1658,58 @@ func (c *probeRPCClient) readResponse(id int, timeout time.Duration) (map[string
 	}
 }
 
+func (c *probeRPCClient) readResponses(ids []int, timeout time.Duration) (map[int]map[string]any, []int, error) {
+	wanted := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	responses := make(map[int]map[string]any, len(ids))
+	order := make([]int, 0, len(ids))
+	deadline := time.Now().Add(timeout)
+	for len(responses) < len(wanted) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return responses, order, fmt.Errorf("timeout waiting for responses ids=%v got_order=%v", ids, order)
+		}
+		lineCh := make(chan []byte, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			if c.scanner.Scan() {
+				lineCh <- append([]byte{}, c.scanner.Bytes()...)
+				return
+			}
+			if err := c.scanner.Err(); err != nil {
+				errCh <- err
+				return
+			}
+			errCh <- io.ErrUnexpectedEOF
+		}()
+		select {
+		case line := <-lineCh:
+			var msg map[string]any
+			if err := json.Unmarshal(line, &msg); err != nil {
+				continue
+			}
+			gotID, ok := jsonNumberToInt(msg["id"])
+			if !ok || !wanted[gotID] {
+				continue
+			}
+			if msg["error"] != nil {
+				return responses, order, fmt.Errorf("json-rpc error for id %d: %v", gotID, msg["error"])
+			}
+			if _, exists := responses[gotID]; !exists {
+				responses[gotID] = msg
+				order = append(order, gotID)
+			}
+		case err := <-errCh:
+			return responses, order, err
+		case <-time.After(remaining):
+			return responses, order, fmt.Errorf("timeout waiting for responses ids=%v got_order=%v", ids, order)
+		}
+	}
+	return responses, order, nil
+}
+
 func (c *probeRPCClient) notify(method string, params any) error {
 	return writeJSONLine(c.stdin, map[string]any{
 		"jsonrpc": "2.0",
@@ -1411,6 +1764,34 @@ func waitSuccessorReady(oldPID int, oldGeneration string, timeout time.Duration)
 		time.Sleep(100 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("successor daemon did not become ready; old_pid=%d old_generation=%s last_status=%v", oldPID, oldGeneration, last)
+}
+
+func waitOwnerConcurrency(want int, timeout time.Duration) (map[string]any, error) {
+	deadline := time.Now().Add(timeout)
+	var last map[string]any
+	for time.Now().Before(deadline) {
+		status, err := sendControl(controlPath(), "status", nil, 500*time.Millisecond)
+		if err == nil {
+			last = status
+			if maxOwnerConcurrency(status) >= want {
+				return status, nil
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return last, fmt.Errorf("owner concurrency did not reach %d; last_status=%v", want, last)
+}
+
+func maxOwnerConcurrency(status map[string]any) int {
+	owners, _ := status["owners"].([]any)
+	maxSeen := 0
+	for _, owner := range owners {
+		obj, _ := owner.(map[string]any)
+		if n, ok := jsonNumberToInt(obj["max_concurrent_calls"]); ok && n > maxSeen {
+			maxSeen = n
+		}
+	}
+	return maxSeen
 }
 
 func jsonNumberToInt(v any) (int, bool) {

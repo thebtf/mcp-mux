@@ -145,7 +145,49 @@ drain, or refresh-token history.
 
 ## Candidate Next Phases
 
-- Phase 6: session manager history and refresh-token reconnect path
-- Phase 7: true concurrent dispatch and out-of-order response demux
+## Phase 6 - True Concurrent Dispatch and Out-of-Order Response Demux
+
+Status: PASS
+
+Adds the first truly concurrent same-stdio traffic condition:
+
+- owner sessions dispatch JSON-RPC requests concurrently instead of serially
+- shim keeps a pending-response map keyed by JSON-RPC ID
+- shim writes requests concurrently and demultiplexes out-of-order owner
+  responses back to the same stdio stdout
+- the probe sends two slow requests, proves `max_concurrent_calls >= 2`, then
+  restarts the daemon while both are outstanding
+- both requests reconnect to the successor owner and return from the successor
+  daemon generation
+
+Observed pre-fix break:
+
+```text
+"probe":"concurrent_demux"
+"break_observed":true
+"error":"owner concurrency did not reach 2"
+"max_concurrent_calls":1
+```
+
+Current pass signal:
+
+```text
+"probe":"concurrent_demux"
+"phase":"phase6"
+"break_observed":false
+"concurrent_status":{"owners":[{"active_calls":2,"max_concurrent_calls":2,...}]}
+"response_order":[fast_id,slow_id]
+"fast_payload":{"daemon_generation":"<successor>","delay_ms":700,"tag":"fast",...}
+"slow_payload":{"daemon_generation":"<successor>","delay_ms":900,"tag":"slow",...}
+```
+
+This proves the PoC shim can handle multiple outstanding owner requests and
+out-of-order responses by JSON-RPC ID across daemon restart. It still does not
+model production refresh-token history, real upstream subprocess side effects,
+or production `muxcore` code imports.
+
+## Candidate Next Phases
+
+- Phase 7: session manager history and refresh-token reconnect path
 - Phase 8: generation-aware graceful restart handoff
 - Phase 9: persistent/idle reaper and upstream process lifecycle

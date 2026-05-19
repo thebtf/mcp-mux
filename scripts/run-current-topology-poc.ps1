@@ -165,6 +165,12 @@ try {
 
     Stop-PocDaemon
 
+    Invoke-NativeStep "out-of-order concurrent demux reconnect" {
+        & $Binary --poc-probe-concurrent-demux
+    }
+
+    Stop-PocDaemon
+
     Write-Host ""
     Write-Host "PASS current-topology PoC"
 } finally {
