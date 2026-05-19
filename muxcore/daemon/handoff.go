@@ -63,6 +63,25 @@ type HandoffUpstream struct {
 	StdoutFD uintptr
 }
 
+func (d *Daemon) retireOldOwnerSockets(ipcPath, controlPath string) bool {
+	retired := true
+	for _, path := range []string{ipcPath, controlPath} {
+		if path == "" {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			retired = false
+			if d.logger != nil {
+				d.logger.Printf("handoff.retire_old_owner_socket_fail path=%s error=%v", path, err)
+			}
+		}
+	}
+	if retired {
+		d.oldOwnerSocketRetiredCount.Add(1)
+	}
+	return retired
+}
+
 // performHandoff runs the old-daemon side of the two-daemon handoff protocol.
 // conn is the fdConn dialed/accepted by the caller; token is the pre-shared
 // authentication token (FR-11); upstreams is the list of owners to transfer.

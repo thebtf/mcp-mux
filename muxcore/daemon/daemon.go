@@ -125,9 +125,11 @@ type Daemon struct {
 
 	// name is the engine instance name from Config.Name (e.g. "mcp-mux", "aimux").
 	// Used to scope IPC socket file paths and stale-socket cleanup to this engine.
-	name             string
-	persistent       bool
-	daemonGeneration string
+	name                        string
+	persistent                  bool
+	daemonGeneration            string
+	predecessorPID              int
+	predecessorDaemonGeneration string
 
 	// authorizeSession is forwarded from Config.AuthorizeSession to every
 	// Owner created by this daemon. nil = no gate (pre-v0.24 behaviour).
@@ -155,11 +157,12 @@ type Daemon struct {
 	// stats holds atomic handoff counters exposed via HandleStatus (NFR-4 / T025).
 	stats handoffStats
 
-	reconnectRefreshed       atomic.Uint64
-	reconnectFallbackSpawned atomic.Uint64
-	reconnectGaveUp          atomic.Uint64
-	restoredOwnerCount       atomic.Uint64
-	ownerRemoval             ownerRemovalStats
+	reconnectRefreshed         atomic.Uint64
+	reconnectFallbackSpawned   atomic.Uint64
+	reconnectGaveUp            atomic.Uint64
+	restoredOwnerCount         atomic.Uint64
+	oldOwnerSocketRetiredCount atomic.Uint64
+	ownerRemoval               ownerRemovalStats
 }
 
 // handoffStats holds atomic counters for handoff lifecycle observability.
@@ -1357,12 +1360,15 @@ func (d *Daemon) HandleStatus() map[string]any {
 		"zombie_detections_spawn":         d.zombieDetectedSpawn,
 		"zombie_detections_restore":       d.zombieDetectedRestore,
 		"handoff": map[string]any{
-			"attempted":                   d.stats.attempted.Load(),
-			"transferred":                 d.stats.transferred.Load(),
-			"aborted":                     d.stats.aborted.Load(),
-			"fallback":                    d.stats.fallback.Load(),
-			"successor_daemon_generation": d.daemonGeneration,
-			"restored_owner_count":        d.restoredOwnerCount.Load(),
+			"attempted":                      d.stats.attempted.Load(),
+			"transferred":                    d.stats.transferred.Load(),
+			"aborted":                        d.stats.aborted.Load(),
+			"fallback":                       d.stats.fallback.Load(),
+			"predecessor_pid":                d.predecessorPID,
+			"predecessor_daemon_generation":  d.predecessorDaemonGeneration,
+			"successor_daemon_generation":    d.daemonGeneration,
+			"restored_owner_count":           d.restoredOwnerCount.Load(),
+			"old_owner_socket_retired_count": d.oldOwnerSocketRetiredCount.Load(),
 		},
 	}
 }

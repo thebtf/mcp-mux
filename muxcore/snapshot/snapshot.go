@@ -62,6 +62,7 @@ type DaemonSnapshot struct {
 	MuxVersion       string            `json:"mux_version"`
 	Timestamp        string            `json:"timestamp"`
 	DaemonGeneration string            `json:"daemon_generation,omitempty"`
+	PredecessorPID   int               `json:"predecessor_pid,omitempty"`
 	Owners           []OwnerSnapshot   `json:"owners"`
 	Sessions         []SessionSnapshot `json:"sessions"`
 }

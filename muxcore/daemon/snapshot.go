@@ -60,6 +60,7 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 		MuxVersion:       owner.Version,
 		Timestamp:        time.Now().UTC().Format(time.RFC3339),
 		DaemonGeneration: d.daemonGeneration,
+		PredecessorPID:   os.Getpid(),
 		Owners:           owners,
 		Sessions:         sessions,
 	}
@@ -139,6 +140,11 @@ func (d *Daemon) loadSnapshot() int {
 		return 0 // cold start
 	}
 
+	d.mu.Lock()
+	d.predecessorPID = snap.PredecessorPID
+	d.predecessorDaemonGeneration = snap.DaemonGeneration
+	d.mu.Unlock()
+
 	// Check for handoff env vars. If both are set, receive transferred FDs from
 	// the old daemon instead of respawning upstreams from scratch (FR-1 to FR-3).
 	// Returns nil if env vars are absent or handoff fails (FR-8 fallback for all owners).
@@ -214,8 +220,7 @@ func (d *Daemon) loadSnapshot() int {
 		// During handoff, predecessor's owner sockets may still be active.
 		// Unconditionally remove them — predecessor is shutting down (#101).
 		if isHandoffMode() {
-			os.Remove(ipcPath)
-			os.Remove(controlPath)
+			d.retireOldOwnerSockets(ipcPath, controlPath)
 		}
 
 		var o *owner.Owner
