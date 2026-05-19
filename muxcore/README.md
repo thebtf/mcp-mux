@@ -9,6 +9,32 @@ for zero-downtime daemon upgrades.
 go get github.com/thebtf/mcp-mux/muxcore@latest
 ```
 
+## Stable Operator Status Contract
+
+`daemon.HandleStatus()` is the stable operator status API used by control
+clients such as `mcp-mux serve` and `mux_list`. Fields may be added
+compatibly, but released field names and meanings must not be removed, renamed,
+or repurposed without release notes and a compatibility window.
+
+Current lifecycle evidence fields:
+
+| Field | Meaning |
+| --- | --- |
+| `daemon_generation` | Process-lifetime generation string for distinguishing predecessor and successor daemons. |
+| `reaped_owner_count` | Count of owners removed by idle lifecycle reaping. |
+| `owner_removal.total` | Count of owner-removal helper executions in this daemon process. |
+| `owner_removal.by_reason` | Removal counts keyed by reason, including `operator_hard`, `operator_soft`, `idle`, `zombie`, `handoff`, `restore_failed`, and `upstream_exit`. |
+| `owner_removal.pending_tokens_removed` | Total owner-scoped pending session tokens removed during owner cleanup. |
+| `owner_removal.bound_history_removed` | Total owner-scoped reconnect history entries removed during owner cleanup. |
+| `handoff.predecessor_pid` | PID recorded by the daemon that wrote the snapshot, when known. |
+| `handoff.predecessor_daemon_generation` | Generation recorded by the daemon that wrote the snapshot, when known. |
+| `handoff.successor_daemon_generation` | Current daemon generation reported in the handoff status block. |
+| `handoff.restored_owner_count` | Number of owners restored from snapshot or handoff into this daemon process. |
+| `handoff.old_owner_socket_retired_count` | Number of predecessor owner socket pairs invalidated while restoring in handoff mode. |
+| `servers[].owner_generation` | Per-owner generation string; changes when a fresh owner replaces a prior owner. |
+| `servers[].restored_from_owner_generation` | Prior owner generation when an owner was restored from snapshot or handoff. |
+| `servers[].restore_source` | Owner source classification: `fresh`, `snapshot_handoff`, or `snapshot_fallback`. |
+
 ## Handoff API (external daemon upgrade)
 
 The `daemon` package exposes five public functions for coordinating a live handoff between

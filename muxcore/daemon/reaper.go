@@ -164,7 +164,7 @@ func (r *Reaper) sweep() int {
 			if decision.reason == "zombie" {
 				// Upstream is already dead — hard remove (no point in stdin close).
 				r.logger.Printf("reaper: owner %s upstream dead with 0 sessions, removing", sid[:8])
-				_ = r.daemon.Remove(sid)
+				_, _ = r.daemon.removeOwner(sid, ownerRemovalReasonZombie, false)
 			} else {
 				// Idle eviction: give upstream a chance to exit cleanly via stdin close.
 				// SoftRemove closes stdin and waits up to 30s before SIGTERM/SIGKILL (US3).
@@ -172,7 +172,7 @@ func (r *Reaper) sweep() int {
 					"reaper: owner %s idle for %.0fs (timeout %.0fs), soft-removing",
 					sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
 				)
-				_ = r.daemon.SoftRemove(sid)
+				_, _ = r.daemon.removeOwner(sid, ownerRemovalReasonIdle, true)
 			}
 			affected++
 		}

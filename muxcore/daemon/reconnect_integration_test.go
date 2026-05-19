@@ -22,6 +22,12 @@ func TestReconnectRefreshPreservesOwner(t *testing.T) {
 	if ok := o.SessionMgr().Bind("prev-token", sid, initial); !ok {
 		t.Fatal("initial Bind returned false")
 	}
+	if o.SessionMgr().IsPreRegistered("prev-token") {
+		t.Fatal("prev-token is still pending after initial Bind; reconnect test requires a consumed token")
+	}
+	if ownerKey, _, _, ok := o.SessionMgr().LookupHistory("prev-token"); !ok || ownerKey != sid {
+		t.Fatalf("LookupHistory(prev-token) = (%q, ok=%v), want owner %q history", ownerKey, ok, sid)
+	}
 
 	d.mu.Lock()
 	d.owners[sid] = &OwnerEntry{
@@ -32,6 +38,9 @@ func TestReconnectRefreshPreservesOwner(t *testing.T) {
 	}
 	d.mu.Unlock()
 	waitOwnerAccepting(t, d, sid)
+	if !d.ownerIsAccepting(sid) {
+		t.Fatal("owner is not accepting before refresh")
+	}
 
 	initial.Close()
 	select {
@@ -46,6 +55,9 @@ func TestReconnectRefreshPreservesOwner(t *testing.T) {
 	}
 	if newToken == "" || newToken == "prev-token" {
 		t.Fatalf("newToken = %q, want distinct non-empty token", newToken)
+	}
+	if !o.SessionMgr().IsPreRegistered(newToken) {
+		t.Fatal("refreshed token is not pending for reconnect Bind")
 	}
 
 	reconnectedReader, reconnectedWriter := io.Pipe()
@@ -75,10 +87,16 @@ func TestReconnectRefreshPreservesOwner(t *testing.T) {
 	if entry == nil || entry.Owner != o {
 		t.Fatal("owner entry missing after reconnect refresh")
 	}
+	if !d.ownerIsAccepting(sid) {
+		t.Fatal("owner is not accepting after reconnect refresh")
+	}
 
 	status := d.HandleStatus()
 	if got := status["shim_reconnect_refreshed"]; got != uint64(1) {
 		t.Fatalf("shim_reconnect_refreshed = %v, want 1", got)
+	}
+	if got := status["shim_reconnect_fallback_spawned"]; got != uint64(0) {
+		t.Fatalf("shim_reconnect_fallback_spawned = %v, want 0", got)
 	}
 	if got := status["shim_reconnect_gave_up"]; got != uint64(0) {
 		t.Fatalf("shim_reconnect_gave_up = %v, want 0", got)

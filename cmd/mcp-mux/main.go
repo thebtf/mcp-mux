@@ -396,6 +396,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	if force {
 		drainMs = 0
 	}
+	daemonControlName := filepath.Base(serverid.DaemonControlPath(tmpDir, engineName))
 
 	// Track which server IDs we've already handled via control socket
 	handled := make(map[string]bool)
@@ -406,6 +407,9 @@ func runStop(drainTimeout time.Duration, force bool) {
 		if !strings.HasPrefix(name, ownSocketPrefix) || !strings.HasSuffix(name, ".ctl.sock") {
 			continue
 		}
+		if name == daemonControlName {
+			continue
+		}
 
 		path := filepath.Join(tmpDir, name)
 		id := strings.TrimPrefix(strings.TrimSuffix(name, ".ctl.sock"), ownSocketPrefix)
@@ -413,8 +417,6 @@ func runStop(drainTimeout time.Duration, force bool) {
 		if len(shortID) > 8 {
 			shortID = shortID[:8]
 		}
-
-		handled[id] = true
 
 		clientTimeout := drainTimeout + 5*time.Second
 		if force {
@@ -426,14 +428,21 @@ func runStop(drainTimeout time.Duration, force bool) {
 			DrainTimeoutMs: drainMs,
 		}, clientTimeout)
 		if err != nil {
+			dataPath := serverid.IPCPath(tmpDir, engineName, id)
+			if ipc.IsAvailable(dataPath) && !force {
+				handled[id] = true
+				fmt.Fprintf(os.Stderr, "  [%s] control unavailable but data socket is live; skipping stale cleanup and legacy fallback\n", shortID)
+				continue
+			}
 			_ = os.Remove(path)
-			dataPath := filepath.Join(tmpDir, fmt.Sprintf("%s%s.sock", ownSocketPrefix, id))
 			_ = os.Remove(dataPath)
+			handled[id] = true
 			stale++
 			fmt.Fprintf(os.Stderr, "  [%s] stale socket removed\n", shortID)
 			continue
 		}
 
+		handled[id] = true
 		if resp.OK {
 			fmt.Fprintf(os.Stderr, "  [%s] %s\n", shortID, resp.Message)
 			stopped++

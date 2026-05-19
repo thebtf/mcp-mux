@@ -301,6 +301,15 @@ func TestOwnerSnapshotOldRoundTrip(t *testing.T) {
 	if got.SpawnPgid != 0 {
 		t.Errorf("SpawnPgid = %d, want 0", got.SpawnPgid)
 	}
+	if got.OwnerGeneration != "" {
+		t.Errorf("OwnerGeneration = %q, want empty", got.OwnerGeneration)
+	}
+	if got.RestoredFromGeneration != "" {
+		t.Errorf("RestoredFromGeneration = %q, want empty", got.RestoredFromGeneration)
+	}
+	if got.RestoreSource != "" {
+		t.Errorf("RestoreSource = %q, want empty", got.RestoreSource)
+	}
 
 	// Re-marshal: omitempty must suppress zero-value new fields.
 	out, err := json.Marshal(got)
@@ -317,20 +326,32 @@ func TestOwnerSnapshotOldRoundTrip(t *testing.T) {
 	if strings.Contains(outStr, "spawn_pgid") {
 		t.Errorf("re-marshaled output must NOT contain spawn_pgid when zero, got: %s", outStr)
 	}
+	if strings.Contains(outStr, "owner_generation") {
+		t.Errorf("re-marshaled output must NOT contain owner_generation when empty, got: %s", outStr)
+	}
+	if strings.Contains(outStr, "restored_from_owner_generation") {
+		t.Errorf("re-marshaled output must NOT contain restored_from_owner_generation when empty, got: %s", outStr)
+	}
+	if strings.Contains(outStr, "restore_source") {
+		t.Errorf("re-marshaled output must NOT contain restore_source when empty, got: %s", outStr)
+	}
 }
 
 // TestOwnerSnapshotNewRoundTrip verifies that new handoff fields marshal and
 // unmarshal correctly when populated.
 func TestOwnerSnapshotNewRoundTrip(t *testing.T) {
 	original := snapshot.OwnerSnapshot{
-		ServerID:          "srv-002",
-		Command:           "aimux",
-		Cwd:               "/dev/aimux",
-		CwdSet:            []string{"/dev/aimux"},
-		Mode:              "shared",
-		UpstreamPID:       12345,
-		HandoffSocketPath: "/tmp/mcp-mux-handoff.sock",
-		SpawnPgid:         12345,
+		ServerID:               "srv-002",
+		Command:                "aimux",
+		Cwd:                    "/dev/aimux",
+		CwdSet:                 []string{"/dev/aimux"},
+		Mode:                   "shared",
+		OwnerGeneration:        "owner-gen-new",
+		RestoredFromGeneration: "owner-gen-old",
+		RestoreSource:          "snapshot_handoff",
+		UpstreamPID:            12345,
+		HandoffSocketPath:      "/tmp/mcp-mux-handoff.sock",
+		SpawnPgid:              12345,
 	}
 
 	out, err := json.Marshal(original)
@@ -349,6 +370,15 @@ func TestOwnerSnapshotNewRoundTrip(t *testing.T) {
 	if !strings.Contains(outStr, "spawn_pgid") {
 		t.Errorf("marshaled output must contain spawn_pgid, got: %s", outStr)
 	}
+	if !strings.Contains(outStr, "owner_generation") {
+		t.Errorf("marshaled output must contain owner_generation, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "restored_from_owner_generation") {
+		t.Errorf("marshaled output must contain restored_from_owner_generation, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "restore_source") {
+		t.Errorf("marshaled output must contain restore_source, got: %s", outStr)
+	}
 
 	// Round-trip: unmarshal back and verify all three fields match.
 	var got snapshot.OwnerSnapshot
@@ -363,5 +393,61 @@ func TestOwnerSnapshotNewRoundTrip(t *testing.T) {
 	}
 	if got.SpawnPgid != 12345 {
 		t.Errorf("SpawnPgid = %d, want 12345", got.SpawnPgid)
+	}
+	if got.OwnerGeneration != "owner-gen-new" {
+		t.Errorf("OwnerGeneration = %q, want owner-gen-new", got.OwnerGeneration)
+	}
+	if got.RestoredFromGeneration != "owner-gen-old" {
+		t.Errorf("RestoredFromGeneration = %q, want owner-gen-old", got.RestoredFromGeneration)
+	}
+	if got.RestoreSource != "snapshot_handoff" {
+		t.Errorf("RestoreSource = %q, want snapshot_handoff", got.RestoreSource)
+	}
+}
+
+func TestDaemonSnapshotGenerationRoundTrip(t *testing.T) {
+	original := snapshot.DaemonSnapshot{
+		Version:          snapshot.SnapshotVersion,
+		MuxVersion:       "test",
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+		DaemonGeneration: "daemon-gen-old",
+		PredecessorPID:   4242,
+		Owners:           []snapshot.OwnerSnapshot{},
+		Sessions:         []snapshot.SessionSnapshot{},
+	}
+
+	raw, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	outStr := string(raw)
+	if !strings.Contains(outStr, "daemon_generation") {
+		t.Errorf("marshaled output must contain daemon_generation, got: %s", outStr)
+	}
+	if !strings.Contains(outStr, "predecessor_pid") {
+		t.Errorf("marshaled output must contain predecessor_pid, got: %s", outStr)
+	}
+
+	var got snapshot.DaemonSnapshot
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.DaemonGeneration != "daemon-gen-old" {
+		t.Errorf("DaemonGeneration = %q, want daemon-gen-old", got.DaemonGeneration)
+	}
+	if got.PredecessorPID != 4242 {
+		t.Errorf("PredecessorPID = %d, want 4242", got.PredecessorPID)
+	}
+
+	oldJSON := []byte(`{"version":1,"mux_version":"old","timestamp":"` + time.Now().UTC().Format(time.RFC3339) + `","owners":[],"sessions":[]}`)
+	var old snapshot.DaemonSnapshot
+	if err := json.Unmarshal(oldJSON, &old); err != nil {
+		t.Fatalf("Unmarshal old daemon snapshot: %v", err)
+	}
+	if old.DaemonGeneration != "" {
+		t.Errorf("old DaemonGeneration = %q, want empty", old.DaemonGeneration)
+	}
+	if old.PredecessorPID != 0 {
+		t.Errorf("old PredecessorPID = %d, want 0", old.PredecessorPID)
 	}
 }

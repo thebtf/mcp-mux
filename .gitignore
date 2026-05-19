@@ -9,7 +9,6 @@ coverage.out
 coverage.html
 .gomodcache/
 .agent/*
-!.agent/specs
 !.agent/arch
 .mcp.json
 .mcp.json.bak

@@ -85,6 +85,91 @@ func TestPreRegisterBind(t *testing.T) {
 	}
 }
 
+func TestPreRegisterForOwnerAndRemovePendingForOwner(t *testing.T) {
+	sm := NewManager()
+
+	sm.PreRegisterForOwner("owned-a", "owner-a", "/project/a", map[string]string{"A": "1"})
+	sm.PreRegisterForOwner("owned-b", "owner-b", "/project/b", nil)
+	sm.PreRegister("legacy", "/project/legacy", nil)
+
+	if removed := sm.RemovePendingForOwner("owner-a"); removed != 1 {
+		t.Fatalf("RemovePendingForOwner(owner-a) = %d, want 1", removed)
+	}
+	if sm.IsPreRegistered("owned-a") {
+		t.Fatal("owned-a pending token still present after owner cleanup")
+	}
+	if !sm.IsPreRegistered("owned-b") {
+		t.Fatal("owned-b pending token was removed by the wrong owner cleanup")
+	}
+	if !sm.IsPreRegistered("legacy") {
+		t.Fatal("legacy owner-keyless pending token must remain TTL-only")
+	}
+
+	s := &Session{ID: 100}
+	sm.RegisterSession(s, "")
+	if ok := sm.Bind("owned-b", "owner-b", s); !ok {
+		t.Fatal("Bind returned false for remaining owner-b token")
+	}
+	if s.Cwd != "/project/b" {
+		t.Fatalf("session.Cwd = %q, want /project/b", s.Cwd)
+	}
+}
+
+func TestBindRejectsWrongOwnerWithoutConsumingToken(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("owned-token", "owner-a", "/project/a", map[string]string{"A": "1"})
+
+	wrong := &Session{ID: 101}
+	sm.RegisterSession(wrong, "")
+	if ok := sm.Bind("owned-token", "owner-b", wrong); ok {
+		t.Fatal("Bind returned true for a token owned by another owner")
+	}
+	if !sm.IsPreRegistered("owned-token") {
+		t.Fatal("wrong-owner Bind consumed the pending token")
+	}
+
+	right := &Session{ID: 102}
+	sm.RegisterSession(right, "")
+	if ok := sm.Bind("owned-token", "owner-a", right); !ok {
+		t.Fatal("Bind returned false for the rightful owner")
+	}
+	hist, ok := sm.bound["owned-token"]
+	if !ok {
+		t.Fatal("bound history missing after rightful Bind")
+	}
+	if hist.OwnerKey != "owner-a" {
+		t.Fatalf("bound owner key = %q, want owner-a", hist.OwnerKey)
+	}
+}
+
+func TestRemoveBoundForOwner(t *testing.T) {
+	sm := NewManager()
+	seedBoundHistory(t, sm, "tok-a", "owner-a")
+	seedBoundHistory(t, sm, "tok-b", "owner-b")
+
+	if removed := sm.RemoveBoundForOwner("owner-a"); removed != 1 {
+		t.Fatalf("RemoveBoundForOwner(owner-a) = %d, want 1", removed)
+	}
+	if _, err := sm.RegisterReconnect("tok-a", func(string) bool { return true }); !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("RegisterReconnect(tok-a) error = %v, want ErrUnknownToken", err)
+	}
+	if _, err := sm.RegisterReconnect("tok-b", func(string) bool { return true }); err != nil {
+		t.Fatalf("RegisterReconnect(tok-b) error = %v, want retained owner-b history", err)
+	}
+}
+
+func TestRemovePendingForOwnerIgnoresEmptyOwnerKey(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegister("legacy", "/project/legacy", nil)
+
+	if removed := sm.RemovePendingForOwner(""); removed != 0 {
+		t.Fatalf("RemovePendingForOwner(empty) = %d, want 0", removed)
+	}
+	if !sm.IsPreRegistered("legacy") {
+		t.Fatal("legacy owner-keyless pending token must remain TTL-only")
+	}
+}
+
 func TestIsPreRegistered(t *testing.T) {
 	sm := NewManager()
 
@@ -255,6 +340,16 @@ func TestRegisterReconnect_NewTokenFresh(t *testing.T) {
 	}
 	if s2.Env["X"] != "1" {
 		t.Fatalf("session Env[X] = %q, want %q", s2.Env["X"], "1")
+	}
+}
+
+func seedBoundHistory(t *testing.T, sm *Manager, token, ownerKey string) {
+	t.Helper()
+	s := &Session{ID: len(token)}
+	sm.RegisterSession(s, "")
+	sm.PreRegisterForOwner(token, ownerKey, "/project/"+ownerKey, nil)
+	if ok := sm.Bind(token, ownerKey, s); !ok {
+		t.Fatalf("Bind(%q) returned false", token)
 	}
 }
 

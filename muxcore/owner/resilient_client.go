@@ -408,18 +408,22 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 		case <-ipcEOF:
 			return
 		case data := <-rc.msgFromCC:
-			// Track request IDs (messages with "id" field that are not responses)
-			if id := extractRequestID(data); id != "" {
-				rc.inflight.Store(id, true)
-				rc.log.Printf("resilient: forwarding request id=%s (%d bytes) to IPC", id, len(data))
-			}
-			_, err := fmt.Fprintf(conn, "%s\n", data)
-			if err != nil {
+			if err := rc.forwardToIPC(conn, data); err != nil {
 				rc.log.Printf("resilient: ipc write error: %v", err)
 				return
 			}
 		}
 	}
+}
+
+func (rc *resilientClient) forwardToIPC(conn io.Writer, data []byte) error {
+	// Track request IDs (messages with "id" field that are not responses).
+	if id := extractRequestID(data); id != "" {
+		rc.inflight.Store(id, true)
+		rc.log.Printf("resilient: forwarding request id=%s (%d bytes) to IPC", id, len(data))
+	}
+	_, err := fmt.Fprintf(conn, "%s\n", data)
+	return err
 }
 
 // reconnectResult carries the result of an async Reconnect() attempt.
@@ -726,8 +730,7 @@ func (rc *resilientClient) flushBuffer(conn io.Writer) {
 	for {
 		select {
 		case data := <-rc.msgFromCC:
-			_, err := fmt.Fprintf(conn, "%s\n", data)
-			if err != nil {
+			if err := rc.forwardToIPC(conn, data); err != nil {
 				rc.log.Printf("resilient: flush write error: %v", err)
 				return
 			}

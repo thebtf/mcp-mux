@@ -17,6 +17,7 @@ type Context struct {
 
 // pendingSession holds pre-registered session data waiting for a shim to connect.
 type pendingSession struct {
+	OwnerKey  string
 	Cwd       string
 	Env       map[string]string
 	CreatedAt time.Time // for TTL expiry — orphan tokens are swept if shim never connects
@@ -99,13 +100,39 @@ func (sm *Manager) RemoveSession(sessionID int) {
 // Pending entries have a TTL (pendingTokenTTL) — orphan tokens from failed
 // spawns are swept by SweepExpiredPending to prevent unbounded growth.
 func (sm *Manager) PreRegister(token, cwd string, env map[string]string) {
+	sm.PreRegisterForOwner(token, "", cwd, env)
+}
+
+// PreRegisterForOwner stores a token→(owner,cwd,env) mapping before the shim connects.
+// ownerKey is optional for legacy callers; owner-keyless pending tokens are
+// cleaned only by TTL expiry, not by owner removal.
+func (sm *Manager) PreRegisterForOwner(token, ownerKey, cwd string, env map[string]string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.pending[token] = &pendingSession{
+		OwnerKey:  ownerKey,
 		Cwd:       cwd,
 		Env:       cloneEnv(env),
 		CreatedAt: time.Now(),
 	}
+}
+
+// RemovePendingForOwner removes pending tokens associated with ownerKey.
+// Owner-keyless legacy pending tokens are intentionally TTL-only.
+func (sm *Manager) RemovePendingForOwner(ownerKey string) int {
+	if ownerKey == "" {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	removed := 0
+	for token, ps := range sm.pending {
+		if ps.OwnerKey == ownerKey {
+			delete(sm.pending, token)
+			removed++
+		}
+	}
+	return removed
 }
 
 // IsPreRegistered reports whether the given token has been pre-registered but
@@ -158,6 +185,23 @@ func (sm *Manager) SweepExpiredBound() int {
 	return swept
 }
 
+// RemoveBoundForOwner removes consumed-token reconnect history associated with ownerKey.
+func (sm *Manager) RemoveBoundForOwner(ownerKey string) int {
+	if ownerKey == "" {
+		return 0
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	removed := 0
+	for token, hist := range sm.bound {
+		if hist.OwnerKey == ownerKey {
+			delete(sm.bound, token)
+			removed++
+		}
+	}
+	return removed
+}
+
 // PendingCount returns the number of pending (pre-registered but not yet bound) tokens.
 // Exposed for observability (mux_list --verbose).
 func (sm *Manager) PendingCount() int {
@@ -177,12 +221,19 @@ func (sm *Manager) Bind(token, ownerKey string, session *Session) bool {
 	if !ok {
 		return false
 	}
+	if ps.OwnerKey != "" && ps.OwnerKey != ownerKey {
+		return false
+	}
 	delete(sm.pending, token)
 
 	now := time.Now()
 	env := cloneEnv(ps.Env)
+	historyOwnerKey := ps.OwnerKey
+	if historyOwnerKey == "" {
+		historyOwnerKey = ownerKey
+	}
 	sm.bound[token] = &boundHistory{
-		OwnerKey: ownerKey,
+		OwnerKey: historyOwnerKey,
 		Cwd:      ps.Cwd,
 		Env:      env,
 		BoundAt:  now,
@@ -254,6 +305,7 @@ func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bo
 	now := time.Now()
 	hist.LastUsed = now
 	sm.pending[token] = &pendingSession{
+		OwnerKey:  ownerKey,
 		Cwd:       cwd,
 		Env:       cloneEnv(env),
 		CreatedAt: now,

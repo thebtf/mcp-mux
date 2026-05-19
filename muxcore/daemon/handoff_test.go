@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 )
 
 // mockFDConn implements fdConn using in-memory channels for unit testing.
 // Two instances are wired as a connected pair via newMockFDConnPair.
 type mockFDConn struct {
-	writeCh  chan []byte   // JSON messages written by this conn arrive here
-	readCh   chan []byte   // JSON messages read by this conn come from here
+	writeCh  chan []byte    // JSON messages written by this conn arrive here
+	readCh   chan []byte    // JSON messages read by this conn come from here
 	sendFdCh chan []uintptr // FDs sent by this conn arrive here
 	recvFdCh chan []uintptr // FDs received by this conn come from here
 }
@@ -159,5 +160,36 @@ func TestHandoffTokenReject(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTokenMismatch) {
 		t.Errorf("expected ErrTokenMismatch, got: %v", err)
+	}
+}
+
+func TestRetireOldOwnerSocketsRemovesPathsAndCounts(t *testing.T) {
+	dir := t.TempDir()
+	ipc, err := os.CreateTemp(dir, "owner-*.sock")
+	if err != nil {
+		t.Fatalf("CreateTemp ipc: %v", err)
+	}
+	if err := ipc.Close(); err != nil {
+		t.Fatalf("Close ipc: %v", err)
+	}
+	control, err := os.CreateTemp(dir, "owner-*.ctl.sock")
+	if err != nil {
+		t.Fatalf("CreateTemp control: %v", err)
+	}
+	if err := control.Close(); err != nil {
+		t.Fatalf("Close control: %v", err)
+	}
+
+	d := &Daemon{}
+	if !d.retireOldOwnerSockets(ipc.Name(), control.Name()) {
+		t.Fatal("retireOldOwnerSockets returned false, want true")
+	}
+	if got := d.oldOwnerSocketRetiredCount.Load(); got != 1 {
+		t.Fatalf("oldOwnerSocketRetiredCount = %d, want 1", got)
+	}
+	for _, path := range []string{ipc.Name(), control.Name()} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("old owner socket path %s still reachable: %v", path, err)
+		}
 	}
 }

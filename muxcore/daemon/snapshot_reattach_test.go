@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -44,6 +45,7 @@ func testDaemonWithLog(t *testing.T) (*Daemon, *syncBuffer) {
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	logger := log.New(buf, "[daemon-test] ", log.LstdFlags)
 	d, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -277,7 +279,7 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 func TestLoadSnapshot_SessionHandlerRestoreDoesNotSpawnCommand(t *testing.T) {
 	os.Remove(SnapshotPath())
 
-	sid := "b86e71a0093a84a9-sessionhandler-snapshot"
+	sid := "b86e71a0093a84a9"
 	snapshot := DaemonSnapshot{
 		Version:   mcpsnapshot.SnapshotVersion,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -306,6 +308,7 @@ func TestLoadSnapshot_SessionHandlerRestoreDoesNotSpawnCommand(t *testing.T) {
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	logger := log.New(buf, "[daemon-test] ", log.LstdFlags)
 	d, err := New(Config{
+		Name:           "test-daemon",
 		ControlPath:    ctlPath,
 		GracePeriod:    1 * time.Second,
 		IdleTimeout:    5 * time.Second,
@@ -337,6 +340,57 @@ func TestLoadSnapshot_SessionHandlerRestoreDoesNotSpawnCommand(t *testing.T) {
 	logs := buf.String()
 	if strings.Contains(logs, "background upstream spawn failed") {
 		t.Fatalf("snapshot restore attempted snapshotted command for SessionHandler owner:\n%s", logs)
+	}
+}
+
+func TestLoadSnapshot_ShutsDownRestoredOwnerWhenGenerationFails(t *testing.T) {
+	os.Remove(SnapshotPath())
+
+	sid := "b86e71a0093a84aa"
+	snapshot := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{
+			{
+				ServerID:       sid,
+				Command:        "echo",
+				Args:           []string{"restore-failed"},
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeShared,
+				CachedInit:     "e30=",
+				CachedTools:    "e30=",
+			},
+		},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+	defer os.Remove(SnapshotPath())
+
+	d, logBuf := testDaemonWithLog(t)
+	t.Cleanup(func() { d.Shutdown() })
+
+	oldGenerateToken := generateTokenFunc
+	generateTokenFunc = func() (string, error) {
+		return "", errors.New("test generation failure")
+	}
+	t.Cleanup(func() { generateTokenFunc = oldGenerateToken })
+
+	if restored := d.loadSnapshot(); restored != 0 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 0", restored)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "snapshot: failed to generate owner generation") {
+		t.Fatalf("missing generation failure log:\n%s", logs)
+	}
+	if !strings.Contains(logs, "owner shut down") {
+		t.Fatalf("restored owner was not shut down after generation failure:\n%s", logs)
 	}
 }
 

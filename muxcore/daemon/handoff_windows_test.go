@@ -5,7 +5,9 @@ package daemon
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -177,30 +179,24 @@ func TestWindowsFDConn_SendRecvHandles(t *testing.T) {
 // when SetTargetPID has not been called. Covers the guard path that prevents
 // a nil-PID DuplicateHandle call from producing an invalid handle.
 func TestWindowsFDConn_SendFDs_NoTargetPID(t *testing.T) {
-	name := randomPipeName(t)
-	ln, err := listenHandoffPipe(name)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		c, _ := ln.Accept()
-		if c != nil {
-			time.Sleep(50 * time.Millisecond)
-			_ = c.Close()
-		}
-	}()
-
-	conn, err := dialHandoffPipe(name, 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	conn, peer := net.Pipe()
+	defer peer.Close()
 	cli := newWindowsFDConn(conn)
 	defer cli.Close()
+	tmp, err := os.CreateTemp("", "handoff-no-target-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
 	// targetPID is zero (SetTargetPID not called) — must return error immediately.
-	err = cli.SendFDs([]uintptr{0}, []byte("h"))
+	err = cli.SendFDs([]uintptr{tmp.Fd()}, []byte("h"))
 	if err == nil {
 		t.Fatal("expected error when targetPID not set")
+	}
+	if !strings.Contains(err.Error(), "targetPID not set") {
+		t.Fatalf("error = %v, want targetPID guard", err)
 	}
 }
 

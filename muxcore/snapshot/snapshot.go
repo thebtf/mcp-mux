@@ -32,6 +32,9 @@ type OwnerSnapshot struct {
 	Classification          classify.SharingMode `json:"classification,omitempty"`
 	ClassificationSource    string               `json:"classification_source,omitempty"`
 	ClassificationReason    []string             `json:"classification_reason,omitempty"`
+	OwnerGeneration         string               `json:"owner_generation,omitempty"`
+	RestoredFromGeneration  string               `json:"restored_from_owner_generation,omitempty"`
+	RestoreSource           string               `json:"restore_source,omitempty"`
 	Persistent              bool                 `json:"persistent,omitempty"`
 	CachedInit              string               `json:"cached_init,omitempty"`
 	CachedTools             string               `json:"cached_tools,omitempty"`
@@ -55,11 +58,13 @@ type SessionSnapshot struct {
 
 // DaemonSnapshot captures the full daemon state for graceful restart.
 type DaemonSnapshot struct {
-	Version    int               `json:"version"`
-	MuxVersion string            `json:"mux_version"`
-	Timestamp  string            `json:"timestamp"`
-	Owners     []OwnerSnapshot   `json:"owners"`
-	Sessions   []SessionSnapshot `json:"sessions"`
+	Version          int               `json:"version"`
+	MuxVersion       string            `json:"mux_version"`
+	Timestamp        string            `json:"timestamp"`
+	DaemonGeneration string            `json:"daemon_generation,omitempty"`
+	PredecessorPID   int               `json:"predecessor_pid,omitempty"`
+	Owners           []OwnerSnapshot   `json:"owners"`
+	Sessions         []SessionSnapshot `json:"sessions"`
 }
 
 // SnapshotPath returns the well-known path for the daemon state snapshot file.

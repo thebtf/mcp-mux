@@ -892,6 +892,51 @@ func TestResilientClient_DrainOrphanedInflight_NoErrorsOnSuccess(t *testing.T) {
 	}
 }
 
+func TestResilientClient_FlushBufferTracksRequestsForDrain(t *testing.T) {
+	rc := &resilientClient{
+		msgFromCC: make(chan []byte, 3),
+		cfg: ResilientClientConfig{
+			Stdout: io.Discard,
+		},
+		log:        log.New(io.Discard, "", 0),
+		stdoutDead: make(chan struct{}),
+	}
+
+	rc.msgFromCC <- []byte(`{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"slow"}}`)
+	rc.msgFromCC <- []byte(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`)
+	rc.msgFromCC <- []byte(`{"jsonrpc":"2.0","id":"req-78","method":"tools/list","params":{}}`)
+
+	var ipcOut strings.Builder
+	rc.flushBuffer(&ipcOut)
+
+	if _, ok := rc.inflight.Load("77"); !ok {
+		t.Fatal("numeric request flushed during reconnect was not tracked as inflight")
+	}
+	if _, ok := rc.inflight.Load(`"req-78"`); !ok {
+		t.Fatal("string request flushed during reconnect was not tracked as inflight")
+	}
+	tracked := 0
+	rc.inflight.Range(func(_, _ any) bool { tracked++; return true })
+	if tracked != 2 {
+		t.Fatalf("tracked inflight entries after flush = %d, want 2", tracked)
+	}
+
+	var stdout strings.Builder
+	rc.cfg.Stdout = &stdout
+	var stdoutMu sync.Mutex
+	rc.drainOrphanedInflight(&stdoutMu)
+
+	out := stdout.String()
+	if !strings.Contains(out, `"id":77`) || !strings.Contains(out, `"id":"req-78"`) {
+		t.Fatalf("flushed tracked requests were not drainable by ID, stdout=%q", out)
+	}
+	remaining := 0
+	rc.inflight.Range(func(_, _ any) bool { remaining++; return true })
+	if remaining != 0 {
+		t.Fatalf("inflight entries remain after drain: %d", remaining)
+	}
+}
+
 // TestResilientClient_DrainOrphanedInflight_FailAfterSuccess verifies that a
 // mid-iteration write failure triggers the fast-skip correctly: earlier writes
 // in the same drain cycle that succeeded remain observable on stdout, while

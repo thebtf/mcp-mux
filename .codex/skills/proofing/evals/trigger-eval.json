@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "skill_name": "proofing",
+  "cluster": "debugging",
+  "competing_skills": ["debug", "investigate", "nvmd-architect", "production-ready-check"],
+  "cases": [
+    {
+      "id": "proofing-positive-001",
+      "prompt": "Build a phased PoC to prove whether this shim-daemon topology can survive restarts before we refactor production code.",
+      "expected_skill": "proofing",
+      "should_trigger": true,
+      "near_miss": false,
+      "near_miss_reason": "",
+      "required_resources": ["codebase", "test-output"],
+      "notes": "Architecture claim needs experimental proof, phase ladder, and refactor evidence."
+    },
+    {
+      "id": "proofing-positive-002",
+      "prompt": "Continue the proofing ladder until the global goal is reached, generate criteria for every phase, and produce an ADR at the end.",
+      "expected_skill": "proofing",
+      "should_trigger": true,
+      "near_miss": false,
+      "near_miss_reason": "",
+      "required_resources": ["codebase"],
+      "notes": "Explicit proofing, phase criteria, global goal, and ADR request."
+    },
+    {
+      "id": "proofing-near-001",
+      "prompt": "A unit test fails after this change; find the bug and fix it.",
+      "expected_skill": "debug",
+      "should_trigger": false,
+      "near_miss": true,
+      "near_miss_reason": "First-pass concrete failure triage belongs to debug; no architecture proof substrate is requested.",
+      "required_resources": ["codebase", "test-output"],
+      "notes": "Direct bug fix, not proofing."
+    },
+    {
+      "id": "proofing-near-002",
+      "prompt": "We already tried two fixes and the failure keeps coming back; trace the real root cause.",
+      "expected_skill": "investigate",
+      "should_trigger": false,
+      "near_miss": true,
+      "near_miss_reason": "Repeated failure and root-cause tracing belongs to investigate until the next action is an experimental architecture proof.",
+      "required_resources": ["codebase", "logs"],
+      "notes": "Root-cause investigation may later hand off to proofing."
+    },
+    {
+      "id": "proofing-near-003",
+      "prompt": "Check whether the project is production ready and list the release blockers.",
+      "expected_skill": "production-ready-check",
+      "should_trigger": false,
+      "near_miss": true,
+      "near_miss_reason": "Release readiness audit belongs to production-ready-check; proofing is for disputed architecture/runtime claims.",
+      "required_resources": ["codebase", "ci"],
+      "notes": "Readiness verdict, not experimental proof."
+    }
+  ]
+}

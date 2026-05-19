@@ -53,15 +53,18 @@ const maxSpawnRetries = 3
 // created by another goroutine. Waiters must read creating under d.mu, then
 // release d.mu, block on <-creating, re-acquire d.mu, and re-check Owner.
 type OwnerEntry struct {
-	Owner       *owner.Owner
-	ServerID    string
-	Command     string
-	Args        []string
-	Cwd         string
-	Mode        string
-	Env         map[string]string
-	Persistent  bool
-	LastSession time.Time
+	Owner                       *owner.Owner
+	ServerID                    string
+	Command                     string
+	Args                        []string
+	Cwd                         string
+	Mode                        string
+	Env                         map[string]string
+	Persistent                  bool
+	LastSession                 time.Time
+	OwnerGeneration             string
+	RestoredFromOwnerGeneration string
+	RestoreSource               string
 	// IdleTimeout is the effective idle timeout for this owner (daemon
 	// default or per-owner x-mux.idleTimeout override). The reaper uses
 	// this to decide whether an idle owner is eligible for removal.
@@ -122,8 +125,11 @@ type Daemon struct {
 
 	// name is the engine instance name from Config.Name (e.g. "mcp-mux", "aimux").
 	// Used to scope IPC socket file paths and stale-socket cleanup to this engine.
-	name       string
-	persistent bool
+	name                        string
+	persistent                  bool
+	daemonGeneration            string
+	predecessorPID              int
+	predecessorDaemonGeneration string
 
 	// authorizeSession is forwarded from Config.AuthorizeSession to every
 	// Owner created by this daemon. nil = no gate (pre-v0.24 behaviour).
@@ -151,9 +157,12 @@ type Daemon struct {
 	// stats holds atomic handoff counters exposed via HandleStatus (NFR-4 / T025).
 	stats handoffStats
 
-	reconnectRefreshed       atomic.Uint64
-	reconnectFallbackSpawned atomic.Uint64
-	reconnectGaveUp          atomic.Uint64
+	reconnectRefreshed         atomic.Uint64
+	reconnectFallbackSpawned   atomic.Uint64
+	reconnectGaveUp            atomic.Uint64
+	restoredOwnerCount         atomic.Uint64
+	oldOwnerSocketRetiredCount atomic.Uint64
+	ownerRemoval               ownerRemovalStats
 }
 
 // handoffStats holds atomic counters for handoff lifecycle observability.
@@ -218,8 +227,8 @@ type Config struct {
 
 	// Name is the engine instance name (e.g. "mcp-mux", "aimux", "engram").
 	// Used to scope IPC socket file names and stale-socket cleanup to this
-	// engine only. Empty string is valid (library is pure); callers that want
-	// FS isolation across multiple engine types must set this.
+	// engine only. Empty string defaults to "mcp-mux" for backward compatibility;
+	// callers that want FS isolation across multiple engine types must set this.
 	Name string
 
 	// Persistent overrides per-owner Persistent detection. When true, all owners
@@ -245,6 +254,11 @@ var _ control.DaemonHandler = (*Daemon)(nil)
 
 // New creates and starts a new Daemon with a control server.
 func New(cfg Config) (*Daemon, error) {
+	name := strings.TrimSpace(cfg.Name)
+	if name == "" {
+		name = "mcp-mux"
+	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
@@ -269,6 +283,11 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	supCtx, supCancel := context.WithCancel(context.Background())
+	daemonGeneration, err := generateGeneration("daemon")
+	if err != nil {
+		supCancel()
+		return nil, err
+	}
 	d := &Daemon{
 		owners:           make(map[string]*OwnerEntry),
 		logger:           logger,
@@ -282,10 +301,12 @@ func New(cfg Config) (*Daemon, error) {
 		handlerFunc:      cfg.HandlerFunc,
 		sessionHandler:   cfg.SessionHandler,
 		daemonFlag:       daemonFlag,
-		name:             cfg.Name,
+		name:             name,
 		persistent:       cfg.Persistent,
+		daemonGeneration: daemonGeneration,
 		authorizeSession: cfg.AuthorizeSession,
 		onFrameReceived:  cfg.OnFrameReceived,
+		ownerRemoval:     newOwnerRemovalStats(),
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -497,11 +518,7 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	// delete would evict the fresh entry, leaving the server unreachable
 	// until the next spawn attempt. Only delete if the current map entry is
 	// still the same pointer we observed at the start of cleanup.
-	d.mu.Lock()
-	if current, ok := d.owners[sid]; ok && current == entry {
-		delete(d.owners, sid)
-	}
-	d.mu.Unlock()
+	d.forgetOwnerIfCurrent(sid, entry, ownerRemovalReasonZombie)
 }
 
 // cleanStaleSocketsDir overrides the directory scanned by cleanStaleSockets.
@@ -565,6 +582,19 @@ func generateToken() (string, error) {
 		return "", fmt.Errorf("generateToken: crypto/rand unavailable: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+var generateTokenFunc = generateToken
+
+func generateGeneration(prefix string) (string, error) {
+	token, err := generateTokenFunc()
+	if err != nil {
+		return "", err
+	}
+	if len(token) > 12 {
+		token = token[:12]
+	}
+	return prefix + "_" + token, nil
 }
 
 // Spawn creates or returns an existing owner for the given server identity.
@@ -680,7 +710,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
 				e.LastSession = time.Now()
 				d.mu.Unlock()
-				e.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+				e.Owner.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, req.Env)
 				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
@@ -720,7 +750,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				}
 				current.LastSession = time.Now()
 				d.mu.Unlock()
-				probeOwner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+				probeOwner.SessionMgr().PreRegisterForOwner(token, probeSID, req.Cwd, req.Env)
 				// Note: no log here — this path is the hot path (every CC
 				// session reconnect). Logging each reuse produced 500+
 				// lines/minute during multi-session incidents.
@@ -747,9 +777,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				"zombie-listener detected: path=spawn server=%s ipc=%q cmd=%q action=tear-down-and-respawn",
 				shortSID, probeOwner.IPCPath(), current.Command,
 			)
-			delete(d.owners, probeSID)
 			d.mu.Unlock()
-			probeOwner.Shutdown()
+			if _, err := d.removeOwnerIfCurrent(probeSID, current, ownerRemovalReasonZombie, false); err != nil {
+				d.logger.Printf("zombie-listener cleanup failed for %s: %v", shortServerID(probeSID), err)
+			}
 			// Retry from the top so placeholder/dedup paths see the cleared slot.
 			return "", "", "", errSpawnRetry
 		}
@@ -770,9 +801,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			reqPtr.Mode = "isolated"
 			return "", "", "", errSpawnRetry
 		}
-		entry.Owner.Shutdown()
-		delete(d.owners, sid)
-		d.logger.Printf("owner %s not accepting (isolated, 0 sessions), re-spawning", sid[:8])
+		d.mu.Unlock()
+		if _, err := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonZombie, false); err != nil {
+			d.logger.Printf("owner %s not accepting cleanup failed: %v", shortServerID(sid), err)
+		}
+		d.logger.Printf("owner %s not accepting (isolated, 0 sessions), re-spawning", shortServerID(sid))
+		return "", "", "", errSpawnRetry
 	}
 
 	// 2. Global dedup: if an accepting owner for same command+args exists (any cwd), reuse it.
@@ -790,7 +824,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				// Dedup hot path is silent — logging every reuse produced 500+ lines/minute.
 				existing.Owner.AddCwd(req.Cwd)
 			}
-			existing.Owner.SessionMgr().PreRegister(token, req.Cwd, req.Env)
+			existing.Owner.SessionMgr().PreRegisterForOwner(token, existingSID, req.Cwd, req.Env)
 			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
 	}
@@ -798,12 +832,19 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// Reserve the slot with a placeholder before releasing d.mu.
 	// Any concurrent goroutine that arrives for the same sid will wait on the
 	// creating channel instead of racing to spawn a duplicate owner.
+	ownerGeneration, err := generateGeneration("owner")
+	if err != nil {
+		d.mu.Unlock()
+		return "", "", "", err
+	}
 	placeholder := &OwnerEntry{
-		ServerID: sid,
-		Command:  req.Command,
-		Args:     req.Args,
-		Cwd:      req.Cwd,
-		creating: make(chan struct{}),
+		ServerID:        sid,
+		Command:         req.Command,
+		Args:            req.Args,
+		Cwd:             req.Cwd,
+		OwnerGeneration: ownerGeneration,
+		RestoreSource:   "fresh",
+		creating:        make(chan struct{}),
 	}
 	d.owners[sid] = placeholder
 	d.mu.Unlock()
@@ -835,13 +876,13 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// Build the shared owner config (used by both template and fresh paths).
 	controlPath := serverid.ControlPath("", d.name, sid)
 	ownerCfg := owner.OwnerConfig{
-		Command:        req.Command,
-		Args:           req.Args,
-		Env:            sessionEnv,
-		Cwd:            req.Cwd,
-		IPCPath:        ipcPath,
-		ControlPath:    controlPath,
-		ServerID:       sid,
+		Command:          req.Command,
+		Args:             req.Args,
+		Env:              sessionEnv,
+		Cwd:              req.Cwd,
+		IPCPath:          ipcPath,
+		ControlPath:      controlPath,
+		ServerID:         sid,
 		TokenHandshake:   true, // daemon-managed owners: shims send a handshake token
 		HandlerFunc:      d.handlerFunc,
 		SessionHandler:   d.sessionHandler,
@@ -900,7 +941,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			// Remove the placeholder and unblock any waiters.
 			d.mu.Lock()
 			if d.owners[sid] == placeholder {
-				delete(d.owners, sid)
+				d.deleteOwnerEntryLocked(sid)
 			}
 			close(placeholder.creating)
 			d.mu.Unlock()
@@ -944,42 +985,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
-	o.SessionMgr().PreRegister(token, req.Cwd, sessionEnv)
+	o.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, sessionEnv)
 	return ipcPath, sid, token, nil
 }
 
 // Remove shuts down and removes an owner by server ID.
 func (d *Daemon) Remove(serverID string) error {
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	if !ok {
-		d.mu.Unlock()
-		return fmt.Errorf("server %s not found", serverID)
-	}
-	if entry.Owner == nil {
-		// Placeholder still being created — do not remove; caller should retry later.
-		d.mu.Unlock()
-		return fmt.Errorf("server %s is still being created", serverID)
-	}
-	delete(d.owners, serverID)
-	token := entry.serviceToken
-	d.mu.Unlock()
-
-	// Remove from supervisor BEFORE Shutdown to prevent suture from
-	// interpreting the shutdown as a failure and attempting restart.
-	// Use RemoveAndWait with a short timeout to avoid blocking forever
-	// if the service is stuck. We report the error to the caller but
-	// still proceed with Owner.Shutdown to avoid leaking resources.
-	var supErr error
-	if d.supervisor != nil {
-		if err := d.supervisor.RemoveAndWait(token, 2*time.Second); err != nil {
-			supErr = fmt.Errorf("remove owner %s from supervisor: %w", serverID[:8], err)
-			d.logger.Printf("warning: %v", supErr)
-		}
-	}
-	entry.Owner.Shutdown()
-	d.logger.Printf("removed owner %s", serverID[:8])
-	return supErr
+	_, err := d.removeOwner(serverID, ownerRemovalReasonOperatorHard, false)
+	return err
 }
 
 // SoftRemove performs a graceful shutdown of the named owner, giving the upstream
@@ -988,45 +1001,8 @@ func (d *Daemon) Remove(serverID string) error {
 // Use Remove (hard kill) for operator-requested restarts; use SoftRemove for idle
 // eviction so upstreams can flush caches, close files, and exit with code 0 (US3).
 func (d *Daemon) SoftRemove(serverID string) error {
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	if !ok {
-		d.mu.Unlock()
-		return fmt.Errorf("server %s not found", serverID)
-	}
-	if entry.Owner == nil {
-		// Placeholder still being created — do not remove.
-		d.mu.Unlock()
-		return fmt.Errorf("server %s is still being created", serverID)
-	}
-	delete(d.owners, serverID)
-	token := entry.serviceToken
-	d.mu.Unlock()
-
-	// Remove from supervisor BEFORE SoftShutdown to prevent suture from
-	// interpreting the shutdown as a failure and attempting restart.
-	var supErr error
-	if d.supervisor != nil {
-		if err := d.supervisor.RemoveAndWait(token, 2*time.Second); err != nil {
-			supErr = fmt.Errorf("soft-remove owner %s from supervisor: %w", serverID[:8], err)
-			d.logger.Printf("warning: %v", supErr)
-		}
-	}
-
-	// Soft shutdown: stdin close → 30s wait → GracefulKill fallback.
-	exitCode, err := entry.Owner.SoftShutdown(30 * time.Second)
-	if err != nil {
-		d.logger.Printf("soft-removed owner %s: forced kill (exit=%d err=%v)", serverID[:8], exitCode, err)
-	} else if exitCode == 0 {
-		d.logger.Printf("soft-removed owner %s: upstream exited cleanly (code 0)", serverID[:8])
-	} else {
-		d.logger.Printf("soft-removed owner %s: upstream exited with code %d", serverID[:8], exitCode)
-	}
-
-	if supErr != nil {
-		return supErr
-	}
-	return nil
+	_, err := d.removeOwner(serverID, ownerRemovalReasonOperatorSoft, true)
+	return err
 }
 
 // HandleSpawn implements control.DaemonHandler.
@@ -1345,6 +1321,15 @@ func (d *Daemon) HandleStatus() map[string]any {
 		s := entry.Owner.Status()
 		s["server_id"] = sid
 		s["persistent"] = entry.Persistent
+		s["owner_generation"] = entry.OwnerGeneration
+		if entry.RestoredFromOwnerGeneration != "" {
+			s["restored_from_owner_generation"] = entry.RestoredFromOwnerGeneration
+		}
+		if entry.RestoreSource != "" {
+			s["restore_source"] = entry.RestoreSource
+		} else {
+			s["restore_source"] = "fresh"
+		}
 		s["last_session"] = entry.LastSession.Format(time.RFC3339)
 		// Prefer the per-owner override from x-mux.idleTimeout capability
 		// (set via Owner.SetIdleTimeout after init); fall back to the
@@ -1365,6 +1350,9 @@ func (d *Daemon) HandleStatus() map[string]any {
 	return map[string]any{
 		"daemon":                          true,
 		"pid":                             os.Getpid(),
+		"daemon_generation":               d.daemonGeneration,
+		"reaped_owner_count":              d.ownerRemoval.ByReason[ownerRemovalReasonIdle],
+		"owner_removal":                   d.ownerRemoval.statusMap(),
 		"owner_count":                     len(servers), // excludes placeholders still being created
 		"servers":                         servers,
 		"owner_idle_timeout":              d.ownerIdleTimeout.String(),
@@ -1375,10 +1363,15 @@ func (d *Daemon) HandleStatus() map[string]any {
 		"zombie_detections_spawn":         d.zombieDetectedSpawn,
 		"zombie_detections_restore":       d.zombieDetectedRestore,
 		"handoff": map[string]any{
-			"attempted":   d.stats.attempted.Load(),
-			"transferred": d.stats.transferred.Load(),
-			"aborted":     d.stats.aborted.Load(),
-			"fallback":    d.stats.fallback.Load(),
+			"attempted":                      d.stats.attempted.Load(),
+			"transferred":                    d.stats.transferred.Load(),
+			"aborted":                        d.stats.aborted.Load(),
+			"fallback":                       d.stats.fallback.Load(),
+			"predecessor_pid":                d.predecessorPID,
+			"predecessor_daemon_generation":  d.predecessorDaemonGeneration,
+			"successor_daemon_generation":    d.daemonGeneration,
+			"restored_owner_count":           d.restoredOwnerCount.Load(),
+			"old_owner_socket_retired_count": d.oldOwnerSocketRetiredCount.Load(),
 		},
 	}
 }
@@ -1857,14 +1850,13 @@ func (d *Daemon) onUpstreamExit(serverID string) {
 			// Reaper handles re-spawn for persistent owners
 			return
 		}
-		delete(d.owners, serverID)
+		d.mu.Unlock()
+		d.forgetOwnerIfCurrent(serverID, entry, ownerRemovalReasonUpstreamExit)
+		entry.Owner.Shutdown()
+		d.logger.Printf("owner %s: upstream exited, removed", shortServerID(serverID))
+		return
 	}
 	d.mu.Unlock()
-
-	if ok {
-		entry.Owner.Shutdown()
-		d.logger.Printf("owner %s: upstream exited, removed", serverID[:8])
-	}
 }
 
 // crashWindow is the time window for crash counting. If an upstream crashes

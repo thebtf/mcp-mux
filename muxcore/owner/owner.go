@@ -879,8 +879,8 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			}
 			return nil // notifications don't need forwarding to upstream
 		}
-		// Forward other notifications as-is to upstream
-		if o.upstream == nil {
+		// Forward other notifications as-is to upstream.
+		if !o.hasWritableUpstream() {
 			return nil // snapshot owner — upstream not yet spawned, drop notification
 		}
 		return o.writeUpstream(msg.Raw)
@@ -906,8 +906,8 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			return o.dispatchToSessionHandler(s, msg)
 		}
 
-		// Fail fast if upstream is dead or not yet spawned (pipe-based mode only)
-		if o.upstream == nil || o.upstreamDead.Load() {
+		// Fail fast if upstream is dead or not yet spawned (pipe-based mode only).
+		if !o.hasWritableUpstream() || o.upstreamDead.Load() {
 			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
 			return s.WriteRaw([]byte(errResp))
 		}
@@ -2626,7 +2626,14 @@ func (o *Owner) writeUpstream(data []byte) error {
 		}
 		return nil
 	}
+	if o.upstream == nil {
+		return errors.New("upstream writer unavailable")
+	}
 	return o.upstream.WriteLine(data)
+}
+
+func (o *Owner) hasWritableUpstream() bool {
+	return o.upstream != nil || o.upstreamWriter != nil
 }
 
 // busyDeclaration is a signal from upstream that it is doing long-running
