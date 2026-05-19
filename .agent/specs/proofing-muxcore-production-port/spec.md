@@ -44,6 +44,32 @@ Port the proven Phase 6-9 `current-topology-poc` invariants into real
 into a release-grade reliability contract for fresh-session attach, reconnect,
 generation-aware handoff, and persistent/idle lifecycle behavior.
 
+## Clarifications
+
+### Session 2026-05-19
+
+| # | Category | Question | Resolution | Date |
+| --- | --- | --- | --- | --- |
+| C1 | Observability / Public Surface | Should P8/P9 generation evidence be exposed through stable status fields, or should tests use package-private hooks only? | Full stable status contract: expose all generation and lifecycle evidence as documented operator API. | 2026-05-19 |
+| C2 | Lifecycle Cleanup Ownership | Where should stale pending-token cleanup for reaped owners live: daemon owner-removal helper, reaper sweep, or session manager? | A single daemon-level owner-removal helper is authoritative; session manager exposes cleanup primitives but does not decide owner lifecycle. | 2026-05-19 |
+| C3 | Runtime Smoke Target | Which real MCP upstream is the canonical runtime smoke target for this workstation? | `time` is the primary smoke target; `serena` is optional secondary after primary passes. | 2026-05-19 |
+
+- Q: Should P8/P9 generation evidence be exposed through stable status fields,
+  or should tests use package-private hooks only? -> A: Full stable status
+  contract. All generation and lifecycle evidence needed for P8/P9 MUST be
+  visible through the documented control status/operator API, not only through
+  package-private test hooks.
+- Q: Where should stale pending-token cleanup for reaped owners live: daemon
+  owner-removal helper, reaper sweep, or session manager? -> A: A single
+  daemon-level owner-removal helper is authoritative. The daemon owns owner
+  lifecycle decisions and calls session-manager cleanup primitives; cleanup
+  MUST NOT be duplicated separately in each removal path.
+- Q: Which real MCP upstream is the canonical runtime smoke target for this
+  workstation? -> A: `time` is the primary smoke target. `serena` is an
+  optional secondary smoke target that runs only after the primary `time` smoke
+  passes, so core mux reliability is proven before heavier upstream-specific
+  behavior is evaluated.
+
 ## Context
 
 Users are seeing random MCP startup and reconnect failures in new Claude
@@ -140,9 +166,9 @@ Evidence: Q1, Q2; proofing Phase 7 PASS; existing production tests around
 
 ### FR-4: Phase 8 generation-aware handoff parity
 
-The production path MUST expose or assert enough handoff evidence to distinguish
-predecessor daemon, successor daemon, restored owner count, and retired old
-owner sockets.
+The production path MUST expose documented status fields that distinguish
+predecessor daemon, successor daemon, restored owner count, restored owner
+identity/generation evidence, and retired old owner sockets.
 
 Acceptance proof MUST fail when traffic succeeds only through fresh spawn
 without restored-owner evidence.
@@ -163,20 +189,53 @@ sleep-only timing.
 Evidence: Q2, Q7; proofing Phase 9 PASS; `muxcore/daemon/reaper.go` eligibility
 contract; `muxcore/session` pending/bound cleanup functions.
 
-### FR-6: Runtime smoke after parity
+### FR-6: Stable operator status contract
+
+The control status/operator API MUST document and expose the generation,
+handoff, reconnect, and lifecycle evidence needed by P8/P9 and runtime smoke.
+At minimum this includes predecessor/successor handoff identity, restored owner
+count, owner identity/generation or equivalent per-owner identity, old-owner
+retirement evidence, persistent classification, active session count,
+reaped-owner count, pending-ticket cleanup evidence, refresh-token counters,
+and fallback-spawn counters.
+
+These fields are a stable public operator contract. Any future removal,
+rename, or semantic change MUST go through release notes and compatibility
+policy.
+
+Evidence: C1 clarification; ADR 011 Hyrum-sensitive status warning.
+
+### FR-7: Unified owner removal cleanup
+
+All owner removal paths MUST route through one daemon-level owner-removal helper
+that owns lifecycle reason, registry deletion, stale pending-token cleanup,
+reconnect-history cleanup where applicable, and status/counter updates.
+
+The session manager MUST provide cleanup primitives keyed by owner/server
+identity, but it MUST NOT independently decide that an owner is gone. Reaper,
+explicit remove/stop/restart, failed restore cleanup, and any future soft-remove
+path MUST use the same helper.
+
+Evidence: C2 clarification; proofing Phase 9 stale ticket cleanup guard.
+
+### FR-8: Runtime smoke after parity
 
 After P6-P9 production parity tests pass, the project MUST build a fresh
-`mcp-mux.exe` and run a controlled runtime smoke against at least one real MCP
-upstream.
+`mcp-mux.exe` and run a controlled runtime smoke against the real `time` MCP
+upstream as the primary target.
 
 The smoke MUST verify that a fresh session attaches without
 `connection closed: initialize response`, that restart behavior uses the
 expected reconnect/handoff path, and that status exposes the relevant counters
 or equivalent evidence.
 
-Evidence: Q1, Q3; ADR 011 runtime smoke requirement.
+`serena` MAY be run as an optional secondary smoke target after the primary
+`time` smoke passes. A `serena` failure MUST be classified separately as
+upstream-specific or muxcore-specific before blocking the core parity port.
 
-### FR-7: No PoC import into production
+Evidence: Q1, Q3; C3 clarification; ADR 011 runtime smoke requirement.
+
+### FR-9: No PoC import into production
 
 Production implementation MUST NOT import or depend on
 `experiments/current-topology-poc`. The PoC remains a regression oracle and
@@ -184,7 +243,7 @@ design artifact only.
 
 Evidence: Q4, Q5, Q6; ADR 011 Non-Goals.
 
-### FR-8: Preserve already-sent in-flight request contract
+### FR-10: Preserve already-sent in-flight request contract
 
 The feature MUST preserve ADR 010 behavior for already-sent in-flight requests:
 the default is one JSON-RPC error response by original ID, not blind replay.
@@ -224,7 +283,14 @@ Public API or status field additions MUST be additive. Existing `muxcore`
 consumers that do not use the new evidence fields MUST continue to compile and
 run.
 
-### NFR-6: Release gate
+### NFR-6: Status contract stability
+
+Generation, handoff, reconnect, and lifecycle status fields introduced or
+documented by this feature are stable operator API. They MUST be versioned in
+release notes, covered by tests, and changed only through a compatibility-aware
+release.
+
+### NFR-7: Release gate
 
 The feature is not production-ready until `go test ./... -count=1` passes in
 both root and `muxcore`, the current-topology PoC runner remains green, and the
@@ -286,11 +352,11 @@ tokens/tickets do not accumulate.
 
 | User evidence | Covered by FR/US | Acceptance proof | Surface / workflow |
 | --- | --- | --- | --- |
-| Q1: fresh sessions randomly fail some mux-routed MCP servers | FR-6, US1 | Fresh-binary runtime smoke with real MCP upstream and no `initialize response` closure | CLI + MCP host startup |
-| Q2: mux is not a reliable multiplexer | FR-1, FR-2, FR-3, FR-4, FR-5 | P6-P9 production parity tests with causal guards | `muxcore` test suite + status/log evidence |
-| Q3: startup problems happen constantly | FR-6, NFR-6, US1 | Runtime attach smoke after library parity | Local workstation binary |
-| Q4/Q5/Q6: build proof by experimental phases, then port the correct implementation | FR-1, FR-7 | No PoC import; separate production tests per slice | SpecKit production port workflow |
-| Q7: achieve result without breaking the current topology | FR-3, FR-4, FR-5, FR-8 | Refresh-before-fallback, handoff evidence, lifecycle parity, and ADR 010 in-flight contract | Shim/daemon/owner lifecycle |
+| Q1: fresh sessions randomly fail some mux-routed MCP servers | FR-8, US1 | Fresh-binary runtime smoke with `time` as primary real MCP upstream and no `initialize response` closure | CLI + MCP host startup |
+| Q2: mux is not a reliable multiplexer | FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7 | P6-P9 production parity tests with causal guards | `muxcore` test suite + status/log evidence |
+| Q3: startup problems happen constantly | FR-8, NFR-7, US1 | Runtime attach smoke after library parity | Local workstation binary |
+| Q4/Q5/Q6: build proof by experimental phases, then port the correct implementation | FR-1, FR-9 | No PoC import; separate production tests per slice | SpecKit production port workflow |
+| Q7: achieve result without breaking the current topology | FR-3, FR-4, FR-5, FR-10 | Refresh-before-fallback, handoff evidence, lifecycle parity, and ADR 010 in-flight contract | Shim/daemon/owner lifecycle |
 
 ## Edge Cases
 
@@ -304,6 +370,10 @@ tokens/tickets do not accumulate.
 - Persistent owner's upstream dies: existing persistent respawn behavior must
   remain compatible with new lifecycle assertions.
 - Stale pending token remains after owner reaping: P9 must fail.
+- Any owner-removal path bypasses the daemon-level cleanup helper: parity tests
+  must fail for missing cleanup evidence or inconsistent lifecycle counters.
+- Primary `time` smoke passes but optional `serena` smoke fails: classify the
+  failure as upstream-specific or muxcore-specific before blocking the feature.
 - Fresh runtime smoke passes only because the old live binary is still serving:
   smoke must verify the fresh binary/version or process identity.
 
@@ -324,7 +394,8 @@ tokens/tickets do not accumulate.
 - Proofing ledger Phase 6-9 PASS evidence.
 - Existing `muxcore` packages: `owner`, `daemon`, `session`, `snapshot`, and
   `control`.
-- A controlled real MCP upstream for final runtime smoke.
+- `time` MCP server as the controlled primary runtime smoke target.
+- Optional secondary `serena` smoke target after primary `time` smoke passes.
 
 ## Success Criteria
 
@@ -338,7 +409,10 @@ tokens/tickets do not accumulate.
       active-session protection, stale ticket cleanup, and persistent restore.
 - [ ] Root and `muxcore` Go test suites pass with `-count=1`.
 - [ ] `.\scripts\run-current-topology-poc.ps1 -WatchSeconds 1` remains green.
-- [ ] Fresh `mcp-mux.exe` runtime smoke passes with a real MCP upstream.
+- [ ] Fresh `mcp-mux.exe` runtime smoke passes with `time` as the primary real
+      MCP upstream.
+- [ ] Optional `serena` smoke is either passing or explicitly classified as
+      upstream-specific vs. muxcore-specific.
 
 ## Boundaries
 
@@ -351,8 +425,8 @@ Always:
 
 Ask First:
 
-- Adding stable public status fields that downstream operators may depend on.
 - Changing public `muxcore` API types.
+- Removing, renaming, or changing semantics of documented status fields.
 - Introducing a new deployment or launcher architecture.
 
 Never:
@@ -364,10 +438,9 @@ Never:
 
 ## Open Questions
 
-1. [NEEDS CLARIFICATION] Should P8/P9 generation evidence be exposed through
-   stable status fields, or should tests use package-private hooks only?
-2. [NEEDS CLARIFICATION] Where should stale pending-token cleanup for reaped
-   owners live: daemon owner-removal helper, reaper sweep, or session manager?
-3. [NEEDS CLARIFICATION] Which real MCP upstream is the canonical runtime smoke
-   target for this workstation: `time`, `serena`, `socraticode`, or another
-   low-risk server?
+1. Resolved C1: P8/P9 generation and lifecycle evidence will be exposed as a
+   full stable status/operator API contract.
+2. Resolved C2: authoritative stale token/ticket cleanup lives in a single
+   daemon-level owner-removal helper; session manager exposes cleanup primitives.
+3. Resolved C3: primary runtime smoke target is `time`; `serena` is optional
+   secondary after primary passes.
