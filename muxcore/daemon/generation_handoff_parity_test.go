@@ -71,6 +71,7 @@ func TestGenerationHandoffParityStatusRejectsFreshSpawnEvidence(t *testing.T) {
 
 	ctlPath := shortSocketPath(t, "generation-handoff.ctl.sock")
 	d, err := New(Config{
+		Name:           "test-daemon",
 		ControlPath:    ctlPath,
 		GracePeriod:    time.Second,
 		IdleTimeout:    5 * time.Second,

@@ -46,6 +46,7 @@ func testDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	d, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -106,6 +107,7 @@ func waitOwnerAccepting(t *testing.T, d *Daemon, sid string) {
 func TestDaemonFlag_ConfigPropagation(t *testing.T) {
 	ctlPath := shortSocketPath(t, "daemonflag.ctl.sock")
 	d1, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -123,6 +125,7 @@ func TestDaemonFlag_ConfigPropagation(t *testing.T) {
 
 	ctlPath2 := shortSocketPath(t, "daemonflag2.ctl.sock")
 	d2, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath2,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -136,6 +139,20 @@ func TestDaemonFlag_ConfigPropagation(t *testing.T) {
 		t.Errorf("daemonFlag = %q, want %q (default)", d2.daemonFlag, "--daemon")
 	}
 	d2.Shutdown()
+}
+
+func TestNewRejectsEmptyName(t *testing.T) {
+	_, err := New(Config{
+		ControlPath:  shortSocketPath(t, "noname.ctl.sock"),
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
+	})
+	if err == nil {
+		t.Fatal("New() with empty Config.Name should fail")
+	}
+	if !strings.Contains(err.Error(), "Config.Name is required") {
+		t.Fatalf("New() error = %v, want Config.Name diagnostic", err)
+	}
 }
 
 func TestDaemonSpawnAndStatus(t *testing.T) {
@@ -761,6 +778,7 @@ func TestDaemonStartAfterCrash(t *testing.T) {
 
 	// Step 2: Start a new daemon — this must succeed despite the stale file.
 	d, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -1543,6 +1561,7 @@ func TestDaemonNew_HandoffMode_DefersControlBind(t *testing.T) {
 	t.Setenv("MCPMUX_HANDOFF_SOCKET", socketPath)
 
 	d, err := New(Config{
+		Name:        "test-daemon",
 		ControlPath: ctlPath,
 		GracePeriod: 1 * time.Second,
 		IdleTimeout: 5 * time.Second,

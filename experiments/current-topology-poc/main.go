@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 const (
@@ -660,7 +662,6 @@ func acceptOwner(ln net.Listener, state *daemonState, entry *ownerEntry) {
 
 func handleOwnerSession(conn net.Conn, state *daemonState, entry *ownerEntry) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
@@ -2698,7 +2699,7 @@ func controlPath() string {
 	if v := os.Getenv(envCtlPath); strings.TrimSpace(v) != "" {
 		return v
 	}
-	return filepath.Join(runtimeDir(), "control.sock")
+	return serverid.DaemonControlPath(runtimeDir(), serverName)
 }
 
 func snapshotPath() string {
@@ -2706,7 +2707,12 @@ func snapshotPath() string {
 }
 
 func ownerPath(serverID, generation string) string {
-	return filepath.Join(runtimeDir(), serverID+"-"+generation+".owner.sock")
+	return serverid.IPCPath(runtimeDir(), serverName, ownerSocketID(serverID, generation))
+}
+
+func ownerSocketID(serverID, generation string) string {
+	sum := sha1.Sum([]byte(serverID + "\x1f" + generation))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func runtimeDir() string {

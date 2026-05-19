@@ -44,6 +44,7 @@ func testDaemonWithLog(t *testing.T) (*Daemon, *syncBuffer) {
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	logger := log.New(buf, "[daemon-test] ", log.LstdFlags)
 	d, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -306,6 +307,7 @@ func TestLoadSnapshot_SessionHandlerRestoreDoesNotSpawnCommand(t *testing.T) {
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	logger := log.New(buf, "[daemon-test] ", log.LstdFlags)
 	d, err := New(Config{
+		Name:           "test-daemon",
 		ControlPath:    ctlPath,
 		GracePeriod:    1 * time.Second,
 		IdleTimeout:    5 * time.Second,

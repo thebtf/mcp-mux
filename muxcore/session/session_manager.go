@@ -221,12 +221,19 @@ func (sm *Manager) Bind(token, ownerKey string, session *Session) bool {
 	if !ok {
 		return false
 	}
+	if ps.OwnerKey != "" && ps.OwnerKey != ownerKey {
+		return false
+	}
 	delete(sm.pending, token)
 
 	now := time.Now()
 	env := cloneEnv(ps.Env)
+	historyOwnerKey := ps.OwnerKey
+	if historyOwnerKey == "" {
+		historyOwnerKey = ownerKey
+	}
 	sm.bound[token] = &boundHistory{
-		OwnerKey: ownerKey,
+		OwnerKey: historyOwnerKey,
 		Cwd:      ps.Cwd,
 		Env:      env,
 		BoundAt:  now,

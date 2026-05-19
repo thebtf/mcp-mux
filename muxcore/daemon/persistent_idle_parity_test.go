@@ -19,6 +19,7 @@ func testLifecycleDaemon(t *testing.T, persistent bool) (*Daemon, *Reaper) {
 	t.Helper()
 	ctlPath := shortSocketPath(t, "lifecycle.ctl.sock")
 	d, err := New(Config{
+		Name:             "test-daemon",
 		ControlPath:      ctlPath,
 		IdleTimeout:      5 * time.Second,
 		OwnerIdleTimeout: lifecycleOwnerIdleTimeout,

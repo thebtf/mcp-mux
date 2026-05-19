@@ -260,13 +260,6 @@ func (d *Daemon) loadSnapshot() int {
 			}
 		}
 
-		// Register with supervisor BEFORE inserting into owners map so that
-		// any concurrent failure is handled by suture.
-		var serviceToken suture.ServiceToken
-		if d.supervisor != nil {
-			serviceToken = d.supervisor.Add(o)
-		}
-
 		ownerGeneration, genErr := generateGeneration("owner")
 		if genErr != nil {
 			d.logger.Printf("snapshot: failed to generate owner generation for %s: %v", sid[:8], genErr)
@@ -275,6 +268,13 @@ func (d *Daemon) loadSnapshot() int {
 		restoreSource := "snapshot_fallback"
 		if reattachedFromHandoff {
 			restoreSource = "snapshot_handoff"
+		}
+
+		// Register with supervisor only after generation metadata is ready. If
+		// generation creation fails, the restored owner is never made runnable.
+		var serviceToken suture.ServiceToken
+		if d.supervisor != nil {
+			serviceToken = d.supervisor.Add(o)
 		}
 
 		d.mu.Lock()

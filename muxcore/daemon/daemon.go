@@ -254,6 +254,10 @@ var _ control.DaemonHandler = (*Daemon)(nil)
 
 // New creates and starts a new Daemon with a control server.
 func New(cfg Config) (*Daemon, error) {
+	if strings.TrimSpace(cfg.Name) == "" {
+		return nil, errors.New("daemon: Config.Name is required and must be unique to this binary")
+	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.New(os.Stderr, "[mcp-muxd] ", log.LstdFlags)
@@ -513,11 +517,7 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	// delete would evict the fresh entry, leaving the server unreachable
 	// until the next spawn attempt. Only delete if the current map entry is
 	// still the same pointer we observed at the start of cleanup.
-	d.mu.Lock()
-	if current, ok := d.owners[sid]; ok && current == entry {
-		d.deleteOwnerEntryLocked(sid)
-	}
-	d.mu.Unlock()
+	d.forgetOwnerIfCurrent(sid, entry, ownerRemovalReasonZombie)
 }
 
 // cleanStaleSocketsDir overrides the directory scanned by cleanStaleSockets.

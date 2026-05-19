@@ -115,6 +115,33 @@ func TestPreRegisterForOwnerAndRemovePendingForOwner(t *testing.T) {
 	}
 }
 
+func TestBindRejectsWrongOwnerWithoutConsumingToken(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("owned-token", "owner-a", "/project/a", map[string]string{"A": "1"})
+
+	wrong := &Session{ID: 101}
+	sm.RegisterSession(wrong, "")
+	if ok := sm.Bind("owned-token", "owner-b", wrong); ok {
+		t.Fatal("Bind returned true for a token owned by another owner")
+	}
+	if !sm.IsPreRegistered("owned-token") {
+		t.Fatal("wrong-owner Bind consumed the pending token")
+	}
+
+	right := &Session{ID: 102}
+	sm.RegisterSession(right, "")
+	if ok := sm.Bind("owned-token", "owner-a", right); !ok {
+		t.Fatal("Bind returned false for the rightful owner")
+	}
+	hist, ok := sm.bound["owned-token"]
+	if !ok {
+		t.Fatal("bound history missing after rightful Bind")
+	}
+	if hist.OwnerKey != "owner-a" {
+		t.Fatalf("bound owner key = %q, want owner-a", hist.OwnerKey)
+	}
+}
+
 func TestRemoveBoundForOwner(t *testing.T) {
 	sm := NewManager()
 	seedBoundHistory(t, sm, "tok-a", "owner-a")

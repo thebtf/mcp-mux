@@ -20,6 +20,7 @@ func TestGracefulRestart_ResponseDelivery(t *testing.T) {
 
 	ctlPath := shortSocketPath(t, "gr-response.ctl.sock")
 	d, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		GracePeriod:  1 * time.Second,
 		IdleTimeout:  5 * time.Second,
@@ -69,6 +70,7 @@ func TestGracefulRestart_ResponseDelivery_WithOwner(t *testing.T) {
 
 	ctlPath := shortSocketPath(t, "gr-owner.ctl.sock")
 	d, err := New(Config{
+		Name:             "test-daemon",
 		ControlPath:      ctlPath,
 		OwnerIdleTimeout: 1 * time.Minute,
 		IdleTimeout:      5 * time.Second,
@@ -121,6 +123,7 @@ func TestGracefulRestart_BackToBack(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		ctlPath := shortSocketPath(t, "gr-b2b.ctl.sock")
 		d, err := New(Config{
+			Name:         "test-daemon",
 			ControlPath:  ctlPath,
 			GracePeriod:  1 * time.Second,
 			IdleTimeout:  5 * time.Second,

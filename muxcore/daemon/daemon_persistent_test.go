@@ -10,6 +10,7 @@ import (
 func TestSessionHandlerOwnerInheritsPersistent(t *testing.T) {
 	ctlPath := shortSocketPath(t, "persist.ctl.sock")
 	d, err := New(Config{
+		Name:           "test-daemon",
 		ControlPath:    ctlPath,
 		GracePeriod:    1 * time.Second,
 		IdleTimeout:    5 * time.Second,

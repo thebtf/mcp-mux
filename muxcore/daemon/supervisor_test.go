@@ -29,6 +29,7 @@ func TestDaemonSupervisorInitialized(t *testing.T) {
 	t.Cleanup(func() { os.Remove(ctlPath) })
 
 	d, err := New(Config{
+		Name:         "test-daemon",
 		ControlPath:  ctlPath,
 		Logger:       log.New(os.Stderr, "[test] ", 0),
 		SkipSnapshot: true,

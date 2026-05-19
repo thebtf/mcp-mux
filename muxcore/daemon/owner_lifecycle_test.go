@@ -57,6 +57,38 @@ func TestOwnerLifecycleRemovalCleansOwnedTicketsAndCounters(t *testing.T) {
 	}
 }
 
+func TestCleanupDeadOwnerUsesOwnerRemovalPath(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-lifecycle-zombie-cleanup"
+	o := testReconnectOwner(t, sid)
+
+	o.SessionMgr().PreRegisterForOwner("pending-zombie", sid, "/owned", nil)
+	seedReconnectHistoryForOwner(t, o, "bound-zombie", sid)
+
+	d.mu.Lock()
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_test", RestoreSource: "fresh"}
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	d.cleanupDeadOwner("owner[" + sid[:8] + " command]")
+
+	d.mu.RLock()
+	_, stillPresent := d.owners[sid]
+	d.mu.RUnlock()
+	if stillPresent {
+		t.Fatal("cleanupDeadOwner left owner in registry")
+	}
+	if o.SessionMgr().IsPreRegistered("pending-zombie") {
+		t.Fatal("owned pending token still pre-registered after zombie cleanup")
+	}
+	if _, err := o.SessionMgr().RegisterReconnect("bound-zombie", func(string) bool { return true }); !errors.Is(err, session.ErrUnknownToken) {
+		t.Fatalf("RegisterReconnect(bound-zombie) error = %v, want session.ErrUnknownToken", err)
+	}
+	status := d.HandleStatus()
+	assertOwnerRemovalStatus(t, status, 1, "zombie", 1)
+}
+
 func seedReconnectHistoryForOwner(t *testing.T, o *owner.Owner, token, ownerKey string) {
 	t.Helper()
 	sess := &owner.Session{ID: len(token)}

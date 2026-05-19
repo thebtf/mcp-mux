@@ -1,5 +1,5 @@
 param(
-    [string]$Launcher = "D:\Dev\mcp-launcher\mcp-launcher.exe",
+    [string]$Launcher = $env:MCP_LAUNCHER,
     [int]$WatchSeconds = 2
 )
 
@@ -93,6 +93,14 @@ function Invoke-WindowsPersistEmulation {
     }
 }
 
+if ([string]::IsNullOrWhiteSpace($Launcher)) {
+    $LocalLauncher = Join-Path $RepoRoot "mcp-launcher.exe"
+    if (Test-Path -LiteralPath $LocalLauncher) {
+        $Launcher = $LocalLauncher
+    } else {
+        throw "mcp-launcher path is required. Pass -Launcher or set MCP_LAUNCHER."
+    }
+}
 if (-not (Test-Path -LiteralPath $Launcher)) {
     throw "mcp-launcher not found: $Launcher"
 }

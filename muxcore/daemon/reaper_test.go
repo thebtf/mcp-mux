@@ -15,6 +15,7 @@ func testDaemonWithReaper(t *testing.T, grace, idle time.Duration) (*Daemon, *Re
 	t.Helper()
 	ctlPath := shortSocketPath(t, "daemon.ctl.sock")
 	d, err := New(Config{
+		Name:        "test-daemon",
 		ControlPath: ctlPath,
 		GracePeriod: grace,
 		IdleTimeout: idle,
@@ -100,6 +101,7 @@ func TestReaperRespectsConfigPersistent(t *testing.T) {
 	logger := log.New(&logs, "[reaper-test] ", 0)
 	ctlPath := shortSocketPath(t, "persistent.ctl.sock")
 	d, err := New(Config{
+		Name:             "test-daemon",
 		ControlPath:      ctlPath,
 		IdleTimeout:      5 * time.Second,
 		OwnerIdleTimeout: 100 * time.Millisecond,
