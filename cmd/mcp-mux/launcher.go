@@ -226,14 +226,22 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 	if lockErr == nil {
 		if flockErr := lockFile(lock); flockErr == nil {
 			defer func() {
-				unlockFile(lock)
-				lock.Close()
+				if err := unlockFile(lock); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not release daemon lock %s: %v\n", lockPath, err)
+				}
+				if err := lock.Close(); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: could not close daemon lock %s: %v\n", lockPath, err)
+				}
 			}()
 			fmt.Fprintln(os.Stderr, "Acquired daemon lock (shims blocked from respawning).")
 		} else {
-			lock.Close()
+			if err := lock.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not close daemon lock %s: %v\n", lockPath, err)
+			}
 			fmt.Fprintf(os.Stderr, "Warning: could not acquire daemon lock: %v (proceeding anyway)\n", flockErr)
 		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Warning: could not open daemon lock %s: %v (proceeding anyway)\n", lockPath, lockErr)
 	}
 
 	fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
@@ -315,16 +323,8 @@ func writeActiveEngine(launcherPath, enginePath string) error {
 		return fmt.Errorf("write active engine pointer: %w", err)
 	}
 	if err := replaceFile(tmp, activeFile); err != nil {
-		data, readErr := os.ReadFile(tmp)
-		if readErr != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("replace active engine pointer: %w", err)
-		}
-		if writeErr := os.WriteFile(activeFile, data, 0644); writeErr != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("replace active engine pointer: %w", err)
-		}
-		_ = removeWithRetry(tmp, 10, 50*time.Millisecond)
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace active engine pointer: %w", err)
 	}
 	return nil
 }

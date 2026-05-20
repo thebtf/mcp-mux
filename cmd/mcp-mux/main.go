@@ -20,6 +20,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -68,6 +70,10 @@ func main() {
 			runStop(*drainTimeout, *force)
 			return
 		case "upgrade":
+			if os.Getenv(envEngineMode) == "1" {
+				fmt.Fprintln(os.Stderr, "error: upgrade command is only supported through the stable launcher.")
+				os.Exit(1)
+			}
 			upgradeFlags := flag.NewFlagSet("upgrade", flag.ExitOnError)
 			restart := upgradeFlags.Bool("restart", false, "Restart daemon after upgrade (shims auto-reconnect)")
 			upgradeFlags.Parse(os.Args[2:])
@@ -204,19 +210,23 @@ func main() {
 
 					deadline := time.Now().Add(10 * time.Second)
 					for {
-						if err := ensureDaemon(logger); err != nil {
+						if err := ensureDaemonWithin(logger, time.Until(deadline)); err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
-								time.Sleep(100 * time.Millisecond)
+								if !sleepWithin(deadline, 100*time.Millisecond) {
+									return "", "", err
+								}
 								continue
 							}
 							return "", "", err
 						}
-						newIPC, newToken, err := spawnViaDaemonWithReason(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger)
+						newIPC, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
-								time.Sleep(100 * time.Millisecond)
+								if !sleepWithin(deadline, 100*time.Millisecond) {
+									return "", "", err
+								}
 								continue
 							}
 							return "", "", err
@@ -717,12 +727,28 @@ func isTransientDaemonReconnectErr(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, daemon.ErrDaemonShuttingDown) {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "daemon shutting down") ||
 		strings.Contains(msg, "control: dial") ||
 		strings.Contains(msg, "control: read response") ||
 		strings.Contains(msg, "use of closed network connection") ||
 		strings.Contains(msg, "daemon did not start")
+}
+
+func sleepWithin(deadline time.Time, requested time.Duration) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	if remaining < requested {
+		time.Sleep(remaining)
+		return false
+	}
+	time.Sleep(requested)
+	return true
 }
 
 func runStatus() {

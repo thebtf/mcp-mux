@@ -3,7 +3,7 @@ module github.com/thebtf/mcp-mux
 go 1.25.4
 
 require (
-	github.com/thebtf/mcp-mux/muxcore v0.21.0
+	github.com/thebtf/mcp-mux/muxcore v0.24.0
 	golang.org/x/sys v0.43.0
 )
 
