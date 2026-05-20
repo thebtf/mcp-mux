@@ -42,24 +42,29 @@ func maybeRunLauncher() (bool, int) {
 		return false, 0
 	}
 
-	return true, runEngineProcess(exe, enginePath, os.Args[1:])
+	return runEngineProcess(exe, enginePath, os.Args[1:])
 }
 
-func runEngineProcess(launcherPath, enginePath string, args []string) int {
+func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int) {
 	cmd := exec.Command(enginePath, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = launcherEnv(launcherPath)
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
+		fmt.Fprintln(os.Stderr, "mcp-mux launcher: falling back to stable launcher binary")
+		return false, 0
+	}
+	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return exitErr.ExitCode()
+			return true, exitErr.ExitCode()
 		}
-		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start engine %s: %v\n", enginePath, err)
-		return 1
+		fmt.Fprintf(os.Stderr, "mcp-mux launcher: active engine %s exited with wait error: %v\n", enginePath, err)
+		return true, 1
 	}
-	return 0
+	return true, 0
 }
 
 func launcherEnv(launcherPath string) []string {

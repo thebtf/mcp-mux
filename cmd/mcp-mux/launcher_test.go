@@ -114,3 +114,17 @@ func TestWriteActiveEngineStoresRelativePointer(t *testing.T) {
 		t.Fatalf("resolved active engine = %q ok=%v, want %q", resolved, ok, enginePath)
 	}
 }
+
+func TestRunEngineProcessStartFailureFallsBackToLauncher(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	missingEnginePath := filepath.Join(versionStoreDir(launcherPath), "missing", engineFileName())
+
+	handled, code := runEngineProcess(launcherPath, missingEnginePath, []string{"status"})
+	if handled {
+		t.Fatal("runEngineProcess handled missing active engine, want launcher fallback")
+	}
+	if code != 0 {
+		t.Fatalf("fallback code = %d, want 0", code)
+	}
+}
