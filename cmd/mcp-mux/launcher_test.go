@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -126,5 +127,22 @@ func TestRunEngineProcessStartFailureFallsBackToLauncher(t *testing.T) {
 	}
 	if code != 0 {
 		t.Fatalf("fallback code = %d, want 0", code)
+	}
+}
+
+func TestDaemonStartReportsActiveAndFallbackStartFailures(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	missingEnginePath := filepath.Join(versionStoreDir(launcherPath), "missing", engineFileName())
+
+	_, fallbackToCaller, err := startEngineOrStableLauncher(launcherPath, missingEnginePath, []string{"daemon"}, false, func(cmd *exec.Cmd) {})
+	if fallbackToCaller {
+		t.Fatal("daemon start requested caller fallback, want child-process fallback")
+	}
+	if err == nil {
+		t.Fatal("daemon start with missing engine and launcher succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "start stable launcher fallback") {
+		t.Fatalf("error = %q, want stable launcher fallback context", err)
 	}
 }

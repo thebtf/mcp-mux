@@ -46,15 +46,17 @@ func maybeRunLauncher() (bool, int) {
 }
 
 func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int) {
-	cmd := exec.Command(enginePath, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = launcherEnv(launcherPath)
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
-		fmt.Fprintln(os.Stderr, "mcp-mux launcher: falling back to stable launcher binary")
+	cmd, fallbackToCaller, err := startEngineOrStableLauncher(launcherPath, enginePath, args, true, func(cmd *exec.Cmd) {
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	})
+	if fallbackToCaller {
 		return false, 0
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mcp-mux launcher: %v\n", err)
+		return true, 1
 	}
 	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
@@ -65,6 +67,34 @@ func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int
 		return true, 1
 	}
 	return true, 0
+}
+
+func startEngineOrStableLauncher(launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*exec.Cmd, bool, error) {
+	cmd := newLauncherEnvCommand(launcherPath, enginePath, args)
+	configure(cmd)
+	if err := cmd.Start(); err == nil {
+		return cmd, false, nil
+	} else if fallbackToCaller {
+		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
+		fmt.Fprintln(os.Stderr, "mcp-mux launcher: falling back to stable launcher binary")
+		return nil, true, nil
+	} else {
+		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
+		fmt.Fprintln(os.Stderr, "mcp-mux launcher: starting daemon via stable launcher binary")
+		startErr := err
+		cmd = newLauncherEnvCommand(launcherPath, launcherPath, args)
+		configure(cmd)
+		if err := cmd.Start(); err != nil {
+			return nil, false, fmt.Errorf("start active engine %s: %v; start stable launcher fallback %s: %w", enginePath, startErr, launcherPath, err)
+		}
+		return cmd, false, nil
+	}
+}
+
+func newLauncherEnvCommand(launcherPath, executablePath string, args []string) *exec.Cmd {
+	cmd := exec.Command(executablePath, args...)
+	cmd.Env = launcherEnv(launcherPath)
+	return cmd
 }
 
 func launcherEnv(launcherPath string) []string {
@@ -284,13 +314,13 @@ func startDaemonAndWait(launcherPath, enginePath, ctlPath string) error {
 }
 
 func startDaemonProcessFrom(launcherPath, enginePath string) error {
-	cmd := exec.Command(enginePath, "daemon")
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
-	cmd.Env = launcherEnv(launcherPath)
-	setSysProcAttr(cmd)
-	if err := cmd.Start(); err != nil {
+	cmd, _, err := startEngineOrStableLauncher(launcherPath, enginePath, []string{"daemon"}, false, func(cmd *exec.Cmd) {
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		cmd.Stdin = nil
+		setSysProcAttr(cmd)
+	})
+	if err != nil {
 		return fmt.Errorf("start daemon process: %w", err)
 	}
 	if err := cmd.Process.Release(); err != nil {
