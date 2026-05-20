@@ -5,6 +5,7 @@ dist/
 *.exe~
 *.exe.old
 *.exe.old.*
+mcp-mux.versions/
 coverage.out
 coverage.html
 .gomodcache/

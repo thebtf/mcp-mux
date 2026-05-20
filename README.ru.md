@@ -282,7 +282,7 @@ mcp-mux status
 # Остановить все запущенные экземпляры и daemon
 mcp-mux stop [--drain-timeout 30s] [--force]
 
-# Атомарное обновление бинарника (см. раздел ниже)
+# Обновление versioned engine (см. раздел ниже)
 mcp-mux upgrade
 
 # Запустить отдельный daemon-процесс (обычно запускается автоматически shim-ами)
@@ -292,21 +292,25 @@ mcp-mux daemon
 mcp-mux serve
 ```
 
-## Атомарное обновление
+## Обновление versioned engine
 
-Обновление бинарника mcp-mux при активных сессиях безопасно:
+Обновление mcp-mux при активных сессиях безопасно:
 
 ```sh
-# 1. Собрать новый бинарник во временный путь
-go build -o mcp-mux.exe~ ./cmd/mcp-mux
-
-# 2. Атомарная замена — останавливает активные сессии, заменяет бинарник, upstream-процессы остаются нетронутыми
-mcp-mux upgrade
+# Обновление с graceful restart
+go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
 ```
 
-`upgrade` выполняет атомарное переименование файлов в два шага (`current` → `.old`, `pending~` → `current`). Если временный бинарник отсутствует или переименование не удалось, `upgrade` завершается с ошибкой, а существующий бинарник остаётся нетронутым.
+`mcp-mux.exe` теперь играет роль стабильного launcher. `upgrade` не переименовывает
+запущенный launcher: staged `mcp-mux.exe~` переносится или копируется в
+`mcp-mux.versions/<hash>/mcp-mux-engine.exe`, а `mcp-mux.versions/active.txt`
+переключается на новую версию engine. Это важно для Windows: живые shim/daemon
+процессы держат image lock на настроенном `mcp-mux.exe`, поэтому self-rename
+этого файла не является надёжной операцией обновления.
 
-После обновления MCP-серверы автоматически перезапустятся при следующем вызове инструмента CC — shim переподключится к новому daemon, запущенному новым бинарником.
+С `--restart` daemon делает snapshot, завершает старый процесс и запускает successor
+из active versioned engine. Без `--restart` daemon продолжает работать на старом
+engine до естественного рестарта, а новые shim-процессы уже используют active engine.
 
 ## Жизненный цикл upstream — выживание при рестарте daemon (v0.21.0+)
 

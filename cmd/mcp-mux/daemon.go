@@ -93,6 +93,7 @@ func runGlobalDaemon() {
 		IdleTimeout:      idleTimeout,
 		Logger:           logger,
 		Name:             engineName,
+		DaemonFlag:       "daemon",
 	})
 	if err != nil {
 		logger.Fatalf("failed to start daemon: %v", err)

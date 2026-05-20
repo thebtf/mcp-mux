@@ -50,6 +50,10 @@ const engineName = "mcp-mux"
 const ownSocketPrefix = engineName + "-"
 
 func main() {
+	if handled, exitCode := maybeRunLauncher(); handled {
+		os.Exit(exitCode)
+	}
+
 	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -65,7 +69,7 @@ func main() {
 			return
 		case "upgrade":
 			upgradeFlags := flag.NewFlagSet("upgrade", flag.ExitOnError)
-			restart := upgradeFlags.Bool("restart", false, "Restart daemon after binary swap (shims auto-reconnect)")
+			restart := upgradeFlags.Bool("restart", false, "Restart daemon after upgrade (shims auto-reconnect)")
 			upgradeFlags.Parse(os.Args[2:])
 			runUpgrade(*restart)
 			return
@@ -198,16 +202,29 @@ func main() {
 					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
 					time.Sleep(jitter)
 
-					if err := ensureDaemon(logger); err != nil {
-						return "", "", err
+					deadline := time.Now().Add(10 * time.Second)
+					for {
+						if err := ensureDaemon(logger); err != nil {
+							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
+								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
+								time.Sleep(100 * time.Millisecond)
+								continue
+							}
+							return "", "", err
+						}
+						newIPC, newToken, err := spawnViaDaemonWithReason(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger)
+						if err != nil {
+							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
+								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
+								time.Sleep(100 * time.Millisecond)
+								continue
+							}
+							return "", "", err
+						}
+						currentIPC = newIPC
+						currentToken = newToken
+						return newIPC, newToken, nil
 					}
-					newIPC, newToken, err := spawnViaDaemonWithReason(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger)
-					if err != nil {
-						return "", "", err
-					}
-					currentIPC = newIPC
-					currentToken = newToken
-					return newIPC, newToken, nil
 				}
 				resilientStart := time.Now()
 				if err := owner.RunResilientClient(owner.ResilientClientConfig{
@@ -694,6 +711,18 @@ func collectEnv() map[string]string {
 		}
 	}
 	return env
+}
+
+func isTransientDaemonReconnectErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "daemon shutting down") ||
+		strings.Contains(msg, "control: dial") ||
+		strings.Contains(msg, "control: read response") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "daemon did not start")
 }
 
 func runStatus() {

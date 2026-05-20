@@ -43,6 +43,10 @@ var ErrUnknownToken = errors.New("unknown token")
 // belonged to is no longer alive enough to accept a refreshed bind.
 var ErrOwnerGone = errors.New("owner gone")
 
+// ErrDaemonShuttingDown indicates the daemon is no longer accepting new owner
+// spawns because shutdown or graceful restart has already begun.
+var ErrDaemonShuttingDown = errors.New("daemon shutting down")
+
 // maxSpawnRetries bounds the retry budget in Spawn. Three iterations handle the
 // realistic cases (stuck placeholder cleanup + one isolated-mode promotion);
 // exhaustion is treated as a hard failure and returned to the caller.
@@ -153,6 +157,7 @@ type Daemon struct {
 	zombieDetectedRestore int
 
 	shutdownOnce sync.Once
+	shuttingDown atomic.Bool
 
 	// stats holds atomic handoff counters exposed via HandleStatus (NFR-4 / T025).
 	stats handoffStats
@@ -1007,6 +1012,9 @@ func (d *Daemon) SoftRemove(serverID string) error {
 
 // HandleSpawn implements control.DaemonHandler.
 func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error) {
+	if d.shuttingDown.Load() {
+		return "", "", "", ErrDaemonShuttingDown
+	}
 	ipcPath, serverID, token, err := d.Spawn(req)
 	if err == nil && req.ReconnectReason == "fallback_spawn" {
 		d.reconnectFallbackSpawned.Add(1)
@@ -1021,6 +1029,7 @@ func (d *Daemon) HandleRemove(serverID string) error {
 
 // HandleShutdown implements control.CommandHandler.
 func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
+	d.shuttingDown.Store(true)
 	go d.Shutdown()
 	return "daemon shutting down"
 }
@@ -1088,7 +1097,7 @@ func (d *Daemon) retryControlBind(socketPath string) error {
 // daemon can locate the handoff socket and authenticate (FR-11). The caller does
 // NOT wait for the process — it runs independently and will dial back.
 func spawnSuccessor(tokenPath, socketPath, daemonFlag string) error {
-	exe, err := os.Executable()
+	exe, err := successorExecutable()
 	if err != nil {
 		return fmt.Errorf("handoff: resolve executable: %w", err)
 	}
@@ -1110,6 +1119,25 @@ func spawnSuccessor(tokenPath, socketPath, daemonFlag string) error {
 		return fmt.Errorf("handoff: release successor: %w", err)
 	}
 	return nil
+}
+
+func successorExecutable() (string, error) {
+	if explicit := strings.TrimSpace(os.Getenv("MCPMUX_SUCCESSOR_EXE")); explicit != "" {
+		return explicit, nil
+	}
+	if pointer := strings.TrimSpace(os.Getenv("MCPMUX_ACTIVE_ENGINE_FILE")); pointer != "" {
+		data, err := os.ReadFile(pointer)
+		if err == nil {
+			target := strings.TrimSpace(string(data))
+			if target != "" {
+				if filepath.IsAbs(target) {
+					return filepath.Clean(target), nil
+				}
+				return filepath.Clean(filepath.Join(filepath.Dir(pointer), target)), nil
+			}
+		}
+	}
+	return os.Executable()
 }
 
 // collectHandoffUpstreams calls ShutdownForHandoff on every live owner and
@@ -1253,6 +1281,7 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), erro
 	if err != nil {
 		return "", nil, fmt.Errorf("snapshot: %w", err)
 	}
+	d.shuttingDown.Store(true)
 
 	// Tag owners BEFORE attemptHandoff. collectHandoffUpstreams (inside
 	// attemptHandoff) detaches owners → supervisor fires termination events
@@ -1349,6 +1378,7 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	return map[string]any{
 		"daemon":                          true,
+		"shutting_down":                   d.shuttingDown.Load(),
 		"pid":                             os.Getpid(),
 		"daemon_generation":               d.daemonGeneration,
 		"reaped_owner_count":              d.ownerRemoval.ByReason[ownerRemovalReasonIdle],
@@ -1737,6 +1767,7 @@ func envTransient(key string) bool {
 // Shutdown gracefully stops all owners and the daemon.
 func (d *Daemon) Shutdown() {
 	d.shutdownOnce.Do(func() {
+		d.shuttingDown.Store(true)
 		d.logger.Printf("daemon shutting down...")
 
 		// Cancel supervisor context first — prevents suture from restarting

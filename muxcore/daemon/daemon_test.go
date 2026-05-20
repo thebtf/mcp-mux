@@ -469,6 +469,26 @@ func TestLegacyReconnectSpawnIncrementsFallbackCounter(t *testing.T) {
 	}
 }
 
+func TestHandleSpawnRejectsAfterShutdownBegins(t *testing.T) {
+	d := testDaemon(t)
+	d.shuttingDown.Store(true)
+
+	_, _, _, err := d.HandleSpawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	})
+	if !errors.Is(err, ErrDaemonShuttingDown) {
+		t.Fatalf("HandleSpawn() error = %v, want ErrDaemonShuttingDown", err)
+	}
+
+	status := d.HandleStatus()
+	if got := status["shutting_down"]; got != true {
+		t.Fatalf("status shutting_down = %v, want true", got)
+	}
+}
+
 // TestDaemon_LegacyShimFallbackAfterTokenConsumed asserts back-compat for
 // pre-v0.21.1 shims that have no knowledge of the refresh-token control
 // command (SC-3 requirement).
