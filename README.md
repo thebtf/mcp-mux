@@ -483,27 +483,23 @@ scripts\verify-handoff.ps1
 The script spawns a test daemon, triggers `upgrade --restart`, asserts all upstream PIDs
 survive across the restart, and reports any dropped FDs.
 
-### Public API (muxcore library)
+### muxcore library integration
 
-Consumers of the `muxcore` Go library — e.g. `aimux` — can drive the handoff protocol
-directly:
+Developers embedding `muxcore` in another Go MCP server should start with
+`muxcore/README.md`. The recommended integration path is `engine.New` +
+`engine.Run`: muxcore then owns daemon/client/proxy mode selection, token
+handshake, reconnect, session routing, snapshot restore, and graceful restart.
 
-```go
-import "github.com/thebtf/mcp-mux/muxcore/daemon"
+The lower-level handoff functions in `muxcore/daemon` remain public for custom
+daemon supervisors, but ordinary consumers should not build their own shim or
+connect directly to owner IPC paths. Doing so bypasses the daemon-minted session
+token path and will be rejected by daemon-managed owners.
 
-// Old daemon side
-result, err := daemon.PerformHandoff(ctx, conn, token, upstreams)
-
-// Successor side
-upstreams, err := daemon.ReceiveHandoff(ctx, conn, token)
-
-// Token lifecycle
-token, path, err := daemon.WriteHandoffToken(dir)
-token, err = daemon.ReadHandoffToken(path)
-defer daemon.DeleteHandoffToken(path)
-```
-
-See `muxcore/README.md` for full API docs, platform constraints, and error handling.
+See `muxcore/README.md` for the consumer checklist, required `engine.Config`
+fields, upgrade/launcher contract, guardrails, and low-level handoff API. The
+guide also states the muxcore API design rule: infer safe behavior in `engine`
+when possible, and fail early with an actionable error when the consumer wiring
+is ambiguous.
 
 ### Reference
 
