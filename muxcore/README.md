@@ -14,7 +14,7 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.24.2
+go get github.com/thebtf/mcp-mux/muxcore@v0.24.3
 ```
 
 ## Golden Path
