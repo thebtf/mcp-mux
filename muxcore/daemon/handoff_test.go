@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -191,5 +192,48 @@ func TestRetireOldOwnerSocketsRemovesPathsAndCounts(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("old owner socket path %s still reachable: %v", path, err)
 		}
+	}
+}
+
+func TestSuccessorExecutableUsesActiveEnginePointer(t *testing.T) {
+	dir := t.TempDir()
+	enginePath := filepath.Join(dir, "versions", "abc123", "mcp-mux-engine.exe")
+	if err := os.MkdirAll(filepath.Dir(enginePath), 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(enginePath, []byte("engine"), 0755); err != nil {
+		t.Fatalf("WriteFile engine: %v", err)
+	}
+	pointerPath := filepath.Join(dir, "active.txt")
+	rel, err := filepath.Rel(filepath.Dir(pointerPath), enginePath)
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	if err := os.WriteFile(pointerPath, []byte(rel+"\n"), 0644); err != nil {
+		t.Fatalf("WriteFile pointer: %v", err)
+	}
+
+	t.Setenv("MCPMUX_SUCCESSOR_EXE", "")
+	t.Setenv("MCPMUX_ACTIVE_ENGINE_FILE", pointerPath)
+	got, err := successorExecutable()
+	if err != nil {
+		t.Fatalf("successorExecutable() error = %v", err)
+	}
+	if filepath.Clean(got) != filepath.Clean(enginePath) {
+		t.Fatalf("successorExecutable() = %q, want %q", got, enginePath)
+	}
+}
+
+func TestSuccessorExecutableExplicitOverrideWins(t *testing.T) {
+	t.Setenv("MCPMUX_ACTIVE_ENGINE_FILE", filepath.Join(t.TempDir(), "missing-active.txt"))
+	want := filepath.Join(t.TempDir(), "explicit-engine.exe")
+	t.Setenv("MCPMUX_SUCCESSOR_EXE", want)
+
+	got, err := successorExecutable()
+	if err != nil {
+		t.Fatalf("successorExecutable() error = %v", err)
+	}
+	if filepath.Clean(got) != filepath.Clean(want) {
+		t.Fatalf("successorExecutable() = %q, want %q", got, want)
 	}
 }

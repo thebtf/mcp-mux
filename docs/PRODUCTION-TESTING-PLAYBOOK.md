@@ -104,7 +104,11 @@ go build -trimpath -o .\mcp-mux.exe~ .\cmd\mcp-mux
 
 Expected:
 
-- The pending binary `mcp-mux.exe~` is consumed by `upgrade --restart`.
+- The stable launcher `mcp-mux.exe` remains in place; upgrade does not attempt
+  to rename the configured binary while live shim/daemon processes may hold it.
+- The pending binary `mcp-mux.exe~` is installed under
+  `mcp-mux.versions/<hash>/mcp-mux-engine.exe`, and
+  `mcp-mux.versions/active.txt` points at that engine.
 - `status` responds without handshake failure.
 - Existing consumers reconnect through the shim/daemon path rather than
   requiring manual config edits.
@@ -112,6 +116,7 @@ Expected:
 Broken signals:
 
 - The build cannot write `mcp-mux.exe~`.
+- `upgrade --restart` reports `rename current to old: Access is denied`.
 - `upgrade --restart` reports socket handoff failure without fallback recovery.
 - `status` cannot contact the daemon after restart.
 

@@ -93,6 +93,7 @@ func runGlobalDaemon() {
 		IdleTimeout:      idleTimeout,
 		Logger:           logger,
 		Name:             engineName,
+		DaemonFlag:       "daemon",
 	})
 	if err != nil {
 		logger.Fatalf("failed to start daemon: %v", err)
@@ -123,6 +124,14 @@ func runGlobalDaemon() {
 // Emits structured "ensure_daemon substep=<name>" log lines so the shim's
 // startup timeline can be reconstructed from the CC mcp-logs jsonl.
 func ensureDaemon(logger *log.Logger) error {
+	return ensureDaemonWithin(logger, 15*time.Second)
+}
+
+func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
+	if budget <= 0 {
+		return fmt.Errorf("daemon did not start within reconnect budget")
+	}
+	deadline := time.Now().Add(budget)
 	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	// Fast path: daemon already running (no lock needed).
@@ -153,7 +162,7 @@ func ensureDaemon(logger *log.Logger) error {
 		logger.Printf("ensure_daemon substep=lock_attempt status=contended duration=%v err=%q",
 			time.Since(lockStart), err.Error())
 		waitStart := time.Now()
-		waitErr := waitForDaemon(ctlPath, 15*time.Second)
+		waitErr := waitForDaemon(ctlPath, remainingBudget(deadline, 15*time.Second))
 		if waitErr != nil {
 			logger.Printf("ensure_daemon substep=wait_for_other_shim status=error duration=%v err=%q",
 				time.Since(waitStart), waitErr.Error())
@@ -188,7 +197,7 @@ func ensureDaemon(logger *log.Logger) error {
 		time.Since(spawnStart))
 
 	waitStart := time.Now()
-	if err := waitForDaemon(ctlPath, 10*time.Second); err != nil {
+	if err := waitForDaemon(ctlPath, remainingBudget(deadline, 10*time.Second)); err != nil {
 		logger.Printf("ensure_daemon substep=wait_for_self status=timeout duration=%v err=%q",
 			time.Since(waitStart), err.Error())
 		return err
@@ -196,6 +205,17 @@ func ensureDaemon(logger *log.Logger) error {
 	logger.Printf("ensure_daemon substep=wait_for_self status=ok duration=%v",
 		time.Since(waitStart))
 	return nil
+}
+
+func remainingBudget(deadline time.Time, cap time.Duration) time.Duration {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Nanosecond
+	}
+	if remaining < cap {
+		return remaining
+	}
+	return cap
 }
 
 // waitForDaemon polls until the daemon control socket responds (up to timeout).
@@ -265,6 +285,13 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 }
 
 func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
+	return spawnViaDaemonWithReasonTimeout(command, args, cwd, mode, env, reconnectReason, logger, 30*time.Second)
+}
+
+func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger, timeout time.Duration) (string, string, error) {
+	if timeout <= 0 {
+		return "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
+	}
 	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	// Spawn returns immediately after creating the owner — proactive init runs
@@ -278,7 +305,7 @@ func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, e
 		Mode:            mode,
 		Env:             env,
 		ReconnectReason: reconnectReason,
-	}, 30*time.Second)
+	}, timeout)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
 		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%q", rpcDur, err.Error())
@@ -286,6 +313,9 @@ func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, e
 	}
 	if !resp.OK {
 		logger.Printf("daemon_rpc_spawn status=not_ok duration=%v msg=%q", rpcDur, resp.Message)
+		if resp.Message == daemon.ErrDaemonShuttingDown.Error() {
+			return "", "", fmt.Errorf("daemon spawn failed: %w", daemon.ErrDaemonShuttingDown)
+		}
 		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 

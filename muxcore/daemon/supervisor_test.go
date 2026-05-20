@@ -58,7 +58,7 @@ func TestDaemonSupervisorInitialized(t *testing.T) {
 // lifecycle (avoid race with d.Shutdown cancelling early).
 func TestSupervisorEventHookFires(t *testing.T) {
 	var hookFires atomic.Int32
-	done := make(chan struct{})
+	done := make(chan struct{}, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

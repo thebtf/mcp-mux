@@ -44,12 +44,19 @@ func Send(socketPath string, req Request) (*Response, error) {
 
 // SendWithTimeout is like Send but uses a custom deadline for long operations like drain.
 func SendWithTimeout(socketPath string, req Request, timeout time.Duration) (*Response, error) {
-	conn, err := net.DialTimeout("unix", socketPath, clientDeadline)
+	dialTimeout := clientDeadline
+	if timeout > 0 && timeout < dialTimeout {
+		dialTimeout = timeout
+	}
+	conn, err := net.DialTimeout("unix", socketPath, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("control: dial %s: %w", socketPath, err)
 	}
 	defer conn.Close()
 
+	if timeout <= 0 {
+		timeout = clientDeadline
+	}
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("control: set deadline: %w", err)
 	}

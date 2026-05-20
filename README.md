@@ -202,7 +202,7 @@ MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
 
 mcp-mux shims automatically reconnect when the daemon restarts. This means:
 
-- `mcp-mux upgrade` swaps the binary without dropping connections
+- `mcp-mux upgrade` switches the active versioned engine without dropping connections
 - `mcp-mux stop --force` triggers automatic reconnect within seconds
 - Daemon crashes are recovered transparently
 
@@ -308,7 +308,7 @@ mcp-mux status
 # Stop all running instances and the daemon
 mcp-mux stop [--drain-timeout 30s] [--force]
 
-# Atomic binary upgrade (see section below)
+# Versioned engine upgrade (see section below)
 mcp-mux upgrade
 
 # Start a detached daemon process (normally auto-started by shims)
@@ -318,7 +318,7 @@ mcp-mux daemon
 mcp-mux serve
 ```
 
-## Atomic Upgrade with Graceful Restart
+## Versioned Engine Upgrade with Graceful Restart
 
 Upgrading the mcp-mux binary while sessions are active is safe and fast:
 
@@ -329,22 +329,30 @@ go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
 
 **What happens:**
 
-1. Binary swap: `current` → `.old`, `pending~` → `current` (atomic rename)
-2. Graceful restart: daemon serializes state snapshot (cached init/tools/prompts/resources
+1. The stable `mcp-mux` launcher is left in place; it is not renamed while live shims hold it.
+2. The pending `mcp-mux.exe~` engine is copied or moved into
+   `mcp-mux.versions/<hash>/mcp-mux-engine.exe`.
+3. `mcp-mux.versions/active.txt` is switched to the new engine path.
+4. Graceful restart: daemon serializes state snapshot (cached init/tools/prompts/resources
    responses, classification, session metadata) to a JSON file
-3. Daemon shuts down, shims detect IPC EOF
-4. Shims auto-reconnect, starting a new daemon from the updated binary
-5. New daemon loads snapshot → owners restored with pre-populated caches
-6. Shims get instant cached replay (~1 second reconnect vs 5-15 second cold start)
+5. Daemon shuts down, shims detect IPC EOF
+6. Shims auto-reconnect, starting a new daemon from the active versioned engine
+7. New daemon loads snapshot → owners restored with pre-populated caches
+8. Shims get instant cached replay (~1 second reconnect vs 5-15 second cold start)
 
-**Without `--restart`** (hot swap only):
+The launcher indirection is intentional on Windows: live `mcp-mux.exe` shim and daemon
+processes keep the executable image locked, so a self-rename of the configured binary is
+not a reliable update primitive. Versioned engines avoid that lock; old processes keep
+running from their old engine path while new shims use the active engine pointer.
+
+**Without `--restart`** (active pointer switch only):
 
 ```sh
 mcp-mux upgrade
 ```
 
-The daemon keeps running with the old binary. New shim processes use the new binary.
-The daemon updates on next natural restart.
+The daemon keeps running with its current engine. New shim processes use the new
+active engine. The daemon updates on next natural restart.
 
 **Graceful restart preserves (v0.21.0+):**
 

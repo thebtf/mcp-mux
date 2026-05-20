@@ -1,7 +1,10 @@
 # ADR-009: Upgrade Strategy — Rename-Swap Without Daemon Restart
 
 ## Status
-Accepted
+Superseded by ADR 012 for Windows-safe engine updates. The stdio pipe
+ownership analysis still stands, but the binary replacement mechanism is now a
+stable launcher plus versioned engine pointer rather than self-renaming the
+configured executable.
 
 ## Context
 mcp-mux daemon manages N upstream processes via stdio pipes (kernel pipe objects).
