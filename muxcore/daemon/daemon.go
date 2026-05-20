@@ -1275,13 +1275,15 @@ func (d *Daemon) attemptHandoff() error {
 // (FR-1/FR-2/FR-3). On any handoff failure the "handoff.fallback" log line is
 // emitted and the function falls through to legacy kill-and-respawn (FR-8).
 func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
+	d.shuttingDown.Store(true)
+
 	// Serialize snapshot first — needed for FR-8 fallback and successor seed
 	// regardless of whether handoff succeeds.
 	snapshotPath, err := d.SerializeSnapshot()
 	if err != nil {
+		d.shuttingDown.Store(false)
 		return "", nil, fmt.Errorf("snapshot: %w", err)
 	}
-	d.shuttingDown.Store(true)
 
 	// Tag owners BEFORE attemptHandoff. collectHandoffUpstreams (inside
 	// attemptHandoff) detaches owners → supervisor fires termination events

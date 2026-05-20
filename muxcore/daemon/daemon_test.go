@@ -489,6 +489,26 @@ func TestHandleSpawnRejectsAfterShutdownBegins(t *testing.T) {
 	}
 }
 
+func TestGracefulRestartSnapshotFailureReopensSpawn(t *testing.T) {
+	d := testDaemon(t)
+
+	badTemp := filepath.Join(t.TempDir(), "temp-is-file")
+	if err := os.WriteFile(badTemp, []byte("not a directory"), 0600); err != nil {
+		t.Fatalf("WriteFile bad temp: %v", err)
+	}
+	t.Setenv("TMP", badTemp)
+	t.Setenv("TEMP", badTemp)
+	t.Setenv("TMPDIR", badTemp)
+
+	_, _, err := d.HandleGracefulRestart(0)
+	if err == nil {
+		t.Fatal("HandleGracefulRestart() error = nil, want snapshot failure")
+	}
+	if d.shuttingDown.Load() {
+		t.Fatal("shuttingDown stayed true after snapshot failure")
+	}
+}
+
 // TestDaemon_LegacyShimFallbackAfterTokenConsumed asserts back-compat for
 // pre-v0.21.1 shims that have no knowledge of the refresh-token control
 // command (SC-3 requirement).
