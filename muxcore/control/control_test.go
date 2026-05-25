@@ -236,6 +236,18 @@ func (m *mockDaemonHandler) HandleListOwners(req Request) (ListOwnersResponse, e
 	return ListOwnersResponse{}, nil
 }
 
+type mockGracefulOptionsHandler struct {
+	mockDaemonHandler
+	optsCalled bool
+	opts       GracefulRestartOptions
+}
+
+func (m *mockGracefulOptionsHandler) HandleGracefulRestartWithOptions(opts GracefulRestartOptions) (string, func(), error) {
+	m.optsCalled = true
+	m.opts = opts
+	return "/tmp/options-snapshot.json", nil, nil
+}
+
 // TestSocketPath verifies SocketPath returns the address used at creation.
 func TestSocketPath(t *testing.T) {
 	path := testSocketPath(t)
@@ -249,6 +261,37 @@ func TestSocketPath(t *testing.T) {
 	got := srv.SocketPath()
 	if got != path {
 		t.Errorf("SocketPath = %q, want %q", got, path)
+	}
+}
+
+func TestGracefulRestartPassesSuccessorExeToOptionsHandler(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockGracefulOptionsHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{
+		Cmd:            "graceful-restart",
+		DrainTimeoutMs: 1234,
+		SuccessorExe:   "/tmp/new-engine",
+	})
+	if err != nil {
+		t.Fatalf("Send graceful-restart: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("graceful-restart not OK: %s", resp.Message)
+	}
+	if !handler.optsCalled {
+		t.Fatal("HandleGracefulRestartWithOptions was not called")
+	}
+	if handler.opts.DrainTimeoutMs != 1234 || handler.opts.SuccessorExe != "/tmp/new-engine" {
+		t.Fatalf("options = %+v, want drain=1234 successor=/tmp/new-engine", handler.opts)
+	}
+	if resp.IPCPath != "/tmp/options-snapshot.json" {
+		t.Fatalf("snapshot path = %q, want /tmp/options-snapshot.json", resp.IPCPath)
 	}
 }
 

@@ -1096,8 +1096,8 @@ func (d *Daemon) retryControlBind(socketPath string) error {
 // injecting MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET so the successor
 // daemon can locate the handoff socket and authenticate (FR-11). The caller does
 // NOT wait for the process — it runs independently and will dial back.
-func spawnSuccessor(tokenPath, socketPath, daemonFlag string) error {
-	exe, err := successorExecutable()
+func spawnSuccessor(tokenPath, socketPath, daemonFlag, successorExe string) error {
+	exe, err := successorExecutableFor(successorExe)
 	if err != nil {
 		return fmt.Errorf("handoff: resolve executable: %w", err)
 	}
@@ -1122,6 +1122,13 @@ func spawnSuccessor(tokenPath, socketPath, daemonFlag string) error {
 }
 
 func successorExecutable() (string, error) {
+	return successorExecutableFor("")
+}
+
+func successorExecutableFor(explicitOverride string) (string, error) {
+	if explicit := strings.TrimSpace(explicitOverride); explicit != "" {
+		return explicit, nil
+	}
 	if explicit := strings.TrimSpace(os.Getenv("MCPMUX_SUCCESSOR_EXE")); explicit != "" {
 		return explicit, nil
 	}
@@ -1186,7 +1193,7 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 //   - ErrTokenMismatch (successor presented wrong token — FR-11)
 //   - ErrProtocolVersionMismatch (binary skew — FR-6)
 //   - Any other performHandoff protocol error (conn drop, JSON decode failure)
-func (d *Daemon) attemptHandoff() error {
+func (d *Daemon) attemptHandoff(successorExe string) error {
 	d.stats.attempted.Add(1)
 	startedAt := time.Now()
 	baseDir := os.TempDir()
@@ -1218,7 +1225,7 @@ func (d *Daemon) attemptHandoff() error {
 	}()
 
 	// Spawn successor with handoff credentials.
-	if spawnErr := spawnSuccessor(tokenPath, socketPath, d.daemonFlag); spawnErr != nil {
+	if spawnErr := spawnSuccessor(tokenPath, socketPath, d.daemonFlag, successorExe); spawnErr != nil {
 		// Do NOT drain connCh here — the listener goroutine will self-terminate
 		// once handoffAcceptTimeout expires (buffered channel prevents goroutine
 		// leak; the accepted conn, if any arrives despite the spawn failure, is
@@ -1275,6 +1282,11 @@ func (d *Daemon) attemptHandoff() error {
 // (FR-1/FR-2/FR-3). On any handoff failure the "handoff.fallback" log line is
 // emitted and the function falls through to legacy kill-and-respawn (FR-8).
 func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
+	return d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{DrainTimeoutMs: drainTimeoutMs})
+}
+
+// HandleGracefulRestartWithOptions implements control.GracefulRestartOptionsHandler.
+func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOptions) (string, func(), error) {
 	d.shuttingDown.Store(true)
 
 	// Serialize snapshot first — needed for FR-8 fallback and successor seed
@@ -1298,7 +1310,7 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), erro
 	// Attempt FD-passing handoff. Every identifiable failure mode routes through
 	// the fallback log line; callers never see a handoff error — FR-8 is silent
 	// to the control-plane caller (it still gets a valid snapshot path).
-	if handoffErr := d.attemptHandoff(); handoffErr != nil {
+	if handoffErr := d.attemptHandoff(opts.SuccessorExe); handoffErr != nil {
 		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
