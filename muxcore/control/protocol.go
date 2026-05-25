@@ -11,8 +11,12 @@ import "encoding/json"
 // Supported daemon commands include "spawn", "remove", "graceful-restart",
 // and "refresh-token".
 type Request struct {
-	Cmd            string            `json:"cmd"`
-	DrainTimeoutMs int               `json:"drain_timeout_ms,omitempty"`
+	Cmd            string `json:"cmd"`
+	DrainTimeoutMs int    `json:"drain_timeout_ms,omitempty"`
+	// SuccessorExe optionally tells a graceful-restart capable daemon which
+	// executable should be launched as the successor. When empty, the daemon
+	// falls back to its environment-driven successor resolution.
+	SuccessorExe string `json:"successor_exe,omitempty"`
 
 	// Spawn fields (daemon control protocol)
 	Command string            `json:"command,omitempty"`
@@ -74,4 +78,18 @@ type DaemonHandler interface {
 	HandleRefreshSessionToken(prevToken string) (newToken string, err error)
 	HandleReconnectGiveUp(reason string) error
 	HandleListOwners(req Request) (ListOwnersResponse, error)
+}
+
+// GracefulRestartOptions carries additive graceful-restart parameters. Daemon
+// handlers that implement GracefulRestartOptionsHandler receive this richer
+// shape; older handlers continue through HandleGracefulRestart.
+type GracefulRestartOptions struct {
+	DrainTimeoutMs int
+	SuccessorExe   string
+}
+
+// GracefulRestartOptionsHandler is an optional daemon handler upgrade for
+// graceful-restart requests that need to specify the successor executable.
+type GracefulRestartOptionsHandler interface {
+	HandleGracefulRestartWithOptions(opts GracefulRestartOptions) (snapshotPath string, afterResponse func(), err error)
 }

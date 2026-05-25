@@ -167,7 +167,17 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		if !ok {
 			return Response{OK: false, Message: "graceful-restart not supported (not a daemon)"}, nil
 		}
-		snapshotPath, afterFn, err := dh.HandleGracefulRestart(req.DrainTimeoutMs)
+		var snapshotPath string
+		var afterFn func()
+		var err error
+		if oh, ok := dh.(GracefulRestartOptionsHandler); ok {
+			snapshotPath, afterFn, err = oh.HandleGracefulRestartWithOptions(GracefulRestartOptions{
+				DrainTimeoutMs: req.DrainTimeoutMs,
+				SuccessorExe:   req.SuccessorExe,
+			})
+		} else {
+			snapshotPath, afterFn, err = dh.HandleGracefulRestart(req.DrainTimeoutMs)
+		}
 		if err != nil {
 			return Response{OK: false, Message: fmt.Sprintf("graceful-restart: %v", err)}, nil
 		}

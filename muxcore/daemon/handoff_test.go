@@ -237,3 +237,17 @@ func TestSuccessorExecutableExplicitOverrideWins(t *testing.T) {
 		t.Fatalf("successorExecutable() = %q, want %q", got, want)
 	}
 }
+
+func TestSuccessorExecutableRequestOverrideWins(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), "env-engine.exe")
+	requestPath := filepath.Join(t.TempDir(), "request-engine.exe")
+	t.Setenv("MCPMUX_SUCCESSOR_EXE", envPath)
+
+	got, err := successorExecutableFor(requestPath)
+	if err != nil {
+		t.Fatalf("successorExecutableFor() error = %v", err)
+	}
+	if filepath.Clean(got) != filepath.Clean(requestPath) {
+		t.Fatalf("successorExecutableFor() = %q, want request override %q", got, requestPath)
+	}
+}

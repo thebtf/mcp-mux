@@ -265,6 +265,51 @@ behind a versioned engine pointer.
 but it is not a full production update strategy for binaries that may be held
 open by many live shim processes.
 
+### Apply Update and Restart
+
+Engine consumers that use `engine.New` should prefer
+`MuxEngine.ApplyUpdateAndRestart` over hand-rolled upgrade code. It combines
+the Windows-safe binary swap with daemon lifecycle orchestration:
+
+```go
+result, err := eng.ApplyUpdateAndRestart(ctx, engine.UpdateAndRestartOptions{
+    CurrentExe:      currentExe,
+    StagedExe:       currentExe + "~",
+    DrainTimeout:    30 * time.Second,
+    RestartTimeout:  60 * time.Second,
+    ShutdownTimeout: 10 * time.Second,
+    ReadyTimeout:    10 * time.Second,
+    CleanStale:      true,
+})
+if err != nil {
+    var updateErr *engine.UpdateAndRestartError
+    if errors.As(err, &updateErr) {
+        // updateErr.Phase tells whether the failure happened during swap,
+        // daemon lock, graceful restart, fallback shutdown, replacement
+        // start, or ready wait. updateErr.Result reports partial success.
+    }
+    return err
+}
+_ = result
+```
+
+The helper:
+
+1. Calls `upgrade.Swap(CurrentExe, StagedExe)`.
+2. Acquires the daemon namespace lock for `engine.Config.Name` and `BaseDir`.
+3. Sends `graceful-restart` with `successor_exe` set to `CurrentExe`.
+4. Falls back to `shutdown` if graceful restart is unavailable or rejected.
+5. Starts the replacement daemon from `CurrentExe` when a successor is not
+   already ready.
+6. Waits for the replacement daemon to answer `ping` before releasing the lock.
+
+SessionHandler consumers such as aimux can use this in their own
+`upgrade(action=apply)` path after staging a new binary. The shim process must
+survive for transparent reconnect to work. Muxcore keeps the shim transport
+alive and reconnects it to the replacement daemon when possible; it does not
+promise that every in-flight request succeeds. Requests active during reconnect
+may receive explicit JSON-RPC errors by original ID.
+
 ## What muxcore Enforces
 
 These guardrails exist in current muxcore:
@@ -277,6 +322,7 @@ These guardrails exist in current muxcore:
 | Daemon-managed owner connections require one-time tokens. | daemon spawn + owner accept loop |
 | Reconnect first tries token refresh, then falls back to daemon spawn. | resilient client |
 | Spawn is rejected while daemon shutdown/restart is in progress. | daemon spawn path |
+| Live updates use one engine helper for swap, daemon lock, restart, fallback, start, and ready wait. | `engine.ApplyUpdateAndRestart` |
 | Owner sockets are scoped by engine name. | serverid/daemon/owner paths |
 | Stale-socket cleanup is name-scoped. | daemon startup |
 | `AuthorizeSession` panics cannot crash the daemon. | owner accept loop |

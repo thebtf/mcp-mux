@@ -57,13 +57,59 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.24.0)
+## muxcore Library API (v0.24.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.24.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.24.4
 ```
+
+### v0.24.4 — engine.ApplyUpdateAndRestart for SessionHandler consumers (#239)
+
+**No breaking changes.** The new update helper is additive; existing
+`upgrade.Swap`, control commands, and engine configuration keep their current
+behavior.
+
+| API | Semantics |
+|-----|-----------|
+| `engine.UpdateAndRestartOptions` | Caller supplies `CurrentExe`, `StagedExe`, drain/restart/shutdown/ready timeouts, stale cleanup preference, and optional lock-failure behavior. |
+| `engine.UpdateAndRestartResult` | Reports partial success: `OldPath`, daemon-running state, lock acquisition, graceful restart, shutdown fallback, replacement start/readiness, stale cleanup count, and warnings. |
+| `(*engine.MuxEngine).ApplyUpdateAndRestart(ctx, opts)` | Runs the reusable provider sequence: `upgrade.Swap`, daemon namespace lock, `graceful-restart`, shutdown fallback, wait-for-exit, replacement daemon start, and ready wait. |
+| `control.Request.SuccessorExe` + `control.GracefulRestartOptionsHandler` | Additive control-plane extension so a caller can tell the old daemon which executable should become the successor during graceful restart. Older handlers fall back to the legacy `HandleGracefulRestart(int)` path. |
+
+**Migration for aimux after muxcore release:**
+
+```go
+result, err := eng.ApplyUpdateAndRestart(ctx, engine.UpdateAndRestartOptions{
+    CurrentExe:      currentExe,
+    StagedExe:       currentExe + "~",
+    DrainTimeout:    30 * time.Second,
+    RestartTimeout:  60 * time.Second,
+    ShutdownTimeout: 10 * time.Second,
+    ReadyTimeout:    10 * time.Second,
+    CleanStale:      true,
+})
+```
+
+Contract: surviving shims reconnect automatically to the replacement daemon
+when possible. This is transport continuity, not request replay; in-flight
+requests may receive explicit JSON-RPC errors by original ID.
+
+**Tests landed in this release:**
+- `TestApplyUpdateAndRestart_GracefulSuccessUsesSuccessorExe`
+- `TestApplyUpdateAndRestart_DaemonNotRunningOnlySwaps`
+- `TestApplyUpdateAndRestart_SwapFailureStopsBeforeDaemonCalls`
+- `TestApplyUpdateAndRestart_GracefulErrorFallsBackToShutdownAndStart`
+- `TestApplyUpdateAndRestart_LockFailureIsPhaseError`
+- `TestApplyUpdateAndRestart_FallbackExitTimeoutIsPhaseError`
+- `TestApplyUpdateAndRestart_StartFailureIsPhaseError`
+- `TestApplyUpdateAndRestart_ReadyTimeoutIsPhaseError`
+- `TestApplyUpdateAndRestart_SessionHandlerConsumerUsesEngineNamespace`
+- `TestGracefulRestartPassesSuccessorExeToOptionsHandler`
+- `TestSuccessorExecutableRequestOverrideWins`
+
+---
 
 ### v0.24.0 — multi-tenant extensions: ConnInfo + SessionMeta + AuthorizeSession + OnFrameReceived (#109, #110, #111, #112)
 
@@ -372,9 +418,9 @@ oldPath, err := upgrade.Swap(currentExe, newExe)
 cleaned := upgrade.CleanStale(exePath)
 ```
 
-For full graceful restart with snapshot serialization, the daemon-specific logic
-(signal, wait, re-start) remains in the consumer's main.go — `upgrade.Swap` handles
-only the atomic file rename.
+For current consumers, prefer `engine.ApplyUpdateAndRestart` for the full live
+update flow. `upgrade.Swap` remains the low-level atomic file rename primitive;
+by itself it does not signal, wait for, or restart a daemon.
 
 #### Bug fixes included in v0.18.0–v0.19.0
 
@@ -397,7 +443,7 @@ cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.23.0
 
 Key changes to adopt:
 1. **SessionHandler** — replace `srv.StdioHandler()` with SessionHandler implementation to get per-CC-session ProjectContext
-2. **upgrade.Swap** — replace manual binary rename with `upgrade.Swap(exe, newExe)` + `upgrade.CleanStale(exe)`
+2. **ApplyUpdateAndRestart** — for live update flows, stage the new binary and call `eng.ApplyUpdateAndRestart(...)`; use `upgrade.Swap` only for low-level rename-only cases.
 3. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
 4. **Circuit breaker** — included automatically, protects against upstream crash loops
 
