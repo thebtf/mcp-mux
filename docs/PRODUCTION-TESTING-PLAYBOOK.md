@@ -132,54 +132,66 @@ Setup:
 - A shareable MCP server in `mcp-mux` host config (the test uses `time`
   server: `uvx mcp-server-time` — known shared-classifiable by tools/list).
 
-Commands (run as a user, not a developer — open two new shells and pretend
-they are two different host sessions):
+Commands (run as a user, not a developer):
 
-```powershell
-# Shell A — first cwd
-cd $env:USERPROFILE
-.\mcp-mux.exe status | ConvertFrom-Json | Select-Object -ExpandProperty servers | `
-  Where-Object { $_.command -eq 'uvx' -and $_.args -contains 'mcp-server-time' } | `
-  Measure-Object | Select-Object -ExpandProperty Count
+1. Open **two** new shells, each in a **different cwd**, and pretend each
+   is a different host session. Example layout:
 
-# Shell B — second cwd, identical command
-cd D:\Dev\mcp-mux
-.\mcp-mux.exe status | ConvertFrom-Json | Select-Object -ExpandProperty servers | `
-  Where-Object { $_.command -eq 'uvx' -and $_.args -contains 'mcp-server-time' } | `
-  Measure-Object | Select-Object -ExpandProperty Count
-```
+   ```powershell
+   # Shell A
+   cd $env:USERPROFILE
 
-Trigger both shells to actually USE the time tool (so the shim spawns the
-upstream and classification completes). Easiest: ask each shell's host to
-run a single `get_current_time` call, or invoke `uvx mcp-server-time` once
-manually if your host wraps it.
+   # Shell B
+   cd D:\Dev\mcp-mux
+   ```
 
-Then count active owners for that command across the whole daemon:
+2. Trigger each shell's host to actually USE the time MCP server at least
+   once (so the shim spawns the upstream and classification completes).
+   Easiest: in each host session, ask the agent to run a `get_current_time`
+   tool call.
 
-```powershell
-.\mcp-mux.exe status | ConvertFrom-Json | Select-Object -ExpandProperty servers | `
-  Where-Object { $_.command -eq 'uvx' -and $_.args -contains 'mcp-server-time' } | `
-  Format-Table server_id, mode, cwd, classification, session_count -AutoSize
-```
+3. Open a **third** shell — a regular PowerShell window, NOT a host session —
+   for inspection. From that third shell:
+
+   ```powershell
+   .\mcp-mux.exe status |
+     ConvertFrom-Json |
+     Select-Object -ExpandProperty servers |
+     Where-Object { $_.command -eq 'uvx' -and ($_.args -join ' ') -match 'mcp-server-time' } |
+     Format-Table server_id, cwd, cwd_set, auto_classification, session_count, persistent -AutoSize
+   ```
 
 Expected:
 
-- After both shells have invoked the time tool, the table shows exactly ONE
-  active `uvx mcp-server-time` owner. The owner's `cwd_set` (or `cwd`) covers
-  both shells' working directories.
-- `mode` reads `global` (not `cwd`).
-- `classification` is `shared` (or `session-aware`); not `isolated`.
-- Subsequent calls from either shell reuse the same `server_id` — visible by
-  re-running the count query and seeing it stay at 1.
+- After both shells have invoked the time tool, the table shows **exactly ONE**
+  row matching `uvx ... mcp-server-time`. Verify with:
+
+  ```powershell
+  (.\mcp-mux.exe status |
+    ConvertFrom-Json |
+    Select-Object -ExpandProperty servers |
+    Where-Object { $_.command -eq 'uvx' -and ($_.args -join ' ') -match 'mcp-server-time' }).Count
+  # Expected: 1
+  ```
+
+- The owner's `cwd_set` array length is **2**, with both shells' working
+  directories listed (e.g. `["C:\\Users\\<you>", "D:\\Dev\\mcp-mux"]`). The
+  single `cwd` field shows whichever shell spawned first.
+- `auto_classification` reads `shared` (or `session-aware`); NOT `isolated`.
+- Subsequent invocations from either shell reuse the same `server_id` —
+  re-running the count query stays at 1.
 
 Broken signals:
 
-- Two owners for the same `(command, args)` tuple appear, one per cwd.
-- `mode` reads `cwd` for the second-shell entry.
-- `classification` reports `isolated` for a server that legitimately
-  advertises shared tools/list (operator should check the upstream's
-  capability — not a global-first bug if the upstream itself claims
-  isolation).
+- Two rows for the same `(command, args)` tuple appear — global-first dedup
+  did not collapse them.
+- `cwd_set` contains only one of the two directories — second-shell spawn
+  did not bind to the existing owner.
+- `auto_classification` reports `isolated` for a server that legitimately
+  advertises shared tools/list. Check the upstream's actual capability
+  before concluding v0.25.0 regression — `mcp-server-time` is normally
+  shared-classifiable; an isolated verdict suggests classification
+  bypassed (look at `classification_source` and `classification_reason`).
 
 ## Scenario 6: Isolated Owner Short Idle Cleanup (v0.25.0)
 
@@ -199,25 +211,28 @@ Commands:
 ```powershell
 # 1. Trigger ONE invocation of the isolated server from a host, then close
 #    the host session (or stop using that server in that session).
-# 2. Note the server_id immediately after invocation:
-.\mcp-mux.exe status | ConvertFrom-Json | `
-  Select-Object -ExpandProperty servers | `
-  Where-Object { $_.classification -eq 'isolated' -and $_.session_count -eq 0 } | `
-  Select-Object server_id, command, classification, session_count, idle_seconds
+# 2. Note the server_id immediately after invocation. Use auto_classification
+#    (not "classification" — there is no such field in the status payload):
+.\mcp-mux.exe status |
+  ConvertFrom-Json |
+  Select-Object -ExpandProperty servers |
+  Where-Object { $_.auto_classification -eq 'isolated' -and $_.session_count -eq 0 } |
+  Select-Object server_id, command, auto_classification, session_count, idle_timeout_s, last_session
 
 # 3. Wait 70 seconds (10 seconds past the 60s default cleanup threshold).
 Start-Sleep -Seconds 70
 
-# 4. Re-check status:
-.\mcp-mux.exe status | ConvertFrom-Json | `
-  Select-Object -ExpandProperty servers | `
+# 4. Re-check status by server_id captured in step 2:
+.\mcp-mux.exe status |
+  ConvertFrom-Json |
+  Select-Object -ExpandProperty servers |
   Where-Object { $_.server_id -eq '<noted-sid-from-step-2>' }
 ```
 
 Expected:
 
 - Step 2 finds the isolated owner with `session_count: 0` and
-  `classification: "isolated"`.
+  `auto_classification: "isolated"`.
 - Step 4 returns no rows — the owner has been reaped.
 - A re-spawn of the same upstream from a new session works fine (no zombie
   state).
@@ -251,11 +266,12 @@ $env:GITHUB_TOKEN = 'abc'
 $env:GITHUB_TOKEN = 'xyz'
 # Start a host session in Shell B and invoke the same github MCP server.
 
-# In a third shell, inspect:
-.\mcp-mux.exe status | ConvertFrom-Json | `
-  Select-Object -ExpandProperty servers | `
-  Where-Object { $_.command -match 'github' -or ($_.args -join ' ') -match 'github' } | `
-  Format-Table server_id, mode, session_count, cwd -AutoSize
+# In a THIRD shell — a plain PowerShell window, NOT a host session — inspect:
+.\mcp-mux.exe status |
+  ConvertFrom-Json |
+  Select-Object -ExpandProperty servers |
+  Where-Object { $_.command -match 'github' -or ($_.args -join ' ') -match 'github' } |
+  Format-Table server_id, session_count, cwd, auto_classification -AutoSize
 ```
 
 Expected:
