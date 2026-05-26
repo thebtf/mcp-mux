@@ -24,14 +24,83 @@ func TestGenerateContextKeyDifferentEnv(t *testing.T) {
 	}
 }
 
-func TestGenerateContextKeyIsolated(t *testing.T) {
+// TestGenerateContextKey_IsolatedDeterministic encodes the post-CR-001
+// contract for isolated server IDs: identical (cmd, args, cwd) inputs MUST
+// produce identical sids so per-(cwd, server) reconnects can rebind to the
+// existing owner instead of spawning a fresh upstream every time. Replaces
+// the pre-CR-001 behavior that minted a random UUID per call and never
+// allowed reuse.
+//
+// Engram #244 Bug 2 reference: 23 random-UUID isolated owners coexisted on
+// one workstation because every new session for the same (cmd, cwd) got a
+// fresh upstream. Deterministic hashing eliminates that accumulation pattern.
+func TestGenerateContextKey_IsolatedDeterministic(t *testing.T) {
 	id1 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, []string{}, "/dev/app")
 	id2 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, []string{}, "/dev/app")
-	if id1 == id2 {
-		t.Errorf("isolated mode produced same ID: %s", id1)
+	if id1 != id2 {
+		t.Errorf("isolated mode must be deterministic for identical inputs, got %s vs %s", id1, id2)
 	}
 	if !strings.HasPrefix(id1, "isolated-") {
 		t.Errorf("isolated mode missing prefix: %s", id1)
+	}
+}
+
+// TestGenerateContextKey_IsolatedDistinctByCwd proves cwd participates in the
+// hash so two cwds for the same (cmd, args) do NOT collapse onto the same
+// owner. Without this, the split-on-isolation path in CR-002 could mistakenly
+// share an isolated upstream across projects.
+func TestGenerateContextKey_IsolatedDistinctByCwd(t *testing.T) {
+	id1 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, nil, "/dev/app-1")
+	id2 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, nil, "/dev/app-2")
+	if id1 == id2 {
+		t.Errorf("isolated mode must differ by cwd, got identical %s", id1)
+	}
+}
+
+// TestGenerateContextKey_IsolatedDistinctByArgs proves args participate in
+// the hash (mirrors the shared-mode behavior). Two upstreams with same cmd
+// but different args are different upstreams.
+func TestGenerateContextKey_IsolatedDistinctByArgs(t *testing.T) {
+	id1 := GenerateContextKey(ModeIsolated, "node", []string{"server-a.js"}, nil, "/dev/app")
+	id2 := GenerateContextKey(ModeIsolated, "node", []string{"server-b.js"}, nil, "/dev/app")
+	if id1 == id2 {
+		t.Errorf("isolated mode must differ by args, got identical %s", id1)
+	}
+}
+
+// TestGenerateContextKey_IsolatedEnvIndependent proves env vars do NOT
+// participate in the isolated hash. Transient session env (CLAUDE_CODE_*,
+// TERM_PROGRAM, etc.) varies between MCP host invocations for the same
+// project; if env were part of identity, every reconnect would create a
+// new owner.
+func TestGenerateContextKey_IsolatedEnvIndependent(t *testing.T) {
+	id1 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, []string{"API=1"}, "/dev/app")
+	id2 := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, []string{"API=2"}, "/dev/app")
+	if id1 != id2 {
+		t.Errorf("isolated mode must ignore env, got %s vs %s", id1, id2)
+	}
+}
+
+// TestGenerateContextKey_IsolatedFormatPreserved keeps the wire-format
+// contract: "isolated-" prefix + 16-hex suffix = 25 chars total. Snapshot
+// files written by old code (random UUIDs in the same format) must remain
+// parseable; we only change the chance of collision, not the shape.
+func TestGenerateContextKey_IsolatedFormatPreserved(t *testing.T) {
+	id := GenerateContextKey(ModeIsolated, "node", []string{"server.js"}, nil, "/dev/app")
+	if !strings.HasPrefix(id, "isolated-") {
+		t.Errorf("isolated id %q missing prefix", id)
+	}
+	const wantLen = len("isolated-") + 16
+	if len(id) != wantLen {
+		t.Errorf("isolated id %q has length %d, want %d", id, len(id), wantLen)
+	}
+	// Suffix must be hex.
+	suffix := strings.TrimPrefix(id, "isolated-")
+	for _, c := range suffix {
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+		if !isHex {
+			t.Errorf("isolated id %q has non-hex suffix char %q", id, c)
+		}
 	}
 }
 

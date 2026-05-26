@@ -258,6 +258,13 @@ func TestDaemonRemove(t *testing.T) {
 }
 
 func TestDaemonShutdownCleansAll(t *testing.T) {
+	// 3 distinct cwds — under post-CR-001 deterministic isolated identity,
+	// identical (cmd, args) with identical cwd collapse to one owner. To get
+	// 3 owners we must vary the cwd. TempDirs allocated BEFORE testDaemon
+	// so Shutdown LIFO cleanup terminates upstream subprocesses before
+	// TempDir rm-rf (Windows subprocess cwd-lock).
+	cwds := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+
 	d := testDaemon(t)
 
 	for i := 0; i < 3; i++ {
@@ -265,6 +272,7 @@ func TestDaemonShutdownCleansAll(t *testing.T) {
 			Cmd:     "spawn",
 			Command: "go",
 			Args:    []string{"run", "../../testdata/mock_server.go"},
+			Cwd:     cwds[i],
 			Mode:    "isolated",
 		})
 		if err != nil {

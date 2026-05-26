@@ -308,42 +308,99 @@ func TestDedup_SharedServersReusedAcrossCwd(t *testing.T) {
 	}
 }
 
-// TestDedup_IsolatedServersNotShared verifies that mode="isolated" always creates
-// a new owner regardless of command+args, so two isolated spawns yield two
-// distinct owners in the daemon.
-func TestDedup_IsolatedServersNotShared(t *testing.T) {
+// TestDedup_IsolatedServersDistinctByCwd verifies the post-CR-001 contract for
+// mode="isolated": identity is deterministic on (cmd, args, cwd), so two
+// isolated spawns from DIFFERENT cwds produce two distinct owners (cross-cwd
+// isolation preserved), while two isolated spawns from the SAME (cmd, args,
+// cwd) reuse one owner (see companion TestDedup_IsolatedSameContextReuses).
+//
+// Replaces pre-CR-001 TestDedup_IsolatedServersNotShared which asserted
+// "isolated always gets a fresh sid regardless of inputs" — that encoded the
+// random-UUID accumulation bug (Engram #244 Bug 2). Under the new contract,
+// "isolated" still prevents cross-CWD sharing, but allows same-context reuse.
+func TestDedup_IsolatedServersDistinctByCwd(t *testing.T) {
+	// TempDirs allocated BEFORE testDaemon so the daemon's Shutdown cleanup
+	// (t.Cleanup LIFO) terminates upstream subprocesses BEFORE TempDir rm-rf
+	// runs on Windows — otherwise Windows file locks on the subprocess cwd
+	// fail the rm-rf and mark the test FAIL post-assertions.
+	cwd1 := t.TempDir()
+	cwd2 := t.TempDir()
+
 	d := testDaemon(t)
 
-	// Use the absolute path to mock_server.go so the process can start from any cwd.
 	mockServer := testdataPath(t, "mock_server.go")
 
 	ipcPath1, sid1, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", mockServer},
+		Cwd:     cwd1,
 		Mode:    "isolated",
 	})
 	if err != nil {
-		t.Fatalf("Spawn() isolated-1 error: %v", err)
+		t.Fatalf("Spawn() isolated-cwd1 error: %v", err)
 	}
 
 	ipcPath2, sid2, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", mockServer},
+		Cwd:     cwd2,
+		Mode:    "isolated",
+	})
+	if err != nil {
+		t.Fatalf("Spawn() isolated-cwd2 error: %v", err)
+	}
+
+	if ipcPath1 == ipcPath2 {
+		t.Errorf("isolated servers from different cwds must not share ipc_path: both returned %s", ipcPath1)
+	}
+	if sid1 == sid2 {
+		t.Errorf("isolated servers from different cwds must not share server_id: both returned %s", sid1)
+	}
+	if d.OwnerCount() != 2 {
+		t.Errorf("OwnerCount = %d, want 2 for two isolated spawns from distinct cwds", d.OwnerCount())
+	}
+}
+
+// TestDedup_IsolatedSameContextReuses asserts the reuse half of the post-CR-001
+// contract: two isolated spawns with identical (cmd, args, cwd) hit the same
+// owner. This is the half that fixes Engram #244 Bug 2's accumulation pattern
+// — every reconnect of the same isolated upstream from the same project now
+// rebinds instead of spawning a fresh subprocess.
+func TestDedup_IsolatedSameContextReuses(t *testing.T) {
+	cwd := t.TempDir()
+
+	d := testDaemon(t)
+
+	mockServer := testdataPath(t, "mock_server.go")
+
+	_, sid1, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", mockServer},
+		Cwd:     cwd,
+		Mode:    "isolated",
+	})
+	if err != nil {
+		t.Fatalf("Spawn() isolated-1 error: %v", err)
+	}
+
+	_, sid2, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", mockServer},
+		Cwd:     cwd,
 		Mode:    "isolated",
 	})
 	if err != nil {
 		t.Fatalf("Spawn() isolated-2 error: %v", err)
 	}
 
-	if ipcPath1 == ipcPath2 {
-		t.Errorf("isolated servers must not share ipc_path: both returned %s", ipcPath1)
+	if sid1 != sid2 {
+		t.Errorf("isolated servers with identical (cmd, args, cwd) must reuse owner: got %s vs %s", sid1, sid2)
 	}
-	if sid1 == sid2 {
-		t.Errorf("isolated servers must not share server_id: both returned %s", sid1)
-	}
-	if d.OwnerCount() != 2 {
-		t.Errorf("OwnerCount = %d, want 2 for two isolated spawns", d.OwnerCount())
+	if d.OwnerCount() != 1 {
+		t.Errorf("OwnerCount = %d, want 1 for two isolated spawns of identical context", d.OwnerCount())
 	}
 }

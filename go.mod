@@ -9,7 +9,6 @@ require (
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/thejerf/suture/v4 v4.0.6 // indirect
 )
 
