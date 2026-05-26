@@ -196,8 +196,10 @@ Broken signals:
 ## Scenario 6: Isolated Owner Short Idle Cleanup (v0.25.0)
 
 Objective: prove a stateful (isolated-classified) upstream tears down within
-60 seconds of its last session disconnect, NOT the general 10-minute owner
-idle timeout.
+**~70 seconds** of its last session disconnect — the 60s `IsolatedIdleTimeout`
+plus up to one 10s reaper sweep — NOT the general 10-minute owner idle
+timeout. Strict-greater comparison + sweep cadence is why ~70s, not 60s
+exactly.
 
 Setup:
 
@@ -205,22 +207,36 @@ Setup:
 - A stateful MCP server in host config that classifies as isolated. The
   `playwright` MCP and `serena` MCP are good candidates — both classify
   isolated under tools/list inspection.
+- **Choose ONE target server before starting** — record its command string
+  (e.g. `npx -y @playwright/mcp@latest` or `uvx --from git+...serena ...`).
+  Step 2 below filters by that exact command so pre-existing isolated
+  owners on the workstation cannot pollute the result.
 
 Commands:
 
 ```powershell
+# Replace this with the exact command string of YOUR target isolated server,
+# verbatim from `mcp-mux status` output (`.command` + `.args` joined).
+$targetMatch = 'playwright'   # e.g. matches any owner whose args contain 'playwright'
+
 # 1. Trigger ONE invocation of the isolated server from a host, then close
 #    the host session (or stop using that server in that session).
 # 2. Note the server_id immediately after invocation. Use auto_classification
-#    (not "classification" — there is no such field in the status payload):
+#    (not "classification" — there is no such field in the status payload).
+#    Filter MUST include the target match — without it, an unrelated
+#    pre-existing isolated owner could be picked up by step 4.
 .\mcp-mux.exe status |
   ConvertFrom-Json |
   Select-Object -ExpandProperty servers |
-  Where-Object { $_.auto_classification -eq 'isolated' -and $_.session_count -eq 0 } |
+  Where-Object {
+    $_.auto_classification -eq 'isolated' -and
+    $_.session_count -eq 0 -and
+    (($_.args -join ' ') -match $targetMatch -or $_.command -match $targetMatch)
+  } |
   Select-Object server_id, command, auto_classification, session_count, idle_timeout_s, last_session
 
-# 3. Wait 70 seconds (10 seconds past the 60s default cleanup threshold).
-Start-Sleep -Seconds 70
+# 3. Wait 75 seconds (60s idle threshold + up to 10s reaper sweep + 5s buffer).
+Start-Sleep -Seconds 75
 
 # 4. Re-check status by server_id captured in step 2:
 .\mcp-mux.exe status |
@@ -231,9 +247,11 @@ Start-Sleep -Seconds 70
 
 Expected:
 
-- Step 2 finds the isolated owner with `session_count: 0` and
-  `auto_classification: "isolated"`.
-- Step 4 returns no rows — the owner has been reaped.
+- Step 2 finds the isolated owner matching `$targetMatch` with
+  `session_count: 0` and `auto_classification: "isolated"`. The selected
+  fields (`idle_timeout_s`, `last_session`) verified to exist on every
+  server entry in real `mcp-mux status` output.
+- Step 4 returns no rows — the owner has been reaped after the sweep.
 - A re-spawn of the same upstream from a new session works fine (no zombie
   state).
 
@@ -317,7 +335,7 @@ with this table:
 | 3 | Current Topology Oracle | PoC verdict PASS |  | PASS/FAIL |
 | 4 | Local Deployment Upgrade | Production binary upgraded and status works |  | PASS/FAIL/SKIPPED |
 | 5 | Global-First Owner Dedup (v0.25.0) | 1 owner per (cmd, args) across 2 cwds |  | PASS/FAIL |
-| 6 | Isolated Short Idle Cleanup (v0.25.0) | Isolated owner reaped within 60s of zero sessions |  | PASS/FAIL |
+| 6 | Isolated Short Idle Cleanup (v0.25.0) | Target isolated owner reaped within ~70s of zero sessions (60s idle + 10s sweep) |  | PASS/FAIL |
 | 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
 
 Overall verdict:
