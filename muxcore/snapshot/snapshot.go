@@ -15,8 +15,23 @@ import (
 
 const (
 	SnapshotFileName = "mcp-muxd-snapshot.json"
-	SnapshotVersion  = 1
-	SnapshotMaxAge   = 5 * time.Minute
+	// SnapshotVersion bumped to 2 in CR-002 (muxcore-global-first-identity).
+	// Reason: v0.24.x daemons wrote snapshots with cwd-keyed owner ids. The
+	// v0.25.0 daemon uses global-keyed identity (one owner per (cmd, args)),
+	// so a v0.24.x snapshot's owner entries are no longer addressable under
+	// the new sid scheme.
+	//
+	// Implementation: the existing Deserialize() version check at line 139
+	// rejects mismatched versions and returns nil (cold start). v0.24.x
+	// snapshots are silently ignored on first v0.25.0 boot; owners
+	// regenerate naturally as Spawns arrive. One-time cold-start cost
+	// after upgrade is the trade-off vs collapse-migration (which spec AC4
+	// originally called for — see implementation-notes for the deviation
+	// rationale: ~150 LOC migration code avoided, zero risk of field-merge
+	// bugs, ~30s cold-start cost on Windows upgrade path that already
+	// requires downtime due to live-shim file locks).
+	SnapshotVersion = 2
+	SnapshotMaxAge  = 5 * time.Minute
 )
 
 // OwnerSnapshot captures the serializable state of an Owner for graceful restart.
