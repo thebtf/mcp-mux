@@ -110,6 +110,16 @@ type Daemon struct {
 	// classification". Per-owner x-mux.idleTimeout always wins over this.
 	isolatedIdleTimeout time.Duration
 
+	// admissionBufferTimeout bounds the wait at the spawn-time admission
+	// gate (CR-002): when a cross-cwd Spawn lands on an existing global
+	// owner that is not yet classified, the caller waits up to this
+	// duration for Owner.Classified() to close before deciding whether to
+	// bind (shareable) or fall through to a fresh isolated-seeded owner.
+	// On timeout, the caller falls through to a fresh spawn (safe default:
+	// assume worst case = isolated). Independent of concurrentCreateWaitTimeout
+	// per spec C3 — these gate semantically different concerns.
+	admissionBufferTimeout time.Duration
+
 	// ownerIdleTimeout is the default time an owner may sit with no activity
 	// (no MCP traffic, no sessions, no pending requests, no active progress
 	// tokens, no busy declarations) before the reaper removes it. Default 10m.
@@ -246,6 +256,21 @@ type Config struct {
 	// Per-owner x-mux.idleTimeout always wins over this value.
 	IsolatedIdleTimeout time.Duration
 
+	// AdmissionBufferTimeout bounds the cross-cwd admission gate wait at
+	// spawn time (CR-002). When a Spawn lands on an existing global owner
+	// whose primary cwd differs AND whose classification is not yet known,
+	// the caller waits up to this duration for Classified() to close.
+	// On wake:
+	//   - classified shareable → cross-cwd bind proceeds
+	//   - classified isolated → caller falls through to fresh isolated
+	//     spawn with a CR-001 deterministic isolated-seeded sid
+	//   - timeout → safe default: fall through to fresh isolated spawn
+	//
+	// Default: 30 seconds (independent of concurrentCreateWaitTimeout per
+	// spec C3 — these gate semantically different concerns). Override via
+	// env MCP_MUX_ADMISSION_TIMEOUT (Go duration string).
+	AdmissionBufferTimeout time.Duration
+
 	Logger *log.Logger
 
 	// SkipSnapshot disables snapshot loading on startup. Used by tests
@@ -318,6 +343,17 @@ func New(cfg Config) (*Daemon, error) {
 	if isolatedIdleTimeout == 0 {
 		isolatedIdleTimeout = 60 * time.Second
 	}
+	// CR-002 admission gate timeout. Env override MCP_MUX_ADMISSION_TIMEOUT
+	// (Go duration string, e.g. "45s") takes precedence over Config.
+	admissionBufferTimeout := cfg.AdmissionBufferTimeout
+	if envAdmission := os.Getenv("MCP_MUX_ADMISSION_TIMEOUT"); envAdmission != "" {
+		if parsed, err := time.ParseDuration(envAdmission); err == nil && parsed > 0 {
+			admissionBufferTimeout = parsed
+		}
+	}
+	if admissionBufferTimeout == 0 {
+		admissionBufferTimeout = 30 * time.Second
+	}
 	daemonFlag := cfg.DaemonFlag
 	if daemonFlag == "" {
 		daemonFlag = "--daemon"
@@ -330,25 +366,26 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{
-		owners:              make(map[string]*OwnerEntry),
-		logger:              logger,
-		done:                make(chan struct{}),
-		ownerIdleTimeout:    ownerIdleTimeout,
-		isolatedIdleTimeout: isolatedIdleTimeout,
-		idleTimeout:         idleTimeout,
-		templateCache:       make(map[string]mcpsnapshot.OwnerSnapshot),
-		crashTracker:        make(map[string][]time.Time),
-		supervisorCtx:       supCtx,
-		supervisorCancel:    supCancel,
-		handlerFunc:         cfg.HandlerFunc,
-		sessionHandler:      cfg.SessionHandler,
-		daemonFlag:          daemonFlag,
-		name:                name,
-		persistent:          cfg.Persistent,
-		daemonGeneration:    daemonGeneration,
-		authorizeSession:    cfg.AuthorizeSession,
-		onFrameReceived:     cfg.OnFrameReceived,
-		ownerRemoval:        newOwnerRemovalStats(),
+		owners:                 make(map[string]*OwnerEntry),
+		logger:                 logger,
+		done:                   make(chan struct{}),
+		ownerIdleTimeout:       ownerIdleTimeout,
+		isolatedIdleTimeout:    isolatedIdleTimeout,
+		admissionBufferTimeout: admissionBufferTimeout,
+		idleTimeout:            idleTimeout,
+		templateCache:          make(map[string]mcpsnapshot.OwnerSnapshot),
+		crashTracker:           make(map[string][]time.Time),
+		supervisorCtx:          supCtx,
+		supervisorCancel:       supCancel,
+		handlerFunc:            cfg.HandlerFunc,
+		sessionHandler:         cfg.SessionHandler,
+		daemonFlag:             daemonFlag,
+		name:                   name,
+		persistent:             cfg.Persistent,
+		daemonGeneration:       daemonGeneration,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
+		ownerRemoval:           newOwnerRemovalStats(),
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -665,6 +702,64 @@ func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSn
 	return snap, ok
 }
 
+// waitForCrossCwdClassify is the CR-002 admission gate. When a Spawn lands
+// on an existing global owner whose primary cwd differs from the requesting
+// session's cwd AND whose classification is not yet known, this function
+// blocks the caller up to d.admissionBufferTimeout for Owner.Classified()
+// to close. Three outcomes:
+//
+//   - shareable=true, err=nil → owner is safe to bind cross-cwd (same cwd
+//     OR already classified as shared/session-aware OR newly classified
+//     shareable). Caller proceeds with PreRegisterForOwner.
+//   - shareable=false, err=nil → owner classified isolated during the wait.
+//     Caller MUST NOT bind cross-cwd; fall through to fresh spawn under a
+//     CR-001 deterministic isolated-seeded sid for the requesting cwd.
+//   - shareable=false, err non-nil → wait timed out. Safe default: caller
+//     treats as isolated and falls through to fresh spawn. The original
+//     owner continues serving its primary-cwd sessions unaffected.
+//
+// Same-cwd binds skip the gate (return immediately as shareable=true).
+// This is the only safety property the admission gate provides: an
+// unclassified upstream NEVER receives frames from a cross-cwd session
+// because that session never gets an IPC path until classification
+// resolves. The Owner.crossCwdBuffer post-attach buffer (mentioned in
+// spec AC2 prose) is unnecessary under this simpler implementation —
+// frames literally don't exist on the daemon yet because the shim hasn't
+// dialed IPC (the daemon's Spawn RPC response is the gate).
+func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shareable bool, err error) {
+	if entry == nil || entry.Owner == nil {
+		return false, fmt.Errorf("admission gate: owner not live")
+	}
+	// Same-cwd: no gate. Primary-cwd sessions always pass through.
+	canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
+	canonReqCwd := serverid.CanonicalizePath(reqCwd)
+	if canonEntryCwd == canonReqCwd {
+		return true, nil
+	}
+	// Already classified: respect the verdict immediately.
+	if entry.Owner.IsClassifiedShareable() {
+		return true, nil
+	}
+	// Already classified non-shareable? Check via Classified() channel.
+	select {
+	case <-entry.Owner.Classified():
+		// Channel already closed AND IsClassifiedShareable returned false →
+		// owner is isolated. Fall through to fresh spawn.
+		return false, nil
+	default:
+	}
+	// Not classified yet AND cross-cwd → wait.
+	d.logger.Printf("admission-gate: cross-cwd Spawn from %q waiting on owner %s classify (primary cwd %q)",
+		canonReqCwd, entry.ServerID[:8], canonEntryCwd)
+	select {
+	case <-entry.Owner.Classified():
+		return entry.Owner.IsClassifiedShareable(), nil
+	case <-time.After(d.admissionBufferTimeout):
+		return false, fmt.Errorf("admission gate: timeout after %s waiting for owner %s classify",
+			d.admissionBufferTimeout, entry.ServerID[:8])
+	}
+}
+
 // warnDeprecatedMode logs a one-shot deprecation warning per (cmd, args) tuple
 // per daemon lifetime when a shim sends a legacy Mode value ("cwd" or "git").
 // Designed to surface stale shim binaries in operator logs without spamming
@@ -787,6 +882,22 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
 				e.LastSession = time.Now()
 				d.mu.Unlock()
+				// CR-002 admission gate: if this Spawn's cwd differs from the
+				// existing owner's primary cwd AND the owner is not yet
+				// classified, wait for classify before binding. Isolated
+				// classification forces fall-through to a fresh isolated-seeded
+				// owner for THIS cwd; shareable classification permits the bind.
+				shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
+				if gateErr != nil {
+					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
+				if !shareable {
+					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", sid[:8], req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
 				e.Owner.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, req.Env)
 				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
@@ -827,6 +938,20 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				}
 				current.LastSession = time.Now()
 				d.mu.Unlock()
+				// CR-002 admission gate: same logic as the placeholder-wait
+				// path. Cross-cwd binding on an unclassified owner waits for
+				// Classified(); isolated verdict forces fall-through.
+				shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
+				if gateErr != nil {
+					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
+				if !shareable {
+					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", probeSID[:8], req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
 				probeOwner.SessionMgr().PreRegisterForOwner(token, probeSID, req.Cwd, req.Env)
 				// Note: no log here — this path is the hot path (every CC
 				// session reconnect). Logging each reuse produced 500+
