@@ -1888,6 +1888,16 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
 
+	// envCompatible must compare like-for-like: owner.Env is post-mergeEnv
+	// (populated at spawn time via mergeEnv(req.Env)), so the request side
+	// must also be merged. Without this, codex PR #121 P1's credential-
+	// asymmetry guard fires on every cross-session lookup because the raw
+	// request env lacks os.Environ-supplied credentials (SSH_AUTH_SOCK,
+	// system-level GITHUB_TOKEN, etc.) that the owner inherited.
+	// mergeEnv is idempotent on already-merged input — safe to apply here
+	// whether the caller already merged or not.
+	mergedEnv := mergeEnv(env)
+
 	// Wait budget: at most one placeholder-wait cycle. Multiple matching
 	// placeholders in flight is pathological; one wait is sufficient for
 	// the common concurrent-spawn case and bounds the wall-clock cost.
@@ -1917,7 +1927,7 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 				continue
 			}
 			// Skip owners with incompatible env — different API keys, tokens, etc.
-			if !envCompatible(entry.Env, env) {
+			if !envCompatible(entry.Env, mergedEnv) {
 				continue
 			}
 			if !entry.Owner.IsAccepting() {
@@ -2050,16 +2060,92 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 // envCompatible returns true if two env maps have no conflicting values
 // for semantically significant keys (API tokens, config paths, etc.).
 // Transient per-session vars (CLAUDE_CODE_*, WT_SESSION, etc.) are ignored.
+//
+// Credential-bearing keys (GITHUB_TOKEN, OPENAI_API_KEY, anything matching
+// envCredentialKey()) additionally MUST match by presence: if a key exists
+// in one side but not the other, the envs are NOT compatible. Per codex
+// PR #121 P1: without this, a first session spawning an owner with
+// GITHUB_TOKEN=abc and a later session without GITHUB_TOKEN would share
+// the same owner, leaking the first session's credential into the second.
+// Plain value-conflict checks miss this because the second map has no
+// key to conflict against.
 func envCompatible(a, b map[string]string) bool {
 	for k, va := range a {
 		if envTransient(k) {
 			continue
 		}
-		if vb, ok := b[k]; ok && va != vb {
+		vb, ok := b[k]
+		if !ok {
+			if envCredentialKey(k) {
+				return false
+			}
+			continue
+		}
+		if va != vb {
+			return false
+		}
+	}
+	// Symmetric check: a credential key present in b but missing in a
+	// must also split. The loop over a alone cannot see keys unique to b.
+	for k := range b {
+		if envTransient(k) {
+			continue
+		}
+		if _, ok := a[k]; ok {
+			continue
+		}
+		if envCredentialKey(k) {
 			return false
 		}
 	}
 	return true
+}
+
+// envCredentialKey returns true if the key likely carries an authentication
+// secret whose presence asymmetry across two env maps must split owners
+// under global-first identity. Heuristic suffix/exact match — exhaustive
+// enumeration is impractical, so the rule errs toward over-splitting on
+// keys that LOOK like credentials. False positives waste one owner per
+// uniquely-named "fake credential" var; false negatives leak real
+// credentials across sessions. The trade-off prefers the former.
+func envCredentialKey(key string) bool {
+	upper := strings.ToUpper(key)
+	switch {
+	case strings.HasSuffix(upper, "_TOKEN"):
+		return true
+	case strings.HasSuffix(upper, "_KEY"):
+		return true
+	case strings.HasSuffix(upper, "_API_KEY"):
+		return true
+	case strings.HasSuffix(upper, "_SECRET"):
+		return true
+	case strings.HasSuffix(upper, "_PASSWORD"):
+		return true
+	case strings.HasSuffix(upper, "_PASSWD"):
+		return true
+	case strings.HasSuffix(upper, "_CREDENTIALS"):
+		return true
+	case strings.HasSuffix(upper, "_AUTH"):
+		return true
+	// Exact-match keys that don't fit the suffix pattern.
+	case upper == "GH_TOKEN" || upper == "GITHUB_TOKEN":
+		return true
+	case upper == "GITHUB_PERSONAL_ACCESS_TOKEN":
+		return true
+	case upper == "OPENAI_API_KEY" || upper == "ANTHROPIC_API_KEY":
+		return true
+	case upper == "TAVILY_API_KEY" || upper == "GOOGLE_API_KEY":
+		return true
+	case upper == "AWS_ACCESS_KEY_ID" || upper == "AWS_SECRET_ACCESS_KEY":
+		return true
+	case upper == "AWS_SESSION_TOKEN":
+		return true
+	case upper == "SSH_AUTH_SOCK" || upper == "SSH_AGENT_PID":
+		return true
+	case upper == "DOCKER_AUTH_CONFIG":
+		return true
+	}
+	return false
 }
 
 // semanticEnvHash returns a stable 8-hex-char hash of env entries that

@@ -1017,8 +1017,17 @@ func TestEnvCompatible(t *testing.T) {
 		want bool
 	}{
 		{name: "both empty", a: map[string]string{}, b: map[string]string{}, want: true},
-		{name: "a empty b has keys", a: map[string]string{}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: true},
-		{name: "a has keys b empty", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{}, want: true},
+		// codex PR #121 P1 fix: credential asymmetry must split owners.
+		// Previously these two cases returned true; they now return false
+		// because a session without GITHUB_TOKEN must not bind to an owner
+		// that was spawned with GITHUB_TOKEN baked into its process env.
+		{name: "a empty b has credential", a: map[string]string{}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: false},
+		{name: "a has credential b empty", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{}, want: false},
+		// Non-credential presence asymmetry is still compatible — PATH or
+		// HOME existing on one side and not the other does not change the
+		// credential boundary the owner enforces.
+		{name: "a empty b has non-credential", a: map[string]string{}, b: map[string]string{"PATH": "/usr/bin"}, want: true},
+		{name: "a has non-credential b empty", a: map[string]string{"PATH": "/usr/bin"}, b: map[string]string{}, want: true},
 		{name: "same key same value", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: true},
 		{name: "same key different value semantic", a: map[string]string{"GITHUB_TOKEN": "abc"}, b: map[string]string{"GITHUB_TOKEN": "xyz"}, want: false},
 		{name: "transient key different value", a: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "cli"}, b: map[string]string{"CLAUDE_CODE_ENTRYPOINT": "ide"}, want: true},
@@ -1027,6 +1036,14 @@ func TestEnvCompatible(t *testing.T) {
 		{name: "overlapping partial", a: map[string]string{"GITHUB_TOKEN": "abc", "PATH": "/usr"}, b: map[string]string{"GITHUB_TOKEN": "abc"}, want: true},
 		{name: "real world same token", a: map[string]string{"GITHUB_TOKEN": "abc", "CLAUDE_CODE_ENTRYPOINT": "cli"}, b: map[string]string{"GITHUB_TOKEN": "abc", "CLAUDE_CODE_ENTRYPOINT": "ide"}, want: true},
 		{name: "real world different token", a: map[string]string{"GITHUB_TOKEN": "abc", "CLAUDE_CODE_ENTRYPOINT": "cli"}, b: map[string]string{"GITHUB_TOKEN": "xyz", "CLAUDE_CODE_ENTRYPOINT": "cli"}, want: false},
+		// codex PR #121 P1 — additional credential-suffix coverage.
+		{name: "credential _API_KEY missing on b", a: map[string]string{"OPENAI_API_KEY": "sk-..."}, b: map[string]string{}, want: false},
+		{name: "credential _SECRET missing on a", a: map[string]string{}, b: map[string]string{"DB_SECRET": "shhh"}, want: false},
+		{name: "credential _PASSWORD missing on b", a: map[string]string{"DB_PASSWORD": "pw"}, b: map[string]string{}, want: false},
+		{name: "credential SSH_AUTH_SOCK missing on b", a: map[string]string{"SSH_AUTH_SOCK": "/tmp/sock"}, b: map[string]string{}, want: false},
+		{name: "credential GH_TOKEN missing on a", a: map[string]string{}, b: map[string]string{"GH_TOKEN": "ghp_..."}, want: false},
+		{name: "credential AWS_ACCESS_KEY_ID missing on b", a: map[string]string{"AWS_ACCESS_KEY_ID": "AKIA"}, b: map[string]string{}, want: false},
+		{name: "credential _TOKEN matches present on both", a: map[string]string{"MY_TOKEN": "x"}, b: map[string]string{"MY_TOKEN": "x"}, want: true},
 	}
 
 	for _, tc := range testCases {
