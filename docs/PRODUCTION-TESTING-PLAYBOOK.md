@@ -219,8 +219,11 @@ Commands:
 # verbatim from `mcp-mux status` output (`.command` + `.args` joined).
 $targetMatch = 'playwright'   # e.g. matches any owner whose args contain 'playwright'
 
-# 1. Trigger ONE invocation of the isolated server from a host, then close
-#    the host session (or stop using that server in that session).
+# 1. Trigger ONE invocation of the isolated server from a host, then FULLY
+#    DISCONNECT — close the host session (Ctrl+D, /exit, or kill the host
+#    process). Merely stopping to use the server keeps session_count >= 1
+#    so the idle-reap clock never starts; the scenario would report a
+#    false regression.
 # 2. Note the server_id immediately after invocation. Use auto_classification
 #    (not "classification" — there is no such field in the status payload).
 #    Filter MUST include the target match — without it, an unrelated
