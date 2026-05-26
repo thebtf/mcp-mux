@@ -403,7 +403,21 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	}
 
 	// 2. Determine sharing mode from environment (mirrors cmd/mcp-mux/main.go logic).
-	mode := serverid.ModeCwd
+	// Default flipped from ModeCwd to ModeGlobal in CR-002 — see cmd/mcp-mux/main.go
+	// comment for rationale. MCP_MUX_DEFAULT_MODE escape valve honored here too.
+	mode := serverid.ModeGlobal
+	if envMode := strings.TrimSpace(strings.ToLower(os.Getenv("MCP_MUX_DEFAULT_MODE"))); envMode != "" {
+		switch envMode {
+		case "cwd":
+			mode = serverid.ModeCwd
+		case "git":
+			mode = serverid.ModeGit
+		case "global":
+			mode = serverid.ModeGlobal
+		case "isolated":
+			mode = serverid.ModeIsolated
+		}
+	}
 	if os.Getenv("MCP_MUX_STATELESS") == "1" {
 		mode = serverid.ModeGlobal
 	}

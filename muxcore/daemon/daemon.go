@@ -132,6 +132,13 @@ type Daemon struct {
 	// creating an infinite respawn loop that burns CPU.
 	crashTracker map[string][]time.Time
 
+	// deprecatedModeWarned tracks (cmd, args) tuples for which a deprecation
+	// warning has been emitted this daemon lifetime. CR-002: legacy shim
+	// Mode="cwd"/"git" is still honored but warns once per (cmd, args). Removal
+	// target v0.27.0. sync.Map keyed by `cmd|args.Join("\0")` so concurrent
+	// spawns don't double-log.
+	deprecatedModeWarned sync.Map
+
 	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
@@ -658,6 +665,25 @@ func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSn
 	return snap, ok
 }
 
+// warnDeprecatedMode logs a one-shot deprecation warning per (cmd, args) tuple
+// per daemon lifetime when a shim sends a legacy Mode value ("cwd" or "git").
+// Designed to surface stale shim binaries in operator logs without spamming
+// the log on every Spawn. Removal target: v0.27.0 (Mode="cwd"/"git" rejected
+// at protocol layer).
+func (d *Daemon) warnDeprecatedMode(cmd string, args []string, legacyMode string) {
+	key := cmd + "\x00" + strings.Join(args, "\x00")
+	if _, loaded := d.deprecatedModeWarned.LoadOrStore(key, true); loaded {
+		return
+	}
+	d.logger.Printf(
+		"deprecation: shim sent Mode=%q for cmd=%q args=%v; this daemon now defaults to ModeGlobal "+
+			"(one upstream per (cmd, args)). Legacy modes honored through muxcore/v0.26.0; removal in v0.27.0. "+
+			"Either rebuild the shim against muxcore/v0.25.0+ or pin the legacy mode explicitly via "+
+			"MCP_MUX_DEFAULT_MODE=cwd in the shim environment to silence this warning.",
+		legacyMode, cmd, args,
+	)
+}
+
 // Spawn creates or reuses an owner for the given command. If a compatible owner
 // already exists (same command+args+cwd, or globally shareable), it is reused —
 // stateless servers don't need per-project copies. Returns the IPC path, server
@@ -688,14 +714,30 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 // the mutation must persist across iterations of the Spawn retry loop.
 func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, error) {
 	req := *reqPtr
-	mode := serverid.ModeCwd
+	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
+	// Mode now gets the global identity (one upstream per (cmd, args)) per the
+	// spec's original "one upstream per (cmd, args), isolation as exception"
+	// intent. Legacy shims that explicitly send Mode="cwd" or "git" are still
+	// honored for backward compat through v0.26.0; deprecation warning logged
+	// once per (cmd, args) per daemon lifetime. v0.27.0 removes "cwd"/"git"
+	// from the protocol entirely (separate spec, separate plan).
+	mode := serverid.ModeGlobal
 	switch req.Mode {
-	case "global":
+	case "global", "":
 		mode = serverid.ModeGlobal
 	case "isolated":
 		mode = serverid.ModeIsolated
-	case "cwd", "":
+	case "cwd":
 		mode = serverid.ModeCwd
+		d.warnDeprecatedMode(req.Command, req.Args, "cwd")
+	case "git":
+		mode = serverid.ModeGit
+		d.warnDeprecatedMode(req.Command, req.Args, "git")
+	default:
+		// Unknown mode value from future-shim or typo — safe default + warn.
+		d.logger.Printf("spawn: unknown Mode=%q from shim, defaulting to ModeGlobal (cmd=%q args=%v)",
+			req.Mode, req.Command, req.Args)
+		mode = serverid.ModeGlobal
 	}
 
 	// Generate handshake token upfront — valid for this spawn call only.
