@@ -179,3 +179,80 @@ func TestDeriveEnvBucketedSid_NoExistingEntry(t *testing.T) {
 		t.Errorf("no existing entry: got %q, want %q", got, base)
 	}
 }
+
+// TestSemanticEnvHash_IgnoresCwdDerivedVars proves the Codex PR #121 follow-up
+// finding is fixed: cwd-derived env vars (PWD, OLDPWD, INIT_CWD, npm_*) MUST
+// NOT fragment env-bucket identity across per-session working directories.
+//
+// Spec invariant (Engram #244 Bug 1 + AC1 + AC8): global-first dedup means
+// two sessions with identical credentials but different cwds land on ONE
+// shared owner. Without this fix, semanticEnvHash would hash PWD into the
+// bucket suffix, two cwds → two suffixes → two owners → per-cwd fan-out
+// recreated.
+//
+// I am running semanticEnvHash on a baseline credentials env, then on the
+// same env enriched with a different PWD/OLDPWD/INIT_CWD/npm_lifecycle_event
+// each. All four enriched hashes must equal the baseline.
+func TestSemanticEnvHash_IgnoresCwdDerivedVars(t *testing.T) {
+	baseline := semanticEnvHash(map[string]string{
+		"GITHUB_TOKEN": "abc",
+	})
+	cases := []struct {
+		name string
+		add  map[string]string
+	}{
+		{"pwd", map[string]string{"PWD": "/dev/app-1"}},
+		{"oldpwd", map[string]string{"OLDPWD": "/dev/prev"}},
+		{"init_cwd", map[string]string{"INIT_CWD": "/dev/init"}},
+		{"npm_lifecycle_event", map[string]string{"npm_lifecycle_event": "start"}},
+		{"npm_package_name", map[string]string{"npm_package_name": "my-pkg"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{"GITHUB_TOKEN": "abc"}
+			for k, v := range tc.add {
+				env[k] = v
+			}
+			got := semanticEnvHash(env)
+			if got != baseline {
+				t.Errorf("cwd/npm-derived var %s leaked into hash: got %q, want baseline %q (envTransient must filter)",
+					tc.name, got, baseline)
+			}
+		})
+	}
+}
+
+// TestSemanticEnvHash_IgnoresShellDerivedVars proves the same invariant for
+// terminal / shell / SSH / display vars that vary per shim launch but do not
+// affect upstream MCP server identity.
+func TestSemanticEnvHash_IgnoresShellDerivedVars(t *testing.T) {
+	baseline := semanticEnvHash(map[string]string{
+		"GITHUB_TOKEN": "abc",
+	})
+	cases := []struct {
+		name string
+		add  map[string]string
+	}{
+		{"term", map[string]string{"TERM": "xterm-256color"}},
+		{"term_program", map[string]string{"TERM_PROGRAM": "vscode"}},
+		{"colorterm", map[string]string{"COLORTERM": "truecolor"}},
+		{"shlvl", map[string]string{"SHLVL": "3"}},
+		{"shell", map[string]string{"SHELL": "/bin/zsh"}},
+		{"ssh_session", map[string]string{"SSH_CLIENT": "1.2.3.4 12345 22"}},
+		{"display", map[string]string{"DISPLAY": ":0"}},
+		{"wayland", map[string]string{"WAYLAND_DISPLAY": "wayland-0"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{"GITHUB_TOKEN": "abc"}
+			for k, v := range tc.add {
+				env[k] = v
+			}
+			got := semanticEnvHash(env)
+			if got != baseline {
+				t.Errorf("shell/terminal var %s leaked into hash: got %q, want baseline %q",
+					tc.name, got, baseline)
+			}
+		})
+	}
+}

@@ -2162,15 +2162,44 @@ func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) 
 // and should NOT affect dedup decisions.
 func envTransient(key string) bool {
 	switch {
+	// Claude Code-specific session vars
 	case strings.HasPrefix(key, "CLAUDE_CODE_"):
 		return true
 	case strings.HasPrefix(key, "CLAUDE_AUTO"):
 		return true
+	case key == "CLAUDE_CODE_ENTRYPOINT":
+		return true
+	// Windows Terminal / WSL session vars
 	case strings.HasPrefix(key, "WT_"):
 		return true
 	case key == "SESSIONNAME" || key == "WSLENV":
 		return true
-	case key == "CLAUDE_CODE_ENTRYPOINT":
+	// CR-002 codex PR #121 fix: cwd-derived vars MUST be transient so
+	// env-bucketing under global-first does not fragment owners across
+	// per-session working directories. Without this, two sessions with
+	// identical credentials from different cwds get different env-bucket
+	// sids because PWD/OLDPWD/INIT_CWD differ — defeating the global-first
+	// dedup goal and recreating per-cwd owner fan-out the spec explicitly
+	// targets (Engram #244 Bug 1).
+	case key == "PWD" || key == "OLDPWD" || key == "INIT_CWD":
+		return true
+	// npm-injected vars (npm sets these per-cwd when running scripts;
+	// shim-via-npx inherits them, so they fragment per shim-launch cwd).
+	case strings.HasPrefix(key, "npm_"):
+		return true
+	// Terminal/shell-derived vars (per-shim-launch transients, not semantic
+	// to the upstream MCP server's identity).
+	case key == "TERM" || key == "TERM_PROGRAM" || key == "TERM_PROGRAM_VERSION":
+		return true
+	case key == "COLORTERM" || key == "LINES" || key == "COLUMNS":
+		return true
+	case key == "_" || key == "SHLVL" || key == "SHELL":
+		return true
+	// SSH session vars (per-connection transients).
+	case strings.HasPrefix(key, "SSH_"):
+		return true
+	// X11/Wayland display vars (per-session transients on Linux desktops).
+	case key == "DISPLAY" || key == "XAUTHORITY" || key == "WAYLAND_DISPLAY":
 		return true
 	}
 	return false
