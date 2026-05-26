@@ -158,8 +158,9 @@ func (r *Reaper) sweep() int {
 			OwnerIdleOverride:    entry.Owner.IdleTimeout(),
 			LastSession:          entry.LastSession,
 			LastActivity:         entry.Owner.LastActivity(),
+			IsolatedClassified:   entry.Owner.IsClassifiedIsolated(),
 		}
-		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout)
+		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout, r.daemon.isolatedIdleTimeout)
 		if decision.evict {
 			if decision.reason == "zombie" {
 				// Upstream is already dead — hard remove (no point in stdin close).
@@ -169,8 +170,8 @@ func (r *Reaper) sweep() int {
 				// Idle eviction: give upstream a chance to exit cleanly via stdin close.
 				// SoftRemove closes stdin and waits up to 30s before SIGTERM/SIGKILL (US3).
 				r.logger.Printf(
-					"reaper: owner %s idle for %.0fs (timeout %.0fs), soft-removing",
-					sid[:8], decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
+					"reaper: owner %s %s for %.0fs (timeout %.0fs), soft-removing",
+					sid[:8], decision.reason, decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
 				)
 				_, _ = r.daemon.removeOwner(sid, ownerRemovalReasonIdle, true)
 			}
@@ -199,6 +200,13 @@ type evictionSample struct {
 	OwnerIdleOverride time.Duration
 	LastSession       time.Time
 	LastActivity      time.Time
+	// IsolatedClassified is true when the owner's post-init classification
+	// verdict was isolated. The reaper applies the shorter
+	// isolatedIdleTimeout to such owners because they cannot be reattached
+	// by future Spawn calls (their server_id is either a random UUID from
+	// the forced-isolated retry path or a cwd-keyed hash whose listener was
+	// closed by the isolation verdict).
+	IsolatedClassified bool
 }
 
 type evictionDecision struct {
@@ -215,13 +223,17 @@ type evictionDecision struct {
 //	pendingRequests == 0 AND
 //	activeProgressTokens == 0 AND
 //	!hasBusyWork AND
-//	now - max(lastSession, lastActivity) > idleTimeout
+//	now - max(lastSession, lastActivity) > effectiveIdleTimeout
 //
 // The effective idleTimeout is, in priority order:
-//  1. OwnerIdleOverride from x-mux.idleTimeout capability
-//  2. Sample.IdleTimeout (daemon default copied at spawn)
-//  3. daemonDefault argument (fallback for placeholder entries)
-func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) evictionDecision {
+//  1. OwnerIdleOverride from x-mux.idleTimeout capability (server-declared
+//     intent always wins — it knows its own state best)
+//  2. isolatedIdleTimeout when IsolatedClassified is true and the value is
+//     positive (Engram #244 Bug 2: isolated owners cannot be reused, so
+//     holding them across the longer general idle window wastes upstreams)
+//  3. Sample.IdleTimeout (daemon default copied at spawn)
+//  4. daemonDefault argument (fallback for placeholder entries)
+func shouldEvict(s evictionSample, now time.Time, daemonDefault, isolatedIdleTimeout time.Duration) evictionDecision {
 	// Zombie: upstream dead + zero sessions = evict immediately regardless of other conditions.
 	if s.UpstreamDead && s.Sessions == 0 {
 		return evictionDecision{evict: true, reason: "zombie"}
@@ -243,6 +255,9 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) e
 	}
 
 	idleTimeout := s.IdleTimeout
+	if s.IsolatedClassified && isolatedIdleTimeout > 0 {
+		idleTimeout = isolatedIdleTimeout
+	}
 	if s.OwnerIdleOverride > 0 {
 		idleTimeout = s.OwnerIdleOverride
 	}
@@ -259,11 +274,15 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault time.Duration) e
 		idleSince = s.LastActivity
 	}
 	elapsed := now.Sub(idleSince)
+	reason := "idle"
+	if s.IsolatedClassified && isolatedIdleTimeout > 0 && s.OwnerIdleOverride <= 0 {
+		reason = "idle-isolated"
+	}
 	return evictionDecision{
 		evict:       elapsed > idleTimeout,
 		elapsed:     elapsed,
 		idleTimeout: idleTimeout,
-		reason:      "idle",
+		reason:      reason,
 	}
 }
 

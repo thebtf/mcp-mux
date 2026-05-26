@@ -101,6 +101,15 @@ type Daemon struct {
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	sessionHandler muxcore.SessionHandler
 
+	// isolatedIdleTimeout is the shorter idle timeout applied to owners whose
+	// classification verdict is isolated. The forced-isolated retry path
+	// (daemon.go:797-807) and any post-init isolated classification produces
+	// owners whose server_id cannot be reused, so holding them across the
+	// longer general OwnerIdleTimeout wastes upstream processes. Zero means
+	// "use the general OwnerIdleTimeout for all owners regardless of
+	// classification". Per-owner x-mux.idleTimeout always wins over this.
+	isolatedIdleTimeout time.Duration
+
 	// ownerIdleTimeout is the default time an owner may sit with no activity
 	// (no MCP traffic, no sessions, no pending requests, no active progress
 	// tokens, no busy declarations) before the reaper removes it. Default 10m.
@@ -217,6 +226,19 @@ type Config struct {
 	// Default: 5 minutes.
 	IdleTimeout time.Duration
 
+	// IsolatedIdleTimeout is the shorter idle timeout applied by the reaper
+	// to owners whose post-init classification was isolated. Isolated owners
+	// cannot be reattached by future Spawn calls (their server_id is either
+	// a random UUID from the forced-isolated retry path or a cwd-keyed hash
+	// whose listener was closed by the isolation verdict), so holding them
+	// across the longer shared/general OwnerIdleTimeout wastes upstream
+	// processes for no possible cache benefit.
+	//
+	// Default: 60 seconds. Set to 0 to disable the optimization (in which
+	// case isolated owners use the same OwnerIdleTimeout as shared owners).
+	// Per-owner x-mux.idleTimeout always wins over this value.
+	IsolatedIdleTimeout time.Duration
+
 	Logger *log.Logger
 
 	// SkipSnapshot disables snapshot loading on startup. Used by tests
@@ -282,6 +304,13 @@ func New(cfg Config) (*Daemon, error) {
 	if idleTimeout == 0 {
 		idleTimeout = 5 * time.Minute
 	}
+	// Isolated owners default to a 60s idle window. Operators who explicitly
+	// want isolated owners to live as long as shared ones can pass a value
+	// equal to ownerIdleTimeout (or any larger duration).
+	isolatedIdleTimeout := cfg.IsolatedIdleTimeout
+	if isolatedIdleTimeout == 0 {
+		isolatedIdleTimeout = 60 * time.Second
+	}
 	daemonFlag := cfg.DaemonFlag
 	if daemonFlag == "" {
 		daemonFlag = "--daemon"
@@ -294,24 +323,25 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{
-		owners:           make(map[string]*OwnerEntry),
-		logger:           logger,
-		done:             make(chan struct{}),
-		ownerIdleTimeout: ownerIdleTimeout,
-		idleTimeout:      idleTimeout,
-		templateCache:    make(map[string]mcpsnapshot.OwnerSnapshot),
-		crashTracker:     make(map[string][]time.Time),
-		supervisorCtx:    supCtx,
-		supervisorCancel: supCancel,
-		handlerFunc:      cfg.HandlerFunc,
-		sessionHandler:   cfg.SessionHandler,
-		daemonFlag:       daemonFlag,
-		name:             name,
-		persistent:       cfg.Persistent,
-		daemonGeneration: daemonGeneration,
-		authorizeSession: cfg.AuthorizeSession,
-		onFrameReceived:  cfg.OnFrameReceived,
-		ownerRemoval:     newOwnerRemovalStats(),
+		owners:              make(map[string]*OwnerEntry),
+		logger:              logger,
+		done:                make(chan struct{}),
+		ownerIdleTimeout:    ownerIdleTimeout,
+		isolatedIdleTimeout: isolatedIdleTimeout,
+		idleTimeout:         idleTimeout,
+		templateCache:       make(map[string]mcpsnapshot.OwnerSnapshot),
+		crashTracker:        make(map[string][]time.Time),
+		supervisorCtx:       supCtx,
+		supervisorCancel:    supCancel,
+		handlerFunc:         cfg.HandlerFunc,
+		sessionHandler:      cfg.SessionHandler,
+		daemonFlag:          daemonFlag,
+		name:                name,
+		persistent:          cfg.Persistent,
+		daemonGeneration:    daemonGeneration,
+		authorizeSession:    cfg.AuthorizeSession,
+		onFrameReceived:     cfg.OnFrameReceived,
+		ownerRemoval:        newOwnerRemovalStats(),
 	}
 
 	// Create supervisor with exponential backoff on restart storms.

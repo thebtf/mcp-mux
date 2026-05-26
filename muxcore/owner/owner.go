@@ -2505,9 +2505,51 @@ func (o *Owner) IsClassifiedShareable() bool {
 	return mode == classify.ModeShared || mode == classify.ModeSessionAware
 }
 
+// IsClassifiedIsolated returns true if the owner has been classified AND the
+// classification is isolated. Returns false when classification is still
+// pending OR when the mode is shared/session-aware. Used by the reaper to
+// apply a shorter idle timeout to isolated owners, which cannot be reattached
+// by future Spawn calls (their server_id is either a random UUID or a
+// cwd-keyed hash whose listener was closed by the isolation verdict).
+func (o *Owner) IsClassifiedIsolated() bool {
+	select {
+	case <-o.classified:
+	default:
+		return false
+	}
+	o.mu.RLock()
+	mode := o.autoClassification
+	o.mu.RUnlock()
+	return mode == classify.ModeIsolated
+}
+
 // MarkClassified forces the classified channel closed. Used by tests that need
 // to bypass the normal init/tools handshake classification flow.
 func (o *Owner) MarkClassified() {
+	o.classifiedOnce.Do(func() {
+		if o.classified != nil {
+			close(o.classified)
+		}
+	})
+}
+
+// MarkClassifiedAs sets the owner's auto-classification to the given mode and
+// closes the classified channel. Used by tests that need both an explicit
+// classification verdict (shared / isolated / session-aware) AND the channel
+// signal in one call, without running a real initialize + tools/list
+// handshake. classificationSource is set to "test" only if it was empty.
+//
+// Production code populates autoClassification via classifyFromCapability or
+// classifyFromToolList in this file; this helper exists exclusively for
+// daemon-level race tests in the daemon package that cannot reach those
+// private code paths.
+func (o *Owner) MarkClassifiedAs(mode classify.SharingMode) {
+	o.mu.Lock()
+	o.autoClassification = mode
+	if o.classificationSource == "" {
+		o.classificationSource = "test"
+	}
+	o.mu.Unlock()
 	o.classifiedOnce.Do(func() {
 		if o.classified != nil {
 			close(o.classified)
