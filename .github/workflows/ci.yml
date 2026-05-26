@@ -32,7 +32,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
-      - run: go test -race -coverprofile=coverage.out ./...
+      - run: go test -race -coverprofile=coverage.out -p=1 ./...
       - name: muxcore coverage
         working-directory: muxcore
         # Note: no -race here. The test matrix (ubuntu/windows/macos) already
@@ -42,7 +42,13 @@ jobs:
         # Reason flake on slow CI runners (upstream spawn racing the priming
         # writes) — not a product bug, just coverage + race + timing amplifying
         # each other.
-        run: go test -coverprofile=coverage.out -count=1 -timeout 180s ./...
+        #
+        # -p=1 serialises package execution because daemon and snapshot tests
+        # both touch the global mcpsnapshot.SnapshotPath("") (TEMP-based) and
+        # race when packages run concurrently (PR #121 CI). The test matrix
+        # job avoids the same race because -race adds enough latency that
+        # parallel package execution implicitly serialises the file writes.
+        run: go test -coverprofile=coverage.out -count=1 -timeout 240s -p=1 ./...
       - uses: codecov/codecov-action@v4
         with:
           # codecov-action@v4: `files` is a comma-separated explicit list.
