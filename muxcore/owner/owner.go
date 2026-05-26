@@ -2544,13 +2544,13 @@ func (o *Owner) MarkClassified() {
 // daemon-level race tests in the daemon package that cannot reach those
 // private code paths.
 func (o *Owner) MarkClassifiedAs(mode classify.SharingMode) {
-	o.mu.Lock()
-	o.autoClassification = mode
-	if o.classificationSource == "" {
-		o.classificationSource = "test"
-	}
-	o.mu.Unlock()
 	o.classifiedOnce.Do(func() {
+		o.mu.Lock()
+		o.autoClassification = mode
+		if o.classificationSource == "" {
+			o.classificationSource = "test"
+		}
+		o.mu.Unlock()
 		if o.classified != nil {
 			close(o.classified)
 		}

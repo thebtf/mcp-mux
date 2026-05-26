@@ -54,11 +54,13 @@ func TestGlobalFirst_EnvIncompatibleOwnersDistinct(t *testing.T) {
 	if sid1 == sid2 {
 		t.Fatalf("env-incompatible Spawns produced identical sid %q — AC8 violated", sid1)
 	}
+	if len(sid1) < 16 {
+		t.Fatalf("sid1 too short to be a valid global sid: %q (want ≥16 hex chars)", sid1)
+	}
 	if !strings.HasPrefix(sid2, sid1[:16]+"-env-") {
 		// sid2 should be `{baseSid}-env-{8hex}`. sid1 is the base global sid
-		// (16 hex chars). If sid1 itself contains an env suffix that's not
-		// expected for the first spawn — log for diagnostics.
-		t.Logf("sid1=%s sid2=%s — sid2 should be sid1 + '-env-' + 8hex", sid1, sid2)
+		// (16 hex chars) and its first 16 chars form the base prefix.
+		t.Fatalf("unexpected env-bucket sid format: sid1=%s sid2=%s — sid2 must start with sid1[:16]+\"-env-\"", sid1, sid2)
 	}
 	if got := d.OwnerCount(); got != 2 {
 		t.Errorf("OwnerCount = %d, want 2 for env-incompatible Spawns under global-first", got)

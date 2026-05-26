@@ -252,10 +252,11 @@ type Config struct {
 	// across the longer shared/general OwnerIdleTimeout wastes upstream
 	// processes for no possible cache benefit.
 	//
-	// Default: 60 seconds. Set to 0 to disable the optimization (in which
-	// case isolated owners use the same OwnerIdleTimeout as shared owners).
+	// Default (nil): 60 seconds. Pass a pointer to zero (new(time.Duration)
+	// or DurationPtr(0)) to disable the optimization, in which case isolated
+	// owners use the same OwnerIdleTimeout as shared owners.
 	// Per-owner x-mux.idleTimeout always wins over this value.
-	IsolatedIdleTimeout time.Duration
+	IsolatedIdleTimeout *time.Duration
 
 	// AdmissionBufferTimeout bounds the cross-cwd admission gate wait at
 	// spawn time (CR-002). When a Spawn lands on an existing global owner
@@ -337,12 +338,15 @@ func New(cfg Config) (*Daemon, error) {
 	if idleTimeout == 0 {
 		idleTimeout = 5 * time.Minute
 	}
-	// Isolated owners default to a 60s idle window. Operators who explicitly
-	// want isolated owners to live as long as shared ones can pass a value
-	// equal to ownerIdleTimeout (or any larger duration).
-	isolatedIdleTimeout := cfg.IsolatedIdleTimeout
-	if isolatedIdleTimeout == 0 {
-		isolatedIdleTimeout = 60 * time.Second
+	// Isolated owners default to a 60s idle window. Callers who explicitly
+	// want to disable the early-reap optimization pass a pointer to zero
+	// (cfg.IsolatedIdleTimeout = new(time.Duration)), in which case isolated
+	// owners use the same ownerIdleTimeout as shared owners.
+	var isolatedIdleTimeout time.Duration
+	if cfg.IsolatedIdleTimeout != nil {
+		isolatedIdleTimeout = *cfg.IsolatedIdleTimeout // 0 = disabled; >0 = custom
+	} else {
+		isolatedIdleTimeout = 60 * time.Second // default
 	}
 	// CR-002 admission gate timeout. Env override MCP_MUX_ADMISSION_TIMEOUT
 	// (Go duration string, e.g. "45s") takes precedence over Config.
@@ -751,13 +755,15 @@ func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shar
 	}
 	// Not classified yet AND cross-cwd → wait.
 	d.logger.Printf("admission-gate: cross-cwd Spawn from %q waiting on owner %s classify (primary cwd %q)",
-		canonReqCwd, entry.ServerID[:8], canonEntryCwd)
+		canonReqCwd, shortServerID(entry.ServerID), canonEntryCwd)
+	timer := time.NewTimer(d.admissionBufferTimeout)
+	defer timer.Stop()
 	select {
 	case <-entry.Owner.Classified():
 		return entry.Owner.IsClassifiedShareable(), nil
-	case <-time.After(d.admissionBufferTimeout):
+	case <-timer.C:
 		return false, fmt.Errorf("admission gate: timeout after %s waiting for owner %s classify",
-			d.admissionBufferTimeout, entry.ServerID[:8])
+			d.admissionBufferTimeout, shortServerID(entry.ServerID))
 	}
 }
 
@@ -889,6 +895,16 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			d.mu.Lock()
 			// Re-check: creation may have succeeded or failed.
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
+				// CR-002 AC8: re-validate env compatibility now that the owner is
+				// fully created and e.Env is populated. At the time deriveEnvBucketedSid
+				// ran (before the creating-wait), the placeholder had no env, so it
+				// returned baseSid. Now we must confirm the new request's env is
+				// compatible; if not, retry so Spawn re-derives the bucketed sid.
+				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, req.Env) {
+					d.logger.Printf("env-incompat after create-wait: owner %s — retrying with bucketed sid", shortServerID(sid))
+					d.mu.Unlock()
+					return "", "", "", errSpawnRetry
+				}
 				e.LastSession = time.Now()
 				d.mu.Unlock()
 				// CR-002 admission gate: if this Spawn's cwd differs from the
@@ -903,12 +919,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 					return "", "", "", errSpawnRetry
 				}
 				if !shareable {
-					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", sid[:8], req.Cwd)
+					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(sid), req.Cwd)
 					reqPtr.Mode = "isolated"
 					return "", "", "", errSpawnRetry
 				}
 				e.Owner.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, req.Env)
-				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
+				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", shortServerID(sid), req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
 			// Creation failed or entry was removed — signal retry so Spawn's
@@ -2021,6 +2037,18 @@ func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) 
 	}
 	d.mu.RUnlock()
 	if existingEnv == nil {
+		// No owner at baseSid. Before returning baseSid, check whether a
+		// bucketed sid for this request's env already exists in d.owners
+		// (can happen when the base owner was evicted but the bucketed owner
+		// is still live). If so, return the bucketed sid to avoid creating a
+		// duplicate base-sid owner that races with the existing bucketed owner.
+		bucketedSid := baseSid + "-env-" + semanticEnvHash(reqEnv)
+		d.mu.RLock()
+		_, bucketedExists := d.owners[bucketedSid]
+		d.mu.RUnlock()
+		if bucketedExists {
+			return bucketedSid
+		}
 		return baseSid // no existing entry — base sid is free
 	}
 	if envCompatible(existingEnv, reqEnv) {
@@ -2028,7 +2056,7 @@ func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) 
 	}
 	derived := baseSid + "-env-" + semanticEnvHash(reqEnv)
 	d.logger.Printf("env-incompat under global-first: deriving sid=%s for cmd=%q (base=%s)",
-		derived, "...", baseSid[:8])
+		derived, "...", shortServerID(baseSid))
 	return derived
 }
 
