@@ -120,6 +120,175 @@ Broken signals:
 - `upgrade --restart` reports socket handoff failure without fallback recovery.
 - `status` cannot contact the daemon after restart.
 
+## Scenario 5: Global-First Owner Dedup Across Cwds (v0.25.0)
+
+Objective: prove that two host sessions wrapping the same MCP server command
+from different working directories share ONE upstream owner (not one per cwd)
+after `mcp-mux upgrade --restart` to v0.25.0.
+
+Setup:
+
+- v0.25.0 binary installed and `mcp-mux status` responds (covered by Scenario 4).
+- A shareable MCP server in `mcp-mux` host config (the test uses `time`
+  server: `uvx mcp-server-time` — known shared-classifiable by tools/list).
+
+Commands (run as a user, not a developer — open two new shells and pretend
+they are two different host sessions):
+
+```powershell
+# Shell A — first cwd
+cd $env:USERPROFILE
+.\mcp-mux.exe status | ConvertFrom-Json | Select-Object -ExpandProperty servers | `
+  Where-Object { $_.command -eq 'uvx' -and $_.args -contains 'mcp-server-time' } | `
+  Measure-Object | Select-Object -ExpandProperty Count
+
+# Shell B — second cwd, identical command
+cd D:\Dev\mcp-mux
+.\mcp-mux.exe status | ConvertFrom-Json | Select-Object -ExpandProperty servers | `
+  Where-Object { $_.command -eq 'uvx' -and $_.args -contains 'mcp-server-time' } | `
+  Measure-Object | Select-Object -ExpandProperty Count
+```
+
+Trigger both shells to actually USE the time tool (so the shim spawns the
+upstream and classification completes). Easiest: ask each shell's host to
+run a single `get_current_time` call, or invoke `uvx mcp-server-time` once
+manually if your host wraps it.
+
+Then count active owners for that command across the whole daemon:
+
+```powershell
+.\mcp-mux.exe status | ConvertFrom-Json | Select-Object -ExpandProperty servers | `
+  Where-Object { $_.command -eq 'uvx' -and $_.args -contains 'mcp-server-time' } | `
+  Format-Table server_id, mode, cwd, classification, session_count -AutoSize
+```
+
+Expected:
+
+- After both shells have invoked the time tool, the table shows exactly ONE
+  active `uvx mcp-server-time` owner. The owner's `cwd_set` (or `cwd`) covers
+  both shells' working directories.
+- `mode` reads `global` (not `cwd`).
+- `classification` is `shared` (or `session-aware`); not `isolated`.
+- Subsequent calls from either shell reuse the same `server_id` — visible by
+  re-running the count query and seeing it stay at 1.
+
+Broken signals:
+
+- Two owners for the same `(command, args)` tuple appear, one per cwd.
+- `mode` reads `cwd` for the second-shell entry.
+- `classification` reports `isolated` for a server that legitimately
+  advertises shared tools/list (operator should check the upstream's
+  capability — not a global-first bug if the upstream itself claims
+  isolation).
+
+## Scenario 6: Isolated Owner Short Idle Cleanup (v0.25.0)
+
+Objective: prove a stateful (isolated-classified) upstream tears down within
+60 seconds of its last session disconnect, NOT the general 10-minute owner
+idle timeout.
+
+Setup:
+
+- v0.25.0 binary installed.
+- A stateful MCP server in host config that classifies as isolated. The
+  `playwright` MCP and `serena` MCP are good candidates — both classify
+  isolated under tools/list inspection.
+
+Commands:
+
+```powershell
+# 1. Trigger ONE invocation of the isolated server from a host, then close
+#    the host session (or stop using that server in that session).
+# 2. Note the server_id immediately after invocation:
+.\mcp-mux.exe status | ConvertFrom-Json | `
+  Select-Object -ExpandProperty servers | `
+  Where-Object { $_.classification -eq 'isolated' -and $_.session_count -eq 0 } | `
+  Select-Object server_id, command, classification, session_count, idle_seconds
+
+# 3. Wait 70 seconds (10 seconds past the 60s default cleanup threshold).
+Start-Sleep -Seconds 70
+
+# 4. Re-check status:
+.\mcp-mux.exe status | ConvertFrom-Json | `
+  Select-Object -ExpandProperty servers | `
+  Where-Object { $_.server_id -eq '<noted-sid-from-step-2>' }
+```
+
+Expected:
+
+- Step 2 finds the isolated owner with `session_count: 0` and
+  `classification: "isolated"`.
+- Step 4 returns no rows — the owner has been reaped.
+- A re-spawn of the same upstream from a new session works fine (no zombie
+  state).
+
+Broken signals:
+
+- The owner still exists after 70 seconds. (Check whether
+  `engine.Config.IsolatedIdleTimeout` was set to `&zero` to disable — that
+  is a legitimate operator override, not a bug.)
+- The owner exists but its process is gone (`ps`/`Get-Process` shows nothing).
+
+## Scenario 7: Credential Boundary Across Sessions (v0.25.0)
+
+Objective: prove two host sessions with different `GITHUB_TOKEN` env values
+get separate owners for the same MCP command, so neither session sees the
+other's token in its upstream.
+
+Setup:
+
+- An MCP server in host config that consumes `GITHUB_TOKEN` (the `github`
+  MCP server, or any server documented to read GH credentials).
+
+Commands:
+
+```powershell
+# Shell A — credential value "abc"
+$env:GITHUB_TOKEN = 'abc'
+# Start a host session in Shell A and invoke the github MCP server.
+
+# Shell B — credential value "xyz"
+$env:GITHUB_TOKEN = 'xyz'
+# Start a host session in Shell B and invoke the same github MCP server.
+
+# In a third shell, inspect:
+.\mcp-mux.exe status | ConvertFrom-Json | `
+  Select-Object -ExpandProperty servers | `
+  Where-Object { $_.command -match 'github' -or ($_.args -join ' ') -match 'github' } | `
+  Format-Table server_id, mode, session_count, cwd -AutoSize
+```
+
+Expected:
+
+- Two distinct `server_id` rows for the same `(command, args)`. The second
+  sid carries an `-env-<hash>` suffix (e.g. `<base>-env-9a1b2c3d`).
+- Each session sees only its own `GITHUB_TOKEN` value reflected in the
+  upstream's behavior (validate by invoking a github tool that echoes the
+  authenticated user; the two shells should report different users if the
+  tokens belong to different accounts).
+
+Same scenario with the credential entirely ABSENT in one shell:
+
+```powershell
+# Shell A — set GITHUB_TOKEN
+$env:GITHUB_TOKEN = 'abc'
+
+# Shell B — REMOVE GITHUB_TOKEN
+Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+```
+
+Expected: still two distinct owners (presence asymmetry must split, not
+collapse). This is the codex PR #121 P1 guarantee — Shell B must not bind
+to Shell A's token-bearing owner.
+
+Broken signals:
+
+- One shared owner serves both shells despite different credential values.
+- One shared owner serves both shells when one has GITHUB_TOKEN and the
+  other does not.
+- A session sees the OTHER session's token in upstream behavior (e.g.
+  authenticated as the wrong user).
+
 ## Verdict Template
 
 Create a run report under `.agent/reports/emulation-playbook-run-YYYYMMDD-HHMM.md`
@@ -131,6 +300,9 @@ with this table:
 | 2 | Real Time Upstream Reconnect | Smoke verdict PASS |  | PASS/FAIL |
 | 3 | Current Topology Oracle | PoC verdict PASS |  | PASS/FAIL |
 | 4 | Local Deployment Upgrade | Production binary upgraded and status works |  | PASS/FAIL/SKIPPED |
+| 5 | Global-First Owner Dedup (v0.25.0) | 1 owner per (cmd, args) across 2 cwds |  | PASS/FAIL |
+| 6 | Isolated Short Idle Cleanup (v0.25.0) | Isolated owner reaped within 60s of zero sessions |  | PASS/FAIL |
+| 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
 
 Overall verdict:
 
