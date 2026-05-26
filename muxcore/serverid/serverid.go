@@ -13,8 +13,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
 type SharingMode string
@@ -131,13 +129,26 @@ func Compute(args []string) string {
 	return GenerateContextKey(ModeCwd, args[0], args[1:], nil, ".")
 }
 
-// GenerateContextKey creates the deterministic ID for the upstream server
+// GenerateContextKey creates the deterministic ID for the upstream server.
+//
+// All modes — including ModeIsolated — produce a stable hash of
+// (MuxVersion || cmd || args || scopePath [|| env]). For shared modes
+// (ModeCwd, ModeGit, ModeGlobal) the result is a bare 16-char hex prefix; for
+// ModeIsolated the result is "isolated-" + 16-char hex prefix so the wire
+// format remains distinguishable in mux_list output and snapshot files.
+//
+// Engram #244 Bug 2: ModeIsolated previously returned "isolated-" + random
+// UUID, making per-(cmd, cwd) reconnects un-reusable — every new session for
+// the same isolated upstream spawned a fresh subprocess that no future call
+// could ever rebind. Seeding the hash from (cmd, args, cwd) eliminates that
+// accumulation pattern: a session that reconnects to the same isolated
+// upstream from the same cwd hits the same sid and reuses the existing owner.
+//
+// env participates in the hash only for non-isolated modes. Including env in
+// the isolated hash would fragment identity along transient session vars
+// (CLAUDE_CODE_*, TERM_PROGRAM, etc.) that vary between MCP host invocations
+// for the same project — the exact thing we just stopped doing.
 func GenerateContextKey(mode SharingMode, cmd string, args, env []string, rawCwd string) string {
-	if mode == ModeIsolated {
-		// Return a random/unique string to ensure no sharing
-		return "isolated-" + uuid.New().String()[:16]
-	}
-
 	hash := sha256.New()
 	hash.Write([]byte(MuxVersion))
 	hash.Write([]byte{0})
@@ -150,7 +161,7 @@ func GenerateContextKey(mode SharingMode, cmd string, args, env []string, rawCwd
 	// 1. Determine Scope Path based on mode
 	scopePath := ""
 	switch mode {
-	case ModeCwd:
+	case ModeCwd, ModeIsolated:
 		scopePath = CanonicalizePath(rawCwd)
 	case ModeGit:
 		scopePath = findGitRoot(CanonicalizePath(rawCwd))
@@ -160,9 +171,11 @@ func GenerateContextKey(mode SharingMode, cmd string, args, env []string, rawCwd
 	hash.Write([]byte{0})
 	hash.Write([]byte(scopePath))
 
-	// 2. Hash deterministic environment fingerprint
-	// Only hash explicitly provided env vars, not the whole os.Environ()
-	if len(env) > 0 {
+	// 2. Hash deterministic environment fingerprint for shared modes only.
+	// Isolated identity must ignore env so per-session env variation (e.g.
+	// CLAUDE_CODE_ENTRYPOINT switching cli↔ide between Claude reconnects)
+	// does not fragment the owner across reconnects of the same upstream.
+	if mode != ModeIsolated && len(env) > 0 {
 		envCopy := make([]string, len(env))
 		copy(envCopy, env)
 		sort.Strings(envCopy)
@@ -172,7 +185,11 @@ func GenerateContextKey(mode SharingMode, cmd string, args, env []string, rawCwd
 		}
 	}
 
-	return hex.EncodeToString(hash.Sum(nil))[:16]
+	suffix := hex.EncodeToString(hash.Sum(nil))[:16]
+	if mode == ModeIsolated {
+		return "isolated-" + suffix
+	}
+	return suffix
 }
 
 // resolveBaseDir returns baseDir if non-empty, otherwise os.TempDir().

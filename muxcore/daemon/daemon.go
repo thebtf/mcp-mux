@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -101,6 +102,25 @@ type Daemon struct {
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	sessionHandler muxcore.SessionHandler
 
+	// isolatedIdleTimeout is the shorter idle timeout applied to owners whose
+	// classification verdict is isolated. The forced-isolated retry path
+	// (daemon.go:797-807) and any post-init isolated classification produces
+	// owners whose server_id cannot be reused, so holding them across the
+	// longer general OwnerIdleTimeout wastes upstream processes. Zero means
+	// "use the general OwnerIdleTimeout for all owners regardless of
+	// classification". Per-owner x-mux.idleTimeout always wins over this.
+	isolatedIdleTimeout time.Duration
+
+	// admissionBufferTimeout bounds the wait at the spawn-time admission
+	// gate (CR-002): when a cross-cwd Spawn lands on an existing global
+	// owner that is not yet classified, the caller waits up to this
+	// duration for Owner.Classified() to close before deciding whether to
+	// bind (shareable) or fall through to a fresh isolated-seeded owner.
+	// On timeout, the caller falls through to a fresh spawn (safe default:
+	// assume worst case = isolated). Independent of concurrentCreateWaitTimeout
+	// per spec C3 — these gate semantically different concerns.
+	admissionBufferTimeout time.Duration
+
 	// ownerIdleTimeout is the default time an owner may sit with no activity
 	// (no MCP traffic, no sessions, no pending requests, no active progress
 	// tokens, no busy declarations) before the reaper removes it. Default 10m.
@@ -122,6 +142,38 @@ type Daemon struct {
 	// times within a window, further spawn requests are rejected instead of
 	// creating an infinite respawn loop that burns CPU.
 	crashTracker map[string][]time.Time
+
+	// deprecatedModeWarned tracks (cmd, args) tuples for which a deprecation
+	// warning has been emitted this daemon lifetime. CR-002: legacy shim
+	// Mode="cwd"/"git" is still honored but warns once per (cmd, args). Removal
+	// target v0.27.0. sync.Map keyed by `cmd|args.Join("\0")` so concurrent
+	// spawns don't double-log.
+	deprecatedModeWarned sync.Map
+
+	// forcedIsolatedRetryCounters provides unique sid suffixes for the
+	// forced-isolated retry path when CR-001's deterministic isolated
+	// identity would otherwise loop. Triggered when daemon.go's
+	// "owner not accepting but has active sessions" branch fires AND the
+	// original Mode was already isolated — under deterministic isolated
+	// sids, the retry would recompute the SAME sid, re-hit the same
+	// closed-listener owner, and exhaust maxSpawnRetries.
+	//
+	// Each forced-isolated retry for a given base sid increments its
+	// counter; the retry's spawnOnce reads the counter and appends
+	// `-r<N>` to the computed sid so each retry produces a distinct
+	// owner. The original entry (closed listener + active sessions)
+	// stays alive serving its existing sessions; the new retry-suffixed
+	// owner serves the new session. The reaper eventually cleans both
+	// per CR-003 idle-isolated timeout.
+	//
+	// Keyed by the base isolated sid (e.g. "isolated-<hash>"). Values
+	// are *atomic.Int64 to handle concurrent retries for the same base.
+	// Memory growth is bounded by the number of distinct (cmd,args,cwd)
+	// tuples that hit the forced-retry path × daemon lifetime — small
+	// in practice (each retry happens once per session-lifecycle event,
+	// not per request).
+	forcedIsolatedRetryCounters sync.Map // key: base isolated sid → *atomic.Int64
+
 
 	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
@@ -217,6 +269,35 @@ type Config struct {
 	// Default: 5 minutes.
 	IdleTimeout time.Duration
 
+	// IsolatedIdleTimeout is the shorter idle timeout applied by the reaper
+	// to owners whose post-init classification was isolated. Isolated owners
+	// cannot be reattached by future Spawn calls (their server_id is either
+	// a random UUID from the forced-isolated retry path or a cwd-keyed hash
+	// whose listener was closed by the isolation verdict), so holding them
+	// across the longer shared/general OwnerIdleTimeout wastes upstream
+	// processes for no possible cache benefit.
+	//
+	// Default (nil): 60 seconds. Pass a pointer to zero (new(time.Duration)
+	// or DurationPtr(0)) to disable the optimization, in which case isolated
+	// owners use the same OwnerIdleTimeout as shared owners.
+	// Per-owner x-mux.idleTimeout always wins over this value.
+	IsolatedIdleTimeout *time.Duration
+
+	// AdmissionBufferTimeout bounds the cross-cwd admission gate wait at
+	// spawn time (CR-002). When a Spawn lands on an existing global owner
+	// whose primary cwd differs AND whose classification is not yet known,
+	// the caller waits up to this duration for Classified() to close.
+	// On wake:
+	//   - classified shareable → cross-cwd bind proceeds
+	//   - classified isolated → caller falls through to fresh isolated
+	//     spawn with a CR-001 deterministic isolated-seeded sid
+	//   - timeout → safe default: fall through to fresh isolated spawn
+	//
+	// Default: 30 seconds (independent of concurrentCreateWaitTimeout per
+	// spec C3 — these gate semantically different concerns). Override via
+	// env MCP_MUX_ADMISSION_TIMEOUT (Go duration string).
+	AdmissionBufferTimeout time.Duration
+
 	Logger *log.Logger
 
 	// SkipSnapshot disables snapshot loading on startup. Used by tests
@@ -282,6 +363,27 @@ func New(cfg Config) (*Daemon, error) {
 	if idleTimeout == 0 {
 		idleTimeout = 5 * time.Minute
 	}
+	// Isolated owners default to a 60s idle window. Callers who explicitly
+	// want to disable the early-reap optimization pass a pointer to zero
+	// (cfg.IsolatedIdleTimeout = new(time.Duration)), in which case isolated
+	// owners use the same ownerIdleTimeout as shared owners.
+	var isolatedIdleTimeout time.Duration
+	if cfg.IsolatedIdleTimeout != nil {
+		isolatedIdleTimeout = *cfg.IsolatedIdleTimeout // 0 = disabled; >0 = custom
+	} else {
+		isolatedIdleTimeout = 60 * time.Second // default
+	}
+	// CR-002 admission gate timeout. Env override MCP_MUX_ADMISSION_TIMEOUT
+	// (Go duration string, e.g. "45s") takes precedence over Config.
+	admissionBufferTimeout := cfg.AdmissionBufferTimeout
+	if envAdmission := os.Getenv("MCP_MUX_ADMISSION_TIMEOUT"); envAdmission != "" {
+		if parsed, err := time.ParseDuration(envAdmission); err == nil && parsed > 0 {
+			admissionBufferTimeout = parsed
+		}
+	}
+	if admissionBufferTimeout == 0 {
+		admissionBufferTimeout = 30 * time.Second
+	}
 	daemonFlag := cfg.DaemonFlag
 	if daemonFlag == "" {
 		daemonFlag = "--daemon"
@@ -294,24 +396,26 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{
-		owners:           make(map[string]*OwnerEntry),
-		logger:           logger,
-		done:             make(chan struct{}),
-		ownerIdleTimeout: ownerIdleTimeout,
-		idleTimeout:      idleTimeout,
-		templateCache:    make(map[string]mcpsnapshot.OwnerSnapshot),
-		crashTracker:     make(map[string][]time.Time),
-		supervisorCtx:    supCtx,
-		supervisorCancel: supCancel,
-		handlerFunc:      cfg.HandlerFunc,
-		sessionHandler:   cfg.SessionHandler,
-		daemonFlag:       daemonFlag,
-		name:             name,
-		persistent:       cfg.Persistent,
-		daemonGeneration: daemonGeneration,
-		authorizeSession: cfg.AuthorizeSession,
-		onFrameReceived:  cfg.OnFrameReceived,
-		ownerRemoval:     newOwnerRemovalStats(),
+		owners:                 make(map[string]*OwnerEntry),
+		logger:                 logger,
+		done:                   make(chan struct{}),
+		ownerIdleTimeout:       ownerIdleTimeout,
+		isolatedIdleTimeout:    isolatedIdleTimeout,
+		admissionBufferTimeout: admissionBufferTimeout,
+		idleTimeout:            idleTimeout,
+		templateCache:          make(map[string]mcpsnapshot.OwnerSnapshot),
+		crashTracker:           make(map[string][]time.Time),
+		supervisorCtx:          supCtx,
+		supervisorCancel:       supCancel,
+		handlerFunc:            cfg.HandlerFunc,
+		sessionHandler:         cfg.SessionHandler,
+		daemonFlag:             daemonFlag,
+		name:                   name,
+		persistent:             cfg.Persistent,
+		daemonGeneration:       daemonGeneration,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
+		ownerRemoval:           newOwnerRemovalStats(),
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -628,6 +732,85 @@ func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSn
 	return snap, ok
 }
 
+// waitForCrossCwdClassify is the CR-002 admission gate. When a Spawn lands
+// on an existing global owner whose primary cwd differs from the requesting
+// session's cwd AND whose classification is not yet known, this function
+// blocks the caller up to d.admissionBufferTimeout for Owner.Classified()
+// to close. Three outcomes:
+//
+//   - shareable=true, err=nil → owner is safe to bind cross-cwd (same cwd
+//     OR already classified as shared/session-aware OR newly classified
+//     shareable). Caller proceeds with PreRegisterForOwner.
+//   - shareable=false, err=nil → owner classified isolated during the wait.
+//     Caller MUST NOT bind cross-cwd; fall through to fresh spawn under a
+//     CR-001 deterministic isolated-seeded sid for the requesting cwd.
+//   - shareable=false, err non-nil → wait timed out. Safe default: caller
+//     treats as isolated and falls through to fresh spawn. The original
+//     owner continues serving its primary-cwd sessions unaffected.
+//
+// Same-cwd binds skip the gate (return immediately as shareable=true).
+// This is the only safety property the admission gate provides: an
+// unclassified upstream NEVER receives frames from a cross-cwd session
+// because that session never gets an IPC path until classification
+// resolves. The Owner.crossCwdBuffer post-attach buffer (mentioned in
+// spec AC2 prose) is unnecessary under this simpler implementation —
+// frames literally don't exist on the daemon yet because the shim hasn't
+// dialed IPC (the daemon's Spawn RPC response is the gate).
+func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shareable bool, err error) {
+	if entry == nil || entry.Owner == nil {
+		return false, fmt.Errorf("admission gate: owner not live")
+	}
+	// Same-cwd: no gate. Primary-cwd sessions always pass through.
+	canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
+	canonReqCwd := serverid.CanonicalizePath(reqCwd)
+	if canonEntryCwd == canonReqCwd {
+		return true, nil
+	}
+	// Already classified: respect the verdict immediately.
+	if entry.Owner.IsClassifiedShareable() {
+		return true, nil
+	}
+	// Already classified non-shareable? Check via Classified() channel.
+	select {
+	case <-entry.Owner.Classified():
+		// Channel already closed AND IsClassifiedShareable returned false →
+		// owner is isolated. Fall through to fresh spawn.
+		return false, nil
+	default:
+	}
+	// Not classified yet AND cross-cwd → wait.
+	d.logger.Printf("admission-gate: cross-cwd Spawn from %q waiting on owner %s classify (primary cwd %q)",
+		canonReqCwd, shortServerID(entry.ServerID), canonEntryCwd)
+	timer := time.NewTimer(d.admissionBufferTimeout)
+	defer timer.Stop()
+	select {
+	case <-entry.Owner.Classified():
+		return entry.Owner.IsClassifiedShareable(), nil
+	case <-timer.C:
+		return false, fmt.Errorf("admission gate: timeout after %s waiting for owner %s classify",
+			d.admissionBufferTimeout, shortServerID(entry.ServerID))
+	}
+}
+
+// warnDeprecatedMode logs a one-shot deprecation warning per (cmd, args) tuple
+// per daemon lifetime when a shim sends a legacy Mode value ("cwd" or "git").
+// Designed to surface stale shim binaries in operator logs without spamming
+// the log on every Spawn. Removal target: v0.27.0 (Mode="cwd"/"git" rejected
+// at protocol layer).
+func (d *Daemon) warnDeprecatedMode(cmd string, args []string, legacyMode string) {
+	key := cmd + "\x00" + strings.Join(args, "\x00")
+	if _, loaded := d.deprecatedModeWarned.LoadOrStore(key, true); loaded {
+		return
+	}
+	d.logger.Printf(
+		"deprecation: shim sent Mode=%q for cmd=%q args=%v; this daemon now defaults to ModeGlobal "+
+			"(one upstream per (cmd, args)). Legacy modes honored through muxcore/v0.26.0; removal in v0.27.0. "+
+			"Either rebuild the shim against muxcore/v0.25.0+ or pin the legacy mode explicitly via "+
+			"MCP_MUX_DEFAULT_MODE=cwd in the shim environment to silence this warning.",
+		legacyMode, cmd, args,
+	)
+}
+
 // Spawn creates or reuses an owner for the given command. If a compatible owner
 // already exists (same command+args+cwd, or globally shareable), it is reused —
 // stateless servers don't need per-project copies. Returns the IPC path, server
@@ -658,14 +841,30 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 // the mutation must persist across iterations of the Spawn retry loop.
 func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, error) {
 	req := *reqPtr
-	mode := serverid.ModeCwd
+	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
+	// Mode now gets the global identity (one upstream per (cmd, args)) per the
+	// spec's original "one upstream per (cmd, args), isolation as exception"
+	// intent. Legacy shims that explicitly send Mode="cwd" or "git" are still
+	// honored for backward compat through v0.26.0; deprecation warning logged
+	// once per (cmd, args) per daemon lifetime. v0.27.0 removes "cwd"/"git"
+	// from the protocol entirely (separate spec, separate plan).
+	mode := serverid.ModeGlobal
 	switch req.Mode {
-	case "global":
+	case "global", "":
 		mode = serverid.ModeGlobal
 	case "isolated":
 		mode = serverid.ModeIsolated
-	case "cwd", "":
+	case "cwd":
 		mode = serverid.ModeCwd
+		d.warnDeprecatedMode(req.Command, req.Args, "cwd")
+	case "git":
+		mode = serverid.ModeGit
+		d.warnDeprecatedMode(req.Command, req.Args, "git")
+	default:
+		// Unknown mode value from future-shim or typo — safe default + warn.
+		d.logger.Printf("spawn: unknown Mode=%q from shim, defaulting to ModeGlobal (cmd=%q args=%v)",
+			req.Mode, req.Command, req.Args)
+		mode = serverid.ModeGlobal
 	}
 
 	// Generate handshake token upfront — valid for this spawn call only.
@@ -691,6 +890,33 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// Server identity is based on command+args+cwd only, NOT env.
 	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
 
+	// CR-002 codex PR #121 fix: when the forced-isolated retry path bumped a
+	// per-base-sid counter, append the counter as `-r<N>` so each retry
+	// produces a distinct isolated owner. Without this, CR-001's deterministic
+	// isolated identity makes the retry recompute the SAME sid and loop until
+	// maxSpawnRetries exhausts.
+	//
+	// The counter persists for daemon lifetime, monotonically increasing per
+	// base sid. Future spawns for the same (cmd,args,cwd) tuple will see a
+	// non-zero counter and start at `-r<latest>`; reconnects of those sessions
+	// race-bump again. Reaper cleans orphaned -rN owners per CR-003 idle-
+	// isolated timeout.
+	if mode == serverid.ModeIsolated {
+		if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
+			if n := ctrI.(*atomic.Int64).Load(); n > 0 {
+				sid = fmt.Sprintf("%s-r%d", sid, n)
+			}
+		}
+	}
+
+	// CR-002 AC8: under global-first default, env-incompat sessions for the
+	// same (cmd, args) must NOT collapse onto a shared owner. Derive an
+	// env-bucketed sid suffix when an existing entry has incompatible env.
+	// Compatible env OR no existing entry → sid unchanged.
+	if mode == serverid.ModeGlobal {
+		sid = d.deriveEnvBucketedSid(sid, req.Env)
+	}
+
 	d.mu.Lock()
 
 	// 1. Exact match (same command+args+cwd)?
@@ -713,10 +939,40 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 			d.mu.Lock()
 			// Re-check: creation may have succeeded or failed.
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
+				// CR-002 AC8: re-validate env compatibility now that the owner is
+				// fully created and e.Env is populated. At the time deriveEnvBucketedSid
+				// ran (before the creating-wait), the placeholder had no env, so it
+				// returned baseSid. Now we must confirm the new request's env is
+				// compatible; if not, retry so Spawn re-derives the bucketed sid.
+				//
+				// mergeEnv normalizes req.Env to the post-merge form (matches
+				// e.Env's stored form) so envCompatible compares like-for-like
+				// per CodeRabbit PR #121 finding about merge-vs-raw asymmetry.
+				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, mergeEnv(req.Env)) {
+					d.logger.Printf("env-incompat after create-wait: owner %s — retrying with bucketed sid", shortServerID(sid))
+					d.mu.Unlock()
+					return "", "", "", errSpawnRetry
+				}
 				e.LastSession = time.Now()
 				d.mu.Unlock()
+				// CR-002 admission gate: if this Spawn's cwd differs from the
+				// existing owner's primary cwd AND the owner is not yet
+				// classified, wait for classify before binding. Isolated
+				// classification forces fall-through to a fresh isolated-seeded
+				// owner for THIS cwd; shareable classification permits the bind.
+				shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
+				if gateErr != nil {
+					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
+				if !shareable {
+					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(sid), req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
 				e.Owner.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, req.Env)
-				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", sid[:8], req.Command)
+				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", shortServerID(sid), req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
 			// Creation failed or entry was removed — signal retry so Spawn's
@@ -753,8 +1009,37 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 					d.mu.Unlock()
 					return "", "", "", errSpawnRetry
 				}
+				// CR-002 AC8 race fix (codex PR #121): between
+				// deriveEnvBucketedSid's RLock and this Lock, another spawn
+				// could have created the base global owner with env that
+				// conflicts with this request. The bucketed sid path was
+				// skipped because no entry existed at derive time. Re-validate
+				// env compatibility under the CAS lock — if incompatible, retry
+				// so Spawn re-derives the bucketed sid against the now-live
+				// entry. Without this, concurrent spawns with different
+				// credentials can collapse onto one upstream during startup
+				// storms, defeating the credentials-boundary guarantee.
+				if mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, mergeEnv(req.Env)) {
+					d.logger.Printf("env-incompat after CAS on fast path: owner %s — retrying with bucketed sid", shortServerID(probeSID))
+					d.mu.Unlock()
+					return "", "", "", errSpawnRetry
+				}
 				current.LastSession = time.Now()
 				d.mu.Unlock()
+				// CR-002 admission gate: same logic as the placeholder-wait
+				// path. Cross-cwd binding on an unclassified owner waits for
+				// Classified(); isolated verdict forces fall-through.
+				shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
+				if gateErr != nil {
+					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
+				if !shareable {
+					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
+					reqPtr.Mode = "isolated"
+					return "", "", "", errSpawnRetry
+				}
 				probeOwner.SessionMgr().PreRegisterForOwner(token, probeSID, req.Cwd, req.Env)
 				// Note: no log here — this path is the hot path (every CC
 				// session reconnect). Logging each reuse produced 500+
@@ -796,13 +1081,30 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		// with a fresh server ID.
 		if entry.Owner.SessionCount() > 0 {
 			d.logger.Printf("owner %s not accepting but has %d active sessions, leaving alive",
-				sid[:8], entry.Owner.SessionCount())
-			// DON'T delete or shutdown. Fall through — new owner will get a unique
-			// isolated ID from serverid.ModeIsolated below.
+				shortServerID(sid), entry.Owner.SessionCount())
+			// CR-002 codex PR #121 fix: under CR-001 deterministic isolated
+			// identity, switching Mode to "isolated" alone is insufficient when
+			// the ORIGINAL mode was already isolated — the retry would recompute
+			// the same sid and re-hit this same closed-listener entry, looping
+			// until maxSpawnRetries exhausts. Bump a per-base-sid retry counter
+			// so spawnOnce's sid computation appends `-r<N>` and produces a
+			// distinct sid for this retry.
+			//
+			// The base sid for the counter is the SAME sid we matched on (the
+			// entry's closed-listener sid), so the counter is keyed correctly
+			// regardless of whether we entered via mode=global or mode=isolated.
+			// For non-isolated original modes, the retry's Mode switch to
+			// isolated produces a different base hash anyway, but bumping the
+			// counter is harmless (the retry will read counter under the new
+			// base, which is initially 0).
+			baseForCounter := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
+			ctrI, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseForCounter, &atomic.Int64{})
+			newCounter := ctrI.(*atomic.Int64).Add(1)
+			d.logger.Printf("forced-isolated retry: bumping counter for base=%s to r%d",
+				shortServerID(baseForCounter), newCounter)
+			// DON'T delete or shutdown the old entry. Fall through — the retry
+			// will compute a unique sid via the counter suffix.
 			d.mu.Unlock()
-			// Force isolated mode for the new spawn so it gets a unique server ID.
-			// Mutate through reqPtr so the next Spawn retry iteration sees the
-			// updated mode (reqPtr points to Spawn's for-loop-local req).
 			reqPtr.Mode = "isolated"
 			return "", "", "", errSpawnRetry
 		}
@@ -1586,6 +1888,16 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
 
+	// envCompatible must compare like-for-like: owner.Env is post-mergeEnv
+	// (populated at spawn time via mergeEnv(req.Env)), so the request side
+	// must also be merged. Without this, codex PR #121 P1's credential-
+	// asymmetry guard fires on every cross-session lookup because the raw
+	// request env lacks os.Environ-supplied credentials (SSH_AUTH_SOCK,
+	// system-level GITHUB_TOKEN, etc.) that the owner inherited.
+	// mergeEnv is idempotent on already-merged input — safe to apply here
+	// whether the caller already merged or not.
+	mergedEnv := mergeEnv(env)
+
 	// Wait budget: at most one placeholder-wait cycle. Multiple matching
 	// placeholders in flight is pathological; one wait is sufficient for
 	// the common concurrent-spawn case and bounds the wall-clock cost.
@@ -1615,7 +1927,7 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 				continue
 			}
 			// Skip owners with incompatible env — different API keys, tokens, etc.
-			if !envCompatible(entry.Env, env) {
+			if !envCompatible(entry.Env, mergedEnv) {
 				continue
 			}
 			if !entry.Owner.IsAccepting() {
@@ -1748,31 +2060,241 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 // envCompatible returns true if two env maps have no conflicting values
 // for semantically significant keys (API tokens, config paths, etc.).
 // Transient per-session vars (CLAUDE_CODE_*, WT_SESSION, etc.) are ignored.
+//
+// Credential-bearing keys (GITHUB_TOKEN, OPENAI_API_KEY, anything matching
+// envCredentialKey()) additionally MUST match by presence: if a key exists
+// in one side but not the other, the envs are NOT compatible. Per codex
+// PR #121 P1: without this, a first session spawning an owner with
+// GITHUB_TOKEN=abc and a later session without GITHUB_TOKEN would share
+// the same owner, leaking the first session's credential into the second.
+// Plain value-conflict checks miss this because the second map has no
+// key to conflict against.
 func envCompatible(a, b map[string]string) bool {
 	for k, va := range a {
 		if envTransient(k) {
 			continue
 		}
-		if vb, ok := b[k]; ok && va != vb {
+		vb, ok := b[k]
+		if !ok {
+			if envCredentialKey(k) {
+				return false
+			}
+			continue
+		}
+		if va != vb {
+			return false
+		}
+	}
+	// Symmetric check: a credential key present in b but missing in a
+	// must also split. The loop over a alone cannot see keys unique to b.
+	for k := range b {
+		if envTransient(k) {
+			continue
+		}
+		if _, ok := a[k]; ok {
+			continue
+		}
+		if envCredentialKey(k) {
 			return false
 		}
 	}
 	return true
 }
 
+// envCredentialKey returns true if the key likely carries an authentication
+// secret whose presence asymmetry across two env maps must split owners
+// under global-first identity. Heuristic suffix/exact match — exhaustive
+// enumeration is impractical, so the rule errs toward over-splitting on
+// keys that LOOK like credentials. False positives waste one owner per
+// uniquely-named "fake credential" var; false negatives leak real
+// credentials across sessions. The trade-off prefers the former.
+func envCredentialKey(key string) bool {
+	upper := strings.ToUpper(key)
+	switch {
+	case strings.HasSuffix(upper, "_TOKEN"):
+		return true
+	case strings.HasSuffix(upper, "_KEY"):
+		return true
+	case strings.HasSuffix(upper, "_API_KEY"):
+		return true
+	case strings.HasSuffix(upper, "_SECRET"):
+		return true
+	case strings.HasSuffix(upper, "_PASSWORD"):
+		return true
+	case strings.HasSuffix(upper, "_PASSWD"):
+		return true
+	case strings.HasSuffix(upper, "_CREDENTIALS"):
+		return true
+	case strings.HasSuffix(upper, "_AUTH"):
+		return true
+	// Exact-match keys that don't fit the suffix pattern.
+	case upper == "GH_TOKEN" || upper == "GITHUB_TOKEN":
+		return true
+	case upper == "GITHUB_PERSONAL_ACCESS_TOKEN":
+		return true
+	case upper == "OPENAI_API_KEY" || upper == "ANTHROPIC_API_KEY":
+		return true
+	case upper == "TAVILY_API_KEY" || upper == "GOOGLE_API_KEY":
+		return true
+	case upper == "AWS_ACCESS_KEY_ID" || upper == "AWS_SECRET_ACCESS_KEY":
+		return true
+	case upper == "AWS_SESSION_TOKEN":
+		return true
+	case upper == "SSH_AUTH_SOCK" || upper == "SSH_AGENT_PID":
+		return true
+	case upper == "DOCKER_AUTH_CONFIG":
+		return true
+	}
+	return false
+}
+
+// semanticEnvHash returns a stable 8-hex-char hash of env entries that
+// envCompatible would consider semantically significant (non-transient
+// keys, sorted alphabetically with their values). Used as a sid suffix
+// when env-incompat sessions need distinct owners under global-first
+// identity (CR-002 AC8). Empty / nil env returns "00000000".
+func semanticEnvHash(env map[string]string) string {
+	if len(env) == 0 {
+		return "00000000"
+	}
+	h := sha256.New()
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if envTransient(k) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		return "00000000"
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		h.Write([]byte{0})
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(env[k]))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:8]
+}
+
+// deriveEnvBucketedSid (CR-002 AC8) preserves the credentials-partition
+// invariant of pre-CR-002 cwd-keyed identity under the new global-first
+// default. When a Spawn lands on a global sid whose existing entry has
+// env semantically incompatible with the new request (e.g., different
+// GITHUB_TOKEN), this function returns a derived sid of the form
+// `{baseSid}-env-{8hex}` so the two sessions land on distinct owners.
+//
+// Compatible env OR no existing entry → return baseSid unchanged
+// (the standard d.owners[sid] hit/spawn path runs unmodified).
+//
+// The check uses envCompatible() with the existing entry's stored env
+// (which is post-mergeEnv from the original spawn). The new request's
+// env is raw shim env; envCompatible's asymmetric semantics correctly
+// detect conflicts even across the merged-vs-raw asymmetry because the
+// daemon's own env keys are stable across spawns — only shim-supplied
+// overrides differ.
+func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) string {
+	d.mu.RLock()
+	entry, ok := d.owners[baseSid]
+	var existingEnv map[string]string
+	if ok && entry.Owner != nil {
+		existingEnv = entry.Env
+	}
+	d.mu.RUnlock()
+
+	// CodeRabbit PR #121 fix: normalize the new request's env via the same
+	// mergeEnv used at spawn time so envCompatible compares like-for-like.
+	// Without this normalization, the existing entry's stored env (post-
+	// mergeEnv) and the raw shim env have asymmetric coverage: a shim that
+	// previously sent GITHUB_TOKEN=A and now omits it entirely would NOT
+	// trigger an env-bucket split (envCompatible iterates existing keys
+	// and req-missing keys produce no conflict), so credential-rotated
+	// sessions could silently reuse an owner holding the old token.
+	// Normalizing both sides closes that asymmetry.
+	normalizedReqEnv := mergeEnv(reqEnv)
+
+	// Also compute the bucket suffix from the normalized env so two
+	// requests with the same effective env (after daemon merge) land on
+	// the same bucketed sid even if one shim sent the key and another
+	// inherited it from daemon defaults.
+	envHash := semanticEnvHash(normalizedReqEnv)
+
+	if existingEnv == nil {
+		// No owner at baseSid. Before returning baseSid, check whether a
+		// bucketed sid for this request's env already exists in d.owners
+		// (can happen when the base owner was evicted but the bucketed owner
+		// is still live). If so, return the bucketed sid to avoid creating a
+		// duplicate base-sid owner that races with the existing bucketed owner.
+		bucketedSid := baseSid + "-env-" + envHash
+		d.mu.RLock()
+		_, bucketedExists := d.owners[bucketedSid]
+		d.mu.RUnlock()
+		if bucketedExists {
+			return bucketedSid
+		}
+		return baseSid // no existing entry — base sid is free
+	}
+	if envCompatible(existingEnv, normalizedReqEnv) {
+		return baseSid // compatible — reuse base sid
+	}
+	derived := baseSid + "-env-" + envHash
+	d.logger.Printf("env-incompat under global-first: deriving sid=%s for cmd=%q (base=%s)",
+		derived, "...", shortServerID(baseSid))
+	return derived
+}
+
 // envTransient returns true for env vars that are per-session/transient
 // and should NOT affect dedup decisions.
 func envTransient(key string) bool {
 	switch {
+	// Claude Code-specific session vars
 	case strings.HasPrefix(key, "CLAUDE_CODE_"):
 		return true
 	case strings.HasPrefix(key, "CLAUDE_AUTO"):
 		return true
+	case key == "CLAUDE_CODE_ENTRYPOINT":
+		return true
+	// Windows Terminal / WSL session vars
 	case strings.HasPrefix(key, "WT_"):
 		return true
 	case key == "SESSIONNAME" || key == "WSLENV":
 		return true
-	case key == "CLAUDE_CODE_ENTRYPOINT":
+	// CR-002 codex PR #121 fix: cwd-derived vars MUST be transient so
+	// env-bucketing under global-first does not fragment owners across
+	// per-session working directories. Without this, two sessions with
+	// identical credentials from different cwds get different env-bucket
+	// sids because PWD/OLDPWD/INIT_CWD differ — defeating the global-first
+	// dedup goal and recreating per-cwd owner fan-out the spec explicitly
+	// targets (Engram #244 Bug 1).
+	case key == "PWD" || key == "OLDPWD" || key == "INIT_CWD":
+		return true
+	// npm launch-noise vars (per-script/cwd, not semantic to MCP identity).
+	// Per CodeRabbit PR #121: narrow from blanket `npm_*` prefix so
+	// credential-bearing keys like npm_config_registry / npm_config_token
+	// REMAIN part of identity — two sessions with different registries
+	// must NOT collapse onto a shared owner.
+	case strings.HasPrefix(key, "npm_lifecycle_"):
+		return true
+	case strings.HasPrefix(key, "npm_package_"):
+		return true
+	case key == "npm_execpath" || key == "npm_node_execpath" || key == "npm_command":
+		return true
+	// Terminal/shell-derived vars (per-shim-launch transients, not semantic
+	// to the upstream MCP server's identity).
+	case key == "TERM" || key == "TERM_PROGRAM" || key == "TERM_PROGRAM_VERSION":
+		return true
+	case key == "COLORTERM" || key == "LINES" || key == "COLUMNS":
+		return true
+	case key == "_" || key == "SHLVL" || key == "SHELL":
+		return true
+	// SSH session metadata (per-connection transients). Per CodeRabbit
+	// PR #121: do NOT match SSH_AUTH_SOCK / SSH_AGENT_PID — those bind
+	// credentials to the upstream and must stay in identity.
+	case key == "SSH_CLIENT" || key == "SSH_CONNECTION" || key == "SSH_TTY":
+		return true
+	// X11/Wayland display vars (per-session transients on Linux desktops).
+	case key == "DISPLAY" || key == "XAUTHORITY" || key == "WAYLAND_DISPLAY":
 		return true
 	}
 	return false

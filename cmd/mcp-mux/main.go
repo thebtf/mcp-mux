@@ -102,8 +102,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Determine sharing mode — env vars take precedence over flags
-	mode := serverid.ModeCwd
+	// Determine sharing mode — env vars take precedence over flags.
+	//
+	// Default flipped from ModeCwd to ModeGlobal in CR-002 (muxcore-global-
+	// first-identity). Original intent of mcp-mux was "one upstream per
+	// (cmd, args), isolation as exception" but the historical ModeCwd
+	// default produced one upstream per (cmd, args, cwd) and defeated that
+	// intent (Engram #244 Bug 1). The new ModeGlobal default restores it:
+	// post-init tools/list classification (handled daemon-side) splits
+	// genuinely-isolated upstreams off via the admission gate; everything
+	// else shares one upstream per (cmd, args).
+	//
+	// Escape valve: set MCP_MUX_DEFAULT_MODE=cwd to revert to legacy
+	// per-cwd behavior (D1 If-Wrong pivot from the spec — emergency
+	// rollback without redeploy).
+	mode := serverid.ModeGlobal
+	if envMode := strings.TrimSpace(strings.ToLower(os.Getenv("MCP_MUX_DEFAULT_MODE"))); envMode != "" {
+		switch envMode {
+		case "cwd":
+			mode = serverid.ModeCwd
+		case "git":
+			mode = serverid.ModeGit
+		case "global":
+			mode = serverid.ModeGlobal
+		case "isolated":
+			mode = serverid.ModeIsolated
+		}
+	}
 	if *stateless || os.Getenv("MCP_MUX_STATELESS") == "1" {
 		mode = serverid.ModeGlobal
 	}
