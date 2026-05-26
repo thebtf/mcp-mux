@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -857,6 +858,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 
 	// Server identity is based on command+args+cwd only, NOT env.
 	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
+
+	// CR-002 AC8: under global-first default, env-incompat sessions for the
+	// same (cmd, args) must NOT collapse onto a shared owner. Derive an
+	// env-bucketed sid suffix when an existing entry has incompatible env.
+	// Compatible env OR no existing entry → sid unchanged.
+	if mode == serverid.ModeGlobal {
+		sid = d.deriveEnvBucketedSid(sid, req.Env)
+	}
 
 	d.mu.Lock()
 
@@ -1955,6 +1964,72 @@ func envCompatible(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// semanticEnvHash returns a stable 8-hex-char hash of env entries that
+// envCompatible would consider semantically significant (non-transient
+// keys, sorted alphabetically with their values). Used as a sid suffix
+// when env-incompat sessions need distinct owners under global-first
+// identity (CR-002 AC8). Empty / nil env returns "00000000".
+func semanticEnvHash(env map[string]string) string {
+	if len(env) == 0 {
+		return "00000000"
+	}
+	h := sha256.New()
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		if envTransient(k) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) == 0 {
+		return "00000000"
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		h.Write([]byte{0})
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(env[k]))
+	}
+	return hex.EncodeToString(h.Sum(nil))[:8]
+}
+
+// deriveEnvBucketedSid (CR-002 AC8) preserves the credentials-partition
+// invariant of pre-CR-002 cwd-keyed identity under the new global-first
+// default. When a Spawn lands on a global sid whose existing entry has
+// env semantically incompatible with the new request (e.g., different
+// GITHUB_TOKEN), this function returns a derived sid of the form
+// `{baseSid}-env-{8hex}` so the two sessions land on distinct owners.
+//
+// Compatible env OR no existing entry → return baseSid unchanged
+// (the standard d.owners[sid] hit/spawn path runs unmodified).
+//
+// The check uses envCompatible() with the existing entry's stored env
+// (which is post-mergeEnv from the original spawn). The new request's
+// env is raw shim env; envCompatible's asymmetric semantics correctly
+// detect conflicts even across the merged-vs-raw asymmetry because the
+// daemon's own env keys are stable across spawns — only shim-supplied
+// overrides differ.
+func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) string {
+	d.mu.RLock()
+	entry, ok := d.owners[baseSid]
+	var existingEnv map[string]string
+	if ok && entry.Owner != nil {
+		existingEnv = entry.Env
+	}
+	d.mu.RUnlock()
+	if existingEnv == nil {
+		return baseSid // no existing entry — base sid is free
+	}
+	if envCompatible(existingEnv, reqEnv) {
+		return baseSid // compatible — reuse base sid
+	}
+	derived := baseSid + "-env-" + semanticEnvHash(reqEnv)
+	d.logger.Printf("env-incompat under global-first: deriving sid=%s for cmd=%q (base=%s)",
+		derived, "...", baseSid[:8])
+	return derived
 }
 
 // envTransient returns true for env vars that are per-session/transient
