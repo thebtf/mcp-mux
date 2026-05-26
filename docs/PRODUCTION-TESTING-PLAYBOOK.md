@@ -272,10 +272,20 @@ Setup:
 
 - An MCP server in host config that consumes `GITHUB_TOKEN` (the `github`
   MCP server, or any server documented to read GH credentials).
+- **Record the exact target command before starting** (same discipline as
+  Scenario 6). Example: `npx -y @modelcontextprotocol/server-github`. A
+  substring uniquely identifying that command goes into `$targetMatch`
+  below so pre-existing github-related owners on the workstation do not
+  pollute the count.
 
 Commands:
 
 ```powershell
+# Substring that uniquely matches YOUR chosen github-credential-consuming
+# MCP server's command/args. Adjust if you use a different github server
+# package.
+$targetMatch = 'server-github'
+
 # Shell A — credential value "abc"
 $env:GITHUB_TOKEN = 'abc'
 # Start a host session in Shell A and invoke the github MCP server.
@@ -288,7 +298,9 @@ $env:GITHUB_TOKEN = 'xyz'
 .\mcp-mux.exe status |
   ConvertFrom-Json |
   Select-Object -ExpandProperty servers |
-  Where-Object { $_.command -match 'github' -or ($_.args -join ' ') -match 'github' } |
+  Where-Object {
+    ($_.args -join ' ') -match $targetMatch -or $_.command -match $targetMatch
+  } |
   Format-Table server_id, session_count, cwd, auto_classification -AutoSize
 ```
 
