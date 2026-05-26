@@ -950,6 +950,28 @@ func TestEnvTransient(t *testing.T) {
 		{name: "tavily api key", key: "TAVILY_API_KEY", want: false},
 		{name: "path", key: "PATH", want: false},
 		{name: "home", key: "HOME", want: false},
+
+		// CodeRabbit PR #121 — narrow npm filter: launch-noise transient,
+		// credential-bearing stays in identity.
+		{name: "npm lifecycle event transient", key: "npm_lifecycle_event", want: true},
+		{name: "npm lifecycle script transient", key: "npm_lifecycle_script", want: true},
+		{name: "npm package name transient", key: "npm_package_name", want: true},
+		{name: "npm package version transient", key: "npm_package_version", want: true},
+		{name: "npm execpath transient", key: "npm_execpath", want: true},
+		{name: "npm node execpath transient", key: "npm_node_execpath", want: true},
+		{name: "npm command transient", key: "npm_command", want: true},
+		{name: "npm config registry KEPT in identity", key: "npm_config_registry", want: false},
+		{name: "npm config token KEPT in identity", key: "npm_config_token", want: false},
+		{name: "npm config strict ssl KEPT in identity", key: "npm_config_strict_ssl", want: false},
+		{name: "npm config userconfig KEPT in identity", key: "npm_config_userconfig", want: false},
+
+		// CodeRabbit PR #121 — narrow SSH filter: session metadata transient,
+		// credential-bearing (SSH_AUTH_SOCK / SSH_AGENT_PID) stays in identity.
+		{name: "ssh client transient", key: "SSH_CLIENT", want: true},
+		{name: "ssh connection transient", key: "SSH_CONNECTION", want: true},
+		{name: "ssh tty transient", key: "SSH_TTY", want: true},
+		{name: "ssh auth sock KEPT in identity", key: "SSH_AUTH_SOCK", want: false},
+		{name: "ssh agent pid KEPT in identity", key: "SSH_AGENT_PID", want: false},
 	}
 
 	for _, tc := range testCases {

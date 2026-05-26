@@ -2183,9 +2183,16 @@ func envTransient(key string) bool {
 	// targets (Engram #244 Bug 1).
 	case key == "PWD" || key == "OLDPWD" || key == "INIT_CWD":
 		return true
-	// npm-injected vars (npm sets these per-cwd when running scripts;
-	// shim-via-npx inherits them, so they fragment per shim-launch cwd).
-	case strings.HasPrefix(key, "npm_"):
+	// npm launch-noise vars (per-script/cwd, not semantic to MCP identity).
+	// Per CodeRabbit PR #121: narrow from blanket `npm_*` prefix so
+	// credential-bearing keys like npm_config_registry / npm_config_token
+	// REMAIN part of identity — two sessions with different registries
+	// must NOT collapse onto a shared owner.
+	case strings.HasPrefix(key, "npm_lifecycle_"):
+		return true
+	case strings.HasPrefix(key, "npm_package_"):
+		return true
+	case key == "npm_execpath" || key == "npm_node_execpath" || key == "npm_command":
 		return true
 	// Terminal/shell-derived vars (per-shim-launch transients, not semantic
 	// to the upstream MCP server's identity).
@@ -2195,8 +2202,10 @@ func envTransient(key string) bool {
 		return true
 	case key == "_" || key == "SHLVL" || key == "SHELL":
 		return true
-	// SSH session vars (per-connection transients).
-	case strings.HasPrefix(key, "SSH_"):
+	// SSH session metadata (per-connection transients). Per CodeRabbit
+	// PR #121: do NOT match SSH_AUTH_SOCK / SSH_AGENT_PID — those bind
+	// credentials to the upstream and must stay in identity.
+	case key == "SSH_CLIENT" || key == "SSH_CONNECTION" || key == "SSH_TTY":
 		return true
 	// X11/Wayland display vars (per-session transients on Linux desktops).
 	case key == "DISPLAY" || key == "XAUTHORITY" || key == "WAYLAND_DISPLAY":

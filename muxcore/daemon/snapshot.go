@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
@@ -13,6 +16,53 @@ import (
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
+
+// retrySidPattern matches forced-isolated retry sids of the form
+// `isolated-<hex16>-r<N>`. Used on snapshot load to rehydrate the in-memory
+// forcedIsolatedRetryCounters so a fresh Spawn for the same (cmd,args,cwd)
+// after restart computes the same `-rN` suffix instead of creating a
+// duplicate owner under the base `isolated-<hex16>` sid (codex PR #121 finding).
+var retrySidPattern = regexp.MustCompile(`^(isolated-[0-9a-f]+)-r(\d+)$`)
+
+// rehydrateRetryCounter parses a retry-suffixed sid, computes the base
+// isolated identity for the (cmd,args,cwd), and bumps the in-memory counter
+// to at least N so the next forced-isolated retry produces `-r<N+1>` rather
+// than colliding with the restored owner's sid.
+//
+// Uses a CAS loop because multiple snapshot entries may share the same base
+// (e.g. -r1 and -r2 both restored) and a plain Store would let a smaller N
+// race ahead of a larger one.
+//
+// The cmd/args/cwd are re-derived to confirm the parsed base matches the
+// deterministic CR-001 hash; if it does not (snapshot from a different
+// scheme version, or hand-crafted sid), the counter is updated against the
+// recomputed base instead. This keeps the retry suffix consistent with what
+// a fresh Spawn would compute, not with whatever happened to be in the
+// snapshot's literal sid field.
+func (d *Daemon) rehydrateRetryCounter(sid, cmd string, args []string, cwd string) {
+	m := retrySidPattern.FindStringSubmatch(sid)
+	if m == nil {
+		return
+	}
+	n, err := strconv.ParseInt(m[2], 10, 64)
+	if err != nil || n <= 0 {
+		return
+	}
+	recomputedBase := serverid.GenerateContextKey(serverid.ModeIsolated, cmd, args, nil, cwd)
+	ctrI, _ := d.forcedIsolatedRetryCounters.LoadOrStore(recomputedBase, &atomic.Int64{})
+	ctr := ctrI.(*atomic.Int64)
+	for {
+		cur := ctr.Load()
+		if cur >= n {
+			return
+		}
+		if ctr.CompareAndSwap(cur, n) {
+			d.logger.Printf("snapshot: rehydrated forced-isolated retry counter base=%s counter=%d from sid=%s",
+				shortServerID(recomputedBase), n, shortServerID(sid))
+			return
+		}
+	}
+}
 
 // DaemonSnapshot is an alias for mcpsnapshot.DaemonSnapshot.
 // Re-exported here so daemon-internal code can reference it without
@@ -295,6 +345,14 @@ func (d *Daemon) loadSnapshot() int {
 			serviceToken:                serviceToken,
 		}
 		d.mu.Unlock()
+
+		// Rehydrate forced-isolated retry counter when the restored sid carries
+		// a `-rN` suffix. Without this, a fresh Spawn for the same (cmd,args,cwd)
+		// after restart would compute the base `isolated-<hex16>` sid (counter
+		// starts at 0 in memory), miss the restored owner's `-r1` sid, and
+		// create a duplicate owner — exactly the continuity break codex flagged
+		// on PR #121.
+		d.rehydrateRetryCounter(sid, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)
 
 		// Seed template cache from snapshot so new isolated spawns can use it immediately.
 		if ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
