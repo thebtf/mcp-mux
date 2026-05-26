@@ -150,6 +150,31 @@ type Daemon struct {
 	// spawns don't double-log.
 	deprecatedModeWarned sync.Map
 
+	// forcedIsolatedRetryCounters provides unique sid suffixes for the
+	// forced-isolated retry path when CR-001's deterministic isolated
+	// identity would otherwise loop. Triggered when daemon.go's
+	// "owner not accepting but has active sessions" branch fires AND the
+	// original Mode was already isolated — under deterministic isolated
+	// sids, the retry would recompute the SAME sid, re-hit the same
+	// closed-listener owner, and exhaust maxSpawnRetries.
+	//
+	// Each forced-isolated retry for a given base sid increments its
+	// counter; the retry's spawnOnce reads the counter and appends
+	// `-r<N>` to the computed sid so each retry produces a distinct
+	// owner. The original entry (closed listener + active sessions)
+	// stays alive serving its existing sessions; the new retry-suffixed
+	// owner serves the new session. The reaper eventually cleans both
+	// per CR-003 idle-isolated timeout.
+	//
+	// Keyed by the base isolated sid (e.g. "isolated-<hash>"). Values
+	// are *atomic.Int64 to handle concurrent retries for the same base.
+	// Memory growth is bounded by the number of distinct (cmd,args,cwd)
+	// tuples that hit the forced-retry path × daemon lifetime — small
+	// in practice (each retry happens once per session-lifecycle event,
+	// not per request).
+	forcedIsolatedRetryCounters sync.Map // key: base isolated sid → *atomic.Int64
+
+
 	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
@@ -865,6 +890,25 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// Server identity is based on command+args+cwd only, NOT env.
 	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
 
+	// CR-002 codex PR #121 fix: when the forced-isolated retry path bumped a
+	// per-base-sid counter, append the counter as `-r<N>` so each retry
+	// produces a distinct isolated owner. Without this, CR-001's deterministic
+	// isolated identity makes the retry recompute the SAME sid and loop until
+	// maxSpawnRetries exhausts.
+	//
+	// The counter persists for daemon lifetime, monotonically increasing per
+	// base sid. Future spawns for the same (cmd,args,cwd) tuple will see a
+	// non-zero counter and start at `-r<latest>`; reconnects of those sessions
+	// race-bump again. Reaper cleans orphaned -rN owners per CR-003 idle-
+	// isolated timeout.
+	if mode == serverid.ModeIsolated {
+		if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
+			if n := ctrI.(*atomic.Int64).Load(); n > 0 {
+				sid = fmt.Sprintf("%s-r%d", sid, n)
+			}
+		}
+	}
+
 	// CR-002 AC8: under global-first default, env-incompat sessions for the
 	// same (cmd, args) must NOT collapse onto a shared owner. Derive an
 	// env-bucketed sid suffix when an existing entry has incompatible env.
@@ -900,7 +944,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				// ran (before the creating-wait), the placeholder had no env, so it
 				// returned baseSid. Now we must confirm the new request's env is
 				// compatible; if not, retry so Spawn re-derives the bucketed sid.
-				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, req.Env) {
+				//
+				// mergeEnv normalizes req.Env to the post-merge form (matches
+				// e.Env's stored form) so envCompatible compares like-for-like
+				// per CodeRabbit PR #121 finding about merge-vs-raw asymmetry.
+				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, mergeEnv(req.Env)) {
 					d.logger.Printf("env-incompat after create-wait: owner %s — retrying with bucketed sid", shortServerID(sid))
 					d.mu.Unlock()
 					return "", "", "", errSpawnRetry
@@ -961,6 +1009,21 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 					d.mu.Unlock()
 					return "", "", "", errSpawnRetry
 				}
+				// CR-002 AC8 race fix (codex PR #121): between
+				// deriveEnvBucketedSid's RLock and this Lock, another spawn
+				// could have created the base global owner with env that
+				// conflicts with this request. The bucketed sid path was
+				// skipped because no entry existed at derive time. Re-validate
+				// env compatibility under the CAS lock — if incompatible, retry
+				// so Spawn re-derives the bucketed sid against the now-live
+				// entry. Without this, concurrent spawns with different
+				// credentials can collapse onto one upstream during startup
+				// storms, defeating the credentials-boundary guarantee.
+				if mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, mergeEnv(req.Env)) {
+					d.logger.Printf("env-incompat after CAS on fast path: owner %s — retrying with bucketed sid", shortServerID(probeSID))
+					d.mu.Unlock()
+					return "", "", "", errSpawnRetry
+				}
 				current.LastSession = time.Now()
 				d.mu.Unlock()
 				// CR-002 admission gate: same logic as the placeholder-wait
@@ -973,7 +1036,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 					return "", "", "", errSpawnRetry
 				}
 				if !shareable {
-					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", probeSID[:8], req.Cwd)
+					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
 					reqPtr.Mode = "isolated"
 					return "", "", "", errSpawnRetry
 				}
@@ -1018,13 +1081,30 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		// with a fresh server ID.
 		if entry.Owner.SessionCount() > 0 {
 			d.logger.Printf("owner %s not accepting but has %d active sessions, leaving alive",
-				sid[:8], entry.Owner.SessionCount())
-			// DON'T delete or shutdown. Fall through — new owner will get a unique
-			// isolated ID from serverid.ModeIsolated below.
+				shortServerID(sid), entry.Owner.SessionCount())
+			// CR-002 codex PR #121 fix: under CR-001 deterministic isolated
+			// identity, switching Mode to "isolated" alone is insufficient when
+			// the ORIGINAL mode was already isolated — the retry would recompute
+			// the same sid and re-hit this same closed-listener entry, looping
+			// until maxSpawnRetries exhausts. Bump a per-base-sid retry counter
+			// so spawnOnce's sid computation appends `-r<N>` and produces a
+			// distinct sid for this retry.
+			//
+			// The base sid for the counter is the SAME sid we matched on (the
+			// entry's closed-listener sid), so the counter is keyed correctly
+			// regardless of whether we entered via mode=global or mode=isolated.
+			// For non-isolated original modes, the retry's Mode switch to
+			// isolated produces a different base hash anyway, but bumping the
+			// counter is harmless (the retry will read counter under the new
+			// base, which is initially 0).
+			baseForCounter := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
+			ctrI, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseForCounter, &atomic.Int64{})
+			newCounter := ctrI.(*atomic.Int64).Add(1)
+			d.logger.Printf("forced-isolated retry: bumping counter for base=%s to r%d",
+				shortServerID(baseForCounter), newCounter)
+			// DON'T delete or shutdown the old entry. Fall through — the retry
+			// will compute a unique sid via the counter suffix.
 			d.mu.Unlock()
-			// Force isolated mode for the new spawn so it gets a unique server ID.
-			// Mutate through reqPtr so the next Spawn retry iteration sees the
-			// updated mode (reqPtr points to Spawn's for-loop-local req).
 			reqPtr.Mode = "isolated"
 			return "", "", "", errSpawnRetry
 		}
@@ -2036,13 +2116,31 @@ func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) 
 		existingEnv = entry.Env
 	}
 	d.mu.RUnlock()
+
+	// CodeRabbit PR #121 fix: normalize the new request's env via the same
+	// mergeEnv used at spawn time so envCompatible compares like-for-like.
+	// Without this normalization, the existing entry's stored env (post-
+	// mergeEnv) and the raw shim env have asymmetric coverage: a shim that
+	// previously sent GITHUB_TOKEN=A and now omits it entirely would NOT
+	// trigger an env-bucket split (envCompatible iterates existing keys
+	// and req-missing keys produce no conflict), so credential-rotated
+	// sessions could silently reuse an owner holding the old token.
+	// Normalizing both sides closes that asymmetry.
+	normalizedReqEnv := mergeEnv(reqEnv)
+
+	// Also compute the bucket suffix from the normalized env so two
+	// requests with the same effective env (after daemon merge) land on
+	// the same bucketed sid even if one shim sent the key and another
+	// inherited it from daemon defaults.
+	envHash := semanticEnvHash(normalizedReqEnv)
+
 	if existingEnv == nil {
 		// No owner at baseSid. Before returning baseSid, check whether a
 		// bucketed sid for this request's env already exists in d.owners
 		// (can happen when the base owner was evicted but the bucketed owner
 		// is still live). If so, return the bucketed sid to avoid creating a
 		// duplicate base-sid owner that races with the existing bucketed owner.
-		bucketedSid := baseSid + "-env-" + semanticEnvHash(reqEnv)
+		bucketedSid := baseSid + "-env-" + envHash
 		d.mu.RLock()
 		_, bucketedExists := d.owners[bucketedSid]
 		d.mu.RUnlock()
@@ -2051,10 +2149,10 @@ func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) 
 		}
 		return baseSid // no existing entry — base sid is free
 	}
-	if envCompatible(existingEnv, reqEnv) {
+	if envCompatible(existingEnv, normalizedReqEnv) {
 		return baseSid // compatible — reuse base sid
 	}
-	derived := baseSid + "-env-" + semanticEnvHash(reqEnv)
+	derived := baseSid + "-env-" + envHash
 	d.logger.Printf("env-incompat under global-first: deriving sid=%s for cmd=%q (base=%s)",
 		derived, "...", shortServerID(baseSid))
 	return derived
