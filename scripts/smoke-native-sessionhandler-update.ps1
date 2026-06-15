@@ -106,8 +106,18 @@ function Invoke-Rpc {
 
     $Proc.StandardInput.WriteLine((ConvertTo-CompactJson $payload))
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $readTask = $Proc.StandardOutput.ReadLineAsync()
     while ((Get-Date) -lt $deadline) {
-        $line = $Proc.StandardOutput.ReadLine()
+        $remainingMs = [Math]::Max(1, [int](($deadline - (Get-Date)).TotalMilliseconds))
+        $waitMs = [Math]::Min(100, $remainingMs)
+        if (-not $readTask.Wait($waitMs)) {
+            if ($Proc.HasExited) {
+                $stderr = $Proc.StandardError.ReadToEnd()
+                throw "fixture session exited while waiting for response id=$id method=$Method stderr=$stderr"
+            }
+            continue
+        }
+        $line = $readTask.Result
         if ($null -eq $line) {
             $stderr = ""
             if ($Proc.HasExited) {
@@ -116,6 +126,7 @@ function Invoke-Rpc {
             throw "fixture session exited while waiting for response id=$id method=$Method stderr=$stderr"
         }
         if ([string]::IsNullOrWhiteSpace($line)) {
+            $readTask = $Proc.StandardOutput.ReadLineAsync()
             continue
         }
         try {
@@ -133,6 +144,7 @@ function Invoke-Rpc {
             }
             return $msg
         }
+        $readTask = $Proc.StandardOutput.ReadLineAsync()
     }
     throw "timeout waiting for response id=$id method=$Method"
 }

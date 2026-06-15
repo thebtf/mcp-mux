@@ -302,15 +302,28 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 	}
 
 	controlPrepared := false
-	prepareControlSocket := func() error {
+	replacementActive := func() bool {
+		if beforeRestart.isZero() {
+			return false
+		}
+		current, err := engineDaemonIdentity(ctlPath)
+		return err == nil && !current.same(beforeRestart)
+	}
+	prepareControlSocket := func() (bool, error) {
 		if controlPrepared {
-			return nil
+			return false, nil
+		}
+		if replacementActive() {
+			return true, nil
 		}
 		if err := enginePrepareControlSocket(ctx, ctlPath, opts.ShutdownTimeout); err != nil {
-			return err
+			if replacementActive() {
+				return true, nil
+			}
+			return false, err
 		}
 		controlPrepared = true
-		return nil
+		return false, nil
 	}
 
 	if successorAlreadyStarted {
@@ -324,8 +337,18 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 	}
 
 	if result.GracefulRestarted {
-		if err := prepareControlSocket(); err != nil {
+		active, err := prepareControlSocket()
+		if err != nil {
 			return result, phaseError(UpdatePhaseStart, result, err)
+		}
+		if active {
+			result.ReplacementStarted = true
+			if readyErr := engineWaitForDaemonReady(ctx, ctlPath, opts.ReadyTimeout); readyErr == nil {
+				result.ReplacementReady = true
+				return result, nil
+			} else {
+				return result, phaseError(UpdatePhaseReady, result, readyErr)
+			}
 		}
 		if readyErr := engineWaitForDaemonReady(ctx, ctlPath, opts.ReadyTimeout); readyErr == nil {
 			result.ReplacementReady = true
@@ -339,8 +362,17 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 	if err := ctx.Err(); err != nil {
 		return result, phaseError(UpdatePhaseStart, result, err)
 	}
-	if err := prepareControlSocket(); err != nil {
+	active, err := prepareControlSocket()
+	if err != nil {
 		return result, phaseError(UpdatePhaseStart, result, err)
+	}
+	if active {
+		result.ReplacementStarted = true
+		if readyErr := engineWaitForDaemonReady(ctx, ctlPath, opts.ReadyTimeout); readyErr != nil {
+			return result, phaseError(UpdatePhaseReady, result, readyErr)
+		}
+		result.ReplacementReady = true
+		return result, nil
 	}
 	if err := engineStartDaemonExecutable(opts.SuccessorExe, e.cfg.DaemonFlag); err != nil {
 		return result, phaseError(UpdatePhaseStart, result, err)

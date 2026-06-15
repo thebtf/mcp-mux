@@ -522,6 +522,56 @@ func TestRestartWithSuccessor_PreparesControlSocketBeforeCleanFallbackStart(t *t
 	}
 }
 
+func TestRestartWithSuccessor_TreatsAlreadyBoundReplacementAsReady(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	identityCalls := 0
+	prepareCalls := 0
+	startCalls := 0
+
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineDaemonIdentity = func(string) (daemonIdentity, error) {
+		identityCalls++
+		if identityCalls == 1 {
+			return daemonIdentity{pid: 100, generation: "old"}, nil
+		}
+		return daemonIdentity{pid: 200, generation: "new"}, nil
+	}
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForReplacement = func(context.Context, string, daemonIdentity, time.Duration) (bool, error) {
+		return false, nil
+	}
+	enginePrepareControlSocket = func(context.Context, string, time.Duration) error {
+		prepareCalls++
+		return errors.New("old socket still active")
+	}
+	engineStartDaemonExecutable = func(string, string) error {
+		startCalls++
+		return nil
+	}
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+
+	got, err := eng.RestartWithSuccessor(context.Background(), RestartWithSuccessorOptions{SuccessorExe: "next.exe"})
+	if err != nil {
+		t.Fatalf("RestartWithSuccessor: %v", err)
+	}
+	if !got.GracefulRestarted || !got.ReplacementStarted || !got.ReplacementReady {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("prepare calls = %d, want 0 when replacement identity is already active", prepareCalls)
+	}
+	if startCalls != 0 {
+		t.Fatalf("start calls = %d, want 0 when replacement identity is already active", startCalls)
+	}
+	if identityCalls < 2 {
+		t.Fatalf("identity calls = %d, want pre-restart and replacement checks", identityCalls)
+	}
+}
+
 func TestApplyUpdateAndRestart_LockFailureIsPhaseError(t *testing.T) {
 	restoreUpdateSeams(t)
 	eng := newUpdateTestEngine(t)
