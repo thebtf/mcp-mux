@@ -8,6 +8,7 @@ package mcpserver
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -323,9 +325,20 @@ Stop + re-spawn as daemon. Existing CC clients reconnect on next tool call:
 func (s *Server) handleToolsList(id json.RawMessage) {
 	tools := []map[string]any{
 		{
+			"name": "mux_engines",
+			"description": "List opted-in native muxcore daemon engines registered on this host. " +
+				"Descriptors are advisory and are verified by daemon status before being marked healthy. " +
+				"Default mux_list remains scoped to this mcp-mux daemon namespace; use mux_list(engine_name=...) to list one registered engine explicitly.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			"name": "mux_list",
 			"description": "List all running mcp-mux managed MCP server instances. " +
 				"This is this mcp-mux daemon's engine namespace, not a global registry for native muxcore products. " +
+				"Use mux_engines to discover opted-in native muxcore engines, then pass engine_name to query exactly one registered engine. " +
 				"Returns compact summary by default: server name, sessions, classification, version. " +
 				"Set verbose=true for full details (PID, IPC path, cache status, classification reason). " +
 				"By default shows only servers belonging to this CC session's project. " +
@@ -343,6 +356,10 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 						"type":        "boolean",
 						"description": "Show servers from all projects/sessions, not just this one (default: false).",
 						"default":     false,
+					},
+					"engine_name": map[string]any{
+						"type":        "string",
+						"description": "Exact opted-in muxcore engine name to query. Empty/default queries only this mcp-mux daemon namespace.",
 					},
 				},
 			},
@@ -416,6 +433,8 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 	}
 
 	switch call.Name {
+	case "mux_engines":
+		s.toolMuxEngines(id, call.Arguments)
 	case "mux_list":
 		s.toolMuxList(id, call.Arguments)
 	case "mux_stop":
@@ -432,11 +451,16 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 // Set all=true to see all servers across all projects.
 func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 	var params struct {
-		Verbose bool `json:"verbose"`
-		All     bool `json:"all"`
+		Verbose    bool   `json:"verbose"`
+		All        bool   `json:"all"`
+		EngineName string `json:"engine_name"`
 	}
 	if args != nil {
 		_ = json.Unmarshal(args, &params)
+	}
+	if strings.TrimSpace(params.EngineName) != "" {
+		s.toolMuxListForEngine(id, params.EngineName, params.Verbose, params.All)
+		return
 	}
 
 	myCwd, _ := os.Getwd()
@@ -462,14 +486,136 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
+	servers := s.formatOwnerList(listResp.Owners, params.Verbose, params.All, myCwd)
+
+	result, _ := json.MarshalIndent(servers, "", "  ")
+	s.sendToolResult(id, string(result))
+}
+
+func (s *Server) toolMuxEngines(id json.RawMessage, _ json.RawMessage) {
+	records, err := registry.ListDescriptors(s.socketDir())
+	if err != nil {
+		s.sendToolError(id, fmt.Sprintf("list muxcore engine registry: %v", err))
+		return
+	}
+	duplicates := registry.DuplicateEngineNames(records)
+
+	engines := make([]map[string]any, 0, len(records))
+	for _, rec := range records {
+		verified := registry.VerifyDescriptor(rec)
+		state := verified.State
+		reason := verified.Reason
+		if rec.Err == nil {
+			if count, ok := duplicates[rec.Descriptor.EngineName]; ok {
+				state = registry.StateDuplicate
+				if reason == "" {
+					reason = fmt.Sprintf("duplicate_engine_name: %d descriptors", count)
+				}
+			}
+		}
+
+		row := map[string]any{
+			"descriptor_path": rec.Path,
+			"state":           state,
+			"reachable":       verified.Reachable,
+		}
+		if reason != "" {
+			row["reason"] = reason
+		}
+		if rec.Err == nil {
+			row["engine_name"] = rec.Descriptor.EngineName
+			row["product_name"] = rec.Descriptor.ProductName
+			row["pid"] = rec.Descriptor.PID
+			if verified.PID != 0 {
+				row["status_pid"] = verified.PID
+			}
+			row["base_dir"] = rec.Descriptor.BaseDir
+			row["daemon_control_path"] = rec.Descriptor.DaemonControlPath
+			row["started_at"] = rec.Descriptor.StartedAt.Format(time.RFC3339)
+			row["muxcore_version"] = rec.Descriptor.MuxcoreVersion
+			row["capabilities"] = rec.Descriptor.Capabilities
+			row["owner_count"] = verified.OwnerCount
+			if verified.DaemonGeneration != "" {
+				row["daemon_generation"] = verified.DaemonGeneration
+			}
+		}
+		engines = append(engines, row)
+	}
+
+	result, _ := json.MarshalIndent(map[string]any{
+		"engines":    engines,
+		"duplicates": duplicates,
+	}, "", "  ")
+	s.sendToolResult(id, string(result))
+}
+
+func (s *Server) toolMuxListForEngine(id json.RawMessage, engineName string, verbose, all bool) {
+	engineName = strings.TrimSpace(engineName)
+	records, err := registry.ListDescriptors(s.socketDir())
+	if err != nil {
+		s.sendToolError(id, fmt.Sprintf("list muxcore engine registry: %v", err))
+		return
+	}
+	rec, err := registry.ResolveEngine(records, engineName)
+	if err != nil {
+		switch {
+		case errors.Is(err, registry.ErrEngineNotFound):
+			s.sendToolError(id, fmt.Sprintf("registered muxcore engine not found: %s", engineName))
+		case errors.Is(err, registry.ErrDuplicateEngine):
+			s.sendToolError(id, fmt.Sprintf("registered muxcore engine is ambiguous: %s", engineName))
+		default:
+			s.sendToolError(id, fmt.Sprintf("resolve registered muxcore engine %q: %v", engineName, err))
+		}
+		return
+	}
+	verified := registry.VerifyDescriptor(rec)
+	if verified.State != registry.StateHealthy {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine is not healthy: %s (%s)", engineName, verified.Reason))
+		return
+	}
+	resp, err := control.Send(rec.Descriptor.DaemonControlPath, control.Request{Cmd: "list_owners"})
+	if err != nil {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine list_owners failed: %v", err))
+		return
+	}
+	if !resp.OK {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine list_owners error: %s", resp.Message))
+		return
+	}
+	if resp.Data == nil {
+		s.sendToolError(id, "registered muxcore engine returned empty list_owners response")
+		return
+	}
+	var listResp control.ListOwnersResponse
+	if err := json.Unmarshal(resp.Data, &listResp); err != nil {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine returned invalid list_owners response: %v", err))
+		return
+	}
+	for i := range listResp.Owners {
+		if listResp.Owners[i].EngineName == "" {
+			listResp.Owners[i].EngineName = engineName
+		}
+		if listResp.Owners[i].EngineName != engineName {
+			s.sendToolError(id, fmt.Sprintf("registered muxcore engine owner mismatch: requested %q, owner %q reports %q", engineName, listResp.Owners[i].ServerID, listResp.Owners[i].EngineName))
+			return
+		}
+	}
+	myCwd, _ := os.Getwd()
+	myCwd = normalizeCwd(myCwd)
+	servers := s.formatOwnerList(listResp.Owners, verbose, all, myCwd)
+	result, _ := json.MarshalIndent(servers, "", "  ")
+	s.sendToolResult(id, string(result))
+}
+
+func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, myCwd string) []map[string]any {
 	var servers []map[string]any
-	for _, owner := range listResp.Owners {
-		if !params.All && myCwd != "" {
+	for _, owner := range owners {
+		if !all && myCwd != "" {
 			if !s.ownerInfoHasCwd(owner, myCwd) {
 				continue
 			}
 		}
-		if params.Verbose {
+		if verbose {
 			servers = append(servers, map[string]any{
 				"server_id":             owner.ServerID,
 				"engine_name":           owner.EngineName,
@@ -503,9 +649,10 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 			})
 		}
 	}
-
-	result, _ := json.MarshalIndent(servers, "", "  ")
-	s.sendToolResult(id, string(result))
+	if servers == nil {
+		return []map[string]any{}
+	}
+	return servers
 }
 
 // normalizeCwd cleans a path and lowercases only on Windows. Linux/macOS

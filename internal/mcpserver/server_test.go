@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 )
 
 // shortBaseDir returns a fresh temp directory whose path is short enough to host
@@ -208,8 +209,8 @@ func TestToolsList(t *testing.T) {
 	}
 	unmarshalResult(t, resp, &result)
 
-	if len(result.Tools) != 3 {
-		t.Fatalf("tools count = %d, want 3", len(result.Tools))
+	if len(result.Tools) != 4 {
+		t.Fatalf("tools count = %d, want 4", len(result.Tools))
 	}
 
 	names := make(map[string]bool)
@@ -217,7 +218,7 @@ func TestToolsList(t *testing.T) {
 		names[tool.Name] = true
 	}
 
-	for _, expected := range []string{"mux_list", "mux_stop", "mux_restart"} {
+	for _, expected := range []string{"mux_engines", "mux_list", "mux_stop", "mux_restart"} {
 		if !names[expected] {
 			t.Errorf("tool %q not found in list", expected)
 		}
@@ -899,9 +900,14 @@ func (h *fakeDaemonHandler) HandleListOwners(_ control.Request) (control.ListOwn
 // startFakeDaemonControlServer creates a daemon control server at socketPath responding to list_owners.
 func startFakeDaemonControlServer(t *testing.T, socketPath string, resp control.ListOwnersResponse) *control.Server {
 	t.Helper()
+	return startFakeDaemonControlServerWithStatus(t, socketPath, map[string]any{}, resp)
+}
+
+func startFakeDaemonControlServerWithStatus(t *testing.T, socketPath string, status map[string]any, resp control.ListOwnersResponse) *control.Server {
+	t.Helper()
 	t.Cleanup(func() { os.Remove(socketPath) })
 	handler := &fakeDaemonHandler{
-		fakeHandler:    fakeHandler{status: map[string]any{}, shutdownMsg: "ok"},
+		fakeHandler:    fakeHandler{status: status, shutdownMsg: "ok"},
 		listOwnersResp: resp,
 	}
 	srv, err := control.NewServer(socketPath, handler, log.New(io.Discard, "", 0))
@@ -910,6 +916,24 @@ func startFakeDaemonControlServer(t *testing.T, socketPath string, resp control.
 	}
 	t.Cleanup(func() { srv.Close() })
 	return srv
+}
+
+func writeTestEngineDescriptor(t *testing.T, baseDir, engineName, productName, ctlPath string) {
+	t.Helper()
+	_, err := registry.WriteDescriptor(baseDir, registry.Descriptor{
+		SchemaVersion:     registry.SchemaVersion,
+		EngineName:        engineName,
+		ProductName:       productName,
+		PID:               1234,
+		BaseDir:           baseDir,
+		DaemonControlPath: ctlPath,
+		StartedAt:         time.Unix(1700000000, 0).UTC(),
+		MuxcoreVersion:    "test",
+		Capabilities:      registry.Capabilities{ListOwners: true},
+	})
+	if err != nil {
+		t.Fatalf("WriteDescriptor(%s): %v", engineName, err)
+	}
 }
 
 // newTestServerFull creates a Server with both DaemonCtlPath and BaseDir set.
@@ -998,6 +1022,248 @@ func TestMuxListWithFakeServer(t *testing.T) {
 	}
 	if !strings.Contains(text, "test-server") {
 		t.Errorf("mux_list output should contain args, got: %s", text)
+	}
+}
+
+func TestMuxEnginesListsHealthyAndStaleDescriptors(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-engines-")
+	healthyCtl := filepath.Join(baseDir, "aimux-muxd.ctl.sock")
+	mismatchCtl := filepath.Join(baseDir, "mismatch-muxd.ctl.sock")
+	missingCtl := filepath.Join(baseDir, "missing-muxd.ctl.sock")
+
+	startFakeDaemonControlServerWithStatus(t, healthyCtl, map[string]any{
+		"engine_name":       "aimux-test",
+		"pid":               4321,
+		"daemon_generation": "daemon-aimux",
+		"owner_count":       2,
+	}, control.ListOwnersResponse{})
+	startFakeDaemonControlServerWithStatus(t, mismatchCtl, map[string]any{
+		"engine_name": "engram-test",
+		"pid":         9999,
+		"owner_count": 0,
+	}, control.ListOwnersResponse{})
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Test", healthyCtl)
+	writeTestEngineDescriptor(t, baseDir, "mismatch-test", "Mismatch Test", mismatchCtl)
+	writeTestEngineDescriptor(t, baseDir, "missing-test", "Missing Test", missingCtl)
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"mux_engines","arguments":{}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 60)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if len(result.Content) == 0 {
+		t.Fatal("expected mux_engines content")
+	}
+	var decoded struct {
+		Engines []struct {
+			EngineName  string `json:"engine_name"`
+			ProductName string `json:"product_name"`
+			State       string `json:"state"`
+			Reachable   bool   `json:"reachable"`
+			Reason      string `json:"reason"`
+			OwnerCount  int    `json:"owner_count"`
+		} `json:"engines"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+		t.Fatalf("mux_engines content is not valid JSON: %v\n%s", err, result.Content[0].Text)
+	}
+	seen := map[string]struct {
+		state     string
+		reachable bool
+		reason    string
+		owners    int
+	}{}
+	for _, engine := range decoded.Engines {
+		seen[engine.EngineName] = struct {
+			state     string
+			reachable bool
+			reason    string
+			owners    int
+		}{engine.State, engine.Reachable, engine.Reason, engine.OwnerCount}
+	}
+	if got := seen["aimux-test"]; got.state != registry.StateHealthy || !got.reachable || got.owners != 2 {
+		t.Fatalf("aimux-test = %+v, want healthy reachable owner_count=2", got)
+	}
+	if got := seen["mismatch-test"]; got.state != registry.StateStale || !strings.Contains(got.reason, "engine_name_mismatch") {
+		t.Fatalf("mismatch-test = %+v, want stale mismatch", got)
+	}
+	if got := seen["missing-test"]; got.state != registry.StateStale || !strings.Contains(got.reason, "control_unreachable") {
+		t.Fatalf("missing-test = %+v, want stale unreachable", got)
+	}
+}
+
+func TestMuxEnginesEmptyRegistry(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-emptyengines-")
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"mux_engines","arguments":{}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 61)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	var decoded struct {
+		Engines []any `json:"engines"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+		t.Fatalf("mux_engines content is not valid JSON: %v\n%s", err, result.Content[0].Text)
+	}
+	if len(decoded.Engines) != 0 {
+		t.Fatalf("engines = %d, want 0", len(decoded.Engines))
+	}
+}
+
+func TestMuxListDefaultIgnoresRegisteredForeignEngines(t *testing.T) {
+	myCwd, _ := os.Getwd()
+	baseDir := shortBaseDir(t, "mcpmux-defaultforeign-")
+
+	foreignCtl := filepath.Join(baseDir, "aimux-muxd.ctl.sock")
+	startFakeDaemonControlServerWithStatus(t, foreignCtl, map[string]any{
+		"engine_name": "aimux-test",
+		"owner_count": 1,
+	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
+		ServerID: "foreign0011223344",
+		Command:  "aimux",
+		Args:     []string{"native"},
+		Cwd:      myCwd,
+	}}})
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Test", foreignCtl)
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
+		ServerID: "local001122334455",
+		Command:  "uvx",
+		Args:     []string{"local-server"},
+		Cwd:      myCwd,
+	}}})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"mux_list","arguments":{}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 62)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	text := result.Content[0].Text
+	if !strings.Contains(text, "local-server") {
+		t.Fatalf("default mux_list should include local current daemon owner, got: %s", text)
+	}
+	if strings.Contains(text, "aimux") || strings.Contains(text, "foreign0011223344") {
+		t.Fatalf("default mux_list leaked registered foreign engine owner: %s", text)
+	}
+}
+
+func TestMuxListWithEngineNameQueriesExactRegisteredEngine(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-scopedlist-")
+	foreignCtl := filepath.Join(baseDir, "aimux-muxd.ctl.sock")
+	startFakeDaemonControlServerWithStatus(t, foreignCtl, map[string]any{
+		"engine_name": "aimux-test",
+		"owner_count": 1,
+	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
+		ServerID:   "aimux001122334455",
+		EngineName: "aimux-test",
+		Command:    "aimux",
+		Args:       []string{"native"},
+		Sessions:   4,
+		Cwd:        filepath.Join(baseDir, "foreign-project"),
+	}}})
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Test", foreignCtl)
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"mux_list","arguments":{"engine_name":"aimux-test","all":true}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 63)
+	assertNoError(t, resp)
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if result.IsError {
+		t.Fatalf("scoped mux_list returned tool error: %+v", result.Content)
+	}
+	text := result.Content[0].Text
+	if !strings.Contains(text, "aimux001122334455") || !strings.Contains(text, "aimux-test") {
+		t.Fatalf("scoped mux_list missing aimux owner: %s", text)
+	}
+}
+
+func TestMuxListWithEngineNameRejectsUnknownAndStale(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-scopederr-")
+	missingCtl := filepath.Join(baseDir, "missing-muxd.ctl.sock")
+	writeTestEngineDescriptor(t, baseDir, "missing-test", "Missing Test", missingCtl)
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"mux_list","arguments":{"engine_name":"unknown-test"}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 64)
+	assertNoError(t, resp)
+	var unknown struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &unknown)
+	if !unknown.IsError || !strings.Contains(unknown.Content[0].Text, "registered muxcore engine not found") {
+		t.Fatalf("unknown engine response = %+v", unknown)
+	}
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"mux_list","arguments":{"engine_name":"missing-test"}}}`)
+	line = readLine(t, clientR)
+	resp = parseResponse(t, line)
+	assertID(t, resp, 65)
+	assertNoError(t, resp)
+	var stale struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &stale)
+	if !stale.IsError || !strings.Contains(stale.Content[0].Text, "registered muxcore engine is not healthy") {
+		t.Fatalf("stale engine response = %+v", stale)
 	}
 }
 

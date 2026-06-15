@@ -15,6 +15,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -943,6 +944,80 @@ func TestEngine_DaemonModeExposesDaemon(t *testing.T) {
 	// After shutdown, Daemon() must be nil (deferred reset in runDaemon).
 	if d := eng.Daemon(); d != nil {
 		t.Error("Daemon() != nil after Run() returned — deferred reset failed")
+	}
+}
+
+func TestEngineRegistryConfigPropagatesToDaemon(t *testing.T) {
+	const testFlag = "--test-daemon-registry-propagation"
+
+	baseDir, err := os.MkdirTemp("", "er*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	eng, err := New(Config{
+		Name:           "er",
+		SessionHandler: noopSessionHandler{},
+		BaseDir:        baseDir,
+		DaemonFlag:     testFlag,
+		IdleTimeout:    2 * time.Second,
+		SkipSnapshot:   true,
+		Registry: &registry.Config{
+			ProductName:    "Engine Registry Test",
+			MuxcoreVersion: "test-version",
+			Capabilities:   registry.Capabilities{ListOwners: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	origArgs := os.Args
+	os.Args = append(os.Args, testFlag)
+	defer func() { os.Args = origArgs }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- eng.Run(ctx) }()
+
+	select {
+	case <-eng.Ready():
+	case err := <-runErr:
+		t.Fatalf("Run() returned before Ready(): %v", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("Ready() did not fire within 5s")
+	}
+
+	records, err := registry.ListDescriptors(baseDir)
+	if err != nil {
+		cancel()
+		t.Fatalf("ListDescriptors: %v", err)
+	}
+	if len(records) != 1 {
+		cancel()
+		t.Fatalf("registry descriptors = %d, want 1: %+v", len(records), records)
+	}
+	rec := records[0]
+	if rec.Err != nil {
+		cancel()
+		t.Fatalf("descriptor parse error: %v", rec.Err)
+	}
+	if rec.Descriptor.EngineName != "er" {
+		cancel()
+		t.Fatalf("engine_name = %q, want er", rec.Descriptor.EngineName)
+	}
+	if rec.Descriptor.DaemonControlPath != serverid.DaemonControlPath(baseDir, "er") {
+		cancel()
+		t.Fatalf("control path = %q, want %q", rec.Descriptor.DaemonControlPath, serverid.DaemonControlPath(baseDir, "er"))
+	}
+
+	cancel()
+	select {
+	case <-runErr:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return within 5s after cancel")
 	}
 }
 

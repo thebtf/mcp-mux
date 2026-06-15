@@ -136,7 +136,33 @@ Every muxcore consumer should satisfy this checklist before shipping.
    your own control socket unless you are in client/proxy mode or an external
    operator process.
 
-10. **Provide a real update strategy.**
+10. **Opt into daemon registry advertisement only when wanted.**
+    `engine.Config.Registry` is nil by default, so non-adopting consumers do
+    not publish descriptors and remain invisible to `mcp-mux serve`
+    cross-engine discovery. If you want central read-only visibility, pass a
+    `registry.Config`:
+
+    ```go
+    import "github.com/thebtf/mcp-mux/muxcore/registry"
+
+    eng, err := engine.New(engine.Config{
+        Name:           "aimux",
+        SessionHandler: handler,
+        Registry: &registry.Config{
+            ProductName:    "aimux",
+            MuxcoreVersion: "vX.Y.Z",
+            Capabilities:   registry.Capabilities{ListOwners: true},
+        },
+    })
+    ```
+
+    The daemon writes a descriptor after its control socket is bound. Descriptor
+    fields include `engine_name`, `product_name`, `pid`, `base_dir`,
+    `daemon_control_path`, `started_at`, `muxcore_version`, and
+    `capabilities`. The descriptor is advisory: readers must call daemon
+    `status` and verify the returned `engine_name` before trusting it.
+
+11. **Provide a real update strategy.**
     Muxcore can restart daemons and reattach owners, but your product must
     choose how new executable bytes become the next daemon. On Windows the
     configured executable is exactly the file most likely to be held by live
@@ -439,6 +465,13 @@ Avoid these integration patterns:
   successor is selected by an active-engine pointer.
 - Reporting update success without checking `UpdateAndRestartResult` or the
   `UpdateAndRestartError.Phase` and partial `Result`.
+- Scanning temp sockets such as `*-muxd.ctl.sock` as a fake global registry.
+  Use opt-in descriptors and verify them with daemon `status`.
+- Treating default `mcp-mux serve` / `mux_list` as a global view of native
+  muxcore products. Default `mux_list` is the current `mcp-mux` namespace.
+- Exposing cross-engine stop/restart/update in CR-001. The registry's first
+  management capability is read-only `list_owners`; mutating management needs a
+  later explicit capability policy.
 
 ## Integration Verification
 
@@ -463,10 +496,11 @@ Then run a customer-mode smoke through the same entrypoint your MCP host uses:
    reconnect counters. SessionHandler hot updates should show refresh-based
    reconnect (`shim_reconnect_refreshed > 0`) without fallback spawn or give-up.
 6. Verify native muxcore products through their own MCP/CLI health and update
-   surfaces. `mcp-mux serve` / `mux_list` observes the `mcp-mux` daemon
-   namespace; it is not a generic registry for `aimux`, `engram`, or other
-   native muxcore daemons unless those products explicitly opt into such a
-   registry.
+   surfaces. Non-adopters remain invisible to cross-engine discovery. Opt-in
+   consumers should additionally verify `mux_engines` shows a healthy row and
+   `mux_list(engine_name="...")` lists only that engine after status
+   verification. Default `mux_list` still observes the current `mcp-mux` daemon
+   namespace.
 
 ## Stable Operator Status Contract
 

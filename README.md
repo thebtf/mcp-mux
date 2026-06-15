@@ -548,9 +548,10 @@ any other server:
 
 | Tool | Description |
 |------|-------------|
-| `mux_list` | Returns running instances for the **current project** inside this `mcp-mux` daemon namespace (filtered by caller's cwd). Pass `all: true` to list this daemon's instances across all projects. Includes server ID, engine name, PID, session count, pending requests, classification, and cache status. With `verbose: true`, includes classification source/reason and inflight request details when present. |
-| `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. |
-| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux, not another project's). Connected sessions reconnect automatically on their next tool call. |
+| `mux_engines` | Lists opted-in native muxcore daemon engines registered on this host. Each descriptor is advisory and is verified by daemon `status` before being marked healthy. Stale or mismatched descriptors are labeled instead of mixed into owner lists. |
+| `mux_list` | Returns running instances for the **current project** inside this `mcp-mux` daemon namespace (filtered by caller's cwd). Pass `all: true` to list this daemon's instances across all projects. Pass exact `engine_name` from `mux_engines` to query one verified native muxcore engine explicitly. Includes server ID, engine name, PID, session count, pending requests, classification, and cache status. With `verbose: true`, includes classification source/reason and inflight request details when present. |
+| `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. CR-001 scope is current `mcp-mux` daemon namespace only; it does not stop native registered engines. |
+| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux if it was launched through this `mcp-mux` daemon, not a native `aimux` engine). CR-001 scope is current namespace only; cross-engine restart is a future opt-in management feature. |
 
 **Session-scoped control plane:**
 
@@ -560,6 +561,11 @@ session's working directory:
 - `mux_list` — shows only servers owned by the current project by default.
   Use `mux_list(all: true)` for a full view across all projects in this
   `mcp-mux` daemon.
+- `mux_engines` — shows native muxcore products only when they explicitly opt
+  into daemon registry advertisement.
+- `mux_list(engine_name: "aimux")` — queries exactly one registered engine after
+  verifying that the descriptor's control socket returns matching
+  `engine_name` from daemon `status`.
 - `mux_restart(name: "aimux")` — resolves to the aimux instance started from this project's
   directory, not a same-named server from a different project.
 
@@ -567,10 +573,13 @@ This prevents accidental cross-project interference when multiple projects use t
 name.
 
 Native muxcore products such as `aimux` or `engram` run under their own engine
-namespaces when they embed muxcore directly. They do not appear in
-`mcp-mux serve` unless they were launched through the `mcp-mux` product daemon.
-Inspect or update those products through their own MCP/CLI health and update
-surfaces, or through a future explicit cross-engine registry.
+namespaces when they embed muxcore directly. They do not appear in default
+`mux_list` unless they were launched through the `mcp-mux` product daemon. If a
+native product opts into muxcore daemon registry advertisement, `mux_engines`
+can discover it and `mux_list(engine_name: "...")` can list that one engine's
+owners. Product-native health, sessions, upgrade, and restart surfaces remain
+authoritative unless that product later opts into explicit cross-engine
+management capabilities.
 
 **Prompts:**
 

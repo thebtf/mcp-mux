@@ -25,6 +25,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
@@ -326,6 +327,10 @@ type Config struct {
 	// managed by this daemon are treated as persistent (not evicted on idle).
 	Persistent bool
 
+	// Registry enables opt-in daemon advertisement for cross-engine discovery.
+	// Nil is the zero-value opt-out and preserves pre-registry behavior.
+	Registry *registry.Config
+
 	// AuthorizeSession, when non-nil, is forwarded to every Owner created by
 	// this daemon. Owners invoke the callback in acceptLoop after IPC
 	// handshake / peer-credential extraction and before AddSession.
@@ -468,6 +473,18 @@ func New(cfg Config) (*Daemon, error) {
 			if restored := d.loadSnapshot(); restored > 0 {
 				logger.Printf("startup: restored %d owners from snapshot", restored)
 			}
+		}
+	}
+
+	if cfg.Registry != nil {
+		baseDir := filepath.Dir(cfg.ControlPath)
+		desc := cfg.Registry.Descriptor(d.name, baseDir, cfg.ControlPath, os.Getpid(), time.Now())
+		if _, err := registry.WriteDescriptor(baseDir, desc); err != nil {
+			if d.ctlSrv != nil {
+				d.ctlSrv.Close()
+			}
+			supCancel()
+			return nil, fmt.Errorf("daemon: registry descriptor: %w", err)
 		}
 	}
 
