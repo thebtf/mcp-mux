@@ -47,11 +47,15 @@ type Capabilities struct {
 }
 
 // Config enables daemon advertisement when passed through engine.Config or
-// daemon.Config. A nil *Config is the opt-out zero value.
+// daemon.Config. A nil *Config is the opt-out zero value. Readers discover
+// descriptors only in their muxcore base dir, so native products and operator
+// tools must share BaseDir (or both use the default os.TempDir()).
 type Config struct {
 	ProductName    string
 	MuxcoreVersion string
-	Capabilities   Capabilities
+	// Capabilities defaults to ListOwners when left empty so an advertised
+	// daemon is useful for CR-001 read-only discovery.
+	Capabilities Capabilities
 }
 
 // Descriptor is a single daemon advertisement. It is intentionally small and
@@ -68,8 +72,8 @@ type Descriptor struct {
 	Capabilities      Capabilities `json:"capabilities"`
 }
 
-// Descriptor builds the runtime descriptor for one daemon process.
-func (cfg Config) Descriptor(engineName, baseDir, controlPath string, pid int, startedAt time.Time) Descriptor {
+// BuildDescriptor builds the runtime descriptor for one daemon process.
+func (cfg Config) BuildDescriptor(engineName, baseDir, controlPath string, pid int, startedAt time.Time) Descriptor {
 	caps := cfg.Capabilities
 	if !caps.ListOwners && !caps.Stop && !caps.Restart && !caps.Update {
 		caps.ListOwners = true
@@ -125,6 +129,9 @@ func Dir(baseDir string) string {
 // when two descriptors claim the same engine name but point at different
 // control sockets.
 func DescriptorPath(baseDir string, d Descriptor) (string, error) {
+	if d.SchemaVersion == 0 {
+		d.SchemaVersion = SchemaVersion
+	}
 	if err := validateDescriptor(d); err != nil {
 		return "", err
 	}
@@ -156,16 +163,24 @@ func WriteDescriptor(baseDir string, d Descriptor) (string, error) {
 	}
 	data = append(data, '\n')
 
-	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), safeName(d.EngineName)+"-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("registry: create temp descriptor: %w", err)
+	}
+	tmp := tmpFile.Name()
 	defer os.Remove(tmp)
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
 		return "", fmt.Errorf("registry: write temp descriptor: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("registry: close temp descriptor: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		// Some platforms are stricter about replacing an existing file. This is
 		// this daemon's own deterministic descriptor path, not a foreign cleanup.
 		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return "", fmt.Errorf("registry: replace descriptor: %w", err)
+			return "", fmt.Errorf("registry: replace descriptor: remove existing: %w (original rename: %v)", removeErr, err)
 		}
 		if retryErr := os.Rename(tmp, path); retryErr != nil {
 			return "", fmt.Errorf("registry: replace descriptor: %w", retryErr)
@@ -298,6 +313,11 @@ func VerifyDescriptorWithSender(rec Record, send SendFunc) VerifiedDescriptor {
 		}
 		return out
 	}
+	if len(resp.Data) == 0 {
+		out.State = StateStale
+		out.Reason = "status_empty_response_data"
+		return out
+	}
 	var status map[string]any
 	if err := json.Unmarshal(resp.Data, &status); err != nil {
 		out.State = StateStale
@@ -322,7 +342,7 @@ func VerifyDescriptorWithSender(rec Record, send SendFunc) VerifiedDescriptor {
 }
 
 func validateDescriptor(d Descriptor) error {
-	if d.SchemaVersion != 0 && d.SchemaVersion != SchemaVersion {
+	if d.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("%w: unsupported schema_version %d", ErrInvalidDescriptor, d.SchemaVersion)
 	}
 	if strings.TrimSpace(d.EngineName) == "" {

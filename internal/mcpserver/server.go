@@ -488,8 +488,7 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 
 	servers := s.formatOwnerList(listResp.Owners, params.Verbose, params.All, myCwd)
 
-	result, _ := json.MarshalIndent(servers, "", "  ")
-	s.sendToolResult(id, string(result))
+	s.sendJSONToolResult(id, servers)
 }
 
 func (s *Server) toolMuxEngines(id json.RawMessage, _ json.RawMessage) {
@@ -542,11 +541,10 @@ func (s *Server) toolMuxEngines(id json.RawMessage, _ json.RawMessage) {
 		engines = append(engines, row)
 	}
 
-	result, _ := json.MarshalIndent(map[string]any{
+	s.sendJSONToolResult(id, map[string]any{
 		"engines":    engines,
 		"duplicates": duplicates,
-	}, "", "  ")
-	s.sendToolResult(id, string(result))
+	})
 }
 
 func (s *Server) toolMuxListForEngine(id json.RawMessage, engineName string, verbose, all bool) {
@@ -591,20 +589,21 @@ func (s *Server) toolMuxListForEngine(id json.RawMessage, engineName string, ver
 		s.sendToolError(id, fmt.Sprintf("registered muxcore engine returned invalid list_owners response: %v", err))
 		return
 	}
+	for _, owner := range listResp.Owners {
+		if owner.EngineName != "" && owner.EngineName != engineName {
+			s.sendToolError(id, fmt.Sprintf("registered muxcore engine owner mismatch: requested %q, owner %q reports %q", engineName, owner.ServerID, owner.EngineName))
+			return
+		}
+	}
 	for i := range listResp.Owners {
 		if listResp.Owners[i].EngineName == "" {
 			listResp.Owners[i].EngineName = engineName
-		}
-		if listResp.Owners[i].EngineName != engineName {
-			s.sendToolError(id, fmt.Sprintf("registered muxcore engine owner mismatch: requested %q, owner %q reports %q", engineName, listResp.Owners[i].ServerID, listResp.Owners[i].EngineName))
-			return
 		}
 	}
 	myCwd, _ := os.Getwd()
 	myCwd = normalizeCwd(myCwd)
 	servers := s.formatOwnerList(listResp.Owners, verbose, all, myCwd)
-	result, _ := json.MarshalIndent(servers, "", "  ")
-	s.sendToolResult(id, string(result))
+	s.sendJSONToolResult(id, servers)
 }
 
 func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, myCwd string) []map[string]any {
@@ -931,6 +930,15 @@ func (s *Server) sendToolResult(id json.RawMessage, text string) {
 			{"type": "text", "text": text},
 		},
 	})
+}
+
+func (s *Server) sendJSONToolResult(id json.RawMessage, payload any) {
+	result, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		s.sendToolError(id, fmt.Sprintf("internal: marshal tool result: %v", err))
+		return
+	}
+	s.sendToolResult(id, string(result))
 }
 
 func (s *Server) sendToolError(id json.RawMessage, text string) {

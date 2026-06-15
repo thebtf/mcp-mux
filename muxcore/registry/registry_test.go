@@ -118,6 +118,21 @@ func TestListDescriptorsReturnsMalformedRecords(t *testing.T) {
 	}
 }
 
+func TestReadDescriptorRejectsSchemaVersionZero(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(Dir(base), 0o700); err != nil {
+		t.Fatalf("mkdir registry dir: %v", err)
+	}
+	path := filepath.Join(Dir(base), "schema-zero.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version":0,"engine_name":"aimux","daemon_control_path":"aimux.sock"}`), 0o600); err != nil {
+		t.Fatalf("write schema-zero descriptor: %v", err)
+	}
+
+	if _, err := ReadDescriptor(path); !errors.Is(err, ErrInvalidDescriptor) {
+		t.Fatalf("ReadDescriptor error = %v, want ErrInvalidDescriptor", err)
+	}
+}
+
 func TestDuplicateEngineNamesAndResolveEngine(t *testing.T) {
 	base := t.TempDir()
 	d1 := testDescriptor("aimux", filepath.Join(base, "one.sock"))
@@ -192,5 +207,15 @@ func TestVerifyDescriptorUnreachableIsStale(t *testing.T) {
 	})
 	if verified.State != StateStale || !strings.Contains(verified.Reason, "control_unreachable") {
 		t.Fatalf("verify = %+v, want stale unreachable", verified)
+	}
+}
+
+func TestVerifyDescriptorEmptyStatusDataIsStale(t *testing.T) {
+	rec := Record{Descriptor: testDescriptor("aimux", "empty-status.sock")}
+	verified := VerifyDescriptorWithSender(rec, func(string, control.Request) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	})
+	if verified.State != StateStale || verified.Reason != "status_empty_response_data" {
+		t.Fatalf("verify = %+v, want stale empty response data", verified)
 	}
 }

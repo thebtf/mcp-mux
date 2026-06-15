@@ -160,7 +160,10 @@ Every muxcore consumer should satisfy this checklist before shipping.
     fields include `engine_name`, `product_name`, `pid`, `base_dir`,
     `daemon_control_path`, `started_at`, `muxcore_version`, and
     `capabilities`. The descriptor is advisory: readers must call daemon
-    `status` and verify the returned `engine_name` before trusting it.
+    `status` and verify the returned `engine_name` before trusting it. The
+    native daemon and the operator tool reading descriptors must use the same
+    `BaseDir` or both rely on the default temp dir; otherwise discovery is
+    intentionally empty.
 
 11. **Provide a real update strategy.**
     Muxcore can restart daemons and reattach owners, but your product must

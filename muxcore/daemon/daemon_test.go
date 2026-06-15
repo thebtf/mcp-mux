@@ -137,6 +137,15 @@ func TestRegistryOptInWritesDescriptorAfterControlBind(t *testing.T) {
 	if verified.State != registry.StateHealthy || !verified.Reachable {
 		t.Fatalf("VerifyDescriptor = %+v, want healthy reachable", verified)
 	}
+
+	d.Shutdown()
+	records, err = registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors after Shutdown: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("clean Shutdown left registry descriptors: %+v", records)
+	}
 }
 
 type noopSessionHandler struct{}
