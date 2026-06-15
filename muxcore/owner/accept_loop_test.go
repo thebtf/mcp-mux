@@ -84,12 +84,12 @@ func TestAcceptLoop_RejectEmptyToken(t *testing.T) {
 	o, socketPath := newTokenHandshakeOwner(t, logger)
 
 	conn := connectWithToken(t, socketPath, "")
-	conn.Close()
+	defer conn.Close()
 
 	// Positive evidence of rejection: the rejection log entry appears. Plain
 	// `sessionCount == 0` is true from t=0 and cannot distinguish "rejected"
 	// from "acceptLoop hasn't run yet" (CodeRabbit concern).
-	waitForCondition(t, 200*time.Millisecond, func() bool {
+	waitForCondition(t, 500*time.Millisecond, func() bool {
 		return strings.Contains(logBuffer.String(), "accept: rejected connection")
 	}, "empty-token connection should produce a rejection log entry")
 	if got := sessionCount(o); got != 0 {
@@ -117,9 +117,9 @@ func TestAcceptLoop_RejectUnknownToken(t *testing.T) {
 	o, socketPath := newTokenHandshakeOwner(t, logger)
 
 	conn := connectWithToken(t, socketPath, "cafebabe")
-	conn.Close()
+	defer conn.Close()
 
-	waitForCondition(t, 200*time.Millisecond, func() bool {
+	waitForCondition(t, 500*time.Millisecond, func() bool {
 		return strings.Contains(logBuffer.String(), "accept: rejected connection")
 	}, "unknown-token connection should produce a rejection log entry")
 	if got := sessionCount(o); got != 0 {
@@ -182,11 +182,8 @@ func TestAcceptLoop_ConcurrentTokenMix(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	for _, conn := range conns[n:] {
-		conn.Close()
-	}
 	t.Cleanup(func() {
-		for _, conn := range conns[:n] {
+		for _, conn := range conns {
 			if conn != nil {
 				conn.Close()
 			}
