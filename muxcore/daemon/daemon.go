@@ -1660,8 +1660,10 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 // HandleGracefulRestart implements control.DaemonHandler.
 // Serializes a state snapshot (used as FR-8 fallback seed and successor
 // cold-start seed), then attempts FD-passing handoff to the successor daemon
-// (FR-1/FR-2/FR-3). On any handoff failure the "handoff.fallback" log line is
-// emitted and the function falls through to legacy kill-and-respawn (FR-8).
+// (FR-1/FR-2/FR-3). Process-backed handoff failures emit the "handoff.fallback"
+// log line and fall through to legacy kill-and-respawn (FR-8). SessionHandler-
+// only configurations have no upstream FDs to hand off and use snapshot-only
+// restart as their healthy path.
 func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
 	return d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{DrainTimeoutMs: drainTimeoutMs})
 }
@@ -1691,15 +1693,14 @@ func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOp
 	}
 	d.mu.Unlock()
 
-	// Attempt FD-passing handoff. Every identifiable failure mode routes through
-	// the fallback log line; callers never see a handoff error — FR-8 is silent
-	// to the control-plane caller (it still gets a valid snapshot path).
+	// Attempt FD-passing handoff. Callers never see a handoff error — FR-8 is
+	// silent to the control-plane caller (it still gets a valid snapshot path).
 	if handoffErr := d.attemptHandoff(opts.SuccessorExe); handoffErr != nil {
-		d.stats.fallback.Add(1)
-		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 		if errors.Is(handoffErr, errNoHandoffUpstreams) {
 			return snapshotPath, d.afterSnapshotOnlyRestart(opts.SuccessorExe), nil
 		}
+		d.stats.fallback.Add(1)
+		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
 
 	return snapshotPath, func() { go d.Shutdown() }, nil

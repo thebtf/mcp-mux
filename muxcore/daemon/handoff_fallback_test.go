@@ -153,6 +153,7 @@ func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorAfterShutdown(t
 	}
 	waitOwnerAccepting(t, d, sid)
 
+	beforeFallback := d.stats.fallback.Load()
 	snapshotPath, afterFn, err := d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{
 		SuccessorExe: "next-engine.exe",
 	})
@@ -173,6 +174,9 @@ func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorAfterShutdown(t
 	}
 	if !d.shuttingDown.Load() {
 		t.Fatal("daemon is not marked shuttingDown while restart response is pending")
+	}
+	if got := d.stats.fallback.Load() - beforeFallback; got != 0 {
+		t.Fatalf("handoff fallback delta = %d, want 0 for SessionHandler-only snapshot restart", got)
 	}
 
 	afterFn()
