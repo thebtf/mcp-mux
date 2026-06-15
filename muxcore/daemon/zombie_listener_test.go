@@ -3,13 +3,13 @@ package daemon
 import (
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
@@ -38,9 +38,9 @@ func TestSpawn_ZombieListenerIsTornDownAndRespawned(t *testing.T) {
 	// the exact shape of the production zombie — listener fd is gone but
 	// the Owner's listenerDone channel is still open, so IsAccepting lies.
 	path := shortSocketPath(t, "zombie.sock")
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
+		t.Fatalf("ipc.Listen: %v", err)
 	}
 	// Close the listener — this is what makes it a zombie. We do NOT call
 	// closeListener() on the Owner, so listenerDone stays open.
@@ -151,9 +151,9 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 	// Zombie: bind listener then close the fd without signalling
 	// listenerDone — IsAccepting lies, IsReachable tells the truth.
 	zPath := shortSocketPath(t, "zombie.sock")
-	zLn, err := net.Listen("unix", zPath)
+	zLn, err := ipc.Listen(zPath)
 	if err != nil {
-		t.Fatalf("net.Listen zombie: %v", err)
+		t.Fatalf("ipc.Listen zombie: %v", err)
 	}
 	zLn.Close()
 	zSID := fmt.Sprintf("%064x", 0xDEAD)
@@ -161,9 +161,9 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 
 	// Healthy: bind and keep it bound.
 	hPath := shortSocketPath(t, "healthy.sock")
-	hLn, err := net.Listen("unix", hPath)
+	hLn, err := ipc.Listen(hPath)
 	if err != nil {
-		t.Fatalf("net.Listen healthy: %v", err)
+		t.Fatalf("ipc.Listen healthy: %v", err)
 	}
 	t.Cleanup(func() { hLn.Close() })
 	go func() {
@@ -184,9 +184,9 @@ func TestRunRestoreHealthGate_ZombieTornDown(t *testing.T) {
 	// accept another connection. The health gate MUST NOT treat this as
 	// a zombie.
 	cPath := shortSocketPath(t, "closed.sock")
-	cLn, err := net.Listen("unix", cPath)
+	cLn, err := ipc.Listen(cPath)
 	if err != nil {
-		t.Fatalf("net.Listen closed: %v", err)
+		t.Fatalf("ipc.Listen closed: %v", err)
 	}
 	cLn.Close()
 	cSID := fmt.Sprintf("%064x", 0xC105ED)

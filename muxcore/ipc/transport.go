@@ -1,8 +1,9 @@
-// Package ipc provides cross-platform IPC transport using Unix domain sockets.
+//go:build !windows
+
+// Package ipc provides cross-platform IPC transport.
 //
-// On all platforms (including Windows 10 1803+), Go supports Unix domain sockets
-// via net.Listen("unix", path). This avoids the need for platform-specific
-// named pipe libraries in the PoC.
+// Unix-like platforms use Unix domain sockets. Windows uses named pipes in
+// transport_windows.go to avoid stale AF_UNIX reparse-point locks.
 package ipc
 
 import (
@@ -16,6 +17,14 @@ import (
 
 const dialTimeout = 500 * time.Millisecond
 
+var (
+	staleSocketRemoveAttempts = 40
+	staleSocketRemoveDelay    = 25 * time.Millisecond
+	removeSocketFile          = os.Remove
+	renameSocketFile          = os.Rename
+	sleepBeforeRemoveRetry    = time.Sleep
+)
+
 // Listen creates an IPC listener at the given path.
 // Any stale socket file is removed before listening.
 // Returns an error if another process is actively serving on path.
@@ -24,8 +33,7 @@ func Listen(path string) (net.Listener, error) {
 		return nil, fmt.Errorf("ipc: listener already active at %s (another process is serving)", path)
 	}
 
-	// Remove stale socket file if it exists
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := removeStaleSocket(path); err != nil {
 		return nil, fmt.Errorf("ipc: remove stale socket %s: %w", path, err)
 	}
 
@@ -37,10 +45,56 @@ func Listen(path string) (net.Listener, error) {
 	return ln, nil
 }
 
+func removeStaleSocket(path string) error {
+	attempts := staleSocketRemoveAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	delay := staleSocketRemoveDelay
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 && IsAvailable(path) {
+			return fmt.Errorf("listener became active while removing stale socket")
+		}
+
+		err := removeSocketFile(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		lastErr = err
+
+		if attempt+1 < attempts && delay > 0 {
+			sleepBeforeRemoveRetry(delay)
+		}
+	}
+	if retireErr := retireStaleSocket(path); retireErr == nil {
+		return nil
+	} else if os.IsNotExist(retireErr) {
+		return nil
+	} else {
+		lastErr = fmt.Errorf("%w; retire stale socket: %v", lastErr, retireErr)
+	}
+	return lastErr
+}
+
+func retireStaleSocket(path string) error {
+	retiredPath := fmt.Sprintf("%s.stale.%d.%d", path, os.Getpid(), time.Now().UnixNano())
+	if err := renameSocketFile(path, retiredPath); err != nil {
+		return err
+	}
+	_ = removeSocketFile(retiredPath)
+	return nil
+}
+
 // Dial connects to an IPC endpoint at the given path.
 // Returns an error if the connection cannot be established within 500ms.
 func Dial(path string) (net.Conn, error) {
-	conn, err := net.DialTimeout("unix", path, dialTimeout)
+	return DialTimeout(path, dialTimeout)
+}
+
+func DialTimeout(path string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("unix", path, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("ipc: dial %s: %w", path, err)
 	}
@@ -59,5 +113,8 @@ func IsAvailable(path string) bool {
 
 // Cleanup removes the socket file. Called by owner on shutdown.
 func Cleanup(path string) {
-	_ = os.Remove(path)
+	if IsAvailable(path) {
+		return
+	}
+	_ = removeStaleSocket(path)
 }

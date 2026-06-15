@@ -34,6 +34,14 @@ const (
 	SnapshotMaxAge  = 5 * time.Minute
 )
 
+const snapshotRenameMaxAttempts = 40
+
+var (
+	snapshotRename           = os.Rename
+	snapshotRemove           = os.Remove
+	snapshotRenameRetryDelay = 25 * time.Millisecond
+)
+
 // OwnerSnapshot captures the serializable state of an Owner for graceful restart.
 // Cached responses are base64-encoded raw JSON-RPC messages.
 type OwnerSnapshot struct {
@@ -56,11 +64,23 @@ type OwnerSnapshot struct {
 	CachedPrompts           string               `json:"cached_prompts,omitempty"`
 	CachedResources         string               `json:"cached_resources,omitempty"`
 	CachedResourceTemplates string               `json:"cached_resource_templates,omitempty"`
+	BoundTokens             []BoundTokenSnapshot `json:"bound_tokens,omitempty"`
 	// Handoff fields (v0.21.0+). Zero-values = cold-spawn path (FR-8 backwards-compat).
 	// Non-zero UpstreamPID + non-empty HandoffSocketPath = reattach path (FR-1/FR-9).
 	UpstreamPID       int    `json:"upstream_pid,omitempty"`
 	HandoffSocketPath string `json:"handoff_socket_path,omitempty"`
 	SpawnPgid         int    `json:"spawn_pgid,omitempty"`
+}
+
+// BoundTokenSnapshot captures consumed-token history required for refresh-token
+// reconnect after a daemon restart.
+type BoundTokenSnapshot struct {
+	Token    string            `json:"token"`
+	OwnerKey string            `json:"owner_key"`
+	Cwd      string            `json:"cwd"`
+	Env      map[string]string `json:"env,omitempty"`
+	BoundAt  time.Time         `json:"bound_at"`
+	LastUsed time.Time         `json:"last_used"`
 }
 
 // SessionSnapshot captures the serializable state of a Session for graceful restart.
@@ -118,9 +138,7 @@ func Serialize(data *DaemonSnapshot, logger interface{ Printf(string, ...any) })
 		return "", fmt.Errorf("snapshot close: %w", err)
 	}
 
-	// On Windows, os.Rename fails if target exists — remove first.
-	os.Remove(path)
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := replaceSnapshotFile(tmpPath, path, encoded); err != nil {
 		os.Remove(tmpPath)
 		return "", fmt.Errorf("snapshot rename: %w", err)
 	}
@@ -128,6 +146,26 @@ func Serialize(data *DaemonSnapshot, logger interface{ Printf(string, ...any) })
 	logger.Printf("snapshot written: %d owners, %d sessions (%d bytes)",
 		len(data.Owners), len(data.Sessions), len(encoded))
 	return path, nil
+}
+
+func replaceSnapshotFile(tmpPath, path string, encoded []byte) error {
+	var err error
+	for attempt := 0; attempt < snapshotRenameMaxAttempts; attempt++ {
+		// On Windows, os.Rename fails if target exists — remove first.
+		_ = snapshotRemove(path)
+		err = snapshotRename(tmpPath, path)
+		if err == nil {
+			return nil
+		}
+		if attempt+1 < snapshotRenameMaxAttempts {
+			time.Sleep(snapshotRenameRetryDelay)
+		}
+	}
+	if writeErr := os.WriteFile(path, encoded, 0600); writeErr == nil {
+		_ = snapshotRemove(tmpPath)
+		return nil
+	}
+	return err
 }
 
 // Deserialize reads and validates a snapshot from SnapshotPath("").

@@ -30,6 +30,7 @@ func TestGracefulRestart_ResponseDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
+	seedProcessBackedOwner(t, d)
 
 	// Send graceful-restart via the real control client — same code path
 	// as ctltest / upgrade --restart.
@@ -133,6 +134,7 @@ func TestGracefulRestart_BackToBack(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Phase %d: New(): %v", i, err)
 		}
+		seedProcessBackedOwner(t, d)
 
 		resp, err := control.SendWithTimeout(ctlPath, control.Request{
 			Cmd:            "graceful-restart",

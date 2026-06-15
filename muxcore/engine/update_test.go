@@ -30,6 +30,9 @@ type updateSeams struct {
 	start           func(string, string) error
 	waitReady       func(context.Context, string, time.Duration) error
 	waitExit        func(context.Context, string, time.Duration) error
+	waitReplacement func(context.Context, string, daemonIdentity, time.Duration) (bool, error)
+	identity        func(string) (daemonIdentity, error)
+	prepareSocket   func(context.Context, string, time.Duration) error
 	acquireLock     func(string) (daemonLock, error)
 }
 
@@ -43,6 +46,9 @@ func captureUpdateSeams() updateSeams {
 		start:           engineStartDaemonExecutable,
 		waitReady:       engineWaitForDaemonReady,
 		waitExit:        engineWaitForDaemonExit,
+		waitReplacement: engineWaitForReplacement,
+		identity:        engineDaemonIdentity,
+		prepareSocket:   enginePrepareControlSocket,
 		acquireLock:     engineAcquireDaemonLock,
 	}
 }
@@ -50,6 +56,13 @@ func captureUpdateSeams() updateSeams {
 func restoreUpdateSeams(t *testing.T) {
 	t.Helper()
 	orig := captureUpdateSeams()
+	enginePrepareControlSocket = func(context.Context, string, time.Duration) error { return nil }
+	engineDaemonIdentity = func(string) (daemonIdentity, error) {
+		return daemonIdentity{pid: 1, generation: "old"}, nil
+	}
+	engineWaitForReplacement = func(context.Context, string, daemonIdentity, time.Duration) (bool, error) {
+		return true, nil
+	}
 	t.Cleanup(func() {
 		engineUpgradeSwap = orig.swap
 		engineCleanStale = orig.clean
@@ -59,6 +72,9 @@ func restoreUpdateSeams(t *testing.T) {
 		engineStartDaemonExecutable = orig.start
 		engineWaitForDaemonReady = orig.waitReady
 		engineWaitForDaemonExit = orig.waitExit
+		engineWaitForReplacement = orig.waitReplacement
+		engineDaemonIdentity = orig.identity
+		enginePrepareControlSocket = orig.prepareSocket
 		engineAcquireDaemonLock = orig.acquireLock
 	})
 }
@@ -153,9 +169,9 @@ func TestApplyUpdateAndRestart_DefaultTimeouts(t *testing.T) {
 		gotRestart = timeout
 		return &control.Response{OK: true}, nil
 	}
-	engineWaitForDaemonExit = func(_ context.Context, _ string, timeout time.Duration) error {
+	engineWaitForReplacement = func(_ context.Context, _ string, _ daemonIdentity, timeout time.Duration) (bool, error) {
 		gotShutdown = timeout
-		return nil
+		return true, nil
 	}
 	engineWaitForDaemonReady = func(_ context.Context, _ string, timeout time.Duration) error {
 		gotReady = timeout
@@ -180,6 +196,124 @@ func TestApplyUpdateAndRestart_DefaultTimeouts(t *testing.T) {
 		t.Fatalf("timeouts restart/shutdown/ready = %s/%s/%s, want %s/%s/%s",
 			gotRestart, gotShutdown, gotReady,
 			defaultUpdateRestartTimeout, defaultUpdateShutdownTimeout, defaultUpdateReadyTimeout)
+	}
+}
+
+func baseRestartWithSuccessorOptions() RestartWithSuccessorOptions {
+	return RestartWithSuccessorOptions{
+		SuccessorExe:    "next-engine.exe",
+		DrainTimeout:    30 * time.Second,
+		RestartTimeout:  time.Minute,
+		ShutdownTimeout: time.Second,
+		ReadyTimeout:    time.Second,
+	}
+}
+
+func TestRestartWithSuccessor_ValidationErrors(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+
+	_, err := eng.RestartWithSuccessor(context.Background(), RestartWithSuccessorOptions{})
+	var updateErr *UpdateAndRestartError
+	if !errors.As(err, &updateErr) {
+		t.Fatalf("error = %v, want UpdateAndRestartError", err)
+	}
+	if updateErr.Phase != UpdatePhaseValidate || !strings.Contains(updateErr.Err.Error(), "SuccessorExe is required") {
+		t.Fatalf("phase/err = %s/%v, want validate/SuccessorExe is required", updateErr.Phase, updateErr.Err)
+	}
+}
+
+func TestRestartWithSuccessor_GracefulSuccessUsesExplicitSuccessor(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	lock := &fakeDaemonLock{}
+	var gracefulReq control.Request
+	swapCalls := 0
+	startCalls := 0
+
+	engineUpgradeSwap = func(string, string) (string, error) {
+		swapCalls++
+		return "", errors.New("swap must not be called")
+	}
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return lock, nil }
+	engineControlSendWithTimeout = func(_ string, req control.Request, timeout time.Duration) (*control.Response, error) {
+		gracefulReq = req
+		if timeout != time.Minute {
+			t.Fatalf("restart timeout = %s, want 1m", timeout)
+		}
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+	engineStartDaemonExecutable = func(string, string) error {
+		startCalls++
+		return nil
+	}
+
+	got, err := eng.RestartWithSuccessor(context.Background(), baseRestartWithSuccessorOptions())
+	if err != nil {
+		t.Fatalf("RestartWithSuccessor: %v", err)
+	}
+	if swapCalls != 0 {
+		t.Fatalf("swap calls = %d, want 0", swapCalls)
+	}
+	if gracefulReq.Cmd != "graceful-restart" || gracefulReq.SuccessorExe != "next-engine.exe" {
+		t.Fatalf("graceful request = %+v, want successor next-engine.exe", gracefulReq)
+	}
+	if !got.DaemonWasRunning || !got.LockAcquired || !got.GracefulRestarted || !got.ReplacementReady {
+		t.Fatalf("unexpected result flags: %+v", got)
+	}
+	if got.OldPath != "" || got.CleanedStale != 0 {
+		t.Fatalf("unexpected swap/cleanup fields: %+v", got)
+	}
+	if startCalls != 0 {
+		t.Fatalf("explicit start calls = %d, want 0 when graceful successor is ready", startCalls)
+	}
+	if !lock.closed {
+		t.Fatal("daemon lock was not released")
+	}
+}
+
+func TestRestartWithSuccessor_GracefulErrorFallbackStartsSuccessor(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	var sent []string
+	var startedExe, startedFlag string
+
+	engineUpgradeSwap = func(string, string) (string, error) {
+		t.Fatal("swap must not be called")
+		return "", nil
+	}
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
+		sent = append(sent, req.Cmd)
+		return nil, errors.New("dial failed")
+	}
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		sent = append(sent, req.Cmd)
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
+	engineStartDaemonExecutable = func(exe, flag string) error {
+		startedExe, startedFlag = exe, flag
+		return nil
+	}
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+
+	got, err := eng.RestartWithSuccessor(context.Background(), baseRestartWithSuccessorOptions())
+	if err != nil {
+		t.Fatalf("RestartWithSuccessor: %v", err)
+	}
+	if len(sent) != 2 || sent[0] != "graceful-restart" || sent[1] != "shutdown" {
+		t.Fatalf("sent commands = %#v, want graceful-restart then shutdown", sent)
+	}
+	if !got.FallbackShutdown || !got.ReplacementStarted || !got.ReplacementReady {
+		t.Fatalf("unexpected fallback result: %+v", got)
+	}
+	if startedExe != "next-engine.exe" || startedFlag != "--test-daemon" {
+		t.Fatalf("started %q %q, want next-engine.exe --test-daemon", startedExe, startedFlag)
 	}
 }
 
@@ -343,6 +477,101 @@ func TestApplyUpdateAndRestart_GracefulErrorFallsBackToShutdownAndStart(t *testi
 	}
 }
 
+func TestRestartWithSuccessor_PreparesControlSocketBeforeCleanFallbackStart(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	var order []string
+	readyCalls := 0
+
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForReplacement = func(context.Context, string, daemonIdentity, time.Duration) (bool, error) {
+		return false, nil
+	}
+	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error {
+		order = append(order, "ready")
+		readyCalls++
+		if readyCalls == 1 {
+			return errors.New("graceful successor not ready")
+		}
+		return nil
+	}
+	enginePrepareControlSocket = func(context.Context, string, time.Duration) error {
+		order = append(order, "prepare")
+		return nil
+	}
+	engineStartDaemonExecutable = func(string, string) error {
+		order = append(order, "start")
+		return nil
+	}
+
+	got, err := eng.RestartWithSuccessor(context.Background(), RestartWithSuccessorOptions{SuccessorExe: "next.exe"})
+	if err != nil {
+		t.Fatalf("RestartWithSuccessor: %v", err)
+	}
+	if !got.GracefulRestarted || !got.ReplacementStarted || !got.ReplacementReady {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	want := []string{"prepare", "ready", "start", "ready"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %#v, want %#v", order, want)
+	}
+}
+
+func TestRestartWithSuccessor_TreatsAlreadyBoundReplacementAsReady(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	identityCalls := 0
+	prepareCalls := 0
+	startCalls := 0
+
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineDaemonIdentity = func(string) (daemonIdentity, error) {
+		identityCalls++
+		if identityCalls == 1 {
+			return daemonIdentity{pid: 100, generation: "old"}, nil
+		}
+		return daemonIdentity{pid: 200, generation: "new"}, nil
+	}
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForReplacement = func(context.Context, string, daemonIdentity, time.Duration) (bool, error) {
+		return false, nil
+	}
+	enginePrepareControlSocket = func(context.Context, string, time.Duration) error {
+		prepareCalls++
+		return errors.New("old socket still active")
+	}
+	engineStartDaemonExecutable = func(string, string) error {
+		startCalls++
+		return nil
+	}
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+
+	got, err := eng.RestartWithSuccessor(context.Background(), RestartWithSuccessorOptions{SuccessorExe: "next.exe"})
+	if err != nil {
+		t.Fatalf("RestartWithSuccessor: %v", err)
+	}
+	if !got.GracefulRestarted || !got.ReplacementStarted || !got.ReplacementReady {
+		t.Fatalf("unexpected result: %+v", got)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("prepare calls = %d, want 0 when replacement identity is already active", prepareCalls)
+	}
+	if startCalls != 0 {
+		t.Fatalf("start calls = %d, want 0 when replacement identity is already active", startCalls)
+	}
+	if identityCalls < 2 {
+		t.Fatalf("identity calls = %d, want pre-restart and replacement checks", identityCalls)
+	}
+}
+
 func TestApplyUpdateAndRestart_LockFailureIsPhaseError(t *testing.T) {
 	restoreUpdateSeams(t)
 	eng := newUpdateTestEngine(t)
@@ -471,7 +700,9 @@ func TestApplyUpdateAndRestart_GracefulExitTimeoutIsPhaseError(t *testing.T) {
 	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
 		return &control.Response{OK: true}, nil
 	}
-	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return exitErr }
+	engineWaitForReplacement = func(context.Context, string, daemonIdentity, time.Duration) (bool, error) {
+		return false, exitErr
+	}
 	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error {
 		readyChecks++
 		return nil

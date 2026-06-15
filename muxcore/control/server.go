@@ -15,15 +15,21 @@ import (
 // Server listens on a Unix domain socket for control commands.
 // Each connection handles one Request → Response, then closes.
 type Server struct {
-	listener net.Listener
-	handler  CommandHandler
-	logger   *log.Logger
+	listener   net.Listener
+	socketPath string
+	handler    CommandHandler
+	logger     *log.Logger
 
 	mu     sync.Mutex
 	closed bool
 	done   chan struct{}
 	wg     sync.WaitGroup
 }
+
+var (
+	acceptErrorBackoff    = 100 * time.Millisecond
+	sleepAfterAcceptError = time.Sleep
+)
 
 // NewServer creates and starts a control server at the given socket path.
 func NewServer(socketPath string, handler CommandHandler, logger *log.Logger) (*Server, error) {
@@ -33,10 +39,11 @@ func NewServer(socketPath string, handler CommandHandler, logger *log.Logger) (*
 	}
 
 	s := &Server{
-		listener: ln,
-		handler:  handler,
-		logger:   logger,
-		done:     make(chan struct{}),
+		listener:   ln,
+		socketPath: socketPath,
+		handler:    handler,
+		logger:     logger,
+		done:       make(chan struct{}),
 	}
 
 	go s.acceptLoop()
@@ -66,7 +73,12 @@ func (s *Server) acceptLoop() {
 				return
 			}
 			s.logger.Printf("control: accept error: %v", err)
+			sleepAfterAcceptError(acceptErrorBackoff)
 			continue
+		}
+		if s.isClosed() {
+			conn.Close()
+			return
 		}
 
 		s.wg.Add(1)
@@ -261,6 +273,9 @@ func (s *Server) Close() {
 	s.mu.Unlock()
 
 	s.listener.Close()
+	if s.socketPath != "" {
+		ipc.Cleanup(s.socketPath)
+	}
 	s.logger.Printf("control.Close: listener closed, waiting for active handlers...")
 	s.wg.Wait()
 	s.logger.Printf("control.Close: all handlers done")
@@ -268,5 +283,5 @@ func (s *Server) Close() {
 
 // SocketPath returns the socket path from the underlying listener.
 func (s *Server) SocketPath() string {
-	return s.listener.Addr().String()
+	return s.socketPath
 }

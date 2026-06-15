@@ -21,3 +21,4 @@ graphify-out/
 .serena/
 .gocache/
 .repro/
+.t/

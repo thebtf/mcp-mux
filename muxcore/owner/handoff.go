@@ -27,6 +27,18 @@ type HandoffPayload struct {
 	Cwd      string
 }
 
+// HasHandoffUpstream reports whether this owner has a subprocess that can be
+// detached and transferred to a successor daemon. SessionHandler-only owners
+// have no upstream process; they recover through snapshot restore instead.
+func (o *Owner) HasHandoffUpstream() bool {
+	if o == nil {
+		return false
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.upstream != nil
+}
+
 // teardownExceptUpstream closes the control server, IPC listener, and all
 // active sessions. It is the shared first-half of both Shutdown and
 // ShutdownForHandoff. Safe to call with an already-empty sessions map.

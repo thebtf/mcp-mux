@@ -1,6 +1,6 @@
 # @critical
 # @category: smoke
-# @features: [MCP-MUX-CLI, MCP-MUX-RECONNECT, MCP-MUX-CURRENT-TOPOLOGY]
+# @features: [MCP-MUX-CLI, MCP-MUX-RECONNECT, MCP-MUX-CURRENT-TOPOLOGY, MUXCORE-NATIVE-UPDATE]
 # @dev_stand: optional
 param(
     [int]$WatchSeconds = 1,
@@ -15,6 +15,7 @@ $RunDir = Join-Path $RepoRoot ".agent\tmp\critical-suite-$Stamp"
 $ReportsDir = Join-Path $RepoRoot ".agent\reports"
 $Binary = Join-Path $RunDir "mcp-mux.exe"
 $SmokeEvidence = Join-Path $ReportsDir "critical-smoke-time-upstream-$Stamp.json"
+$NativeUpdateEvidence = Join-Path $ReportsDir "critical-native-sessionhandler-update-$Stamp.json"
 $JsonReport = Join-Path $ReportsDir "critical-suite-$Stamp.json"
 $MdReport = Join-Path $ReportsDir "critical-suite-$Stamp.md"
 
@@ -73,6 +74,16 @@ try {
             throw "run-current-topology-poc exited with code $LASTEXITCODE"
         }
     }
+
+    Invoke-CriticalStep "native SessionHandler update smoke" {
+        & .\scripts\smoke-native-sessionhandler-update.ps1 `
+            -RunDir (Join-Path $RunDir "native-sessionhandler-update") `
+            -EvidencePath $NativeUpdateEvidence `
+            -TimeoutSeconds $TimeoutSeconds
+        if ($LASTEXITCODE -ne 0) {
+            throw "smoke-native-sessionhandler-update exited with code $LASTEXITCODE"
+        }
+    }
 } catch {
     $runError = $_.Exception.Message
 } finally {
@@ -104,6 +115,7 @@ $report = [pscustomobject]@{
     error = $runError
     binary = $Binary
     smoke_evidence = $SmokeEvidence
+    native_update_evidence = $NativeUpdateEvidence
     results = $results
 }
 
@@ -116,6 +128,7 @@ $md = @(
     "**Runtime seconds:** $($report.runtime_seconds)",
     "**Binary:** $Binary",
     "**Smoke evidence:** $SmokeEvidence",
+    "**Native update evidence:** $NativeUpdateEvidence",
     "",
     "| Step | Verdict | Duration ms | Error |",
     "| --- | --- | ---: | --- |"

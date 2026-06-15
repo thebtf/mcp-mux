@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // fdConn abstracts over platform-specific FD transfer channels (Unix socket
@@ -69,7 +70,7 @@ func (d *Daemon) retireOldOwnerSockets(ipcPath, controlPath string) bool {
 		if path == "" {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := removeOwnerSocketWithRetry(path); err != nil {
 			retired = false
 			if d.logger != nil {
 				d.logger.Printf("handoff.retire_old_owner_socket_fail path=%s error=%v", path, err)
@@ -82,18 +83,30 @@ func (d *Daemon) retireOldOwnerSockets(ipcPath, controlPath string) bool {
 	return retired
 }
 
+func removeOwnerSocketWithRetry(path string) error {
+	var err error
+	for attempt := 0; attempt < 40; attempt++ {
+		err = os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return err
+}
+
 // performHandoff runs the old-daemon side of the two-daemon handoff protocol.
 // conn is the fdConn dialed/accepted by the caller; token is the pre-shared
 // authentication token (FR-11); upstreams is the list of owners to transfer.
 //
 // Protocol:
 //
-//	1. Wait for Hello msg from successor; verify version + token.
-//	2. Send Ready listing all upstreams.
-//	3. For each upstream: send FdTransfer + SendFDs; read AckTransfer.
-//	   Aborted if ok:false OR SendFDs side-channel error.
-//	4. Send Done with transferred/aborted split.
-//	5. Read HandoffAck from successor.
+//  1. Wait for Hello msg from successor; verify version + token.
+//  2. Send Ready listing all upstreams.
+//  3. For each upstream: send FdTransfer + SendFDs; read AckTransfer.
+//     Aborted if ok:false OR SendFDs side-channel error.
+//  4. Send Done with transferred/aborted split.
+//  5. Read HandoffAck from successor.
 //
 // Returns HandoffResult with per-upstream outcome. Total error only on
 // protocol-level failures (token reject, version mismatch, conn drop).

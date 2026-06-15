@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 // mockHandler implements CommandHandler for testing.
@@ -52,6 +55,37 @@ func testLogger(t *testing.T) *log.Logger {
 	t.Helper()
 	return log.New(os.Stderr, "[control-test] ", log.LstdFlags)
 }
+
+type fakeAddr string
+
+func (a fakeAddr) Network() string { return "fake" }
+func (a fakeAddr) String() string  { return string(a) }
+
+type acceptErrorListener struct {
+	mu      sync.Mutex
+	closed  bool
+	err     error
+	accepts int
+}
+
+func (l *acceptErrorListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.accepts++
+	if l.closed {
+		return nil, net.ErrClosed
+	}
+	return nil, l.err
+}
+
+func (l *acceptErrorListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closed = true
+	return nil
+}
+
+func (l *acceptErrorListener) Addr() net.Addr { return fakeAddr("accept-error-listener") }
 
 func TestPing(t *testing.T) {
 	path := testSocketPath(t)
@@ -322,6 +356,52 @@ func TestRefreshToken(t *testing.T) {
 	}
 }
 
+func TestAcceptLoopBacksOffAfterTransientAcceptError(t *testing.T) {
+	ln := &acceptErrorListener{err: errors.New("boom")}
+	var logs bytes.Buffer
+	srv := &Server{
+		listener: ln,
+		handler:  &mockHandler{},
+		logger:   log.New(&logs, "", 0),
+		done:     make(chan struct{}),
+	}
+
+	origSleep := sleepAfterAcceptError
+	t.Cleanup(func() { sleepAfterAcceptError = origSleep })
+	slept := make(chan time.Duration, 1)
+	sleepAfterAcceptError = func(d time.Duration) {
+		slept <- d
+		srv.mu.Lock()
+		srv.closed = true
+		srv.mu.Unlock()
+		_ = ln.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.acceptLoop()
+		close(done)
+	}()
+
+	select {
+	case got := <-slept:
+		if got != acceptErrorBackoff {
+			t.Fatalf("accept error backoff = %v, want %v", got, acceptErrorBackoff)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("acceptLoop did not back off after transient accept error")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("acceptLoop did not exit after listener close")
+	}
+	if !strings.Contains(logs.String(), "control: accept error: boom") {
+		t.Fatalf("missing accept error log, got %q", logs.String())
+	}
+}
+
 func TestRefreshTokenUnknownToken(t *testing.T) {
 	path := testSocketPath(t)
 	handler := &mockDaemonHandler{refreshErr: fmt.Errorf("wrapped: %w", errUnknownToken)}
@@ -548,7 +628,7 @@ func TestInvalidJSONRequest(t *testing.T) {
 	defer srv.Close()
 
 	// Connect raw and send garbage JSON
-	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	conn, err := ipc.DialTimeout(path, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -646,6 +726,20 @@ func TestCloseIdempotent(t *testing.T) {
 
 	srv.Close()
 	srv.Close() // second close must be a no-op, not a panic
+}
+
+func TestCloseRemovesSocketPath(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	srv.Close()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("socket path after Close: stat err = %v, want not exist", err)
+	}
 }
 
 type panicAcceptListener struct {
@@ -762,7 +856,7 @@ func TestControlServer_ReadDeadlineFiresOnSilentClient(t *testing.T) {
 
 	// Connect but never send anything — the server's handleConn goroutine must
 	// self-terminate via the read deadline rather than block indefinitely.
-	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	conn, err := ipc.DialTimeout(path, 5*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

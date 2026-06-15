@@ -275,6 +275,24 @@ operator docs.
 | Fixed replaceable engine path | The product has a current engine executable path that can be renamed while old processes continue from `*.old.<pid>`. | Build or copy the candidate to an explicit `StagedExe`, commonly `CurrentExe + "~"`, then call `ApplyUpdateAndRestart` with `CurrentExe` set to that replaceable engine path. |
 | Offline / custom supervisor | The product owns daemon lifecycle outside the standard engine helper. | Use `upgrade.Swap` only as the rename primitive. Your updater must still handle daemon namespace locking, graceful restart, shutdown fallback, daemon start, ready wait, and status reporting. |
 
+For the **stable launcher + versioned engine store** topology, do not swap the
+launcher. Update the active engine pointer first, then ask the currently-running
+daemon to restart with the intended successor executable:
+
+```go
+result, err := eng.RestartWithSuccessor(ctx, engine.RestartWithSuccessorOptions{
+    SuccessorExe:    nextEngineExe,
+    DrainTimeout:    30 * time.Second,
+    RestartTimeout:  60 * time.Second,
+    ShutdownTimeout: 10 * time.Second,
+    ReadyTimeout:    30 * time.Second,
+})
+```
+
+Existing shims wait briefly for the planned successor daemon before self-starting
+their own executable. This prevents a live predecessor shim from resurrecting
+the old binary during the successor's control-socket bind window.
+
 ### Apply Update and Restart
 
 Consumers using the **fixed replaceable engine path** topology should prefer
@@ -334,6 +352,11 @@ responses, classification, cwd/env metadata, reconnect-token history, and shim
 reconnection. Product-private in-memory state inside the handler survives only
 if the consumer persists it outside the daemon process or can reconstruct it in
 the successor.
+
+For a healthy SessionHandler hot update, the same open shim should reconnect by
+token refresh under the successor daemon: `shim_reconnect_refreshed` increments,
+`shim_reconnect_fallback_spawned` remains `0`, `shim_reconnect_gave_up` remains
+`0`, and `handoff.restored_owner_count` is non-zero when owners were present.
 
 ## What muxcore Enforces
 
@@ -431,7 +454,9 @@ Then run a customer-mode smoke through the same entrypoint your MCP host uses:
 4. If you ship an updater, run it while a session is active and confirm the
    next daemon uses the intended engine or successor path.
 5. Inspect `HandleStatus` / control-plane status for `daemon_generation`,
-   `owner_generation`, `restore_source`, and reconnect counters.
+   `owner_generation`, `restore_source`, `handoff.restored_owner_count`, and
+   reconnect counters. SessionHandler hot updates should show refresh-based
+   reconnect (`shim_reconnect_refreshed > 0`) without fallback spawn or give-up.
 6. Verify native muxcore products through their own MCP/CLI health and update
    surfaces. `mcp-mux serve` / `mux_list` observes the `mcp-mux` daemon
    namespace; it is not a generic registry for `aimux`, `engram`, or other

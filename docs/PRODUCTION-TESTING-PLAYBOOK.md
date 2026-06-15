@@ -224,6 +224,12 @@ Required consumer fixture:
 Commands:
 
 ```powershell
+# Repo fixture:
+.\scripts\smoke-native-sessionhandler-update.ps1 `
+  -RunDir .t\native-sessionhandler-update `
+  -TimeoutSeconds 120
+
+# Consumer/product equivalent:
 # 1. Start the old consumer through the same entrypoint an MCP host uses.
 # 2. Call the consumer's own health/status surface and save the old version
 #    plus daemon_generation/owner_generation.
@@ -239,9 +245,13 @@ Expected:
 - The update result reports whether it used graceful restart or fallback
   shutdown/start, and reports partial failure phase when it cannot complete.
 - The still-open session can make a successful post-update MCP request.
+- The still-open session reports the new product version/executable after
+  reconnect.
 - A fresh session reports the new product version.
 - `daemon_generation` changes, `engine_name` stays the consumer's engine name,
-  and reconnect counters show no `shim_reconnect_gave_up`.
+  and reconnect counters show `shim_reconnect_refreshed > 0`,
+  `shim_reconnect_fallback_spawned = 0`, and `shim_reconnect_gave_up = 0`.
+- `handoff.restored_owner_count` is non-zero when owners existed before update.
 - For `SessionHandler` products, product-private in-memory state is either
   durably restored by the consumer or explicitly documented as not preserved.
 
@@ -253,6 +263,8 @@ Forbidden signals:
   evidence.
 - Calling `ApplyUpdateAndRestart` against a stable launcher path when the real
   successor should come from a versioned engine pointer.
+- `shim_reconnect_fallback_spawned > 0` in the hot-update fixture unless the
+  consumer explicitly documents fallback spawn as its accepted recovery mode.
 
 ## Scenario 6: Isolated Owner Short Idle Cleanup (v0.25.0)
 

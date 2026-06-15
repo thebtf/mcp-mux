@@ -17,12 +17,15 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
-	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 var runResilientClient = owner.RunResilientClient
+
+var engineClientStartDaemon = func(e *MuxEngine) error {
+	return e.startDaemon()
+}
 
 // Internal timing defaults for the engine. Kept as named constants (not inline
 // literals) so the rationale is discoverable and future tuning has a single
@@ -48,6 +51,12 @@ const (
 	// It should not pay the upstream spawn/init budget because it only consults
 	// live owner session history and mints a token.
 	refreshRPCTimeout = 5 * time.Second
+
+	// reconnectDaemonWaitTimeout gives a planned restart successor a short
+	// window to bind the control socket before an existing shim self-starts
+	// its own executable. Without this grace window, old shims can resurrect
+	// the predecessor binary during snapshot-only SessionHandler restarts.
+	reconnectDaemonWaitTimeout = 2 * time.Second
 )
 
 // Mode is the runtime role of the engine selected by Run().
@@ -449,10 +458,8 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		jitter := time.Duration(os.Getpid()%500) * time.Millisecond
 		time.Sleep(jitter)
 
-		if !isDaemonRunning(ctlPath) {
-			if err := e.startDaemon(); err != nil {
-				return "", "", fmt.Errorf("engine client: refresh: start daemon: %w", err)
-			}
+		if err := e.ensureDaemonForReconnect(ctlPath, "refresh"); err != nil {
+			return "", "", err
 		}
 		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, e.logger)
 		if err != nil {
@@ -466,10 +473,8 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		jitter := time.Duration(os.Getpid()%500) * time.Millisecond
 		time.Sleep(jitter)
 
-		if !isDaemonRunning(ctlPath) {
-			if err := e.startDaemon(); err != nil {
-				return "", "", fmt.Errorf("engine client: reconnect: start daemon: %w", err)
-			}
+		if err := e.ensureDaemonForReconnect(ctlPath, "reconnect"); err != nil {
+			return "", "", err
 		}
 		newIPC, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", e.logger)
 		if err != nil {
@@ -492,6 +497,20 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		EnginePrefix:   e.cfg.Name,
 		Logger:         e.logger,
 	})
+}
+
+func (e *MuxEngine) ensureDaemonForReconnect(ctlPath, operation string) error {
+	if isDaemonRunning(ctlPath) {
+		return nil
+	}
+	if err := waitForDaemon(ctlPath, reconnectDaemonWaitTimeout); err == nil {
+		return nil
+	}
+	e.logger.Printf("engine client: daemon unavailable during %s after %s, starting...", operation, reconnectDaemonWaitTimeout)
+	if err := engineClientStartDaemon(e); err != nil {
+		return fmt.Errorf("engine client: %s: start daemon: %w", operation, err)
+	}
+	return nil
 }
 
 // runProxy runs the Handler directly on stdin/stdout (T025).
@@ -547,9 +566,11 @@ func (e *MuxEngine) startDaemon() error {
 	}
 
 	cmd := exec.Command(exe, e.cfg.DaemonFlag)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.Stdin = nil
+	closeStdio, err := attachDetachedStdio(cmd)
+	if err != nil {
+		return err
+	}
+	defer closeStdio()
 	setDetached(cmd)
 
 	if err := cmd.Start(); err != nil {
@@ -567,9 +588,6 @@ func (e *MuxEngine) startDaemon() error {
 
 // isDaemonRunning checks whether the daemon control socket responds to ping.
 func isDaemonRunning(ctlPath string) bool {
-	if !ipc.IsAvailable(ctlPath) {
-		return false
-	}
 	resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"})
 	return err == nil && resp.OK
 }

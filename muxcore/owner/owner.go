@@ -353,6 +353,10 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	if o.tokenHandshake {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
+	if len(snap.BoundTokens) > 0 {
+		imported := o.sessionMgr.ImportBoundHistory(boundTokenSnapshotsToSession(snap.BoundTokens))
+		logger.Printf("owner restored %d reconnect token history entries from snapshot", imported)
+	}
 
 	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
 	o.cacheHandlerInterfaces()
@@ -1768,6 +1772,15 @@ func (o *Owner) acceptLoop() {
 			time.Sleep(100 * time.Millisecond) // backoff to prevent CPU saturation
 			continue
 		}
+		select {
+		case <-o.done:
+			conn.Close()
+			return
+		case <-o.listenerDone:
+			conn.Close()
+			return
+		default:
+		}
 
 		var token string
 		var reader io.Reader = conn
@@ -2877,7 +2890,35 @@ func (o *Owner) ExportSnapshot() OwnerSnapshot {
 		snap.CachedResourceTemplates = base64Encode(o.resourceTemplateList)
 	}
 	o.mu.RUnlock()
+	for _, hist := range o.sessionMgr.ExportBoundHistory() {
+		snap.BoundTokens = append(snap.BoundTokens, snapshot.BoundTokenSnapshot{
+			Token:    hist.Token,
+			OwnerKey: hist.OwnerKey,
+			Cwd:      hist.Cwd,
+			Env:      hist.Env,
+			BoundAt:  hist.BoundAt,
+			LastUsed: hist.LastUsed,
+		})
+	}
 	return snap
+}
+
+func boundTokenSnapshotsToSession(entries []snapshot.BoundTokenSnapshot) []session.BoundHistorySnapshot {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]session.BoundHistorySnapshot, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, session.BoundHistorySnapshot{
+			Token:    entry.Token,
+			OwnerKey: entry.OwnerKey,
+			Cwd:      entry.Cwd,
+			Env:      entry.Env,
+			BoundAt:  entry.BoundAt,
+			LastUsed: entry.LastUsed,
+		})
+	}
+	return out
 }
 
 // ExportSessions returns snapshot metadata for all active sessions.

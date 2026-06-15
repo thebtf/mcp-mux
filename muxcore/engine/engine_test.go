@@ -444,6 +444,83 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	}
 }
 
+func TestRunClientReconnectWaitsForSuccessorBeforeSelfStart(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "er*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	name := "er-wait"
+	ctlPath := serverid.DaemonControlPath(baseDir, name)
+	handler := &runClientControlHandler{}
+	srv, err := control.NewServer(ctlPath, handler, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("start control server: %v", err)
+	}
+	defer srv.Close()
+
+	e, err := New(Config{
+		Name:    name,
+		Command: "test-command",
+		BaseDir: baseDir,
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+
+	origRunResilientClient := runResilientClient
+	origStartDaemon := engineClientStartDaemon
+	startDaemonCalls := 0
+	engineClientStartDaemon = func(*MuxEngine) error {
+		startDaemonCalls++
+		return errors.New("self-start should not run while successor is binding")
+	}
+	t.Cleanup(func() {
+		runResilientClient = origRunResilientClient
+		engineClientStartDaemon = origStartDaemon
+	})
+
+	stopErr := errors.New("stop after refresh")
+	runResilientClient = func(cfg owner.ResilientClientConfig) error {
+		srv.Close()
+
+		successorReady := make(chan struct{})
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			successor, err := control.NewServer(ctlPath, handler, log.New(io.Discard, "", 0))
+			if err != nil {
+				t.Errorf("start successor control server: %v", err)
+				close(successorReady)
+				return
+			}
+			t.Cleanup(func() { successor.Close() })
+			close(successorReady)
+		}()
+
+		path, token, err := cfg.RefreshToken()
+		if err != nil {
+			t.Fatalf("RefreshToken() error: %v", err)
+		}
+		if path != "ipc-initial" || token != "token-refreshed" {
+			t.Fatalf("RefreshToken() = (%q, %q), want (ipc-initial, token-refreshed)", path, token)
+		}
+		select {
+		case <-successorReady:
+		case <-time.After(time.Second):
+			t.Fatal("successor server did not start")
+		}
+		return stopErr
+	}
+
+	if err := e.runClient(context.Background()); !errors.Is(err, stopErr) {
+		t.Fatalf("runClient() error = %v, want %v", err, stopErr)
+	}
+	if startDaemonCalls != 0 {
+		t.Fatalf("startDaemon calls = %d, want 0", startDaemonCalls)
+	}
+}
+
 // TestNew_HandlerOnly verifies that New succeeds when only Handler is set
 // (no Command), which is the in-process mode configuration.
 func TestNew_HandlerOnly(t *testing.T) {
