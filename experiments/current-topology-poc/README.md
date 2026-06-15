@@ -26,10 +26,13 @@ Expected result:
 PASS current-topology PoC
 ```
 
-The runner uses `mcp-launcher` for MCP startup, tool calls, crash reconnect, and
-restart smoke. On Windows it uses a status-backed persist emulation because
-`mcp-launcher -mode persist` currently treats live processes as dead when
-`Process.Signal(0)` returns Windows `EWINDOWS`.
+The runner uses `mcp-launcher` for MCP startup and tool-call sessions. On
+Windows, lifecycle checks that need `-ctl` are emulated through the PoC's native
+control path because muxcore maps IPC paths to named pipes there; external
+helpers that dial the path as raw AF_UNIX cannot manage that control socket.
+The persist check also stays status-backed because `mcp-launcher -mode persist`
+currently treats live processes as dead when `Process.Signal(0)` returns
+Windows `EWINDOWS`.
 
 See `PHASES.md` for the current experiment ladder. Each phase adds one
 production-like mechanism and must keep the same runner green.

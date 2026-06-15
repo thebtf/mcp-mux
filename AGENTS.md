@@ -83,7 +83,20 @@ behavior.
 Use this helper only for the fixed replaceable engine path topology. If aimux
 or another consumer uses a stable launcher plus versioned engine store, update
 the active engine pointer and invoke graceful restart with the intended
-successor executable instead of passing the launcher path as `CurrentExe`.
+successor executable instead of passing the launcher path as `CurrentExe`:
+
+```go
+result, err := eng.RestartWithSuccessor(ctx, engine.RestartWithSuccessorOptions{
+    SuccessorExe:    nextEngineExe,
+    DrainTimeout:    30 * time.Second,
+    RestartTimeout:  60 * time.Second,
+    ShutdownTimeout: 10 * time.Second,
+    ReadyTimeout:    30 * time.Second,
+})
+```
+
+Use `ApplyUpdateAndRestart` only when `CurrentExe` is the replaceable engine
+binary that should exist after the swap:
 
 ```go
 result, err := eng.ApplyUpdateAndRestart(ctx, engine.UpdateAndRestartOptions{
@@ -106,6 +119,11 @@ preserves shim transport, owner/snapshot metadata, cached MCP discovery
 responses, classification, cwd/env metadata, reconnect-token history, and
 reconnect behavior. Product-private handler state must be persisted by the
 consumer or reconstructed by the successor daemon.
+
+Healthy SessionHandler hot-update evidence: same open session reports the new
+product executable/version, `daemon_generation` changes,
+`handoff.restored_owner_count > 0`, `shim_reconnect_refreshed > 0`,
+`shim_reconnect_fallback_spawned == 0`, and `shim_reconnect_gave_up == 0`.
 
 **Tests landed in this release:**
 - `TestApplyUpdateAndRestart_GracefulSuccessUsesSuccessorExe`

@@ -31,6 +31,17 @@ type boundHistory struct {
 	LastUsed time.Time
 }
 
+// BoundHistorySnapshot is the serializable subset of consumed-token history
+// needed to refresh reconnecting shims after daemon restart.
+type BoundHistorySnapshot struct {
+	Token    string
+	OwnerKey string
+	Cwd      string
+	Env      map[string]string
+	BoundAt  time.Time
+	LastUsed time.Time
+}
+
 // pendingTokenTTL is the maximum time a pre-registered token lives before
 // being swept. Must be long enough to cover slow CC startup + daemon spawn
 // + shim dial, but short enough to prevent memory leaks from orphan spawns.
@@ -69,6 +80,73 @@ func NewManager() *Manager {
 		bound:      make(map[string]*boundHistory),
 		lastActive: make(map[int]time.Time),
 	}
+}
+
+// ExportBoundHistory returns non-expired consumed-token history entries for
+// snapshot restore. Pending tokens and inflight request maps are deliberately
+// not exported; reconnect only needs the previous consumed token.
+func (sm *Manager) ExportBoundHistory() []BoundHistorySnapshot {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	now := time.Now()
+	entries := make([]BoundHistorySnapshot, 0, len(sm.bound))
+	for token, hist := range sm.bound {
+		if hist == nil || token == "" || hist.OwnerKey == "" {
+			continue
+		}
+		if now.Sub(hist.LastUsed) > boundTokenTTL {
+			continue
+		}
+		entries = append(entries, BoundHistorySnapshot{
+			Token:    token,
+			OwnerKey: hist.OwnerKey,
+			Cwd:      hist.Cwd,
+			Env:      cloneEnv(hist.Env),
+			BoundAt:  hist.BoundAt,
+			LastUsed: hist.LastUsed,
+		})
+	}
+	return entries
+}
+
+// ImportBoundHistory restores consumed-token history from a daemon snapshot.
+// Expired or malformed entries are ignored.
+func (sm *Manager) ImportBoundHistory(entries []BoundHistorySnapshot) int {
+	if len(entries) == 0 {
+		return 0
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	now := time.Now()
+	imported := 0
+	for _, entry := range entries {
+		if entry.Token == "" || entry.OwnerKey == "" {
+			continue
+		}
+		lastUsed := entry.LastUsed
+		if lastUsed.IsZero() {
+			lastUsed = entry.BoundAt
+		}
+		if lastUsed.IsZero() || now.Sub(lastUsed) > boundTokenTTL {
+			continue
+		}
+		boundAt := entry.BoundAt
+		if boundAt.IsZero() {
+			boundAt = lastUsed
+		}
+		sm.bound[entry.Token] = &boundHistory{
+			OwnerKey: entry.OwnerKey,
+			Cwd:      entry.Cwd,
+			Env:      cloneEnv(entry.Env),
+			BoundAt:  boundAt,
+			LastUsed: lastUsed,
+		}
+		imported++
+	}
+	return imported
 }
 
 // RegisterSession adds a session with its working directory to the manager.

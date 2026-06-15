@@ -267,9 +267,12 @@ func (d *Daemon) loadSnapshot() int {
 			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 		}
 
-		// During handoff, predecessor's owner sockets may still be active.
-		// Unconditionally remove them — predecessor is shutting down (#101).
-		if isHandoffMode() {
+		// During restart restore, predecessor's owner sockets may still be
+		// active. Unconditionally remove them — predecessor is shutting down
+		// (#101). Snapshot-only SessionHandler restart needs the same path as
+		// FD handoff because there is no upstream process to keep the socket
+		// alive across daemons.
+		if isRestartRestoreMode() {
 			d.retireOldOwnerSockets(ipcPath, controlPath)
 		}
 
@@ -386,6 +389,32 @@ func (d *Daemon) loadSnapshot() int {
 	d.runRestoreHealthGate()
 
 	return restored
+}
+
+func (d *Daemon) loadSnapshotMetadataOnly(reason string) int {
+	snap, err := DeserializeSnapshot(d.logger)
+	if err != nil {
+		d.logger.Printf("snapshot load error: %v", err)
+		return 0
+	}
+	if snap == nil {
+		return 0
+	}
+
+	d.mu.Lock()
+	d.predecessorPID = snap.PredecessorPID
+	d.predecessorDaemonGeneration = snap.DaemonGeneration
+	d.mu.Unlock()
+
+	for _, ownerSnap := range snap.Owners {
+		if ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
+			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
+		}
+		d.rehydrateRetryCounter(ownerSnap.ServerID, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)
+	}
+
+	d.logger.Printf("snapshot: deferred restore of %d owners (%s)", len(snap.Owners), reason)
+	return len(snap.Owners)
 }
 
 // restoreHealthGateWindow is the time we allow newly-restored owners to fully

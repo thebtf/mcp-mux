@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 // resilientTestLogger returns a logger writing to stderr for resilient client tests.
@@ -51,7 +53,7 @@ func startEchoIPCServer(t *testing.T, path string) (srv *echoServer, received ch
 	t.Helper()
 	received = make(chan string, 100)
 
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
 		t.Fatalf("listen %s: %v", path, err)
 	}
@@ -73,7 +75,7 @@ func startEchoIPCServer(t *testing.T, path string) (srv *echoServer, received ch
 
 	t.Cleanup(func() {
 		srv.closeAll()
-		os.Remove(path)
+		ipc.Cleanup(path)
 	})
 
 	return srv, received
@@ -136,8 +138,8 @@ func newTestIPCPath(t *testing.T) string {
 	}
 	path := f.Name()
 	f.Close()
-	os.Remove(path)
-	t.Cleanup(func() { os.Remove(path) })
+	ipc.Cleanup(path)
+	t.Cleanup(func() { ipc.Cleanup(path) })
 	return path
 }
 

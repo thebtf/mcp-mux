@@ -13,7 +13,6 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
-	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/rotlog"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
@@ -241,9 +240,6 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 
 // isDaemonRunning checks if the daemon control socket responds to ping.
 func isDaemonRunning(ctlPath string) bool {
-	if !ipc.IsAvailable(ctlPath) {
-		return false
-	}
 	resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"})
 	if err != nil {
 		return false

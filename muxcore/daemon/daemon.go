@@ -36,6 +36,12 @@ import (
 // FR-6 retry pattern that replaced the old recursive d.Spawn(req) calls.
 var errSpawnRetry = errors.New("spawn: retry requested")
 
+var errNoHandoffUpstreams = errors.New("no process-backed owners to hand off")
+
+const snapshotRestartEnv = "MCPMUX_SNAPSHOT_RESTART"
+
+var spawnSnapshotSuccessorForRestart = spawnSnapshotSuccessor
+
 // ErrUnknownToken indicates that the daemon does not recognize a reconnect
 // token presented through the refresh-token control-plane path.
 var ErrUnknownToken = errors.New("unknown token")
@@ -429,19 +435,26 @@ func New(cfg Config) (*Daemon, error) {
 		EventHook: d.supervisorEventHook,
 	})
 
-	// In handoff mode (successor during graceful restart), loadSnapshot must run
-	// BEFORE binding the control socket — the predecessor still holds it.
-	// After tryHandoffReceive completes, the predecessor starts Shutdown() which
-	// releases the socket. retryControlBind polls until it becomes available.
-	if isHandoffMode() && !cfg.SkipSnapshot {
+	// In restart-restore mode (successor during graceful restart), loadSnapshot
+	// must run BEFORE binding the control socket: the predecessor still holds it.
+	// Process-backed handoff also receives transferred FDs. Snapshot-only
+	// SessionHandler restart has no FDs to preserve, but still restores owners
+	// here so existing shims can refresh their reconnect tokens instead of
+	// falling back to a cold spawn under the successor daemon.
+	if isRestartRestoreMode() && !cfg.SkipSnapshot {
+		waitBeforeSnapshotRestartControlBind(logger)
+		modeLabel := "handoff mode"
+		if isSnapshotRestartMode() && !isHandoffMode() {
+			modeLabel = "snapshot restart mode"
+		}
 		if restored := d.loadSnapshot(); restored > 0 {
-			logger.Printf("startup: restored %d owners from snapshot (handoff mode)", restored)
+			logger.Printf("startup: restored %d owners from snapshot (%s)", restored, modeLabel)
 		}
 		if err := d.retryControlBind(cfg.ControlPath); err != nil {
 			supCancel()
 			return nil, fmt.Errorf("daemon: %w", err)
 		}
-		logger.Printf("daemon started, control socket: %s (handoff mode)", cfg.ControlPath)
+		logger.Printf("daemon started, control socket: %s (%s)", cfg.ControlPath, modeLabel)
 	} else {
 		ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
 		if err != nil {
@@ -1361,12 +1374,35 @@ var controlBindRetryInterval = 500 * time.Millisecond
 // socket. Declared as var so tests can override it.
 var controlBindMaxAttempts = 60
 
+// snapshotRestartControlBindDelay gives the predecessor process a short window
+// to fully release Windows AF_UNIX socket reparse points before the snapshot
+// successor starts touching the fixed daemon control path.
+var snapshotRestartControlBindDelay = 1 * time.Second
+
 // isHandoffMode reports whether this process was launched as a successor daemon
 // during a graceful restart. Both env vars must be present for the handoff
 // protocol to proceed.
 func isHandoffMode() bool {
 	return os.Getenv("MCPMUX_HANDOFF_TOKEN_PATH") != "" &&
 		os.Getenv("MCPMUX_HANDOFF_SOCKET") != ""
+}
+
+func isSnapshotRestartMode() bool {
+	return os.Getenv(snapshotRestartEnv) == "1"
+}
+
+func isRestartRestoreMode() bool {
+	return isHandoffMode() || isSnapshotRestartMode()
+}
+
+func waitBeforeSnapshotRestartControlBind(logger *log.Logger) {
+	if !isSnapshotRestartMode() || isHandoffMode() || snapshotRestartControlBindDelay <= 0 {
+		return
+	}
+	if logger != nil {
+		logger.Printf("snapshot_restart.control_bind_delay delay=%s", snapshotRestartControlBindDelay)
+	}
+	time.Sleep(snapshotRestartControlBindDelay)
 }
 
 // retryControlBind polls for the control socket to become available and binds
@@ -1385,7 +1421,9 @@ func (d *Daemon) retryControlBind(socketPath string) error {
 			return nil
 		}
 		if i == 0 {
-			d.logger.Printf("handoff.control_bind_wait predecessor still holds socket, retrying...")
+			d.logger.Printf("handoff.control_bind_wait predecessor still holds socket, retrying: %v", err)
+		} else if (i+1)%10 == 0 {
+			d.logger.Printf("handoff.control_bind_retry attempt=%d err=%v", i+1, err)
 		}
 		time.Sleep(controlBindRetryInterval)
 	}
@@ -1418,6 +1456,26 @@ func spawnSuccessor(tokenPath, socketPath, daemonFlag, successorExe string) erro
 	}
 	if err := cmd.Process.Release(); err != nil {
 		return fmt.Errorf("handoff: release successor: %w", err)
+	}
+	return nil
+}
+
+func spawnSnapshotSuccessor(successorExe, daemonFlag string) error {
+	exe, err := successorExecutableFor(successorExe)
+	if err != nil {
+		return fmt.Errorf("snapshot restart: resolve executable: %w", err)
+	}
+	cmd := exec.Command(exe, daemonFlag)
+	cmd.Env = append(os.Environ(), snapshotRestartEnv+"=1")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Stdin = nil
+	setSuccessorDetached(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("snapshot restart: spawn successor: %w", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		return fmt.Errorf("snapshot restart: release successor: %w", err)
 	}
 	return nil
 }
@@ -1481,6 +1539,24 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 	return upstreams
 }
 
+func (d *Daemon) hasHandoffUpstreamOwners() bool {
+	d.mu.RLock()
+	owners := make([]*owner.Owner, 0, len(d.owners))
+	for _, e := range d.owners {
+		if e.Owner != nil {
+			owners = append(owners, e.Owner)
+		}
+	}
+	d.mu.RUnlock()
+
+	for _, o := range owners {
+		if o.HasHandoffUpstream() {
+			return true
+		}
+	}
+	return false
+}
+
 // attemptHandoff runs the old-daemon side of the two-daemon handoff protocol.
 // Returns nil if the protocol completed (transferred or FR-7 per-upstream abort).
 // Returns non-nil on any protocol-level failure — the caller logs "handoff.fallback"
@@ -1498,6 +1574,10 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 	d.stats.attempted.Add(1)
 	startedAt := time.Now()
 	baseDir := os.TempDir()
+
+	if !d.hasHandoffUpstreamOwners() {
+		return errNoHandoffUpstreams
+	}
 
 	// Write handoff token (FR-11). Token is deleted via defer on both paths.
 	token, tokenPath, err := writeHandoffToken(baseDir)
@@ -1589,6 +1669,9 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), erro
 // HandleGracefulRestartWithOptions implements control.GracefulRestartOptionsHandler.
 func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOptions) (string, func(), error) {
 	d.shuttingDown.Store(true)
+	if successorExe := strings.TrimSpace(opts.SuccessorExe); successorExe != "" {
+		d.logger.Printf("graceful-restart: successor_exe=%q", successorExe)
+	}
 
 	// Serialize snapshot first — needed for FR-8 fallback and successor seed
 	// regardless of whether handoff succeeds.
@@ -1614,9 +1697,27 @@ func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOp
 	if handoffErr := d.attemptHandoff(opts.SuccessorExe); handoffErr != nil {
 		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
+		if errors.Is(handoffErr, errNoHandoffUpstreams) {
+			return snapshotPath, d.afterSnapshotOnlyRestart(opts.SuccessorExe), nil
+		}
 	}
 
 	return snapshotPath, func() { go d.Shutdown() }, nil
+}
+
+func (d *Daemon) afterSnapshotOnlyRestart(successorExe string) func() {
+	return func() {
+		go func() {
+			d.shutdown(func() {
+				d.logger.Printf("snapshot_restart.spawn_successor exe=%q flag=%q", successorExe, d.daemonFlag)
+				if err := spawnSnapshotSuccessorForRestart(successorExe, d.daemonFlag); err != nil {
+					d.logger.Printf("snapshot_restart.successor_spawn_failed reason=no_process_backed_owners err=%v", err)
+					return
+				}
+				d.logger.Printf("snapshot_restart.successor_spawned reason=no_process_backed_owners")
+			})
+		}()
+	}
 }
 
 // HandleRefreshSessionToken implements control.DaemonHandler.
@@ -2328,6 +2429,10 @@ func envTransient(key string) bool {
 
 // Shutdown gracefully stops all owners and the daemon.
 func (d *Daemon) Shutdown() {
+	d.shutdown(nil)
+}
+
+func (d *Daemon) shutdown(beforeDone func()) {
 	d.shutdownOnce.Do(func() {
 		d.shuttingDown.Store(true)
 		d.logger.Printf("daemon shutting down...")
@@ -2365,6 +2470,10 @@ func (d *Daemon) Shutdown() {
 			if e.Owner != nil {
 				e.Owner.Shutdown()
 			}
+		}
+
+		if beforeDone != nil {
+			beforeDone()
 		}
 
 		d.logger.Printf("daemon stopped (%d owners shut down)", len(entries))

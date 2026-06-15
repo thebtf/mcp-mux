@@ -341,9 +341,12 @@ go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
 4. Graceful restart: daemon serializes state snapshot (cached init/tools/prompts/resources
    responses, classification, session metadata) to a JSON file
 5. Daemon shuts down, shims detect IPC EOF
-6. Shims auto-reconnect, starting a new daemon from the active versioned engine
-7. New daemon loads snapshot → owners restored with pre-populated caches
-8. Shims get instant cached replay (~1 second reconnect vs 5-15 second cold start)
+6. Shims auto-reconnect and first wait briefly for the planned successor daemon
+   instead of immediately self-starting their current executable.
+7. New daemon loads snapshot → owners restored with pre-populated caches and
+   reconnect-token history.
+8. Shims refresh their reconnect tokens and resume against the successor engine
+   (~1 second reconnect vs 5-15 second cold start)
 
 The launcher indirection is intentional on Windows: live `mcp-mux.exe` shim and daemon
 processes keep the executable image locked, so a self-rename of the configured binary is
@@ -365,6 +368,8 @@ active engine. The daemon updates on next natural restart.
 - Cached MCP responses (init, tools, prompts, resources)
 - Server classification (shared/isolated/session-aware)
 - Session metadata (cwd, env)
+- Reconnect-token history, so live shims can refresh without fallback-spawning
+  an owner during planned restart.
 
 **Only the daemon restarts** — upstreams are reattached via FD passing (Unix SCM_RIGHTS, Windows DuplicateHandle). See the next section for the lifecycle contract.
 

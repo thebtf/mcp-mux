@@ -217,6 +217,68 @@ function Convert-McpResponseLine {
     }
 }
 
+function ConvertFrom-SmokeStatusJson {
+    param(
+        [string]$Text,
+        [string]$Label
+    )
+
+    $trimmed = if ($null -eq $Text) { "" } else { $Text.Trim() }
+    if (-not ($trimmed.StartsWith("{") -or $trimmed.StartsWith("["))) {
+        throw "$Label returned non-JSON status: $trimmed"
+    }
+    try {
+        return $trimmed | ConvertFrom-Json
+    } catch {
+        throw "$Label returned malformed JSON status: $($_.Exception.Message); stdout=$trimmed"
+    }
+}
+
+function Get-SmokeStatusOwners {
+    param([object]$Status)
+
+    if ($Status -is [array]) {
+        return @($Status)
+    }
+    if ($null -ne $Status.servers) {
+        return @($Status.servers)
+    }
+    return @()
+}
+
+function Wait-SmokeStatusWithOwners {
+    param(
+        [string]$FileName,
+        [int]$TimeoutMs
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $lastError = ""
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $status = Invoke-SmokeNative -FileName $FileName -Arguments @("status") -TimeoutMs 10000
+        if ($status.exit_code -ne 0) {
+            $lastError = "status exited with code $($status.exit_code): $($status.stderr)"
+        } else {
+            try {
+                $parsed = ConvertFrom-SmokeStatusJson -Text $status.stdout -Label "status after reconnect"
+                if ((Get-SmokeStatusOwners -Status $parsed).Count -gt 0) {
+                    return [pscustomobject]@{
+                        parsed = $parsed
+                        stdout = $status.stdout
+                        stderr = $status.stderr
+                    }
+                }
+                $lastError = "status returned JSON without owners: $($status.stdout)"
+            } catch {
+                $lastError = $_.Exception.Message
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "status after reconnect did not report an owner within $TimeoutMs ms: $lastError"
+}
+
 function Read-StdoutLine {
     param(
         [System.Diagnostics.Process]$Process,
@@ -487,7 +549,7 @@ try {
     if ($statusBefore.exit_code -ne 0) {
         throw "status before reconnect failed: $($statusBefore.stderr)"
     }
-    $evidence.status_before_reconnect = $statusBefore.stdout | ConvertFrom-Json
+    $evidence.status_before_reconnect = ConvertFrom-SmokeStatusJson -Text $statusBefore.stdout -Label "status before reconnect"
 
     $stopResult = Invoke-SmokeNative -FileName $ResolvedBinary -Arguments @("stop", "--force") -TimeoutMs 15000
     $evidence.reconnect_probe = [ordered]@{
@@ -498,6 +560,8 @@ try {
     if ($stopResult.exit_code -ne 0) {
         throw "isolated stop --force failed: $($stopResult.stderr)"
     }
+
+    Start-Sleep -Milliseconds 750
 
     Send-McpLine -Process $process -Request @{
         jsonrpc = "2.0"
@@ -514,11 +578,8 @@ try {
     }
 
     Start-Sleep -Milliseconds 300
-    $statusAfter = Invoke-SmokeNative -FileName $ResolvedBinary -Arguments @("status") -TimeoutMs 10000
-    if ($statusAfter.exit_code -ne 0) {
-        throw "status after reconnect failed: $($statusAfter.stderr)"
-    }
-    $evidence.status_after_reconnect = $statusAfter.stdout | ConvertFrom-Json
+    $statusAfter = Wait-SmokeStatusWithOwners -FileName $ResolvedBinary -TimeoutMs 10000
+    $evidence.status_after_reconnect = $statusAfter.parsed
 
     Drain-Stdout -Process $process -Observed $observedStdout
     $stderrText = Stop-SmokeProcess -Process $process -StderrTask $stderrTask

@@ -1,9 +1,10 @@
 package owner
 
 import (
-	"net"
 	"strings"
 	"testing"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 // TestIsReachable_LiveListener verifies the happy path: a freshly-bound
@@ -13,9 +14,9 @@ func TestIsReachable_LiveListener(t *testing.T) {
 	o := newMinimalOwner()
 	o.ipcPath = path
 
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
+		t.Fatalf("ipc.Listen: %v", err)
 	}
 	defer ln.Close()
 	o.listener = ln
@@ -46,9 +47,9 @@ func TestIsReachable_ExplicitClose(t *testing.T) {
 	o := newMinimalOwner()
 	o.ipcPath = path
 
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
+		t.Fatalf("ipc.Listen: %v", err)
 	}
 	o.listener = ln
 
@@ -79,9 +80,9 @@ func TestIsReachable_ZombieListener(t *testing.T) {
 	o := newMinimalOwner()
 	o.ipcPath = path
 
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
-		t.Fatalf("net.Listen: %v", err)
+		t.Fatalf("ipc.Listen: %v", err)
 	}
 	o.listener = ln
 

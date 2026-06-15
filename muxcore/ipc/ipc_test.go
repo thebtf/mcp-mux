@@ -1,11 +1,14 @@
 package ipc
 
 import (
+	"errors"
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func socketPath(t *testing.T) string {
@@ -50,34 +53,48 @@ func TestListenAndDial(t *testing.T) {
 	server := <-accepted
 	defer server.Close()
 
-	// Send data client → server
-	_, err = client.Write([]byte("hello\n"))
-	if err != nil {
+	// Named-pipe writes on Windows can wait until the peer has posted a read,
+	// so arrange the read side before writing in each direction.
+	serverRead := make(chan readResult, 1)
+	go readOnce(server, serverRead)
+	if _, err := client.Write([]byte("hello\n")); err != nil {
 		t.Fatalf("client.Write() error: %v", err)
 	}
-
-	buf := make([]byte, 100)
-	n, err := server.Read(buf)
-	if err != nil {
-		t.Fatalf("server.Read() error: %v", err)
+	got := <-serverRead
+	if got.err != nil {
+		t.Fatalf("server.Read() error: %v", got.err)
 	}
-	if string(buf[:n]) != "hello\n" {
-		t.Errorf("server received %q, want 'hello\\n'", string(buf[:n]))
+	if got.data != "hello\n" {
+		t.Errorf("server received %q, want 'hello\\n'", got.data)
 	}
 
-	// Send data server → client
-	_, err = server.Write([]byte("world\n"))
-	if err != nil {
+	clientRead := make(chan readResult, 1)
+	go readOnce(client, clientRead)
+	if _, err := server.Write([]byte("world\n")); err != nil {
 		t.Fatalf("server.Write() error: %v", err)
 	}
+	got = <-clientRead
+	if got.err != nil {
+		t.Fatalf("client.Read() error: %v", got.err)
+	}
+	if got.data != "world\n" {
+		t.Errorf("client received %q, want 'world\\n'", got.data)
+	}
+}
 
-	n, err = client.Read(buf)
+type readResult struct {
+	data string
+	err  error
+}
+
+func readOnce(conn net.Conn, out chan<- readResult) {
+	buf := make([]byte, 100)
+	n, err := conn.Read(buf)
 	if err != nil {
-		t.Fatalf("client.Read() error: %v", err)
+		out <- readResult{err: err}
+		return
 	}
-	if string(buf[:n]) != "world\n" {
-		t.Errorf("client received %q, want 'world\\n'", string(buf[:n]))
-	}
+	out <- readResult{data: string(buf[:n])}
 }
 
 func TestIsAvailable(t *testing.T) {
@@ -283,3 +300,145 @@ func TestListen_SucceedsOnStalePath(t *testing.T) {
 	ln.Close()
 }
 
+func TestListen_RetriesTransientStaleRemoveFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows IPC uses named pipes without stale socket files")
+	}
+	path := socketPath(t)
+
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+
+	origRemove := removeSocketFile
+	origRename := renameSocketFile
+	origSleep := sleepBeforeRemoveRetry
+	origAttempts := staleSocketRemoveAttempts
+	origDelay := staleSocketRemoveDelay
+	t.Cleanup(func() {
+		removeSocketFile = origRemove
+		renameSocketFile = origRename
+		sleepBeforeRemoveRetry = origSleep
+		staleSocketRemoveAttempts = origAttempts
+		staleSocketRemoveDelay = origDelay
+	})
+
+	removeErr := errors.New("Access is denied.")
+	calls := 0
+	removeSocketFile = func(p string) error {
+		calls++
+		if calls < 3 {
+			return removeErr
+		}
+		return origRemove(p)
+	}
+	sleepBeforeRemoveRetry = func(time.Duration) {}
+	staleSocketRemoveAttempts = 5
+	staleSocketRemoveDelay = time.Millisecond
+
+	ln, err := Listen(path)
+	if err != nil {
+		t.Fatalf("Listen() after transient stale remove failures error: %v", err)
+	}
+	ln.Close()
+
+	if calls != 3 {
+		t.Fatalf("remove calls = %d, want 3", calls)
+	}
+}
+
+func TestListen_RetiresStaleSocketWhenRemoveDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows IPC uses named pipes without stale socket files")
+	}
+	path := socketPath(t)
+
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+
+	origRemove := removeSocketFile
+	origRename := renameSocketFile
+	origSleep := sleepBeforeRemoveRetry
+	origAttempts := staleSocketRemoveAttempts
+	origDelay := staleSocketRemoveDelay
+	t.Cleanup(func() {
+		removeSocketFile = origRemove
+		renameSocketFile = origRename
+		sleepBeforeRemoveRetry = origSleep
+		staleSocketRemoveAttempts = origAttempts
+		staleSocketRemoveDelay = origDelay
+	})
+
+	removeErr := errors.New("Access is denied.")
+	removeCalls := 0
+	removeSocketFile = func(p string) error {
+		removeCalls++
+		if p == path {
+			return removeErr
+		}
+		return origRemove(p)
+	}
+	sleepBeforeRemoveRetry = func(time.Duration) {}
+	staleSocketRemoveAttempts = 3
+	staleSocketRemoveDelay = time.Millisecond
+
+	ln, err := Listen(path)
+	if err != nil {
+		t.Fatalf("Listen() after retire fallback error: %v", err)
+	}
+	ln.Close()
+
+	if removeCalls < 2 {
+		t.Fatalf("remove calls = %d, want at least original + retired cleanup", removeCalls)
+	}
+}
+
+func TestListen_BoundsPersistentStaleRemoveFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows IPC uses named pipes without stale socket files")
+	}
+	path := socketPath(t)
+
+	if err := os.WriteFile(path, []byte{}, 0600); err != nil {
+		t.Fatalf("WriteFile stale: %v", err)
+	}
+
+	origRemove := removeSocketFile
+	origRename := renameSocketFile
+	origSleep := sleepBeforeRemoveRetry
+	origAttempts := staleSocketRemoveAttempts
+	origDelay := staleSocketRemoveDelay
+	t.Cleanup(func() {
+		removeSocketFile = origRemove
+		renameSocketFile = origRename
+		sleepBeforeRemoveRetry = origSleep
+		staleSocketRemoveAttempts = origAttempts
+		staleSocketRemoveDelay = origDelay
+	})
+
+	removeErr := errors.New("Access is denied.")
+	calls := 0
+	removeSocketFile = func(string) error {
+		calls++
+		return removeErr
+	}
+	renameSocketFile = func(string, string) error {
+		return removeErr
+	}
+	sleepBeforeRemoveRetry = func(time.Duration) {}
+	staleSocketRemoveAttempts = 3
+	staleSocketRemoveDelay = time.Millisecond
+
+	ln, err := Listen(path)
+	if err == nil {
+		ln.Close()
+		t.Fatal("Listen() expected persistent stale remove error, got nil")
+	}
+	if !strings.Contains(err.Error(), "remove stale socket") {
+		t.Fatalf("expected stale remove error, got: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("remove calls = %d, want 3", calls)
+	}
+}

@@ -3,15 +3,16 @@ package control
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 const clientDeadline = 5 * time.Second
 
 // Send connects to the control socket, sends a Request, reads one Response, and closes.
 func Send(socketPath string, req Request) (*Response, error) {
-	conn, err := net.DialTimeout("unix", socketPath, clientDeadline)
+	conn, err := ipc.DialTimeout(socketPath, clientDeadline)
 	if err != nil {
 		return nil, fmt.Errorf("control: dial %s: %w", socketPath, err)
 	}
@@ -48,7 +49,7 @@ func SendWithTimeout(socketPath string, req Request, timeout time.Duration) (*Re
 	if timeout > 0 && timeout < dialTimeout {
 		dialTimeout = timeout
 	}
-	conn, err := net.DialTimeout("unix", socketPath, dialTimeout)
+	conn, err := ipc.DialTimeout(socketPath, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("control: dial %s: %w", socketPath, err)
 	}

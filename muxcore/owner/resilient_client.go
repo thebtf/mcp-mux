@@ -438,8 +438,10 @@ type reconnectResult struct {
 // cfg.Reconnect every 500ms asynchronously, and buffers new CC stdin traffic
 // via msgFromCC.
 //
-// On success: dials new IPC, replays cached initialize, flushes buffered
-// CC messages, and returns the new connection.
+// On success: dials new IPC, replays cached initialize, and returns the new
+// connection. Buffered CC messages remain in msgFromCC; the CONNECTED state's
+// normal IPC writer drains them after the IPC reader is running, which avoids
+// half-duplex deadlocks on Windows named pipes.
 //
 // Returns error on: reconnect timeout, or CC stdin EOF during reconnect.
 //
@@ -576,7 +578,6 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 		return nil, "handshake", err
 	}
 
-	rc.flushBuffer(conn)
 	rc.sendListChangedNotifications(stdoutMu)
 	return conn, "", nil
 }

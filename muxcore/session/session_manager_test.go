@@ -296,6 +296,51 @@ func TestLookupHistory_AfterBind(t *testing.T) {
 	}
 }
 
+func TestBoundHistorySnapshotRoundTrip(t *testing.T) {
+	sm := NewManager()
+	s := &Session{ID: 9}
+	sm.RegisterSession(s, "")
+	env := map[string]string{"TOKEN": "value"}
+	sm.PreRegisterForOwner("tok-snapshot", "owner-snapshot", "/project/snapshot", env)
+	if ok := sm.Bind("tok-snapshot", "owner-snapshot", s); !ok {
+		t.Fatal("Bind returned false")
+	}
+
+	exported := sm.ExportBoundHistory()
+	if len(exported) != 1 {
+		t.Fatalf("ExportBoundHistory() len = %d, want 1", len(exported))
+	}
+	env["TOKEN"] = "mutated"
+
+	restored := NewManager()
+	if imported := restored.ImportBoundHistory(exported); imported != 1 {
+		t.Fatalf("ImportBoundHistory() = %d, want 1", imported)
+	}
+	exported[0].Env["TOKEN"] = "export-mutated"
+
+	newToken, err := restored.RegisterReconnect("tok-snapshot", func(key string) bool {
+		return key == "owner-snapshot"
+	})
+	if err != nil {
+		t.Fatalf("RegisterReconnect() after import error = %v", err)
+	}
+	if newToken == "" || newToken == "tok-snapshot" {
+		t.Fatalf("newToken = %q, want distinct non-empty token", newToken)
+	}
+
+	reconnected := &Session{ID: 10}
+	restored.RegisterSession(reconnected, "")
+	if ok := restored.Bind(newToken, "owner-snapshot", reconnected); !ok {
+		t.Fatal("Bind on refreshed token returned false")
+	}
+	if reconnected.Cwd != "/project/snapshot" {
+		t.Fatalf("reconnected Cwd = %q, want /project/snapshot", reconnected.Cwd)
+	}
+	if reconnected.Env["TOKEN"] != "value" {
+		t.Fatalf("reconnected Env[TOKEN] = %q, want value", reconnected.Env["TOKEN"])
+	}
+}
+
 func TestRegisterReconnect_NewTokenFresh(t *testing.T) {
 	sm := NewManager()
 	s := &Session{ID: 10}

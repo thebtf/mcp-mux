@@ -59,6 +59,136 @@ func testDaemonWithLog(t *testing.T) (*Daemon, *syncBuffer) {
 	return d, buf
 }
 
+func TestLoadSnapshotMetadataOnlyConsumesWithoutRestoringOwners(t *testing.T) {
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { os.Remove(SnapshotPath()) })
+
+	sid := "metadata-only-sessionhandler-owner"
+	snapshot := DaemonSnapshot{
+		Version:          mcpsnapshot.SnapshotVersion,
+		Timestamp:        time.Now().UTC().Format(time.RFC3339),
+		DaemonGeneration: "daemon_previous",
+		PredecessorPID:   4242,
+		Owners: []mcpsnapshot.OwnerSnapshot{
+			{
+				ServerID:       sid,
+				Command:        "",
+				Args:           nil,
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeSessionAware,
+				CachedInit:     "e30=",
+				CachedTools:    "e30=",
+			},
+		},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+
+	d, logBuf := testDaemonWithLog(t)
+	deferred := d.loadSnapshotMetadataOnly("test")
+	if deferred != 1 {
+		t.Fatalf("loadSnapshotMetadataOnly() = %d, want 1", deferred)
+	}
+	if _, err := os.Stat(SnapshotPath()); !os.IsNotExist(err) {
+		t.Fatalf("snapshot file still exists after metadata-only load: %v", err)
+	}
+	if entry := d.Entry(sid); entry != nil {
+		t.Fatalf("metadata-only load restored owner entry: %+v", entry)
+	}
+	if d.predecessorPID != 4242 {
+		t.Fatalf("predecessorPID = %d, want 4242", d.predecessorPID)
+	}
+	if d.predecessorDaemonGeneration != "daemon_previous" {
+		t.Fatalf("predecessorDaemonGeneration = %q, want daemon_previous", d.predecessorDaemonGeneration)
+	}
+	if !strings.Contains(logBuf.String(), "snapshot: deferred restore of 1 owners (test)") {
+		t.Fatalf("missing deferred restore log:\n%s", logBuf.String())
+	}
+}
+
+func TestSnapshotRestartModeRestoresSessionHandlerOwner(t *testing.T) {
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { os.Remove(SnapshotPath()) })
+
+	origDelay := snapshotRestartControlBindDelay
+	snapshotRestartControlBindDelay = 0
+	t.Cleanup(func() { snapshotRestartControlBindDelay = origDelay })
+	t.Setenv(snapshotRestartEnv, "1")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", "")
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "")
+
+	sid := "snapshot-restart-sessionhandler-owner"
+	now := time.Now()
+	snapshot := DaemonSnapshot{
+		Version:          mcpsnapshot.SnapshotVersion,
+		Timestamp:        now.UTC().Format(time.RFC3339),
+		DaemonGeneration: "daemon_previous",
+		PredecessorPID:   4242,
+		Owners: []mcpsnapshot.OwnerSnapshot{
+			{
+				ServerID:       sid,
+				Command:        "",
+				Args:           nil,
+				Cwd:            t.TempDir(),
+				Mode:           "global",
+				Classification: classify.ModeSessionAware,
+				BoundTokens: []mcpsnapshot.BoundTokenSnapshot{
+					{
+						Token:    "prev-token",
+						OwnerKey: sid,
+						Cwd:      "/project/restart",
+						Env:      map[string]string{"A": "B"},
+						BoundAt:  now,
+						LastUsed: now,
+					},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+
+	ctlPath := shortSocketPath(t, "snapshot-restart-sessionhandler.ctl.sock")
+	d, err := New(Config{
+		Name:           "test-daemon",
+		ControlPath:    ctlPath,
+		GracePeriod:    1 * time.Second,
+		IdleTimeout:    5 * time.Second,
+		SessionHandler: noopSessionHandler{},
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	waitOwnerAccepting(t, d, sid)
+	if entry := d.Entry(sid); entry == nil || entry.Owner == nil {
+		t.Fatal("snapshot restart mode did not restore SessionHandler owner")
+	}
+	newToken, err := d.HandleRefreshSessionToken("prev-token")
+	if err != nil {
+		t.Fatalf("HandleRefreshSessionToken() error = %v, want nil", err)
+	}
+	if newToken == "" || newToken == "prev-token" {
+		t.Fatalf("newToken = %q, want distinct non-empty token", newToken)
+	}
+	if got := d.HandleStatus()["shim_reconnect_fallback_spawned"]; got != uint64(0) {
+		t.Fatalf("shim_reconnect_fallback_spawned = %v, want 0", got)
+	}
+}
+
 func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	os.Remove(SnapshotPath())
 

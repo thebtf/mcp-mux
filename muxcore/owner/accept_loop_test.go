@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 type noopSessionHandler struct{}
@@ -60,7 +61,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, cond func() bool, msg
 
 func connectWithToken(t *testing.T, socketPath, token string) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("unix", socketPath)
+	conn, err := ipc.Dial(socketPath)
 	if err != nil {
 		t.Fatalf("net.Dial() = %v", err)
 	}

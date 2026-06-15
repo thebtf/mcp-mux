@@ -8,11 +8,12 @@ import (
 	"io"
 	"log"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 // startSlowEchoIPCServer starts an IPC echo server whose response for each
@@ -26,7 +27,7 @@ func startSlowEchoIPCServer(t *testing.T, path string, onRequest func(conn net.C
 	t.Helper()
 	received := make(chan string, 100)
 
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
 		t.Fatalf("slow-echo listen %s: %v", path, err)
 	}
@@ -48,7 +49,7 @@ func startSlowEchoIPCServer(t *testing.T, path string, onRequest func(conn net.C
 
 	t.Cleanup(func() {
 		srv.closeAll()
-		os.Remove(path)
+		ipc.Cleanup(path)
 	})
 
 	return srv

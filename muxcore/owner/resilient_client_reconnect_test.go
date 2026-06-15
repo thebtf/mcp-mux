@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 func newReconnectClient(t *testing.T, stdout io.Writer, logger *log.Logger) *resilientClient {
@@ -54,7 +56,7 @@ func tempReconnectSocketPath(t *testing.T, sid string) string {
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("Remove() error: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Remove(path) })
+	t.Cleanup(func() { ipc.Cleanup(path) })
 	return path
 }
 
@@ -318,7 +320,7 @@ func TestReconnect_ImmediateSpawnOnUnknownToken(t *testing.T) {
 func startGenerationIPCServer(t *testing.T, path, generation string) *echoServer {
 	t.Helper()
 	received := make(chan string, 100)
-	ln, err := net.Listen("unix", path)
+	ln, err := ipc.Listen(path)
 	if err != nil {
 		t.Fatalf("generation listen %s: %v", path, err)
 	}
@@ -337,7 +339,7 @@ func startGenerationIPCServer(t *testing.T, path, generation string) *echoServer
 	}()
 	t.Cleanup(func() {
 		srv.closeAll()
-		os.Remove(path)
+		ipc.Cleanup(path)
 	})
 	return srv
 }

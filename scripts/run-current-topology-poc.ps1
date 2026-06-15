@@ -41,6 +41,14 @@ function Stop-PocDaemon {
         }
     }
     Start-Sleep -Milliseconds 300
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        $binaryPath = (Resolve-Path -LiteralPath $Binary -ErrorAction SilentlyContinue).Path
+        if ($binaryPath) {
+            Get-CimInstance Win32_Process -Filter "name = 'current-topology-poc.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -like "*$binaryPath*" -and $_.CommandLine -like "*--muxcore-daemon*" } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        }
+    }
     Remove-Item -LiteralPath $ControlSocket -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath (Join-Path $RuntimeDir "owners.snapshot.json") -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $RuntimeDir -Filter "*.owner.sock" -ErrorAction SilentlyContinue |
@@ -94,6 +102,86 @@ function Invoke-WindowsPersistEmulation {
     }
 }
 
+function Wait-PocReplacementReady {
+    param(
+        [int]$PreviousPid,
+        [string]$PreviousGeneration
+    )
+
+    $Deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $Deadline) {
+        try {
+            $Status = Get-PocStatus
+            if ($Status.ready -eq $true -and ($Status.pid -ne $PreviousPid -or $Status.daemon_generation -ne $PreviousGeneration)) {
+                return $Status
+            }
+        } catch {
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "PoC replacement daemon did not become ready"
+}
+
+function Invoke-WindowsKillReconnectEmulation {
+    $Started = Get-Date
+    Write-Host "  Session A: connect"
+    & $Launcher -binary $Binary -mode tool -tool topology_state -args "{}" -expect-tools 1 -timeout 10
+    if ($LASTEXITCODE -ne 0) {
+        throw "launcher session A failed with exit code $LASTEXITCODE"
+    }
+    $StatusA = Get-PocStatus
+    Write-Host "  daemon A pid=$($StatusA.pid) generation=$($StatusA.daemon_generation)"
+
+    Stop-Process -Id $StatusA.pid -Force
+    Start-Sleep -Milliseconds 300
+
+    Write-Host "  Session B: reconnect"
+    & $Launcher -binary $Binary -mode tool -tool topology_state -args "{}" -expect-tools 1 -timeout 10
+    if ($LASTEXITCODE -ne 0) {
+        throw "launcher session B failed with exit code $LASTEXITCODE"
+    }
+    $StatusB = Get-PocStatus
+    Write-Host "  daemon B pid=$($StatusB.pid) generation=$($StatusB.daemon_generation) ready=$($StatusB.ready)"
+
+    if ($StatusB.ready -ne $true) {
+        throw "daemon is not ready after kill reconnect"
+    }
+    if ($StatusA.pid -eq $StatusB.pid) {
+        throw "daemon pid did not change after hard kill: $($StatusA.pid)"
+    }
+    $Elapsed = (Get-Date) - $Started
+    if ($Elapsed.TotalSeconds -gt 30) {
+        throw "kill reconnect exceeded 30s stdio timeout: $($Elapsed.TotalMilliseconds)ms"
+    }
+    Write-Host ("  total_recovery={0:n1}ms daemon_pid_A={1} daemon_pid_B={2}" -f $Elapsed.TotalMilliseconds, $StatusA.pid, $StatusB.pid)
+}
+
+function Invoke-WindowsPhase2RestartEmulation {
+    & $Launcher -binary $Binary -mode tool -tool topology_state -args "{}" -expect-tools 1 -timeout 10
+    if ($LASTEXITCODE -ne 0) {
+        throw "launcher pre-restart session failed with exit code $LASTEXITCODE"
+    }
+    $Before = Get-PocStatus
+    if ($Before.owner_count -lt 1) {
+        throw "pre-restart owner registry is empty"
+    }
+
+    $Restart = & $Binary --poc-control graceful-restart | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $Restart.ok -ne $true) {
+        throw "graceful-restart failed: $($Restart | ConvertTo-Json -Compress)"
+    }
+    $After = Wait-PocReplacementReady -PreviousPid $Before.pid -PreviousGeneration $Before.daemon_generation
+    Write-Host "  replacement pid=$($After.pid) generation=$($After.daemon_generation) owner_count=$($After.owner_count) handoff=$($After.handoff)"
+
+    if ($After.owner_count -lt 1) {
+        throw "post-restart owner registry is empty"
+    }
+    & $Launcher -binary $Binary -mode tool -tool topology_state -args "{}" -expect-tools 1 -timeout 10
+    if ($LASTEXITCODE -ne 0) {
+        throw "launcher post-restart session failed with exit code $LASTEXITCODE"
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Launcher)) {
     $LocalLauncher = Join-Path $RepoRoot "mcp-launcher.exe"
     if (Test-Path -LiteralPath $LocalLauncher) {
@@ -132,14 +220,26 @@ try {
 
     Stop-PocDaemon
 
-    Invoke-NativeStep "mcp-launcher kill-reconnect" {
-        & $Launcher -binary $Binary -mode kill-reconnect -ctl $ControlSocket -expect-tools 1 -timeout 10
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        Invoke-NativeStep "windows kill-reconnect emulation with mcp-launcher sessions" {
+            Invoke-WindowsKillReconnectEmulation
+        }
+    } else {
+        Invoke-NativeStep "mcp-launcher kill-reconnect" {
+            & $Launcher -binary $Binary -mode kill-reconnect -ctl $ControlSocket -expect-tools 1 -timeout 10
+        }
     }
 
     Stop-PocDaemon
 
-    Invoke-NativeStep "mcp-launcher phase2 restart smoke" {
-        & $Launcher -binary $Binary -mode phase2 -ctl $ControlSocket -expect-tools 1 -timeout 10
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
+        Invoke-NativeStep "windows phase2 restart emulation with mcp-launcher sessions" {
+            Invoke-WindowsPhase2RestartEmulation
+        }
+    } else {
+        Invoke-NativeStep "mcp-launcher phase2 restart smoke" {
+            & $Launcher -binary $Binary -mode phase2 -ctl $ControlSocket -expect-tools 1 -timeout 10
+        }
     }
 
     Stop-PocDaemon

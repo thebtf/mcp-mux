@@ -1080,7 +1080,7 @@ func connectOwnerFromControlResponse(resp map[string]any, reconnectReason string
 		return nil, fmt.Errorf("incomplete owner connection response: %v", resp)
 	}
 
-	conn, err := net.DialTimeout("unix", ownerSocket, 5*time.Second)
+	conn, err := ipc.DialTimeout(ownerSocket, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dial owner: %w", err)
 	}
@@ -1317,7 +1317,7 @@ func startDaemonProcess(successor bool) error {
 }
 
 func sendControl(path, cmd string, extra map[string]any, timeout time.Duration) (map[string]any, error) {
-	conn, err := net.DialTimeout("unix", path, timeout)
+	conn, err := ipc.DialTimeout(path, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -1378,7 +1378,7 @@ func probeStaleToken() error {
 	daemonGen, _ := spawnResp["daemon_generation"].(string)
 	ownerGen, _ := spawnResp["owner_generation"].(string)
 
-	conn, err := net.DialTimeout("unix", ownerSocket, 5*time.Second)
+	conn, err := ipc.DialTimeout(ownerSocket, 5*time.Second)
 	if err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
 
@@ -50,7 +51,7 @@ func TestNewOwnerFromHandoff_ListenerStarts(t *testing.T) {
 	var conn net.Conn
 	var dialErr error
 	for i := 0; i < 20; i++ {
-		conn, dialErr = net.DialTimeout("unix", ipcPath, 200*time.Millisecond)
+		conn, dialErr = ipc.DialTimeout(ipcPath, 200*time.Millisecond)
 		if dialErr == nil {
 			break
 		}
