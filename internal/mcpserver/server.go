@@ -8,7 +8,6 @@ package mcpserver
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -554,23 +553,32 @@ func (s *Server) toolMuxListForEngine(id json.RawMessage, engineName string, ver
 		s.sendToolError(id, fmt.Sprintf("list muxcore engine registry: %v", err))
 		return
 	}
-	rec, err := registry.ResolveEngine(records, engineName)
-	if err != nil {
-		switch {
-		case errors.Is(err, registry.ErrEngineNotFound):
-			s.sendToolError(id, fmt.Sprintf("registered muxcore engine not found: %s", engineName))
-		case errors.Is(err, registry.ErrDuplicateEngine):
-			s.sendToolError(id, fmt.Sprintf("registered muxcore engine is ambiguous: %s", engineName))
-		default:
-			s.sendToolError(id, fmt.Sprintf("resolve registered muxcore engine %q: %v", engineName, err))
+	var matches []registry.VerifiedDescriptor
+	for _, rec := range records {
+		if rec.Err != nil || rec.Descriptor.EngineName != engineName {
+			continue
 		}
+		matches = append(matches, registry.VerifyDescriptor(rec))
+	}
+	if len(matches) == 0 {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine not found: %s", engineName))
 		return
 	}
-	verified := registry.VerifyDescriptor(rec)
-	if verified.State != registry.StateHealthy {
-		s.sendToolError(id, fmt.Sprintf("registered muxcore engine is not healthy: %s (%s)", engineName, verified.Reason))
+	var healthy []registry.VerifiedDescriptor
+	for _, match := range matches {
+		if match.State == registry.StateHealthy {
+			healthy = append(healthy, match)
+		}
+	}
+	if len(healthy) == 0 {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine is not healthy: %s (%s)", engineName, registrySummary(matches)))
 		return
 	}
+	if len(healthy) > 1 {
+		s.sendToolError(id, fmt.Sprintf("registered muxcore engine is ambiguous: %s (%d healthy descriptors)", engineName, len(healthy)))
+		return
+	}
+	rec := healthy[0].Record
 	resp, err := control.Send(rec.Descriptor.DaemonControlPath, control.Request{Cmd: "list_owners"})
 	if err != nil {
 		s.sendToolError(id, fmt.Sprintf("registered muxcore engine list_owners failed: %v", err))
@@ -652,6 +660,18 @@ func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, 
 		return []map[string]any{}
 	}
 	return servers
+}
+
+func registrySummary(matches []registry.VerifiedDescriptor) string {
+	parts := make([]string, 0, len(matches))
+	for _, match := range matches {
+		reason := match.Reason
+		if reason == "" {
+			reason = match.State
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", match.State, reason))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // normalizeCwd cleans a path and lowercases only on Windows. Linux/macOS

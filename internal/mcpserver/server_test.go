@@ -1224,6 +1224,49 @@ func TestMuxListWithEngineNameQueriesExactRegisteredEngine(t *testing.T) {
 	}
 }
 
+func TestMuxListWithEngineNameIgnoresStaleDuplicateWhenOneHealthy(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-scopeddupe-")
+	healthyCtl := filepath.Join(baseDir, "aimux-live-muxd.ctl.sock")
+	staleCtl := filepath.Join(baseDir, "aimux-stale-muxd.ctl.sock")
+
+	startFakeDaemonControlServerWithStatus(t, healthyCtl, map[string]any{
+		"engine_name": "aimux-test",
+		"owner_count": 1,
+	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
+		ServerID:   "aimuxlive11223344",
+		EngineName: "aimux-test",
+		Command:    "aimux",
+		Args:       []string{"native"},
+	}}})
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Live", healthyCtl)
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Stale", staleCtl)
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":66,"method":"tools/call","params":{"name":"mux_list","arguments":{"engine_name":"aimux-test","all":true}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 66)
+	assertNoError(t, resp)
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if result.IsError {
+		t.Fatalf("scoped mux_list should ignore stale duplicate when one healthy descriptor remains: %+v", result.Content)
+	}
+	if text := result.Content[0].Text; !strings.Contains(text, "aimuxlive11223344") {
+		t.Fatalf("scoped mux_list missing live owner: %s", text)
+	}
+}
+
 func TestMuxListWithEngineNameRejectsUnknownAndStale(t *testing.T) {
 	baseDir := shortBaseDir(t, "mcpmux-scopederr-")
 	missingCtl := filepath.Join(baseDir, "missing-muxd.ctl.sock")
