@@ -37,6 +37,7 @@ type updateSeams struct {
 	waitReplacement func(context.Context, string, daemonIdentity, time.Duration) (bool, error)
 	identity        func(string) (daemonIdentity, error)
 	prepareSocket   func(context.Context, string, time.Duration) error
+	available       func(string) bool
 	acquireLock     func(string) (daemonLock, error)
 }
 
@@ -53,6 +54,7 @@ func captureUpdateSeams() updateSeams {
 		waitReplacement: engineWaitForReplacement,
 		identity:        engineDaemonIdentity,
 		prepareSocket:   enginePrepareControlSocket,
+		available:       engineControlSocketAvailable,
 		acquireLock:     engineAcquireDaemonLock,
 	}
 }
@@ -79,6 +81,7 @@ func restoreUpdateSeams(t *testing.T) {
 		engineWaitForReplacement = orig.waitReplacement
 		engineDaemonIdentity = orig.identity
 		enginePrepareControlSocket = orig.prepareSocket
+		engineControlSocketAvailable = orig.available
 		engineAcquireDaemonLock = orig.acquireLock
 	})
 }
@@ -576,7 +579,7 @@ func TestRestartWithSuccessor_TreatsAlreadyBoundReplacementAsReady(t *testing.T)
 	}
 }
 
-func TestPrepareControlSocketForReplacement_DoesNotUnlinkActiveSocketOnFalseNegative(t *testing.T) {
+func TestPrepareControlSocketForReplacement_WaitsOnActiveSocketFalseNegative(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix socket pathname unlink race does not apply to Windows named pipes")
 	}
@@ -606,14 +609,32 @@ func TestPrepareControlSocketForReplacement_DoesNotUnlinkActiveSocketOnFalseNega
 
 	engineIsDaemonRunning = func(string) bool { return false }
 
-	if err := prepareControlSocketForReplacement(context.Background(), ctlPath, time.Second); err != nil {
-		t.Fatalf("prepareControlSocketForReplacement: %v", err)
+	err = prepareControlSocketForReplacement(context.Background(), ctlPath, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("prepareControlSocketForReplacement returned nil while socket listener was still active")
 	}
 	conn, err := net.DialTimeout("unix", ctlPath, 200*time.Millisecond)
 	if err != nil {
 		t.Fatalf("control socket path was unlinked; dial after prepare: %v", err)
 	}
 	_ = conn.Close()
+}
+
+func TestPrepareControlSocketForReplacement_ReturnsAfterEndpointUnavailable(t *testing.T) {
+	restoreUpdateSeams(t)
+	availableCalls := 0
+	engineIsDaemonRunning = func(string) bool { return false }
+	engineControlSocketAvailable = func(string) bool {
+		availableCalls++
+		return availableCalls < 3
+	}
+
+	if err := prepareControlSocketForReplacement(context.Background(), "control.sock", time.Second); err != nil {
+		t.Fatalf("prepareControlSocketForReplacement: %v", err)
+	}
+	if availableCalls < 3 {
+		t.Fatalf("available calls = %d, want polling until unavailable", availableCalls)
+	}
 }
 
 func TestApplyUpdateAndRestart_LockFailureIsPhaseError(t *testing.T) {

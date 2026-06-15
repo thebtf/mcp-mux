@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
@@ -163,6 +164,7 @@ var (
 	engineWaitForReplacement     = waitForDaemonReplacementOrExit
 	engineDaemonIdentity         = daemonIdentityFromStatus
 	enginePrepareControlSocket   = prepareControlSocketForReplacement
+	engineControlSocketAvailable = ipc.IsAvailable
 	engineAcquireDaemonLock      = acquireDaemonLock
 )
 
@@ -543,7 +545,7 @@ func prepareControlSocketForReplacement(ctx context.Context, ctlPath string, tim
 	ticker := time.NewTicker(daemonPollInterval)
 	defer ticker.Stop()
 	for {
-		if !engineIsDaemonRunning(ctlPath) {
+		if !engineIsDaemonRunning(ctlPath) && !engineControlSocketAvailable(ctlPath) {
 			return nil
 		}
 		select {
