@@ -1759,35 +1759,9 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 		classification, _ := s["auto_classification"].(string)
 		classificationSource, _ := s["classification_source"].(string)
 
-		sessions := 0
-		switch v := s["session_count"].(type) {
-		case int:
-			sessions = v
-		case float64:
-			sessions = int(v)
-		case int64:
-			sessions = int(v)
-		}
-
-		pending := 0
-		switch v := s["pending_requests"].(type) {
-		case int64:
-			pending = int(v)
-		case float64:
-			pending = int(v)
-		case int:
-			pending = v
-		}
-
-		upstreamPID := 0
-		switch v := s["upstream_pid"].(type) {
-		case int:
-			upstreamPID = v
-		case float64:
-			upstreamPID = int(v)
-		case int64:
-			upstreamPID = int(v)
-		}
+		sessions := statusInt(s["session_count"])
+		pending := statusInt(s["pending_requests"])
+		upstreamPID := statusInt(s["upstream_pid"])
 
 		var cwdSet []string
 		switch v := s["cwd_set"].(type) {
@@ -1841,6 +1815,22 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 	}
 
 	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil
+}
+
+func statusInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		if parsed, err := n.Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return 0
 }
 
 func (d *Daemon) ownerIsAccepting(serverID string) bool {
