@@ -224,6 +224,7 @@ type Daemon struct {
 	reconnectFallbackSpawned   atomic.Uint64
 	reconnectGaveUp            atomic.Uint64
 	registryDescriptorPath     string
+	registryDescriptor         registry.Descriptor
 	restoredOwnerCount         atomic.Uint64
 	oldOwnerSocketRetiredCount atomic.Uint64
 	ownerRemoval               ownerRemovalStats
@@ -489,6 +490,7 @@ func New(cfg Config) (*Daemon, error) {
 			return nil, fmt.Errorf("daemon: registry descriptor: %w", err)
 		}
 		d.registryDescriptorPath = path
+		d.registryDescriptor = desc
 	}
 
 	// Clean up stale socket files from previous daemon crashes/kills.
@@ -2478,7 +2480,7 @@ func (d *Daemon) shutdown(beforeDone func()) {
 			d.ctlSrv.Close()
 		}
 		if d.registryDescriptorPath != "" {
-			if err := os.Remove(d.registryDescriptorPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if _, err := registry.RemoveDescriptorIfOwned(d.registryDescriptorPath, d.registryDescriptor); err != nil {
 				d.logger.Printf("registry: remove descriptor %s: %v", d.registryDescriptorPath, err)
 			}
 		}
