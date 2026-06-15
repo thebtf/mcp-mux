@@ -174,7 +174,6 @@ type Daemon struct {
 	// not per request).
 	forcedIsolatedRetryCounters sync.Map // key: base isolated sid → *atomic.Int64
 
-
 	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
@@ -1694,6 +1693,7 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	return map[string]any{
 		"daemon":                          true,
+		"engine_name":                     d.name,
 		"shutting_down":                   d.shuttingDown.Load(),
 		"pid":                             os.Getpid(),
 		"daemon_generation":               d.daemonGeneration,
@@ -1757,26 +1757,11 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 		cwd, _ := s["cwd"].(string)
 		muxVer, _ := s["mux_version"].(string)
 		classification, _ := s["auto_classification"].(string)
+		classificationSource, _ := s["classification_source"].(string)
 
-		sessions := 0
-		switch v := s["session_count"].(type) {
-		case int:
-			sessions = v
-		case float64:
-			sessions = int(v)
-		case int64:
-			sessions = int(v)
-		}
-
-		pending := 0
-		switch v := s["pending_requests"].(type) {
-		case int64:
-			pending = int(v)
-		case float64:
-			pending = int(v)
-		case int:
-			pending = v
-		}
+		sessions := statusInt(s["session_count"])
+		pending := statusInt(s["pending_requests"])
+		upstreamPID := statusInt(s["upstream_pid"])
 
 		var cwdSet []string
 		switch v := s["cwd_set"].(type) {
@@ -1790,21 +1775,62 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 			}
 		}
 
+		var classificationReason []string
+		switch v := s["classification_reason"].(type) {
+		case []string:
+			classificationReason = append(classificationReason, v...)
+		case []any:
+			for _, r := range v {
+				if rs, ok := r.(string); ok {
+					classificationReason = append(classificationReason, rs)
+				}
+			}
+		}
+
+		cachedInit, _ := s["cached_init"].(bool)
+		cachedTools, _ := s["cached_tools"].(bool)
+		cachedPrompts, _ := s["cached_prompts"].(bool)
+		cachedResources, _ := s["cached_resources"].(bool)
+
 		owners = append(owners, control.OwnerInfo{
-			ServerID:       sid,
-			Command:        entry.Command,
-			Args:           entry.Args,
-			Cwd:            cwd,
-			CwdSet:         cwdSet,
-			Sessions:       sessions,
-			Pending:        pending,
-			Classification: classification,
-			MuxVersion:     muxVer,
-			Persistent:     entry.Persistent,
+			ServerID:             sid,
+			EngineName:           d.name,
+			Command:              entry.Command,
+			Args:                 entry.Args,
+			Cwd:                  cwd,
+			CwdSet:               cwdSet,
+			Sessions:             sessions,
+			Pending:              pending,
+			UpstreamPID:          upstreamPID,
+			Classification:       classification,
+			ClassificationSource: classificationSource,
+			ClassificationReason: classificationReason,
+			MuxVersion:           muxVer,
+			Persistent:           entry.Persistent,
+			CachedInit:           cachedInit,
+			CachedTools:          cachedTools,
+			CachedPrompts:        cachedPrompts,
+			CachedResources:      cachedResources,
 		})
 	}
 
 	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil
+}
+
+func statusInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case json.Number:
+		if parsed, err := n.Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return 0
 }
 
 func (d *Daemon) ownerIsAccepting(serverID string) bool {

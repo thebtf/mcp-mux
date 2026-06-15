@@ -51,16 +51,24 @@ type CommandHandler interface {
 
 // OwnerInfo contains summary data for a single managed owner returned by list_owners.
 type OwnerInfo struct {
-	ServerID       string   `json:"server_id"`
-	Command        string   `json:"command"`
-	Args           []string `json:"args"`
-	Cwd            string   `json:"cwd"`
-	CwdSet         []string `json:"cwd_set"`
-	Sessions       int      `json:"sessions"`
-	Pending        int      `json:"pending"`
-	Classification string   `json:"classification"`
-	MuxVersion     string   `json:"mux_version"`
-	Persistent     bool     `json:"persistent"`
+	ServerID             string   `json:"server_id"`
+	EngineName           string   `json:"engine_name,omitempty"`
+	Command              string   `json:"command"`
+	Args                 []string `json:"args"`
+	Cwd                  string   `json:"cwd"`
+	CwdSet               []string `json:"cwd_set"`
+	Sessions             int      `json:"sessions"`
+	Pending              int      `json:"pending"`
+	UpstreamPID          int      `json:"upstream_pid,omitempty"`
+	Classification       string   `json:"classification"`
+	ClassificationSource string   `json:"classification_source,omitempty"`
+	ClassificationReason []string `json:"classification_reason,omitempty"`
+	MuxVersion           string   `json:"mux_version"`
+	Persistent           bool     `json:"persistent"`
+	CachedInit           bool     `json:"cached_init,omitempty"`
+	CachedTools          bool     `json:"cached_tools,omitempty"`
+	CachedPrompts        bool     `json:"cached_prompts,omitempty"`
+	CachedResources      bool     `json:"cached_resources,omitempty"`
 }
 
 // ListOwnersResponse is the response payload for the "list_owners" daemon RPC.

@@ -10,6 +10,9 @@ func TestHandleStatus_StableOperatorContract(t *testing.T) {
 	d := testDaemon(t)
 
 	initial := d.HandleStatus()
+	if got := initial["engine_name"]; got != "test-daemon" {
+		t.Fatalf("engine_name = %#v, want test-daemon", got)
+	}
 	if got, ok := initial["daemon_generation"].(string); !ok || got == "" {
 		t.Fatalf("daemon_generation = %#v, want non-empty string", initial["daemon_generation"])
 	}

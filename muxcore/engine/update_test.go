@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,100 @@ func baseUpdateOptions() UpdateAndRestartOptions {
 		ShutdownTimeout: time.Second,
 		ReadyTimeout:    time.Second,
 		CleanStale:      true,
+	}
+}
+
+func TestApplyUpdateAndRestart_ValidationErrors(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+
+	for _, tc := range []struct {
+		name string
+		opts UpdateAndRestartOptions
+		want string
+	}{
+		{name: "missing current", opts: UpdateAndRestartOptions{StagedExe: "next.exe"}, want: "CurrentExe is required"},
+		{name: "missing staged", opts: UpdateAndRestartOptions{CurrentExe: "current.exe"}, want: "StagedExe is required"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := eng.ApplyUpdateAndRestart(context.Background(), tc.opts)
+			var updateErr *UpdateAndRestartError
+			if !errors.As(err, &updateErr) {
+				t.Fatalf("error = %v, want UpdateAndRestartError", err)
+			}
+			if updateErr.Phase != UpdatePhaseValidate || !strings.Contains(updateErr.Err.Error(), tc.want) {
+				t.Fatalf("phase/err = %s/%v, want validate/%q", updateErr.Phase, updateErr.Err, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyUpdateAndRestart_CanceledContextStopsBeforeSwap(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	swapCalls := 0
+	engineUpgradeSwap = func(string, string) (string, error) {
+		swapCalls++
+		return "old", nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := eng.ApplyUpdateAndRestart(ctx, baseUpdateOptions())
+	var updateErr *UpdateAndRestartError
+	if !errors.As(err, &updateErr) {
+		t.Fatalf("error = %v, want UpdateAndRestartError", err)
+	}
+	if updateErr.Phase != UpdatePhaseValidate || !errors.Is(updateErr.Err, context.Canceled) {
+		t.Fatalf("phase/err = %s/%v, want validate/context canceled", updateErr.Phase, updateErr.Err)
+	}
+	if swapCalls != 0 {
+		t.Fatalf("swap calls = %d, want 0 after canceled context", swapCalls)
+	}
+}
+
+func TestApplyUpdateAndRestart_DefaultTimeouts(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	var gotDrainMs int
+	var gotRestart, gotShutdown, gotReady time.Duration
+
+	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
+	engineCleanStale = func(string) int { return 0 }
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineControlSendWithTimeout = func(_ string, req control.Request, timeout time.Duration) (*control.Response, error) {
+		gotDrainMs = req.DrainTimeoutMs
+		gotRestart = timeout
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForDaemonExit = func(_ context.Context, _ string, timeout time.Duration) error {
+		gotShutdown = timeout
+		return nil
+	}
+	engineWaitForDaemonReady = func(_ context.Context, _ string, timeout time.Duration) error {
+		gotReady = timeout
+		return nil
+	}
+
+	opts := UpdateAndRestartOptions{
+		CurrentExe: "current.exe",
+		StagedExe:  "current.exe~",
+	}
+	got, err := eng.ApplyUpdateAndRestart(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("ApplyUpdateAndRestart: %v", err)
+	}
+	if !got.GracefulRestarted || !got.ReplacementReady {
+		t.Fatalf("unexpected result flags: %+v", got)
+	}
+	if gotDrainMs != int(defaultUpdateDrainTimeout/time.Millisecond) {
+		t.Fatalf("drain timeout ms = %d, want %d", gotDrainMs, int(defaultUpdateDrainTimeout/time.Millisecond))
+	}
+	if gotRestart != defaultUpdateRestartTimeout || gotShutdown != defaultUpdateShutdownTimeout || gotReady != defaultUpdateReadyTimeout {
+		t.Fatalf("timeouts restart/shutdown/ready = %s/%s/%s, want %s/%s/%s",
+			gotRestart, gotShutdown, gotReady,
+			defaultUpdateRestartTimeout, defaultUpdateShutdownTimeout, defaultUpdateReadyTimeout)
 	}
 }
 
@@ -268,6 +363,42 @@ func TestApplyUpdateAndRestart_LockFailureIsPhaseError(t *testing.T) {
 	}
 }
 
+func TestApplyUpdateAndRestart_ProceedWithoutLockContinuesWithWarning(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	lockErr := errors.New("locked by another updater")
+
+	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
+	engineCleanStale = func(string) int { return 0 }
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return nil, lockErr }
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return nil, errors.New("dial failed")
+	}
+	engineControlSend = func(string, control.Request) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
+	engineStartDaemonExecutable = func(string, string) error { return nil }
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+
+	opts := baseUpdateOptions()
+	opts.ProceedWithoutLock = true
+	got, err := eng.ApplyUpdateAndRestart(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("ApplyUpdateAndRestart: %v", err)
+	}
+	if got.LockAcquired {
+		t.Fatalf("LockAcquired = true, want false")
+	}
+	if !got.FallbackShutdown || !got.ReplacementReady {
+		t.Fatalf("unexpected result flags: %+v", got)
+	}
+	if len(got.Warnings) == 0 || !strings.Contains(got.Warnings[0], "could not acquire daemon lock") {
+		t.Fatalf("warnings = %#v, want daemon lock warning", got.Warnings)
+	}
+}
+
 func TestApplyUpdateAndRestart_FallbackExitTimeoutIsPhaseError(t *testing.T) {
 	restoreUpdateSeams(t)
 	eng := newUpdateTestEngine(t)
@@ -295,6 +426,35 @@ func TestApplyUpdateAndRestart_FallbackExitTimeoutIsPhaseError(t *testing.T) {
 	}
 	if !updateErr.Result.FallbackShutdown {
 		t.Fatalf("partial result did not record fallback shutdown: %+v", updateErr.Result)
+	}
+}
+
+func TestApplyUpdateAndRestart_ErrorResultIncludesCleanStaleCount(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	readyErr := errors.New("not ready")
+
+	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
+	engineCleanStale = func(string) int { return 7 }
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return nil, errors.New("dial failed")
+	}
+	engineControlSend = func(string, control.Request) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
+	engineStartDaemonExecutable = func(string, string) error { return nil }
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return readyErr }
+
+	_, err := eng.ApplyUpdateAndRestart(context.Background(), baseUpdateOptions())
+	var updateErr *UpdateAndRestartError
+	if !errors.As(err, &updateErr) {
+		t.Fatalf("error = %v, want UpdateAndRestartError", err)
+	}
+	if updateErr.Result.CleanedStale != 7 {
+		t.Fatalf("CleanedStale in error result = %d, want 7", updateErr.Result.CleanedStale)
 	}
 }
 

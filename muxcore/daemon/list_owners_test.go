@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"testing"
@@ -71,6 +72,9 @@ func TestHandleListOwners(t *testing.T) {
 		if o.ServerID == "" {
 			t.Error("owner has empty ServerID")
 		}
+		if o.EngineName != "test-daemon" {
+			t.Errorf("owner %s engine_name = %q, want test-daemon", o.ServerID, o.EngineName)
+		}
 		sidSet[o.ServerID] = true
 	}
 	for _, sid := range sids {
@@ -119,5 +123,14 @@ func TestHandleListOwners_Truncated(t *testing.T) {
 	}
 	if !resp.Truncated {
 		t.Error("want truncated=true for 201 owners, got false")
+	}
+}
+
+func TestStatusIntHandlesJSONNumber(t *testing.T) {
+	if got := statusInt(json.Number("1234")); got != 1234 {
+		t.Fatalf("statusInt(json.Number) = %d, want 1234", got)
+	}
+	if got := statusInt(json.Number("not-a-number")); got != 0 {
+		t.Fatalf("statusInt(invalid json.Number) = %d, want 0", got)
 	}
 }

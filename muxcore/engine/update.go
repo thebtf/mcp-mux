@@ -35,7 +35,9 @@ const (
 
 // UpdateAndRestartOptions configures ApplyUpdateAndRestart.
 type UpdateAndRestartOptions struct {
-	// CurrentExe is the stable executable path that should exist after the swap.
+	// CurrentExe is the replaceable engine executable path that should exist
+	// after the swap. Do not pass a stable launcher path here unless that
+	// launcher is deliberately replaceable while the product is running.
 	CurrentExe string
 	// StagedExe is the replacement binary to move into CurrentExe.
 	StagedExe string
@@ -123,8 +125,9 @@ var (
 
 // ApplyUpdateAndRestart swaps in a staged binary and restarts this engine's
 // daemon namespace using muxcore's graceful-restart control path. It is intended
-// for embedded SessionHandler consumers that need the same restart choreography
-// as the mcp-mux binary without copying cmd/mcp-mux code.
+// for embedded consumers that use a fixed replaceable engine path and need the
+// same restart choreography as the mcp-mux binary without copying cmd/mcp-mux
+// code.
 func (e *MuxEngine) ApplyUpdateAndRestart(ctx context.Context, opts UpdateAndRestartOptions) (result UpdateAndRestartResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()

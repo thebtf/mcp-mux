@@ -325,6 +325,7 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 		{
 			"name": "mux_list",
 			"description": "List all running mcp-mux managed MCP server instances. " +
+				"This is this mcp-mux daemon's engine namespace, not a global registry for native muxcore products. " +
 				"Returns compact summary by default: server name, sessions, classification, version. " +
 				"Set verbose=true for full details (PID, IPC path, cache status, classification reason). " +
 				"By default shows only servers belonging to this CC session's project. " +
@@ -470,26 +471,35 @@ func (s *Server) toolMuxList(id json.RawMessage, args json.RawMessage) {
 		}
 		if params.Verbose {
 			servers = append(servers, map[string]any{
-				"server_id":      owner.ServerID,
-				"command":        owner.Command,
-				"args":           owner.Args,
-				"cwd":            owner.Cwd,
-				"cwd_set":        owner.CwdSet,
-				"sessions":       owner.Sessions,
-				"pending":        owner.Pending,
-				"classification": owner.Classification,
-				"mux_version":    owner.MuxVersion,
-				"persistent":     owner.Persistent,
+				"server_id":             owner.ServerID,
+				"engine_name":           owner.EngineName,
+				"command":               owner.Command,
+				"args":                  owner.Args,
+				"cwd":                   owner.Cwd,
+				"cwd_set":               owner.CwdSet,
+				"sessions":              owner.Sessions,
+				"pending":               owner.Pending,
+				"upstream_pid":          owner.UpstreamPID,
+				"classification":        owner.Classification,
+				"classification_source": owner.ClassificationSource,
+				"classification_reason": owner.ClassificationReason,
+				"mux_version":           owner.MuxVersion,
+				"persistent":            owner.Persistent,
+				"cached_init":           owner.CachedInit,
+				"cached_tools":          owner.CachedTools,
+				"cached_prompts":        owner.CachedPrompts,
+				"cached_resources":      owner.CachedResources,
 			})
 		} else {
 			servers = append(servers, map[string]any{
-				"server_id": owner.ServerID,
-				"command":   owner.Command,
-				"args":      owner.Args,
-				"sessions":  owner.Sessions,
-				"pending":   owner.Pending,
-				"class":     owner.Classification,
-				"version":   owner.MuxVersion,
+				"server_id":   owner.ServerID,
+				"engine_name": owner.EngineName,
+				"command":     owner.Command,
+				"args":        owner.Args,
+				"sessions":    owner.Sessions,
+				"pending":     owner.Pending,
+				"class":       owner.Classification,
+				"version":     owner.MuxVersion,
 			})
 		}
 	}
