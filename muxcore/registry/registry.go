@@ -189,6 +189,33 @@ func WriteDescriptor(baseDir string, d Descriptor) (string, error) {
 	return path, nil
 }
 
+// RemoveDescriptorIfOwned removes path only when the descriptor currently on
+// disk still belongs to the expected daemon process. It intentionally refuses
+// to remove descriptors with a different PID so a predecessor cannot erase a
+// successor advertisement that reused the same deterministic descriptor path.
+func RemoveDescriptorIfOwned(path string, expected Descriptor) (bool, error) {
+	current, err := ReadDescriptor(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if current.EngineName != expected.EngineName ||
+		current.DaemonControlPath != expected.DaemonControlPath ||
+		current.PID == 0 ||
+		current.PID != expected.PID {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // ReadDescriptor reads and validates a descriptor file.
 func ReadDescriptor(path string) (Descriptor, error) {
 	data, err := os.ReadFile(path)
@@ -334,6 +361,11 @@ func VerifyDescriptorWithSender(rec Record, send SendFunc) VerifiedDescriptor {
 	if engineName != rec.Descriptor.EngineName {
 		out.State = StateStale
 		out.Reason = fmt.Sprintf("engine_name_mismatch: descriptor=%q status=%q", rec.Descriptor.EngineName, engineName)
+		return out
+	}
+	if rec.Descriptor.PID != 0 && out.PID != rec.Descriptor.PID {
+		out.State = StateStale
+		out.Reason = fmt.Sprintf("pid_mismatch: descriptor=%d status=%d", rec.Descriptor.PID, out.PID)
 		return out
 	}
 	out.State = StateHealthy

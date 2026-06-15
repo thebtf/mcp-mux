@@ -166,10 +166,10 @@ func TestVerifyDescriptorStatusMismatchAndHealthy(t *testing.T) {
 		Descriptor: testDescriptor("aimux", filepath.Join(base, "aimux.sock")),
 	}
 
-	statusData := func(engineName string) json.RawMessage {
+	statusData := func(engineName string, pid int) json.RawMessage {
 		data, err := json.Marshal(map[string]any{
 			"engine_name":       engineName,
-			"pid":               4321,
+			"pid":               pid,
 			"daemon_generation": "daemon-test",
 			"owner_count":       7,
 		})
@@ -183,20 +183,71 @@ func TestVerifyDescriptorStatusMismatchAndHealthy(t *testing.T) {
 		if path != rec.Descriptor.DaemonControlPath || req.Cmd != "status" {
 			t.Fatalf("unexpected verify request path=%q req=%+v", path, req)
 		}
-		return &control.Response{OK: true, Data: statusData("engram")}, nil
+		return &control.Response{OK: true, Data: statusData("engram", rec.Descriptor.PID)}, nil
 	})
 	if mismatch.State != StateStale || !strings.Contains(mismatch.Reason, "engine_name_mismatch") {
 		t.Fatalf("mismatch verify = %+v, want stale engine mismatch", mismatch)
 	}
 
+	pidMismatch := VerifyDescriptorWithSender(rec, func(string, control.Request) (*control.Response, error) {
+		return &control.Response{OK: true, Data: statusData("aimux", rec.Descriptor.PID+1)}, nil
+	})
+	if pidMismatch.State != StateStale || !strings.Contains(pidMismatch.Reason, "pid_mismatch") {
+		t.Fatalf("pid mismatch verify = %+v, want stale pid mismatch", pidMismatch)
+	}
+
 	healthy := VerifyDescriptorWithSender(rec, func(string, control.Request) (*control.Response, error) {
-		return &control.Response{OK: true, Data: statusData("aimux")}, nil
+		return &control.Response{OK: true, Data: statusData("aimux", rec.Descriptor.PID)}, nil
 	})
 	if healthy.State != StateHealthy || !healthy.Reachable {
 		t.Fatalf("healthy verify = %+v, want healthy reachable", healthy)
 	}
-	if healthy.PID != 4321 || healthy.OwnerCount != 7 || healthy.DaemonGeneration != "daemon-test" {
+	if healthy.PID != rec.Descriptor.PID || healthy.OwnerCount != 7 || healthy.DaemonGeneration != "daemon-test" {
 		t.Fatalf("healthy status fields = %+v", healthy)
+	}
+}
+
+func TestRemoveDescriptorIfOwnedSkipsSuccessorDescriptor(t *testing.T) {
+	base := t.TempDir()
+	oldDesc := testDescriptor("aimux", filepath.Join(base, "aimux.sock"))
+	oldDesc.PID = 1111
+	path, err := WriteDescriptor(base, oldDesc)
+	if err != nil {
+		t.Fatalf("WriteDescriptor old: %v", err)
+	}
+
+	successor := oldDesc
+	successor.PID = 2222
+	if successorPath, err := WriteDescriptor(base, successor); err != nil {
+		t.Fatalf("WriteDescriptor successor: %v", err)
+	} else if successorPath != path {
+		t.Fatalf("successor descriptor path = %q, want %q", successorPath, path)
+	}
+
+	removed, err := RemoveDescriptorIfOwned(path, oldDesc)
+	if err != nil {
+		t.Fatalf("RemoveDescriptorIfOwned old: %v", err)
+	}
+	if removed {
+		t.Fatal("old descriptor cleanup removed successor descriptor")
+	}
+	got, err := ReadDescriptor(path)
+	if err != nil {
+		t.Fatalf("ReadDescriptor after skipped remove: %v", err)
+	}
+	if got.PID != successor.PID {
+		t.Fatalf("descriptor PID = %d, want successor PID %d", got.PID, successor.PID)
+	}
+
+	removed, err = RemoveDescriptorIfOwned(path, successor)
+	if err != nil {
+		t.Fatalf("RemoveDescriptorIfOwned successor: %v", err)
+	}
+	if !removed {
+		t.Fatal("successor descriptor was not removed by matching cleanup")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("descriptor still exists after matching cleanup: %v", err)
 	}
 }
 

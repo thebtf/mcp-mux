@@ -148,6 +148,56 @@ func TestRegistryOptInWritesDescriptorAfterControlBind(t *testing.T) {
 	}
 }
 
+func TestRegistryShutdownDoesNotRemoveSuccessorDescriptor(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "rd*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	ctlPath := filepath.Join(baseDir, "regok.ctl.sock")
+	d, err := New(Config{
+		Name:         "regok",
+		ControlPath:  ctlPath,
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
+		Registry: &registry.Config{
+			ProductName:    "Registry Test Product",
+			MuxcoreVersion: "test-version",
+			Capabilities:   registry.Capabilities{ListOwners: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	records, err := registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors: %v", err)
+	}
+	if len(records) != 1 || records[0].Err != nil {
+		t.Fatalf("registry descriptors = %+v, want one valid descriptor", records)
+	}
+	path := records[0].Path
+	successor := records[0].Descriptor
+	successor.PID++
+	if successorPath, err := registry.WriteDescriptor(baseDir, successor); err != nil {
+		t.Fatalf("WriteDescriptor successor: %v", err)
+	} else if successorPath != path {
+		t.Fatalf("successor descriptor path = %q, want %q", successorPath, path)
+	}
+
+	d.Shutdown()
+	got, err := registry.ReadDescriptor(path)
+	if err != nil {
+		t.Fatalf("successor descriptor was removed by predecessor shutdown: %v", err)
+	}
+	if got.PID != successor.PID {
+		t.Fatalf("descriptor PID = %d, want successor PID %d", got.PID, successor.PID)
+	}
+}
+
 type noopSessionHandler struct{}
 
 func (noopSessionHandler) HandleRequest(context.Context, muxcore.ProjectContext, []byte) ([]byte, error) {

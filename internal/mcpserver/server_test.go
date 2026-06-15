@@ -1033,7 +1033,7 @@ func TestMuxEnginesListsHealthyAndStaleDescriptors(t *testing.T) {
 
 	startFakeDaemonControlServerWithStatus(t, healthyCtl, map[string]any{
 		"engine_name":       "aimux-test",
-		"pid":               4321,
+		"pid":               1234,
 		"daemon_generation": "daemon-aimux",
 		"owner_count":       2,
 	}, control.ListOwnersResponse{})
@@ -1141,6 +1141,7 @@ func TestMuxListDefaultIgnoresRegisteredForeignEngines(t *testing.T) {
 	foreignCtl := filepath.Join(baseDir, "aimux-muxd.ctl.sock")
 	startFakeDaemonControlServerWithStatus(t, foreignCtl, map[string]any{
 		"engine_name": "aimux-test",
+		"pid":         1234,
 		"owner_count": 1,
 	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
 		ServerID: "foreign0011223344",
@@ -1186,6 +1187,7 @@ func TestMuxListWithEngineNameQueriesExactRegisteredEngine(t *testing.T) {
 	foreignCtl := filepath.Join(baseDir, "aimux-muxd.ctl.sock")
 	startFakeDaemonControlServerWithStatus(t, foreignCtl, map[string]any{
 		"engine_name": "aimux-test",
+		"pid":         1234,
 		"owner_count": 1,
 	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
 		ServerID:   "aimux001122334455",
@@ -1231,6 +1233,7 @@ func TestMuxListWithEngineNameIgnoresStaleDuplicateWhenOneHealthy(t *testing.T) 
 
 	startFakeDaemonControlServerWithStatus(t, healthyCtl, map[string]any{
 		"engine_name": "aimux-test",
+		"pid":         1234,
 		"owner_count": 1,
 	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{{
 		ServerID:   "aimuxlive11223344",
