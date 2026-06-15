@@ -25,6 +25,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
@@ -222,6 +223,7 @@ type Daemon struct {
 	reconnectRefreshed         atomic.Uint64
 	reconnectFallbackSpawned   atomic.Uint64
 	reconnectGaveUp            atomic.Uint64
+	registryDescriptorPath     string
 	restoredOwnerCount         atomic.Uint64
 	oldOwnerSocketRetiredCount atomic.Uint64
 	ownerRemoval               ownerRemovalStats
@@ -325,6 +327,10 @@ type Config struct {
 	// Persistent overrides per-owner Persistent detection. When true, all owners
 	// managed by this daemon are treated as persistent (not evicted on idle).
 	Persistent bool
+
+	// Registry enables opt-in daemon advertisement for cross-engine discovery.
+	// Nil is the zero-value opt-out and preserves pre-registry behavior.
+	Registry *registry.Config
 
 	// AuthorizeSession, when non-nil, is forwarded to every Owner created by
 	// this daemon. Owners invoke the callback in acceptLoop after IPC
@@ -469,6 +475,20 @@ func New(cfg Config) (*Daemon, error) {
 				logger.Printf("startup: restored %d owners from snapshot", restored)
 			}
 		}
+	}
+
+	if cfg.Registry != nil {
+		baseDir := filepath.Dir(cfg.ControlPath)
+		desc := cfg.Registry.BuildDescriptor(d.name, baseDir, cfg.ControlPath, os.Getpid(), time.Now())
+		path, err := registry.WriteDescriptor(baseDir, desc)
+		if err != nil {
+			if d.ctlSrv != nil {
+				d.ctlSrv.Close()
+			}
+			supCancel()
+			return nil, fmt.Errorf("daemon: registry descriptor: %w", err)
+		}
+		d.registryDescriptorPath = path
 	}
 
 	// Clean up stale socket files from previous daemon crashes/kills.
@@ -2456,6 +2476,11 @@ func (d *Daemon) shutdown(beforeDone func()) {
 		// Close control server
 		if d.ctlSrv != nil {
 			d.ctlSrv.Close()
+		}
+		if d.registryDescriptorPath != "" {
+			if err := os.Remove(d.registryDescriptorPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				d.logger.Printf("registry: remove descriptor %s: %v", d.registryDescriptorPath, err)
+			}
 		}
 
 		// Shutdown all owners

@@ -484,7 +484,7 @@ cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
 Key changes to adopt:
 1. **SessionHandler** — replace `srv.StdioHandler()` with SessionHandler implementation to get per-CC-session ProjectContext
 2. **Native update topology** — use `eng.RestartWithSuccessor(...)` when aimux keeps a stable launcher plus versioned engine store; use `eng.ApplyUpdateAndRestart(...)` only when `CurrentExe` is the replaceable engine path. Do not call `upgrade.Swap` as the whole update protocol.
-3. **Native process management** — agents should use aimux's own `sessions`, `status`, and `upgrade` surfaces for aimux state. `mcp-mux mux_list` is scoped to mcp-mux unless a future opt-in muxcore registry is implemented.
+3. **Native process management** — agents should use aimux's own `sessions`, `status`, and `upgrade` surfaces for aimux state. Default `mcp-mux mux_list` is scoped to the `mcp-mux` daemon namespace. When aimux consumes a muxcore version with opt-in daemon registry support, it may advertise via `engine.Config.Registry`; then `mux_engines` can show aimux and `mux_list(engine_name="aimux")` can list aimux owners read-only after status verification. This does not imply cross-engine stop/restart/update.
 4. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
 5. **Circuit breaker** — included automatically, protects against upstream crash loops
 
@@ -498,6 +498,7 @@ Key changes:
 1. **DaemonControlPath** — if you call it directly, add name parameter: `DaemonControlPath(baseDir, "engram")`
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
+4. **Opt-in daemon registry** — optional read-only visibility. If engram adopts `engine.Config.Registry`, `mcp-mux serve` can show it through `mux_engines` and scoped `mux_list(engine_name="engram")`; default `mux_list` remains the `mcp-mux` namespace and engram's own management surface remains authoritative.
 
 ### v0.21.10 — Flush conn before afterFn (#99)
 

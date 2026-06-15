@@ -19,6 +19,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -58,6 +59,93 @@ func testDaemon(t *testing.T) *Daemon {
 	}
 	t.Cleanup(func() { d.Shutdown() })
 	return d
+}
+
+func TestRegistryNilConfigWritesNoDescriptor(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "rd*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	d, err := New(Config{
+		Name:         "regnil",
+		ControlPath:  filepath.Join(baseDir, "regnil.ctl.sock"),
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	records, err := registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("nil Registry wrote descriptors: %+v", records)
+	}
+}
+
+func TestRegistryOptInWritesDescriptorAfterControlBind(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "rd*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(baseDir) })
+
+	ctlPath := filepath.Join(baseDir, "regok.ctl.sock")
+	d, err := New(Config{
+		Name:         "regok",
+		ControlPath:  ctlPath,
+		SkipSnapshot: true,
+		Logger:       testLogger(t),
+		Registry: &registry.Config{
+			ProductName:    "Registry Test Product",
+			MuxcoreVersion: "test-version",
+			Capabilities:   registry.Capabilities{ListOwners: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	records, err := registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("registry descriptors = %d, want 1: %+v", len(records), records)
+	}
+	rec := records[0]
+	if rec.Err != nil {
+		t.Fatalf("descriptor parse error: %v", rec.Err)
+	}
+	if rec.Descriptor.EngineName != "regok" {
+		t.Fatalf("engine_name = %q, want regok", rec.Descriptor.EngineName)
+	}
+	if rec.Descriptor.ProductName != "Registry Test Product" {
+		t.Fatalf("product_name = %q", rec.Descriptor.ProductName)
+	}
+	if rec.Descriptor.DaemonControlPath != ctlPath {
+		t.Fatalf("control path = %q, want %q", rec.Descriptor.DaemonControlPath, ctlPath)
+	}
+
+	verified := registry.VerifyDescriptor(rec)
+	if verified.State != registry.StateHealthy || !verified.Reachable {
+		t.Fatalf("VerifyDescriptor = %+v, want healthy reachable", verified)
+	}
+
+	d.Shutdown()
+	records, err = registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors after Shutdown: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("clean Shutdown left registry descriptors: %+v", records)
+	}
 }
 
 type noopSessionHandler struct{}

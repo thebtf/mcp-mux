@@ -18,6 +18,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -127,6 +128,10 @@ type Config struct {
 	// Persistent means the daemon stays alive even with zero sessions.
 	// Useful for servers that maintain long-running state (like aimux).
 	Persistent bool
+
+	// Registry enables opt-in daemon advertisement for cross-engine discovery.
+	// Nil is the zero-value opt-out and preserves pre-registry behavior.
+	Registry *registry.Config
 
 	// BaseDir overrides os.TempDir() for socket file locations.
 	// Empty string = use system temp dir.
@@ -361,6 +366,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		DaemonFlag:       e.cfg.DaemonFlag,
 		Name:             e.cfg.Name,
 		Persistent:       e.cfg.Persistent,
+		Registry:         e.cfg.Registry,
 		AuthorizeSession: e.cfg.AuthorizeSession,
 		OnFrameReceived:  e.cfg.OnFrameReceived,
 	})
