@@ -218,8 +218,9 @@ Required consumer fixture:
   product version, `engine_name`, `daemon_generation`, `owner_generation`,
   `restore_source`, and shim reconnect counters.
 - A consumer update command/tool that exercises the chosen topology from
-  `muxcore/README.md`: stable launcher + versioned engine store, fixed
-  replaceable engine path with `ApplyUpdateAndRestart`, or custom supervisor.
+  `muxcore/README.md`: stable launcher + versioned engine store with
+  `RestartWithSuccessor`, fixed replaceable engine path with
+  `ApplyUpdateAndRestart`, or custom supervisor.
 
 Commands:
 

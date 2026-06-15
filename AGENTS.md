@@ -62,20 +62,24 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.25.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
 ```
 
-### v0.24.4 — engine.ApplyUpdateAndRestart for SessionHandler consumers (#239)
+### v0.25.3 - native SessionHandler live update helpers (#239)
 
-**No breaking changes.** The new update helper is additive; existing
+**No breaking changes.** The live-update helpers are additive; existing
 `upgrade.Swap`, control commands, and engine configuration keep their current
-behavior.
+behavior. Use v0.25.3 as the current consumer target; it supersedes the
+v0.25.1/v0.25.2 release candidates and includes the active-control-socket wait
+fix needed for reliable fallback start after graceful restart.
 
 | API | Semantics |
 |-----|-----------|
 | `engine.UpdateAndRestartOptions` | Caller supplies `CurrentExe`, `StagedExe`, drain/restart/shutdown/ready timeouts, stale cleanup preference, and optional lock-failure behavior. |
+| `engine.RestartWithSuccessorOptions` | Caller supplies the explicit successor executable for stable-launcher/versioned-engine topologies without renaming the launcher. |
 | `engine.UpdateAndRestartResult` | Reports partial success: `OldPath`, daemon-running state, lock acquisition, graceful restart, shutdown fallback, replacement start/readiness, stale cleanup count, and warnings. |
 | `(*engine.MuxEngine).ApplyUpdateAndRestart(ctx, opts)` | Runs the reusable provider sequence: `upgrade.Swap`, daemon namespace lock, `graceful-restart`, shutdown fallback, wait-for-exit, replacement daemon start, and ready wait. |
+| `(*engine.MuxEngine).RestartWithSuccessor(ctx, opts)` | Runs the restart sequence with an explicit `SuccessorExe`, but does not rename files. Use after the consumer has updated its active engine pointer. |
 | `control.Request.SuccessorExe` + `control.GracefulRestartOptionsHandler` | Additive control-plane extension so a caller can tell the old daemon which executable should become the successor during graceful restart. Older handlers fall back to the legacy `HandleGracefulRestart(int)` path. |
 
 **Migration for aimux after muxcore release:**
@@ -126,6 +130,13 @@ product executable/version, `daemon_generation` changes,
 `shim_reconnect_fallback_spawned == 0`, and `shim_reconnect_gave_up == 0`.
 
 **Tests landed in this release:**
+- `TestRestartWithSuccessor_ValidationErrors`
+- `TestRestartWithSuccessor_GracefulSuccessUsesExplicitSuccessor`
+- `TestRestartWithSuccessor_GracefulErrorFallbackStartsSuccessor`
+- `TestRestartWithSuccessor_PreparesControlSocketBeforeCleanFallbackStart`
+- `TestRestartWithSuccessor_TreatsAlreadyBoundReplacementAsReady`
+- `TestPrepareControlSocketForReplacement_WaitsOnActiveSocketFalseNegative`
+- `TestPrepareControlSocketForReplacement_ReturnsAfterEndpointUnavailable`
 - `TestApplyUpdateAndRestart_GracefulSuccessUsesSuccessorExe`
 - `TestApplyUpdateAndRestart_DaemonNotRunningOnlySwaps`
 - `TestApplyUpdateAndRestart_SwapFailureStopsBeforeDaemonCalls`
@@ -467,19 +478,20 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.25.0
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
 ```
 
 Key changes to adopt:
 1. **SessionHandler** — replace `srv.StdioHandler()` with SessionHandler implementation to get per-CC-session ProjectContext
-2. **ApplyUpdateAndRestart** — for live update flows, stage the new binary and call `eng.ApplyUpdateAndRestart(...)`; use `upgrade.Swap` only for low-level rename-only cases.
-3. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
-4. **Circuit breaker** — included automatically, protects against upstream crash loops
+2. **Native update topology** — use `eng.RestartWithSuccessor(...)` when aimux keeps a stable launcher plus versioned engine store; use `eng.ApplyUpdateAndRestart(...)` only when `CurrentExe` is the replaceable engine path. Do not call `upgrade.Swap` as the whole update protocol.
+3. **Native process management** — agents should use aimux's own `sessions`, `status`, and `upgrade` surfaces for aimux state. `mcp-mux mux_list` is scoped to mcp-mux unless a future opt-in muxcore registry is implemented.
+4. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
+5. **Circuit breaker** — included automatically, protects against upstream crash loops
 
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.19.3
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
 ```
 
 Key changes:
