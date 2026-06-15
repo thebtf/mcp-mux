@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -580,7 +581,12 @@ func TestPrepareControlSocketForReplacement_DoesNotUnlinkActiveSocketOnFalseNega
 		t.Skip("Unix socket pathname unlink race does not apply to Windows named pipes")
 	}
 	restoreUpdateSeams(t)
-	ctlPath := filepath.Join(t.TempDir(), "control.sock")
+	baseDir, err := os.MkdirTemp("", "ctl*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(baseDir) })
+	ctlPath := filepath.Join(baseDir, "control.sock")
 	ln, err := net.Listen("unix", ctlPath)
 	if err != nil {
 		t.Fatalf("listen unix socket: %v", err)
