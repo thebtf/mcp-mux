@@ -14,8 +14,13 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.25.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
 ```
+
+Use v0.25.3 for native SessionHandler hot-update work. It is the current
+consumer target for the `RestartWithSuccessor` / `ApplyUpdateAndRestart`
+contract and includes the active-control-socket wait fix required for reliable
+fallback start after graceful restart.
 
 ## Golden Path
 
@@ -271,7 +276,7 @@ operator docs.
 
 | Topology | Use when | Consumer action |
 | --- | --- | --- |
-| Stable launcher + versioned engine store | The executable configured in the MCP host may be held open by live shims or daemons. This is the safest Windows topology. | Keep the configured launcher stable. Install each build as a new engine path such as `versions/<hash>/<product>-engine.exe`, update an `active.txt` pointer, and restart with `MCPMUX_ACTIVE_ENGINE_FILE` or `MCPMUX_SUCCESSOR_EXE` pointing at the intended successor. Do not call `ApplyUpdateAndRestart` against the launcher path. |
+| Stable launcher + versioned engine store | The executable configured in the MCP host may be held open by live shims or daemons. This is the safest Windows topology. | Keep the configured launcher stable. Install each build as a new engine path such as `versions/<hash>/<product>-engine.exe`, update an `active.txt` pointer, then call `RestartWithSuccessor` or restart with `MCPMUX_ACTIVE_ENGINE_FILE` / `MCPMUX_SUCCESSOR_EXE` pointing at the intended successor. Do not call `ApplyUpdateAndRestart` against the launcher path. |
 | Fixed replaceable engine path | The product has a current engine executable path that can be renamed while old processes continue from `*.old.<pid>`. | Build or copy the candidate to an explicit `StagedExe`, commonly `CurrentExe + "~"`, then call `ApplyUpdateAndRestart` with `CurrentExe` set to that replaceable engine path. |
 | Offline / custom supervisor | The product owns daemon lifecycle outside the standard engine helper. | Use `upgrade.Swap` only as the rename primitive. Your updater must still handle daemon namespace locking, graceful restart, shutdown fallback, daemon start, ready wait, and status reporting. |
 
