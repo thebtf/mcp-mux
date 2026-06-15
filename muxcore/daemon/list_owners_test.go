@@ -71,6 +71,9 @@ func TestHandleListOwners(t *testing.T) {
 		if o.ServerID == "" {
 			t.Error("owner has empty ServerID")
 		}
+		if o.EngineName != "test-daemon" {
+			t.Errorf("owner %s engine_name = %q, want test-daemon", o.ServerID, o.EngineName)
+		}
 		sidSet[o.ServerID] = true
 	}
 	for _, sid := range sids {

@@ -14,7 +14,7 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.24.3
+go get github.com/thebtf/mcp-mux/muxcore@v0.25.0
 ```
 
 ## Golden Path
@@ -132,12 +132,11 @@ Every muxcore consumer should satisfy this checklist before shipping.
    operator process.
 
 10. **Provide a real update strategy.**
-    Muxcore can restart daemons and reattach owners, but it cannot replace your
-    product binary safely by itself. On Windows the configured executable is
-    exactly the file most likely to be locked by live shims/daemons. Production
-    consumers should use a stable launcher plus versioned engine store, or set
-    `MCPMUX_SUCCESSOR_EXE` / `MCPMUX_ACTIVE_ENGINE_FILE` so graceful restart
-    spawns the intended successor executable.
+    Muxcore can restart daemons and reattach owners, but your product must
+    choose how new executable bytes become the next daemon. On Windows the
+    configured executable is exactly the file most likely to be held by live
+    shim/daemon processes, so do not assume that a self-overwrite or
+    launcher-path swap is a safe update protocol.
 
 ## SessionHandler Contract
 
@@ -265,11 +264,25 @@ behind a versioned engine pointer.
 but it is not a full production update strategy for binaries that may be held
 open by many live shim processes.
 
+### Choose One Update Topology
+
+Pick exactly one product topology and document it in the consumer's own
+operator docs.
+
+| Topology | Use when | Consumer action |
+| --- | --- | --- |
+| Stable launcher + versioned engine store | The executable configured in the MCP host may be held open by live shims or daemons. This is the safest Windows topology. | Keep the configured launcher stable. Install each build as a new engine path such as `versions/<hash>/<product>-engine.exe`, update an `active.txt` pointer, and restart with `MCPMUX_ACTIVE_ENGINE_FILE` or `MCPMUX_SUCCESSOR_EXE` pointing at the intended successor. Do not call `ApplyUpdateAndRestart` against the launcher path. |
+| Fixed replaceable engine path | The product has a current engine executable path that can be renamed while old processes continue from `*.old.<pid>`. | Build or copy the candidate to an explicit `StagedExe`, commonly `CurrentExe + "~"`, then call `ApplyUpdateAndRestart` with `CurrentExe` set to that replaceable engine path. |
+| Offline / custom supervisor | The product owns daemon lifecycle outside the standard engine helper. | Use `upgrade.Swap` only as the rename primitive. Your updater must still handle daemon namespace locking, graceful restart, shutdown fallback, daemon start, ready wait, and status reporting. |
+
 ### Apply Update and Restart
 
-Engine consumers that use `engine.New` should prefer
-`MuxEngine.ApplyUpdateAndRestart` over hand-rolled upgrade code. It combines
-the Windows-safe binary swap with daemon lifecycle orchestration:
+Consumers using the **fixed replaceable engine path** topology should prefer
+`MuxEngine.ApplyUpdateAndRestart` over hand-rolled upgrade code. In this helper,
+`CurrentExe` is the replaceable engine executable that should exist after the
+swap, and `StagedExe` is the already-built replacement binary. `CurrentExe` is
+not the configured stable launcher path unless your product deliberately makes
+that path replaceable while live processes are running.
 
 ```go
 result, err := eng.ApplyUpdateAndRestart(ctx, engine.UpdateAndRestartOptions{
@@ -304,11 +317,23 @@ The helper:
 6. Waits for the replacement daemon to answer `ping` before releasing the lock.
 
 SessionHandler consumers such as aimux can use this in their own
-`upgrade(action=apply)` path after staging a new binary. The shim process must
-survive for transparent reconnect to work. Muxcore keeps the shim transport
-alive and reconnects it to the replacement daemon when possible; it does not
-promise that every in-flight request succeeds. Requests active during reconnect
+`upgrade(action=apply)` path only when their product topology has a replaceable
+engine path. If they use a stable launcher and versioned engine store, their
+updater should update the engine pointer and invoke graceful restart with the
+intended successor executable instead.
+
+The shim process must survive for transparent reconnect to work. Muxcore keeps
+the shim transport alive and reconnects it to the replacement daemon when
+possible; it does not promise request replay. Requests active during reconnect
 may receive explicit JSON-RPC errors by original ID.
+
+For `SessionHandler` consumers, this is **transport and owner continuity**, not
+a heap-state migration of the old daemon process. Muxcore preserves the
+snapshot-restored owner registry, cached initialize/tools/prompts/resources
+responses, classification, cwd/env metadata, reconnect-token history, and shim
+reconnection. Product-private in-memory state inside the handler survives only
+if the consumer persists it outside the daemon process or can reconstruct it in
+the successor.
 
 ## What muxcore Enforces
 
@@ -382,6 +407,10 @@ Avoid these integration patterns:
   sessions, not necessarily owner allocation.
 - Using `upgrade.Swap` as the only live-update mechanism on Windows for a
   heavily shared configured executable.
+- Calling `ApplyUpdateAndRestart` with a stable launcher path when the real
+  successor is selected by an active-engine pointer.
+- Reporting update success without checking `UpdateAndRestartResult` or the
+  `UpdateAndRestartError.Phase` and partial `Result`.
 
 ## Integration Verification
 
@@ -399,10 +428,15 @@ Then run a customer-mode smoke through the same entrypoint your MCP host uses:
 2. Open two sessions and confirm shared/session-aware/isolated behavior matches
    your intended mode.
 3. Restart the daemon and confirm the shim reconnects.
-4. If you ship a launcher/versioned-engine updater, run the updater while a
-   session is active and confirm the next daemon uses the intended engine.
+4. If you ship an updater, run it while a session is active and confirm the
+   next daemon uses the intended engine or successor path.
 5. Inspect `HandleStatus` / control-plane status for `daemon_generation`,
    `owner_generation`, `restore_source`, and reconnect counters.
+6. Verify native muxcore products through their own MCP/CLI health and update
+   surfaces. `mcp-mux serve` / `mux_list` observes the `mcp-mux` daemon
+   namespace; it is not a generic registry for `aimux`, `engram`, or other
+   native muxcore daemons unless those products explicitly opt into such a
+   registry.
 
 ## Stable Operator Status Contract
 
@@ -415,6 +449,7 @@ Current lifecycle evidence fields:
 
 | Field | Meaning |
 | --- | --- |
+| `engine_name` | Daemon namespace name such as `mcp-mux`, `aimux`, or `engram`; use it to avoid confusing product-native daemons with the `mcp-mux` product daemon. |
 | `daemon_generation` | Process-lifetime generation string for distinguishing predecessor and successor daemons. |
 | `reaped_owner_count` | Count of owners removed by idle lifecycle reaping. |
 | `owner_removal.total` | Count of owner-removal helper executions in this daemon process. |

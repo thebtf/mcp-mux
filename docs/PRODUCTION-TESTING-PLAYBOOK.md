@@ -17,6 +17,10 @@ This playbook covers the local CLI/runtime surfaces that users depend on:
 - Release deployment to the workstation binary through the documented upgrade
   path, when deployment is part of the release contract.
 
+This is the `mcp-mux` product playbook. Muxcore library consumers need their
+own customer-mode playbooks that exercise the consumer's public MCP/CLI entrypoint,
+health/status surface, and chosen update topology.
+
 ## Prerequisites
 
 - Windows PowerShell from the repository root.
@@ -94,6 +98,10 @@ Expected:
 Run this scenario only when the release contract includes deploying to this
 workstation.
 
+This scenario is specific to the `mcp-mux` product updater. Native muxcore
+consumers should not copy the `mcp-mux.exe~` / `mcp-mux.versions` layout unless
+their product deliberately chose the same topology.
+
 Commands:
 
 ```powershell
@@ -110,7 +118,7 @@ Expected:
   `mcp-mux.versions/<hash>/mcp-mux-engine.exe`, and
   `mcp-mux.versions/active.txt` points at that engine.
 - `status` responds without handshake failure.
-- Existing consumers reconnect through the shim/daemon path rather than
+- Existing MCP host sessions/shims reconnect through the shim/daemon path rather than
   requiring manual config edits.
 
 Broken signals:
@@ -192,6 +200,59 @@ Broken signals:
   before concluding v0.25.0 regression — `mcp-server-time` is normally
   shared-classifiable; an isolated verdict suggests classification
   bypassed (look at `classification_source` and `classification_reason`).
+
+## Scenario 5b: Native Muxcore Consumer Hot Update
+
+Run this scenario when the release changes muxcore library contracts, update
+helpers, or docs that native consumers depend on.
+
+Objective: prove a product that embeds muxcore can update through its own
+public entrypoint without agents reaching for `mcp-mux mux_list` as the source
+of truth.
+
+Required consumer fixture:
+
+- A small SessionHandler-based test binary or a real downstream product in a
+  read-only fixture mode.
+- A stable consumer status or health command/tool that reports at least:
+  product version, `engine_name`, `daemon_generation`, `owner_generation`,
+  `restore_source`, and shim reconnect counters.
+- A consumer update command/tool that exercises the chosen topology from
+  `muxcore/README.md`: stable launcher + versioned engine store, fixed
+  replaceable engine path with `ApplyUpdateAndRestart`, or custom supervisor.
+
+Commands:
+
+```powershell
+# 1. Start the old consumer through the same entrypoint an MCP host uses.
+# 2. Call the consumer's own health/status surface and save the old version
+#    plus daemon_generation/owner_generation.
+# 3. Keep that MCP session open.
+# 4. Stage the new consumer binary using the consumer's documented topology.
+# 5. Invoke the consumer's own update/apply command.
+# 6. Call the same consumer health/status surface through the still-open
+#    session and then through a fresh session.
+```
+
+Expected:
+
+- The update result reports whether it used graceful restart or fallback
+  shutdown/start, and reports partial failure phase when it cannot complete.
+- The still-open session can make a successful post-update MCP request.
+- A fresh session reports the new product version.
+- `daemon_generation` changes, `engine_name` stays the consumer's engine name,
+  and reconnect counters show no `shim_reconnect_gave_up`.
+- For `SessionHandler` products, product-private in-memory state is either
+  durably restored by the consumer or explicitly documented as not preserved.
+
+Forbidden signals:
+
+- `connection closed: initialize response`.
+- Inspecting or managing a native consumer solely through `mcp-mux mux_list`.
+- Reporting success from `upgrade.Swap` alone without daemon restart/readiness
+  evidence.
+- Calling `ApplyUpdateAndRestart` against a stable launcher path when the real
+  successor should come from a versioned engine pointer.
 
 ## Scenario 6: Isolated Owner Short Idle Cleanup (v0.25.0)
 
@@ -350,6 +411,7 @@ with this table:
 | 3 | Current Topology Oracle | PoC verdict PASS |  | PASS/FAIL |
 | 4 | Local Deployment Upgrade | Production binary upgraded and status works |  | PASS/FAIL/SKIPPED |
 | 5 | Global-First Owner Dedup (v0.25.0) | 1 owner per (cmd, args) across 2 cwds |  | PASS/FAIL |
+| 5b | Native Muxcore Consumer Hot Update | Consumer-owned update path preserves MCP session and reports new version |  | PASS/FAIL/SKIPPED |
 | 6 | Isolated Short Idle Cleanup (v0.25.0) | Target isolated owner reaped within ~70s of zero sessions (60s idle + 10s sweep) |  | PASS/FAIL |
 | 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
 

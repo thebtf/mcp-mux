@@ -174,7 +174,6 @@ type Daemon struct {
 	// not per request).
 	forcedIsolatedRetryCounters sync.Map // key: base isolated sid → *atomic.Int64
 
-
 	// daemonFlag is the CLI flag passed to the successor binary by spawnSuccessor.
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
@@ -1694,6 +1693,7 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	return map[string]any{
 		"daemon":                          true,
+		"engine_name":                     d.name,
 		"shutting_down":                   d.shuttingDown.Load(),
 		"pid":                             os.Getpid(),
 		"daemon_generation":               d.daemonGeneration,
@@ -1757,6 +1757,7 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 		cwd, _ := s["cwd"].(string)
 		muxVer, _ := s["mux_version"].(string)
 		classification, _ := s["auto_classification"].(string)
+		classificationSource, _ := s["classification_source"].(string)
 
 		sessions := 0
 		switch v := s["session_count"].(type) {
@@ -1778,6 +1779,16 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 			pending = v
 		}
 
+		upstreamPID := 0
+		switch v := s["upstream_pid"].(type) {
+		case int:
+			upstreamPID = v
+		case float64:
+			upstreamPID = int(v)
+		case int64:
+			upstreamPID = int(v)
+		}
+
 		var cwdSet []string
 		switch v := s["cwd_set"].(type) {
 		case []string:
@@ -1790,17 +1801,42 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 			}
 		}
 
+		var classificationReason []string
+		switch v := s["classification_reason"].(type) {
+		case []string:
+			classificationReason = append(classificationReason, v...)
+		case []any:
+			for _, r := range v {
+				if rs, ok := r.(string); ok {
+					classificationReason = append(classificationReason, rs)
+				}
+			}
+		}
+
+		cachedInit, _ := s["cached_init"].(bool)
+		cachedTools, _ := s["cached_tools"].(bool)
+		cachedPrompts, _ := s["cached_prompts"].(bool)
+		cachedResources, _ := s["cached_resources"].(bool)
+
 		owners = append(owners, control.OwnerInfo{
-			ServerID:       sid,
-			Command:        entry.Command,
-			Args:           entry.Args,
-			Cwd:            cwd,
-			CwdSet:         cwdSet,
-			Sessions:       sessions,
-			Pending:        pending,
-			Classification: classification,
-			MuxVersion:     muxVer,
-			Persistent:     entry.Persistent,
+			ServerID:             sid,
+			EngineName:           d.name,
+			Command:              entry.Command,
+			Args:                 entry.Args,
+			Cwd:                  cwd,
+			CwdSet:               cwdSet,
+			Sessions:             sessions,
+			Pending:              pending,
+			UpstreamPID:          upstreamPID,
+			Classification:       classification,
+			ClassificationSource: classificationSource,
+			ClassificationReason: classificationReason,
+			MuxVersion:           muxVer,
+			Persistent:           entry.Persistent,
+			CachedInit:           cachedInit,
+			CachedTools:          cachedTools,
+			CachedPrompts:        cachedPrompts,
+			CachedResources:      cachedResources,
 		})
 	}
 

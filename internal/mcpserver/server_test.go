@@ -1009,14 +1009,20 @@ func TestMuxListVerbose(t *testing.T) {
 	owners := control.ListOwnersResponse{
 		Owners: []control.OwnerInfo{
 			{
-				ServerID:       sid,
-				Command:        "node",
-				Args:           []string{"verbose-test.js"},
-				Sessions:       3,
-				Pending:        1,
-				Classification: "session-aware",
-				MuxVersion:     "v0.5.1",
-				Cwd:            baseDir,
+				ServerID:             sid,
+				EngineName:           "mcp-mux",
+				Command:              "node",
+				Args:                 []string{"verbose-test.js"},
+				Sessions:             3,
+				Pending:              1,
+				UpstreamPID:          1234,
+				Classification:       "session-aware",
+				ClassificationSource: "tools",
+				ClassificationReason: []string{"session"},
+				MuxVersion:           "v0.5.1",
+				Cwd:                  baseDir,
+				CachedInit:           true,
+				CachedTools:          true,
 			},
 		},
 	}
@@ -1041,6 +1047,11 @@ func TestMuxListVerbose(t *testing.T) {
 	text := result.Content[0].Text
 	if !strings.Contains(text, "session-aware") {
 		t.Errorf("verbose mux_list should contain classification, got: %s", text)
+	}
+	for _, want := range []string{"mcp-mux", "tools", "session", "1234", "cached_tools"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("verbose mux_list should contain %q, got: %s", want, text)
+		}
 	}
 }
 

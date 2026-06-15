@@ -322,6 +322,11 @@ mcp-mux serve
 
 Upgrading the mcp-mux binary while sessions are active is safe and fast:
 
+This section describes the `mcp-mux` product updater. If you embed `muxcore`
+in another product, start from `muxcore/README.md` and choose that product's
+own launcher, engine path, staging name, and status/update surface instead of
+copying the `mcp-mux.exe~` / `mcp-mux.versions` layout blindly.
+
 ```sh
 # One-command upgrade with graceful restart
 go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
@@ -538,7 +543,7 @@ any other server:
 
 | Tool | Description |
 |------|-------------|
-| `mux_list` | Returns running instances for the **current project** (filtered by caller's cwd). Pass `all: true` to list instances across all projects. Includes server ID, PID, session count, pending requests, classification, and cache status. With `verbose: true`, includes inflight request details: method, tool name, session, elapsed time. |
+| `mux_list` | Returns running instances for the **current project** inside this `mcp-mux` daemon namespace (filtered by caller's cwd). Pass `all: true` to list this daemon's instances across all projects. Includes server ID, engine name, PID, session count, pending requests, classification, and cache status. With `verbose: true`, includes classification source/reason and inflight request details when present. |
 | `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. |
 | `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux, not another project's). Connected sessions reconnect automatically on their next tool call. |
 
@@ -548,12 +553,19 @@ The control plane is session-aware. Each tool call is resolved in the context of
 session's working directory:
 
 - `mux_list` — shows only servers owned by the current project by default.
-  Use `mux_list(all: true)` for a full view across all projects.
+  Use `mux_list(all: true)` for a full view across all projects in this
+  `mcp-mux` daemon.
 - `mux_restart(name: "aimux")` — resolves to the aimux instance started from this project's
   directory, not a same-named server from a different project.
 
 This prevents accidental cross-project interference when multiple projects use the same server
 name.
+
+Native muxcore products such as `aimux` or `engram` run under their own engine
+namespaces when they embed muxcore directly. They do not appear in
+`mcp-mux serve` unless they were launched through the `mcp-mux` product daemon.
+Inspect or update those products through their own MCP/CLI health and update
+surfaces, or through a future explicit cross-engine registry.
 
 **Prompts:**
 

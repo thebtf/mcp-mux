@@ -57,12 +57,12 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.24.x)
+## muxcore Library API (v0.25.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.24.4
+go get github.com/thebtf/mcp-mux/muxcore@v0.25.0
 ```
 
 ### v0.24.4 — engine.ApplyUpdateAndRestart for SessionHandler consumers (#239)
@@ -80,6 +80,11 @@ behavior.
 
 **Migration for aimux after muxcore release:**
 
+Use this helper only for the fixed replaceable engine path topology. If aimux
+or another consumer uses a stable launcher plus versioned engine store, update
+the active engine pointer and invoke graceful restart with the intended
+successor executable instead of passing the launcher path as `CurrentExe`.
+
 ```go
 result, err := eng.ApplyUpdateAndRestart(ctx, engine.UpdateAndRestartOptions{
     CurrentExe:      currentExe,
@@ -95,6 +100,12 @@ result, err := eng.ApplyUpdateAndRestart(ctx, engine.UpdateAndRestartOptions{
 Contract: surviving shims reconnect automatically to the replacement daemon
 when possible. This is transport continuity, not request replay; in-flight
 requests may receive explicit JSON-RPC errors by original ID.
+
+For `SessionHandler` consumers, this is not heap-state migration. Muxcore
+preserves shim transport, owner/snapshot metadata, cached MCP discovery
+responses, classification, cwd/env metadata, reconnect-token history, and
+reconnect behavior. Product-private handler state must be persisted by the
+consumer or reconstructed by the successor daemon.
 
 **Tests landed in this release:**
 - `TestApplyUpdateAndRestart_GracefulSuccessUsesSuccessorExe`
@@ -438,7 +449,7 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.23.0
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.25.0
 ```
 
 Key changes to adopt:
