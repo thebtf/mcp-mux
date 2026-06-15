@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -20,6 +21,7 @@ const pipeBufferSize = 64 * 1024
 var (
 	staleSocketRemoveAttempts = 40
 	staleSocketRemoveDelay    = 25 * time.Millisecond
+	pipeListenerCloseTimeout  = 2 * time.Second
 	removeSocketFile          = os.Remove
 	renameSocketFile          = os.Rename
 	sleepBeforeRemoveRetry    = time.Sleep
@@ -69,10 +71,19 @@ func currentUserSDDL() (string, error) {
 
 type pipeListener struct {
 	net.Listener
-	path string
+	path      string
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (l *pipeListener) Close() error {
+	l.closeOnce.Do(func() {
+		l.closeErr = l.close()
+	})
+	return l.closeErr
+}
+
+func (l *pipeListener) close() error {
 	// go-winio aborts a pending Accept by closing the in-flight pipe handle.
 	// On Windows that can wait on overlapped ConnectNamedPipe cancellation.
 	// Wake the Accept path first so the listener routine returns to its close
@@ -81,7 +92,18 @@ func (l *pipeListener) Close() error {
 		_ = conn.Close()
 	}
 	time.Sleep(10 * time.Millisecond)
-	return l.Listener.Close()
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- l.Listener.Close()
+	}()
+
+	select {
+	case err := <-closed:
+		return err
+	case <-time.After(pipeListenerCloseTimeout):
+		return fmt.Errorf("ipc: close named pipe listener %s timed out after %s", l.path, pipeListenerCloseTimeout)
+	}
 }
 
 func Dial(path string) (net.Conn, error) {

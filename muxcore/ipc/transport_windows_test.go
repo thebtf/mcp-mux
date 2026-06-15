@@ -131,6 +131,42 @@ func TestDetachedProcessListenerAcceptsParentDial(t *testing.T) {
 	}
 }
 
+func TestPipeListenerCloseTimesOutWhenUnderlyingCloseBlocks(t *testing.T) {
+	oldTimeout := pipeListenerCloseTimeout
+	pipeListenerCloseTimeout = 25 * time.Millisecond
+	defer func() { pipeListenerCloseTimeout = oldTimeout }()
+
+	inner := &blockingCloseListener{
+		closeStarted: make(chan struct{}),
+		unblockClose: make(chan struct{}),
+	}
+	defer close(inner.unblockClose)
+
+	ln := &pipeListener{
+		Listener: inner,
+		path:     socketPath(t),
+	}
+
+	start := time.Now()
+	err := ln.Close()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Close() error = nil, want timeout")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("Close() error = %v, want timeout", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Close() took %s, want bounded timeout", elapsed)
+	}
+
+	select {
+	case <-inner.closeStarted:
+	default:
+		t.Fatal("underlying listener Close was not called")
+	}
+}
+
 func TestDetachedProcessListenerHelper(t *testing.T) {
 	if os.Getenv("MUXCORE_IPC_TEST_HELPER") != "1" {
 		return
@@ -163,6 +199,30 @@ func TestDetachedProcessListenerHelper(t *testing.T) {
 	_ = os.WriteFile(resultPath, []byte("ok"), 0600)
 	os.Exit(0)
 }
+
+type blockingCloseListener struct {
+	closeStarted chan struct{}
+	unblockClose chan struct{}
+}
+
+func (l *blockingCloseListener) Accept() (net.Conn, error) {
+	return nil, net.ErrClosed
+}
+
+func (l *blockingCloseListener) Close() error {
+	close(l.closeStarted)
+	<-l.unblockClose
+	return nil
+}
+
+func (l *blockingCloseListener) Addr() net.Addr {
+	return testAddr("blocking-close-listener")
+}
+
+type testAddr string
+
+func (a testAddr) Network() string { return "test" }
+func (a testAddr) String() string  { return string(a) }
 
 func waitForFile(t *testing.T, path string, timeout time.Duration) {
 	t.Helper()
