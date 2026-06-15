@@ -542,22 +542,14 @@ func prepareControlSocketForReplacement(ctx context.Context, ctlPath string, tim
 	defer timer.Stop()
 	ticker := time.NewTicker(daemonPollInterval)
 	defer ticker.Stop()
-	var lastErr error
 	for {
 		if !engineIsDaemonRunning(ctlPath) {
-			err := os.Remove(ctlPath)
-			if err == nil || os.IsNotExist(err) {
-				return nil
-			}
-			lastErr = err
+			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timer.C:
-			if lastErr != nil {
-				return fmt.Errorf("control socket %s was not released: %w", ctlPath, lastErr)
-			}
 			return fmt.Errorf("control socket %s was still active", ctlPath)
 		case <-ticker.C:
 		}
