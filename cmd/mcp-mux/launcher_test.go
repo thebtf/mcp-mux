@@ -473,7 +473,7 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 	if code := runLauncherUpgrade(launcherPath, []string{"--restart-active", filepath.Join("relative-engine", engineFileName())}); code != 0 {
 		t.Fatalf("runLauncherUpgrade(--restart-active) code = %d, want 0", code)
 	}
-	if gotEnginePath != enginePath {
+	if !samePath(gotEnginePath, enginePath) {
 		t.Fatalf("SuccessorExe = %q, want absolute path %q", gotEnginePath, enginePath)
 	}
 }
