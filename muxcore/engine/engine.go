@@ -662,6 +662,8 @@ func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (strin
 			return "", daemon.ErrOwnerGone
 		case daemon.ErrUnknownToken.Error():
 			return "", daemon.ErrUnknownToken
+		case daemon.ErrDaemonShuttingDown.Error():
+			return "", daemon.ErrDaemonShuttingDown
 		default:
 			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
 		}

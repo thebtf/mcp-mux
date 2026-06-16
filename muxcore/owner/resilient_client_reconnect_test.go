@@ -317,6 +317,55 @@ func TestReconnect_ImmediateSpawnOnUnknownToken(t *testing.T) {
 	}
 }
 
+func TestReconnect_RetriesRefreshDuringDaemonShutdown(t *testing.T) {
+	var logs bytes.Buffer
+	logger := log.New(&logs, "", 0)
+	rc := newReconnectClient(t, io.Discard, logger)
+	rc.token = "prev-token"
+
+	refreshPath := tempReconnectSocketPath(t, "aabbccddeeff")
+	srv, _ := startEchoIPCServer(t, refreshPath)
+	defer srv.closeAll()
+
+	stdinDone := make(chan error)
+	refreshCalls := 0
+	reconnectCalls := 0
+	rc.cfg.RefreshToken = func() (string, string, error) {
+		refreshCalls++
+		if refreshCalls == 1 {
+			return "", "", errors.New("daemon shutting down")
+		}
+		return refreshPath, "fresh-token", nil
+	}
+	rc.cfg.Reconnect = func() (string, string, error) {
+		reconnectCalls++
+		return "", "", errors.New("unexpected fallback spawn")
+	}
+
+	conn, err := rc.reconnect(&sync.Mutex{}, stdinDone)
+	if err != nil {
+		t.Fatalf("reconnect() error = %v", err)
+	}
+	defer closeReconnectConn(t, conn)
+
+	if refreshCalls != 2 {
+		t.Fatalf("refreshCalls = %d, want 2", refreshCalls)
+	}
+	if reconnectCalls != 0 {
+		t.Fatalf("reconnectCalls = %d, want 0", reconnectCalls)
+	}
+	if rc.token != "fresh-token" {
+		t.Fatalf("rc.token = %q, want fresh-token", rc.token)
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, "shim.reconnect.refresh_fail reason=daemon_shutting_down") {
+		t.Fatalf("missing transient refresh_fail log, got %q", logText)
+	}
+	if strings.Contains(logText, "shim.reconnect.fallback_spawn") {
+		t.Fatalf("unexpected fallback spawn log, got %q", logText)
+	}
+}
+
 func startGenerationIPCServer(t *testing.T, path, generation string) *echoServer {
 	t.Helper()
 	received := make(chan string, 100)

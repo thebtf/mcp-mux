@@ -1745,6 +1745,10 @@ func (d *Daemon) afterSnapshotOnlyRestart(successorExe string) func() {
 
 // HandleRefreshSessionToken implements control.DaemonHandler.
 func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
+	if d.shuttingDown.Load() {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=daemon_shutting_down")
+		return "", ErrDaemonShuttingDown
+	}
 	if prevToken == "" {
 		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
 		return "", ErrUnknownToken
