@@ -279,7 +279,9 @@ func startDaemonProcess() error {
 func daemonExecutableForSpawn(currentExe string) string {
 	if pointerPath := os.Getenv(envActiveEngineFile); pointerPath != "" {
 		if activeExe, ok := resolveActiveEnginePointer(pointerPath); ok && !samePath(activeExe, currentExe) {
-			return activeExe
+			if _, err := os.Stat(activeExe); err == nil {
+				return activeExe
+			}
 		}
 	}
 	return currentExe

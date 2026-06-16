@@ -141,6 +141,23 @@ func TestDaemonExecutableForSpawnUsesActiveEnginePointer(t *testing.T) {
 	}
 }
 
+func TestDaemonExecutableForSpawnIgnoresMissingActiveEnginePointer(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	currentEnginePath := filepath.Join(versionStoreDir(launcherPath), "old123", engineFileName())
+	missingActiveEnginePath := filepath.Join(versionStoreDir(launcherPath), "missing", engineFileName())
+	writeTestFile(t, currentEnginePath, "old engine")
+	if err := writeActiveEngine(launcherPath, missingActiveEnginePath); err != nil {
+		t.Fatalf("writeActiveEngine() error = %v", err)
+	}
+	t.Setenv(envActiveEngineFile, activeEngineFile(launcherPath))
+
+	got := daemonExecutableForSpawn(currentEnginePath)
+	if !samePath(got, currentEnginePath) {
+		t.Fatalf("daemonExecutableForSpawn() = %q, want current engine %q", got, currentEnginePath)
+	}
+}
+
 func TestRunEngineProcessStartFailureFallsBackToLauncher(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
@@ -399,6 +416,65 @@ func TestRunLauncherUpgradeRestartActiveDoesNotRequirePendingUpdate(t *testing.T
 
 	if code := runLauncherUpgrade(launcherPath, []string{"--restart-active", enginePath}); code != 0 {
 		t.Fatalf("runLauncherUpgrade(--restart-active) code = %d, want 0", code)
+	}
+}
+
+func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	enginePath := filepath.Join(dir, "relative-engine", engineFileName())
+	writeTestFile(t, launcherPath, "launcher")
+	writeTestFile(t, enginePath, "engine")
+
+	oldRestart := launcherRunRestartActive
+	oldWd, wdErr := os.Getwd()
+	if wdErr != nil {
+		t.Fatalf("Getwd(): %v", wdErr)
+	}
+	t.Cleanup(func() {
+		launcherRunRestartActive = oldRestart
+		if err := os.Chdir(oldWd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%s): %v", dir, err)
+	}
+
+	var gotEnginePath string
+	launcherRunRestartActive = func(string, string) int {
+		t.Fatal("--restart-active should restart inline, not re-exec")
+		return 1
+	}
+	oldIsDaemonRunning := launcherIsDaemonRunning
+	oldControlSendWithTimeout := launcherControlSendWithTimeout
+	oldWaitForDaemonExit := launcherWaitForDaemonExit
+	oldWaitForDaemon := launcherWaitForDaemon
+	oldStartDaemonProcessFrom := launcherStartDaemonProcessFrom
+	t.Cleanup(func() {
+		launcherIsDaemonRunning = oldIsDaemonRunning
+		launcherControlSendWithTimeout = oldControlSendWithTimeout
+		launcherWaitForDaemonExit = oldWaitForDaemonExit
+		launcherWaitForDaemon = oldWaitForDaemon
+		launcherStartDaemonProcessFrom = oldStartDaemonProcessFrom
+	})
+	launcherIsDaemonRunning = func(string) bool { return true }
+	launcherControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
+		gotEnginePath = req.SuccessorExe
+		return &control.Response{OK: true}, nil
+	}
+	launcherWaitForDaemonExit = func(string, string) {}
+	launcherWaitForDaemon = func(string, time.Duration) error { return nil }
+	launcherStartDaemonProcessFrom = func(string, string) error {
+		t.Fatal("--restart-active should not fallback-start when successor is ready")
+		return nil
+	}
+
+	if code := runLauncherUpgrade(launcherPath, []string{"--restart-active", filepath.Join("relative-engine", engineFileName())}); code != 0 {
+		t.Fatalf("runLauncherUpgrade(--restart-active) code = %d, want 0", code)
+	}
+	if gotEnginePath != enginePath {
+		t.Fatalf("SuccessorExe = %q, want absolute path %q", gotEnginePath, enginePath)
 	}
 }
 

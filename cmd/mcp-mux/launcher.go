@@ -115,7 +115,13 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 		return 2
 	}
 	if *restartActive != "" {
-		if err := restartDaemonAfterEngineSwitch(launcherPath, filepath.Clean(*restartActive)); err != nil {
+		enginePath, err := filepath.Abs(filepath.Clean(*restartActive))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: resolve active engine path: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+			return 1
+		}
+		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
 			return 1
