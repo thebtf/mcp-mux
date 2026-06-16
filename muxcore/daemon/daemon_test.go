@@ -631,6 +631,16 @@ func TestHandleRefreshSessionToken_UnknownToken(t *testing.T) {
 	}
 }
 
+func TestHandleRefreshSessionToken_ShuttingDownIsTransient(t *testing.T) {
+	d := testDaemon(t)
+	d.shuttingDown.Store(true)
+
+	_, err := d.HandleRefreshSessionToken("missing-token")
+	if !errors.Is(err, ErrDaemonShuttingDown) {
+		t.Fatalf("HandleRefreshSessionToken() error = %v, want ErrDaemonShuttingDown", err)
+	}
+}
+
 func TestHandleRefreshSessionToken_OwnerGone(t *testing.T) {
 	d := testDaemon(t)
 	sid := "owner-refresh-gone"

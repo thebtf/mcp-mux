@@ -253,8 +253,10 @@ func startDaemonProcess() error {
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
+	daemonExe := daemonExecutableForSpawn(exe)
 
-	cmd := exec.Command(exe, "daemon")
+	cmd := exec.Command(daemonExe, "daemon")
+	cmd.Env = setEnv(os.Environ(), envEngineMode, "1")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Stdin = nil
@@ -272,6 +274,17 @@ func startDaemonProcess() error {
 	}
 
 	return nil
+}
+
+func daemonExecutableForSpawn(currentExe string) string {
+	if pointerPath := os.Getenv(envActiveEngineFile); pointerPath != "" {
+		if activeExe, ok := resolveActiveEnginePointer(pointerPath); ok && !samePath(activeExe, currentExe) {
+			if _, err := os.Stat(activeExe); err == nil {
+				return activeExe
+			}
+		}
+	}
+	return currentExe
 }
 
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path and handshake token.
@@ -349,6 +362,8 @@ func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error)
 			return "", daemon.ErrOwnerGone
 		case daemon.ErrUnknownToken.Error():
 			return "", daemon.ErrUnknownToken
+		case daemon.ErrDaemonShuttingDown.Error():
+			return "", daemon.ErrDaemonShuttingDown
 		default:
 			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
 		}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
 
 const (
@@ -109,12 +110,27 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 	upgradeFlags := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	upgradeFlags.SetOutput(os.Stderr)
 	restart := upgradeFlags.Bool("restart", false, "Restart daemon after active engine switch")
+	restartActive := upgradeFlags.String("restart-active", "", "internal: restart daemon after active engine switch")
 	if err := upgradeFlags.Parse(args); err != nil {
 		return 2
 	}
+	if *restartActive != "" {
+		enginePath, err := filepath.Abs(filepath.Clean(*restartActive))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: resolve active engine path: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+			return 1
+		}
+		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+			return 1
+		}
+		return 0
+	}
 
 	pendingPath := launcherPath + "~"
-	enginePath, installed, err := installVersionedEngine(launcherPath, pendingPath)
+	enginePath, installed, launcherUpdated, err := installVersionedEngine(launcherPath, pendingPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		fmt.Fprintln(os.Stderr, "")
@@ -128,9 +144,17 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 	} else {
 		fmt.Fprintf(os.Stderr, "Engine already installed: %s\n", enginePath)
 	}
+	if launcherUpdated {
+		fmt.Fprintf(os.Stderr, "Updated launcher: %s\n", launcherPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "Launcher already current: %s\n", launcherPath)
+	}
 	fmt.Fprintf(os.Stderr, "Active engine: %s\n", enginePath)
 
 	if *restart {
+		if launcherUpdated {
+			return launcherRunRestartActive(launcherPath, enginePath)
+		}
 		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
@@ -140,17 +164,35 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 	return 0
 }
 
-func installVersionedEngine(launcherPath, pendingPath string) (enginePath string, installed bool, err error) {
+func runLauncherRestartActive(launcherPath, enginePath string) int {
+	fmt.Fprintln(os.Stderr, "Re-executing updated launcher for daemon restart...")
+	cmd := exec.Command(launcherPath, "upgrade", "--restart-active", enginePath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "warning: updated launcher restart failed: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+		return 1
+	}
+	return 0
+}
+
+func installVersionedEngine(launcherPath, pendingPath string) (enginePath string, installed bool, launcherUpdated bool, err error) {
 	if _, err := os.Stat(pendingPath); err != nil {
 		if os.IsNotExist(err) {
-			return "", false, fmt.Errorf("no pending update found at %s", pendingPath)
+			return "", false, false, fmt.Errorf("no pending update found at %s", pendingPath)
 		}
-		return "", false, fmt.Errorf("stat pending update: %w", err)
+		return "", false, false, fmt.Errorf("stat pending update: %w", err)
 	}
 
 	hash, err := fileHash(pendingPath)
 	if err != nil {
-		return "", false, fmt.Errorf("hash pending update: %w", err)
+		return "", false, false, fmt.Errorf("hash pending update: %w", err)
 	}
 	versionID := hash
 	if len(versionID) > 12 {
@@ -158,51 +200,40 @@ func installVersionedEngine(launcherPath, pendingPath string) (enginePath string
 	}
 	enginePath = filepath.Join(versionStoreDir(launcherPath), versionID, engineFileName())
 
-	if current, ok := resolveActiveEngine(launcherPath); ok && samePath(current, enginePath) {
-		if sameFile(current, pendingPath) {
-			_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
-			return enginePath, false, nil
-		}
-	}
-
 	if err := os.MkdirAll(filepath.Dir(enginePath), 0755); err != nil {
-		return "", false, fmt.Errorf("create version dir: %w", err)
+		return "", false, false, fmt.Errorf("create version dir: %w", err)
 	}
 
 	if _, statErr := os.Stat(enginePath); statErr == nil {
 		if !sameFile(enginePath, pendingPath) {
-			return "", false, fmt.Errorf("version path exists with different content: %s", enginePath)
+			return "", false, false, fmt.Errorf("version path exists with different content: %s", enginePath)
 		}
-		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
 		installed = false
 	} else if os.IsNotExist(statErr) {
-		if err := movePendingEngine(pendingPath, enginePath); err != nil {
-			return "", false, fmt.Errorf("move pending update into version store: %w", err)
+		if err := copyFile(pendingPath, enginePath, 0755); err != nil {
+			return "", false, false, fmt.Errorf("copy pending update into version store: %w", err)
 		}
 		installed = true
 	} else {
-		return "", false, fmt.Errorf("stat version path: %w", statErr)
+		return "", false, false, fmt.Errorf("stat version path: %w", statErr)
+	}
+
+	if sameFile(launcherPath, pendingPath) {
+		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
+	} else {
+		oldPath, swapErr := upgrade.Swap(launcherPath, pendingPath)
+		if swapErr != nil {
+			return "", installed, false, fmt.Errorf("update launcher binary: %w", swapErr)
+		}
+		_ = os.Remove(oldPath)
+		upgrade.CleanStale(launcherPath)
+		launcherUpdated = true
 	}
 
 	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
-		return "", installed, err
+		return "", installed, launcherUpdated, err
 	}
-	return enginePath, installed, nil
-}
-
-func movePendingEngine(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	if err := copyFile(src, dst, 0755); err != nil {
-		return err
-	}
-	if !sameFile(src, dst) {
-		_ = os.Remove(dst)
-		return fmt.Errorf("copied engine hash mismatch")
-	}
-	_ = removeWithRetry(src, 10, 50*time.Millisecond)
-	return nil
+	return enginePath, installed, launcherUpdated, nil
 }
 
 func copyFile(src, dst string, perm os.FileMode) error {
@@ -249,11 +280,9 @@ func removeWithRetry(path string, attempts int, delay time.Duration) error {
 
 func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 	ctlPath := serverid.DaemonControlPath("", engineName)
-	if !isDaemonRunning(ctlPath) {
-		if err := startDaemonProcessFrom(launcherPath, enginePath); err != nil {
-			return err
-		}
-		return waitForDaemon(ctlPath, 10*time.Second)
+	if !launcherIsDaemonRunning(ctlPath) {
+		fmt.Fprintln(os.Stderr, "No daemon running; active engine will be used by the next shim reconnect.")
+		return nil
 	}
 
 	lockPath := serverid.DaemonLockPath("", engineName)
@@ -280,37 +309,42 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
-	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+	resp, err := launcherControlSendWithTimeout(ctlPath, control.Request{
 		Cmd:            "graceful-restart",
 		DrainTimeoutMs: 30000,
+		SuccessorExe:   enginePath,
 	}, 60*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  graceful-restart not available: %v, falling back to shutdown\n", err)
 		_, _ = control.Send(ctlPath, control.Request{Cmd: "shutdown"})
-		waitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
+		launcherWaitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
 		return startDaemonAndWait(launcherPath, enginePath, ctlPath)
 	}
 	if !resp.OK {
 		fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
 		_, _ = control.Send(ctlPath, control.Request{Cmd: "shutdown"})
-		waitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
+		launcherWaitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
 		return startDaemonAndWait(launcherPath, enginePath, ctlPath)
 	}
 
-	waitForDaemonExit(ctlPath, "  snapshot written. Waiting for daemon to exit...")
-	if err := waitForDaemon(ctlPath, 10*time.Second); err == nil {
+	launcherWaitForDaemonExit(ctlPath, "  snapshot written. Waiting for daemon to exit...")
+	if err := launcherWaitForDaemon(ctlPath, 10*time.Second); err == nil {
 		fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
 		return nil
 	}
 	fmt.Fprintln(os.Stderr, "  Successor daemon not ready; starting active engine daemon...")
-	return startDaemonAndWait(launcherPath, enginePath, ctlPath)
+	if err := startDaemonAndWait(launcherPath, enginePath, ctlPath); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
+	return nil
 }
 
 func startDaemonAndWait(launcherPath, enginePath, ctlPath string) error {
-	if err := startDaemonProcessFrom(launcherPath, enginePath); err != nil {
+	if err := launcherStartDaemonProcessFrom(launcherPath, enginePath); err != nil {
 		return err
 	}
-	return waitForDaemon(ctlPath, 10*time.Second)
+	return launcherWaitForDaemon(ctlPath, 10*time.Second)
 }
 
 func startDaemonProcessFrom(launcherPath, enginePath string) error {
@@ -329,8 +363,21 @@ func startDaemonProcessFrom(launcherPath, enginePath string) error {
 	return nil
 }
 
+var (
+	launcherIsDaemonRunning        = isDaemonRunning
+	launcherWaitForDaemon          = waitForDaemon
+	launcherWaitForDaemonExit      = waitForDaemonExit
+	launcherStartDaemonProcessFrom = startDaemonProcessFrom
+	launcherControlSendWithTimeout = control.SendWithTimeout
+	launcherRunRestartActive       = runLauncherRestartActive
+)
+
 func resolveActiveEngine(launcherPath string) (string, bool) {
-	data, err := os.ReadFile(activeEngineFile(launcherPath))
+	return resolveActiveEnginePointer(activeEngineFile(launcherPath))
+}
+
+func resolveActiveEnginePointer(pointerPath string) (string, bool) {
+	data, err := os.ReadFile(pointerPath)
 	if err != nil {
 		return "", false
 	}
@@ -341,7 +388,7 @@ func resolveActiveEngine(launcherPath string) (string, bool) {
 	if filepath.IsAbs(raw) {
 		return filepath.Clean(raw), true
 	}
-	return filepath.Clean(filepath.Join(versionStoreDir(launcherPath), raw)), true
+	return filepath.Clean(filepath.Join(filepath.Dir(pointerPath), raw)), true
 }
 
 func writeActiveEngine(launcherPath, enginePath string) error {

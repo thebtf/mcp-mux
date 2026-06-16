@@ -589,6 +589,9 @@ func refreshFailureReason(err error) string {
 	if isUnknownTokenError(err) {
 		return "unknown_token"
 	}
+	if isDaemonShuttingDownError(err) {
+		return "daemon_shutting_down"
+	}
 	return "other"
 }
 
@@ -598,6 +601,10 @@ func isOwnerGoneError(err error) bool {
 
 func isUnknownTokenError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unknown token")
+}
+
+func isDaemonShuttingDownError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "daemon shutting down")
 }
 
 // terminalRefreshErrorReason returns a non-empty fallback reason if err is
