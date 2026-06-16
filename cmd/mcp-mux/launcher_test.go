@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeTestFile(t *testing.T, path, content string) {
@@ -144,5 +145,79 @@ func TestDaemonStartReportsActiveAndFallbackStartFailures(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "start stable launcher fallback") {
 		t.Fatalf("error = %q, want stable launcher fallback context", err)
+	}
+}
+
+func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
+
+	oldIsDaemonRunning := launcherIsDaemonRunning
+	oldStartDaemonProcessFrom := launcherStartDaemonProcessFrom
+	oldWaitForDaemon := launcherWaitForDaemon
+	t.Cleanup(func() {
+		launcherIsDaemonRunning = oldIsDaemonRunning
+		launcherStartDaemonProcessFrom = oldStartDaemonProcessFrom
+		launcherWaitForDaemon = oldWaitForDaemon
+	})
+
+	startCalled := false
+	waitCalled := false
+	launcherIsDaemonRunning = func(string) bool { return false }
+	launcherStartDaemonProcessFrom = func(string, string) error {
+		startCalled = true
+		return nil
+	}
+	launcherWaitForDaemon = func(string, time.Duration) error {
+		waitCalled = true
+		return nil
+	}
+
+	if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
+		t.Fatalf("restartDaemonAfterEngineSwitch() error = %v, want nil", err)
+	}
+	if startCalled {
+		t.Fatal("restartDaemonAfterEngineSwitch started a daemon when none was running")
+	}
+	if waitCalled {
+		t.Fatal("restartDaemonAfterEngineSwitch waited for daemon readiness when none was running")
+	}
+}
+
+func TestRunLauncherUpgradeRestartNoDaemonSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	pendingPath := launcherPath + "~"
+	writeTestFile(t, launcherPath, "stable launcher")
+	writeTestFile(t, pendingPath, "engine v1")
+
+	oldIsDaemonRunning := launcherIsDaemonRunning
+	oldStartDaemonProcessFrom := launcherStartDaemonProcessFrom
+	oldWaitForDaemon := launcherWaitForDaemon
+	t.Cleanup(func() {
+		launcherIsDaemonRunning = oldIsDaemonRunning
+		launcherStartDaemonProcessFrom = oldStartDaemonProcessFrom
+		launcherWaitForDaemon = oldWaitForDaemon
+	})
+
+	launcherIsDaemonRunning = func(string) bool { return false }
+	launcherStartDaemonProcessFrom = func(string, string) error {
+		t.Fatal("runLauncherUpgrade started a daemon when none was running")
+		return nil
+	}
+	launcherWaitForDaemon = func(string, time.Duration) error {
+		t.Fatal("runLauncherUpgrade waited for daemon readiness when none was running")
+		return nil
+	}
+
+	if code := runLauncherUpgrade(launcherPath, []string{"--restart"}); code != 0 {
+		t.Fatalf("runLauncherUpgrade(--restart) code = %d, want 0", code)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending path still exists after install: %v", err)
+	}
+	if _, ok := resolveActiveEngine(launcherPath); !ok {
+		t.Fatal("active engine pointer was not written")
 	}
 }

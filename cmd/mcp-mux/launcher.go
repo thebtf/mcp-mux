@@ -249,11 +249,9 @@ func removeWithRetry(path string, attempts int, delay time.Duration) error {
 
 func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 	ctlPath := serverid.DaemonControlPath("", engineName)
-	if !isDaemonRunning(ctlPath) {
-		if err := startDaemonProcessFrom(launcherPath, enginePath); err != nil {
-			return err
-		}
-		return waitForDaemon(ctlPath, 10*time.Second)
+	if !launcherIsDaemonRunning(ctlPath) {
+		fmt.Fprintln(os.Stderr, "No daemon running; active engine will be used by the next shim reconnect.")
+		return nil
 	}
 
 	lockPath := serverid.DaemonLockPath("", engineName)
@@ -298,7 +296,7 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 	}
 
 	waitForDaemonExit(ctlPath, "  snapshot written. Waiting for daemon to exit...")
-	if err := waitForDaemon(ctlPath, 10*time.Second); err == nil {
+	if err := launcherWaitForDaemon(ctlPath, 10*time.Second); err == nil {
 		fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
 		return nil
 	}
@@ -307,10 +305,10 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 }
 
 func startDaemonAndWait(launcherPath, enginePath, ctlPath string) error {
-	if err := startDaemonProcessFrom(launcherPath, enginePath); err != nil {
+	if err := launcherStartDaemonProcessFrom(launcherPath, enginePath); err != nil {
 		return err
 	}
-	return waitForDaemon(ctlPath, 10*time.Second)
+	return launcherWaitForDaemon(ctlPath, 10*time.Second)
 }
 
 func startDaemonProcessFrom(launcherPath, enginePath string) error {
@@ -328,6 +326,12 @@ func startDaemonProcessFrom(launcherPath, enginePath string) error {
 	}
 	return nil
 }
+
+var (
+	launcherIsDaemonRunning        = isDaemonRunning
+	launcherWaitForDaemon          = waitForDaemon
+	launcherStartDaemonProcessFrom = startDaemonProcessFrom
+)
 
 func resolveActiveEngine(launcherPath string) (string, bool) {
 	data, err := os.ReadFile(activeEngineFile(launcherPath))
