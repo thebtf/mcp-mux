@@ -14,13 +14,13 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
 ```
 
-Use v0.25.3 for native SessionHandler hot-update work. It is the current
-consumer target for the `RestartWithSuccessor` / `ApplyUpdateAndRestart`
-contract and includes the active-control-socket wait fix required for reliable
-fallback start after graceful restart.
+Use v0.26.2 as the current consumer target. It includes the v0.25.3 native
+SessionHandler hot-update contract (`RestartWithSuccessor` /
+`ApplyUpdateAndRestart`) plus the v0.26.x opt-in daemon registry and tagged
+source-doc corrections for read-only cross-engine visibility.
 
 ## Golden Path
 

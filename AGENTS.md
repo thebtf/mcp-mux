@@ -57,21 +57,46 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
-## muxcore Library API (v0.25.x)
+## muxcore Library API (v0.26.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
 ```
+
+### v0.26.2 - consumer docs target correction
+
+**No runtime changes from v0.26.1.** Use v0.26.2 as the current consumer target
+so tagged source docs no longer point agents at the older v0.25.3 install
+snippet.
+
+### v0.26.1 - opt-in daemon registry ownership hardening
+
+**No breaking changes.** v0.26.1 includes the v0.25.3 native SessionHandler
+hot-update helpers and the v0.26.x opt-in daemon registry. Consumers that do
+not set `engine.Config.Registry` remain invisible to cross-engine discovery and
+keep existing behavior.
+
+| API | Semantics |
+|-----|-----------|
+| `engine.Config.Registry *registry.Config` | Optional daemon advertisement. Nil is the opt-out zero value. |
+| `registry.Config{ProductName, MuxcoreVersion, Capabilities}` | Descriptor metadata for products that want central read-only visibility. |
+| `registry.Capabilities{ListOwners: true}` | CR-001 read-only capability used by `mux_engines` and scoped `mux_list(engine_name)`. |
+| `mux_engines` | mcp-mux operator tool that lists opted-in muxcore daemons as healthy/stale/invalid/duplicate after status verification. |
+| `mux_list(engine_name: "...")` | Explicit read-only owner listing for one registered engine. Default `mux_list` remains scoped to `mcp-mux`. |
+
+Descriptor verification rejects PID mismatches, and daemon shutdown removes a
+descriptor only if it still belongs to the same process. CR-001 does not add
+cross-engine stop/restart/update.
 
 ### v0.25.3 - native SessionHandler live update helpers (#239)
 
 **No breaking changes.** The live-update helpers are additive; existing
 `upgrade.Swap`, control commands, and engine configuration keep their current
-behavior. Use v0.25.3 as the current consumer target; it supersedes the
-v0.25.1/v0.25.2 release candidates and includes the active-control-socket wait
-fix needed for reliable fallback start after graceful restart.
+behavior. v0.25.3 superseded the v0.25.1/v0.25.2 release candidates and
+included the active-control-socket wait fix needed for reliable fallback start
+after graceful restart.
 
 | API | Semantics |
 |-----|-----------|
@@ -478,7 +503,7 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
 ```
 
 Key changes to adopt:
@@ -491,7 +516,7 @@ Key changes to adopt:
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.25.3
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
 ```
 
 Key changes:
