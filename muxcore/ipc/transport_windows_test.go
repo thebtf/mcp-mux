@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Microsoft/go-winio"
 	"golang.org/x/sys/windows"
 )
 
@@ -167,6 +168,45 @@ func TestPipeListenerCloseTimesOutWhenUnderlyingCloseBlocks(t *testing.T) {
 	}
 }
 
+func TestListenRetriesTransientPipeAccessDenied(t *testing.T) {
+	oldListen := listenNamedPipe
+	oldSleep := sleepBeforeListenRetry
+	oldAttempts := pipeListenRetryAttempts
+	oldDelay := pipeListenRetryDelay
+	t.Cleanup(func() {
+		listenNamedPipe = oldListen
+		sleepBeforeListenRetry = oldSleep
+		pipeListenRetryAttempts = oldAttempts
+		pipeListenRetryDelay = oldDelay
+	})
+
+	calls := 0
+	listenNamedPipe = func(string, *winio.PipeConfig) (net.Listener, error) {
+		calls++
+		if calls < 3 {
+			return nil, &os.PathError{
+				Op:   "open",
+				Path: `\\.\pipe\mcp-mux-test`,
+				Err:  windows.ERROR_ACCESS_DENIED,
+			}
+		}
+		return stubListener{}, nil
+	}
+	sleepBeforeListenRetry = func(time.Duration) {}
+	pipeListenRetryAttempts = 5
+	pipeListenRetryDelay = time.Millisecond
+
+	ln, err := Listen(socketPath(t))
+	if err != nil {
+		t.Fatalf("Listen() error = %v, want retry success", err)
+	}
+	ln.Close()
+
+	if calls != 3 {
+		t.Fatalf("listen calls = %d, want 3", calls)
+	}
+}
+
 func TestDetachedProcessListenerHelper(t *testing.T) {
 	if os.Getenv("MUXCORE_IPC_TEST_HELPER") != "1" {
 		return
@@ -223,6 +263,12 @@ type testAddr string
 
 func (a testAddr) Network() string { return "test" }
 func (a testAddr) String() string  { return string(a) }
+
+type stubListener struct{}
+
+func (stubListener) Accept() (net.Conn, error) { return nil, net.ErrClosed }
+func (stubListener) Close() error              { return nil }
+func (stubListener) Addr() net.Addr            { return testAddr("stub-listener") }
 
 func waitForFile(t *testing.T, path string, timeout time.Duration) {
 	t.Helper()

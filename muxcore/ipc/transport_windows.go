@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -21,10 +22,14 @@ const pipeBufferSize = 64 * 1024
 var (
 	staleSocketRemoveAttempts = 40
 	staleSocketRemoveDelay    = 25 * time.Millisecond
+	pipeListenRetryAttempts   = 40
+	pipeListenRetryDelay      = 25 * time.Millisecond
 	pipeListenerCloseTimeout  = 2 * time.Second
 	removeSocketFile          = os.Remove
 	renameSocketFile          = os.Rename
 	sleepBeforeRemoveRetry    = time.Sleep
+	sleepBeforeListenRetry    = time.Sleep
+	listenNamedPipe           = winio.ListenPipe
 )
 
 // Listen creates an IPC listener for path.
@@ -40,11 +45,39 @@ func Listen(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ipc: build pipe security %s: %w", path, err)
 	}
-	ln, err := winio.ListenPipe(pipeName(path), cfg)
+	ln, err := listenPipeWithRetry(path, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ipc: listen %s: %w", path, err)
 	}
 	return &pipeListener{Listener: ln, path: path}, nil
+}
+
+func listenPipeWithRetry(path string, cfg *winio.PipeConfig) (net.Listener, error) {
+	attempts := pipeListenRetryAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		ln, err := listenNamedPipe(pipeName(path), cfg)
+		if err == nil {
+			return ln, nil
+		}
+		lastErr = err
+		if !isRetryablePipeListenError(err) {
+			return nil, err
+		}
+		if attempt+1 < attempts && pipeListenRetryDelay > 0 {
+			sleepBeforeListenRetry(pipeListenRetryDelay)
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetryablePipeListenError(err error) bool {
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+		errors.Is(err, windows.ERROR_PIPE_BUSY)
 }
 
 func pipeConfig() (*winio.PipeConfig, error) {
