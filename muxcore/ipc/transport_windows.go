@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -76,7 +77,7 @@ func listenPipeWithRetry(path string, cfg *winio.PipeConfig) (net.Listener, erro
 }
 
 func isRetryablePipeListenError(err error) bool {
-	return errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+	return errors.Is(err, syscall.ERROR_ACCESS_DENIED) ||
 		errors.Is(err, windows.ERROR_PIPE_BUSY)
 }
 
