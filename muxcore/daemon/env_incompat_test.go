@@ -196,8 +196,8 @@ func TestSemanticEnvHash_Deterministic(t *testing.T) {
 	}
 }
 
-// TestSemanticEnvHash_NPMConfigIdentityKeys asserts that npm registry and
-// config-file settings remain identity keys while lifecycle/package metadata is
+// TestSemanticEnvHash_NPMConfigIdentityKeys asserts that npm config settings
+// remain identity keys while lifecycle/package metadata is
 // still ignored. This preserves the credential/config boundary without
 // restoring broad npm launch-noise fanout.
 func TestSemanticEnvHash_NPMConfigIdentityKeys(t *testing.T) {
@@ -215,6 +215,14 @@ func TestSemanticEnvHash_NPMConfigIdentityKeys(t *testing.T) {
 	})
 	if registryA == registryB {
 		t.Fatalf("different npm registry values produced identical hash %q", registryA)
+	}
+
+	strictSSLFalse := semanticEnvHash(map[string]string{
+		"npm_config_registry":   "https://registry-a.example/",
+		"npm_config_strict_ssl": "false",
+	})
+	if strictSSLFalse == registryA {
+		t.Fatalf("different npm strict_ssl values produced identical hash %q", strictSSLFalse)
 	}
 
 	withNoise := semanticEnvHash(map[string]string{
