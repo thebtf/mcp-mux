@@ -166,6 +166,15 @@ func IsAvailable(path string) bool {
 	return true
 }
 
+// IsEndpointOccupiedError reports errors that mean the named-pipe object
+// exists but did not complete a usable client connection. In that state a
+// caller must not assume the endpoint is free for a competing listener.
+func IsEndpointOccupiedError(err error) bool {
+	return errors.Is(err, syscall.ERROR_ACCESS_DENIED) ||
+		errors.Is(err, windows.ERROR_PIPE_BUSY) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 func Cleanup(path string) {
 	_ = removeSocketFile(path)
 }

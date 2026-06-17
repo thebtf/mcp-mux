@@ -3,6 +3,7 @@
 package ipc
 
 import (
+	"context"
 	"net"
 	"os"
 	"os/exec"
@@ -187,7 +188,7 @@ func TestListenRetriesTransientPipeAccessDenied(t *testing.T) {
 			return nil, &os.PathError{
 				Op:   "open",
 				Path: `\\.\pipe\mcp-mux-test`,
-				Err:  windows.ERROR_ACCESS_DENIED,
+				Err:  syscall.ERROR_ACCESS_DENIED,
 			}
 		}
 		return stubListener{}, nil
@@ -204,6 +205,29 @@ func TestListenRetriesTransientPipeAccessDenied(t *testing.T) {
 
 	if calls != 3 {
 		t.Fatalf("listen calls = %d, want 3", calls)
+	}
+}
+
+func TestMissingPipeIsNotOccupiedEndpoint(t *testing.T) {
+	path := socketPath(t)
+	_, err := DialTimeout(path, 25*time.Millisecond)
+	if err == nil {
+		t.Fatal("DialTimeout() error = nil, want missing pipe error")
+	}
+	if IsEndpointOccupiedError(err) {
+		t.Fatalf("IsEndpointOccupiedError(%v) = true, want false for missing pipe", err)
+	}
+}
+
+func TestEndpointOccupiedErrorClassification(t *testing.T) {
+	for name, err := range map[string]error{
+		"access denied":     syscall.ERROR_ACCESS_DENIED,
+		"pipe busy":         windows.ERROR_PIPE_BUSY,
+		"deadline exceeded": context.DeadlineExceeded,
+	} {
+		if !IsEndpointOccupiedError(err) {
+			t.Fatalf("%s: IsEndpointOccupiedError(%v) = false, want true", name, err)
+		}
 	}
 }
 

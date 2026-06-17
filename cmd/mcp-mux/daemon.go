@@ -13,9 +13,14 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/rotlog"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
+
+var daemonStarter = startDaemonProcess
+
+const daemonPingTimeout = 500 * time.Millisecond
 
 // runGlobalDaemon starts the global daemon process. This is invoked via
 // `mcp-mux daemon` subcommand. The daemon manages all upstream MCP servers,
@@ -137,9 +142,21 @@ func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
 	// Log lines use key=value with no trailing prose so post-mortem grep/awk
 	// can parse them without surprises.
 	pingStart := time.Now()
-	if isDaemonRunning(ctlPath) {
+	if ok, err := pingDaemon(ctlPath); ok {
 		logger.Printf("ensure_daemon substep=fast_ping status=ok duration=%v",
 			time.Since(pingStart))
+		return nil
+	} else if isOccupiedControlEndpoint(err) {
+		logger.Printf("ensure_daemon substep=fast_ping status=occupied_unresponsive duration=%v err=%q",
+			time.Since(pingStart), err.Error())
+		waitStart := time.Now()
+		if waitErr := waitForDaemon(ctlPath, remainingBudget(deadline, 10*time.Second)); waitErr != nil {
+			logger.Printf("ensure_daemon substep=wait_for_occupied_control status=error duration=%v err=%q",
+				time.Since(waitStart), waitErr.Error())
+			return fmt.Errorf("daemon control endpoint occupied but unresponsive: %w", waitErr)
+		}
+		logger.Printf("ensure_daemon substep=wait_for_occupied_control status=ok duration=%v",
+			time.Since(waitStart))
 		return nil
 	}
 	logger.Printf("ensure_daemon substep=fast_ping status=miss duration=%v",
@@ -177,9 +194,21 @@ func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
 
 	// Re-check after acquiring lock (another shim may have started it)
 	recheckStart := time.Now()
-	if isDaemonRunning(ctlPath) {
+	if ok, err := pingDaemon(ctlPath); ok {
 		logger.Printf("ensure_daemon substep=lock_recheck status=already_running duration=%v",
 			time.Since(recheckStart))
+		return nil
+	} else if isOccupiedControlEndpoint(err) {
+		logger.Printf("ensure_daemon substep=lock_recheck status=occupied_unresponsive duration=%v err=%q",
+			time.Since(recheckStart), err.Error())
+		waitStart := time.Now()
+		if waitErr := waitForDaemon(ctlPath, remainingBudget(deadline, 10*time.Second)); waitErr != nil {
+			logger.Printf("ensure_daemon substep=wait_for_occupied_control status=error duration=%v err=%q",
+				time.Since(waitStart), waitErr.Error())
+			return fmt.Errorf("daemon control endpoint occupied but unresponsive: %w", waitErr)
+		}
+		logger.Printf("ensure_daemon substep=wait_for_occupied_control status=ok duration=%v",
+			time.Since(waitStart))
 		return nil
 	}
 	logger.Printf("ensure_daemon substep=lock_recheck status=still_missing duration=%v",
@@ -187,7 +216,7 @@ func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
 
 	// Start daemon as detached process
 	spawnStart := time.Now()
-	if err := startDaemonProcess(); err != nil {
+	if err := daemonStarter(); err != nil {
 		logger.Printf("ensure_daemon substep=spawn_process status=error duration=%v err=%q",
 			time.Since(spawnStart), err.Error())
 		return fmt.Errorf("start daemon: %w", err)
@@ -240,11 +269,23 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 
 // isDaemonRunning checks if the daemon control socket responds to ping.
 func isDaemonRunning(ctlPath string) bool {
-	resp, err := control.Send(ctlPath, control.Request{Cmd: "ping"})
+	ok, _ := pingDaemon(ctlPath)
+	return ok
+}
+
+func pingDaemon(ctlPath string) (bool, error) {
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{Cmd: "ping"}, daemonPingTimeout)
 	if err != nil {
+		return false, err
+	}
+	return resp.OK, nil
+}
+
+func isOccupiedControlEndpoint(err error) bool {
+	if err == nil {
 		return false
 	}
-	return resp.OK
+	return ipc.IsEndpointOccupiedError(err)
 }
 
 // startDaemonProcess spawns `mcp-mux daemon` as a detached background process.
