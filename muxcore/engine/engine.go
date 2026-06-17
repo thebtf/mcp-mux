@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -35,6 +36,8 @@ var engineClientStartDaemon = func(e *MuxEngine) error {
 var engineReadBuildInfo = debug.ReadBuildInfo
 
 var engineExecutable = os.Executable
+
+var engineGOOS = runtime.GOOS
 
 // Internal timing defaults for the engine. Kept as named constants (not inline
 // literals) so the rationale is discoverable and future tuning has a single
@@ -640,9 +643,17 @@ func engineIdentity(name string) string {
 		return "go-main:" + bi.Main.Path + "|name:" + name
 	}
 	if exe, err := engineExecutable(); err == nil {
-		return "exe:" + filepath.Clean(exe) + "|name:" + name
+		return "exe:" + normalizeExecutableIdentityPath(exe) + "|name:" + name
 	}
 	return "name:" + name
+}
+
+func normalizeExecutableIdentityPath(exe string) string {
+	cleaned := filepath.Clean(exe)
+	if engineGOOS == "windows" {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
 }
 
 func sanitizeNamespaceComponent(s string) string {

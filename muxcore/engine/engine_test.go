@@ -163,11 +163,14 @@ func TestNewDerivesDistinctNamespacesForSameNameDifferentProducts(t *testing.T) 
 func TestNewDerivesDistinctNamespacesForSameNameDifferentExecutables(t *testing.T) {
 	origReadBuildInfo := engineReadBuildInfo
 	origExecutable := engineExecutable
+	origGOOS := engineGOOS
 	t.Cleanup(func() {
 		engineReadBuildInfo = origReadBuildInfo
 		engineExecutable = origExecutable
+		engineGOOS = origGOOS
 	})
 	engineReadBuildInfo = func() (*debug.BuildInfo, bool) { return nil, false }
+	engineGOOS = "windows"
 
 	engineExecutable = func() (string, error) { return `C:\Products\Alpha\server.exe`, nil }
 	alpha, err := New(Config{Name: "server", Command: "echo"})
@@ -183,6 +186,35 @@ func TestNewDerivesDistinctNamespacesForSameNameDifferentExecutables(t *testing.
 
 	if alpha.cfg.Namespace == beta.cfg.Namespace {
 		t.Fatalf("same display Name and executable basename produced same namespace %q", alpha.cfg.Namespace)
+	}
+}
+
+func TestNewNormalizesWindowsExecutableCaseForNamespaceIdentity(t *testing.T) {
+	origReadBuildInfo := engineReadBuildInfo
+	origExecutable := engineExecutable
+	origGOOS := engineGOOS
+	t.Cleanup(func() {
+		engineReadBuildInfo = origReadBuildInfo
+		engineExecutable = origExecutable
+		engineGOOS = origGOOS
+	})
+	engineReadBuildInfo = func() (*debug.BuildInfo, bool) { return nil, false }
+	engineGOOS = "windows"
+
+	engineExecutable = func() (string, error) { return `C:\Products\Alpha\Server.exe`, nil }
+	upper, err := New(Config{Name: "server", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(upper): %v", err)
+	}
+
+	engineExecutable = func() (string, error) { return `c:\products\alpha\server.exe`, nil }
+	lower, err := New(Config{Name: "server", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(lower): %v", err)
+	}
+
+	if upper.cfg.Namespace != lower.cfg.Namespace {
+		t.Fatalf("Windows executable path case changed namespace: upper=%q lower=%q", upper.cfg.Namespace, lower.cfg.Namespace)
 	}
 }
 
