@@ -62,8 +62,29 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.4
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
 ```
+
+### v0.26.5 - process-explosion owner fanout reduction
+
+**No breaking changes.** v0.26.5 reduces two confirmed owner/process fanout
+vectors after startup storms:
+
+- forced-isolated retry counters are cleaned when the final owner in that retry
+  family is removed;
+- global/shared env bucketing ignores ordinary launch noise (`PATH`, temp dirs,
+  shell/session metadata) while preserving credential/config/proxy/URL/host/port
+  and cert identity boundaries.
+
+Consumer impact: update to v0.26.5; no muxcore API change is required. This
+release does not kill or clean already-running stale workstation processes. It
+prevents new fanout from these source-side vectors after consumers deploy the
+new muxcore/runtime.
+
+Operational invariant: a Windows named pipe that is already bound is healthy
+only if the control endpoint answers ping/status within the bounded readiness
+window. Bound but unresponsive is an abnormal recovery state, not replacement
+readiness and not permission to spawn a competing daemon.
 
 ### v0.26.4 - Windows occupied control-pipe startup guard
 
@@ -74,7 +95,7 @@ does not answer ping, `mcp-mux` now waits and fails clearly instead of spawning 
 competing daemon against the same named pipe. A genuinely missing pipe remains a
 normal startup miss.
 
-Consumer impact: update to v0.26.4; no muxcore API change is required. This
+Consumer impact: update to v0.26.4 or newer; no muxcore API change is required. This
 does not recover an already-unresponsive daemon process by killing it. Recovery
 still needs explicit operator or product policy.
 
@@ -522,7 +543,7 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.4
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
 ```
 
 Key changes to adopt:
@@ -535,7 +556,7 @@ Key changes to adopt:
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.4
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
 ```
 
 Key changes:
