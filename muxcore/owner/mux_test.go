@@ -2,6 +2,7 @@ package owner
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -918,6 +919,113 @@ func TestNewOwnerFromSnapshot_CachedInit(t *testing.T) {
 	// Verify ID was replaced to match our request (42)
 	if !strings.Contains(line, `"id":42`) {
 		t.Errorf("response should have id:42: %s", line)
+	}
+}
+
+func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
+	ipcPath := testIPCPath(t)
+	cwd := t.TempDir()
+
+	initResp := `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"snap-server","version":"0.1.0"}}}`
+	toolsResp := `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"snapshot-tool"}]}}`
+
+	snap := OwnerSnapshot{
+		ServerID:       "test-background-refresh-cache",
+		Command:        "in-process-handler",
+		Cwd:            cwd,
+		CwdSet:         []string{cwd},
+		Mode:           "isolated",
+		Classification: "isolated",
+		CachedInit:     base64Encode([]byte(initResp)),
+		CachedTools:    base64Encode([]byte(toolsResp)),
+	}
+
+	handlerStarted := make(chan struct{})
+	handlerFunc := func(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
+		_ = ctx
+		_ = stdout
+		close(handlerStarted)
+		_, _ = io.Copy(io.Discard, stdin)
+		return nil
+	}
+
+	owner, err := NewOwnerFromSnapshot(OwnerConfig{
+		Command:     snap.Command,
+		Cwd:         snap.Cwd,
+		IPCPath:     ipcPath,
+		ServerID:    snap.ServerID,
+		HandlerFunc: handlerFunc,
+		Logger:      testLogger(t),
+	}, snap)
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot() error: %v", err)
+	}
+	defer owner.Shutdown()
+
+	bgCh := owner.backgroundSpawnCh
+	if bgCh == nil {
+		t.Fatal("snapshot owner should expose backgroundSpawnCh before background spawn")
+	}
+	owner.SpawnUpstreamBackground()
+	select {
+	case <-bgCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background spawn did not finish")
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background handler did not start")
+	}
+
+	conn, err := ipc.Dial(ipcPath)
+	if err != nil {
+		t.Fatalf("Dial() error: %v", err)
+	}
+	defer conn.Close()
+
+	scanner := bufio.NewScanner(conn)
+	readLineWithin := func(timeout time.Duration) string {
+		t.Helper()
+		done := make(chan scanResult, 1)
+		go func() {
+			ok := scanner.Scan()
+			done <- scanResult{ok: ok, line: scanner.Text(), err: scanner.Err()}
+		}()
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case res := <-done:
+			if !res.ok {
+				if res.err != nil {
+					t.Fatalf("scanner error: %v", res.err)
+				}
+				t.Fatal("scanner returned EOF before any data")
+			}
+			return res.line
+		case <-timer.C:
+			t.Fatalf("timeout waiting for cached response after %s", timeout)
+		}
+		return ""
+	}
+
+	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}` + "\n")); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+	initLine := readLineWithin(500 * time.Millisecond)
+	if !strings.Contains(initLine, `"id":42`) || !strings.Contains(initLine, "snap-server") {
+		t.Fatalf("unexpected cached initialize response: %s", initLine)
+	}
+
+	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n")); err != nil {
+		t.Fatalf("write initialized notification: %v", err)
+	}
+	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":43,"method":"tools/list","params":{}}` + "\n")); err != nil {
+		t.Fatalf("write tools/list: %v", err)
+	}
+	toolsLine := readLineWithin(500 * time.Millisecond)
+	if !strings.Contains(toolsLine, `"id":43`) || !strings.Contains(toolsLine, "snapshot-tool") {
+		t.Fatalf("unexpected cached tools/list response: %s", toolsLine)
 	}
 }
 

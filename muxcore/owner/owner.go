@@ -157,20 +157,21 @@ type Owner struct {
 
 	progressTracker *progress.Tracker // dedup state for synthetic progress emission
 
-	upstreamDead       atomic.Bool // set when upstream exits; prevents sending to dead pipe
-	methodTags         sync.Map    // remapped request ID (string) -> method name
-	inflightTracker    sync.Map    // remapped request ID (string) -> *InflightRequest
-	timedOutIDs        sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
-	pendingRequests    atomic.Int64
-	drainTimeout       time.Duration // from x-mux.drainTimeout capability; 0 = use default
-	toolTimeoutNs      atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
-	idleTimeoutNs      atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
-	progressIntervalNs atomic.Int64  // from x-mux.progressInterval capability; stored as nanoseconds; 0 = use default (5s)
-	lastActivityNs     atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
-	busyMu             sync.Mutex
-	busyDeclarations   map[string]busyDeclaration // busy_id → declaration (long-running work signal)
-	startTime          time.Time
-	controlServer      *control.Server
+	upstreamDead            atomic.Bool // set when upstream exits; prevents sending to dead pipe
+	methodTags              sync.Map    // remapped request ID (string) -> method name
+	inflightTracker         sync.Map    // remapped request ID (string) -> *InflightRequest
+	timedOutIDs             sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
+	pendingRequests         atomic.Int64
+	drainTimeout            time.Duration // from x-mux.drainTimeout capability; 0 = use default
+	toolTimeoutNs           atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
+	idleTimeoutNs           atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
+	progressIntervalNs      atomic.Int64  // from x-mux.progressInterval capability; stored as nanoseconds; 0 = use default (5s)
+	lastActivityNs          atomic.Int64  // unix-nano of last inbound/outbound MCP message or session change
+	listChangedAfterRefresh atomic.Bool
+	busyMu                  sync.Mutex
+	busyDeclarations        map[string]busyDeclaration // busy_id → declaration (long-running work signal)
+	startTime               time.Time
+	controlServer           *control.Server
 
 	shutdownOnce      sync.Once
 	closeListenerOnce sync.Once
@@ -496,17 +497,18 @@ func (o *Owner) SpawnUpstreamBackground() {
 			close(o.backgroundSpawnCh)
 			o.backgroundSpawnCh = nil
 		}
-		// Invalidate stale list caches — the new upstream may have different
-		// tools/prompts/resources. Proactive init will repopulate them.
-		o.toolList = nil
-		o.promptList = nil
-		o.resourceList = nil
-		o.resourceTemplateList = nil
+		hadCachedLists := o.toolList != nil || o.promptList != nil ||
+			o.resourceList != nil || o.resourceTemplateList != nil
+		if hadCachedLists {
+			// Keep snapshot list caches usable while the replacement upstream is
+			// warming. Clearing here creates a startup race: clients that already
+			// received cached initialize can miss cached tools/list and block on
+			// the live upstream until their MCP startup timeout expires. The first
+			// fresh tools/list response below will replace the tools cache, clear
+			// non-refreshed prompt/resource caches, and broadcast list_changed.
+			o.listChangedAfterRefresh.Store(true)
+		}
 		o.mu.Unlock()
-
-		// Notify all connected sessions that lists have changed so CC re-fetches
-		// its tool/prompt/resource lists from the fresh upstream.
-		o.broadcastListChanged()
 
 		// Start reading upstream responses
 		go o.readUpstream()
@@ -3025,6 +3027,14 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 		// Daemon stores this as a template for instant future isolated spawns.
 		if o.onCacheReady != nil && o.initDone {
 			go o.onCacheReady(o.serverID)
+		}
+		if o.listChangedAfterRefresh.Swap(false) {
+			o.mu.Lock()
+			o.promptList = nil
+			o.resourceList = nil
+			o.resourceTemplateList = nil
+			o.mu.Unlock()
+			o.broadcastListChanged()
 		}
 	}
 }
