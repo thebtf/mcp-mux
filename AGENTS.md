@@ -57,6 +57,15 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 | **Reasoning first** | Document WHY before implementing |
 | **Spec compliance** | MCP protocol spec is authoritative — verify all protocol behavior against it |
 
+## RELEASE PROTOCOL
+
+Public releases must follow [`docs/RELEASE-PROTOCOL.md`](docs/RELEASE-PROTOCOL.md).
+When a release contains a critical or consumer-impacting `muxcore` update,
+the release closeout must include `CONSUMER_HANDOFF_PASS`: fresh Engram
+issues or comments for `aimux`, `engram`, and any other impacted muxcore
+consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
+do not call the full critical muxcore scope shipped.
+
 ## muxcore Library API (v0.26.x)
 
 ### Upgrade

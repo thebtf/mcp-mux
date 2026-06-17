@@ -54,6 +54,13 @@ docs/                 Public protocol specifications
 4. Commit with conventional format: `feat:`, `fix:`, `test:`, `docs:`, `chore:`
 5. Open PR against `master`
 
+## Release Process
+
+Public releases follow [`docs/RELEASE-PROTOCOL.md`](docs/RELEASE-PROTOCOL.md).
+When a critical or consumer-impacting `muxcore` update ships, the release
+requires Engram handoff issues or comments for impacted consumers such as
+`aimux` and `engram` before the full release scope can be reported as shipped.
+
 ## Architecture Principles
 
 See `.agent/specs/constitution.md` for the 10 project principles. Key ones:

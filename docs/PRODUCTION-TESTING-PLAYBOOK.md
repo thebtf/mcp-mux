@@ -267,6 +267,18 @@ Forbidden signals:
 - `shim_reconnect_fallback_spawned > 0` in the hot-update fixture unless the
   consumer explicitly documents fallback spawn as its accepted recovery mode.
 
+Release handoff evidence:
+
+- When the release contains a critical or consumer-impacting `muxcore` change,
+  Scenario 5b is paired with the consumer handoff gate in
+  `docs/RELEASE-PROTOCOL.md`.
+- The release report must list the Engram issues or comments created for
+  `aimux`, `engram`, and any other impacted muxcore consumer. A local fixture
+  PASS proves provider behavior; it does not replace consumer adoption
+  instructions.
+- If Engram cannot be updated, record `CONSUMER_HANDOFF_BLOCKED` and do not
+  report the full critical muxcore release scope as shipped.
+
 ## Scenario 6: Isolated Owner Short Idle Cleanup (v0.25.0)
 
 Objective: prove a stateful (isolated-classified) upstream tears down within
