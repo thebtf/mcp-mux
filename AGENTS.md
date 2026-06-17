@@ -62,10 +62,16 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
 ```
 
-### Next - auto-managed engine namespace
+### v0.26.7 - consumer docs target correction
+
+**No runtime changes from v0.26.6.** Use v0.26.7 as the current consumer target
+so tagged source docs and agent-facing instructions point at the released
+auto-managed namespace implementation instead of v0.26.5.
+
+### v0.26.6 - auto-managed engine namespace
 
 **No breaking changes for ordinary `engine.New` consumers.** `engine.Config.Name`
 is now a human-readable/status label, and muxcore derives a collision-resistant
@@ -372,7 +378,7 @@ Two muxcore consumers on one host (e.g. mcp-mux + aimux) no longer share the
 literal `"mcp-mux-"` prefix and cannot interfere with each other.
 
 Historical note: this section describes the v0.22 migration point. The current
-consumer contract is the "Next - auto-managed engine namespace" section above:
+consumer contract is the "v0.26.6 - auto-managed engine namespace" section above:
 `engine.Config.Name` is a display label, and ordinary consumers should leave
 `engine.Config.Namespace` empty.
 
@@ -566,7 +572,7 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
 ```
 
 Key changes to adopt:
@@ -579,7 +585,7 @@ Key changes to adopt:
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
 ```
 
 Key changes:
