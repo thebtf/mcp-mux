@@ -14,14 +14,16 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
 ```
 
-Use v0.26.7 as the current consumer target. It includes the v0.25.3 native
+Use v0.26.8 as the current consumer target. It includes the v0.25.3 native
 SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
-v0.26.6 auto-managed engine namespace.
+v0.26.6 auto-managed engine namespace. It also preserves snapshot-restored
+`tools/list` cache during background refresh so new MCP host sessions can replay
+cached tool discovery while the replacement upstream refreshes.
 
 ## Golden Path
 

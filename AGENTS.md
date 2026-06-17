@@ -71,8 +71,20 @@ do not call the full critical muxcore scope shipped.
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
 ```
+
+### v0.26.8 - snapshot tools/list cache refresh fix
+
+**No breaking changes.** v0.26.8 keeps snapshot-restored `tools/list` cache
+available while the replacement upstream refreshes in the background. This
+prevents startup-time `tools/list` timeouts where a restored owner had cached
+tools, cleared them before refresh, and then a new MCP host session waited on a
+slow live upstream until the host startup budget expired.
+
+Consumer impact: update to v0.26.8. Do not add product-local cold-start,
+binary-renaming, or cache invalidation workarounds for this issue; muxcore owns
+the snapshot-cache refresh protocol.
 
 ### v0.26.7 - consumer docs target correction
 
@@ -581,7 +593,7 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
 ```
 
 Key changes to adopt:
@@ -594,7 +606,7 @@ Key changes to adopt:
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.7
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
 ```
 
 Key changes:
