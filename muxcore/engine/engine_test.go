@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -106,11 +107,82 @@ func TestNew_MissingName(t *testing.T) {
 		Command: "echo",
 	}
 	e, err := New(cfg)
-	if err == nil {
-		t.Fatal("New() expected error for missing Name, got nil")
+	if err != nil {
+		t.Fatalf("New() unexpected error for missing Name: %v", err)
 	}
-	if e != nil {
-		t.Fatal("New() expected nil engine on error, got non-nil")
+	if e == nil {
+		t.Fatal("New() returned nil engine")
+	}
+	if e.cfg.Name == "" {
+		t.Fatal("New() did not derive an engine name")
+	}
+	if e.cfg.Namespace == "" {
+		t.Fatal("New() did not derive an engine namespace")
+	}
+	if e.cfg.Name == e.cfg.Namespace {
+		t.Fatalf("derived namespace = name %q, want collision-resistant namespace", e.cfg.Name)
+	}
+}
+
+func TestNewDerivesDistinctNamespacesForSameNameDifferentProducts(t *testing.T) {
+	origReadBuildInfo := engineReadBuildInfo
+	origExecutable := engineExecutable
+	t.Cleanup(func() {
+		engineReadBuildInfo = origReadBuildInfo
+		engineExecutable = origExecutable
+	})
+	engineExecutable = func() (string, error) { return "ignored.exe", nil }
+
+	engineReadBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Path: "example.com/products/alpha"}}, true
+	}
+	alpha, err := New(Config{Name: "mcp-mux", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(alpha): %v", err)
+	}
+
+	engineReadBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{Main: debug.Module{Path: "example.com/products/beta"}}, true
+	}
+	beta, err := New(Config{Name: "mcp-mux", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(beta): %v", err)
+	}
+
+	if alpha.cfg.Name != beta.cfg.Name {
+		t.Fatalf("display names differ: alpha=%q beta=%q", alpha.cfg.Name, beta.cfg.Name)
+	}
+	if alpha.cfg.Namespace == beta.cfg.Namespace {
+		t.Fatalf("same display Name and different product identity produced same namespace %q", alpha.cfg.Namespace)
+	}
+	if alpha.cfg.Namespace == "mcp-mux" || beta.cfg.Namespace == "mcp-mux" {
+		t.Fatalf("auto namespace fell back to raw display name: alpha=%q beta=%q", alpha.cfg.Namespace, beta.cfg.Namespace)
+	}
+}
+
+func TestNewDerivesDistinctNamespacesForSameNameDifferentExecutables(t *testing.T) {
+	origReadBuildInfo := engineReadBuildInfo
+	origExecutable := engineExecutable
+	t.Cleanup(func() {
+		engineReadBuildInfo = origReadBuildInfo
+		engineExecutable = origExecutable
+	})
+	engineReadBuildInfo = func() (*debug.BuildInfo, bool) { return nil, false }
+
+	engineExecutable = func() (string, error) { return `C:\Products\Alpha\server.exe`, nil }
+	alpha, err := New(Config{Name: "server", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(alpha): %v", err)
+	}
+
+	engineExecutable = func() (string, error) { return `C:\Products\Beta\server.exe`, nil }
+	beta, err := New(Config{Name: "server", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(beta): %v", err)
+	}
+
+	if alpha.cfg.Namespace == beta.cfg.Namespace {
+		t.Fatalf("same display Name and executable basename produced same namespace %q", alpha.cfg.Namespace)
 	}
 }
 
@@ -315,6 +387,7 @@ func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
 
 	e, err := New(Config{
 		Name:         name,
+		Namespace:    name,
 		Handler:      noopHandler,
 		BaseDir:      baseDir,
 		SkipSnapshot: true,
@@ -367,10 +440,11 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	defer srv.Close()
 
 	e, err := New(Config{
-		Name:    name,
-		Command: "test-command",
-		Args:    []string{"--flag"},
-		BaseDir: baseDir,
+		Name:      name,
+		Namespace: name,
+		Command:   "test-command",
+		Args:      []string{"--flag"},
+		BaseDir:   baseDir,
 	})
 	if err != nil {
 		t.Fatalf("New() unexpected error: %v", err)
@@ -462,9 +536,10 @@ func TestRunClientReconnectWaitsForSuccessorBeforeSelfStart(t *testing.T) {
 	defer srv.Close()
 
 	e, err := New(Config{
-		Name:    name,
-		Command: "test-command",
-		BaseDir: baseDir,
+		Name:      name,
+		Namespace: name,
+		Command:   "test-command",
+		BaseDir:   baseDir,
 	})
 	if err != nil {
 		t.Fatalf("New() unexpected error: %v", err)
@@ -854,8 +929,9 @@ func TestEngine_AccessorsBeforeRun(t *testing.T) {
 		// expected: channel is open
 	}
 
-	// ControlSocketPath must be non-empty and match serverid.DaemonControlPath.
-	want := serverid.DaemonControlPath(cfg.BaseDir, cfg.Name)
+	// ControlSocketPath must be non-empty and match the resolved namespace,
+	// not the display Name.
+	want := serverid.DaemonControlPath(cfg.BaseDir, eng.cfg.Namespace)
 	got := eng.ControlSocketPath()
 	if got == "" {
 		t.Error("ControlSocketPath() returned empty string")
@@ -1008,9 +1084,9 @@ func TestEngineRegistryConfigPropagatesToDaemon(t *testing.T) {
 		cancel()
 		t.Fatalf("engine_name = %q, want er", rec.Descriptor.EngineName)
 	}
-	if rec.Descriptor.DaemonControlPath != serverid.DaemonControlPath(baseDir, "er") {
+	if rec.Descriptor.DaemonControlPath != serverid.DaemonControlPath(baseDir, eng.cfg.Namespace) {
 		cancel()
-		t.Fatalf("control path = %q, want %q", rec.Descriptor.DaemonControlPath, serverid.DaemonControlPath(baseDir, "er"))
+		t.Fatalf("control path = %q, want %q", rec.Descriptor.DaemonControlPath, serverid.DaemonControlPath(baseDir, eng.cfg.Namespace))
 	}
 
 	cancel()
@@ -1023,21 +1099,43 @@ func TestEngineRegistryConfigPropagatesToDaemon(t *testing.T) {
 
 // TestNewRejectsEmptyName verifies that New returns an error with the exact
 // required message when cfg.Name is empty.
-func TestNewRejectsEmptyName(t *testing.T) {
+func TestNewDerivesNameAndNamespaceWhenNameEmpty(t *testing.T) {
 	cfg := Config{
 		Command: "echo",
 		// Name intentionally omitted (empty string)
 	}
 	e, err := New(cfg)
-	if err == nil {
-		t.Fatal("New() expected error for empty Name, got nil")
+	if err != nil {
+		t.Fatalf("New() unexpected error for empty Name: %v", err)
 	}
-	if e != nil {
-		t.Fatal("New() expected nil engine on error, got non-nil")
+	if e == nil {
+		t.Fatal("New() returned nil engine")
 	}
-	const wantMsg = `muxcore: engine.Config.Name is required (was empty); pass a name unique to this binary, e.g. "aimux", "mcp-mux", "engram"`
-	if err.Error() != wantMsg {
-		t.Errorf("New() error message mismatch:\n  got:  %q\n  want: %q", err.Error(), wantMsg)
+	if e.cfg.Name == "" {
+		t.Fatal("New() did not derive Name")
+	}
+	if e.cfg.Namespace == "" {
+		t.Fatal("New() did not derive Namespace")
+	}
+	if e.cfg.Namespace == e.cfg.Name {
+		t.Fatalf("Namespace = Name = %q, want collision-resistant derived namespace", e.cfg.Name)
+	}
+}
+
+func TestNewPreservesExplicitNamespaceForLegacyCompatibility(t *testing.T) {
+	e, err := New(Config{
+		Name:      "aimux",
+		Namespace: "Legacy.Namespace_1",
+		Command:   "echo",
+	})
+	if err != nil {
+		t.Fatalf("New() unexpected error: %v", err)
+	}
+	if e.cfg.Name != "aimux" {
+		t.Fatalf("Name = %q, want aimux", e.cfg.Name)
+	}
+	if e.cfg.Namespace != "Legacy.Namespace_1" {
+		t.Fatalf("Namespace = %q, want Legacy.Namespace_1", e.cfg.Namespace)
 	}
 }
 

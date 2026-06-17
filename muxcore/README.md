@@ -78,15 +78,19 @@ func serveStdio(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
 Every muxcore consumer should satisfy this checklist before shipping.
 
 1. **Use `engine.New` and `engine.Run` as the main runtime path.**
-   `engine.New` enforces the two most important setup errors: `Name` is
-   required, and at least one serving shape (`Command`, `Handler`, or
-   `SessionHandler`) is required. Direct `daemon.New` still has compatibility
-   defaults and can be misconfigured more easily.
+   `engine.New` enforces the most important setup error: at least one serving
+   shape (`Command`, `Handler`, or `SessionHandler`) is required. It also
+   derives a safe engine label and transport namespace when the consumer leaves
+   them empty. Direct `daemon.New` still has compatibility defaults and can be
+   misconfigured more easily.
 
-2. **Choose a unique, stable `engine.Config.Name`.**
-   The name scopes daemon control sockets, owner sockets, locks, stale-socket
-   cleanup, status, and reconnect behavior. Do not reuse `"mcp-mux"` for a
-   different product. Use values like `"aimux"` or `"engram"`.
+2. **Use `Name` as a display label; let muxcore manage the namespace.**
+   `engine.Config.Name` is surfaced in status and registry descriptors. It is
+   no longer the consumer's pipe-name contract. By default muxcore derives a
+   collision-resistant `Namespace` from the label plus product identity and uses
+   that namespace for daemon control sockets, owner sockets, locks,
+   stale-socket cleanup, and reconnect behavior. Set `engine.Config.Namespace`
+   only to preserve a previously shipped namespace during migration.
 
 3. **Choose one serving shape deliberately.**
 
@@ -361,7 +365,8 @@ _ = result
 The helper:
 
 1. Calls `upgrade.Swap(CurrentExe, StagedExe)`.
-2. Acquires the daemon namespace lock for `engine.Config.Name` and `BaseDir`.
+2. Acquires the daemon namespace lock for the resolved `engine.Config.Namespace`
+   and `BaseDir`.
 3. Sends `graceful-restart` with `successor_exe` set to `CurrentExe`.
 4. Falls back to `shutdown` if graceful restart is unavailable or rejected.
 5. Starts the replacement daemon from `CurrentExe` when a successor is not
@@ -398,15 +403,15 @@ These guardrails exist in current muxcore:
 
 | Guardrail | Where |
 | --- | --- |
-| Empty `engine.Config.Name` is rejected. | `engine.New` |
+| Empty `engine.Config.Name` is derived from build metadata or executable name. | `engine.New` |
 | Missing serving shape is rejected. | `engine.New` |
 | `SessionHandler` takes priority over `Handler` in daemon mode; proxy mode requires `Handler`. | `engine.Run` |
 | Daemon-managed owner connections require one-time tokens. | daemon spawn + owner accept loop |
 | Reconnect first tries token refresh, then falls back to daemon spawn. | resilient client |
 | Spawn is rejected while daemon shutdown/restart is in progress. | daemon spawn path |
 | Live updates use one engine helper for swap, daemon lock, restart, fallback, start, and ready wait. | `engine.ApplyUpdateAndRestart` |
-| Owner sockets are scoped by engine name. | serverid/daemon/owner paths |
-| Stale-socket cleanup is name-scoped. | daemon startup |
+| Daemon and owner sockets are scoped by resolved engine namespace. | engine/serverid/daemon/owner paths |
+| Stale-socket cleanup is namespace-scoped. | daemon startup |
 | `AuthorizeSession` panics cannot crash the daemon. | owner accept loop |
 | `OnFrameReceived` timeout/panic is fail-open. | owner frame dispatch |
 
@@ -452,7 +457,8 @@ Avoid these integration patterns:
 
 - Calling `daemon.New` directly for ordinary consumers. Use `engine.New` unless
   you are implementing muxcore internals or a custom control plane.
-- Reusing `Name: "mcp-mux"` in another product.
+- Setting `Namespace` by copy-paste for a new product. Leave it empty unless
+  you are intentionally preserving a previously shipped namespace.
 - Letting a CLI parser reject `--muxcore-daemon` before `engine.Run` can see it.
 - Implementing only `SessionHandler` and then wrapping the binary with an
   external `mcp-mux`; proxy mode needs `Handler`.
@@ -516,7 +522,7 @@ Current lifecycle evidence fields:
 
 | Field | Meaning |
 | --- | --- |
-| `engine_name` | Daemon namespace name such as `mcp-mux`, `aimux`, or `engram`; use it to avoid confusing product-native daemons with the `mcp-mux` product daemon. |
+| `engine_name` | Human-readable engine label such as `mcp-mux`, `aimux`, or `engram`; use it to avoid confusing product-native daemons with the `mcp-mux` product daemon. It is not the transport namespace. |
 | `daemon_generation` | Process-lifetime generation string for distinguishing predecessor and successor daemons. |
 | `reaped_owner_count` | Count of owners removed by idle lifecycle reaping. |
 | `owner_removal.total` | Count of owner-removal helper executions in this daemon process. |

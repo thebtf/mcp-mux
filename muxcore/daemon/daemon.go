@@ -185,9 +185,10 @@ type Daemon struct {
 	// Initialized from Config.DaemonFlag; defaults to "--daemon" when empty.
 	daemonFlag string
 
-	// name is the engine instance name from Config.Name (e.g. "mcp-mux", "aimux").
-	// Used to scope IPC socket file paths and stale-socket cleanup to this engine.
-	name                        string
+	// name is the human-readable engine instance name from Config.Name.
+	name string
+	// namespace scopes IPC socket file paths and stale-socket cleanup to this engine.
+	namespace                   string
 	persistent                  bool
 	daemonGeneration            string
 	predecessorPID              int
@@ -319,11 +320,14 @@ type Config struct {
 	// pre-v0.21.7 callers that don't set it.
 	DaemonFlag string
 
-	// Name is the engine instance name (e.g. "mcp-mux", "aimux", "engram").
-	// Used to scope IPC socket file names and stale-socket cleanup to this
-	// engine only. Empty string defaults to "mcp-mux" for backward compatibility;
-	// callers that want FS isolation across multiple engine types must set this.
+	// Name is the human-readable engine instance name (e.g. "mcp-mux", "aimux",
+	// "engram"). It is surfaced in status and registry descriptors.
 	Name string
+
+	// Namespace scopes IPC socket file names and stale-socket cleanup to this
+	// daemon. Empty string defaults to Name for backward compatibility with
+	// direct daemon.New callers. engine.New supplies an auto-managed namespace.
+	Namespace string
 
 	// Persistent overrides per-owner Persistent detection. When true, all owners
 	// managed by this daemon are treated as persistent (not evicted on idle).
@@ -355,6 +359,10 @@ func New(cfg Config) (*Daemon, error) {
 	name := strings.TrimSpace(cfg.Name)
 	if name == "" {
 		name = "mcp-mux"
+	}
+	namespace := strings.TrimSpace(cfg.Namespace)
+	if namespace == "" {
+		namespace = name
 	}
 
 	logger := cfg.Logger
@@ -423,6 +431,7 @@ func New(cfg Config) (*Daemon, error) {
 		sessionHandler:         cfg.SessionHandler,
 		daemonFlag:             daemonFlag,
 		name:                   name,
+		namespace:              namespace,
 		persistent:             cfg.Persistent,
 		daemonGeneration:       daemonGeneration,
 		authorizeSession:       cfg.AuthorizeSession,
@@ -494,7 +503,7 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	// Clean up stale socket files from previous daemon crashes/kills.
-	cleaned := cleanStaleSockets(d.name, logger)
+	cleaned := cleanStaleSockets(d.namespace, logger)
 	if cleaned > 0 {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
 	}
@@ -1190,7 +1199,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	d.owners[sid] = placeholder
 	d.mu.Unlock()
 
-	ipcPath := serverid.IPCPath("", d.name, sid)
+	ipcPath := serverid.IPCPath("", d.namespace, sid)
 
 	// Pass full session env to the owner. Shim-supplied vars WIN; daemon env
 	// fills gaps. Rationale: some shims are launched by tools that strip
@@ -1215,7 +1224,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	}
 
 	// Build the shared owner config (used by both template and fresh paths).
-	controlPath := serverid.ControlPath("", d.name, sid)
+	controlPath := serverid.ControlPath("", d.namespace, sid)
 	ownerCfg := owner.OwnerConfig{
 		Command:          req.Command,
 		Args:             req.Args,

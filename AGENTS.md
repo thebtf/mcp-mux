@@ -65,6 +65,24 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 go get github.com/thebtf/mcp-mux/muxcore@v0.26.5
 ```
 
+### Next - auto-managed engine namespace
+
+**No breaking changes for ordinary `engine.New` consumers.** `engine.Config.Name`
+is now a human-readable/status label, and muxcore derives a collision-resistant
+transport namespace automatically from the label plus product identity. Daemon
+control sockets, owner sockets, daemon locks, stale-socket cleanup, snapshot
+restore, and reconnect behavior use the resolved namespace.
+
+| API | Semantics |
+|-----|-----------|
+| `engine.Config.Name` | Optional display label surfaced in status and registry descriptors. Empty derives from Go build metadata or executable name. |
+| `engine.Config.Namespace` | Optional legacy/advanced transport namespace override. Empty is the normal value; muxcore derives the namespace automatically. Set only to preserve a previously shipped namespace. |
+| `daemon.Config.Namespace` | Lower-level direct-daemon override. Empty defaults to `daemon.Config.Name` for compatibility; ordinary consumers should use `engine.New`. |
+
+Consumer impact: new consumers should not hand-pick pipe names. Existing
+consumers that must keep a shipped namespace for rolling compatibility can set
+`Namespace` explicitly during migration.
+
 ### v0.26.5 - process-explosion owner fanout reduction
 
 **No breaking changes.** v0.26.5 reduces two confirmed owner/process fanout
@@ -353,12 +371,17 @@ if err != nil {
 Two muxcore consumers on one host (e.g. mcp-mux + aimux) no longer share the
 literal `"mcp-mux-"` prefix and cannot interfere with each other.
 
+Historical note: this section describes the v0.22 migration point. The current
+consumer contract is the "Next - auto-managed engine namespace" section above:
+`engine.Config.Name` is a display label, and ordinary consumers should leave
+`engine.Config.Namespace` empty.
+
 | Change | Migration |
 |--------|-----------|
 | `serverid.IPCPath(id, baseDir)` → `serverid.IPCPath(baseDir, name, id)` | Pass engine name as the second argument. Format becomes `{baseDir}/{name}-{id}.sock`. |
 | `serverid.ControlPath(id, baseDir)` → `serverid.ControlPath(baseDir, name, id)` | Same — argument-order change + new name parameter. |
 | `serverid.LockPath(id, baseDir)` → `serverid.LockPath(baseDir, name, id)` | Same. |
-| `engine.Config.Name` is now MANDATORY | `engine.New(Config{Name: "..."})` — empty Name returns error: `"muxcore: engine.Config.Name is required (was empty); pass a name unique to this binary, e.g. \"aimux\", \"mcp-mux\", \"engram\""`. No silent default. |
+| v0.22-only `engine.Config.Name` requirement | At that release point, `engine.New(Config{Name: "..."})` rejected empty Name. Current muxcore derives Name and Namespace automatically for `engine.New`. |
 | `daemon.Config.Name string` (additive) | The engine layer now passes `cfg.Name` through to `daemon.Config.Name`. Internal callers are updated; library consumers that construct `daemon.Config` directly must set `Name`. |
 | `daemon.Config.Persistent bool` (additive) | The engine layer now passes `cfg.Persistent` through. Closes #103: SessionHandler-topology owners now hydrate `OwnerEntry.Persistent` from this field. Subprocess topology continues to derive Persistent from the upstream's `x-mux.persistent` capability — both paths converge on `OwnerEntry.Persistent` before the reaper reads it. |
 | `daemon.HandleListOwners` control RPC (new) | New `Cmd: "list_owners"` returns `ListOwnersResponse{Owners []OwnerInfo, Truncated bool}`. mcp-mux's `mux_list/mux_stop/mux_restart` now query this RPC instead of FS-scanning TEMP — closes #102. |
