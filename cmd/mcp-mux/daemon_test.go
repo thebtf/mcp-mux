@@ -6,11 +6,14 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -184,5 +187,44 @@ func TestMainIsolatedModeStillUsesDaemon(t *testing.T) {
 	}
 	if strings.Contains(output, "becoming owner") {
 		t.Fatalf("isolated daemon failure started a legacy owner; stderr:\n%s", output)
+	}
+}
+
+func TestEnsureDaemonDoesNotSpawnWhenControlEndpointOccupied(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows named-pipe occupied endpoint behavior")
+	}
+	tempDir := shortTempDir(t, "occ")
+	t.Setenv("TEMP", tempDir)
+	t.Setenv("TMP", tempDir)
+
+	ctlPath := serverid.DaemonControlPath("", engineName)
+	ln, err := ipc.Listen(ctlPath)
+	if err != nil {
+		t.Fatalf("ipc.Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	oldStarter := daemonStarter
+	startCalled := false
+	daemonStarter = func() error {
+		startCalled = true
+		return nil
+	}
+	t.Cleanup(func() { daemonStarter = oldStarter })
+
+	var logs bytes.Buffer
+	err = ensureDaemonWithin(log.New(&logs, "[cmd-test] ", 0), 150*time.Millisecond)
+	if err == nil {
+		t.Fatalf("ensureDaemonWithin() error = nil, want occupied endpoint error; logs:\n%s", logs.String())
+	}
+	if startCalled {
+		t.Fatalf("ensureDaemonWithin started a competing daemon for occupied control endpoint; logs:\n%s", logs.String())
+	}
+	if !strings.Contains(err.Error(), "daemon control endpoint occupied but unresponsive") {
+		t.Fatalf("ensureDaemonWithin() error = %v, want occupied endpoint message; logs:\n%s", err, logs.String())
+	}
+	if !strings.Contains(logs.String(), "status=occupied_unresponsive") {
+		t.Fatalf("logs missing occupied_unresponsive status; logs:\n%s", logs.String())
 	}
 }

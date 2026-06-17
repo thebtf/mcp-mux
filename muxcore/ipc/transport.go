@@ -111,6 +111,13 @@ func IsAvailable(path string) bool {
 	return true
 }
 
+// IsEndpointOccupiedError reports errors that mean an endpoint exists but did
+// not complete a usable client connection. Unix callers rely on socket-file
+// cleanup instead, so no dial error is treated as occupied here.
+func IsEndpointOccupiedError(error) bool {
+	return false
+}
+
 // Cleanup removes the socket file. Called by owner on shutdown.
 func Cleanup(path string) {
 	if IsAvailable(path) {
