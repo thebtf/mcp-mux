@@ -236,6 +236,58 @@ func TestSemanticEnvHash_NPMConfigIdentityKeys(t *testing.T) {
 	}
 }
 
+// TestSemanticEnvHash_ConfigExactAndCertIdentityKeys covers common
+// configuration keys that do not fit the underscore-suffix pattern but still
+// change the upstream's process identity.
+func TestSemanticEnvHash_ConfigExactAndCertIdentityKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		a    map[string]string
+		b    map[string]string
+	}{
+		{
+			name: "exact-port",
+			a:    map[string]string{"PORT": "3000"},
+			b:    map[string]string{"PORT": "3001"},
+		},
+		{
+			name: "exact-host",
+			a:    map[string]string{"HOST": "127.0.0.1"},
+			b:    map[string]string{"HOST": "0.0.0.0"},
+		},
+		{
+			name: "suffixed-port",
+			a:    map[string]string{"MCP_SERVER_PORT": "8811"},
+			b:    map[string]string{"MCP_SERVER_PORT": "8812"},
+		},
+		{
+			name: "kubeconfig",
+			a:    map[string]string{"KUBECONFIG": "D:/clusters/dev.yaml"},
+			b:    map[string]string{"KUBECONFIG": "D:/clusters/prod.yaml"},
+		},
+		{
+			name: "docker-cert-path",
+			a:    map[string]string{"DOCKER_CERT_PATH": "D:/certs/a"},
+			b:    map[string]string{"DOCKER_CERT_PATH": "D:/certs/b"},
+		},
+		{
+			name: "node-extra-ca-certs",
+			a:    map[string]string{"NODE_EXTRA_CA_CERTS": "D:/ca/a.pem"},
+			b:    map[string]string{"NODE_EXTRA_CA_CERTS": "D:/ca/b.pem"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hashA := semanticEnvHash(tc.a)
+			hashB := semanticEnvHash(tc.b)
+			if hashA == hashB {
+				t.Fatalf("different %s env values produced identical hash %q", tc.name, hashA)
+			}
+		})
+	}
+}
+
 // TestSemanticEnvHash_IgnoresTransient asserts the helper skips transient
 // keys (CLAUDE_CODE_*, WT_*, SESSIONNAME, WSLENV) so per-session var
 // variation does not fragment owner identity.

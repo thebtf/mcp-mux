@@ -2225,6 +2225,10 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 // the same owner, leaking the first session's credential into the second.
 // Plain value-conflict checks miss this because the second map has no
 // key to conflict against.
+//
+// Non-credential identity keys are incompatible only when both env maps carry
+// the key with different values. Presence in only one env remains compatible so
+// optional config defaults do not fragment owners by themselves.
 func envCompatible(a, b map[string]string) bool {
 	for k, va := range a {
 		if envTransient(k) {
@@ -2338,9 +2342,17 @@ func envIdentityKey(key string) bool {
 		return true
 	case strings.HasSuffix(upper, "_HOST"):
 		return true
+	case strings.HasSuffix(upper, "_PORT"):
+		return true
 	case strings.HasSuffix(upper, "_REGION"):
 		return true
 	case strings.HasSuffix(upper, "_PROFILE"):
+		return true
+	case strings.HasSuffix(upper, "_CERT_PATH") || strings.HasSuffix(upper, "_CERT_FILE"):
+		return true
+	case upper == "HOST" || upper == "PORT" || upper == "URL" || upper == "ENDPOINT":
+		return true
+	case upper == "KUBECONFIG" || upper == "NODE_EXTRA_CA_CERTS":
 		return true
 	case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY":
 		return true
