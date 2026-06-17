@@ -615,8 +615,8 @@ func resolveEngineName(name string) string {
 	if trimmed := strings.TrimSpace(name); trimmed != "" {
 		return trimmed
 	}
-	if bi, ok := engineReadBuildInfo(); ok && bi.Main.Path != "" && bi.Main.Path != "command-line-arguments" {
-		if base := pathBaseNoExt(bi.Main.Path); base != "" {
+	if bi, ok := engineReadBuildInfo(); ok {
+		if base := pathBaseNoExt(buildInfoIdentityPath(bi)); base != "" {
 			return base
 		}
 	}
@@ -639,13 +639,28 @@ func resolveEngineNamespace(name, namespace string) string {
 }
 
 func engineIdentity(name string) string {
-	if bi, ok := engineReadBuildInfo(); ok && bi.Main.Path != "" && bi.Main.Path != "command-line-arguments" {
-		return "go-main:" + bi.Main.Path + "|name:" + name
+	if bi, ok := engineReadBuildInfo(); ok {
+		if path := buildInfoIdentityPath(bi); path != "" {
+			return "go-main:" + path + "|name:" + name
+		}
 	}
 	if exe, err := engineExecutable(); err == nil {
 		return "exe:" + normalizeExecutableIdentityPath(exe) + "|name:" + name
 	}
 	return "name:" + name
+}
+
+func buildInfoIdentityPath(bi *debug.BuildInfo) string {
+	if bi == nil {
+		return ""
+	}
+	if bi.Path != "" && bi.Path != "command-line-arguments" {
+		return bi.Path
+	}
+	if bi.Main.Path != "" && bi.Main.Path != "command-line-arguments" {
+		return bi.Main.Path
+	}
+	return ""
 }
 
 func normalizeExecutableIdentityPath(exe string) string {

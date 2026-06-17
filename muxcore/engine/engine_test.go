@@ -134,7 +134,7 @@ func TestNewDerivesDistinctNamespacesForSameNameDifferentProducts(t *testing.T) 
 	engineExecutable = func() (string, error) { return "ignored.exe", nil }
 
 	engineReadBuildInfo = func() (*debug.BuildInfo, bool) {
-		return &debug.BuildInfo{Main: debug.Module{Path: "example.com/products/alpha"}}, true
+		return &debug.BuildInfo{Path: "example.com/products/alpha/cmd/server"}, true
 	}
 	alpha, err := New(Config{Name: "mcp-mux", Command: "echo"})
 	if err != nil {
@@ -142,7 +142,7 @@ func TestNewDerivesDistinctNamespacesForSameNameDifferentProducts(t *testing.T) 
 	}
 
 	engineReadBuildInfo = func() (*debug.BuildInfo, bool) {
-		return &debug.BuildInfo{Main: debug.Module{Path: "example.com/products/beta"}}, true
+		return &debug.BuildInfo{Path: "example.com/products/beta/cmd/server"}, true
 	}
 	beta, err := New(Config{Name: "mcp-mux", Command: "echo"})
 	if err != nil {
@@ -157,6 +157,42 @@ func TestNewDerivesDistinctNamespacesForSameNameDifferentProducts(t *testing.T) 
 	}
 	if alpha.cfg.Namespace == "mcp-mux" || beta.cfg.Namespace == "mcp-mux" {
 		t.Fatalf("auto namespace fell back to raw display name: alpha=%q beta=%q", alpha.cfg.Namespace, beta.cfg.Namespace)
+	}
+}
+
+func TestNewDerivesDistinctNamespacesForSameModuleDifferentCommands(t *testing.T) {
+	origReadBuildInfo := engineReadBuildInfo
+	origExecutable := engineExecutable
+	t.Cleanup(func() {
+		engineReadBuildInfo = origReadBuildInfo
+		engineExecutable = origExecutable
+	})
+	engineExecutable = func() (string, error) { return "ignored.exe", nil }
+
+	engineReadBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{
+			Path: "example.com/suite/cmd/alpha",
+			Main: debug.Module{Path: "example.com/suite"},
+		}, true
+	}
+	alpha, err := New(Config{Name: "suite", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(alpha): %v", err)
+	}
+
+	engineReadBuildInfo = func() (*debug.BuildInfo, bool) {
+		return &debug.BuildInfo{
+			Path: "example.com/suite/cmd/beta",
+			Main: debug.Module{Path: "example.com/suite"},
+		}, true
+	}
+	beta, err := New(Config{Name: "suite", Command: "echo"})
+	if err != nil {
+		t.Fatalf("New(beta): %v", err)
+	}
+
+	if alpha.cfg.Namespace == beta.cfg.Namespace {
+		t.Fatalf("same module and display Name for different commands produced same namespace %q", alpha.cfg.Namespace)
 	}
 }
 
