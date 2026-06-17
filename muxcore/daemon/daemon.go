@@ -2211,9 +2211,11 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 	return merged
 }
 
-// envCompatible returns true if two env maps have no conflicting values
-// for semantically significant keys (API tokens, config paths, etc.).
-// Transient per-session vars (CLAUDE_CODE_*, WT_SESSION, etc.) are ignored.
+// envCompatible returns true if two env maps have no conflicting values for
+// keys that affect upstream process identity (credentials, config paths/URLs,
+// proxies, etc.). Ordinary launch noise (PATH, temp dirs, shell metadata, host
+// session IDs) is ignored so global-first sharing does not fragment into one
+// owner per MCP host session.
 //
 // Credential-bearing keys (GITHUB_TOKEN, OPENAI_API_KEY, anything matching
 // envCredentialKey()) additionally MUST match by presence: if a key exists
@@ -2226,6 +2228,9 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 func envCompatible(a, b map[string]string) bool {
 	for k, va := range a {
 		if envTransient(k) {
+			continue
+		}
+		if !envIdentityKey(k) {
 			continue
 		}
 		vb, ok := b[k]
@@ -2243,6 +2248,9 @@ func envCompatible(a, b map[string]string) bool {
 	// must also split. The loop over a alone cannot see keys unique to b.
 	for k := range b {
 		if envTransient(k) {
+			continue
+		}
+		if !envIdentityKey(k) {
 			continue
 		}
 		if _, ok := a[k]; ok {
@@ -2302,6 +2310,48 @@ func envCredentialKey(key string) bool {
 	return false
 }
 
+// envIdentityKey returns true for env vars that should partition a global
+// owner. This intentionally stays narrower than "all non-transient vars":
+// hashing PATH/TEMP/HOME-style noise recreates the process fan-out that
+// global-first identity is meant to eliminate. Unknown credential-like keys
+// remain identity keys via envCredentialKey; non-secret configuration keys use
+// conservative suffix/exact matches.
+func envIdentityKey(key string) bool {
+	if envCredentialKey(key) {
+		return true
+	}
+	upper := strings.ToUpper(key)
+	switch {
+	case strings.HasSuffix(upper, "_CONFIG"):
+		return true
+	case strings.HasSuffix(upper, "_CONFIG_FILE"):
+		return true
+	case strings.HasSuffix(upper, "_CONFIG_PATH"):
+		return true
+	case strings.HasSuffix(upper, "_CONFIG_DIR"):
+		return true
+	case strings.HasSuffix(upper, "_ENDPOINT"):
+		return true
+	case strings.HasSuffix(upper, "_BASE_URL"):
+		return true
+	case strings.HasSuffix(upper, "_URL"):
+		return true
+	case strings.HasSuffix(upper, "_HOST"):
+		return true
+	case strings.HasSuffix(upper, "_REGION"):
+		return true
+	case strings.HasSuffix(upper, "_PROFILE"):
+		return true
+	case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY":
+		return true
+	case upper == "SSL_CERT_FILE" || upper == "SSL_CERT_DIR":
+		return true
+	case upper == "REQUESTS_CA_BUNDLE" || upper == "CURL_CA_BUNDLE":
+		return true
+	}
+	return false
+}
+
 // semanticEnvHash returns a stable 8-hex-char hash of env entries that
 // envCompatible would consider semantically significant (non-transient
 // keys, sorted alphabetically with their values). Used as a sid suffix
@@ -2315,6 +2365,9 @@ func semanticEnvHash(env map[string]string) string {
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		if envTransient(k) {
+			continue
+		}
+		if !envIdentityKey(k) {
 			continue
 		}
 		keys = append(keys, k)

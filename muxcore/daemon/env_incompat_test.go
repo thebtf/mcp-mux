@@ -115,19 +115,84 @@ func TestGlobalFirst_EnvCompatibleSharedSingleOwner(t *testing.T) {
 	}
 }
 
+// TestGlobalFirst_NonIdentityEnvNoiseSharedSingleOwner proves the process
+// explosion guard: global/shared owners must not split merely because MCP host
+// sessions carry different launch noise. Credential/config keys still split in
+// the tests above; this test covers PATH/temp/shell/session-style vars that
+// should not create one owner per host session.
+func TestGlobalFirst_NonIdentityEnvNoiseSharedSingleOwner(t *testing.T) {
+	cwd1 := t.TempDir()
+	cwd2 := t.TempDir()
+	d := testDaemon(t)
+	mockServer := mockServerAbsPath(t)
+	tempA := t.TempDir()
+	tempB := t.TempDir()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	env1 := map[string]string{
+		"PATH":            "/tools/a",
+		"TEMP":            tempA,
+		"TMP":             tempA,
+		"USERPROFILE":     homeA,
+		"NVMD_SESSION_ID": "session-a",
+	}
+	env2 := map[string]string{
+		"PATH":            "/tools/b",
+		"TEMP":            tempB,
+		"TMP":             tempB,
+		"USERPROFILE":     homeB,
+		"NVMD_SESSION_ID": "session-b",
+	}
+
+	_, sid1, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", mockServer},
+		Cwd:     cwd1,
+		Env:     env1,
+	})
+	if err != nil {
+		t.Fatalf("Spawn 1: %v", err)
+	}
+
+	_, sid2, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", mockServer},
+		Cwd:     cwd2,
+		Env:     env2,
+	})
+	if err != nil {
+		t.Fatalf("Spawn 2: %v", err)
+	}
+
+	if sid1 != sid2 {
+		t.Errorf("non-identity env noise produced distinct sids %q vs %q", sid1, sid2)
+	}
+	if got := d.OwnerCount(); got != 1 {
+		t.Errorf("OwnerCount = %d, want 1 when only env noise differs", got)
+	}
+}
+
 // TestSemanticEnvHash_Deterministic asserts that the helper produces
 // identical hashes for identical inputs and different hashes for
 // different inputs on a semantically significant key.
 func TestSemanticEnvHash_Deterministic(t *testing.T) {
-	a := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "PATH": "/usr/bin"})
-	b := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "PATH": "/usr/bin"})
+	a := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "MCP_SERVER_CONFIG": "/cfg/a.json"})
+	b := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "MCP_SERVER_CONFIG": "/cfg/a.json"})
 	if a != b {
 		t.Errorf("identical inputs produced different hashes: %q vs %q", a, b)
 	}
 
-	c := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "xyz", "PATH": "/usr/bin"})
+	c := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "xyz", "MCP_SERVER_CONFIG": "/cfg/a.json"})
 	if a == c {
 		t.Errorf("different GITHUB_TOKEN produced identical hash: %q", a)
+	}
+
+	d := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "MCP_SERVER_CONFIG": "/cfg/b.json"})
+	if a == d {
+		t.Errorf("different config path produced identical hash: %q", a)
 	}
 }
 
@@ -166,6 +231,25 @@ func TestSemanticEnvHash_EmptyEnv(t *testing.T) {
 	if allTransient != "00000000" {
 		t.Errorf("all-transient env hash = %q, want %q (no semantic content)",
 			allTransient, "00000000")
+	}
+}
+
+// TestSemanticEnvHash_IgnoresNonIdentityNoise asserts that common process
+// launch noise does not participate in the env bucket suffix. This keeps
+// shared/global owners from multiplying across MCP host sessions that differ
+// only by shell, temp, path, or local session metadata.
+func TestSemanticEnvHash_IgnoresNonIdentityNoise(t *testing.T) {
+	baseline := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc"})
+	noisy := semanticEnvHash(map[string]string{
+		"GITHUB_TOKEN":    "abc",
+		"PATH":            "/tools/a",
+		"TEMP":            "/tmp/a",
+		"TMP":             "/tmp/a",
+		"USERPROFILE":     "/users/a",
+		"NVMD_SESSION_ID": "session-a",
+	})
+	if noisy != baseline {
+		t.Errorf("non-identity env noise leaked into hash: got %q, want %q", noisy, baseline)
 	}
 }
 
