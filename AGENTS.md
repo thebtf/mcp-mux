@@ -62,8 +62,27 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.4
 ```
+
+### v0.26.4 - Windows occupied control-pipe startup guard
+
+**No breaking changes.** v0.26.4 includes the v0.26.3 restart reconnect /
+launcher upgrade protocol plus a Windows startup guard for occupied but
+unresponsive daemon control pipes. When a control endpoint is already bound but
+does not answer ping, `mcp-mux` now waits and fails clearly instead of spawning a
+competing daemon against the same named pipe. A genuinely missing pipe remains a
+normal startup miss.
+
+Consumer impact: update to v0.26.4; no muxcore API change is required. This
+does not recover an already-unresponsive daemon process by killing it. Recovery
+still needs explicit operator or product policy.
+
+### v0.26.3 - restart reconnect and launcher upgrade protocol
+
+**No breaking changes.** v0.26.3 fixes restart reconnect behavior and stable
+launcher upgrade protocol issues. It is superseded by v0.26.4 for Windows
+control-pipe startup reliability.
 
 ### v0.26.2 - consumer docs target correction
 
@@ -503,7 +522,7 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.4
 ```
 
 Key changes to adopt:
@@ -516,7 +535,7 @@ Key changes to adopt:
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.2
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.4
 ```
 
 Key changes:
