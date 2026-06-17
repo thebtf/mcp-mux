@@ -5,11 +5,16 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +32,12 @@ var runResilientClient = owner.RunResilientClient
 var engineClientStartDaemon = func(e *MuxEngine) error {
 	return e.startDaemon()
 }
+
+var engineReadBuildInfo = debug.ReadBuildInfo
+
+var engineExecutable = os.Executable
+
+var engineGOOS = runtime.GOOS
 
 // Internal timing defaults for the engine. Kept as named constants (not inline
 // literals) so the rationale is discoverable and future tuning has a single
@@ -95,9 +106,17 @@ type Handler func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 
 // Config configures the muxcore engine.
 type Config struct {
-	// Name is used for log prefixes and socket file naming.
-	// Required.
+	// Name is the human-readable engine/product label surfaced in status and
+	// registry descriptors. If empty, muxcore derives a label from Go build
+	// metadata or the executable name.
 	Name string
+
+	// Namespace scopes daemon and owner IPC paths. Empty is the normal value:
+	// muxcore derives a collision-resistant namespace from the engine label and
+	// product identity so consumers do not have to hand-pick globally unique
+	// pipe names. Set only for deliberate legacy compatibility with a
+	// previously-shipped namespace.
+	Namespace string
 
 	// Command and Args define the upstream MCP server to spawn.
 	// Used in daemon mode to start the real server process.
@@ -227,12 +246,11 @@ type MuxEngine struct {
 // New creates a MuxEngine with the given configuration.
 // Validates config and applies defaults.
 func New(cfg Config) (*MuxEngine, error) {
-	if cfg.Name == "" {
-		return nil, fmt.Errorf("muxcore: engine.Config.Name is required (was empty); pass a name unique to this binary, e.g. \"aimux\", \"mcp-mux\", \"engram\"")
-	}
 	if cfg.Command == "" && cfg.Handler == nil && cfg.SessionHandler == nil {
 		return nil, fmt.Errorf("engine: Command, Handler, or SessionHandler is required")
 	}
+	cfg.Name = resolveEngineName(cfg.Name)
+	cfg.Namespace = resolveEngineNamespace(cfg.Name, cfg.Namespace)
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 5 * time.Minute
 	}
@@ -329,18 +347,18 @@ func (e *MuxEngine) Ready() <-chan struct{} {
 }
 
 // ControlSocketPath returns the canonical daemon control socket path for this
-// engine's Name and BaseDir. Mirrors serverid.DaemonControlPath exactly;
+// engine's Namespace and BaseDir. Mirrors serverid.DaemonControlPath exactly;
 // exposed so consumers do not need to import serverid directly or duplicate the
-// BaseDir/Name composition.
+// BaseDir/Namespace composition.
 func (e *MuxEngine) ControlSocketPath() string {
-	return serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
+	return serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 }
 
 // runDaemon starts the global daemon that manages owners and accepts IPC
 // connections. It mirrors the behaviour of runGlobalDaemon() in cmd/mcp-mux/
 // but uses the engine's Config for timeouts and base directory.
 func (e *MuxEngine) runDaemon(ctx context.Context) error {
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 
 	// If another daemon is already serving this engine namespace, do not unlink
 	// its control socket. ipc.Listen removes stale files after proving they are
@@ -365,6 +383,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		SessionHandler:   e.cfg.SessionHandler,
 		DaemonFlag:       e.cfg.DaemonFlag,
 		Name:             e.cfg.Name,
+		Namespace:        e.cfg.Namespace,
 		Persistent:       e.cfg.Persistent,
 		Registry:         e.cfg.Registry,
 		AuthorizeSession: e.cfg.AuthorizeSession,
@@ -407,7 +426,7 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 func (e *MuxEngine) runClient(ctx context.Context) error {
 	e.markReady(ModeClient, nil)
 
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 
 	// 1. Ensure the daemon is running, starting it if necessary.
 	if !isDaemonRunning(ctlPath) {
@@ -588,8 +607,105 @@ func (e *MuxEngine) startDaemon() error {
 		return fmt.Errorf("release daemon process: %w", err)
 	}
 
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Name)
+	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 	return waitForDaemon(ctlPath, daemonStartupTimeout)
+}
+
+func resolveEngineName(name string) string {
+	if trimmed := strings.TrimSpace(name); trimmed != "" {
+		return trimmed
+	}
+	if bi, ok := engineReadBuildInfo(); ok {
+		if base := pathBaseNoExt(buildInfoIdentityPath(bi)); base != "" {
+			return base
+		}
+	}
+	if exe, err := engineExecutable(); err == nil {
+		if base := pathBaseNoExt(exe); base != "" {
+			return base
+		}
+	}
+	return "muxcore-engine"
+}
+
+func resolveEngineNamespace(name, namespace string) string {
+	if trimmed := strings.TrimSpace(namespace); trimmed != "" {
+		return trimmed
+	}
+	label := sanitizeNamespaceComponent(name)
+	identity := engineIdentity(name)
+	sum := sha256.Sum256([]byte(identity))
+	return label + "-" + hex.EncodeToString(sum[:])[:12]
+}
+
+func engineIdentity(name string) string {
+	if bi, ok := engineReadBuildInfo(); ok {
+		if path := buildInfoIdentityPath(bi); path != "" {
+			return "go-main:" + path + "|name:" + name
+		}
+	}
+	if exe, err := engineExecutable(); err == nil {
+		return "exe:" + normalizeExecutableIdentityPath(exe) + "|name:" + name
+	}
+	return "name:" + name
+}
+
+func buildInfoIdentityPath(bi *debug.BuildInfo) string {
+	if bi == nil {
+		return ""
+	}
+	if bi.Path != "" && bi.Path != "command-line-arguments" {
+		return bi.Path
+	}
+	if bi.Main.Path != "" && bi.Main.Path != "command-line-arguments" {
+		return bi.Main.Path
+	}
+	return ""
+}
+
+func normalizeExecutableIdentityPath(exe string) string {
+	cleaned := filepath.Clean(exe)
+	if engineGOOS == "windows" {
+		return strings.ToLower(cleaned)
+	}
+	return cleaned
+}
+
+func sanitizeNamespaceComponent(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	lastDash := false
+	for _, r := range s {
+		ok := r >= 'a' && r <= 'z' || r >= '0' && r <= '9'
+		if ok {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "muxcore-engine"
+	}
+	if len(out) > 48 {
+		out = strings.TrimRight(out[:48], "-")
+	}
+	if out == "" {
+		return "muxcore-engine"
+	}
+	return out
+}
+
+func pathBaseNoExt(path string) string {
+	base := filepath.Base(path)
+	if ext := filepath.Ext(base); ext != "" {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return strings.TrimSpace(base)
 }
 
 // isDaemonRunning checks whether the daemon control socket responds to ping.

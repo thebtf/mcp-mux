@@ -204,6 +204,44 @@ func (noopSessionHandler) HandleRequest(context.Context, muxcore.ProjectContext,
 	return []byte(`{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`), nil
 }
 
+func TestDaemonNamespaceScopesOwnerPathsWithoutChangingEngineName(t *testing.T) {
+	ctlPath := shortSocketPath(t, "daemon-namespace.ctl.sock")
+	d, err := New(Config{
+		Name:           "aimux",
+		Namespace:      "aimux-auto-test",
+		ControlPath:    ctlPath,
+		GracePeriod:    1 * time.Second,
+		IdleTimeout:    5 * time.Second,
+		SkipSnapshot:   true,
+		Logger:         testLogger(t),
+		SessionHandler: noopSessionHandler{},
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.Shutdown() })
+
+	ipcPath, sid, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "test-session-handler",
+		Mode:    "global",
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+	if want := serverid.IPCPath("", "aimux-auto-test", sid); ipcPath != want {
+		t.Fatalf("Spawn() ipcPath = %q, want namespace-scoped %q", ipcPath, want)
+	}
+	if forbidden := serverid.IPCPath("", "aimux", sid); ipcPath == forbidden {
+		t.Fatalf("Spawn() ipcPath used display Name instead of Namespace: %q", ipcPath)
+	}
+
+	status := d.HandleStatus()
+	if status["engine_name"] != "aimux" {
+		t.Fatalf("status engine_name = %q, want display Name aimux", status["engine_name"])
+	}
+}
+
 func testReconnectOwner(t *testing.T, sid string) *owner.Owner {
 	t.Helper()
 	ipcPath := shortSocketPath(t, "refresh.sock")

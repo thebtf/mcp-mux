@@ -14,6 +14,7 @@ import (
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 type fakeDaemonLock struct {
@@ -279,6 +280,40 @@ func TestRestartWithSuccessor_GracefulSuccessUsesExplicitSuccessor(t *testing.T)
 	}
 	if !lock.closed {
 		t.Fatal("daemon lock was not released")
+	}
+}
+
+func TestRestartWithSuccessor_UsesNamespaceForDaemonLock(t *testing.T) {
+	restoreUpdateSeams(t)
+	baseDir := t.TempDir()
+	eng, err := New(Config{
+		Name:       "display-name",
+		Namespace:  "transport-ns",
+		Command:    "test-command",
+		BaseDir:    baseDir,
+		DaemonFlag: "--test-daemon",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	var gotLockPath string
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(path string) (daemonLock, error) {
+		gotLockPath = path
+		return &fakeDaemonLock{}, nil
+	}
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return &control.Response{OK: true}, nil
+	}
+	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+
+	if _, err := eng.RestartWithSuccessor(context.Background(), baseRestartWithSuccessorOptions()); err != nil {
+		t.Fatalf("RestartWithSuccessor: %v", err)
+	}
+	wantLockPath := serverid.DaemonLockPath(baseDir, "transport-ns")
+	if gotLockPath != wantLockPath {
+		t.Fatalf("lock path = %q, want %q", gotLockPath, wantLockPath)
 	}
 }
 
