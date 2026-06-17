@@ -247,7 +247,7 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 		result.Warnings = append(result.Warnings, fmt.Sprintf("could not read daemon identity before restart: %v", identityErr))
 	}
 
-	lockPath := serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Name)
+	lockPath := serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace)
 	lock, err := engineAcquireDaemonLock(lockPath)
 	if err != nil {
 		if !opts.ProceedWithoutLock {
