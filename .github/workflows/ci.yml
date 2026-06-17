@@ -23,7 +23,9 @@ jobs:
         working-directory: muxcore
         run: |
           go vet ./...
-          go test -race -count=1 -timeout 180s ./...
+          # Serialize packages because daemon and snapshot tests share the
+          # TEMP-based snapshot path; coverage already uses the same guard.
+          go test -race -count=1 -timeout 180s -p=1 ./...
 
   coverage:
     runs-on: ubuntu-latest
