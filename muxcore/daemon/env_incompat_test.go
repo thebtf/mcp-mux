@@ -196,6 +196,38 @@ func TestSemanticEnvHash_Deterministic(t *testing.T) {
 	}
 }
 
+// TestSemanticEnvHash_NPMConfigIdentityKeys asserts that npm registry and
+// config-file settings remain identity keys while lifecycle/package metadata is
+// still ignored. This preserves the credential/config boundary without
+// restoring broad npm launch-noise fanout.
+func TestSemanticEnvHash_NPMConfigIdentityKeys(t *testing.T) {
+	registryA := semanticEnvHash(map[string]string{
+		"npm_config_registry":        "https://registry-a.example/",
+		"npm_lifecycle_event":        "start",
+		"npm_package_json":           "D:/repo-a/package.json",
+		"npm_package_integrity_hash": "session-a",
+	})
+	registryB := semanticEnvHash(map[string]string{
+		"npm_config_registry":        "https://registry-b.example/",
+		"npm_lifecycle_event":        "start",
+		"npm_package_json":           "D:/repo-b/package.json",
+		"npm_package_integrity_hash": "session-b",
+	})
+	if registryA == registryB {
+		t.Fatalf("different npm registry values produced identical hash %q", registryA)
+	}
+
+	withNoise := semanticEnvHash(map[string]string{
+		"npm_config_registry":        "https://registry-a.example/",
+		"npm_lifecycle_event":        "test",
+		"npm_package_json":           "D:/repo-c/package.json",
+		"npm_package_integrity_hash": "session-c",
+	})
+	if withNoise != registryA {
+		t.Fatalf("npm launch/package noise changed registry identity hash: got %q want %q", withNoise, registryA)
+	}
+}
+
 // TestSemanticEnvHash_IgnoresTransient asserts the helper skips transient
 // keys (CLAUDE_CODE_*, WT_*, SESSIONNAME, WSLENV) so per-session var
 // variation does not fragment owner identity.

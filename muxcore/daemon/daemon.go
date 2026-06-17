@@ -2344,6 +2344,10 @@ func envIdentityKey(key string) bool {
 		return true
 	case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY":
 		return true
+	case upper == "NPM_CONFIG_REGISTRY" || upper == "NPM_CONFIG_USERCONFIG" || upper == "NPM_CONFIG_GLOBALCONFIG":
+		return true
+	case upper == "NPM_CONFIG_PROXY" || upper == "NPM_CONFIG_HTTPS_PROXY" || upper == "NPM_CONFIG_CAFILE":
+		return true
 	case upper == "SSL_CERT_FILE" || upper == "SSL_CERT_DIR":
 		return true
 	case upper == "REQUESTS_CA_BUNDLE" || upper == "CURL_CA_BUNDLE":
