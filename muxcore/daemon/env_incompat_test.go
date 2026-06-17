@@ -256,6 +256,21 @@ func TestSemanticEnvHash_ConfigExactAndCertIdentityKeys(t *testing.T) {
 			b:    map[string]string{"HOST": "0.0.0.0"},
 		},
 		{
+			name: "exact-config",
+			a:    map[string]string{"CONFIG": "D:/configs/a.json"},
+			b:    map[string]string{"CONFIG": "D:/configs/b.json"},
+		},
+		{
+			name: "exact-region",
+			a:    map[string]string{"REGION": "us-east-1"},
+			b:    map[string]string{"REGION": "eu-west-1"},
+		},
+		{
+			name: "exact-profile",
+			a:    map[string]string{"PROFILE": "dev"},
+			b:    map[string]string{"PROFILE": "prod"},
+		},
+		{
 			name: "suffixed-port",
 			a:    map[string]string{"MCP_SERVER_PORT": "8811"},
 			b:    map[string]string{"MCP_SERVER_PORT": "8812"},

@@ -2350,9 +2350,13 @@ func envIdentityKey(key string) bool {
 		return true
 	case strings.HasSuffix(upper, "_CERT_PATH") || strings.HasSuffix(upper, "_CERT_FILE"):
 		return true
-	case upper == "HOST" || upper == "PORT" || upper == "URL" || upper == "ENDPOINT":
+	case upper == "CONFIG" || upper == "CONFIG_FILE" || upper == "CONFIG_PATH" || upper == "CONFIG_DIR":
 		return true
-	case upper == "KUBECONFIG" || upper == "NODE_EXTRA_CA_CERTS":
+	case upper == "HOST" || upper == "PORT" || upper == "URL" || upper == "BASE_URL" || upper == "ENDPOINT":
+		return true
+	case upper == "REGION" || upper == "PROFILE":
+		return true
+	case upper == "KUBECONFIG" || upper == "NODE_EXTRA_CA_CERTS" || upper == "CERT_PATH" || upper == "CERT_FILE":
 		return true
 	case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY":
 		return true
