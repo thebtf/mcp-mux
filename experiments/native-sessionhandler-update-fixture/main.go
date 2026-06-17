@@ -40,6 +40,8 @@ type rpcRequest struct {
 }
 
 func main() {
+	appendTraceLog(fmt.Sprintf("entry pid=%d args=%q base_dir=%q", os.Getpid(), os.Args, os.Getenv(envBaseDir)))
+
 	var successorExe string
 	var showStatus bool
 	var shutdown bool
@@ -339,8 +341,27 @@ func fatalJSON(err error) {
 	data, marshalErr := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
 	if marshalErr != nil {
 		fmt.Fprintf(os.Stderr, "marshal JSON: %v\n", marshalErr)
+		appendFatalLog("marshal JSON: " + marshalErr.Error())
 	} else {
 		fmt.Fprintln(os.Stderr, string(data))
+		appendFatalLog(string(data))
 	}
 	os.Exit(1)
+}
+
+func appendFatalLog(message string) {
+	appendTraceLog("fatal: " + message)
+}
+
+func appendTraceLog(message string) {
+	logPath := os.Getenv(envLogPath)
+	if logPath == "" {
+		return
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "[native-fixture] %s %s\n", time.Now().Format("2006/01/02 15:04:05.000000"), message)
 }

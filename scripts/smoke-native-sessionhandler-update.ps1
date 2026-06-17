@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$Stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([guid]::NewGuid().ToString("N").Substring(0, 8))
 if ([string]::IsNullOrWhiteSpace($RunDir)) {
     $TempRoot = $env:MUXCORE_NATIVE_SMOKE_ROOT
     if ([string]::IsNullOrWhiteSpace($TempRoot)) {
