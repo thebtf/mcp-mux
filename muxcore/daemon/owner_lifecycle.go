@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -129,6 +130,33 @@ func (d *Daemon) forgetOwnerIfCurrent(serverID string, expected *OwnerEntry, rea
 
 func (d *Daemon) deleteOwnerEntryLocked(serverID string) {
 	delete(d.owners, serverID)
+	d.cleanupForcedIsolatedRetryCounterLocked(serverID)
+}
+
+func (d *Daemon) cleanupForcedIsolatedRetryCounterLocked(serverID string) {
+	base, ok := retryCounterBaseForServerID(serverID)
+	if !ok {
+		return
+	}
+	if _, exists := d.forcedIsolatedRetryCounters.Load(base); !exists {
+		return
+	}
+	for sid := range d.owners {
+		if sid == base || strings.HasPrefix(sid, base+"-r") {
+			return
+		}
+	}
+	d.forcedIsolatedRetryCounters.Delete(base)
+}
+
+func retryCounterBaseForServerID(serverID string) (string, bool) {
+	if matches := retrySidPattern.FindStringSubmatch(serverID); matches != nil {
+		return matches[1], true
+	}
+	if strings.HasPrefix(serverID, "isolated-") {
+		return serverID, true
+	}
+	return "", false
 }
 
 func (d *Daemon) recordOwnerRemovalLocked(result ownerRemovalResult) {

@@ -115,19 +115,191 @@ func TestGlobalFirst_EnvCompatibleSharedSingleOwner(t *testing.T) {
 	}
 }
 
+// TestGlobalFirst_NonIdentityEnvNoiseSharedSingleOwner proves the process
+// explosion guard: global/shared owners must not split merely because MCP host
+// sessions carry different launch noise. Credential/config keys still split in
+// the tests above; this test covers PATH/temp/shell/session-style vars that
+// should not create one owner per host session.
+func TestGlobalFirst_NonIdentityEnvNoiseSharedSingleOwner(t *testing.T) {
+	cwd1 := t.TempDir()
+	cwd2 := t.TempDir()
+	d := testDaemon(t)
+	mockServer := mockServerAbsPath(t)
+	tempA := t.TempDir()
+	tempB := t.TempDir()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	env1 := map[string]string{
+		"PATH":            "/tools/a",
+		"TEMP":            tempA,
+		"TMP":             tempA,
+		"USERPROFILE":     homeA,
+		"NVMD_SESSION_ID": "session-a",
+	}
+	env2 := map[string]string{
+		"PATH":            "/tools/b",
+		"TEMP":            tempB,
+		"TMP":             tempB,
+		"USERPROFILE":     homeB,
+		"NVMD_SESSION_ID": "session-b",
+	}
+
+	_, sid1, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", mockServer},
+		Cwd:     cwd1,
+		Env:     env1,
+	})
+	if err != nil {
+		t.Fatalf("Spawn 1: %v", err)
+	}
+
+	_, sid2, _, err := d.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", mockServer},
+		Cwd:     cwd2,
+		Env:     env2,
+	})
+	if err != nil {
+		t.Fatalf("Spawn 2: %v", err)
+	}
+
+	if sid1 != sid2 {
+		t.Errorf("non-identity env noise produced distinct sids %q vs %q", sid1, sid2)
+	}
+	if got := d.OwnerCount(); got != 1 {
+		t.Errorf("OwnerCount = %d, want 1 when only env noise differs", got)
+	}
+}
+
 // TestSemanticEnvHash_Deterministic asserts that the helper produces
 // identical hashes for identical inputs and different hashes for
 // different inputs on a semantically significant key.
 func TestSemanticEnvHash_Deterministic(t *testing.T) {
-	a := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "PATH": "/usr/bin"})
-	b := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "PATH": "/usr/bin"})
+	a := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "MCP_SERVER_CONFIG": "/cfg/a.json"})
+	b := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "MCP_SERVER_CONFIG": "/cfg/a.json"})
 	if a != b {
 		t.Errorf("identical inputs produced different hashes: %q vs %q", a, b)
 	}
 
-	c := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "xyz", "PATH": "/usr/bin"})
+	c := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "xyz", "MCP_SERVER_CONFIG": "/cfg/a.json"})
 	if a == c {
 		t.Errorf("different GITHUB_TOKEN produced identical hash: %q", a)
+	}
+
+	d := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc", "MCP_SERVER_CONFIG": "/cfg/b.json"})
+	if a == d {
+		t.Errorf("different config path produced identical hash: %q", a)
+	}
+}
+
+// TestSemanticEnvHash_NPMConfigIdentityKeys asserts that npm config settings
+// remain identity keys while lifecycle/package metadata is
+// still ignored. This preserves the credential/config boundary without
+// restoring broad npm launch-noise fanout.
+func TestSemanticEnvHash_NPMConfigIdentityKeys(t *testing.T) {
+	registryA := semanticEnvHash(map[string]string{
+		"npm_config_registry":        "https://registry-a.example/",
+		"npm_lifecycle_event":        "start",
+		"npm_package_json":           "D:/repo-a/package.json",
+		"npm_package_integrity_hash": "session-a",
+	})
+	registryB := semanticEnvHash(map[string]string{
+		"npm_config_registry":        "https://registry-b.example/",
+		"npm_lifecycle_event":        "start",
+		"npm_package_json":           "D:/repo-b/package.json",
+		"npm_package_integrity_hash": "session-b",
+	})
+	if registryA == registryB {
+		t.Fatalf("different npm registry values produced identical hash %q", registryA)
+	}
+
+	strictSSLFalse := semanticEnvHash(map[string]string{
+		"npm_config_registry":   "https://registry-a.example/",
+		"npm_config_strict_ssl": "false",
+	})
+	if strictSSLFalse == registryA {
+		t.Fatalf("different npm strict_ssl values produced identical hash %q", strictSSLFalse)
+	}
+
+	withNoise := semanticEnvHash(map[string]string{
+		"npm_config_registry":        "https://registry-a.example/",
+		"npm_lifecycle_event":        "test",
+		"npm_package_json":           "D:/repo-c/package.json",
+		"npm_package_integrity_hash": "session-c",
+	})
+	if withNoise != registryA {
+		t.Fatalf("npm launch/package noise changed registry identity hash: got %q want %q", withNoise, registryA)
+	}
+}
+
+// TestSemanticEnvHash_ConfigExactAndCertIdentityKeys covers common
+// configuration keys that do not fit the underscore-suffix pattern but still
+// change the upstream's process identity.
+func TestSemanticEnvHash_ConfigExactAndCertIdentityKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		a    map[string]string
+		b    map[string]string
+	}{
+		{
+			name: "exact-port",
+			a:    map[string]string{"PORT": "3000"},
+			b:    map[string]string{"PORT": "3001"},
+		},
+		{
+			name: "exact-host",
+			a:    map[string]string{"HOST": "127.0.0.1"},
+			b:    map[string]string{"HOST": "0.0.0.0"},
+		},
+		{
+			name: "exact-config",
+			a:    map[string]string{"CONFIG": "D:/configs/a.json"},
+			b:    map[string]string{"CONFIG": "D:/configs/b.json"},
+		},
+		{
+			name: "exact-region",
+			a:    map[string]string{"REGION": "us-east-1"},
+			b:    map[string]string{"REGION": "eu-west-1"},
+		},
+		{
+			name: "exact-profile",
+			a:    map[string]string{"PROFILE": "dev"},
+			b:    map[string]string{"PROFILE": "prod"},
+		},
+		{
+			name: "suffixed-port",
+			a:    map[string]string{"MCP_SERVER_PORT": "8811"},
+			b:    map[string]string{"MCP_SERVER_PORT": "8812"},
+		},
+		{
+			name: "kubeconfig",
+			a:    map[string]string{"KUBECONFIG": "D:/clusters/dev.yaml"},
+			b:    map[string]string{"KUBECONFIG": "D:/clusters/prod.yaml"},
+		},
+		{
+			name: "docker-cert-path",
+			a:    map[string]string{"DOCKER_CERT_PATH": "D:/certs/a"},
+			b:    map[string]string{"DOCKER_CERT_PATH": "D:/certs/b"},
+		},
+		{
+			name: "node-extra-ca-certs",
+			a:    map[string]string{"NODE_EXTRA_CA_CERTS": "D:/ca/a.pem"},
+			b:    map[string]string{"NODE_EXTRA_CA_CERTS": "D:/ca/b.pem"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hashA := semanticEnvHash(tc.a)
+			hashB := semanticEnvHash(tc.b)
+			if hashA == hashB {
+				t.Fatalf("different %s env values produced identical hash %q", tc.name, hashA)
+			}
+		})
 	}
 }
 
@@ -166,6 +338,25 @@ func TestSemanticEnvHash_EmptyEnv(t *testing.T) {
 	if allTransient != "00000000" {
 		t.Errorf("all-transient env hash = %q, want %q (no semantic content)",
 			allTransient, "00000000")
+	}
+}
+
+// TestSemanticEnvHash_IgnoresNonIdentityNoise asserts that common process
+// launch noise does not participate in the env bucket suffix. This keeps
+// shared/global owners from multiplying across MCP host sessions that differ
+// only by shell, temp, path, or local session metadata.
+func TestSemanticEnvHash_IgnoresNonIdentityNoise(t *testing.T) {
+	baseline := semanticEnvHash(map[string]string{"GITHUB_TOKEN": "abc"})
+	noisy := semanticEnvHash(map[string]string{
+		"GITHUB_TOKEN":    "abc",
+		"PATH":            "/tools/a",
+		"TEMP":            "/tmp/a",
+		"TMP":             "/tmp/a",
+		"USERPROFILE":     "/users/a",
+		"NVMD_SESSION_ID": "session-a",
+	})
+	if noisy != baseline {
+		t.Errorf("non-identity env noise leaked into hash: got %q, want %q", noisy, baseline)
 	}
 }
 
