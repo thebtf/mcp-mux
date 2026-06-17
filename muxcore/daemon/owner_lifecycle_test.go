@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
 )
 
@@ -87,6 +89,38 @@ func TestCleanupDeadOwnerUsesOwnerRemovalPath(t *testing.T) {
 	}
 	status := d.HandleStatus()
 	assertOwnerRemovalStatus(t, status, 1, "zombie", 1)
+}
+
+func TestOwnerLifecycleRemovalCleansFinalRetryCounter(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+
+	cwd := t.TempDir()
+	cmd := "echo"
+	args := []string{"hello"}
+	base := serverid.GenerateContextKey(serverid.ModeIsolated, cmd, args, nil, cwd)
+	sid := base + "-r1"
+	o := testReconnectOwner(t, sid)
+
+	d.forcedIsolatedRetryCounters.Store(base, &atomic.Int64{})
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{
+		Owner:           o,
+		ServerID:        sid,
+		Command:         cmd,
+		Args:            args,
+		Cwd:             cwd,
+		OwnerGeneration: "owner_gen_retry",
+		RestoreSource:   "fresh",
+	}
+	d.mu.Unlock()
+
+	if _, err := d.removeOwner(sid, ownerRemovalReasonIdle, false); err != nil {
+		t.Fatalf("removeOwner() error: %v", err)
+	}
+	if _, ok := d.forcedIsolatedRetryCounters.Load(base); ok {
+		t.Fatalf("retry counter for %q survived final retry owner removal", base)
+	}
 }
 
 func seedReconnectHistoryForOwner(t *testing.T, o *owner.Owner, token, ownerKey string) {

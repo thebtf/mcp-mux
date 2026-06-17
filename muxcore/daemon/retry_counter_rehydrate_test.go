@@ -108,6 +108,45 @@ func TestRehydrateRetryCounter_BumpsBeyondRestoredOnNextRetry(t *testing.T) {
 	}
 }
 
+func TestDeleteOwnerEntryCleansRetryCounterWhenLastRetryOwnerGone(t *testing.T) {
+	d, _ := testDaemonWithLog(t)
+	cwd := t.TempDir()
+	cmd := "echo"
+	args := []string{"hello"}
+	base := serverid.GenerateContextKey(serverid.ModeIsolated, cmd, args, nil, cwd)
+
+	d.forcedIsolatedRetryCounters.Store(base, &atomic.Int64{})
+	mustLoadCounter(t, d, base)
+
+	d.mu.Lock()
+	d.owners[base+"-r2"] = &OwnerEntry{ServerID: base + "-r2", Command: cmd, Args: args, Cwd: cwd}
+	d.deleteOwnerEntryLocked(base + "-r2")
+	d.mu.Unlock()
+
+	if _, ok := d.forcedIsolatedRetryCounters.Load(base); ok {
+		t.Fatalf("retry counter for %q survived after final retry owner removal", base)
+	}
+}
+
+func TestDeleteOwnerEntryKeepsRetryCounterWhileSiblingRetryOwnerExists(t *testing.T) {
+	d, _ := testDaemonWithLog(t)
+	cwd := t.TempDir()
+	cmd := "echo"
+	args := []string{"hello"}
+	base := serverid.GenerateContextKey(serverid.ModeIsolated, cmd, args, nil, cwd)
+
+	d.forcedIsolatedRetryCounters.Store(base, &atomic.Int64{})
+	d.mu.Lock()
+	d.owners[base+"-r1"] = &OwnerEntry{ServerID: base + "-r1", Command: cmd, Args: args, Cwd: cwd}
+	d.owners[base+"-r2"] = &OwnerEntry{ServerID: base + "-r2", Command: cmd, Args: args, Cwd: cwd}
+	d.deleteOwnerEntryLocked(base + "-r2")
+	d.mu.Unlock()
+
+	if _, ok := d.forcedIsolatedRetryCounters.Load(base); !ok {
+		t.Fatalf("retry counter for %q was removed while sibling retry owner remained", base)
+	}
+}
+
 func mustLoadCounter(t *testing.T, d *Daemon, base string) int64 {
 	t.Helper()
 	ctrI, ok := d.forcedIsolatedRetryCounters.Load(base)
