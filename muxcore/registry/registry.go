@@ -280,6 +280,30 @@ func DuplicateEngineNames(records []Record) map[string]int {
 	return dups
 }
 
+// DuplicateHealthyEngineNames returns exact engine names claimed by more than
+// one verified healthy descriptor. Stale descriptors are deliberately excluded:
+// an old unreachable descriptor must not make the current live daemon look
+// ambiguous to operator tools.
+func DuplicateHealthyEngineNames(records []VerifiedDescriptor) map[string]int {
+	counts := make(map[string]int)
+	for _, rec := range records {
+		if rec.State != StateHealthy {
+			continue
+		}
+		name := rec.Record.Descriptor.EngineName
+		if name != "" {
+			counts[name]++
+		}
+	}
+	dups := make(map[string]int)
+	for name, count := range counts {
+		if count > 1 {
+			dups[name] = count
+		}
+	}
+	return dups
+}
+
 // ResolveEngine returns exactly one valid descriptor for engineName.
 func ResolveEngine(records []Record, engineName string) (Record, error) {
 	var matches []Record

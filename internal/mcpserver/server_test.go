@@ -1104,6 +1104,77 @@ func TestMuxEnginesListsHealthyAndStaleDescriptors(t *testing.T) {
 	}
 }
 
+func TestMuxEnginesDoesNotMarkHealthyEngineDuplicateBecauseOfStaleRecord(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-engines-staledupe-")
+	healthyCtl := filepath.Join(baseDir, "aimux-live-muxd.ctl.sock")
+	staleCtl := filepath.Join(baseDir, "aimux-stale-muxd.ctl.sock")
+
+	startFakeDaemonControlServerWithStatus(t, healthyCtl, map[string]any{
+		"engine_name":       "aimux-test",
+		"pid":               1234,
+		"daemon_generation": "daemon-aimux-live",
+		"owner_count":       1,
+	}, control.ListOwnersResponse{})
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Live", healthyCtl)
+	writeTestEngineDescriptor(t, baseDir, "aimux-test", "Aimux Stale", staleCtl)
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":67,"method":"tools/call","params":{"name":"mux_engines","arguments":{}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 67)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	var decoded struct {
+		Engines []struct {
+			EngineName string `json:"engine_name"`
+			State      string `json:"state"`
+			Reachable  bool   `json:"reachable"`
+			Reason     string `json:"reason"`
+		} `json:"engines"`
+		Duplicates map[string]int `json:"duplicates"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+		t.Fatalf("mux_engines content is not valid JSON: %v\n%s", err, result.Content[0].Text)
+	}
+	if len(decoded.Duplicates) != 0 {
+		t.Fatalf("duplicates = %v, want no duplicate when only one descriptor is healthy", decoded.Duplicates)
+	}
+	var healthy, stale int
+	for _, engine := range decoded.Engines {
+		if engine.EngineName != "aimux-test" {
+			continue
+		}
+		switch engine.State {
+		case registry.StateHealthy:
+			if !engine.Reachable {
+				t.Fatalf("healthy row is not reachable: %+v", engine)
+			}
+			healthy++
+		case registry.StateStale:
+			if !strings.Contains(engine.Reason, "control_unreachable") {
+				t.Fatalf("stale row reason = %q, want control_unreachable", engine.Reason)
+			}
+			stale++
+		default:
+			t.Fatalf("same-name healthy+stale descriptor row state = %q, want healthy or stale", engine.State)
+		}
+	}
+	if healthy != 1 || stale != 1 {
+		t.Fatalf("same-name rows healthy=%d stale=%d, want 1/1", healthy, stale)
+	}
+}
+
 func TestMuxEnginesEmptyRegistry(t *testing.T) {
 	baseDir := shortBaseDir(t, "mcpmux-emptyengines-")
 	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")

@@ -168,8 +168,8 @@ keep existing behavior.
 | `engine.Config.Registry *registry.Config` | Optional daemon advertisement. Nil is the opt-out zero value. |
 | `registry.Config{ProductName, MuxcoreVersion, Capabilities}` | Descriptor metadata for products that want central read-only visibility. |
 | `registry.Capabilities{ListOwners: true}` | CR-001 read-only capability used by `mux_engines` and scoped `mux_list(engine_name)`. |
-| `mux_engines` | mcp-mux operator tool that lists opted-in muxcore daemons as healthy/stale/invalid/duplicate after status verification. |
-| `mux_list(engine_name: "...")` | Explicit read-only owner listing for one registered engine. Default `mux_list` remains scoped to `mcp-mux`. |
+| `mux_engines` | mcp-mux operator tool that lists opted-in muxcore daemons as healthy/stale/invalid/duplicate after status verification. `duplicate` means multiple healthy descriptors share an engine name; stale leftovers stay stale. |
+| `mux_list(engine_name: "...")` | Explicit read-only owner listing for one registered engine. Default `mux_list` remains scoped to `mcp-mux`; `sessions` counts downstream MCP clients/shims, which can exceed visible terminal sessions. |
 
 Descriptor verification rejects PID mismatches, and daemon shutdown removes a
 descriptor only if it still belongs to the same process. CR-001 does not add

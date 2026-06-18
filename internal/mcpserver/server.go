@@ -496,14 +496,18 @@ func (s *Server) toolMuxEngines(id json.RawMessage, _ json.RawMessage) {
 		s.sendToolError(id, fmt.Sprintf("list muxcore engine registry: %v", err))
 		return
 	}
-	duplicates := registry.DuplicateEngineNames(records)
-
-	engines := make([]map[string]any, 0, len(records))
+	verifiedRecords := make([]registry.VerifiedDescriptor, 0, len(records))
 	for _, rec := range records {
-		verified := registry.VerifyDescriptor(rec)
+		verifiedRecords = append(verifiedRecords, registry.VerifyDescriptor(rec))
+	}
+	duplicates := registry.DuplicateHealthyEngineNames(verifiedRecords)
+
+	engines := make([]map[string]any, 0, len(verifiedRecords))
+	for _, verified := range verifiedRecords {
+		rec := verified.Record
 		state := verified.State
 		reason := verified.Reason
-		if rec.Err == nil {
+		if rec.Err == nil && state == registry.StateHealthy {
 			if count, ok := duplicates[rec.Descriptor.EngineName]; ok {
 				state = registry.StateDuplicate
 				if reason == "" {

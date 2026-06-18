@@ -159,6 +159,27 @@ func TestDuplicateEngineNamesAndResolveEngine(t *testing.T) {
 	}
 }
 
+func TestDuplicateHealthyEngineNamesIgnoresStaleRecords(t *testing.T) {
+	base := t.TempDir()
+	healthy := Record{Descriptor: testDescriptor("aimux", filepath.Join(base, "live.sock"))}
+	stale := Record{Descriptor: testDescriptor("aimux", filepath.Join(base, "stale.sock"))}
+	healthy2 := Record{Descriptor: testDescriptor("engram", filepath.Join(base, "engram-one.sock"))}
+	healthy3 := Record{Descriptor: testDescriptor("engram", filepath.Join(base, "engram-two.sock"))}
+
+	dups := DuplicateHealthyEngineNames([]VerifiedDescriptor{
+		{Record: healthy, State: StateHealthy},
+		{Record: stale, State: StateStale, Reason: "control_unreachable: dial failed"},
+		{Record: healthy2, State: StateHealthy},
+		{Record: healthy3, State: StateHealthy},
+	})
+	if _, ok := dups["aimux"]; ok {
+		t.Fatalf("aimux reported duplicate with only one healthy descriptor: %v", dups)
+	}
+	if dups["engram"] != 2 {
+		t.Fatalf("engram duplicate count = %v, want 2", dups)
+	}
+}
+
 func TestVerifyDescriptorStatusMismatchAndHealthy(t *testing.T) {
 	base := t.TempDir()
 	rec := Record{

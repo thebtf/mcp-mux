@@ -172,6 +172,11 @@ Every muxcore consumer should satisfy this checklist before shipping.
     `BaseDir` or both rely on the default temp dir; otherwise discovery is
     intentionally empty.
 
+    Operator tools should treat `duplicate` as "more than one healthy
+    descriptor advertises this engine name." A stale same-name descriptor from
+    an old test run or crashed daemon remains a stale row and should not make a
+    healthy current daemon look ambiguous.
+
 11. **Provide a real update strategy.**
     Muxcore can restart daemons and reattach owners, but your product must
     choose how new executable bytes become the next daemon. On Windows the
