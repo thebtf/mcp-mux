@@ -22,31 +22,44 @@ const (
 	envDisableLauncher  = "MCPMUX_DISABLE_LAUNCHER"
 	envLauncherExe      = "MCPMUX_LAUNCHER_EXE"
 	envActiveEngineFile = "MCPMUX_ACTIVE_ENGINE_FILE"
+	envLauncherTrace    = "MCPMUX_LAUNCHER_TRACE"
 )
 
 func maybeRunLauncher() (bool, int) {
 	if os.Getenv(envEngineMode) == "1" || os.Getenv(envDisableLauncher) == "1" {
+		launcherTracef("bypass env_engine=%q disable=%q args=%v", os.Getenv(envEngineMode), os.Getenv(envDisableLauncher), os.Args[1:])
 		return false, 0
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
+		launcherTracef("bypass executable_error=%v args=%v", err, os.Args[1:])
 		return false, 0
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "upgrade" {
+		launcherTracef("handle upgrade launcher=%s args=%v", exe, os.Args[2:])
 		return true, runLauncherUpgrade(exe, os.Args[2:])
+	}
+	if shouldRunOperatorCommandInLauncher(os.Args[1:]) {
+		launcherTracef("bypass operator_command launcher=%s args=%v", exe, os.Args[1:])
+		return false, 0
 	}
 
 	enginePath, ok := resolveActiveEngine(exe)
 	if !ok || samePath(enginePath, exe) {
+		launcherTracef("bypass active_engine ok=%v launcher=%s active=%s args=%v", ok, exe, enginePath, os.Args[1:])
 		return false, 0
 	}
 
+	launcherTracef("handle active_engine launcher=%s active=%s args=%v", exe, enginePath, os.Args[1:])
 	return runEngineProcess(exe, enginePath, os.Args[1:])
 }
 
 func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int) {
+	if shouldRunOperatorCommandInLauncher(args) {
+		return false, 0
+	}
 	if shouldSuperviseEngineProcess(args) {
 		return true, runLauncherStdioSupervisor(launcherSupervisorConfig{
 			LauncherPath:      launcherPath,
@@ -79,6 +92,25 @@ func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int
 		return true, 1
 	}
 	return true, 0
+}
+
+func shouldRunOperatorCommandInLauncher(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "status", "stop":
+		return true
+	default:
+		return false
+	}
+}
+
+func launcherTracef(format string, args ...any) {
+	if os.Getenv(envLauncherTrace) != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "mcp-mux launcher trace: "+format+"\n", args...)
 }
 
 func startEngineOrStableLauncher(launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*exec.Cmd, bool, error) {

@@ -172,6 +172,26 @@ func TestRunEngineProcessStartFailureFallsBackToLauncher(t *testing.T) {
 	}
 }
 
+func TestRunEngineProcessKeepsOperatorCommandsInLauncher(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
+
+	for _, args := range [][]string{
+		{"status"},
+		{"stop"},
+		{"stop", "--force"},
+	} {
+		handled, code := runEngineProcess(launcherPath, enginePath, args)
+		if handled {
+			t.Fatalf("runEngineProcess(%v) handled command in active engine, want launcher-local handling", args)
+		}
+		if code != 0 {
+			t.Fatalf("runEngineProcess(%v) code = %d, want 0", args, code)
+		}
+	}
+}
+
 func TestDaemonStartReportsActiveAndFallbackStartFailures(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")

@@ -777,6 +777,9 @@ func sleepWithin(deadline time.Time, requested time.Duration) bool {
 }
 
 var statusControlSendWithTimeout = control.SendWithTimeout
+var statusDaemonRetryWindow = 750 * time.Millisecond
+var statusDaemonRetryDelay = 25 * time.Millisecond
+var statusSleep = time.Sleep
 
 func runStatus() {
 	runStatusWithWriters(os.Stdout, os.Stderr)
@@ -785,7 +788,7 @@ func runStatus() {
 func runStatusWithWriters(stdout, stderr io.Writer) {
 	// Try daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
-	resp, err := statusControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, 5*time.Second)
+	resp, err := queryDaemonStatusForCLI(ctlPath)
 	if err == nil && resp.OK && resp.Data != nil {
 		var pretty json.RawMessage
 		if json.Valid(resp.Data) {
@@ -794,6 +797,15 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 		formatted, _ := json.MarshalIndent(pretty, "", "  ")
 		fmt.Fprintln(stdout, string(formatted))
 		return
+	}
+	if os.Getenv("MCPMUX_STATUS_TRACE") == "1" {
+		if err != nil {
+			fmt.Fprintf(stderr, "mcp-mux status trace: daemon_status path=%q error=%v\n", ctlPath, err)
+		} else if resp == nil {
+			fmt.Fprintf(stderr, "mcp-mux status trace: daemon_status path=%q nil_response\n", ctlPath)
+		} else {
+			fmt.Fprintf(stderr, "mcp-mux status trace: daemon_status path=%q ok=%v message=%q data_len=%d\n", ctlPath, resp.OK, resp.Message, len(resp.Data))
+		}
 	}
 
 	// Fallback: legacy per-server scan
@@ -878,4 +890,37 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 
 	data, _ := json.MarshalIndent(results, "", "  ")
 	fmt.Fprintln(stdout, string(data))
+}
+
+func queryDaemonStatusForCLI(ctlPath string) (*control.Response, error) {
+	deadline := time.Now().Add(statusDaemonRetryWindow)
+	var resp *control.Response
+	var err error
+	for {
+		resp, err = statusControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, 5*time.Second)
+		if err == nil || !isRetryableDaemonStatusError(err) || time.Now().After(deadline) {
+			return resp, err
+		}
+		delay := statusDaemonRetryDelay
+		if remaining := time.Until(deadline); remaining < delay {
+			delay = remaining
+		}
+		if delay <= 0 {
+			return resp, err
+		}
+		statusSleep(delay)
+	}
+}
+
+func isRetryableDaemonStatusError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ipc.IsEndpointOccupiedError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "all pipe instances are busy") ||
+		strings.Contains(msg, "error_pipe_busy") ||
+		strings.Contains(msg, "pipe busy")
 }
