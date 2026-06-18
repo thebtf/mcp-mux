@@ -35,6 +35,7 @@ running mcp-mux instances.
 Available tools:
 - mux_engines: Show opted-in native muxcore daemon engines.
 - mux_prune_engines: Dry-run or remove stale/invalid native muxcore registry descriptors.
+- mux_topology: Show owners, registered engines, local mcp-mux processes, and read-only cleanup plan.
 - mux_list: Show all running MCP server instances (PID, sessions, classification, caches).
 - mux_stop: Gracefully stop an instance by server_id (with optional drain or force).
 - mux_restart: Restart an instance — stops the old one, spawns a new daemon, clients auto-reconnect.
@@ -52,6 +53,9 @@ type Server struct {
 	BaseDir       string // directory scanned for .ctl.sock files; empty = os.TempDir()
 	DaemonCtlPath string // injectable daemon control path; empty = serverid.DaemonControlPath("", "mcp-mux")
 	EngineName    string // engine name used to build owner socket paths; empty = "mcp-mux"
+	// ProcessSnapshot is injectable for tests. Production uses a best-effort
+	// platform process snapshot limited to mcp-mux launcher/engine processes.
+	ProcessSnapshot processSnapshotFunc
 }
 
 // engineName returns the engine name used to build owner socket paths.
@@ -360,6 +364,21 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 			},
 		},
 		{
+			"name": "mux_topology",
+			"description": "Return a read-only topology snapshot that joins local mcp-mux owners, opted-in native muxcore registry descriptors, " +
+				"local mcp-mux launcher/engine processes, warnings, and cleanup candidates. This tool never stops processes or removes files.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"include_processes": map[string]any{
+						"type":        "boolean",
+						"description": "Include a best-effort OS process snapshot for local mcp-mux launcher/engine processes. Default: true.",
+						"default":     true,
+					},
+				},
+			},
+		},
+		{
 			"name": "mux_list",
 			"description": "List all running mcp-mux managed MCP server instances. " +
 				"This is this mcp-mux daemon's engine namespace, not a global registry for native muxcore products. " +
@@ -462,6 +481,8 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 		s.toolMuxEngines(id, call.Arguments)
 	case "mux_prune_engines":
 		s.toolMuxPruneEngines(id, call.Arguments)
+	case "mux_topology":
+		s.toolMuxTopology(id, call.Arguments)
 	case "mux_list":
 		s.toolMuxList(id, call.Arguments)
 	case "mux_stop":

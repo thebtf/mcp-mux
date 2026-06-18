@@ -209,8 +209,8 @@ func TestToolsList(t *testing.T) {
 	}
 	unmarshalResult(t, resp, &result)
 
-	if len(result.Tools) != 5 {
-		t.Fatalf("tools count = %d, want 5", len(result.Tools))
+	if len(result.Tools) != 6 {
+		t.Fatalf("tools count = %d, want 6", len(result.Tools))
 	}
 
 	names := make(map[string]bool)
@@ -218,7 +218,7 @@ func TestToolsList(t *testing.T) {
 		names[tool.Name] = true
 	}
 
-	for _, expected := range []string{"mux_engines", "mux_prune_engines", "mux_list", "mux_stop", "mux_restart"} {
+	for _, expected := range []string{"mux_engines", "mux_prune_engines", "mux_topology", "mux_list", "mux_stop", "mux_restart"} {
 		if !names[expected] {
 			t.Errorf("tool %q not found in list", expected)
 		}
@@ -939,12 +939,18 @@ func writeTestEngineDescriptor(t *testing.T, baseDir, engineName, productName, c
 // newTestServerFull creates a Server with both DaemonCtlPath and BaseDir set.
 func newTestServerFull(t *testing.T, daemonCtlPath, baseDir string) (clientW io.WriteCloser, clientR io.Reader, done chan error) {
 	t.Helper()
+	return newTestServerFullWithProcessSnapshot(t, daemonCtlPath, baseDir, nil)
+}
+
+func newTestServerFullWithProcessSnapshot(t *testing.T, daemonCtlPath, baseDir string, snapshot processSnapshotFunc) (clientW io.WriteCloser, clientR io.Reader, done chan error) {
+	t.Helper()
 	serverR, clientW := io.Pipe()
 	clientR, serverW := io.Pipe()
 	logger := log.New(os.Stderr, "[mcpserver-test] ", 0)
 	srv := NewServer(serverR, serverW, logger)
 	srv.BaseDir = baseDir
 	srv.DaemonCtlPath = daemonCtlPath
+	srv.ProcessSnapshot = snapshot
 	done = make(chan error, 1)
 	go func() {
 		err := srv.Run()
@@ -1101,6 +1107,93 @@ func TestMuxEnginesListsHealthyAndStaleDescriptors(t *testing.T) {
 	}
 	if got := seen["missing-test"]; got.state != registry.StateStale || !strings.Contains(got.reason, "control_unreachable") {
 		t.Fatalf("missing-test = %+v, want stale unreachable", got)
+	}
+}
+
+func TestMuxTopologyReportsOwnersRegistryProcessesAndCleanupPlan(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-topology-")
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	missingCtl := filepath.Join(baseDir, "aimux-stale-muxd.ctl.sock")
+
+	owners := control.ListOwnersResponse{
+		Owners: []control.OwnerInfo{
+			{
+				ServerID:       "zero111122223333",
+				EngineName:     "mcp-mux",
+				Command:        "npx",
+				Args:           []string{"-y", "chrome-devtools-mcp@latest"},
+				Sessions:       0,
+				Pending:        0,
+				Classification: "isolated",
+				MuxVersion:     "new-version",
+			},
+			{
+				ServerID:       "live444455556666",
+				EngineName:     "mcp-mux",
+				Command:        "uvx",
+				Args:           []string{"mcp-server-time"},
+				Sessions:       2,
+				Pending:        0,
+				Classification: "shared",
+				MuxVersion:     "new-version",
+			},
+		},
+	}
+	startFakeDaemonControlServer(t, daemonCtlPath, owners)
+	writeTestEngineDescriptor(t, baseDir, "aimux-stale", "Aimux Stale", missingCtl)
+
+	processSnapshot := func() ([]runtimeProcess, error) {
+		return []runtimeProcess{
+			{
+				PID:           101,
+				ParentPID:     100,
+				Name:          "mcp-mux-engine.exe",
+				ExePath:       filepath.Join("D:", "Dev", "mcp-mux", "mcp-mux.versions", "old-version", "mcp-mux-engine.exe"),
+				Role:          "engine",
+				VersionDir:    "old-version",
+				ActiveVersion: false,
+			},
+			{
+				PID:           102,
+				ParentPID:     100,
+				Name:          "mcp-mux.exe",
+				ExePath:       filepath.Join("D:", "Dev", "mcp-mux", "mcp-mux.exe"),
+				Role:          "launcher",
+				ActiveVersion: false,
+			},
+		}, nil
+	}
+
+	clientW, clientR, _ := newTestServerFullWithProcessSnapshot(t, daemonCtlPath, baseDir, processSnapshot)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"mux_topology","arguments":{}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 70)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if len(result.Content) == 0 {
+		t.Fatal("expected mux_topology content")
+	}
+	text := result.Content[0].Text
+	for _, want := range []string{
+		`"schema_version": 1`,
+		`"zero_session_owner"`,
+		`"stale_registry_descriptor"`,
+		`"old_version_engine_process"`,
+		`"old_engine_process_count": 1`,
+		`"read_only": true`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("mux_topology output missing %q:\n%s", want, text)
+		}
 	}
 }
 
