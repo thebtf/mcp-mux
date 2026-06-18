@@ -71,8 +71,24 @@ do not call the full critical muxcore scope shipped.
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.9
 ```
+
+### v0.26.9 - transparent upstream respawn for live sessions
+
+**No breaking changes.** v0.26.9 makes pipe-backed owners treat an upstream
+process exit as a recoverable upstream-generation failure instead of owner or
+session teardown when live sessions remain attached. Muxcore drains current
+in-flight requests with explicit JSON-RPC `upstream process exited` errors by
+original id, respawns the replacement upstream inside the same owner, refreshes
+MCP discovery caches, and lets the next request on the same downstream session
+hit the replacement upstream automatically.
+
+Consumer impact: update to v0.26.9. Do not add product-local direct-stdio
+smokes, binary-renaming schemes, retry loops, or manual reconnect hacks for
+ordinary subprocess upstream crash/update recovery; muxcore owns the
+same-session respawn protocol. Pure `SessionHandler` native consumers still use
+the explicit muxcore live-update helpers for product binary replacement.
 
 ### v0.26.8 - snapshot tools/list cache refresh fix
 
@@ -595,20 +611,21 @@ by itself it does not signal, wait for, or restart a daemon.
 ### For aimux
 
 ```bash
-cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
+cd aimux && go get github.com/thebtf/mcp-mux/muxcore@v0.26.9
 ```
 
 Key changes to adopt:
 1. **SessionHandler** — replace `srv.StdioHandler()` with SessionHandler implementation to get per-CC-session ProjectContext
 2. **Native update topology** — use `eng.RestartWithSuccessor(...)` when aimux keeps a stable launcher plus versioned engine store; use `eng.ApplyUpdateAndRestart(...)` only when `CurrentExe` is the replaceable engine path. Do not call `upgrade.Swap` as the whole update protocol.
 3. **Native process management** — agents should use aimux's own `sessions`, `status`, and `upgrade` surfaces for aimux state. Default `mcp-mux mux_list` is scoped to the `mcp-mux` daemon namespace. When aimux consumes a muxcore version with opt-in daemon registry support, it may advertise via `engine.Config.Registry`; then `mux_engines` can show aimux and `mux_list(engine_name="aimux")` can list aimux owners read-only after status verification. This does not imply cross-engine stop/restart/update.
-4. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
-5. **Circuit breaker** — included automatically, protects against upstream crash loops
+4. **Transparent subprocess respawn** — included automatically for pipe-backed owners. Do not duplicate it in aimux with direct stdio smokes, ad hoc binary names, or local retry loops; validate that the same open session survives an upstream crash/update and that the next call reaches the replacement upstream.
+5. **v0.19.3 concurrency fixes** — included automatically, no code changes needed. The CPU-spin-on-failed-background-spawn (BUG-001) and ownerNotifier.Notify RLock hold (BUG-002) are both hidden behind existing aimux code paths and required no consumer-side changes.
+6. **Circuit breaker** — included automatically, protects against upstream crash loops
 
 ### For engram
 
 ```bash
-cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.8
+cd engram && go get github.com/thebtf/mcp-mux/muxcore@v0.26.9
 ```
 
 Key changes:
@@ -616,6 +633,7 @@ Key changes:
 2. **v0.19.3 concurrency fixes** — included automatically
 3. **SessionHandler** — optional. engram can stay on legacy `Handler` until multi-session support is needed
 4. **Opt-in daemon registry** — optional read-only visibility. If engram adopts `engine.Config.Registry`, `mcp-mux serve` can show it through `mux_engines` and scoped `mux_list(engine_name="engram")`; default `mux_list` remains the `mcp-mux` namespace and engram's own management surface remains authoritative.
+5. **Transparent subprocess respawn** — included automatically for pipe-backed owners. Remove or avoid product-local retry/reconnect workarounds for ordinary upstream process replacement; the provider acceptance is same-session crash error plus next-call generation replacement.
 
 ### v0.21.10 — Flush conn before afterFn (#99)
 
