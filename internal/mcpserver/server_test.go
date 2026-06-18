@@ -209,8 +209,8 @@ func TestToolsList(t *testing.T) {
 	}
 	unmarshalResult(t, resp, &result)
 
-	if len(result.Tools) != 4 {
-		t.Fatalf("tools count = %d, want 4", len(result.Tools))
+	if len(result.Tools) != 5 {
+		t.Fatalf("tools count = %d, want 5", len(result.Tools))
 	}
 
 	names := make(map[string]bool)
@@ -218,7 +218,7 @@ func TestToolsList(t *testing.T) {
 		names[tool.Name] = true
 	}
 
-	for _, expected := range []string{"mux_engines", "mux_list", "mux_stop", "mux_restart"} {
+	for _, expected := range []string{"mux_engines", "mux_prune_engines", "mux_list", "mux_stop", "mux_restart"} {
 		if !names[expected] {
 			t.Errorf("tool %q not found in list", expected)
 		}
@@ -1202,6 +1202,121 @@ func TestMuxEnginesEmptyRegistry(t *testing.T) {
 	}
 	if len(decoded.Engines) != 0 {
 		t.Fatalf("engines = %d, want 0", len(decoded.Engines))
+	}
+}
+
+func TestMuxPruneEnginesDryRunByDefault(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-prune-dryrun-")
+	staleCtl := filepath.Join(baseDir, "aimux-stale-muxd.ctl.sock")
+	writeTestEngineDescriptor(t, baseDir, "aimux-stale", "Aimux Stale", staleCtl)
+	records, err := registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors before prune: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records before prune = %d, want 1", len(records))
+	}
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":68,"method":"tools/call","params":{"name":"mux_prune_engines","arguments":{}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 68)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	var decoded struct {
+		DryRun       bool             `json:"dry_run"`
+		RemovedCount int              `json:"removed_count"`
+		Candidates   []map[string]any `json:"candidates"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+		t.Fatalf("mux_prune_engines content is not valid JSON: %v\n%s", err, result.Content[0].Text)
+	}
+	if !decoded.DryRun {
+		t.Fatal("dry_run = false, want true by default")
+	}
+	if decoded.RemovedCount != 0 {
+		t.Fatalf("removed_count = %d, want 0 in dry-run", decoded.RemovedCount)
+	}
+	if len(decoded.Candidates) != 1 {
+		t.Fatalf("candidates = %d, want 1", len(decoded.Candidates))
+	}
+	if _, err := os.Stat(records[0].Path); err != nil {
+		t.Fatalf("dry-run removed descriptor %s: %v", records[0].Path, err)
+	}
+}
+
+func TestMuxPruneEnginesRemovesOnlyStaleAndInvalidDescriptors(t *testing.T) {
+	baseDir := shortBaseDir(t, "mcpmux-prune-")
+	healthyCtl := filepath.Join(baseDir, "aimux-live-muxd.ctl.sock")
+	staleCtl := filepath.Join(baseDir, "aimux-stale-muxd.ctl.sock")
+
+	startFakeDaemonControlServerWithStatus(t, healthyCtl, map[string]any{
+		"engine_name": "aimux-live",
+		"pid":         1234,
+		"owner_count": 1,
+	}, control.ListOwnersResponse{})
+	writeTestEngineDescriptor(t, baseDir, "aimux-live", "Aimux Live", healthyCtl)
+	writeTestEngineDescriptor(t, baseDir, "aimux-stale", "Aimux Stale", staleCtl)
+	registryDir := registry.Dir(baseDir)
+	if err := os.MkdirAll(registryDir, 0o700); err != nil {
+		t.Fatalf("mkdir registry dir: %v", err)
+	}
+	invalidPath := filepath.Join(registryDir, "invalid.json")
+	if err := os.WriteFile(invalidPath, []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("write invalid descriptor: %v", err)
+	}
+
+	daemonCtlPath := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, daemonCtlPath, control.ListOwnersResponse{})
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, `{"jsonrpc":"2.0","id":69,"method":"tools/call","params":{"name":"mux_prune_engines","arguments":{"dry_run":false}}}`)
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 69)
+	assertNoError(t, resp)
+
+	var result struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	var decoded struct {
+		DryRun       bool `json:"dry_run"`
+		RemovedCount int  `json:"removed_count"`
+	}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &decoded); err != nil {
+		t.Fatalf("mux_prune_engines content is not valid JSON: %v\n%s", err, result.Content[0].Text)
+	}
+	if decoded.DryRun {
+		t.Fatal("dry_run = true, want false when requested")
+	}
+	if decoded.RemovedCount != 2 {
+		t.Fatalf("removed_count = %d, want 2", decoded.RemovedCount)
+	}
+
+	records, err := registry.ListDescriptors(baseDir)
+	if err != nil {
+		t.Fatalf("ListDescriptors after prune: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records after prune = %d, want only healthy descriptor: %+v", len(records), records)
+	}
+	if records[0].Err != nil || records[0].Descriptor.EngineName != "aimux-live" {
+		t.Fatalf("remaining descriptor = %+v, want healthy aimux-live", records[0])
 	}
 }
 

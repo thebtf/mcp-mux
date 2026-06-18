@@ -33,6 +33,8 @@ reducing memory usage by ~3x. This control-plane server lets you monitor and man
 running mcp-mux instances.
 
 Available tools:
+- mux_engines: Show opted-in native muxcore daemon engines.
+- mux_prune_engines: Dry-run or remove stale/invalid native muxcore registry descriptors.
 - mux_list: Show all running MCP server instances (PID, sessions, classification, caches).
 - mux_stop: Gracefully stop an instance by server_id (with optional drain or force).
 - mux_restart: Restart an instance — stops the old one, spawns a new daemon, clients auto-reconnect.
@@ -334,6 +336,30 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 			},
 		},
 		{
+			"name": "mux_prune_engines",
+			"description": "Remove stale or invalid native muxcore registry descriptors after verification. " +
+				"Dry-run is enabled by default. This only deletes descriptor files; it never stops processes, owners, or daemon control sockets.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"dry_run": map[string]any{
+						"type":        "boolean",
+						"description": "When true, report candidates without deleting descriptor files. Default: true.",
+						"default":     true,
+					},
+					"engine_name": map[string]any{
+						"type":        "string",
+						"description": "Optional exact engine name filter. Invalid descriptors without an engine name are skipped when this is set.",
+					},
+					"min_age_seconds": map[string]any{
+						"type":        "integer",
+						"description": "Optional minimum descriptor age before removal. Useful when pruning non-dry-run on a busy workstation.",
+						"default":     0,
+					},
+				},
+			},
+		},
+		{
 			"name": "mux_list",
 			"description": "List all running mcp-mux managed MCP server instances. " +
 				"This is this mcp-mux daemon's engine namespace, not a global registry for native muxcore products. " +
@@ -434,6 +460,8 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 	switch call.Name {
 	case "mux_engines":
 		s.toolMuxEngines(id, call.Arguments)
+	case "mux_prune_engines":
+		s.toolMuxPruneEngines(id, call.Arguments)
 	case "mux_list":
 		s.toolMuxList(id, call.Arguments)
 	case "mux_stop":
@@ -547,6 +575,87 @@ func (s *Server) toolMuxEngines(id json.RawMessage, _ json.RawMessage) {
 	s.sendJSONToolResult(id, map[string]any{
 		"engines":    engines,
 		"duplicates": duplicates,
+	})
+}
+
+func (s *Server) toolMuxPruneEngines(id json.RawMessage, args json.RawMessage) {
+	dryRun := true
+	var params struct {
+		DryRun        *bool  `json:"dry_run"`
+		EngineName    string `json:"engine_name"`
+		MinAgeSeconds int64  `json:"min_age_seconds"`
+	}
+	if args != nil {
+		_ = json.Unmarshal(args, &params)
+	}
+	if params.DryRun != nil {
+		dryRun = *params.DryRun
+	}
+	engineName := strings.TrimSpace(params.EngineName)
+	now := time.Now()
+
+	records, err := registry.ListDescriptors(s.socketDir())
+	if err != nil {
+		s.sendToolError(id, fmt.Sprintf("list muxcore engine registry: %v", err))
+		return
+	}
+
+	candidates := make([]map[string]any, 0)
+	removedCount := 0
+	skippedCount := 0
+	for _, rec := range records {
+		verified := registry.VerifyDescriptor(rec)
+		if rec.Err == nil && engineName != "" && rec.Descriptor.EngineName != engineName {
+			continue
+		}
+		if rec.Err != nil && engineName != "" {
+			skippedCount++
+			continue
+		}
+		if verified.State == registry.StateHealthy {
+			continue
+		}
+
+		row := map[string]any{
+			"descriptor_path": rec.Path,
+			"state":           verified.State,
+			"reason":          verified.Reason,
+			"removed":         false,
+		}
+		if rec.Err == nil {
+			row["engine_name"] = rec.Descriptor.EngineName
+			row["product_name"] = rec.Descriptor.ProductName
+			row["pid"] = rec.Descriptor.PID
+			row["started_at"] = rec.Descriptor.StartedAt.Format(time.RFC3339)
+			ageSeconds := int64(now.Sub(rec.Descriptor.StartedAt).Seconds())
+			row["age_seconds"] = ageSeconds
+			if params.MinAgeSeconds > 0 && ageSeconds < params.MinAgeSeconds {
+				row["skip_reason"] = "below_min_age_seconds"
+				skippedCount++
+				candidates = append(candidates, row)
+				continue
+			}
+		}
+		if dryRun {
+			candidates = append(candidates, row)
+			continue
+		}
+		if err := os.Remove(rec.Path); err != nil {
+			row["error"] = err.Error()
+		} else {
+			row["removed"] = true
+			removedCount++
+		}
+		candidates = append(candidates, row)
+	}
+
+	s.sendJSONToolResult(id, map[string]any{
+		"dry_run":       dryRun,
+		"engine_name":   engineName,
+		"removed_count": removedCount,
+		"skipped_count": skippedCount,
+		"candidates":    candidates,
+		"note":          "mux_prune_engines only removes stale/invalid registry descriptor files; it never stops processes or native muxcore daemons.",
 	})
 }
 

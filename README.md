@@ -549,6 +549,7 @@ any other server:
 | Tool | Description |
 |------|-------------|
 | `mux_engines` | Lists opted-in native muxcore daemon engines registered on this host. Each descriptor is advisory and is verified by daemon `status` before being marked healthy. Stale or mismatched descriptors are labeled instead of mixed into owner lists. `duplicate` means more than one healthy descriptor advertises the same engine name; stale leftovers do not make a healthy daemon duplicate. |
+| `mux_prune_engines` | Dry-run by default. Lists or removes stale / invalid native muxcore registry descriptor files after the same verification used by `mux_engines`. This is registry garbage collection only: it never stops processes, owners, daemon control sockets, or live native muxcore products. |
 | `mux_list` | Returns running instances for the **current project** inside this `mcp-mux` daemon namespace (filtered by caller's cwd). Pass `all: true` to list this daemon's instances across all projects. Pass exact `engine_name` from `mux_engines` to query one verified native muxcore engine explicitly. Includes server ID, engine name, PID, downstream session count, pending requests, classification, and cache status. With `verbose: true`, includes classification source/reason and inflight request details when present. |
 | `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. CR-001 scope is current `mcp-mux` daemon namespace only; it does not stop native registered engines. |
 | `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux if it was launched through this `mcp-mux` daemon, not a native `aimux` engine). CR-001 scope is current namespace only; cross-engine restart is a future opt-in management feature. |
@@ -563,6 +564,9 @@ session's working directory:
   `mcp-mux` daemon.
 - `mux_engines` — shows native muxcore products only when they explicitly opt
   into daemon registry advertisement.
+- `mux_prune_engines` — shows prune candidates with `dry_run: true` by default.
+  Pass `dry_run: false` only after reviewing candidates; it removes stale /
+  invalid registry descriptors, not daemon processes.
 - `mux_list(engine_name: "aimux")` — queries exactly one registered engine after
   verifying that the descriptor's control socket returns matching
   `engine_name` from daemon `status`.
