@@ -33,6 +33,10 @@ func mockServerArgs() (command string, args []string) {
 // Pre-building once amortises the compile cost across all tests and reduces
 // per-exec startup from ~20s to <100ms.
 func TestMain(m *testing.M) {
+	if os.Getenv("MCP_MUX_RESPAWN_HELPER") == "1" {
+		os.Exit(m.Run())
+	}
+
 	// mock_server.go lives in <repo_root>/testdata/ — two levels up from
 	// muxcore/owner/ (the test working directory). We set cmd.Dir to that
 	// directory so "go build" resolves in the root module context, not the

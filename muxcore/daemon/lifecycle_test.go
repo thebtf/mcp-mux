@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,23 +68,20 @@ func waitEOF(c *ipcConn, timeout time.Duration) bool {
 	}
 }
 
-// TestUpstreamCrashDisconnectsSession verifies that when the upstream process
-// exits unexpectedly, the daemon calls Owner.Shutdown(), which closes all
-// active sessions via Session.Close, and the connected IPC client receives EOF
-// within 5 seconds.
-//
-// Because mock_server_crash exits ~200 ms after responding, there is a race
-// between the initialize response arriving and the session being torn down.
-// The test accepts both outcomes — receiving the response OR an immediate EOF —
-// and then waits for the final EOF that signals the session was closed.
-func TestUpstreamCrashDisconnectsSession(t *testing.T) {
+// TestUpstreamCrashRespawnsSession verifies that when an upstream exits
+// unexpectedly while a session is still connected, muxcore keeps the IPC
+// session alive, returns an explicit error for the lost in-flight request, and
+// respawns a replacement upstream for the next request.
+func TestUpstreamCrashRespawnsSession(t *testing.T) {
 	d := testDaemon(t)
+	generationFile := t.TempDir() + string(os.PathSeparator) + "generation.txt"
+	cmd, args, env := daemonRespawnHelperCommand(generationFile)
 
-	// Spawn an owner using mock_server_crash — it responds to initialize then exits.
 	ipcPath, _, tok, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
-		Command: "go",
-		Args:    []string{"run", "../../testdata/mock_server_crash.go"},
+		Command: cmd,
+		Args:    args,
+		Env:     env,
 		Mode:    "global",
 	})
 	if err != nil {
@@ -92,18 +92,159 @@ func TestUpstreamCrashDisconnectsSession(t *testing.T) {
 	client := dialIPC(t, ipcPath, tok)
 	defer client.conn.Close()
 
-	// Send initialize so the upstream processes at least one request.
-	// We do NOT use daemonReadReq here because the session may close before
-	// the response arrives — instead waitEOF drains all remaining lines.
 	daemonSendReq(t, client, 1, "initialize",
 		`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}`)
+	daemonReadRespWithID(t, client, 1)
 
-	// mock_server_crash exits after ~200 ms.
-	// Path: upstream exit → onUpstreamExit → Shutdown() → Session.Close() → net.Conn.Close().
-	// The scanner must eventually return false (EOF), signalling the session was closed.
-	if !waitEOF(client, 5*time.Second) {
-		t.Fatal("IPC client did not receive EOF within 5s after upstream crash")
+	daemonSendReq(t, client, 2, "ping", `{}`)
+	resp := daemonReadRespWithID(t, client, 2)
+	if !strings.Contains(string(resp), `"generation":1`) {
+		t.Fatalf("initial ping response = %s, want generation 1", resp)
 	}
+
+	daemonSendReq(t, client, 3, "tools/call", `{"name":"crash","arguments":{}}`)
+	crashResp := daemonReadRespWithID(t, client, 3)
+	if !strings.Contains(string(crashResp), "upstream process exited") {
+		t.Fatalf("crash response = %s, want explicit upstream-exit error", crashResp)
+	}
+
+	daemonSendReq(t, client, 4, "ping", `{}`)
+	resp = daemonReadRespWithID(t, client, 4)
+	if !strings.Contains(string(resp), `"generation":2`) {
+		t.Fatalf("post-respawn ping response = %s, want generation 2 from same IPC session", resp)
+	}
+}
+
+func daemonReadRespWithID(t *testing.T, c *ipcConn, id int) []byte {
+	t.Helper()
+	for i := 0; i < 10; i++ {
+		resp := daemonReadResp(t, c)
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(resp, &obj); err != nil {
+			t.Fatalf("unmarshal response: %v (raw: %s)", err, resp)
+		}
+		if got := string(obj["id"]); got == strconv.Itoa(id) {
+			return resp
+		}
+		if obj["id"] == nil && obj["method"] != nil {
+			continue
+		}
+		t.Fatalf("unexpected response while waiting for id %d: %s", id, resp)
+	}
+	t.Fatalf("did not receive response id %d", id)
+	return nil
+}
+
+func daemonRespawnHelperCommand(generationFile string) (string, []string, map[string]string) {
+	env := make(map[string]string)
+	for _, kv := range os.Environ() {
+		k, v, ok := strings.Cut(kv, "=")
+		if ok {
+			env[k] = v
+		}
+	}
+	env["MCP_MUX_DAEMON_RESPAWN_HELPER"] = "1"
+	env["MCP_MUX_DAEMON_RESPAWN_GENERATION_FILE"] = generationFile
+	return os.Args[0], []string{"-test.run=TestDaemonRespawnHelperProcess", "--"}, env
+}
+
+func TestDaemonRespawnHelperProcess(t *testing.T) {
+	if os.Getenv("MCP_MUX_DAEMON_RESPAWN_HELPER") != "1" {
+		return
+	}
+	generationFile := os.Getenv("MCP_MUX_DAEMON_RESPAWN_GENERATION_FILE")
+	if generationFile == "" {
+		fmt.Fprintln(os.Stderr, "MCP_MUX_DAEMON_RESPAWN_GENERATION_FILE is required")
+		os.Exit(2)
+	}
+	generation := nextDaemonRespawnHelperGeneration(generationFile)
+	runDaemonRespawnHelperServer(generation)
+	os.Exit(0)
+}
+
+func nextDaemonRespawnHelperGeneration(path string) int {
+	data, _ := os.ReadFile(path)
+	n, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+	n++
+	_ = os.WriteFile(path, []byte(strconv.Itoa(n)), 0o644)
+	return n
+}
+
+func runDaemonRespawnHelperServer(generation int) {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var req struct {
+			ID     json.RawMessage `json:"id,omitempty"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params,omitempty"`
+		}
+		if err := json.Unmarshal(line, &req); err != nil {
+			writeDaemonRespawnError(nil, -32700, err.Error())
+			continue
+		}
+		switch req.Method {
+		case "initialize":
+			writeDaemonRespawnResult(req.ID, map[string]any{
+				"protocolVersion": "2025-11-25",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo": map[string]any{
+					"name":    "daemon-respawn-helper",
+					"version": fmt.Sprintf("generation-%d", generation),
+				},
+			})
+		case "notifications/initialized":
+			continue
+		case "tools/list":
+			writeDaemonRespawnResult(req.ID, map[string]any{
+				"tools": []map[string]any{
+					{
+						"name":        "crash",
+						"description": "exit without a response",
+						"inputSchema": map[string]any{"type": "object"},
+					},
+				},
+			})
+		case "tools/call":
+			var params struct {
+				Name string `json:"name"`
+			}
+			_ = json.Unmarshal(req.Params, &params)
+			if params.Name == "crash" {
+				os.Exit(42)
+			}
+			writeDaemonRespawnResult(req.ID, map[string]any{"generation": generation})
+		case "ping":
+			writeDaemonRespawnResult(req.ID, map[string]any{"generation": generation})
+		default:
+			writeDaemonRespawnError(req.ID, -32601, "method not found")
+		}
+	}
+}
+
+func writeDaemonRespawnResult(id json.RawMessage, result any) {
+	data, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
+	fmt.Fprintln(os.Stdout, string(data))
+}
+
+func writeDaemonRespawnError(id json.RawMessage, code int, message string) {
+	data, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
+	fmt.Fprintln(os.Stdout, string(data))
 }
 
 // TestDaemonShutdownDisconnectsAllSessions verifies that Daemon.Shutdown() closes

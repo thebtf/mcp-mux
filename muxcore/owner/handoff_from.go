@@ -128,35 +128,17 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	}
 
 	// Start goroutines — identical set to NewOwner.
-	go o.readUpstream()
+	go o.readUpstream(proc)
 	go o.sendProactiveInit()
 	go o.acceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 
 	// Monitor upstream exit. Attached processes are NOT managed by suture
 	// (NewOwnerFromHandoff bypasses Serve()), so we need our own watcher.
-	// Select between proc.Done (real exit) and o.done (owner shutdown) so the
-	// goroutine never leaks in tests that use handler-based stubs whose
-	// proc.Done only closes via context cancellation.
-	go func() {
-		select {
-		case <-proc.Done:
-			logger.Printf("handoff upstream exited (pid=%d, cmd=%s): %v", payload.PID, payload.Command, proc.ExitErr)
-			o.initReadyOnce.Do(func() {
-				if o.initReady != nil {
-					close(o.initReady)
-				}
-			})
-			if o.onUpstreamExit != nil {
-				o.onUpstreamExit(o.serverID)
-			} else {
-				o.Shutdown()
-			}
-		case <-o.done:
-			// Owner shutdown — bail without touching initReady or onUpstreamExit.
-			return
-		}
-	}()
+	// monitorUpstreamExit selects between proc.Done (real exit) and o.done
+	// (owner shutdown), and respawns when a live session still depends on this
+	// owner.
+	go o.monitorUpstreamExit(proc)
 
 	logger.Printf("owner reattached from handoff (pid=%d, server=%s)", payload.PID, srvID)
 	return o, nil

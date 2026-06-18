@@ -44,6 +44,12 @@ type (
 	SessionSnapshot = snapshot.SessionSnapshot
 )
 
+const (
+	upstreamRespawnWaitTimeout = 30 * time.Second
+	upstreamRespawnInitialWait = 100 * time.Millisecond
+	upstreamRespawnMaxWait     = 2 * time.Second
+)
+
 // Constructor aliases.
 var (
 	NewSession              = session.NewSession
@@ -184,6 +190,14 @@ type Owner struct {
 	// It is closed (under mu) when background spawn finishes (success or failure),
 	// allowing Serve to block instead of treating nil upstream as dead.
 	backgroundSpawnCh chan struct{}
+
+	respawnMu sync.Mutex
+	respawn   *upstreamRespawn
+}
+
+type upstreamRespawn struct {
+	done chan struct{}
+	err  error
 }
 
 // OwnerConfig holds parameters for creating an Owner.
@@ -511,26 +525,13 @@ func (o *Owner) SpawnUpstreamBackground() {
 		o.mu.Unlock()
 
 		// Start reading upstream responses
-		go o.readUpstream()
+		go o.readUpstream(proc)
 
 		// Send proactive init to refresh caches from new upstream
 		go o.sendProactiveInit()
 
-		// Monitor upstream exit
-		go func() {
-			<-proc.Done
-			o.logger.Printf("upstream exited: %v", proc.ExitErr)
-			o.initReadyOnce.Do(func() {
-				if o.initReady != nil {
-					close(o.initReady)
-				}
-			})
-			if o.onUpstreamExit != nil {
-				o.onUpstreamExit(o.serverID)
-			} else {
-				o.Shutdown()
-			}
-		}()
+		// Monitor upstream exit.
+		go o.monitorUpstreamExit(proc)
 	}()
 }
 
@@ -642,7 +643,9 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	}
 
 	// Start reading from upstream
-	go o.readUpstream()
+	if proc != nil {
+		go o.readUpstream(proc)
+	}
 
 	// Send proactive initialize to upstream so init response is cached
 	// before any session connects. Without this, Daemon.Spawn blocks on
@@ -660,21 +663,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 
 	// Monitor upstream exit (skip in SessionHandler-only mode — proc is nil)
 	if proc != nil {
-		go func() {
-			<-proc.Done
-			logger.Printf("upstream exited: %v", proc.ExitErr)
-			// Signal init-ready so Daemon.Spawn doesn't block forever on crashed upstream
-			o.initReadyOnce.Do(func() {
-				if o.initReady != nil {
-					close(o.initReady)
-				}
-			})
-			if o.onUpstreamExit != nil {
-				o.onUpstreamExit(o.serverID)
-			} else {
-				o.Shutdown()
-			}
-		}()
+		go o.monitorUpstreamExit(proc)
 	}
 
 	return o, nil
@@ -914,8 +903,10 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 
 		// Fail fast if upstream is dead or not yet spawned (pipe-based mode only).
 		if !o.hasWritableUpstream() || o.upstreamDead.Load() {
-			errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(msg.ID))
-			return s.WriteRaw([]byte(errResp))
+			if err := o.ensureUpstreamReadyForRequest(); err != nil {
+				errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":%q}}`, string(msg.ID), err.Error())
+				return s.WriteRaw([]byte(errResp))
+			}
 		}
 
 		// Track pending requests
@@ -997,7 +988,16 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 		}
 
-		return o.writeUpstream(remapped)
+		if err := o.writeUpstream(remapped); err != nil {
+			o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), err)
+			o.upstreamDead.Store(true)
+			o.drainInflightRequests()
+			if o.shouldRespawnUpstream() {
+				o.startUpstreamRespawn("write_error")
+			}
+			return nil
+		}
+		return nil
 
 	case msg.IsResponse():
 		// Client is responding to a server→client request (e.g., sampling/createMessage).
@@ -1108,6 +1108,9 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 // Also sends notifications/initialized and tools/list to pre-populate caches.
 func (o *Owner) sendProactiveInit() {
 	initReq := `{"jsonrpc":"2.0","id":"mux-init-0","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"mcp-mux","version":"1.0.0"}}}`
+	o.mu.RLock()
+	initReady := o.initReady
+	o.mu.RUnlock()
 
 	// Tag the request so handleUpstreamMessage caches the response.
 	// Key must match string(msg.ID) which includes JSON quotes: "\"mux-init-0\"".
@@ -1125,9 +1128,9 @@ func (o *Owner) sendProactiveInit() {
 
 	// After init response is cached (signaled by initReady), send the
 	// followup notifications/initialized + tools/list to pre-populate caches.
-	go func() {
+	go func(initReady <-chan struct{}) {
 		select {
-		case <-o.initReady:
+		case <-initReady:
 		case <-o.done:
 			return
 		}
@@ -1149,20 +1152,20 @@ func (o *Owner) sendProactiveInit() {
 		if err := o.writeUpstream([]byte(toolsReq)); err != nil {
 			o.logger.Printf("proactive init: tools/list failed: %v", err)
 		}
-	}()
+	}(initReady)
 }
 
-// readUpstream reads responses from the upstream and routes them to the correct session.
-func (o *Owner) readUpstream() {
-	if o.upstream == nil {
+// readUpstream reads responses from one upstream generation and routes them to
+// the correct session.
+func (o *Owner) readUpstream(proc *upstream.Process) {
+	if proc == nil {
 		return // SessionHandler-only mode — no upstream to read
 	}
 	defer func() {
-		o.upstreamDead.Store(true)
-		o.drainInflightRequests() // send error responses for all pending requests
+		o.markCurrentUpstreamDead(proc)
 	}()
 	for {
-		line, err := o.upstream.ReadLine()
+		line, err := proc.ReadLine()
 		if err != nil {
 			if err != io.EOF {
 				o.logger.Printf("upstream read error: %v", err)
@@ -1182,6 +1185,216 @@ func (o *Owner) readUpstream() {
 		if err := o.handleUpstreamMessage(msg); err != nil {
 			o.logger.Printf("upstream handle error: %v", err)
 		}
+	}
+}
+
+func (o *Owner) monitorUpstreamExit(proc *upstream.Process) {
+	select {
+	case <-proc.Done:
+	case <-o.done:
+		return
+	}
+	if !o.isCurrentUpstream(proc) {
+		return
+	}
+
+	o.logger.Printf("upstream exited: %v", proc.ExitErr)
+	o.markCurrentUpstreamDead(proc)
+	// Signal init-ready so Daemon.Spawn or respawn waiters do not block forever
+	// on a crashed upstream generation.
+	o.initReadyOnce.Do(func() {
+		if o.initReady != nil {
+			close(o.initReady)
+		}
+	})
+
+	if o.shouldRespawnUpstream() {
+		o.startUpstreamRespawn("upstream_exit")
+		return
+	}
+	o.notifyUpstreamExit()
+}
+
+func (o *Owner) isCurrentUpstream(proc *upstream.Process) bool {
+	o.mu.RLock()
+	current := o.upstream
+	o.mu.RUnlock()
+	return current == proc
+}
+
+func (o *Owner) shouldRespawnUpstream() bool {
+	select {
+	case <-o.done:
+		return false
+	default:
+	}
+	if o.upstreamWriter != nil {
+		return false
+	}
+	if o.sessionHandler != nil && o.handlerFunc == nil {
+		return false
+	}
+	if o.handlerFunc == nil && o.command == "" {
+		return false
+	}
+	return o.SessionCount() > 0
+}
+
+func (o *Owner) notifyUpstreamExit() {
+	if o.onUpstreamExit != nil {
+		o.onUpstreamExit(o.serverID)
+		return
+	}
+	o.Shutdown()
+}
+
+func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
+	if !o.isCurrentUpstream(proc) {
+		return false
+	}
+	o.upstreamDead.Store(true)
+	o.drainInflightRequests()
+	return true
+}
+
+func (o *Owner) ensureUpstreamReadyForRequest() error {
+	if o.hasWritableUpstream() && !o.upstreamDead.Load() {
+		return nil
+	}
+	if !o.shouldRespawnUpstream() {
+		return errors.New("upstream process exited")
+	}
+	state := o.startUpstreamRespawn("request")
+	timer := time.NewTimer(upstreamRespawnWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-state.done:
+		return state.err
+	case <-timer.C:
+		return fmt.Errorf("upstream respawn still pending after %s", upstreamRespawnWaitTimeout)
+	case <-o.done:
+		return errors.New("owner shutting down")
+	}
+}
+
+func (o *Owner) startUpstreamRespawn(reason string) *upstreamRespawn {
+	o.respawnMu.Lock()
+	if o.respawn != nil {
+		state := o.respawn
+		o.respawnMu.Unlock()
+		return state
+	}
+	state := &upstreamRespawn{done: make(chan struct{})}
+	o.respawn = state
+	o.respawnMu.Unlock()
+
+	go func() {
+		state.err = o.runUpstreamRespawn(reason)
+		close(state.done)
+		o.respawnMu.Lock()
+		if o.respawn == state {
+			o.respawn = nil
+		}
+		o.respawnMu.Unlock()
+	}()
+	return state
+}
+
+func (o *Owner) runUpstreamRespawn(reason string) error {
+	wait := upstreamRespawnInitialWait
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-o.done:
+			return errors.New("owner shutting down")
+		default:
+		}
+		if o.SessionCount() == 0 {
+			return errors.New("no live sessions remain")
+		}
+
+		proc, err := o.spawnReplacementUpstream()
+		if err != nil {
+			o.logger.Printf("upstream respawn failed attempt=%d reason=%s err=%v", attempt, reason, err)
+			if !o.waitBeforeRespawnRetry(wait) {
+				return errors.New("owner shutting down")
+			}
+			if wait < upstreamRespawnMaxWait {
+				wait *= 2
+				if wait > upstreamRespawnMaxWait {
+					wait = upstreamRespawnMaxWait
+				}
+			}
+			continue
+		}
+
+		o.mu.Lock()
+		o.upstream = proc
+		o.initReady = make(chan struct{})
+		o.initReadyOnce = sync.Once{}
+		o.initDone = false
+		ready := o.initReady
+		if o.toolList != nil || o.promptList != nil ||
+			o.resourceList != nil || o.resourceTemplateList != nil {
+			o.listChangedAfterRefresh.Store(true)
+		}
+		o.mu.Unlock()
+		o.upstreamDead.Store(true)
+
+		o.logger.Printf("upstream respawn started attempt=%d reason=%s", attempt, reason)
+		go o.readUpstream(proc)
+		go o.monitorUpstreamExit(proc)
+		o.sendProactiveInit()
+
+		timer := time.NewTimer(upstreamRespawnWaitTimeout)
+		select {
+		case <-ready:
+			timer.Stop()
+			if o.InitSuccess() && o.isCurrentUpstream(proc) {
+				o.upstreamDead.Store(false)
+				o.logger.Printf("upstream respawn ready attempt=%d reason=%s", attempt, reason)
+				return nil
+			}
+			o.logger.Printf("upstream respawn attempt=%d exited before initialize completed", attempt)
+		case <-timer.C:
+			o.logger.Printf("upstream respawn attempt=%d readiness timeout after %s", attempt, upstreamRespawnWaitTimeout)
+			_ = proc.Close()
+		case <-o.done:
+			timer.Stop()
+			_ = proc.Close()
+			return errors.New("owner shutting down")
+		}
+
+		if !o.waitBeforeRespawnRetry(wait) {
+			return errors.New("owner shutting down")
+		}
+		if wait < upstreamRespawnMaxWait {
+			wait *= 2
+			if wait > upstreamRespawnMaxWait {
+				wait = upstreamRespawnMaxWait
+			}
+		}
+	}
+}
+
+func (o *Owner) spawnReplacementUpstream() (*upstream.Process, error) {
+	if o.handlerFunc != nil {
+		o.logger.Printf("upstream respawn: in-process handler")
+		return upstream.NewProcessFromHandler(context.Background(), o.handlerFunc), nil
+	}
+	if o.command == "" {
+		return nil, errors.New("upstream command is empty")
+	}
+	return upstream.Start(o.command, o.args, o.env, o.cwd, o.logger)
+}
+
+func (o *Owner) waitBeforeRespawnRetry(wait time.Duration) bool {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-o.done:
+		return false
 	}
 }
 
@@ -2140,25 +2353,27 @@ func (o *Owner) drainInflightRequests() {
 	}
 	o.logger.Printf("upstream died: sending error responses for %d in-flight requests", len(entries))
 
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-
 	for _, entry := range entries {
-		result, err := remap.Deremap(json.RawMessage(`"` + entry.RemappedID + `"`))
+		remappedID := json.RawMessage(entry.RemappedID)
+		if !json.Valid(remappedID) {
+			remappedID = json.RawMessage(strconv.Quote(entry.RemappedID))
+		}
+		result, err := remap.Deremap(remappedID)
 		if err != nil {
 			o.logger.Printf("drainInflight: deremap error for %s: %v", entry.RemappedID, err)
 			continue
 		}
+		o.mu.RLock()
 		session, ok := o.sessions[result.SessionID]
-		if !ok {
-			continue // session already disconnected
-		}
-		errResp := fmt.Sprintf(
-			`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
-			string(result.OriginalID),
-		)
-		if writeErr := session.WriteRaw([]byte(errResp)); writeErr != nil {
-			o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
+		o.mu.RUnlock()
+		if ok {
+			errResp := fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
+				string(result.OriginalID),
+			)
+			if writeErr := session.WriteRaw([]byte(errResp)); writeErr != nil {
+				o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
+			}
 		}
 		// Use LoadAndDelete to atomically claim the inflightTracker entry.
 		// If the watchdog already claimed it (LoadAndDelete returns false), skip
@@ -2169,6 +2384,9 @@ func (o *Owner) drainInflightRequests() {
 		if _, claimed := o.inflightTracker.LoadAndDelete(entry.RemappedID); claimed {
 			o.decrementPending()
 		}
+		o.methodTags.Delete(entry.RemappedID)
+		o.timedOutIDs.Delete(entry.RemappedID)
+		o.clearProgressTokensForRequest(entry.RemappedID)
 	}
 }
 
@@ -2674,22 +2892,28 @@ func (o *Owner) touchActivity() {
 // semantics. Used by tests to capture output without a subprocess.
 func (o *Owner) writeUpstream(data []byte) error {
 	o.touchActivity()
-	if o.upstreamWriter != nil {
-		if _, err := o.upstreamWriter.Write(data); err != nil {
+	o.mu.RLock()
+	writer := o.upstreamWriter
+	up := o.upstream
+	o.mu.RUnlock()
+	if writer != nil {
+		if _, err := writer.Write(data); err != nil {
 			return fmt.Errorf("upstream writer: write: %w", err)
 		}
-		if _, err := o.upstreamWriter.Write([]byte("\n")); err != nil {
+		if _, err := writer.Write([]byte("\n")); err != nil {
 			return fmt.Errorf("upstream writer: write newline: %w", err)
 		}
 		return nil
 	}
-	if o.upstream == nil {
+	if up == nil {
 		return errors.New("upstream writer unavailable")
 	}
-	return o.upstream.WriteLine(data)
+	return up.WriteLine(data)
 }
 
 func (o *Owner) hasWritableUpstream() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	return o.upstream != nil || o.upstreamWriter != nil
 }
 
