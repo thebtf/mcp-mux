@@ -776,27 +776,31 @@ func sleepWithin(deadline time.Time, requested time.Duration) bool {
 	return true
 }
 
+var statusControlSendWithTimeout = control.SendWithTimeout
+
 func runStatus() {
+	runStatusWithWriters(os.Stdout, os.Stderr)
+}
+
+func runStatusWithWriters(stdout, stderr io.Writer) {
 	// Try daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
-	if isDaemonRunning(ctlPath) {
-		resp, err := control.Send(ctlPath, control.Request{Cmd: "status"})
-		if err == nil && resp.OK && resp.Data != nil {
-			var pretty json.RawMessage
-			if json.Valid(resp.Data) {
-				pretty = resp.Data
-			}
-			formatted, _ := json.MarshalIndent(pretty, "", "  ")
-			fmt.Println(string(formatted))
-			return
+	resp, err := statusControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, 5*time.Second)
+	if err == nil && resp.OK && resp.Data != nil {
+		var pretty json.RawMessage
+		if json.Valid(resp.Data) {
+			pretty = resp.Data
 		}
+		formatted, _ := json.MarshalIndent(pretty, "", "  ")
+		fmt.Fprintln(stdout, string(formatted))
+		return
 	}
 
 	// Fallback: legacy per-server scan
 	tmpDir := os.TempDir()
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error reading temp dir: %v\n", err)
+		fmt.Fprintf(stderr, "error reading temp dir: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -819,9 +823,9 @@ func runStatus() {
 
 		handled[id] = true
 
-		resp, err := control.Send(path, control.Request{Cmd: "status"})
+		resp, err := statusControlSendWithTimeout(path, control.Request{Cmd: "status"}, 5*time.Second)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  [%s] unreachable (stale socket)\n", shortID)
+			fmt.Fprintf(stderr, "  [%s] unreachable (stale socket)\n", shortID)
 			continue
 		}
 
@@ -868,10 +872,10 @@ func runStatus() {
 	}
 
 	if len(results) == 0 {
-		fmt.Println("No active mcp-mux instances found.")
+		fmt.Fprintln(stdout, "No active mcp-mux instances found.")
 		return
 	}
 
 	data, _ := json.MarshalIndent(results, "", "  ")
-	fmt.Println(string(data))
+	fmt.Fprintln(stdout, string(data))
 }

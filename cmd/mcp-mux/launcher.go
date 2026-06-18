@@ -47,6 +47,17 @@ func maybeRunLauncher() (bool, int) {
 }
 
 func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int) {
+	if shouldSuperviseEngineProcess(args) {
+		return true, runLauncherStdioSupervisor(launcherSupervisorConfig{
+			LauncherPath:      launcherPath,
+			InitialEnginePath: enginePath,
+			Args:              args,
+			Stdin:             os.Stdin,
+			Stdout:            os.Stdout,
+			Stderr:            os.Stderr,
+		})
+	}
+
 	cmd, fallbackToCaller, err := startEngineOrStableLauncher(launcherPath, enginePath, args, true, func(cmd *exec.Cmd) {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
