@@ -6,6 +6,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT -and $PSVersionTable.PSEdition -eq "Desktop") {
+    $pwsh = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($null -eq $pwsh) {
+        $pwshPath = "C:\Program Files\PowerShell\7\pwsh.exe"
+        if (Test-Path -LiteralPath $pwshPath) {
+            $pwsh = [pscustomobject]@{ Source = $pwshPath }
+        }
+    }
+    if ($null -eq $pwsh) {
+        throw "Scenario 5b requires PowerShell 7+ on Windows; install pwsh or run this script from PowerShell 7."
+    }
+    $forwardArgs = @("-NoProfile", "-File", $PSCommandPath)
+    if ($PSBoundParameters.ContainsKey("RunDir")) {
+        $forwardArgs += @("-RunDir", $RunDir)
+    }
+    if ($PSBoundParameters.ContainsKey("EvidencePath")) {
+        $forwardArgs += @("-EvidencePath", $EvidencePath)
+    }
+    if ($PSBoundParameters.ContainsKey("TimeoutSeconds")) {
+        $forwardArgs += @("-TimeoutSeconds", "$TimeoutSeconds")
+    }
+    & $pwsh.Source @forwardArgs
+    exit $LASTEXITCODE
+}
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Stamp = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), ([guid]::NewGuid().ToString("N").Substring(0, 8))
 if ([string]::IsNullOrWhiteSpace($RunDir)) {
@@ -262,6 +287,11 @@ $evidence = [ordered]@{
     fixture_log = $FixtureLog
     old_binary = $OldBinary
     new_binary = $NewBinary
+    powershell_host = [ordered]@{
+        edition = $PSVersionTable.PSEdition
+        version = $PSVersionTable.PSVersion.ToString()
+        process_path = (Get-Process -Id $PID).Path
+    }
     verdict = "FAIL"
     error = ""
 }

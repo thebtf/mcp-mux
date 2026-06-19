@@ -133,6 +133,55 @@ func TestDetachedProcessListenerAcceptsParentDial(t *testing.T) {
 	}
 }
 
+func TestDetachedDevNullProcessListenerAcceptsParentDial(t *testing.T) {
+	path := socketPath(t)
+	readyPath := path + ".ready"
+	resultPath := path + ".result"
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestDetachedProcessListenerHelper")
+	cmd.Env = append(os.Environ(),
+		"MUXCORE_IPC_TEST_HELPER=1",
+		"MUXCORE_IPC_TEST_PATH="+path,
+		"MUXCORE_IPC_TEST_READY="+readyPath,
+		"MUXCORE_IPC_TEST_RESULT="+resultPath,
+	)
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open devnull: %v", err)
+	}
+	defer devNull.Close()
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+		HideWindow:    true,
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		t.Fatalf("release helper: %v", err)
+	}
+
+	waitForFile(t, readyPath, 5*time.Second)
+
+	conn, err := DialTimeout(path, 5*time.Second)
+	if err != nil {
+		t.Fatalf("DialTimeout() error: %v", err)
+	}
+	conn.Close()
+
+	waitForFile(t, resultPath, 5*time.Second)
+	result, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if got := strings.TrimSpace(string(result)); got != "ok" {
+		t.Fatalf("helper result = %q, want ok", got)
+	}
+}
+
 func TestPipeListenerCloseTimesOutWhenUnderlyingCloseBlocks(t *testing.T) {
 	oldTimeout := pipeListenerCloseTimeout
 	pipeListenerCloseTimeout = 25 * time.Millisecond

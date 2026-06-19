@@ -23,7 +23,11 @@ health/status surface, and chosen update topology.
 
 ## Prerequisites
 
-- Windows PowerShell from the repository root.
+- PowerShell 7+ (`pwsh`) from the repository root. For Scenario 5b, run from a
+  normal operator shell or an explicitly approved unsandboxed agent command;
+  sandboxed agent hosts can produce a host-specific Windows named-pipe
+  `Access is denied` false failure. The script self-reexecs under `pwsh` when
+  launched from Windows PowerShell 5.1.
 - Go toolchain matching CI (`go version` should be compatible with `go 1.25`).
 - `uvx` available for `mcp-server-time`.
 - `D:\Dev\mcp-launcher\mcp-launcher.exe` available for the topology PoC.
@@ -234,9 +238,14 @@ Commands:
 
 ```powershell
 # Repo fixture:
-.\scripts\smoke-native-sessionhandler-update.ps1 `
+pwsh -NoProfile -File .\scripts\smoke-native-sessionhandler-update.ps1 `
   -RunDir .t\native-sessionhandler-update `
   -TimeoutSeconds 120
+
+# If the fixture log repeats:
+# control: accept error: open \\.\pipe\mcp-mux-...: Access is denied
+# rerun the same command from a normal operator pwsh window or an unsandboxed
+# agent shell before treating the result as muxcore evidence.
 
 # Consumer/product equivalent:
 # 1. Start the old consumer through the same entrypoint an MCP host uses.
