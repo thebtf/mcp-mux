@@ -211,13 +211,18 @@ During reconnect, the shim:
 2. Drains orphaned in-flight requests — sends spec-compliant JSON-RPC error responses so CC sees
    explicit failures for pending requests instead of silence (silence on a pending request is
    what CC's stdio transport tears the connection down over)
-3. Buffers incoming CC requests (up to 1000 messages)
-4. Starts a new daemon via `ensureDaemon()`
-5. Re-spawns the upstream server via `spawnViaDaemon()`
-6. Replays cached `initialize` request to warm the new owner
-7. Flushes buffered requests and resumes normal proxy
+3. Tries the planned reconnect path first, including reconnect-token refresh
+4. Starts or waits for the replacement daemon when needed
+5. Replays cached `initialize` request to warm the replacement owner
+6. Sends `notifications/tools/list_changed` so the host can refresh discovery
+7. Flushes any still-valid buffered requests and resumes normal proxy
 
-Reconnect timeout: 30 seconds. If reconnect fails, the shim exits and CC restarts it.
+Reconnect timeout: 30 seconds. If reconnect is still unavailable after that
+window and a reconnect path exists, the shim does **not** exit. It enters
+degraded retry: new client requests receive JSON-RPC errors by their original
+ids, the parent stdio transport stays open, and normal proxying resumes on that
+same transport after backend recovery. The shim exits only when the MCP host
+closes stdin/stdout or when no reconnect path was configured.
 
 > **Note on keepalives:** Earlier versions emitted synthetic `notifications/progress` with a
 > `mux-reconnect` progress token every 5 s as a keep-alive. That violated the MCP spec
@@ -318,9 +323,12 @@ mcp-mux daemon
 mcp-mux serve
 ```
 
-## Versioned Engine Upgrade with Graceful Restart
+## Versioned Engine Upgrade with Safe Restart
 
-Upgrading the mcp-mux binary while sessions are active is safe and fast:
+Upgrading the mcp-mux binary while sessions are active is safe and fast, but
+ordinary upgrades do not force live host transports through a daemon restart.
+The configured `mcp-mux` executable is a stable launcher and stdio anchor; the
+runtime code lives behind the versioned engine pointer.
 
 This section describes the `mcp-mux` product updater. If you embed `muxcore`
 in another product, start from `muxcore/README.md` and choose that product's
@@ -328,7 +336,7 @@ own launcher, engine path, staging name, and status/update surface instead of
 copying the `mcp-mux.exe~` / `mcp-mux.versions` layout blindly.
 
 ```sh
-# One-command upgrade with graceful restart
+# One-command upgrade with safe restart/defer semantics
 go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
 ```
 
@@ -338,20 +346,26 @@ go build -o mcp-mux.exe~ ./cmd/mcp-mux && mcp-mux upgrade --restart
 2. The pending `mcp-mux.exe~` engine is copied or moved into
    `mcp-mux.versions/<hash>/mcp-mux-engine.exe`.
 3. `mcp-mux.versions/active.txt` is switched to the new engine path.
-4. Graceful restart: daemon serializes state snapshot (cached init/tools/prompts/resources
-   responses, classification, session metadata) to a JSON file
-5. Daemon shuts down, shims detect IPC EOF
-6. Shims auto-reconnect and first wait briefly for the planned successor daemon
-   instead of immediately self-starting their current executable.
-7. New daemon loads snapshot → owners restored with pre-populated caches and
-   reconnect-token history.
-8. Shims refresh their reconnect tokens and resume against the successor engine
-   (~1 second reconnect vs 5-15 second cold start)
+4. If the daemon has live sessions, the daemon restart is deferred. Existing
+   host stdio transports stay attached to their current daemon/engine boundary,
+   and new shims use the new active engine pointer.
+5. If zero live sessions can be proven, `--restart` may perform graceful restart:
+   the daemon serializes state snapshot (cached init/tools/prompts/resources
+   responses, classification, session metadata), shuts down, and starts the
+   successor daemon from the new engine.
+6. Current-generation shims reconnect to the successor, refresh reconnect
+   tokens, and resume against restored owners with pre-populated caches.
 
 The launcher indirection is intentional on Windows: live `mcp-mux.exe` shim and daemon
 processes keep the executable image locked, so a self-rename of the configured binary is
 not a reliable update primitive. Versioned engines avoid that lock; old processes keep
 running from their old engine path while new shims use the active engine pointer.
+
+This has one bootstrap boundary: processes that were already launched by an
+older, pre-supervisor `mcp-mux serve` cannot be retrofitted in-place. Move the
+host configuration onto the stable launcher once; after that, ordinary engine
+updates preserve the host-facing stdio boundary by keeping the launcher stable
+and deferring daemon restart when live sessions are present.
 
 **Without `--restart`** (active pointer switch only):
 
@@ -362,7 +376,7 @@ mcp-mux upgrade
 The daemon keeps running with its current engine. New shim processes use the new
 active engine. The daemon updates on next natural restart.
 
-**Graceful restart preserves (v0.21.0+):**
+**When graceful restart is safe and actually runs (v0.21.0+), it preserves:**
 
 - **Upstream processes themselves** — they keep running across the daemon restart, with in-flight requests intact
 - Cached MCP responses (init, tools, prompts, resources)
@@ -383,7 +397,8 @@ equivalence to running the server as a direct child of the stdio client (the CC 
 
 | Trigger | Pre-v0.21.0 | v0.21.0+ |
 |---|---|---|
-| `mcp-mux upgrade --restart` | Upstream killed + respawned, in-flight requests dropped | Upstream keeps running, new daemon reattaches FDs |
+| `mcp-mux upgrade --restart` with live sessions | Upstream killed + respawned, in-flight requests dropped | Daemon restart deferred; existing stdio transports remain on the current daemon while new shims use the new engine pointer |
+| `mcp-mux upgrade --restart` with zero live sessions | Upstream killed + respawned, in-flight requests dropped | Upstream keeps running, new daemon reattaches FDs when graceful restart runs |
 | Daemon crash (SIGKILL) | Upstream killed with daemon | Upstream survives (Unix: own process group; Windows: Job Object without KILL_ON_JOB_CLOSE) |
 | `mux_restart <sid>` (operator-initiated) | Hard kill — unchanged | Hard kill — unchanged (explicit operator intent) |
 | Reaper idle-eviction | Hard SIGKILL | Soft-close: 30s stdin drain → SIGTERM only after timeout |
