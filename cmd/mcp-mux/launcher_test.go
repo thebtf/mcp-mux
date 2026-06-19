@@ -22,7 +22,7 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 }
 
-func TestInstallVersionedEngineUpdatesLauncher(t *testing.T) {
+func TestInstallVersionedEngineKeepsLauncherStableByDefault(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -36,16 +36,16 @@ func TestInstallVersionedEngineUpdatesLauncher(t *testing.T) {
 	if !installed {
 		t.Fatal("installVersionedEngine() installed = false, want true")
 	}
-	if !launcherUpdated {
-		t.Fatal("installVersionedEngine() launcherUpdated = false, want true")
+	if launcherUpdated {
+		t.Fatal("installVersionedEngine() launcherUpdated = true, want false for ordinary engine update")
 	}
 
 	launcherBytes, err := os.ReadFile(launcherPath)
 	if err != nil {
 		t.Fatalf("read launcher: %v", err)
 	}
-	if string(launcherBytes) != "engine v1" {
-		t.Fatalf("launcher content = %q, want engine v1", launcherBytes)
+	if string(launcherBytes) != "stable launcher" {
+		t.Fatalf("launcher content = %q, want stable launcher", launcherBytes)
 	}
 	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
 		t.Fatalf("pending path still exists after install: %v", err)
@@ -235,7 +235,7 @@ func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
 		return nil
 	}
 
-	if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
+	if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, false); err != nil {
 		t.Fatalf("restartDaemonAfterEngineSwitch() error = %v, want nil", err)
 	}
 	if startCalled {
@@ -300,7 +300,7 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 		return nil
 	}
 
-	if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
+	if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, true); err != nil {
 		t.Fatalf("restartDaemonAfterEngineSwitch() error = %v, want nil", err)
 	}
 	if !sendCalled {
@@ -323,6 +323,68 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 	}
 	if startCalled {
 		t.Fatal("restartDaemonAfterEngineSwitch started fallback daemon despite ready successor")
+	}
+}
+
+func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TEMP", dir)
+	t.Setenv("TMP", dir)
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
+
+	oldIsDaemonRunning := launcherIsDaemonRunning
+	oldStartDaemonProcessFrom := launcherStartDaemonProcessFrom
+	oldWaitForDaemon := launcherWaitForDaemon
+	oldWaitForDaemonExit := launcherWaitForDaemonExit
+	oldControlSendWithTimeout := launcherControlSendWithTimeout
+	t.Cleanup(func() {
+		launcherIsDaemonRunning = oldIsDaemonRunning
+		launcherStartDaemonProcessFrom = oldStartDaemonProcessFrom
+		launcherWaitForDaemon = oldWaitForDaemon
+		launcherWaitForDaemonExit = oldWaitForDaemonExit
+		launcherControlSendWithTimeout = oldControlSendWithTimeout
+	})
+
+	gracefulCalled := false
+	launcherIsDaemonRunning = func(path string) bool {
+		return path == serverid.DaemonControlPath("", engineName)
+	}
+	launcherControlSendWithTimeout = func(path string, req control.Request, timeout time.Duration) (*control.Response, error) {
+		if path != serverid.DaemonControlPath("", engineName) {
+			t.Fatalf("control path = %q, want daemon control path", path)
+		}
+		switch req.Cmd {
+		case "status":
+			return &control.Response{
+				OK:   true,
+				Data: []byte(`{"servers":[{"session_count":1}]}`),
+			}, nil
+		case "graceful-restart":
+			gracefulCalled = true
+			return &control.Response{OK: true}, nil
+		default:
+			t.Fatalf("unexpected control command %q", req.Cmd)
+			return nil, nil
+		}
+	}
+	launcherWaitForDaemonExit = func(string, string) {
+		t.Fatal("daemon-exit wait should not be called when live sessions exist")
+	}
+	launcherWaitForDaemon = func(string, time.Duration) error {
+		t.Fatal("successor readiness wait should not be called when live sessions exist")
+		return nil
+	}
+	launcherStartDaemonProcessFrom = func(string, string) error {
+		t.Fatal("fallback daemon should not be started when live sessions exist")
+		return nil
+	}
+
+	if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, false); err != nil {
+		t.Fatalf("restartDaemonAfterEngineSwitch() error = %v, want nil deferred restart", err)
+	}
+	if gracefulCalled {
+		t.Fatal("graceful-restart was sent despite live sessions")
 	}
 }
 
@@ -366,11 +428,11 @@ func TestRunLauncherUpgradeRestartNoDaemonSucceeds(t *testing.T) {
 		t.Fatalf("read launcher: %v", err)
 	}
 	if string(gotLauncher) != "engine v1" {
-		t.Fatalf("launcher content = %q, want staged binary", gotLauncher)
+		t.Fatalf("launcher content = %q, want stable launcher", gotLauncher)
 	}
 }
 
-func TestRunLauncherUpgradeRestartReexecsUpdatedLauncher(t *testing.T) {
+func TestRunLauncherUpgradeRestartReexecsExplicitLauncherUpdate(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -389,7 +451,7 @@ func TestRunLauncherUpgradeRestartReexecsUpdatedLauncher(t *testing.T) {
 		t.Fatal("restart should be delegated to the updated launcher, not run inline")
 		return false
 	}
-	launcherRunRestartActive = func(gotLauncherPath, gotEnginePath string) int {
+	launcherRunRestartActive = func(gotLauncherPath, gotEnginePath string, forceDaemonRestart bool) int {
 		reexecCalled = true
 		if gotLauncherPath != launcherPath {
 			t.Fatalf("launcherPath = %q, want %q", gotLauncherPath, launcherPath)
@@ -397,11 +459,14 @@ func TestRunLauncherUpgradeRestartReexecsUpdatedLauncher(t *testing.T) {
 		if !strings.Contains(gotEnginePath, versionStoreDir(launcherPath)) {
 			t.Fatalf("enginePath = %q, want version store path", gotEnginePath)
 		}
+		if forceDaemonRestart {
+			t.Fatal("forceDaemonRestart = true, want false")
+		}
 		return 0
 	}
 
-	if code := runLauncherUpgrade(launcherPath, []string{"--restart"}); code != 0 {
-		t.Fatalf("runLauncherUpgrade(--restart) code = %d, want 0", code)
+	if code := runLauncherUpgrade(launcherPath, []string{"--update-launcher", "--restart"}); code != 0 {
+		t.Fatalf("runLauncherUpgrade(--update-launcher --restart) code = %d, want 0", code)
 	}
 	if !reexecCalled {
 		t.Fatal("updated launcher restart was not re-executed")
@@ -462,7 +527,7 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 	}
 
 	var gotEnginePath string
-	launcherRunRestartActive = func(string, string) int {
+	launcherRunRestartActive = func(string, string, bool) int {
 		t.Fatal("--restart-active should restart inline, not re-exec")
 		return 1
 	}
@@ -490,7 +555,7 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 		return nil
 	}
 
-	if code := runLauncherUpgrade(launcherPath, []string{"--restart-active", filepath.Join("relative-engine", engineFileName())}); code != 0 {
+	if code := runLauncherUpgrade(launcherPath, []string{"--restart-active", filepath.Join("relative-engine", engineFileName()), "--force-daemon-restart"}); code != 0 {
 		t.Fatalf("runLauncherUpgrade(--restart-active) code = %d, want 0", code)
 	}
 	gotReal, gotRealErr := filepath.EvalSymlinks(gotEnginePath)
@@ -506,7 +571,7 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 	}
 }
 
-func TestInstallVersionedEngineUpdatesStaleLauncherWhenEngineAlreadyInstalled(t *testing.T) {
+func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -532,8 +597,8 @@ func TestInstallVersionedEngineUpdatesStaleLauncherWhenEngineAlreadyInstalled(t 
 	if installed {
 		t.Fatal("installed = true, want false for already-installed engine")
 	}
-	if !launcherUpdated {
-		t.Fatal("launcherUpdated = false, want true")
+	if launcherUpdated {
+		t.Fatal("launcherUpdated = true, want false for ordinary engine update")
 	}
 	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
 		t.Fatalf("pending path still exists after launcher update: %v", err)
@@ -542,7 +607,7 @@ func TestInstallVersionedEngineUpdatesStaleLauncherWhenEngineAlreadyInstalled(t 
 	if err != nil {
 		t.Fatalf("read launcher: %v", err)
 	}
-	if string(gotLauncher) != "new engine" {
-		t.Fatalf("launcher content = %q, want staged binary", gotLauncher)
+	if string(gotLauncher) != "old launcher" {
+		t.Fatalf("launcher content = %q, want old launcher", gotLauncher)
 	}
 }

@@ -77,9 +77,10 @@ func main() {
 				os.Exit(1)
 			}
 			upgradeFlags := flag.NewFlagSet("upgrade", flag.ExitOnError)
-			restart := upgradeFlags.Bool("restart", false, "Restart daemon after upgrade (shims auto-reconnect)")
+			restart := upgradeFlags.Bool("restart", false, "Safely restart daemon after upgrade only when no live sessions are attached")
+			forceDaemonRestart := upgradeFlags.Bool("force-daemon-restart", false, "Maintenance: restart daemon even with live sessions; existing old transports may close")
 			upgradeFlags.Parse(os.Args[2:])
-			runUpgrade(*restart)
+			runUpgrade(*restart, *forceDaemonRestart)
 			return
 		case "serve":
 			runServe()
@@ -557,7 +558,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	}
 }
 
-func runUpgrade(restart bool) {
+func runUpgrade(restart bool, forceDaemonRestart bool) {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot resolve executable path: %v\n", err)
@@ -618,6 +619,22 @@ func runUpgrade(restart bool) {
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
 	if restart && isDaemonRunning(ctlPath) {
+		if !forceDaemonRestart {
+			liveSessions, err := launcherDaemonLiveSessionCount(ctlPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Daemon restart deferred: could not prove zero live sessions: %v\n", err)
+				fmt.Fprintln(os.Stderr, "Existing host transports are preserved.")
+				fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
+				return
+			}
+			if liveSessions > 0 {
+				fmt.Fprintf(os.Stderr, "Daemon restart deferred: %d live session(s) attached; preserving host transports.\n", liveSessions)
+				fmt.Fprintln(os.Stderr, "Daemon can be restarted after sessions drain.")
+				fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
+				return
+			}
+		}
+
 		// Acquire daemon lock BEFORE sending graceful-restart.
 		// This prevents shims from spawning a competing daemon during the restart window.
 		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
@@ -686,7 +703,7 @@ func runUpgrade(restart bool) {
 	} else if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")
 		fmt.Fprintln(os.Stderr, "New shims use new binary. Daemon updates on next restart.")
-		fmt.Fprintln(os.Stderr, "Use: mcp-mux upgrade --restart to restart daemon immediately.")
+		fmt.Fprintln(os.Stderr, "Use: mcp-mux upgrade --restart after sessions drain, or --force-daemon-restart for maintenance.")
 	} else {
 		fmt.Fprintln(os.Stderr, "Daemon will start with new code on next tool call.")
 	}

@@ -26,17 +26,27 @@ consumer -> mcp-mux.exe launcher -> mcp-mux.versions/<hash>/mcp-mux-engine.exe
                                \-> mcp-mux.versions/active.txt
 ```
 
-`mcp-mux upgrade` no longer renames the configured launcher. It installs the
-pending `mcp-mux.exe~` as a content-addressed engine under
-`mcp-mux.versions/<hash>/mcp-mux-engine.exe`, updates `active.txt`, and keeps
-the launcher path stable. If a directory ACL prevents rename/delete of the
-staged file, the installer falls back to copy+hash-verify and treats staged-file
-cleanup as best effort after the active engine is safely installed.
+`mcp-mux upgrade` no longer renames the configured launcher during ordinary
+runtime updates. It installs the pending `mcp-mux.exe~` as a content-addressed
+engine under `mcp-mux.versions/<hash>/mcp-mux-engine.exe`, updates
+`active.txt`, removes the staged file, and keeps the launcher path stable.
 
-`upgrade --restart` asks the daemon to graceful-restart. Successor daemon spawn
-resolves the active engine pointer through `MCPMUX_ACTIVE_ENGINE_FILE` (or an
-explicit `MCPMUX_SUCCESSOR_EXE`) instead of blindly spawning `os.Executable()`.
-The `cmd/mcp-mux` daemon config explicitly sets `DaemonFlag: "daemon"` so the
+Launcher replacement is a separate maintenance operation
+(`upgrade --update-launcher`). It is not part of the ordinary engine update
+path, because the host-facing launcher/shim is the durable stdio anchor and
+must not become a release-to-release moving part.
+
+`upgrade --restart` is safe by default: before sending `graceful-restart`, it
+asks the daemon for status and sums live `session_count` values. If any live
+session is attached, or if zero sessions cannot be proven, the daemon restart is
+deferred and the existing host transports are preserved. A forced daemon
+restart remains available only as explicit maintenance through
+`--force-daemon-restart`.
+
+When a daemon restart is actually allowed, successor daemon spawn resolves the
+active engine pointer through `MCPMUX_ACTIVE_ENGINE_FILE` (or an explicit
+`MCPMUX_SUCCESSOR_EXE`) instead of blindly spawning `os.Executable()`. The
+`cmd/mcp-mux` daemon config explicitly sets `DaemonFlag: "daemon"` so the
 successor enters the correct CLI subcommand.
 
 ## Consequences
@@ -53,10 +63,16 @@ Negative:
 - There is one extra launcher process per shim while the active engine runs.
 - Launcher changes themselves still require a maintenance replacement, but that
   should be rare compared with engine/runtime updates.
+- Ordinary updates do not force old host-facing shims to prove reconnect logic.
+  Existing sessions may continue on the old daemon until they drain; this is the
+  transparency tradeoff that prevents raw host-visible `Transport closed` from
+  an update.
 - The first deployment from a pre-launcher binary may still need a maintenance
   replacement if live old-style `mcp-mux.exe` processes lock the configured
   executable. After the stable launcher is installed, normal engine updates no
   longer touch that path.
+- A forced daemon restart with live sessions is a maintenance action, not a
+  transparent update.
 - `mcp-mux.versions/` is runtime state and must stay out of git.
 
 ## Verification
@@ -73,3 +89,8 @@ Fresh evidence for the accepting implementation:
 - Isolated `upgrade --restart` with repo-local `TEMP` installed the engine,
   started a daemon through the active engine, returned `status`, and stopped
   cleanly.
+- `TestInstallVersionedEngineKeepsLauncherStableByDefault` proves ordinary
+  engine install leaves the stable launcher bytes unchanged.
+- `TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist` proves
+  ordinary `--restart` does not send `graceful-restart` while live sessions are
+  attached.

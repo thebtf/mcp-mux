@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -152,7 +153,9 @@ func launcherEnv(launcherPath string) []string {
 func runLauncherUpgrade(launcherPath string, args []string) int {
 	upgradeFlags := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	upgradeFlags.SetOutput(os.Stderr)
-	restart := upgradeFlags.Bool("restart", false, "Restart daemon after active engine switch")
+	restart := upgradeFlags.Bool("restart", false, "Safely restart daemon after active engine switch only when no live sessions are attached")
+	forceDaemonRestart := upgradeFlags.Bool("force-daemon-restart", false, "Maintenance: restart daemon even with live sessions; existing old transports may close")
+	updateLauncher := upgradeFlags.Bool("update-launcher", false, "Maintenance: replace the stable launcher binary from the staged update")
 	restartActive := upgradeFlags.String("restart-active", "", "internal: restart daemon after active engine switch")
 	if err := upgradeFlags.Parse(args); err != nil {
 		return 2
@@ -164,7 +167,7 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
 			return 1
 		}
-		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
+		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, *forceDaemonRestart); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
 			return 1
@@ -173,7 +176,9 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 	}
 
 	pendingPath := launcherPath + "~"
-	enginePath, installed, launcherUpdated, err := installVersionedEngine(launcherPath, pendingPath)
+	enginePath, installed, launcherUpdated, err := installVersionedEngineWithOptions(launcherPath, pendingPath, versionedEngineInstallOptions{
+		UpdateLauncher: *updateLauncher,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		fmt.Fprintln(os.Stderr, "")
@@ -189,16 +194,18 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 	}
 	if launcherUpdated {
 		fmt.Fprintf(os.Stderr, "Updated launcher: %s\n", launcherPath)
-	} else {
+	} else if *updateLauncher {
 		fmt.Fprintf(os.Stderr, "Launcher already current: %s\n", launcherPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "Launcher preserved: %s\n", launcherPath)
 	}
 	fmt.Fprintf(os.Stderr, "Active engine: %s\n", enginePath)
 
 	if *restart {
 		if launcherUpdated {
-			return launcherRunRestartActive(launcherPath, enginePath)
+			return launcherRunRestartActive(launcherPath, enginePath, *forceDaemonRestart)
 		}
-		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath); err != nil {
+		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, *forceDaemonRestart); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
 			return 1
@@ -207,9 +214,13 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 	return 0
 }
 
-func runLauncherRestartActive(launcherPath, enginePath string) int {
+func runLauncherRestartActive(launcherPath, enginePath string, forceDaemonRestart bool) int {
 	fmt.Fprintln(os.Stderr, "Re-executing updated launcher for daemon restart...")
-	cmd := exec.Command(launcherPath, "upgrade", "--restart-active", enginePath)
+	args := []string{"upgrade", "--restart-active", enginePath}
+	if forceDaemonRestart {
+		args = append(args, "--force-daemon-restart")
+	}
+	cmd := exec.Command(launcherPath, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -225,7 +236,15 @@ func runLauncherRestartActive(launcherPath, enginePath string) int {
 	return 0
 }
 
+type versionedEngineInstallOptions struct {
+	UpdateLauncher bool
+}
+
 func installVersionedEngine(launcherPath, pendingPath string) (enginePath string, installed bool, launcherUpdated bool, err error) {
+	return installVersionedEngineWithOptions(launcherPath, pendingPath, versionedEngineInstallOptions{})
+}
+
+func installVersionedEngineWithOptions(launcherPath, pendingPath string, opts versionedEngineInstallOptions) (enginePath string, installed bool, launcherUpdated bool, err error) {
 	if _, err := os.Stat(pendingPath); err != nil {
 		if os.IsNotExist(err) {
 			return "", false, false, fmt.Errorf("no pending update found at %s", pendingPath)
@@ -261,7 +280,9 @@ func installVersionedEngine(launcherPath, pendingPath string) (enginePath string
 		return "", false, false, fmt.Errorf("stat version path: %w", statErr)
 	}
 
-	if sameFile(launcherPath, pendingPath) {
+	if !opts.UpdateLauncher {
+		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
+	} else if sameFile(launcherPath, pendingPath) {
 		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
 	} else {
 		oldPath, swapErr := upgrade.Swap(launcherPath, pendingPath)
@@ -321,11 +342,27 @@ func removeWithRetry(path string, attempts int, delay time.Duration) error {
 	return last
 }
 
-func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
+func restartDaemonAfterEngineSwitch(launcherPath, enginePath string, force bool) error {
 	ctlPath := serverid.DaemonControlPath("", engineName)
 	if !launcherIsDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "No daemon running; active engine will be used by the next shim reconnect.")
 		return nil
+	}
+
+	if !force {
+		liveSessions, err := launcherDaemonLiveSessionCount(ctlPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Daemon restart deferred: could not prove zero live sessions: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Active engine updated; existing host transports are preserved.")
+			fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
+			return nil
+		}
+		if liveSessions > 0 {
+			fmt.Fprintf(os.Stderr, "Daemon restart deferred: %d live session(s) attached; preserving host transports.\n", liveSessions)
+			fmt.Fprintln(os.Stderr, "Active engine updated; the daemon can be restarted after sessions drain.")
+			fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
+			return nil
+		}
 	}
 
 	lockPath := serverid.DaemonLockPath("", engineName)
@@ -381,6 +418,36 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string) error {
 	}
 	fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
 	return nil
+}
+
+func launcherDaemonLiveSessionCount(ctlPath string) (int, error) {
+	resp, err := launcherControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, 5*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	if resp == nil {
+		return 0, errors.New("nil status response")
+	}
+	if !resp.OK {
+		return 0, fmt.Errorf("status: %s", resp.Message)
+	}
+
+	var payload struct {
+		Servers []struct {
+			SessionCount int `json:"session_count"`
+		} `json:"servers"`
+	}
+	if len(resp.Data) == 0 {
+		return 0, nil
+	}
+	if err := json.Unmarshal(resp.Data, &payload); err != nil {
+		return 0, fmt.Errorf("decode daemon status: %w", err)
+	}
+	total := 0
+	for _, srv := range payload.Servers {
+		total += srv.SessionCount
+	}
+	return total, nil
 }
 
 func startDaemonAndWait(launcherPath, enginePath, ctlPath string) error {

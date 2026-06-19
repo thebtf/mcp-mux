@@ -352,13 +352,19 @@ operator docs.
 
 | Topology | Use when | Consumer action |
 | --- | --- | --- |
-| Stable launcher + versioned engine store | The executable configured in the MCP host may be held open by live shims or daemons. This is the safest Windows topology. | Keep the configured launcher stable. Install each build as a new engine path such as `versions/<hash>/<product>-engine.exe`, update an `active.txt` pointer, then call `RestartWithSuccessor` or restart with `MCPMUX_ACTIVE_ENGINE_FILE` / `MCPMUX_SUCCESSOR_EXE` pointing at the intended successor. Do not call `ApplyUpdateAndRestart` against the launcher path. |
+| Stable launcher + versioned engine store | The executable configured in the MCP host may be held open by live shims or daemons. This is the safest Windows topology. | Keep the configured launcher stable. Install each build as a new engine path such as `versions/<hash>/<product>-engine.exe`, update an `active.txt` pointer, and do not restart the live daemon while sessions are attached. Defer daemon restart until sessions drain, or use an explicit maintenance mode if you intentionally accept visible disruption. Do not call `ApplyUpdateAndRestart` against the launcher path. |
 | Fixed replaceable engine path | The product has a current engine executable path that can be renamed while old processes continue from `*.old.<pid>`. | Build or copy the candidate to an explicit `StagedExe`, commonly `CurrentExe + "~"`, then call `ApplyUpdateAndRestart` with `CurrentExe` set to that replaceable engine path. |
 | Offline / custom supervisor | The product owns daemon lifecycle outside the standard engine helper. | Use `upgrade.Swap` only as the rename primitive. Your updater must still handle daemon namespace locking, graceful restart, shutdown fallback, daemon start, ready wait, and status reporting. |
 
 For the **stable launcher + versioned engine store** topology, do not swap the
-launcher. Update the active engine pointer first, then ask the currently-running
-daemon to restart with the intended successor executable:
+launcher during ordinary runtime updates. Update the active engine pointer
+first. If the daemon has live sessions, leave it running so already-open
+host-facing shims keep their stdio transports. Restart the daemon only after
+sessions drain, or during an explicit maintenance action where visible
+disruption is acceptable.
+
+When a restart is safe, ask the currently-running daemon to restart with the
+intended successor executable:
 
 ```go
 result, err := eng.RestartWithSuccessor(ctx, engine.RestartWithSuccessorOptions{
@@ -370,9 +376,12 @@ result, err := eng.RestartWithSuccessor(ctx, engine.RestartWithSuccessorOptions{
 })
 ```
 
-Existing shims wait briefly for the planned successor daemon before self-starting
-their own executable. This prevents a live predecessor shim from resurrecting
-the old binary during the successor's control-socket bind window.
+Existing current-generation shims wait briefly for the planned successor daemon
+before self-starting their own executable. This prevents a live predecessor shim
+from resurrecting the old binary during the successor's control-socket bind
+window. Do not rely on this as the only transparency mechanism for already-open
+older shims; the ordinary update path must avoid forcing those shims across a
+daemon boundary.
 
 ### Apply Update and Restart
 
@@ -419,8 +428,9 @@ The helper:
 SessionHandler consumers such as aimux can use this in their own
 `upgrade(action=apply)` path only when their product topology has a replaceable
 engine path. If they use a stable launcher and versioned engine store, their
-updater should update the engine pointer and invoke graceful restart with the
-intended successor executable instead.
+updater should update the engine pointer and defer daemon restart while live
+sessions exist. A forced graceful restart with the intended successor executable
+is maintenance, not a transparent live update.
 
 The shim process must survive for transparent reconnect to work. Muxcore keeps
 the shim transport alive and reconnects it to the replacement daemon when

@@ -107,6 +107,7 @@ Commands:
 ```powershell
 go build -trimpath -o .\mcp-mux.exe~ .\cmd\mcp-mux
 .\mcp-mux.exe upgrade --restart
+Get-Content .\mcp-mux.versions\active.txt
 .\mcp-mux.exe status
 ```
 
@@ -117,15 +118,22 @@ Expected:
 - The pending binary `mcp-mux.exe~` is installed under
   `mcp-mux.versions/<hash>/mcp-mux-engine.exe`, and
   `mcp-mux.versions/active.txt` points at that engine.
-- `status` responds without handshake failure.
-- Existing MCP host sessions/shims reconnect through the shim/daemon path rather than
-  requiring manual config edits.
+- If live sessions are attached, `upgrade --restart` reports daemon restart
+  deferred and does not send `graceful-restart`; existing MCP host stdio
+  transports remain open.
+- If no live sessions are attached, `upgrade --restart` may restart the daemon
+  and `status` responds without handshake failure.
+- `--force-daemon-restart` is maintenance-only. Do not use it as the release
+  smoke for transparent updates with live sessions.
 
 Broken signals:
 
 - The build cannot write `mcp-mux.exe~`.
 - `upgrade --restart` reports `rename current to old: Access is denied`.
-- `upgrade --restart` reports socket handoff failure without fallback recovery.
+- `upgrade --restart` sends `graceful-restart` while status shows live
+  `session_count > 0`.
+- `upgrade --restart` reports socket handoff failure without fallback recovery
+  when no live sessions were attached.
 - `status` cannot contact the daemon after restart.
 
 ## Scenario 5: Global-First Owner Dedup Across Cwds (v0.25.0)
