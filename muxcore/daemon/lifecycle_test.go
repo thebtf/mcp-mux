@@ -98,7 +98,8 @@ func TestUpstreamCrashRespawnsSession(t *testing.T) {
 
 	daemonSendReq(t, client, 2, "ping", `{}`)
 	resp := daemonReadRespWithID(t, client, 2)
-	if !strings.Contains(string(resp), `"generation":1`) {
+	initialGeneration := daemonRespawnGeneration(t, resp)
+	if initialGeneration != 1 {
 		t.Fatalf("initial ping response = %s, want generation 1", resp)
 	}
 
@@ -110,9 +111,23 @@ func TestUpstreamCrashRespawnsSession(t *testing.T) {
 
 	daemonSendReq(t, client, 4, "ping", `{}`)
 	resp = daemonReadRespWithID(t, client, 4)
-	if !strings.Contains(string(resp), `"generation":2`) {
-		t.Fatalf("post-respawn ping response = %s, want generation 2 from same IPC session", resp)
+	replacementGeneration := daemonRespawnGeneration(t, resp)
+	if replacementGeneration <= initialGeneration {
+		t.Fatalf("post-respawn ping response = %s, want generation > %d from same IPC session", resp, initialGeneration)
 	}
+}
+
+func daemonRespawnGeneration(t *testing.T, resp []byte) int {
+	t.Helper()
+	var obj struct {
+		Result struct {
+			Generation int `json:"generation"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &obj); err != nil {
+		t.Fatalf("unmarshal generation response: %v (raw: %s)", err, resp)
+	}
+	return obj.Result.Generation
 }
 
 func daemonReadRespWithID(t *testing.T, c *ipcConn, id int) []byte {

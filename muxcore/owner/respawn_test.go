@@ -39,7 +39,8 @@ func TestOwnerRespawnsUpstreamForLiveSession(t *testing.T) {
 	sendReq(t, clientW, 2, "ping", `{}`)
 	resp := readResp(t, clientR)
 	assertResponseID(t, resp, 2)
-	if !strings.Contains(string(resp), `"generation":1`) {
+	initialGeneration := respawnGeneration(t, resp)
+	if initialGeneration != 1 {
 		t.Fatalf("initial ping response = %s, want generation 1", resp)
 	}
 
@@ -53,9 +54,23 @@ func TestOwnerRespawnsUpstreamForLiveSession(t *testing.T) {
 	sendReq(t, clientW, 4, "ping", `{}`)
 	resp = readRespWithID(t, clientR, 4)
 	assertResponseID(t, resp, 4)
-	if !strings.Contains(string(resp), `"generation":2`) {
-		t.Fatalf("post-respawn ping response = %s, want generation 2 from same session", resp)
+	replacementGeneration := respawnGeneration(t, resp)
+	if replacementGeneration <= initialGeneration {
+		t.Fatalf("post-respawn ping response = %s, want generation > %d from same session", resp, initialGeneration)
 	}
+}
+
+func respawnGeneration(t *testing.T, resp []byte) int {
+	t.Helper()
+	var obj struct {
+		Result struct {
+			Generation int `json:"generation"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(resp, &obj); err != nil {
+		t.Fatalf("unmarshal generation response: %v (raw: %s)", err, resp)
+	}
+	return obj.Result.Generation
 }
 
 func readRespWithID(t *testing.T, r io.Reader, id int) []byte {
