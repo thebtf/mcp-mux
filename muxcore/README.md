@@ -14,10 +14,10 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.9
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.13
 ```
 
-Use v0.26.9 as the current consumer target. It includes the v0.25.3 native
+Use v0.26.13 as the current consumer target. It includes the v0.25.3 native
 SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
@@ -27,7 +27,37 @@ cached tool discovery while the replacement upstream refreshes. For pipe-backed
 owners, it also keeps live downstream sessions attached across upstream process
 exit/update by draining current in-flight requests with explicit JSON-RPC
 errors and automatically respawning the replacement upstream for the next
-request.
+request. Reconnect timeout now enters degraded retry instead of closing the
+parent stdio transport, and zero-session disposable owners are cleaned
+automatically after a short safety-gated delay.
+
+### v0.26.13 - transport degraded retry and automatic zero-session cleanup
+
+**No required consumer code changes for ordinary `engine.New` users.** This
+release hardens muxcore's two main lifecycle responsibilities:
+
+- Resilient shims no longer exit merely because daemon/owner reconnect exceeded
+  `ReconnectTimeout`. When a reconnect path is configured, timeout moves the
+  shim into degraded retry: new client requests receive explicit JSON-RPC
+  errors by original id, the parent MCP stdio transport stays alive, and normal
+  proxying resumes on the same transport after backend recovery.
+- Disposable owners are cleaned automatically after their last session
+  disconnects. The default `ZeroSessionCleanupDelay` is 30 seconds. Cleanup is
+  still safety-gated by the same invariants as idle reaping: same owner entry,
+  same zero-session epoch, `sessions == 0`, not persistent, no pending
+  requests, no active progress tokens, and no busy declarations.
+
+New optional API:
+
+| API | Semantics |
+| --- | --- |
+| `engine.Config.ZeroSessionCleanupDelay` | Optional event-driven cleanup delay after the last session disconnects. Zero uses the muxcore default (`30s`); negative disables this path and leaves cleanup to the periodic reaper. |
+| `daemon.Config.ZeroSessionCleanupDelay` | Lower-level daemon equivalent for direct daemon consumers. Ordinary consumers should prefer `engine.Config`. |
+
+Consumer impact: bump muxcore and remove product-local hacks that kill stale
+owners or restart the MCP transport after recoverable daemon/owner outages.
+Persistent products with background state should keep `Persistent: true` or
+declare `x-mux.persistent: true`; those owners are not cleaned by this path.
 
 ## Golden Path
 
@@ -134,7 +164,8 @@ Every muxcore consumer should satisfy this checklist before shipping.
    If your server owns background jobs, caches, indexes, active conversations,
    or other state that should survive all clients disconnecting, set
    `Persistent: true` or declare `x-mux.persistent: true` in the upstream
-   initialize response. Otherwise idle owners are eligible for reaping.
+   initialize response. Otherwise zero-session owners are eligible for automatic
+   cleanup after `ZeroSessionCleanupDelay` and for periodic idle reaping.
 
 8. **Use `StdinEOFWaitForDisconnect` only when EOF is not client shutdown.**
    The default policy treats stdin EOF as the MCP host ending the session: drain

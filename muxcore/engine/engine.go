@@ -140,6 +140,13 @@ type Config struct {
 	// Default: 5 minutes.
 	IdleTimeout time.Duration
 
+	// ZeroSessionCleanupDelay is the grace after an owner reaches zero sessions
+	// before muxcore performs event-driven cleanup. The cleanup still requires
+	// no pending requests, no active progress tokens, no busy declarations, and
+	// non-persistent ownership. Zero uses the daemon default (30 seconds);
+	// negative disables event-driven cleanup.
+	ZeroSessionCleanupDelay time.Duration
+
 	// ProgressInterval is the synthetic progress notification interval.
 	// Default: 5 seconds. Range: 1-60 seconds.
 	ProgressInterval time.Duration
@@ -374,20 +381,21 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		handlerFunc = nil // SessionHandler is passed separately; clear HandlerFunc
 	}
 	d, err := daemon.New(daemon.Config{
-		ControlPath:      ctlPath,
-		OwnerIdleTimeout: e.cfg.IdleTimeout,
-		IdleTimeout:      e.cfg.IdleTimeout,
-		Logger:           e.logger,
-		SkipSnapshot:     e.cfg.SkipSnapshot,
-		HandlerFunc:      handlerFunc,
-		SessionHandler:   e.cfg.SessionHandler,
-		DaemonFlag:       e.cfg.DaemonFlag,
-		Name:             e.cfg.Name,
-		Namespace:        e.cfg.Namespace,
-		Persistent:       e.cfg.Persistent,
-		Registry:         e.cfg.Registry,
-		AuthorizeSession: e.cfg.AuthorizeSession,
-		OnFrameReceived:  e.cfg.OnFrameReceived,
+		ControlPath:             ctlPath,
+		OwnerIdleTimeout:        e.cfg.IdleTimeout,
+		IdleTimeout:             e.cfg.IdleTimeout,
+		ZeroSessionCleanupDelay: e.cfg.ZeroSessionCleanupDelay,
+		Logger:                  e.logger,
+		SkipSnapshot:            e.cfg.SkipSnapshot,
+		HandlerFunc:             handlerFunc,
+		SessionHandler:          e.cfg.SessionHandler,
+		DaemonFlag:              e.cfg.DaemonFlag,
+		Name:                    e.cfg.Name,
+		Namespace:               e.cfg.Namespace,
+		Persistent:              e.cfg.Persistent,
+		Registry:                e.cfg.Registry,
+		AuthorizeSession:        e.cfg.AuthorizeSession,
+		OnFrameReceived:         e.cfg.OnFrameReceived,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)

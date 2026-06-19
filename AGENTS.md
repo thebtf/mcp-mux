@@ -71,8 +71,33 @@ do not call the full critical muxcore scope shipped.
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.9
+go get github.com/thebtf/mcp-mux/muxcore@v0.26.13
 ```
+
+### v0.26.13 - transport degraded retry and automatic zero-session cleanup
+
+**No required consumer code changes for ordinary `engine.New` users.** This
+release hardens muxcore's lifecycle responsibilities:
+
+- reconnect timeout no longer closes the parent stdio transport when a
+  reconnect path is configured; the shim enters degraded retry, returns
+  explicit JSON-RPC errors for new requests by original id, keeps retrying, and
+  resumes proxying on the same transport after backend recovery;
+- zero-session disposable owners are cleaned automatically after a 30-second
+  safety-gated delay. Cleanup re-checks same owner entry, same zero-session
+  timestamp, no sessions, non-persistent ownership, no pending requests, no
+  active progress tokens, and no busy declarations.
+
+| API | Semantics |
+|-----|-----------|
+| `engine.Config.ZeroSessionCleanupDelay` | Optional event-driven cleanup delay after the last session disconnects. Zero uses the muxcore default (`30s`); negative disables this path and leaves cleanup to the periodic reaper. |
+| `daemon.Config.ZeroSessionCleanupDelay` | Lower-level daemon equivalent for direct daemon consumers. Ordinary consumers should prefer `engine.Config`. |
+
+Consumer impact: update to v0.26.13. Do not add product-local transport restart
+loops, stale-owner kill jobs, or manual cleanup hacks for recoverable
+daemon/owner outages; muxcore owns the degraded reconnect and zero-session
+cleanup protocols. Products with background state should keep `Persistent: true`
+or declare `x-mux.persistent: true`.
 
 ### v0.26.9 - transparent upstream respawn for live sessions
 

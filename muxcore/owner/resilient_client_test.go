@@ -512,21 +512,32 @@ func TestResilientClient_OnInject_BufferFull(t *testing.T) {
 	}
 }
 
-// TestResilientClient_TimeoutExits verifies that RunResilientClient returns an
-// error when the ReconnectFunc always fails and the timeout expires.
-func TestResilientClient_TimeoutExits(t *testing.T) {
+// TestResilientClient_TimeoutEntersDegradedRetry verifies that reconnect
+// timeout is not a stdio-transport death sentence. After the grace window, the
+// shim should fail new requests quickly with JSON-RPC errors, keep retrying in
+// the background, and resume proxying on the same stdio transport once the
+// backend is available again.
+func TestResilientClient_TimeoutEntersDegradedRetry(t *testing.T) {
 	path1 := newTestIPCPath(t)
+	path2 := newTestIPCPath(t)
 
 	srv1, _ := startEchoIPCServer(t, path1)
+	_, recv2 := startEchoIPCServer(t, path2)
 
 	ccStdinR, ccStdinW := io.Pipe()
 	ccStdoutR, ccStdoutW := io.Pipe()
 
+	reconnectAllowed := make(chan struct{})
 	reconnectFn := func() (string, string, error) {
+		select {
+		case <-reconnectAllowed:
+			return path2, "", nil
+		default:
+		}
 		return "", "", fmt.Errorf("daemon not available")
 	}
 
-	const shortTimeout = 2 * time.Second
+	const shortTimeout = 200 * time.Millisecond
 
 	cfg := ResilientClientConfig{
 		ProbeGracePeriod:  time.Nanosecond,
@@ -544,28 +555,76 @@ func TestResilientClient_TimeoutExits(t *testing.T) {
 		errCh <- RunResilientClient(cfg)
 	}()
 
-	// Drain stdout.
+	stdoutLines := make(chan string, 20)
 	go func() {
-		io.Copy(io.Discard, ccStdoutR)
+		scanner := bufio.NewScanner(ccStdoutR)
+		for scanner.Scan() {
+			stdoutLines <- scanner.Text()
+		}
 	}()
 
 	// Let client connect then close the IPC server.
 	time.Sleep(200 * time.Millisecond)
 	srv1.closeAll()
 
-	// Expect RunResilientClient to return an error within timeout + grace.
+	time.Sleep(shortTimeout + reconnectPollInterval + 200*time.Millisecond)
 	select {
 	case err := <-errCh:
-		if err == nil {
-			t.Error("expected error from timeout, got nil")
-		} else {
-			t.Logf("got expected error: %v", err)
-		}
-	case <-time.After(shortTimeout + 3*time.Second):
-		t.Fatal("RunResilientClient did not exit after timeout")
+		t.Fatalf("RunResilientClient exited after reconnect timeout: %v", err)
+	default:
+		// Good: timeout became degraded retry, not process exit.
 	}
 
-	_ = ccStdinW
+	degradedReq := `{"jsonrpc":"2.0","id":77,"method":"ping","params":{}}`
+	fmt.Fprintf(ccStdinW, "%s\n", degradedReq)
+
+	var degradedResp testJSONRPCResponse
+	select {
+	case line := <-stdoutLines:
+		degradedResp = parseJSONRPCResponseLine(t, line)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: no degraded JSON-RPC response")
+	}
+	if string(degradedResp.ID) != "77" {
+		t.Fatalf("degraded response id = %s, want 77", degradedResp.ID)
+	}
+	if degradedResp.Error == nil || !strings.Contains(degradedResp.Error.Message, "mux backend reconnecting") {
+		t.Fatalf("degraded response error = %#v, want mux backend reconnecting", degradedResp.Error)
+	}
+
+	close(reconnectAllowed)
+	reconnected := false
+	for !reconnected {
+		select {
+		case line := <-stdoutLines:
+			if strings.Contains(line, "notifications/tools/list_changed") {
+				reconnected = true
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout: reconnect did not resume stdio transport")
+		}
+	}
+
+	ping := `{"jsonrpc":"2.0","id":78,"method":"ping","params":{}}`
+	fmt.Fprintf(ccStdinW, "%s\n", ping)
+	select {
+	case line := <-recv2:
+		if !strings.Contains(line, `"id":78`) {
+			t.Fatalf("server 2 received %q, want ping id=78", line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: server 2 did not receive ping after degraded reconnect")
+	}
+
+	ccStdinW.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("expected nil on stdin close, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: RunResilientClient did not exit after stdin close")
+	}
 }
 
 // TestResilientClient_NoMuxReconnectKeepalive is a regression test for the

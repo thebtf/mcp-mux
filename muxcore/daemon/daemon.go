@@ -60,6 +60,8 @@ var ErrDaemonShuttingDown = errors.New("daemon shutting down")
 // exhaustion is treated as a hard failure and returned to the caller.
 const maxSpawnRetries = 3
 
+const defaultZeroSessionCleanupDelay = 30 * time.Second
+
 // OwnerEntry tracks a single managed owner and its metadata.
 // When creating != nil, the entry is a placeholder: Owner is nil and is being
 // created by another goroutine. Waiters must read creating under d.mu, then
@@ -133,8 +135,12 @@ type Daemon struct {
 	// tokens, no busy declarations) before the reaper removes it. Default 10m.
 	// Overridable per-owner via x-mux.idleTimeout capability.
 	ownerIdleTimeout time.Duration
-	idleTimeout      time.Duration                        // daemon-level auto-exit timeout (zero owners + zero sessions)
-	templateCache    map[string]mcpsnapshot.OwnerSnapshot // command+args key → cached init data
+	// zeroSessionCleanupDelay is the event-driven cleanup grace after the last
+	// session disconnects. It uses the same activity gates as the reaper but
+	// does not wait for the coarse reaper interval/ownerIdleTimeout path.
+	zeroSessionCleanupDelay time.Duration
+	idleTimeout             time.Duration                        // daemon-level auto-exit timeout (zero owners + zero sessions)
+	templateCache           map[string]mcpsnapshot.OwnerSnapshot // command+args key → cached init data
 
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
@@ -278,6 +284,13 @@ type Config struct {
 	// Default: 5 minutes.
 	IdleTimeout time.Duration
 
+	// ZeroSessionCleanupDelay is the grace after an owner reaches zero sessions
+	// before muxcore performs event-driven cleanup. The cleanup still requires
+	// no pending requests, no active progress tokens, no busy declarations, and
+	// non-persistent ownership. Default: 30 seconds. Negative disables this
+	// event-driven cleanup path and leaves cleanup to the periodic reaper.
+	ZeroSessionCleanupDelay time.Duration
+
 	// IsolatedIdleTimeout is the shorter idle timeout applied by the reaper
 	// to owners whose post-init classification was isolated. Isolated owners
 	// cannot be reattached by future Spawn calls (their server_id is either
@@ -383,6 +396,10 @@ func New(cfg Config) (*Daemon, error) {
 	if idleTimeout == 0 {
 		idleTimeout = 5 * time.Minute
 	}
+	zeroSessionCleanupDelay := cfg.ZeroSessionCleanupDelay
+	if zeroSessionCleanupDelay == 0 {
+		zeroSessionCleanupDelay = defaultZeroSessionCleanupDelay
+	}
 	// Isolated owners default to a 60s idle window. Callers who explicitly
 	// want to disable the early-reap optimization pass a pointer to zero
 	// (cfg.IsolatedIdleTimeout = new(time.Duration)), in which case isolated
@@ -416,27 +433,28 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, err
 	}
 	d := &Daemon{
-		owners:                 make(map[string]*OwnerEntry),
-		logger:                 logger,
-		done:                   make(chan struct{}),
-		ownerIdleTimeout:       ownerIdleTimeout,
-		isolatedIdleTimeout:    isolatedIdleTimeout,
-		admissionBufferTimeout: admissionBufferTimeout,
-		idleTimeout:            idleTimeout,
-		templateCache:          make(map[string]mcpsnapshot.OwnerSnapshot),
-		crashTracker:           make(map[string][]time.Time),
-		supervisorCtx:          supCtx,
-		supervisorCancel:       supCancel,
-		handlerFunc:            cfg.HandlerFunc,
-		sessionHandler:         cfg.SessionHandler,
-		daemonFlag:             daemonFlag,
-		name:                   name,
-		namespace:              namespace,
-		persistent:             cfg.Persistent,
-		daemonGeneration:       daemonGeneration,
-		authorizeSession:       cfg.AuthorizeSession,
-		onFrameReceived:        cfg.OnFrameReceived,
-		ownerRemoval:           newOwnerRemovalStats(),
+		owners:                  make(map[string]*OwnerEntry),
+		logger:                  logger,
+		done:                    make(chan struct{}),
+		ownerIdleTimeout:        ownerIdleTimeout,
+		zeroSessionCleanupDelay: zeroSessionCleanupDelay,
+		isolatedIdleTimeout:     isolatedIdleTimeout,
+		admissionBufferTimeout:  admissionBufferTimeout,
+		idleTimeout:             idleTimeout,
+		templateCache:           make(map[string]mcpsnapshot.OwnerSnapshot),
+		crashTracker:            make(map[string][]time.Time),
+		supervisorCtx:           supCtx,
+		supervisorCancel:        supCancel,
+		handlerFunc:             cfg.HandlerFunc,
+		sessionHandler:          cfg.SessionHandler,
+		daemonFlag:              daemonFlag,
+		name:                    name,
+		namespace:               namespace,
+		persistent:              cfg.Persistent,
+		daemonGeneration:        daemonGeneration,
+		authorizeSession:        cfg.AuthorizeSession,
+		onFrameReceived:         cfg.OnFrameReceived,
+		ownerRemoval:            newOwnerRemovalStats(),
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -2651,17 +2669,57 @@ func (d *Daemon) Entry(serverID string) *OwnerEntry {
 
 // onZeroSessions is called by an owner when its last session disconnects.
 func (d *Daemon) onZeroSessions(serverID string) {
+	var (
+		entry  *OwnerEntry
+		zeroAt time.Time
+		delay  time.Duration
+	)
 	d.mu.Lock()
 	entry, ok := d.owners[serverID]
 	if ok {
-		entry.LastSession = time.Now()
+		zeroAt = time.Now()
+		entry.LastSession = zeroAt
+		delay = d.zeroSessionCleanupDelay
+		if entry.Owner != nil {
+			if override := entry.Owner.IdleTimeout(); override > 0 {
+				delay = override
+			}
+		}
 	}
 	d.mu.Unlock()
 
 	if ok {
-		d.logger.Printf("owner %s: zero sessions (grace period starts)", serverID[:8])
+		d.logger.Printf("owner %s: zero sessions (cleanup delay %s)", serverID[:8], delay)
+		d.scheduleZeroSessionCleanup(serverID, entry, zeroAt, delay)
 	}
-	// Reaper will handle cleanup after grace period
+}
+
+func (d *Daemon) scheduleZeroSessionCleanup(serverID string, entry *OwnerEntry, zeroAt time.Time, delay time.Duration) {
+	if delay < 0 {
+		return
+	}
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-d.done:
+			return
+		}
+
+		result, removed, err := d.removeOwnerIfCurrentAndZeroIdle(serverID, entry, zeroAt, delay)
+		if err != nil {
+			if result.Removed {
+				d.logger.Printf("owner %s: zero-session cleanup warning: %v", shortServerID(serverID), err)
+			} else {
+				d.logger.Printf("owner %s: zero-session cleanup failed: %v", shortServerID(serverID), err)
+			}
+			return
+		}
+		if removed {
+			d.logger.Printf("owner %s: zero-session cleanup removed owner", shortServerID(serverID))
+		}
+	}()
 }
 
 // onUpstreamExit is called by an owner when its upstream process exits.

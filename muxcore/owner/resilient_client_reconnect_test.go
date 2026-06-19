@@ -541,7 +541,7 @@ func TestReconnect_RefreshNilFallsBackImmediately(t *testing.T) {
 	}
 }
 
-func TestReconnect_NoGoroutineLeakOnRefreshTimeout(t *testing.T) {
+func TestReconnect_NoGoroutineLeakOnDegradedRefreshAttempt(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 
 	var logs bytes.Buffer
@@ -549,6 +549,10 @@ func TestReconnect_NoGoroutineLeakOnRefreshTimeout(t *testing.T) {
 	rc := newReconnectClient(t, io.Discard, logger)
 	rc.cfg.ReconnectTimeout = 100 * time.Millisecond
 	rc.cfg.MaxRefreshAttempts = 1
+
+	spawnPath := tempReconnectSocketPath(t, "baddad123456")
+	srv, _ := startEchoIPCServer(t, spawnPath)
+	defer srv.closeAll()
 
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -558,20 +562,53 @@ func TestReconnect_NoGoroutineLeakOnRefreshTimeout(t *testing.T) {
 		return "", "", errors.New("unknown token")
 	}
 	rc.cfg.Reconnect = func() (string, string, error) {
-		return "", "", errors.New("spawn should not be called after timeout")
+		return spawnPath, "spawn-token", nil
 	}
 
 	stdinDone := make(chan error)
-	_, err := rc.reconnect(&sync.Mutex{}, stdinDone)
-	if err == nil || !strings.Contains(err.Error(), "reconnect timeout") {
-		t.Fatalf("reconnect() error = %v, want timeout", err)
-	}
+	connCh := make(chan interface {
+		io.Reader
+		io.Writer
+		io.Closer
+	}, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := rc.reconnect(&sync.Mutex{}, stdinDone)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		connCh <- conn
+	}()
 	select {
 	case <-started:
 	case <-time.After(time.Second):
 		t.Fatal("refresh callback never started")
 	}
+
+	time.Sleep(rc.cfg.ReconnectTimeout + 100*time.Millisecond)
+	select {
+	case err := <-errCh:
+		t.Fatalf("reconnect returned after degraded grace: %v", err)
+	case conn := <-connCh:
+		closeReconnectConn(t, conn)
+		t.Fatal("reconnect succeeded before blocked refresh was released")
+	default:
+		// Good: degraded grace does not abandon the in-flight refresh goroutine.
+	}
+
 	close(release)
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("reconnect() error = %v, want fallback success", err)
+	case conn := <-connCh:
+		closeReconnectConn(t, conn)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("reconnect did not fall back after refresh release; logs=%q", logs.String())
+	}
+
+	srv.closeAll()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thejerf/suture/v4"
 )
 
 type ownerRemovalReason string
@@ -32,6 +35,12 @@ type ownerRemovalStats struct {
 	ByReason             map[ownerRemovalReason]uint64
 	PendingTokensRemoved uint64
 	BoundHistoryRemoved  uint64
+}
+
+type preparedOwnerRemoval struct {
+	result   ownerRemovalResult
+	token    suture.ServiceToken
+	ownerRef *owner.Owner
 }
 
 func newOwnerRemovalStats() ownerRemovalStats {
@@ -73,43 +82,100 @@ func (d *Daemon) removeOwnerIfCurrent(serverID string, expected *OwnerEntry, rea
 		return result, fmt.Errorf("server %s is still being created", serverID)
 	}
 
+	prepared := d.prepareOwnerRemovalLocked(serverID, entry, reason, soft)
+	d.mu.Unlock()
+
+	return prepared.result, d.finishOwnerRemoval(prepared)
+}
+
+func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *OwnerEntry, zeroAt time.Time, idleTimeout time.Duration) (ownerRemovalResult, bool, error) {
+	result := ownerRemovalResult{ServerID: serverID, Reason: ownerRemovalReasonIdle, Soft: true}
+
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if !ok || (expected != nil && entry != expected) || entry.Owner == nil {
+		d.mu.Unlock()
+		return result, false, nil
+	}
+	if !entry.LastSession.Equal(zeroAt) {
+		d.mu.Unlock()
+		return result, false, nil
+	}
+
+	sample := evictionSample{
+		Sessions:             entry.Owner.SessionCount(),
+		Persistent:           entry.Persistent,
+		PendingRequests:      entry.Owner.PendingRequests(),
+		ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),
+		HasBusyWork:          entry.Owner.HasActiveBusyWork(),
+		UpstreamDead:         entry.Owner.UpstreamDead(),
+		IdleTimeout:          idleTimeout,
+		OwnerIdleOverride:    entry.Owner.IdleTimeout(),
+		LastSession:          entry.LastSession,
+		LastActivity:         entry.Owner.LastActivity(),
+		IsolatedClassified:   entry.Owner.IsClassifiedIsolated(),
+	}
+	decision := shouldEvict(sample, time.Now(), idleTimeout, 0)
+	if !decision.evict {
+		d.mu.Unlock()
+		return result, false, nil
+	}
+
+	reason := ownerRemovalReasonIdle
+	soft := true
+	if decision.reason == "zombie" {
+		reason = ownerRemovalReasonZombie
+		soft = false
+	}
+	prepared := d.prepareOwnerRemovalLocked(serverID, entry, reason, soft)
+	d.mu.Unlock()
+
+	return prepared.result, true, d.finishOwnerRemoval(prepared)
+}
+
+func (d *Daemon) prepareOwnerRemovalLocked(serverID string, entry *OwnerEntry, reason ownerRemovalReason, soft bool) preparedOwnerRemoval {
+	result := ownerRemovalResult{ServerID: serverID, Reason: reason, Soft: soft}
 	entry.terminationHint = terminationHintForRemoval(reason)
 	result.PendingTokensRemoved = entry.Owner.SessionMgr().RemovePendingForOwner(serverID)
 	result.BoundHistoryRemoved = entry.Owner.SessionMgr().RemoveBoundForOwner(serverID)
 	d.recordOwnerRemovalLocked(result)
 	d.deleteOwnerEntryLocked(serverID)
 	result.Removed = true
-	token := entry.serviceToken
-	ownerRef := entry.Owner
-	d.mu.Unlock()
+	return preparedOwnerRemoval{
+		result:   result,
+		token:    entry.serviceToken,
+		ownerRef: entry.Owner,
+	}
+}
 
+func (d *Daemon) finishOwnerRemoval(prepared preparedOwnerRemoval) error {
 	var supErr error
 	if d.supervisor != nil {
-		if err := d.supervisor.RemoveAndWait(token, 2*time.Second); err != nil {
+		if err := d.supervisor.RemoveAndWait(prepared.token, 2*time.Second); err != nil {
 			action := "remove"
-			if soft {
+			if prepared.result.Soft {
 				action = "soft-remove"
 			}
-			supErr = fmt.Errorf("%s owner %s from supervisor: %w", action, shortServerID(serverID), err)
+			supErr = fmt.Errorf("%s owner %s from supervisor: %w", action, shortServerID(prepared.result.ServerID), err)
 			d.logger.Printf("warning: %v", supErr)
 		}
 	}
 
-	if soft {
-		exitCode, err := ownerRef.SoftShutdown(30 * time.Second)
+	if prepared.result.Soft {
+		exitCode, err := prepared.ownerRef.SoftShutdown(30 * time.Second)
 		if err != nil {
-			d.logger.Printf("soft-removed owner %s: forced kill (exit=%d err=%v)", shortServerID(serverID), exitCode, err)
+			d.logger.Printf("soft-removed owner %s: forced kill (exit=%d err=%v)", shortServerID(prepared.result.ServerID), exitCode, err)
 		} else if exitCode == 0 {
-			d.logger.Printf("soft-removed owner %s: upstream exited cleanly (code 0)", shortServerID(serverID))
+			d.logger.Printf("soft-removed owner %s: upstream exited cleanly (code 0)", shortServerID(prepared.result.ServerID))
 		} else {
-			d.logger.Printf("soft-removed owner %s: upstream exited with code %d", shortServerID(serverID), exitCode)
+			d.logger.Printf("soft-removed owner %s: upstream exited with code %d", shortServerID(prepared.result.ServerID), exitCode)
 		}
 	} else {
-		ownerRef.Shutdown()
-		d.logger.Printf("removed owner %s", shortServerID(serverID))
+		prepared.ownerRef.Shutdown()
+		d.logger.Printf("removed owner %s", shortServerID(prepared.result.ServerID))
 	}
 
-	return result, supErr
+	return supErr
 }
 
 func (d *Daemon) forgetOwnerIfCurrent(serverID string, expected *OwnerEntry, reason ownerRemovalReason) ownerRemovalResult {

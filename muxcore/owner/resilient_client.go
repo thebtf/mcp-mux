@@ -20,6 +20,7 @@ import (
 const (
 	defaultReconnectTimeout   = 30 * time.Second
 	reconnectPollInterval     = 500 * time.Millisecond
+	degradedDrainInterval     = 100 * time.Millisecond
 	msgFromCCBufferSize       = 1000
 	msgFromIPCBufferSize      = 1000
 	defaultMaxRefreshAttempts = 3
@@ -104,10 +105,10 @@ type resilientClient struct {
 	log        *log.Logger
 }
 
-// ErrReconnectExit is returned by reconnect when the shim should exit
-// so CC restarts it with a fresh MCP handshake.
-// ErrReconnectExit is returned when the shim should exit after successful reconnect
-// so CC restarts it with a fresh MCP handshake.
+// ErrReconnectExit is returned when the shim should exit after successful
+// reconnect so the MCP host restarts it with a fresh handshake. It is retained
+// for API compatibility; the default resilient path keeps stdio alive and does
+// not use this sentinel.
 var (
 	ErrInjectFull    = errors.New("muxcore: inject buffer full")
 	ErrInjectClosed  = errors.New("muxcore: inject channel closed")
@@ -120,9 +121,12 @@ var (
 //
 //	CONNECTED     — normal proxy: stdin→IPC, IPC→stdout
 //	RECONNECTING  — IPC broken; buffer stdin, tombstone inflight, poll Reconnect()
-//	EXIT          — reconnect timed out; return error
+//	DEGRADED      — reconnect exceeded grace; keep retrying and error new requests
+//	EXIT          — MCP host stdin/stdout is gone
 //
-// Returns only on: CC stdin EOF (io.EOF), or reconnect timeout (error).
+// Returns only on MCP host disconnect (stdin EOF/stdout broken). Reconnect
+// failures keep the shim process alive so the parent stdio transport survives
+// daemon/owner restarts and temporary backend outages.
 func RunResilientClient(cfg ResilientClientConfig) error {
 	if cfg.ReconnectTimeout == 0 {
 		cfg.ReconnectTimeout = defaultReconnectTimeout
@@ -352,7 +356,10 @@ func (rc *resilientClient) runProxy(conn interface {
 
 			newConn, err := rc.reconnect(stdoutMu, stdinDone)
 			if err != nil {
-				return err // timeout or stdin EOF during reconnect
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
 			}
 			conn = newConn
 			rc.log.Printf("resilient: reconnected, resuming proxy")
@@ -435,15 +442,17 @@ type reconnectResult struct {
 
 // reconnect enters the RECONNECTING state: immediately tombstones every
 // in-flight request with an RPC error response (so CC does not hang), polls
-// cfg.Reconnect every 500ms asynchronously, and buffers new CC stdin traffic
-// via msgFromCC.
+// cfg.Reconnect asynchronously, and buffers new CC stdin traffic via msgFromCC.
 //
 // On success: dials new IPC, replays cached initialize, and returns the new
 // connection. Buffered CC messages remain in msgFromCC; the CONNECTED state's
 // normal IPC writer drains them after the IPC reader is running, which avoids
 // half-duplex deadlocks on Windows named pipes.
 //
-// Returns error on: reconnect timeout, or CC stdin EOF during reconnect.
+// If reconnect is still unavailable after ReconnectTimeout, the shim enters a
+// degraded retry state: it keeps retrying forever, but responds to new client
+// requests with JSON-RPC errors instead of letting the MCP host mark the stdio
+// transport dead while requests hang. Returns only when the MCP host disconnects.
 //
 // Why no keepalive: a previous revision emitted a synthetic
 // notifications/progress with progressToken="mux-reconnect" every 5s as a
@@ -468,11 +477,16 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	// succeeded in under a second.
 	rc.drainOrphanedInflight(stdoutMu)
 
-	deadline := time.Now().Add(rc.cfg.ReconnectTimeout)
+	if rc.cfg.RefreshToken == nil && rc.cfg.Reconnect == nil {
+		return nil, fmt.Errorf("resilient: reconnect function not configured")
+	}
+
+	graceDeadline := time.Now().Add(rc.cfg.ReconnectTimeout)
+	degraded := false
 	if rc.cfg.RefreshToken != nil {
 		fallbackReason := ""
 		for attempt := 0; attempt < rc.cfg.MaxRefreshAttempts; attempt++ {
-			res, err := rc.awaitReconnectAttempt(deadline, stdinDone, rc.cfg.RefreshToken)
+			res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.RefreshToken)
 			if err != nil {
 				if err == io.EOF {
 					return nil, io.EOF
@@ -487,6 +501,9 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 					break
 				}
 				rc.log.Printf("shim.reconnect.refresh_fail reason=%s", refreshFailureReason(err))
+				if waitErr := rc.waitBeforeReconnectRetry(stdinDone, stdoutMu, degraded); waitErr != nil {
+					return nil, waitErr
+				}
 				continue
 			}
 
@@ -496,6 +513,9 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 				if reason == "owner_gone" {
 					fallbackReason = "owner_gone"
 					break
+				}
+				if waitErr := rc.waitBeforeReconnectRetry(stdinDone, stdoutMu, degraded); waitErr != nil {
+					return nil, waitErr
 				}
 				continue
 			}
@@ -510,20 +530,30 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	}
 
 	for {
-		res, err := rc.awaitReconnectAttempt(deadline, stdinDone, rc.cfg.Reconnect)
+		res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.Reconnect)
 		if err != nil {
-			return nil, err
+			if err == io.EOF {
+				return nil, io.EOF
+			}
+			rc.log.Printf("shim.reconnect.fallback_spawn_fail reason=%s err=%v", refreshFailureReason(err), err)
+			if waitErr := rc.waitBeforeReconnectRetry(stdinDone, stdoutMu, degraded); waitErr != nil {
+				return nil, waitErr
+			}
+			continue
 		}
 		conn, _, err := rc.finishReconnect(res.path, res.token, stdoutMu)
 		if err != nil {
 			rc.log.Printf("resilient: reconnect handshake failed: %v (retrying)", err)
+			if waitErr := rc.waitBeforeReconnectRetry(stdinDone, stdoutMu, degraded); waitErr != nil {
+				return nil, waitErr
+			}
 			continue
 		}
 		return conn, nil
 	}
 }
 
-func (rc *resilientClient) awaitReconnectAttempt(deadline time.Time, stdinDone <-chan error, fn ReconnectFunc) (reconnectResult, error) {
+func (rc *resilientClient) awaitReconnectAttempt(graceDeadline *time.Time, stdinDone <-chan error, stdoutMu *sync.Mutex, degraded *bool, fn ReconnectFunc) (reconnectResult, error) {
 	if fn == nil {
 		return reconnectResult{}, fmt.Errorf("resilient: reconnect function not configured")
 	}
@@ -534,14 +564,22 @@ func (rc *resilientClient) awaitReconnectAttempt(deadline time.Time, stdinDone <
 		resultCh <- reconnectResult{path: newPath, token: newToken, err: err}
 	}()
 
-	pollTicker := time.NewTicker(reconnectPollInterval)
-	defer pollTicker.Stop()
+	drainTicker := time.NewTicker(degradedDrainInterval)
+	defer drainTicker.Stop()
+
+	var graceTimer *time.Timer
+	var graceC <-chan time.Time
+	if graceDeadline != nil && !*degraded {
+		until := time.Until(*graceDeadline)
+		if until < 0 {
+			until = 0
+		}
+		graceTimer = time.NewTimer(until)
+		graceC = graceTimer.C
+		defer graceTimer.Stop()
+	}
 
 	for {
-		if time.Now().After(deadline) {
-			return reconnectResult{}, fmt.Errorf("resilient: reconnect timeout after %s", rc.cfg.ReconnectTimeout)
-		}
-
 		select {
 		case err := <-stdinDone:
 			if err == io.EOF {
@@ -550,7 +588,40 @@ func (rc *resilientClient) awaitReconnectAttempt(deadline time.Time, stdinDone <
 			return reconnectResult{}, fmt.Errorf("resilient: stdin during reconnect: %w", err)
 		case res := <-resultCh:
 			return res, res.err
-		case <-pollTicker.C:
+		case <-graceC:
+			*degraded = true
+			graceC = nil
+			rc.log.Printf("shim.reconnect.degraded after=%s action=keep_retrying", rc.cfg.ReconnectTimeout)
+			rc.failBufferedRequestsDuringReconnect(stdoutMu)
+		case <-drainTicker.C:
+			if *degraded {
+				rc.failBufferedRequestsDuringReconnect(stdoutMu)
+			}
+		}
+	}
+}
+
+func (rc *resilientClient) waitBeforeReconnectRetry(stdinDone <-chan error, stdoutMu *sync.Mutex, degraded bool) error {
+	timer := time.NewTimer(reconnectPollInterval)
+	defer timer.Stop()
+	drainTicker := time.NewTicker(degradedDrainInterval)
+	defer drainTicker.Stop()
+	for {
+		select {
+		case err := <-stdinDone:
+			if err == io.EOF {
+				return io.EOF
+			}
+			return fmt.Errorf("resilient: stdin during reconnect retry: %w", err)
+		case <-timer.C:
+			if degraded {
+				rc.failBufferedRequestsDuringReconnect(stdoutMu)
+			}
+			return nil
+		case <-drainTicker.C:
+			if degraded {
+				rc.failBufferedRequestsDuringReconnect(stdoutMu)
+			}
 		}
 	}
 }
@@ -728,6 +799,53 @@ func (rc *resilientClient) sendListChangedNotifications(mu *sync.Mutex) {
 	}
 	mu.Unlock()
 	rc.log.Printf("resilient: sent list_changed notifications to CC")
+}
+
+// failBufferedRequestsDuringReconnect drains client messages that arrived
+// after the reconnect grace window expired. Requests receive an immediate
+// JSON-RPC error by original id; notifications/responses are dropped because
+// there is no live upstream generation to consume them. This keeps the parent
+// MCP host's stdio transport alive while still making individual tool calls
+// fail fast and retryable during a backend outage.
+func (rc *resilientClient) failBufferedRequestsDuringReconnect(stdoutMu *sync.Mutex) {
+	failedRequests := 0
+	droppedMessages := 0
+	stdoutBroken := false
+	for {
+		select {
+		case data := <-rc.msgFromCC:
+			id := extractRequestID(data)
+			if id == "" {
+				droppedMessages++
+				continue
+			}
+			rc.inflight.Delete(id)
+			failedRequests++
+			if stdoutBroken {
+				continue
+			}
+			errResp := fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"mux backend reconnecting; request was not sent upstream; retry shortly"}}`,
+				id,
+			)
+			stdoutMu.Lock()
+			_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", errResp)
+			stdoutMu.Unlock()
+			if err != nil {
+				stdoutBroken = true
+				rc.log.Printf("resilient: stdout broken while failing reconnect-buffered request: %v", err)
+				rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
+			}
+		default:
+			if failedRequests > 0 || droppedMessages > 0 {
+				rc.log.Printf(
+					"shim.reconnect.degraded_drain failed_requests=%d dropped_messages=%d",
+					failedRequests, droppedMessages,
+				)
+			}
+			return
+		}
+	}
 }
 
 // flushBuffer drains any messages buffered in msgFromCC and writes them to
