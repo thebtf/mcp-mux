@@ -149,8 +149,8 @@ func (s *Server) handleInitialize(id json.RawMessage) {
 	result := map[string]any{
 		"protocolVersion": "2025-11-25",
 		"capabilities": map[string]any{
-			"tools":   map[string]any{},
-			"prompts": map[string]any{},
+			"tools":   map[string]any{"listChanged": true},
+			"prompts": map[string]any{"listChanged": true},
 		},
 		"serverInfo": map[string]any{
 			"name":    "mcp-mux",

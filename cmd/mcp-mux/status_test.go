@@ -170,3 +170,53 @@ func TestRunStatusRetriesDaemonStatusPipeBusyBeforeFallback(t *testing.T) {
 		t.Fatalf("stdout missing daemon status after retry:\n%s", out)
 	}
 }
+
+func TestRunStatusRetriesDaemonStatusAccessDeniedBeforeFallback(t *testing.T) {
+	tempDir := shortTempDir(t, "status-access-denied")
+	t.Setenv("TEMP", tempDir)
+	t.Setenv("TMP", tempDir)
+
+	oldSend := statusControlSendWithTimeout
+	oldWindow := statusDaemonRetryWindow
+	oldDelay := statusDaemonRetryDelay
+	oldSleep := statusSleep
+	t.Cleanup(func() {
+		statusControlSendWithTimeout = oldSend
+		statusDaemonRetryWindow = oldWindow
+		statusDaemonRetryDelay = oldDelay
+		statusSleep = oldSleep
+	})
+
+	statusDaemonRetryWindow = time.Second
+	statusDaemonRetryDelay = time.Millisecond
+	statusSleep = func(time.Duration) {}
+
+	called := 0
+	statusControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		called++
+		if called < 3 {
+			return nil, errors.New(`control: dial pipe: open \\.\pipe\mcp-mux-test: Access is denied.`)
+		}
+		data, err := json.Marshal(map[string]any{
+			"daemon":      true,
+			"owner_count": 11,
+		})
+		if err != nil {
+			t.Fatalf("marshal status: %v", err)
+		}
+		return &control.Response{OK: true, Data: data}, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	runStatusWithWriters(&stdout, &stderr)
+	if called != 3 {
+		t.Fatalf("status sender called %d times, want retries until daemon status succeeds", called)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, `"daemon": true`) || !strings.Contains(out, `"owner_count": 11`) {
+		t.Fatalf("stdout missing daemon status after access-denied retry:\n%s", out)
+	}
+}

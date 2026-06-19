@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -136,6 +137,85 @@ func TestLauncherSupervisorRetriesInitializeWithoutClosingTransport(t *testing.T
 	}
 }
 
+func TestLauncherSupervisorRestartsChildWhenActiveEnginePointerChanges(t *testing.T) {
+	dir := t.TempDir()
+	generationFile := filepath.Join(dir, "generation.txt")
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	enginePath1 := filepath.Join(dir, "engine-v1", engineFileName())
+	enginePath2 := filepath.Join(dir, "engine-v2", engineFileName())
+
+	var mu sync.Mutex
+	activeEnginePath := enginePath1
+	resolveActive := func(string) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		return activeEnginePath, true
+	}
+	setActive := func(path string) {
+		mu.Lock()
+		activeEnginePath = path
+		mu.Unlock()
+	}
+
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	stderr := &strings.Builder{}
+	lines := make(chan string, 16)
+	go scanTestLines(stdoutR, lines)
+
+	codeCh := make(chan int, 1)
+	go func() {
+		codeCh <- runLauncherStdioSupervisor(launcherSupervisorConfig{
+			LauncherPath:        launcherPath,
+			InitialEnginePath:   enginePath1,
+			Args:                []string{"serve"},
+			Stdin:               stdinR,
+			Stdout:              stdoutW,
+			Stderr:              stderr,
+			ResolveActiveEngine: resolveActive,
+			StartChild: func(_, _ string, _ []string, stderr io.Writer) (*supervisedEngineChild, error) {
+				cmd := exec.Command(os.Args[0], "-test.run=TestLauncherSupervisorChildHelper", "--")
+				cmd.Env = append(os.Environ(),
+					"MCP_MUX_TEST_SUPERVISOR_CHILD=1",
+					"MCP_MUX_TEST_SUPERVISOR_GEN_FILE="+generationFile,
+				)
+				cmd.Stderr = stderr
+				return startSupervisedChildCommand(cmd)
+			},
+			RespawnDelay:       10 * time.Millisecond,
+			ReplayTimeout:      2 * time.Second,
+			EnginePollInterval: 10 * time.Millisecond,
+		})
+	}()
+
+	writeTestLine(t, stdinW, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	if line := readTestLine(t, lines); !strings.Contains(line, `"version":"generation-1"`) {
+		t.Fatalf("initialize response = %s, want generation-1", line)
+	}
+	writeTestLine(t, stdinW, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+
+	setActive(enginePath2)
+	readTestLineContaining(t, lines, "notifications/tools/list_changed")
+	readTestLineContaining(t, lines, "notifications/prompts/list_changed")
+
+	writeTestLine(t, stdinW, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"after-pointer-change"}}`)
+	if line := readTestLineContaining(t, lines, `"id":2`); !strings.Contains(line, "generation-2") {
+		t.Fatalf("post-pointer-change response = %s, want generation-2", line)
+	}
+
+	if err := stdinW.Close(); err != nil {
+		t.Fatalf("close stdin: %v", err)
+	}
+	select {
+	case code := <-codeCh:
+		if code != 0 {
+			t.Fatalf("supervisor exit code = %d, stderr:\n%s", code, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("supervisor did not exit after stdin close; stderr:\n%s", stderr.String())
+	}
+}
+
 func TestLauncherSupervisorChildHelper(t *testing.T) {
 	if os.Getenv("MCP_MUX_TEST_SUPERVISOR_CHILD") != "1" {
 		return
@@ -210,4 +290,23 @@ func readTestLine(t *testing.T, lines <-chan string) string {
 		t.Fatal("timeout waiting for stdout line")
 	}
 	return ""
+}
+
+func readTestLineContaining(t *testing.T, lines <-chan string, want string) string {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("stdout closed before line containing %q", want)
+			}
+			if strings.Contains(line, want) {
+				return line
+			}
+		case <-timer.C:
+			t.Fatalf("timeout waiting for stdout line containing %q", want)
+		}
+	}
 }

@@ -24,6 +24,7 @@ type launcherSupervisorConfig struct {
 	StartChild          func(launcherPath, enginePath string, args []string, stderr io.Writer) (*supervisedEngineChild, error)
 	RespawnDelay        time.Duration
 	ReplayTimeout       time.Duration
+	EnginePollInterval  time.Duration
 }
 
 type supervisedEngineChild struct {
@@ -89,10 +90,20 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 	if cfg.ReplayTimeout == 0 {
 		cfg.ReplayTimeout = 5 * time.Second
 	}
+	if cfg.EnginePollInterval == 0 {
+		cfg.EnginePollInterval = 5 * time.Second
+	}
 
-	child, childOut, err := startLauncherSupervisorChild(cfg, nil, nil, false, nil)
+	child, childOut, childEnginePath, err := startLauncherSupervisorChild(cfg, nil, nil, false, nil)
 	if err != nil {
 		return err
+	}
+	var enginePoll <-chan time.Time
+	var engineTicker *time.Ticker
+	if cfg.EnginePollInterval > 0 {
+		engineTicker = time.NewTicker(cfg.EnginePollInterval)
+		defer engineTicker.Stop()
+		enginePoll = engineTicker.C
 	}
 
 	stdinCh := make(chan launcherStdinEvent, 16)
@@ -128,7 +139,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 				preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
 				launcherDrainInflight(cfg.Stdout, inflight, "initialize")
 				child.kill()
-				child, childOut, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
+				child, childOut, childEnginePath, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
 				if err != nil {
 					return err
 				}
@@ -139,7 +150,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 				preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
 				launcherDrainInflight(cfg.Stdout, inflight, "initialize")
 				child.kill()
-				child, childOut, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
+				child, childOut, childEnginePath, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
 				if err != nil {
 					return err
 				}
@@ -154,6 +165,20 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 				child.kill()
 				return nil
 			}
+		case <-enginePoll:
+			activeEnginePath, ok := cfg.ResolveActiveEngine(cfg.LauncherPath)
+			if !ok || activeEnginePath == "" || samePath(activeEnginePath, childEnginePath) {
+				continue
+			}
+			preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
+			launcherDrainInflight(cfg.Stdout, inflight, "initialize")
+			child.kill()
+			child.waitOrKill(2 * time.Second)
+			child, childOut, childEnginePath, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
+			if err != nil {
+				return err
+			}
+			launcherNotifyListChangedAfterEngineReplacement(cfg.Stdout, cfg.Stderr, cfg.Args)
 		}
 	}
 }
@@ -209,7 +234,7 @@ func startSupervisedChildCommand(cmd *exec.Cmd) (*supervisedEngineChild, error) 
 	}, nil
 }
 
-func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeRequest, initializedNotification []byte, forwardInitializeResponse bool, inflight map[string]string) (*supervisedEngineChild, <-chan launcherChildOutput, error) {
+func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeRequest, initializedNotification []byte, forwardInitializeResponse bool, inflight map[string]string) (*supervisedEngineChild, <-chan launcherChildOutput, string, error) {
 	enginePath := cfg.InitialEnginePath
 	if active, ok := cfg.ResolveActiveEngine(cfg.LauncherPath); ok && active != "" {
 		enginePath = active
@@ -217,7 +242,7 @@ func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeReques
 
 	child, err := cfg.StartChild(cfg.LauncherPath, enginePath, cfg.Args, cfg.Stderr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("start engine child: %w", err)
+		return nil, nil, "", fmt.Errorf("start engine child: %w", err)
 	}
 
 	if len(initializeRequest) > 0 {
@@ -225,13 +250,13 @@ func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeReques
 		if err != nil {
 			child.kill()
 			child.waitOrKill(2 * time.Second)
-			return nil, nil, fmt.Errorf("replay initialize into replacement engine: %w", err)
+			return nil, nil, "", fmt.Errorf("replay initialize into replacement engine: %w", err)
 		}
 		if forwardInitializeResponse {
 			if _, err := cfg.Stdout.Write(response); err != nil {
 				child.kill()
 				child.waitOrKill(2 * time.Second)
-				return nil, nil, fmt.Errorf("forward replayed initialize response: %w", err)
+				return nil, nil, "", fmt.Errorf("forward replayed initialize response: %w", err)
 			}
 			if msg, parseErr := jsonrpc.Parse(bytes.TrimRight(response, "\r\n")); parseErr == nil && msg.IsResponse() && inflight != nil {
 				delete(inflight, string(msg.ID))
@@ -241,18 +266,33 @@ func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeReques
 
 	out := make(chan launcherChildOutput, 16)
 	go pumpLauncherSupervisorStdout(child.stdout, out)
-	return child, out, nil
+	return child, out, enginePath, nil
 }
 
-func restartLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeRequest, initializedNotification []byte, forwardInitializeResponse bool, inflight map[string]string) (*supervisedEngineChild, <-chan launcherChildOutput, error) {
+func restartLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeRequest, initializedNotification []byte, forwardInitializeResponse bool, inflight map[string]string) (*supervisedEngineChild, <-chan launcherChildOutput, string, error) {
 	for {
 		time.Sleep(cfg.RespawnDelay)
-		child, childOut, err := startLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, forwardInitializeResponse, inflight)
+		child, childOut, enginePath, err := startLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, forwardInitializeResponse, inflight)
 		if err == nil {
 			fmt.Fprintln(cfg.Stderr, "mcp-mux launcher: replacement engine attached; stdio transport preserved")
-			return child, childOut, nil
+			return child, childOut, enginePath, nil
 		}
 		fmt.Fprintf(cfg.Stderr, "mcp-mux launcher: replacement engine start failed: %v; retrying\n", err)
+	}
+}
+
+func launcherNotifyListChangedAfterEngineReplacement(stdout, stderr io.Writer, args []string) {
+	if len(args) == 0 || args[0] != "serve" {
+		return
+	}
+	for _, method := range []string{
+		"notifications/tools/list_changed",
+		"notifications/prompts/list_changed",
+	} {
+		if _, err := fmt.Fprintf(stdout, `{"jsonrpc":"2.0","method":%q}`+"\n", method); err != nil {
+			fmt.Fprintf(stderr, "mcp-mux launcher: failed to send %s after engine replacement: %v\n", method, err)
+			return
+		}
 	}
 }
 

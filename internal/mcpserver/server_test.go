@@ -173,9 +173,13 @@ func TestInitialize(t *testing.T) {
 	}
 	if result.Capabilities.Tools == nil {
 		t.Error("capabilities.tools is nil")
+	} else if result.Capabilities.Tools["listChanged"] != true {
+		t.Errorf("capabilities.tools.listChanged = %v, want true", result.Capabilities.Tools["listChanged"])
 	}
 	if result.Capabilities.Prompts == nil {
 		t.Error("capabilities.prompts is nil")
+	} else if result.Capabilities.Prompts["listChanged"] != true {
+		t.Errorf("capabilities.prompts.listChanged = %v, want true", result.Capabilities.Prompts["listChanged"])
 	}
 	if result.ServerInfo.Name != "mcp-mux" {
 		t.Errorf("serverInfo.name = %q, want %q", result.ServerInfo.Name, "mcp-mux")

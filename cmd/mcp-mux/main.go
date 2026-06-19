@@ -780,7 +780,7 @@ func sleepWithin(deadline time.Time, requested time.Duration) bool {
 
 var statusControlSendWithTimeout = control.SendWithTimeout
 var statusDaemonControlTimeout = 15 * time.Second
-var statusDaemonRetryWindow = 750 * time.Millisecond
+var statusDaemonRetryWindow = 5 * time.Second
 var statusDaemonRetryDelay = 25 * time.Millisecond
 var statusSleep = time.Sleep
 var statusPipeHints = discoverStatusPipeHints
@@ -931,7 +931,8 @@ func isRetryableDaemonStatusError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "all pipe instances are busy") ||
 		strings.Contains(msg, "error_pipe_busy") ||
-		strings.Contains(msg, "pipe busy")
+		strings.Contains(msg, "pipe busy") ||
+		strings.Contains(msg, "access is denied")
 }
 
 func shouldReportStatusUnknown(resp *control.Response, err error) bool {
