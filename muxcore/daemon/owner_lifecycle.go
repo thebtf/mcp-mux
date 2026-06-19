@@ -24,6 +24,7 @@ type ownerRemovalResult struct {
 	PendingTokensRemoved int
 	BoundHistoryRemoved  int
 	Soft                 bool
+	Removed              bool
 }
 
 type ownerRemovalStats struct {
@@ -77,6 +78,7 @@ func (d *Daemon) removeOwnerIfCurrent(serverID string, expected *OwnerEntry, rea
 	result.BoundHistoryRemoved = entry.Owner.SessionMgr().RemoveBoundForOwner(serverID)
 	d.recordOwnerRemovalLocked(result)
 	d.deleteOwnerEntryLocked(serverID)
+	result.Removed = true
 	token := entry.serviceToken
 	ownerRef := entry.Owner
 	d.mu.Unlock()

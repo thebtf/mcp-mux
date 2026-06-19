@@ -1372,6 +1372,37 @@ func (d *Daemon) HandleRemove(serverID string) error {
 	return d.Remove(serverID)
 }
 
+// HandleStopOwner implements the optional control.OwnerStopHandler extension.
+func (d *Daemon) HandleStopOwner(req control.Request) (string, error) {
+	serverID := req.ServerID
+	if serverID == "" {
+		serverID = req.Command
+	}
+	if serverID == "" {
+		return "", fmt.Errorf("server_id is required")
+	}
+
+	if req.DrainTimeoutMs <= 0 {
+		result, err := d.removeOwner(serverID, ownerRemovalReasonOperatorHard, false)
+		msg := "force shutdown initiated"
+		return stopOwnerResultMessage(msg, result, err)
+	}
+
+	result, err := d.removeOwner(serverID, ownerRemovalReasonOperatorSoft, true)
+	msg := fmt.Sprintf("stopped via daemon (drain timeout %dms)", req.DrainTimeoutMs)
+	return stopOwnerResultMessage(msg, result, err)
+}
+
+func stopOwnerResultMessage(msg string, result ownerRemovalResult, err error) (string, error) {
+	if err != nil {
+		if result.Removed {
+			return fmt.Sprintf("%s (warning: %v)", msg, err), nil
+		}
+		return "", err
+	}
+	return msg, nil
+}
+
 // HandleShutdown implements control.CommandHandler.
 func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
 	d.shuttingDown.Store(true)

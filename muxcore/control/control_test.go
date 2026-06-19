@@ -213,14 +213,17 @@ type mockDaemonHandler struct {
 	mockHandler
 	spawnCalled   bool
 	removeCalled  bool
+	stopCalled    bool
 	refreshCalled bool
 	giveUpCalled  bool
 	spawnErr      error
 	removeErr     error
+	stopErr       error
 	refreshErr    error
 	spawnIPCPath  string
 	spawnSrvID    string
 	removeArg     string
+	stopReq       Request
 	refreshArg    string
 	giveUpArg     string
 }
@@ -245,6 +248,15 @@ func (m *mockDaemonHandler) HandleRemove(serverID string) error {
 	m.removeCalled = true
 	m.removeArg = serverID
 	return m.removeErr
+}
+
+func (m *mockDaemonHandler) HandleStopOwner(req Request) (string, error) {
+	m.stopCalled = true
+	m.stopReq = req
+	if m.stopErr != nil {
+		return "", m.stopErr
+	}
+	return "stopped through daemon", nil
 }
 
 func (m *mockDaemonHandler) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
@@ -573,6 +585,57 @@ func TestRemoveWithDaemonHandler(t *testing.T) {
 	}
 	if handler.removeArg != "srv-xyz" {
 		t.Errorf("removeArg = %q, want %q", handler.removeArg, "srv-xyz")
+	}
+}
+
+func TestStopOwnerWithOptionalDaemonHandler(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "stop_owner", ServerID: "srv-xyz", DrainTimeoutMs: 30000})
+	if err != nil {
+		t.Fatalf("Send stop_owner: %v", err)
+	}
+	if !resp.OK {
+		t.Errorf("stop_owner not OK: %s", resp.Message)
+	}
+	if resp.Message != "stopped through daemon" {
+		t.Errorf("stop_owner message = %q, want %q", resp.Message, "stopped through daemon")
+	}
+	if !handler.stopCalled {
+		t.Error("HandleStopOwner was not called")
+	}
+	if handler.stopReq.ServerID != "srv-xyz" {
+		t.Errorf("stopReq.ServerID = %q, want %q", handler.stopReq.ServerID, "srv-xyz")
+	}
+	if handler.stopReq.DrainTimeoutMs != 30000 {
+		t.Errorf("stopReq.DrainTimeoutMs = %d, want 30000", handler.stopReq.DrainTimeoutMs)
+	}
+}
+
+func TestStopOwnerWithoutOptionalHandler(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "stop_owner", ServerID: "srv-xyz"})
+	if err != nil {
+		t.Fatalf("Send stop_owner: %v", err)
+	}
+	if resp.OK {
+		t.Error("expected not OK when stop_owner is not supported")
+	}
+	if resp.Message != "stop_owner not supported (not a daemon)" {
+		t.Errorf("unexpected message: %s", resp.Message)
 	}
 }
 

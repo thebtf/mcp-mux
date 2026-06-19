@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -120,6 +121,21 @@ func TestOwnerLifecycleRemovalCleansFinalRetryCounter(t *testing.T) {
 	}
 	if _, ok := d.forcedIsolatedRetryCounters.Load(base); ok {
 		t.Fatalf("retry counter for %q survived final retry owner removal", base)
+	}
+}
+
+func TestStopOwnerResultMessageTreatsPostRemovalErrorAsWarning(t *testing.T) {
+	msg, err := stopOwnerResultMessage("stopped", ownerRemovalResult{Removed: true}, errors.New("supervisor wait timed out"))
+	if err != nil {
+		t.Fatalf("stopOwnerResultMessage() error = %v, want nil warning", err)
+	}
+	if !strings.Contains(msg, "stopped") || !strings.Contains(msg, "warning: supervisor wait timed out") {
+		t.Fatalf("message = %q, want success with warning", msg)
+	}
+
+	_, err = stopOwnerResultMessage("stopped", ownerRemovalResult{Removed: false}, errors.New("server not found"))
+	if err == nil {
+		t.Fatal("expected pre-removal error to remain an error")
 	}
 }
 

@@ -13,6 +13,7 @@ import "encoding/json"
 type Request struct {
 	Cmd            string `json:"cmd"`
 	DrainTimeoutMs int    `json:"drain_timeout_ms,omitempty"`
+	ServerID       string `json:"server_id,omitempty"`
 	// SuccessorExe optionally tells a graceful-restart capable daemon which
 	// executable should be launched as the successor. When empty, the daemon
 	// falls back to its environment-driven successor resolution.
@@ -86,6 +87,12 @@ type DaemonHandler interface {
 	HandleRefreshSessionToken(prevToken string) (newToken string, err error)
 	HandleReconnectGiveUp(reason string) error
 	HandleListOwners(req Request) (ListOwnersResponse, error)
+}
+
+// OwnerStopHandler is an optional daemon-side extension for stopping a specific
+// owner through the daemon registry instead of the owner's own control socket.
+type OwnerStopHandler interface {
+	HandleStopOwner(req Request) (message string, err error)
 }
 
 // GracefulRestartOptions carries additive graceful-restart parameters. Daemon

@@ -174,6 +174,17 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		}
 		return Response{OK: true, Message: "removed"}, nil
 
+	case "stop_owner":
+		oh, ok := s.handler.(OwnerStopHandler)
+		if !ok {
+			return Response{OK: false, Message: "stop_owner not supported (not a daemon)"}, nil
+		}
+		msg, err := oh.HandleStopOwner(req)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("stop_owner: %v", err)}, nil
+		}
+		return Response{OK: true, Message: msg}, nil
+
 	case "graceful-restart":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {

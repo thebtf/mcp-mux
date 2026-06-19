@@ -872,6 +872,11 @@ type fakeDaemonHandler struct {
 
 	removeErr error
 
+	stopOwnerCalled bool
+	stopOwnerReq    control.Request
+	stopOwnerMsg    string
+	stopOwnerErr    error
+
 	restartMsg   string
 	restartAfter func()
 	restartErr   error
@@ -887,6 +892,20 @@ func (h *fakeDaemonHandler) HandleSpawn(_ control.Request) (string, string, stri
 }
 func (h *fakeDaemonHandler) HandleRemove(_ string) error {
 	return h.removeErr
+}
+func (h *fakeDaemonHandler) HandleStopOwner(req control.Request) (string, error) {
+	h.stopOwnerCalled = true
+	h.stopOwnerReq = req
+	if h.stopOwnerErr != nil {
+		return "", h.stopOwnerErr
+	}
+	if h.stopOwnerMsg != "" {
+		return h.stopOwnerMsg, nil
+	}
+	if req.DrainTimeoutMs <= 0 {
+		return "force shutdown initiated", nil
+	}
+	return fmt.Sprintf("stopped via daemon (drain timeout %dms)", req.DrainTimeoutMs), nil
 }
 func (h *fakeDaemonHandler) HandleGracefulRestart(_ int) (string, func(), error) {
 	return h.restartMsg, h.restartAfter, h.restartErr
@@ -1687,6 +1706,67 @@ func TestMuxStopWithFakeServer(t *testing.T) {
 	}
 	if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "draining") {
 		t.Errorf("expected draining message, got: %v", result.Content)
+	}
+}
+
+func TestMuxStopIdleOwnerUsesDaemonWhenOwnerControlMissing(t *testing.T) {
+	sid := "ddff112233445566"
+	baseDir := shortBaseDir(t, "mcpmux-stop-daemon-")
+	daemonCtlPath := filepath.Join(baseDir, "test-stop-daemon-muxd.ctl.sock")
+	t.Cleanup(func() { _ = os.Remove(daemonCtlPath) })
+
+	handler := &fakeDaemonHandler{
+		fakeHandler: fakeHandler{status: map[string]any{}, shutdownMsg: "ok"},
+		listOwnersResp: control.ListOwnersResponse{
+			Owners: []control.OwnerInfo{
+				{
+					ServerID: sid,
+					Command:  "uvx",
+					Args:     []string{"idle-stop-test"},
+					Sessions: 0,
+					Pending:  0,
+				},
+			},
+		},
+		stopOwnerMsg: "stopped through daemon",
+	}
+	srv, err := control.NewServer(daemonCtlPath, handler, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("control.NewServer: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
+	defer clientW.Close()
+
+	sendLine(t, clientW, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"mux_stop","arguments":{"server_id":"%s"}}}`, sid))
+	line := readLine(t, clientR)
+	resp := parseResponse(t, line)
+	assertID(t, resp, 44)
+	assertNoError(t, resp)
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if result.IsError {
+		t.Fatalf("mux_stop should succeed through daemon stop_owner, got error: %v", result.Content)
+	}
+	if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "stopped through daemon") {
+		t.Errorf("expected daemon stop message, got: %v", result.Content)
+	}
+	if !handler.stopOwnerCalled {
+		t.Fatal("daemon HandleStopOwner was not called")
+	}
+	if handler.stopOwnerReq.ServerID != sid {
+		t.Fatalf("stop owner server_id = %q, want %q", handler.stopOwnerReq.ServerID, sid)
+	}
+	if handler.stopOwnerReq.DrainTimeoutMs != 30000 {
+		t.Fatalf("stop owner drain timeout = %d, want 30000", handler.stopOwnerReq.DrainTimeoutMs)
 	}
 }
 

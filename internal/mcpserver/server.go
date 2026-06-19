@@ -937,8 +937,6 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
-
 	drainMs := 30000
 	timeout := 35 * time.Second
 	if params.Force {
@@ -946,16 +944,46 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		timeout = 5 * time.Second
 	}
 
-	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:            "shutdown",
-		DrainTimeoutMs: drainMs,
-	}, timeout)
+	resp, err := s.stopOwner(owner, drainMs, timeout, params.Force || (owner.Sessions == 0 && owner.Pending == 0))
 	if err != nil {
 		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
 		return
 	}
 
 	s.sendToolResult(id, resp.Message)
+}
+
+func (s *Server) stopOwner(owner control.OwnerInfo, drainMs int, timeout time.Duration, preferDaemon bool) (*control.Response, error) {
+	if preferDaemon {
+		resp, err := control.SendWithTimeout(s.daemonCtlPath(), control.Request{
+			Cmd:            "stop_owner",
+			ServerID:       owner.ServerID,
+			Command:        owner.ServerID,
+			DrainTimeoutMs: drainMs,
+		}, timeout)
+		if err == nil && resp.OK {
+			return resp, nil
+		}
+		if err == nil && !stopOwnerUnsupported(resp.Message) {
+			return resp, fmt.Errorf("%s", resp.Message)
+		}
+	}
+
+	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+		Cmd:            "shutdown",
+		DrainTimeoutMs: drainMs,
+	}, timeout)
+	if err != nil {
+		return resp, err
+	}
+	return resp, nil
+}
+
+func stopOwnerUnsupported(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "unknown command: stop_owner") ||
+		strings.Contains(lower, "stop_owner not supported")
 }
 
 // toolMuxRestart stops a server and spawns a new daemon owner.
@@ -987,8 +1015,6 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
-
 	// Stop the server
 	drainMs := 30000
 	timeout := 35 * time.Second
@@ -997,10 +1023,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		timeout = 5 * time.Second
 	}
 
-	stopResp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:            "shutdown",
-		DrainTimeoutMs: drainMs,
-	}, timeout)
+	stopResp, err := s.stopOwner(owner, drainMs, timeout, params.Force || (owner.Sessions == 0 && owner.Pending == 0))
 	if err != nil {
 		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
 		return
