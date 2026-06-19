@@ -29,8 +29,8 @@ func TestRunStatusQueriesDaemonStatusDirectly(t *testing.T) {
 		if req.Cmd != "status" {
 			t.Fatalf("request cmd = %q, want status", req.Cmd)
 		}
-		if timeout != 5*time.Second {
-			t.Fatalf("timeout = %s, want 5s", timeout)
+		if timeout != statusDaemonControlTimeout {
+			t.Fatalf("timeout = %s, want %s", timeout, statusDaemonControlTimeout)
 		}
 		data, err := json.Marshal(map[string]any{
 			"daemon":      true,
@@ -76,6 +76,48 @@ func TestRunStatusFallsBackWhenDaemonStatusUnavailable(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "No active mcp-mux instances found.") {
 		t.Fatalf("stdout = %q, want fallback empty message", stdout.String())
+	}
+}
+
+func TestRunStatusReportsUnknownForAmbiguousDaemonFailureWithPipeHints(t *testing.T) {
+	tempDir := shortTempDir(t, "status-unknown")
+	t.Setenv("TEMP", tempDir)
+	t.Setenv("TMP", tempDir)
+
+	oldSend := statusControlSendWithTimeout
+	oldPipeHints := statusPipeHints
+	t.Cleanup(func() {
+		statusControlSendWithTimeout = oldSend
+		statusPipeHints = oldPipeHints
+	})
+
+	statusControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return nil, errors.New("control: read response: i/o timeout")
+	}
+	statusPipeHints = func() ([]string, error) {
+		return []string{
+			"mcp-mux-11111111111111111111111111111111",
+			"mcp-mux-22222222222222222222222222222222",
+		}, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	runStatusWithWriters(&stdout, &stderr)
+	out := stdout.String()
+	if strings.Contains(out, "No active mcp-mux instances found.") {
+		t.Fatalf("stdout reported empty active set for ambiguous daemon failure:\n%s", out)
+	}
+	for _, want := range []string{
+		"mcp-mux status unavailable",
+		"Active state is unknown",
+		"Found 2 mcp-mux named-pipe endpoint(s)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, out)
+		}
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
 

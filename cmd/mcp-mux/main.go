@@ -28,6 +28,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -777,9 +779,11 @@ func sleepWithin(deadline time.Time, requested time.Duration) bool {
 }
 
 var statusControlSendWithTimeout = control.SendWithTimeout
+var statusDaemonControlTimeout = 15 * time.Second
 var statusDaemonRetryWindow = 750 * time.Millisecond
 var statusDaemonRetryDelay = 25 * time.Millisecond
 var statusSleep = time.Sleep
+var statusPipeHints = discoverStatusPipeHints
 
 func runStatus() {
 	runStatusWithWriters(os.Stdout, os.Stderr)
@@ -789,6 +793,7 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 	// Try daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
 	resp, err := queryDaemonStatusForCLI(ctlPath)
+	daemonResp, daemonErr := resp, err
 	if err == nil && resp.OK && resp.Data != nil {
 		var pretty json.RawMessage
 		if json.Valid(resp.Data) {
@@ -884,6 +889,10 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 	}
 
 	if len(results) == 0 {
+		if shouldReportStatusUnknown(daemonResp, daemonErr) {
+			printStatusUnknown(stdout, daemonResp, daemonErr)
+			return
+		}
 		fmt.Fprintln(stdout, "No active mcp-mux instances found.")
 		return
 	}
@@ -897,7 +906,7 @@ func queryDaemonStatusForCLI(ctlPath string) (*control.Response, error) {
 	var resp *control.Response
 	var err error
 	for {
-		resp, err = statusControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, 5*time.Second)
+		resp, err = statusControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, statusDaemonControlTimeout)
 		if err == nil || !isRetryableDaemonStatusError(err) || time.Now().After(deadline) {
 			return resp, err
 		}
@@ -923,4 +932,75 @@ func isRetryableDaemonStatusError(err error) bool {
 	return strings.Contains(msg, "all pipe instances are busy") ||
 		strings.Contains(msg, "error_pipe_busy") ||
 		strings.Contains(msg, "pipe busy")
+}
+
+func shouldReportStatusUnknown(resp *control.Response, err error) bool {
+	if err != nil {
+		return isAmbiguousDaemonStatusError(err)
+	}
+	return resp != nil && !resp.OK
+}
+
+func isAmbiguousDaemonStatusError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ipc.IsEndpointOccupiedError(err) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "read response") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline") ||
+		strings.Contains(msg, "closed") ||
+		strings.Contains(msg, "pipe busy") ||
+		strings.Contains(msg, "access is denied")
+}
+
+func printStatusUnknown(stdout io.Writer, resp *control.Response, err error) {
+	if err != nil {
+		fmt.Fprintf(stdout, "mcp-mux status unavailable: daemon control query failed: %v\n", err)
+	} else {
+		fmt.Fprintf(stdout, "mcp-mux status unavailable: daemon control query returned OK=false: %s\n", resp.Message)
+	}
+	fmt.Fprintln(stdout, "Active state is unknown; not reporting an empty instance set.")
+
+	hints, hintErr := statusPipeHints()
+	if hintErr != nil {
+		fmt.Fprintf(stdout, "Named-pipe hint scan failed: %v\n", hintErr)
+		return
+	}
+	if len(hints) == 0 {
+		return
+	}
+	fmt.Fprintf(stdout, "Found %d mcp-mux named-pipe endpoint(s), which indicates live or recently-live transports.\n", len(hints))
+	limit := len(hints)
+	if limit > 10 {
+		limit = 10
+	}
+	for _, hint := range hints[:limit] {
+		fmt.Fprintf(stdout, "  %s\n", hint)
+	}
+	if len(hints) > limit {
+		fmt.Fprintf(stdout, "  ... %d more\n", len(hints)-limit)
+	}
+}
+
+func discoverStatusPipeHints() ([]string, error) {
+	if runtime.GOOS != "windows" {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(`\\.\pipe\`)
+	if err != nil {
+		return nil, err
+	}
+	var hints []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "mcp-mux-") {
+			hints = append(hints, name)
+		}
+	}
+	sort.Strings(hints)
+	return hints, nil
 }
