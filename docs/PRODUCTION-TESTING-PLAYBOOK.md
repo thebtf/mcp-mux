@@ -441,6 +441,82 @@ Broken signals:
 - A session sees the OTHER session's token in upstream behavior (e.g.
   authenticated as the wrong user).
 
+## Scenario 8: Lifecycle Convergence and Tree Authority (v0.27.0)
+
+Run this scenario for v0.27.0 and later releases that touch shim suspension,
+launcher dormancy, process containment, snapshot fallback, or live handoff.
+
+Objective: prove disposable processes disappear without losing the host stdio
+transport, request delivery stays exactly-once across wake/reconnect, and a
+planned restart never leaves process-tree authority split between generations.
+
+Focused automated proof:
+
+```powershell
+go test ./cmd/mcp-mux -run 'TestLauncherSupervisorDormant|TestLauncherSupervisorQuiescing|TestReplayLauncherSupervisorHandshake' -count=1
+Push-Location muxcore
+go test ./owner -run 'TestResilientClient_(Idle|Activity|WriterOwned|DemandBefore|ReplayInit|InitializeHints|ZeroIdle)' -count=1
+go test ./daemon -run 'Test(PerformHandoff|HandoffReceipt|ProtocolVersion)' -count=1
+go test ./procgroup -run 'Test(GracefulKill_KillsTree|Kill_AfterLeaderExitTerminatesDescendant)' -count=1
+go test ./upstream -run 'TestClose_LeaderExitsOnEOFKillsRemainingDescendant' -count=1
+Pop-Location
+```
+
+Run the tree tests on both Windows and Unix. A PASS on one platform does not
+prove the other platform's Job Object/process-group path.
+
+Runtime idle/dormant proof:
+
+1. Build and run an isolated candidate through its stable launcher with a real
+   non-persistent MCP upstream. Set short valid test values before starting the
+   host so the proof does not wait for production defaults:
+
+   ```powershell
+   $env:MCPMUX_SHIM_IDLE_TIMEOUT = '5s'
+   $env:MCPMUX_SHIM_DORMANT_GRACE = '3s'
+   ```
+
+2. Complete `initialize`, then leave the session with no requests, queued
+   frames, progress tokens, or busy declarations. Verify the daemon IPC session
+   closes after about five seconds and the supervised engine exits dormant
+   after the additional three-second grace without closing host stdio.
+3. Send one new tool request through the same host session. Verify the stable
+   launcher starts the current active engine, the cached initialize handshake
+   completes, and the triggering request reaches the upstream exactly once.
+4. Repeat with a persistent fixture (`Persistent: true` or
+   `x-mux.persistent: true`). It must remain connected and must not become
+   dormant. Repeat with zero or a negative value to prove the selected stage is
+   disabled. Remove both environment overrides after the run.
+
+Planned-restart proof:
+
+- v1-to-v2: start a pre-v0.27 candidate, stage v0.27.0, and request the normal
+  safe restart with zero live sessions. Evidence must show protocol mismatch
+  before owner detach, one bounded `snapshot_fallback` respawn, and a usable
+  successor. In-flight work may receive explicit JSON-RPC errors by original
+  id; it must not be replayed.
+- v2-to-v2: restart between two v2 candidates with a subprocess tree. Evidence
+  must show `snapshot_handoff`, a changed daemon generation, the same upstream
+  PID/process tree, a complete accepted/aborted final partition, and no
+  orphan descendant after final cleanup.
+
+Serena note: its web dashboard is configured separately from mux lifecycle. If
+the runtime proof uses Serena and the dashboard must not run, add
+`--enable-web-dashboard false` to `start-mcp-server`; do not treat a separately
+configured dashboard as evidence that muxcore leaked an upstream descendant.
+
+Broken signals:
+
+- Dormant engine respawns before demand, the host stdio closes, or the wake
+  request reaches the upstream more than once.
+- An already-sent in-flight request is replayed after reconnect instead of
+  receiving one explicit error with its original id.
+- A persistent owner suspends or reaps.
+- A v1 peer detaches before version rejection, or fallback loops through more
+  than one cold respawn.
+- A v2 predecessor releases tree authority before final adoption, both daemon
+  generations retain authority, or any descendant survives final tree cleanup.
+
 ## Verdict Template
 
 Create a run report under `.agent/reports/emulation-playbook-run-YYYYMMDD-HHMM.md`
@@ -456,6 +532,7 @@ with this table:
 | 5b | Native Muxcore Consumer Hot Update | Consumer-owned update path preserves MCP session and reports new version |  | PASS/FAIL/SKIPPED |
 | 6 | Isolated Short Idle Cleanup (v0.25.0) | Target isolated owner reaped within ~70s of zero sessions (60s idle + 10s sweep) |  | PASS/FAIL |
 | 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
+| 8 | Lifecycle Convergence and Tree Authority (v0.27.0) | Dormant wake is exact-once; v1 fallback is bounded; same-v2 handoff retains one full-tree authority |  | PASS/FAIL |
 
 Overall verdict:
 

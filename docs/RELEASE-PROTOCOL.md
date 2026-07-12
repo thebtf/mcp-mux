@@ -41,6 +41,18 @@ Before tagging or publishing:
    Scenario 5b when the release changes `muxcore` library contracts, daemon
    lifecycle, snapshot/cache behavior, reconnect, process management, update
    helpers, registry behavior, namespaces, or consumer-facing docs.
+   For v0.27.0 lifecycle convergence, Scenario 8 is mandatory in addition to
+   the repository critical suite:
+
+   ```powershell
+   .\tests\critical\run-all.ps1 -TimeoutSeconds 120
+   ```
+
+   The existing critical suite is necessary but not sufficient for v0.27.0:
+   release evidence must also cover idle-to-dormant wake, full-tree cleanup on
+   Windows and Unix, one v1-to-v2 bounded snapshot respawn, and one same-v2
+   handoff that retains tree authority. Record each command, exit code, and
+   evidence artifact; do not infer cross-platform containment from one OS.
 6. Create annotated tags for both surfaces when both are released:
    `vX.Y.Z` and `muxcore/vX.Y.Z`.
 7. Verify remote tag parity with `git ls-remote --tags origin`.
@@ -144,6 +156,7 @@ Record this checklist in the release report:
 - [ ] `PROJECT_RELEASE_PROTOCOL_PASS` or explicit blocker.
 - [ ] Root tests passed.
 - [ ] muxcore tests passed when muxcore changed.
+- [ ] Repository critical suite passed.
 - [ ] Runtime/customer playbook scenarios passed or were explicitly scoped out.
 - [ ] Remote tags exist and point at the release commit.
 - [ ] muxcore module resolution points at `muxcore/vX.Y.Z` when muxcore was released.
