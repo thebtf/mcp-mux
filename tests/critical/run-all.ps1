@@ -16,6 +16,7 @@ $ReportsDir = Join-Path $RepoRoot ".agent\reports"
 $Binary = Join-Path $RunDir "mcp-mux.exe"
 $SmokeEvidence = Join-Path $ReportsDir "critical-smoke-time-upstream-$Stamp.json"
 $NativeUpdateEvidence = Join-Path $ReportsDir "critical-native-sessionhandler-update-$Stamp.json"
+$LifecycleEvidence = Join-Path $ReportsDir "critical-process-lifecycle-$Stamp.json"
 $JsonReport = Join-Path $ReportsDir "critical-suite-$Stamp.json"
 $MdReport = Join-Path $ReportsDir "critical-suite-$Stamp.md"
 
@@ -56,6 +57,17 @@ Push-Location $RepoRoot
 try {
     Invoke-CriticalStep "build isolated mcp-mux binary" {
         go build -trimpath -o $Binary .\cmd\mcp-mux
+    }
+
+    Invoke-CriticalStep "process lifecycle convergence smoke" {
+        & .\scripts\smoke-process-lifecycle.ps1 `
+            -CandidateBinary $Binary `
+            -RunDir (Join-Path $RunDir "process-lifecycle") `
+            -EvidencePath $LifecycleEvidence `
+            -TimeoutSeconds $TimeoutSeconds
+        if ($LASTEXITCODE -ne 0) {
+            throw "smoke-process-lifecycle exited with code $LASTEXITCODE"
+        }
     }
 
     Invoke-CriticalStep "real time upstream reconnect smoke" {
@@ -116,6 +128,7 @@ $report = [pscustomobject]@{
     binary = $Binary
     smoke_evidence = $SmokeEvidence
     native_update_evidence = $NativeUpdateEvidence
+    lifecycle_evidence = $LifecycleEvidence
     results = $results
 }
 
@@ -129,6 +142,7 @@ $md = @(
     "**Binary:** $Binary",
     "**Smoke evidence:** $SmokeEvidence",
     "**Native update evidence:** $NativeUpdateEvidence",
+    "**Process lifecycle evidence:** $LifecycleEvidence",
     "",
     "| Step | Verdict | Duration ms | Error |",
     "| --- | --- | ---: | --- |"
