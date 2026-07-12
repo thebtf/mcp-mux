@@ -96,8 +96,18 @@ func TestPersistentIdleParityEvictsOnlyDisposableIdleOwners(t *testing.T) {
 
 	_, idleSID, _ := spawnLifecycleOwner(t, d, "idle-disposable")
 	waitPastLifecycleIdle(t)
+	if affected := r.sweep(); affected != 0 {
+		t.Fatalf("pending reservation sweep affected %d owners, want 0", affected)
+	}
+	idleEntry := d.Entry(idleSID)
+	if idleEntry == nil {
+		t.Fatal("pending reservation did not protect idle owner")
+	}
+	if removed := idleEntry.Owner.SessionMgr().RemovePendingForOwner(idleSID); removed != 1 {
+		t.Fatalf("RemovePendingForOwner() = %d, want 1", removed)
+	}
 	if affected := r.sweep(); affected != 1 {
-		t.Fatalf("idle disposable sweep affected %d owners, want 1", affected)
+		t.Fatalf("idle disposable sweep after reservation removal affected %d owners, want 1", affected)
 	}
 	if entry := d.Entry(idleSID); entry != nil {
 		t.Fatalf("idle disposable owner still present after sweep: %#v", entry)
@@ -143,8 +153,8 @@ func TestPersistentIdleParityEvictsOnlyDisposableIdleOwners(t *testing.T) {
 	}
 }
 
-func TestPersistentIdleParityRemovesStaleTicketsForReapedOwner(t *testing.T) {
-	d, r := testLifecycleDaemon(t, false)
+func TestOwnerRemovalRemovesStaleTickets(t *testing.T) {
+	d, _ := testLifecycleDaemon(t, false)
 
 	_, sid, spawnToken := spawnLifecycleOwner(t, d, "stale-ticket-reap")
 	entry := d.Entry(sid)
@@ -156,15 +166,14 @@ func TestPersistentIdleParityRemovesStaleTicketsForReapedOwner(t *testing.T) {
 	o.SessionMgr().PreRegister("pending-legacy", "/legacy", nil)
 	seedReconnectHistoryForOwner(t, o, "bound-reaped", sid)
 
-	waitPastLifecycleIdle(t)
-	if affected := r.sweep(); affected != 1 {
-		t.Fatalf("stale-ticket sweep affected %d owners, want 1", affected)
+	if _, err := d.removeOwner(sid, ownerRemovalReasonOperatorHard, false); err != nil {
+		t.Fatalf("removeOwner() error: %v", err)
 	}
 	if o.SessionMgr().IsPreRegistered("pending-reaped") {
-		t.Fatal("owned pending token survived reaper removal")
+		t.Fatal("owned pending token survived owner removal")
 	}
 	if o.SessionMgr().IsPreRegistered(spawnToken) {
-		t.Fatal("spawn pending token survived reaper removal")
+		t.Fatal("spawn pending token survived owner removal")
 	}
 	if !o.SessionMgr().IsPreRegistered("pending-legacy") {
 		t.Fatal("owner-keyless legacy pending token must remain TTL-only")
@@ -177,7 +186,7 @@ func TestPersistentIdleParityRemovesStaleTicketsForReapedOwner(t *testing.T) {
 	}
 
 	status := d.HandleStatus()
-	assertOwnerRemovalStatus(t, status, 1, "idle", 1)
+	assertOwnerRemovalStatus(t, status, 1, "operator_hard", 1)
 	ownerRemoval := status["owner_removal"].(map[string]any)
 	if got := uint64Status(t, ownerRemoval, "pending_tokens_removed"); got != 2 {
 		t.Fatalf("pending_tokens_removed = %d, want 2", got)

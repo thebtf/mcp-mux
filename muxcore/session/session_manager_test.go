@@ -416,10 +416,65 @@ func TestRegisterReconnect_OwnerGone(t *testing.T) {
 	}
 
 	_, err := sm.RegisterReconnect("tok-owner-gone", func(key string) bool {
+		if got := sm.PendingCount(); got != 1 {
+			t.Fatalf("PendingCount() during ownerAlive = %d, want 1 reservation", got)
+		}
 		return false
 	})
 	if !errors.Is(err, ErrOwnerGone) {
 		t.Fatalf("RegisterReconnect() error = %v, want ErrOwnerGone", err)
+	}
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after owner-gone rollback = %d, want 0", got)
+	}
+}
+
+func TestPendingCountExcludesHistoryAndExpiredReservations(t *testing.T) {
+	now := time.Now()
+	sm := NewManager()
+	sm.now = func() time.Time { return now }
+	seedBoundHistory(t, sm, "bound-only", "owner-pending-count")
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() with reconnect history only = %d, want 0", got)
+	}
+
+	sm.PreRegisterForOwner("pending", "owner-pending-count", "/project/pending", nil)
+	if got := sm.PendingCount(); got != 1 {
+		t.Fatalf("PendingCount() = %d, want 1", got)
+	}
+	now = now.Add(pendingTokenTTL + time.Second)
+	if swept := sm.SweepExpiredPending(); swept != 1 {
+		t.Fatalf("SweepExpiredPending() = %d, want 1", swept)
+	}
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after expiry sweep = %d, want 0", got)
+	}
+	if _, _, _, ok := sm.LookupHistory("bound-only"); !ok {
+		t.Fatal("pending sweep removed reconnect history")
+	}
+}
+
+func TestRegisterReconnect_ExpiredReservationReturnsErrorWithoutRetention(t *testing.T) {
+	now := time.Now()
+	sm := NewManager()
+	sm.now = func() time.Time { return now }
+	seedBoundHistory(t, sm, "previous", "owner-expired-reservation")
+
+	_, err := sm.RegisterReconnect("previous", func(string) bool {
+		now = now.Add(pendingTokenTTL + time.Second)
+		if swept := sm.SweepExpiredPending(); swept != 1 {
+			t.Fatalf("SweepExpiredPending() = %d, want 1", swept)
+		}
+		return true
+	})
+	if !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("RegisterReconnect() error = %v, want ErrUnknownToken", err)
+	}
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after expired reservation = %d, want 0", got)
+	}
+	if _, _, _, ok := sm.LookupHistory("previous"); !ok {
+		t.Fatal("expired reconnect reservation removed previous live history")
 	}
 }
 

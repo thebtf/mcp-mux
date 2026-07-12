@@ -238,7 +238,7 @@ func (sm *Manager) PreRegisterForOwner(token, ownerKey, cwd string, env map[stri
 	sm.pending[token] = &pendingSession{
 		OwnerKey:  ownerKey,
 		Cwd:       cwd,
-		Env:       cloneEnv(env),
+		Env:       env,
 		CreatedAt: sm.currentTime(),
 	}
 }
@@ -391,7 +391,9 @@ func (sm *Manager) LookupHistory(prev string) (ownerKey, cwd string, env map[str
 }
 
 // RegisterReconnect mints a fresh pending token for a previously bound owner
-// if that owner is still alive. ownerAlive is invoked without holding sm.mu.
+// if that owner is still alive. The pending reservation is visible before
+// ownerAlive runs so idle cleanup cannot remove the owner after validating it.
+// ownerAlive is invoked without holding sm.mu.
 func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bool) (string, error) {
 	sm.mu.Lock()
 	hist, exists := sm.bound[prev]
@@ -403,37 +405,44 @@ func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bo
 		sm.mu.Unlock()
 		return "", ErrUnknownToken
 	}
+	token, err := generateToken()
+	if err != nil {
+		sm.mu.Unlock()
+		return "", err
+	}
 	ownerKey := hist.OwnerKey
 	cwd := hist.Cwd
 	env := cloneEnv(hist.Env)
-	sm.mu.Unlock()
-
-	if !ownerAlive(ownerKey) {
-		return "", ErrOwnerGone
-	}
-
-	token, err := generateToken()
-	if err != nil {
-		return "", err
-	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	hist, exists = sm.bound[prev]
-	now = sm.currentTime()
-	if !exists || sm.boundExpiredLocked(hist, now) {
-		if exists {
-			delete(sm.bound, prev)
-		}
-		return "", ErrUnknownToken
-	}
-	hist.LastUsed = now
 	sm.pending[token] = &pendingSession{
 		OwnerKey:  ownerKey,
 		Cwd:       cwd,
 		Env:       cloneEnv(env),
 		CreatedAt: now,
 	}
+	sm.mu.Unlock()
+
+	if !ownerAlive(ownerKey) {
+		sm.mu.Lock()
+		delete(sm.pending, token)
+		sm.mu.Unlock()
+		return "", ErrOwnerGone
+	}
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	hist, exists = sm.bound[prev]
+	now = sm.currentTime()
+	if _, reserved := sm.pending[token]; !reserved {
+		return "", ErrUnknownToken
+	}
+	if !exists || sm.boundExpiredLocked(hist, now) {
+		delete(sm.pending, token)
+		if exists {
+			delete(sm.bound, prev)
+		}
+		return "", ErrUnknownToken
+	}
+	hist.LastUsed = now
 	sm.bound[token] = &boundHistory{
 		OwnerKey: ownerKey,
 		Cwd:      cwd,

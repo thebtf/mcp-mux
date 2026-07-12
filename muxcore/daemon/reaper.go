@@ -15,12 +15,13 @@ import (
 // pending_requests (aimux background jobs, long-running inference).
 //
 // An owner is eligible for removal only when ALL of the following hold:
-//   1. sessions == 0
-//   2. not persistent (x-mux.persistent: true pins the owner forever)
-//   3. pending JSON-RPC requests == 0
-//   4. active progress tokens == 0 (no long-running tool/call streaming)
-//   5. no active busy declarations (x-mux busy protocol)
-//   6. lastActivity older than the owner's idleTimeout
+//  1. sessions == 0
+//  2. pending session reservations == 0
+//  3. not persistent (x-mux.persistent: true pins the owner forever)
+//  4. pending JSON-RPC requests == 0
+//  5. active progress tokens == 0 (no long-running tool/call streaming)
+//  6. no active busy declarations (x-mux busy protocol)
+//  7. lastActivity older than the owner's idleTimeout
 //
 // The default idleTimeout is 10 minutes (was 30s grace in v0.10.x).
 // Overridable via MCP_MUX_OWNER_IDLE env or per-owner via x-mux.idleTimeout.
@@ -149,6 +150,7 @@ func (r *Reaper) sweep() int {
 
 		sample := evictionSample{
 			Sessions:             entry.Owner.SessionCount(),
+			PendingSessions:      entry.Owner.SessionMgr().PendingCount(),
 			Persistent:           entry.Persistent,
 			PendingRequests:      entry.Owner.PendingRequests(),
 			ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),
@@ -188,6 +190,7 @@ func (r *Reaper) sweep() int {
 // constructing a real Owner.
 type evictionSample struct {
 	Sessions             int
+	PendingSessions      int
 	Persistent           bool
 	PendingRequests      int64
 	ActiveProgressTokens int
@@ -219,6 +222,7 @@ type evictionDecision struct {
 // shouldEvict applies the activity-aware kill gate:
 //
 //	sessions == 0 AND
+//	pendingSessions == 0 AND
 //	!persistent AND
 //	pendingRequests == 0 AND
 //	activeProgressTokens == 0 AND
@@ -234,7 +238,11 @@ type evictionDecision struct {
 //  3. Sample.IdleTimeout (daemon default copied at spawn)
 //  4. daemonDefault argument (fallback for placeholder entries)
 func shouldEvict(s evictionSample, now time.Time, daemonDefault, isolatedIdleTimeout time.Duration) evictionDecision {
-	// Zombie: upstream dead + zero sessions = evict immediately regardless of other conditions.
+	if s.PendingSessions > 0 {
+		return evictionDecision{}
+	}
+	// Zombie: upstream dead + zero sessions = evict immediately once reconnect
+	// reservations have either rolled back or expired.
 	if s.UpstreamDead && s.Sessions == 0 {
 		return evictionDecision{evict: true, reason: "zombie"}
 	}
