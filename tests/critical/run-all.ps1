@@ -56,7 +56,16 @@ function Invoke-CriticalStep {
 Push-Location $RepoRoot
 try {
     Invoke-CriticalStep "build isolated mcp-mux binary" {
+        if (Test-Path -LiteralPath $Binary) {
+            Remove-Item -LiteralPath $Binary -Force
+        }
         go build -trimpath -o $Binary .\cmd\mcp-mux
+        if ($LASTEXITCODE -ne 0) {
+            throw "go build exited with code $LASTEXITCODE"
+        }
+        if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
+            throw "go build did not produce candidate binary: $Binary"
+        }
     }
 
     Invoke-CriticalStep "process lifecycle convergence smoke" {

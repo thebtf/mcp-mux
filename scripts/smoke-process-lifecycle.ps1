@@ -53,12 +53,19 @@ $evidence = [ordered]@{
     candidate_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash
     engine_v1 = ""
     engine_v2 = ""
+    initial_engine_pids = @()
+    wake_engine_pids = @()
+    post_upgrade_engine_pids = @()
     initial = @()
     wake = @()
     post_upgrade = @()
     daemon_pids = @()
     captured_processes = @()
     stale_descendants = @()
+    captured_survivors_before_cleanup = @()
+    scoped_survivors_before_cleanup = @()
+    captured_survivors_after_cleanup = @()
+    scoped_survivors_after_cleanup = @()
     launcher_only_convergences = 0
     stderr_tail = @()
     error = ""
@@ -199,7 +206,7 @@ function Stop-CapturedIdentity {
     if (-not (Test-IdentityAlive -Identity $Identity)) {
         return
     }
-    Stop-Process -Id $Identity.pid -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $Identity.pid -Force -ErrorAction Stop
 }
 
 function Send-Message {
@@ -244,7 +251,7 @@ function Start-Sessions {
     param([string]$ExpectedEngine)
     for ($i = 0; $i -lt $ParallelSessions; $i++) {
         $process = [System.Diagnostics.Process]::new()
-        $process.StartInfo = New-StartInfo -FileName $Launcher -Arguments @("--isolated", $Fixture, "--session", "$i") -ShimLog (Join-Path $RunDir "shim-$i.log")
+        $process.StartInfo = New-StartInfo -FileName $Launcher -Arguments @("--isolated", $Fixture) -ShimLog (Join-Path $RunDir "shim-$i.log")
         if (-not $process.Start()) {
             throw "failed to start launcher $i"
         }
@@ -359,7 +366,11 @@ function Wait-EngineChildren {
             }
         }
         if ($found.Count -eq $ParallelSessions) {
-            return @($found | ForEach-Object { Get-Identity -ProcessId ([int]$_.ProcessId) -Label "$Phase-engine" -ParentProcessId ([int]$_.ParentProcessId) -ExpectedPath $ExpectedEngine })
+            $identities = @($found | ForEach-Object { Get-Identity -ProcessId ([int]$_.ProcessId) -Label "$Phase-engine" -ParentProcessId ([int]$_.ParentProcessId) -ExpectedPath $ExpectedEngine })
+            if (@($identities.pid | Sort-Object -Unique).Count -ne $ParallelSessions) {
+                throw "$Phase did not create $ParallelSessions distinct isolated engine children"
+            }
+            return $identities
         }
         Start-Sleep -Milliseconds 200
     }
@@ -377,6 +388,31 @@ function Get-ScopedProcesses {
         -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
         [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) -like $prefix
     })
+}
+
+function Get-CapturedSurvivors {
+    return @($captured | Where-Object { Test-IdentityAlive -Identity $_ } | Select-Object label, pid, parent_pid, executable, created_utc)
+}
+
+function Get-ScopedSurvivors {
+    return @(Get-ScopedProcesses | ForEach-Object {
+        [pscustomobject]@{
+            name = $_.Name
+            pid = [int]$_.ProcessId
+            parent_pid = [int]$_.ParentProcessId
+            executable = [System.IO.Path]::GetFullPath([string]$_.ExecutablePath)
+        }
+    })
+}
+
+function Add-CleanupError {
+    param([string]$Message)
+    $evidence.verdict = "FAIL"
+    if ([string]::IsNullOrWhiteSpace($evidence.error)) {
+        $evidence.error = $Message
+    } else {
+        $evidence.error += "; cleanup: $Message"
+    }
 }
 
 function Wait-LauncherOnly {
@@ -441,6 +477,7 @@ try {
     $engineV1 = Install-Engine -Marker "lifecycle-engine-v1"
     $evidence.engine_v1 = $engineV1
     $initialEngines = @(Start-Sessions -ExpectedEngine $engineV1)
+    $evidence.initial_engine_pids = @($initialEngines.pid)
     $initial = Invoke-ParallelProbe -BaseId 100 -Phase "initial"
     $evidence.initial = @($initial | Select-Object session, leader_pid, descendant_pid)
     $initialDaemon = Wait-DaemonIdentity -Label "initial-daemon" -ExpectedEngine $engineV1
@@ -451,6 +488,7 @@ try {
 
     $wake = Invoke-ParallelProbe -BaseId 200 -Phase "wake" -ExpectedEngine $engineV1
     $wakeEngines = @($script:LastProbeEngines)
+    $evidence.wake_engine_pids = @($wakeEngines.pid)
     Assert-UniqueFromPrevious -Current $wake -Previous $initial -Phase "demand wake"
     $wakeDaemon = Wait-DaemonIdentity -Label "wake-daemon" -ExpectedEngine $engineV1
     $evidence.daemon_pids += $wakeDaemon.pid
@@ -461,8 +499,9 @@ try {
     if ($engineV2 -ieq $engineV1) {
         throw "active engine pointer did not change across installed candidates"
     }
-    $upgradeEngines = Wait-EngineChildren -ExpectedEngine $engineV2 -Phase "installed-upgrade"
-    $postUpgrade = Invoke-ParallelProbe -BaseId 300 -Phase "post-upgrade"
+    $postUpgrade = Invoke-ParallelProbe -BaseId 300 -Phase "post-upgrade" -ExpectedEngine $engineV2
+    $upgradeEngines = @($script:LastProbeEngines)
+    $evidence.post_upgrade_engine_pids = @($upgradeEngines.pid)
     $evidence.post_upgrade = @($postUpgrade | Select-Object session, leader_pid, descendant_pid)
 
     $allMustExit = @($wakeEngines) + @($upgradeEngines) + @($wakeDaemon) + @($wake.leader_identity) + @($wake.descendant_identity) + @($postUpgrade.leader_identity) + @($postUpgrade.descendant_identity)
@@ -480,8 +519,8 @@ try {
         throw "run-scoped processes remained after host EOF"
     }
 
-    $stale = @($captured | Where-Object { Test-IdentityAlive -Identity $_ })
-    $evidence.stale_descendants = @($stale | Select-Object label, pid, executable, created_utc)
+    $stale = @(Get-CapturedSurvivors)
+    $evidence.stale_descendants = $stale
     if ($stale.Count -ne 0) {
         throw "captured process identities remained alive after convergence"
     }
@@ -493,14 +532,30 @@ try {
     foreach ($session in $sessions) {
         try { $session.process.StandardInput.Close() } catch {}
     }
-    foreach ($row in @(Get-ScopedProcesses)) {
+    $evidence.captured_survivors_before_cleanup = @(Get-CapturedSurvivors)
+    $evidence.scoped_survivors_before_cleanup = @(Get-ScopedSurvivors)
+    foreach ($row in @($evidence.scoped_survivors_before_cleanup)) {
         try {
-            [void](Get-Identity -ProcessId ([int]$row.ProcessId) -Label "cleanup-scoped" -ExpectedPath ([System.IO.Path]::GetFullPath([string]$row.ExecutablePath)))
+            [void](Get-Identity -ProcessId $row.pid -Label "cleanup-scoped" -ExpectedPath $row.executable)
         } catch {
+            if (@(Get-ScopedSurvivors | Where-Object { $_.pid -eq $row.pid }).Count -ne 0) {
+                Add-CleanupError "failed to capture scoped process $($row.pid): $($_.Exception.Message)"
+            }
         }
     }
     foreach ($identity in @($captured)) {
-        Stop-CapturedIdentity -Identity $identity
+        try {
+            Stop-CapturedIdentity -Identity $identity
+        } catch {
+            Add-CleanupError "failed to stop captured process $($identity.label):$($identity.pid): $($_.Exception.Message)"
+        }
+    }
+    Start-Sleep -Milliseconds 100
+    $evidence.captured_survivors_after_cleanup = @(Get-CapturedSurvivors)
+    $evidence.scoped_survivors_after_cleanup = @(Get-ScopedSurvivors)
+    $evidence.stale_descendants = @($evidence.captured_survivors_after_cleanup)
+    if ($evidence.captured_survivors_after_cleanup.Count -ne 0 -or $evidence.scoped_survivors_after_cleanup.Count -ne 0) {
+        Add-CleanupError "cleanup left captured=$($evidence.captured_survivors_after_cleanup.Count) scoped=$($evidence.scoped_survivors_after_cleanup.Count) run-scoped processes"
     }
     foreach ($session in $sessions) {
         if ($null -ne $session.stderr_task) {
