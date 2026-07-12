@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -415,6 +417,101 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	if strings.Contains(logs, dontWantHandoff) {
 		t.Errorf("did not expect %q (socket was unreachable, handoff must fail).\nLogs:\n%s",
 			dontWantHandoff, logs)
+	}
+}
+
+func TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn(t *testing.T) {
+	if marker := os.Getenv("MCPMUX_TEST_V1_FALLBACK_SPAWN"); marker != "" {
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			t.Fatalf("write spawn marker: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	}
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { os.Remove(SnapshotPath()) })
+
+	const sid = "aabbccdd-version-skew-fallback"
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	spawnMarker := filepath.Join(t.TempDir(), "spawned")
+	t.Setenv("MCPMUX_TEST_V1_FALLBACK_SPAWN", spawnMarker)
+	snapshot := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{{
+			ServerID:       sid,
+			Command:        exe,
+			Args:           []string{"-test.run=^TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn$"},
+			Cwd:            ".",
+			Mode:           "global",
+			Classification: classify.ModeShared,
+			CachedInit:     "e30=",
+			CachedTools:    "e30=",
+		}},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+
+	tokenFile, err := os.CreateTemp("", "mcp-mux-handoff-v1-*.tok")
+	if err != nil {
+		t.Fatalf("CreateTemp token: %v", err)
+	}
+	tokenPath := tokenFile.Name()
+	if err := tokenFile.Close(); err != nil {
+		t.Fatalf("Close token: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(tokenPath) })
+	if err := os.WriteFile(tokenPath, []byte("version-skew-token"), 0o600); err != nil {
+		t.Fatalf("WriteFile token: %v", err)
+	}
+
+	legacy := &scriptedHandoffConn{reads: []scriptedHandoffRead{{
+		msg: ReadyMsg{
+			Type:            MsgReady,
+			ProtocolVersion: HandoffProtocolVersion - 1,
+			Upstreams: []UpstreamRef{{
+				ServerID: sid,
+				Command:  "go",
+				PID:      os.Getpid(),
+			}},
+		},
+	}}}
+	origHook := dialHandoffHook
+	dialHandoffHook = func(string, time.Duration) (fdConn, error) { return legacy, nil }
+	t.Cleanup(func() { dialHandoffHook = origHook })
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenPath)
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "/mock/legacy-v1")
+
+	d, logBuf := testDaemonWithLog(t)
+	if restored := d.loadSnapshot(); restored != 1 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(spawnMarker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot fallback did not spawn a fresh upstream; logs:\n%s", logBuf.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "handoff.receive.fail reason=handoff: protocol version mismatch") {
+		t.Fatalf("missing v1 rejection marker; logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "snapshot: reattached owner "+sid[:8]+" from handoff") {
+		t.Fatalf("legacy v1 peer was reattached without v2 authority; logs:\n%s", logs)
 	}
 }
 
