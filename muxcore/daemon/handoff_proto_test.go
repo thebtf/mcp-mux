@@ -89,7 +89,7 @@ func TestReadyMsgRoundtrip(t *testing.T) {
 // TestFdTransferMsgRoundtrip verifies FdTransferMsg round-trips including
 // both HandleMeta nested structs.
 func TestFdTransferMsgRoundtrip(t *testing.T) {
-	orig := NewFdTransferMsg("ab3c", HandleMeta{Kind: "pipe"}, HandleMeta{Kind: "pipe"})
+	orig := NewFdTransferMsg("ab3c", HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"}, HandleMeta{Kind: "tree_authority"})
 	if orig.Type != MsgFdTransfer {
 		t.Fatalf("NewFdTransferMsg: Type = %q, want %q", orig.Type, MsgFdTransfer)
 	}
@@ -120,6 +120,9 @@ func TestFdTransferMsgRoundtrip(t *testing.T) {
 	}
 	if got.StdoutHandleMeta.Kind != orig.StdoutHandleMeta.Kind {
 		t.Errorf("StdoutHandleMeta.Kind: got %q, want %q", got.StdoutHandleMeta.Kind, orig.StdoutHandleMeta.Kind)
+	}
+	if got.AuthorityHandleMeta == nil || got.AuthorityHandleMeta.Kind != "tree_authority" {
+		t.Errorf("AuthorityHandleMeta: got %+v, want tree_authority", got.AuthorityHandleMeta)
 	}
 }
 
@@ -222,7 +225,7 @@ func TestDoneMsgRoundtrip(t *testing.T) {
 
 // TestHandoffAckMsgRoundtrip verifies HandoffAckMsg round-trips preserving Status.
 func TestHandoffAckMsgRoundtrip(t *testing.T) {
-	orig := NewHandoffAckMsg("accepted")
+	orig := NewHandoffAckResult([]string{"ab3c"}, []string{"7d9e"})
 	if orig.Type != MsgHandoffAck {
 		t.Fatalf("NewHandoffAckMsg: Type = %q, want %q", orig.Type, MsgHandoffAck)
 	}
@@ -248,6 +251,12 @@ func TestHandoffAckMsgRoundtrip(t *testing.T) {
 	if got.Status != orig.Status {
 		t.Errorf("Status: got %q, want %q", got.Status, orig.Status)
 	}
+	if len(got.Accepted) != 1 || got.Accepted[0] != "ab3c" {
+		t.Errorf("Accepted: got %v, want [ab3c]", got.Accepted)
+	}
+	if len(got.Aborted) != 1 || got.Aborted[0] != "7d9e" {
+		t.Errorf("Aborted: got %v, want [7d9e]", got.Aborted)
+	}
 }
 
 // TestProtocolVersionReject verifies that validateProtocolVersion returns
@@ -260,27 +269,27 @@ func TestProtocolVersionReject(t *testing.T) {
 	}{
 		{
 			name: "hello",
-			raw:  `{"type":"hello","protocol_version":2,"token":"abc"}`,
+			raw:  `{"type":"hello","protocol_version":999,"token":"abc"}`,
 		},
 		{
 			name: "ready",
-			raw:  `{"type":"ready","protocol_version":2,"upstreams":[]}`,
+			raw:  `{"type":"ready","protocol_version":999,"upstreams":[]}`,
 		},
 		{
 			name: "fd_transfer",
-			raw:  `{"type":"fd_transfer","protocol_version":2,"server_id":"x","stdin_handle_meta":{"kind":"pipe"},"stdout_handle_meta":{"kind":"pipe"}}`,
+			raw:  `{"type":"fd_transfer","protocol_version":999,"server_id":"x","stdin_handle_meta":{"kind":"pipe"},"stdout_handle_meta":{"kind":"pipe"}}`,
 		},
 		{
 			name: "ack_transfer",
-			raw:  `{"type":"ack_transfer","protocol_version":2,"server_id":"x","ok":true,"reason":null}`,
+			raw:  `{"type":"ack_transfer","protocol_version":999,"server_id":"x","ok":true,"reason":null}`,
 		},
 		{
 			name: "done",
-			raw:  `{"type":"done","protocol_version":2,"transferred":[],"aborted":[]}`,
+			raw:  `{"type":"done","protocol_version":999,"transferred":[],"aborted":[]}`,
 		},
 		{
 			name: "handoff_ack",
-			raw:  `{"type":"handoff_ack","protocol_version":2,"status":"accepted"}`,
+			raw:  `{"type":"handoff_ack","protocol_version":999,"status":"accepted"}`,
 		},
 	}
 
@@ -294,7 +303,7 @@ func TestProtocolVersionReject(t *testing.T) {
 			}
 			err := validateProtocolVersion(base.ProtocolVersion)
 			if err == nil {
-				t.Fatal("expected error for protocol_version 2, got nil")
+				t.Fatal("expected error for unsupported protocol_version, got nil")
 			}
 			if !errors.Is(err, ErrProtocolVersionMismatch) {
 				t.Errorf("expected errors.Is(err, ErrProtocolVersionMismatch), got: %v", err)

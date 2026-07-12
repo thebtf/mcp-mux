@@ -28,6 +28,7 @@ func resilientTestLogger(t *testing.T) *log.Logger {
 type echoServer struct {
 	ln       net.Listener
 	received chan string
+	closed   chan struct{}
 	mu       sync.Mutex
 	conns    []net.Conn
 }
@@ -58,7 +59,7 @@ func startEchoIPCServer(t *testing.T, path string) (srv *echoServer, received ch
 		t.Fatalf("listen %s: %v", path, err)
 	}
 
-	srv = &echoServer{ln: ln, received: received}
+	srv = &echoServer{ln: ln, received: received, closed: make(chan struct{}, 100)}
 
 	go func() {
 		for {
@@ -69,7 +70,7 @@ func startEchoIPCServer(t *testing.T, path string) (srv *echoServer, received ch
 			srv.mu.Lock()
 			srv.conns = append(srv.conns, conn)
 			srv.mu.Unlock()
-			go handleEchoConn(conn, received)
+			go handleEchoConn(conn, received, srv.closed)
 		}
 	}()
 
@@ -82,8 +83,14 @@ func startEchoIPCServer(t *testing.T, path string) (srv *echoServer, received ch
 }
 
 // handleEchoConn handles one IPC server connection: reads JSON-RPC lines and echoes responses.
-func handleEchoConn(conn net.Conn, received chan string) {
+func handleEchoConn(conn net.Conn, received chan string, closed chan<- struct{}) {
 	defer conn.Close()
+	defer func() {
+		select {
+		case closed <- struct{}{}:
+		default:
+		}
+	}()
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
@@ -495,6 +502,11 @@ func TestResilientClient_OnInject_BufferFull(t *testing.T) {
 	if err := rc.injectFrame([]byte("{}\n")); err != nil {
 		t.Fatalf("first injectFrame() error: %v", err)
 	}
+	if got := rc.localWork.Load(); got != 1 {
+		t.Fatalf("local work after delivered injection = %d, want 1", got)
+	}
+	firstActivity := rc.lastHostActivity.Load()
+	time.Sleep(time.Millisecond)
 
 	// Threshold tolerant to busy CI: select-default returns instantly on Go
 	// runtime scheduling under normal load, but a contended scheduler can add
@@ -509,6 +521,12 @@ func TestResilientClient_OnInject_BufferFull(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInjectFull) {
 		t.Fatalf("expected ErrInjectFull, got %v", err)
+	}
+	if got := rc.localWork.Load(); got != 1 {
+		t.Fatalf("failed injection changed local work to %d, want 1", got)
+	}
+	if rc.lastHostActivity.Load() <= firstActivity {
+		t.Fatal("failed injection did not update host activity")
 	}
 }
 
@@ -963,6 +981,7 @@ func TestResilientClient_FlushBufferTracksRequestsForDrain(t *testing.T) {
 		stdoutDead: make(chan struct{}),
 	}
 
+	rc.localWork.Add(3)
 	rc.msgFromCC <- []byte(`{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"slow"}}`)
 	rc.msgFromCC <- []byte(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`)
 	rc.msgFromCC <- []byte(`{"jsonrpc":"2.0","id":"req-78","method":"tools/list","params":{}}`)

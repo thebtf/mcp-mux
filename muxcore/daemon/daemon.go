@@ -1586,9 +1586,9 @@ func successorExecutableFor(explicitOverride string) (string, error) {
 	return os.Executable()
 }
 
-// collectHandoffUpstreams calls ShutdownForHandoff on every live owner and
-// returns the HandoffUpstream list. Owners that fail to detach are logged and
-// skipped; per-upstream atomicity (FR-7) is enforced inside performHandoff.
+// collectHandoffUpstreams prepares every live process-backed owner and retains
+// its commit/abort lease until the successor's final adoption decision. Owners
+// that fail to prepare are logged and skipped.
 // Must NOT hold d.mu while calling ShutdownForHandoff (it may block).
 func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 	d.mu.RLock()
@@ -1609,11 +1609,14 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 			continue
 		}
 		upstreams = append(upstreams, HandoffUpstream{
-			ServerID: payload.ServerID,
-			Command:  payload.Command,
-			PID:      payload.PID,
-			StdinFD:  payload.StdinFD,
-			StdoutFD: payload.StdoutFD,
+			ServerID:    payload.ServerID,
+			Command:     payload.Command,
+			PID:         payload.PID,
+			StdinFD:     payload.StdinFD,
+			StdoutFD:    payload.StdoutFD,
+			AuthorityFD: payload.AuthorityFD,
+			abort:       payload.Abort,
+			commit:      payload.Commit,
 		})
 	}
 	return upstreams
@@ -1702,29 +1705,20 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 	conn := cr.conn
 	defer conn.Close() //nolint:errcheck
 
-	// Collect HandoffUpstream list by detaching all live owners.
-	// ShutdownForHandoff detaches FDs from the Owner; they are no longer managed
-	// by any Owner after this call and must be closed explicitly by this function.
-	// Failing to close them would exhaust file descriptors and prevent upstreams
-	// from receiving EOF on their pipes if the handoff protocol fails.
-	upstreams := d.collectHandoffUpstreams()
-	defer func() {
-		for _, u := range upstreams {
-			if u.StdinFD > 2 {
-				_ = os.NewFile(u.StdinFD, "").Close()
-			}
-			if u.StdoutFD > 2 {
-				_ = os.NewFile(u.StdoutFD, "").Close()
-			}
-		}
-	}()
+	// Version/token negotiation happens before detaching any owner. A v1 peer
+	// therefore falls back to one bounded cold respawn without losing authority.
+	if err := acceptHandoffHello(conn, token); err != nil {
+		return fmt.Errorf("protocol hello: %w", err)
+	}
 
-	// Run handoff protocol with 30s deadline. The existing _ = ctx reservation
-	// in performHandoff (T009 integration) becomes meaningful here.
+	// Detach only after the successor proved it speaks the exact v2 schema.
+	// Each entry carries abort/commit operations retained until final adoption.
+	upstreams := d.collectHandoffUpstreams()
+
 	ctx, cancel := context.WithTimeout(context.Background(), handoffTotalTimeout)
 	defer cancel()
 
-	result, err := performHandoff(ctx, conn, token, upstreams)
+	result, err := performHandoffAfterHello(ctx, conn, upstreams)
 	if err != nil {
 		return fmt.Errorf("protocol error: %w", err)
 	}
@@ -1836,6 +1830,42 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 	d.reconnectRefreshed.Add(1)
 	d.logger.Printf("shim.reconnect.refresh_ok owner=%s", shortServerID(ownerKey))
 	return newToken, nil
+}
+
+// HandleCanSuspend verifies owner-wide safety before a shim intentionally
+// releases its data-plane session.
+func (d *Daemon) HandleCanSuspend(prevToken string) (control.SuspendCheckResponse, error) {
+	if d.shuttingDown.Load() {
+		return control.SuspendCheckResponse{}, ErrDaemonShuttingDown
+	}
+	if prevToken == "" {
+		return control.SuspendCheckResponse{}, ErrUnknownToken
+	}
+	entry, ownerKey := d.lookupReconnectOwner(prevToken)
+	if entry == nil || entry.Owner == nil {
+		return control.SuspendCheckResponse{}, ErrUnknownToken
+	}
+
+	d.mu.RLock()
+	current, ok := d.owners[ownerKey]
+	persistent := ok && current == entry && entry.Persistent
+	d.mu.RUnlock()
+	if !ok || current != entry {
+		return control.SuspendCheckResponse{}, ErrOwnerGone
+	}
+	if persistent {
+		return control.SuspendCheckResponse{Reason: "persistent"}, nil
+	}
+	if entry.Owner.PendingRequests() > 0 {
+		return control.SuspendCheckResponse{Reason: "pending_requests"}, nil
+	}
+	if entry.Owner.ActiveProgressTokens() > 0 {
+		return control.SuspendCheckResponse{Reason: "active_progress"}, nil
+	}
+	if entry.Owner.HasActiveBusyWork() {
+		return control.SuspendCheckResponse{Reason: "busy"}, nil
+	}
+	return control.SuspendCheckResponse{Allowed: true}, nil
 }
 
 // HandleStatus implements control.CommandHandler.

@@ -89,6 +89,18 @@ type DaemonHandler interface {
 	HandleListOwners(req Request) (ListOwnersResponse, error)
 }
 
+// SuspendCheckResponse is the safety verdict for intentionally parking one
+// reconnectable shim session.
+type SuspendCheckResponse struct {
+	Allowed bool   `json:"allowed"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// SuspendCheckHandler is an optional daemon control-plane extension.
+type SuspendCheckHandler interface {
+	HandleCanSuspend(prevToken string) (SuspendCheckResponse, error)
+}
+
 // OwnerStopHandler is an optional daemon-side extension for stopping a specific
 // owner through the daemon registry instead of the owner's own control socket.
 type OwnerStopHandler interface {

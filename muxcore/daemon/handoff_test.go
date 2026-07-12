@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,7 +43,9 @@ func (m *mockFDConn) RecvFDs() ([]uintptr, []byte, error) {
 	return fds, nil, nil
 }
 
-func (m *mockFDConn) Close() error { return nil }
+func (m *mockFDConn) handoffSchema() handoffHandleSchema { return handoffHandleSchema{count: 2} }
+func (m *mockFDConn) closeReceivedHandles([]uintptr)     {}
+func (m *mockFDConn) Close() error                       { return nil }
 
 // newMockFDConnPair returns two connected mockFDConn instances.
 // a.WriteJSON delivers to b.ReadJSON, and b.WriteJSON delivers to a.ReadJSON.
@@ -115,9 +118,9 @@ func TestHandoffHappyPath(t *testing.T) {
 				break
 			}
 		}
-		if hu.StdinFD != orig.StdinFD || hu.StdoutFD != orig.StdoutFD {
-			t.Errorf("server %s: FD mismatch: got stdin=%d stdout=%d, want stdin=%d stdout=%d",
-				hu.ServerID, hu.StdinFD, hu.StdoutFD, orig.StdinFD, orig.StdoutFD)
+		if hu.StdinFD != orig.StdinFD || hu.StdoutFD != orig.StdoutFD || hu.AuthorityFD != orig.AuthorityFD {
+			t.Errorf("server %s: FD mismatch: got stdin=%d stdout=%d authority=%d, want stdin=%d stdout=%d authority=%d",
+				hu.ServerID, hu.StdinFD, hu.StdoutFD, hu.AuthorityFD, orig.StdinFD, orig.StdoutFD, orig.AuthorityFD)
 		}
 	}
 }
@@ -130,7 +133,7 @@ func TestHandoffVersionReject(t *testing.T) {
 
 	// Successor sends Hello with wrong protocol version.
 	go func() {
-		bad := HelloMsg{Type: MsgHello, ProtocolVersion: 2, Token: "secret"}
+		bad := HelloMsg{Type: MsgHello, ProtocolVersion: HandoffProtocolVersion + 1, Token: "secret"}
 		_ = receiveConn.WriteJSON(bad)
 	}()
 
@@ -249,5 +252,176 @@ func TestSuccessorExecutableRequestOverrideWins(t *testing.T) {
 	}
 	if filepath.Clean(got) != filepath.Clean(requestPath) {
 		t.Fatalf("successorExecutableFor() = %q, want request override %q", got, requestPath)
+	}
+}
+
+type scriptedHandoffRead struct {
+	msg any
+	err error
+}
+
+type scriptedHandoffConn struct {
+	reads  []scriptedHandoffRead
+	readAt int
+	fds    [][]uintptr
+	fdAt   int
+	closed []uintptr
+	schema handoffHandleSchema
+}
+
+func (c *scriptedHandoffConn) WriteJSON(any) error { return nil }
+
+func (c *scriptedHandoffConn) ReadJSON(v any) error {
+	if c.readAt >= len(c.reads) {
+		return io.EOF
+	}
+	step := c.reads[c.readAt]
+	c.readAt++
+	if step.err != nil {
+		return step.err
+	}
+	data, err := json.Marshal(step.msg)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, v)
+}
+
+func (c *scriptedHandoffConn) SendFDs([]uintptr, []byte) error { return nil }
+
+func (c *scriptedHandoffConn) RecvFDs() ([]uintptr, []byte, error) {
+	if c.fdAt >= len(c.fds) {
+		return nil, nil, io.EOF
+	}
+	fds := c.fds[c.fdAt]
+	c.fdAt++
+	return fds, nil, nil
+}
+
+func (c *scriptedHandoffConn) handoffSchema() handoffHandleSchema {
+	return c.schema
+}
+
+func (c *scriptedHandoffConn) closeReceivedHandles(fds []uintptr) {
+	c.closed = append(c.closed, fds...)
+}
+
+func (c *scriptedHandoffConn) Close() error { return nil }
+
+func TestPerformHandoffFinalAckControlsLeaseSettlement(t *testing.T) {
+	var committed, aborted int
+	upstreams := []HandoffUpstream{
+		{ServerID: "s1", PID: 1, StdinFD: 11, StdoutFD: 12, commit: func() error { committed++; return nil }, abort: func() error { aborted++; return nil }},
+		{ServerID: "s2", PID: 2, StdinFD: 21, StdoutFD: 22, commit: func() error { committed++; return nil }, abort: func() error { aborted++; return nil }},
+	}
+	conn := &scriptedHandoffConn{
+		schema: handoffHandleSchema{count: 2},
+		reads: []scriptedHandoffRead{
+			{msg: NewHelloMsg("secret")},
+			{msg: NewAckTransferMsg("s1", true, nil)},
+			{msg: NewAckTransferMsg("s2", true, nil)},
+			{msg: NewHandoffAckResult([]string{"s1"}, []string{"s2"})},
+		},
+	}
+
+	result, err := performHandoff(context.Background(), conn, "secret", upstreams)
+	if err != nil {
+		t.Fatalf("performHandoff: %v", err)
+	}
+	if committed != 1 || aborted != 1 {
+		t.Fatalf("lease settlement: committed=%d aborted=%d, want 1/1", committed, aborted)
+	}
+	if len(result.Transferred) != 1 || result.Transferred[0] != "s1" {
+		t.Fatalf("Transferred=%v, want [s1]", result.Transferred)
+	}
+	if len(result.Aborted) != 1 || result.Aborted[0] != "s2" {
+		t.Fatalf("Aborted=%v, want [s2]", result.Aborted)
+	}
+}
+
+func TestPerformHandoffFinalAckFailureAbortsEveryPreparedTree(t *testing.T) {
+	var committed, aborted int
+	upstreams := []HandoffUpstream{{
+		ServerID: "s1", PID: 1, StdinFD: 11, StdoutFD: 12,
+		commit: func() error { committed++; return nil },
+		abort:  func() error { aborted++; return nil },
+	}}
+	conn := &scriptedHandoffConn{
+		schema: handoffHandleSchema{count: 2},
+		reads: []scriptedHandoffRead{
+			{msg: NewHelloMsg("secret")},
+			{msg: NewAckTransferMsg("s1", true, nil)},
+			{err: io.ErrUnexpectedEOF},
+		},
+	}
+
+	if _, err := performHandoff(context.Background(), conn, "secret", upstreams); err == nil {
+		t.Fatal("performHandoff error=nil, want final ACK failure")
+	}
+	if committed != 0 || aborted != 1 {
+		t.Fatalf("lease settlement: committed=%d aborted=%d, want 0/1", committed, aborted)
+	}
+}
+
+func TestPerformHandoffVersionSkewRejectsBeforeLeaseSettlement(t *testing.T) {
+	var settled int
+	conn := &scriptedHandoffConn{
+		schema: handoffHandleSchema{count: 2},
+		reads: []scriptedHandoffRead{{
+			msg: HelloMsg{Type: MsgHello, ProtocolVersion: HandoffProtocolVersion - 1, Token: "secret"},
+		}},
+	}
+	upstreams := []HandoffUpstream{{
+		ServerID: "s1", PID: 1, StdinFD: 11, StdoutFD: 12,
+		commit: func() error { settled++; return nil },
+		abort:  func() error { settled++; return nil },
+	}}
+
+	if _, err := performHandoff(context.Background(), conn, "secret", upstreams); !errors.Is(err, ErrProtocolVersionMismatch) {
+		t.Fatalf("performHandoff error=%v, want ErrProtocolVersionMismatch", err)
+	}
+	if settled != 0 {
+		t.Fatalf("lease settled %d times before Hello version acceptance", settled)
+	}
+}
+
+func TestPrepareHandoffReceiveClosesMalformedHandleBatch(t *testing.T) {
+	conn := &scriptedHandoffConn{
+		schema: handoffHandleSchema{count: 2},
+		reads: []scriptedHandoffRead{
+			{msg: NewReadyMsg([]UpstreamRef{{ServerID: "s1", Command: "cmd", PID: 1}})},
+			{msg: NewFdTransferMsg("s1", HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"})},
+			{msg: NewDoneMsg(nil, []string{"s1"})},
+		},
+		fds: [][]uintptr{{11, 12, 13}},
+	}
+
+	receipt, err := prepareHandoffReceive(context.Background(), conn, "secret")
+	if err != nil {
+		t.Fatalf("prepareHandoffReceive: %v", err)
+	}
+	if err := receipt.finalize(nil); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if len(conn.closed) != 3 {
+		t.Fatalf("closed handles=%v, want all malformed handles", conn.closed)
+	}
+}
+
+func TestHandoffReceiptFinalizeClosesUnadoptedHandles(t *testing.T) {
+	conn := &scriptedHandoffConn{schema: handoffHandleSchema{count: 2}}
+	receipt := &handoffReceipt{
+		conn:     conn,
+		order:    []string{"unmatched"},
+		received: map[string]HandoffUpstream{"unmatched": {ServerID: "unmatched", StdinFD: 31, StdoutFD: 32}},
+		owned:    map[string]bool{"unmatched": true},
+		taken:    make(map[string]bool),
+		rejected: make(map[string]struct{}),
+	}
+	if err := receipt.finalize(nil); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if len(conn.closed) != 2 || conn.closed[0] != 31 || conn.closed[1] != 32 {
+		t.Fatalf("closed handles=%v, want [31 32]", conn.closed)
 	}
 }

@@ -289,8 +289,23 @@ func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 	return fds, combined, nil
 }
 
-// Close releases the underlying socket.
+func (u *unixFDConn) handoffSchema() handoffHandleSchema {
+	return handoffHandleSchema{count: 2}
+}
+
+func (u *unixFDConn) closeReceivedHandles(fds []uintptr) {
+	for _, fd := range fds {
+		if fd != 0 {
+			_ = syscall.Close(int(fd))
+		}
+	}
+}
+
+// Close releases the underlying socket and any SCM_RIGHTS handles already
+// captured by the decoder but not yet claimed by RecvFDs.
 func (u *unixFDConn) Close() error {
+	u.closeReceivedHandles(u.pendingFDs)
+	u.pendingFDs = nil
 	return u.conn.Close()
 }
 

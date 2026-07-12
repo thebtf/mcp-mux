@@ -1,7 +1,11 @@
 package procgroup
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -163,4 +167,81 @@ func TestSpawn_InvalidCommand(t *testing.T) {
 	if err == nil {
 		t.Error("expected error spawning non-existent command, got nil")
 	}
+}
+
+func TestKill_AfterLeaderExitTerminatesDescendant(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	p, err := Spawn(Options{
+		Command: os.Args[0],
+		Args:    []string{"-test.run=TestProcgroupLeaderExitHelper"},
+		Env: append(os.Environ(),
+			"MCP_MUX_PROCGROUP_HELPER=leader-exits",
+			"MCP_MUX_PROCGROUP_DESCENDANT_PID_FILE="+pidFile,
+		),
+	})
+	if err != nil {
+		t.Fatalf("Spawn helper: %v", err)
+	}
+
+	descendantPID := waitForDescendantPID(t, pidFile)
+	t.Cleanup(func() { killTestProcess(descendantPID) })
+	select {
+	case <-p.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("leader did not exit")
+	}
+	if !waitForTestProcessExit(descendantPID, 5*time.Second) {
+		t.Fatalf("descendant pid %d survived leader finalization", descendantPID)
+	}
+	if err := p.Kill(); err != nil {
+		t.Fatalf("idempotent Kill after tree exit: %v", err)
+	}
+}
+
+func TestProcgroupLeaderExitHelper(t *testing.T) {
+	if os.Getenv("MCP_MUX_PROCGROUP_HELPER") != "leader-exits" {
+		return
+	}
+
+	opts := longRunningCmd()
+	cmd := exec.Command(opts.Command, opts.Args...)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start descendant: %v", err)
+	}
+	pidFile := os.Getenv("MCP_MUX_PROCGROUP_DESCENDANT_PID_FILE")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("write descendant pid: %v", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		t.Fatalf("release descendant: %v", err)
+	}
+}
+
+func waitForDescendantPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, convErr := strconv.Atoi(string(data))
+			if convErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("descendant pid file was not populated: %s", path)
+	return 0
+}
+
+func waitForTestProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !testProcessAlive(pid) {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return !testProcessAlive(pid)
 }

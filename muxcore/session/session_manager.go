@@ -29,6 +29,7 @@ type boundHistory struct {
 	Env      map[string]string
 	BoundAt  time.Time
 	LastUsed time.Time
+	Session  *Session
 }
 
 // BoundHistorySnapshot is the serializable subset of consumed-token history
@@ -68,6 +69,7 @@ type Manager struct {
 	pending    map[string]*pendingSession // token → session data (pre-registered, consumed on Bind)
 	bound      map[string]*boundHistory   // consumed token → owner/session history for reconnect refresh
 	lastActive map[int]time.Time          // session ID → time of last TrackRequest call
+	now        func() time.Time
 	mu         sync.RWMutex
 }
 
@@ -79,7 +81,27 @@ func NewManager() *Manager {
 		pending:    make(map[string]*pendingSession),
 		bound:      make(map[string]*boundHistory),
 		lastActive: make(map[int]time.Time),
+		now:        time.Now,
 	}
+}
+
+func (sm *Manager) currentTime() time.Time {
+	if sm.now != nil {
+		return sm.now()
+	}
+	return time.Now()
+}
+
+func (sm *Manager) boundIsLiveLocked(hist *boundHistory) bool {
+	if hist == nil || hist.Session == nil {
+		return false
+	}
+	ctx := sm.sessions[hist.Session.ID]
+	return ctx != nil && ctx.Session == hist.Session
+}
+
+func (sm *Manager) boundExpiredLocked(hist *boundHistory, now time.Time) bool {
+	return hist == nil || (!sm.boundIsLiveLocked(hist) && now.Sub(hist.LastUsed) > boundTokenTTL)
 }
 
 // ExportBoundHistory returns non-expired consumed-token history entries for
@@ -89,14 +111,21 @@ func (sm *Manager) ExportBoundHistory() []BoundHistorySnapshot {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	now := time.Now()
+	now := sm.currentTime()
 	entries := make([]BoundHistorySnapshot, 0, len(sm.bound))
 	for token, hist := range sm.bound {
 		if hist == nil || token == "" || hist.OwnerKey == "" {
 			continue
 		}
-		if now.Sub(hist.LastUsed) > boundTokenTTL {
+		live := sm.boundIsLiveLocked(hist)
+		if !live && now.Sub(hist.LastUsed) > boundTokenTTL {
 			continue
+		}
+		lastUsed := hist.LastUsed
+		if live {
+			// Session pointers are process-local. Renew the exported lease so
+			// the successor can refresh a token that was live at snapshot time.
+			lastUsed = now
 		}
 		entries = append(entries, BoundHistorySnapshot{
 			Token:    token,
@@ -104,7 +133,7 @@ func (sm *Manager) ExportBoundHistory() []BoundHistorySnapshot {
 			Cwd:      hist.Cwd,
 			Env:      cloneEnv(hist.Env),
 			BoundAt:  hist.BoundAt,
-			LastUsed: hist.LastUsed,
+			LastUsed: lastUsed,
 		})
 	}
 	return entries
@@ -120,7 +149,7 @@ func (sm *Manager) ImportBoundHistory(entries []BoundHistorySnapshot) int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	now := time.Now()
+	now := sm.currentTime()
 	imported := 0
 	for _, entry := range entries {
 		if entry.Token == "" || entry.OwnerKey == "" {
@@ -154,6 +183,15 @@ func (sm *Manager) ImportBoundHistory(entries []BoundHistorySnapshot) int {
 func (sm *Manager) RegisterSession(session *Session, cwd string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	if previous := sm.sessions[session.ID]; previous != nil && previous.Session != session {
+		now := sm.currentTime()
+		for _, hist := range sm.bound {
+			if hist.Session == previous.Session {
+				hist.Session = nil
+				hist.LastUsed = now
+			}
+		}
+	}
 	sm.sessions[session.ID] = &Context{Session: session, Cwd: cwd}
 }
 
@@ -162,10 +200,20 @@ func (sm *Manager) RemoveSession(sessionID int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	removed := sm.sessions[sessionID]
 	delete(sm.sessions, sessionID)
 	delete(sm.lastActive, sessionID)
+	if removed != nil {
+		now := sm.currentTime()
+		for _, hist := range sm.bound {
+			if hist.Session == removed.Session {
+				hist.Session = nil
+				// Inactive history expires from disconnect, not original bind.
+				hist.LastUsed = now
+			}
+		}
+	}
 
-	// Clean up any inflight entries that belong to this session.
 	for id, sid := range sm.inflight {
 		if sid == sessionID {
 			delete(sm.inflight, id)
@@ -191,7 +239,7 @@ func (sm *Manager) PreRegisterForOwner(token, ownerKey, cwd string, env map[stri
 		OwnerKey:  ownerKey,
 		Cwd:       cwd,
 		Env:       cloneEnv(env),
-		CreatedAt: time.Now(),
+		CreatedAt: sm.currentTime(),
 	}
 }
 
@@ -235,7 +283,7 @@ func (sm *Manager) IsPreRegistered(token string) bool {
 func (sm *Manager) SweepExpiredPending() int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	now := time.Now()
+	now := sm.currentTime()
 	swept := 0
 	for token, ps := range sm.pending {
 		if now.Sub(ps.CreatedAt) > pendingTokenTTL {
@@ -252,10 +300,10 @@ func (sm *Manager) SweepExpiredPending() int {
 func (sm *Manager) SweepExpiredBound() int {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	now := time.Now()
+	now := sm.currentTime()
 	swept := 0
 	for token, hist := range sm.bound {
-		if now.Sub(hist.LastUsed) > boundTokenTTL {
+		if sm.boundExpiredLocked(hist, now) {
 			delete(sm.bound, token)
 			swept++
 		}
@@ -304,7 +352,7 @@ func (sm *Manager) Bind(token, ownerKey string, session *Session) bool {
 	}
 	delete(sm.pending, token)
 
-	now := time.Now()
+	now := sm.currentTime()
 	env := cloneEnv(ps.Env)
 	historyOwnerKey := ps.OwnerKey
 	if historyOwnerKey == "" {
@@ -316,12 +364,12 @@ func (sm *Manager) Bind(token, ownerKey string, session *Session) bool {
 		Env:      env,
 		BoundAt:  now,
 		LastUsed: now,
+		Session:  session,
 	}
 
 	session.Cwd = ps.Cwd
 	session.Env = cloneEnv(env)
 
-	// Update Context if the session is already registered.
 	if ctx, exists := sm.sessions[session.ID]; exists {
 		ctx.Cwd = ps.Cwd
 		ctx.Env = cloneEnv(env)
@@ -336,10 +384,7 @@ func (sm *Manager) LookupHistory(prev string) (ownerKey, cwd string, env map[str
 	defer sm.mu.RUnlock()
 
 	hist, exists := sm.bound[prev]
-	if !exists {
-		return "", "", nil, false
-	}
-	if time.Since(hist.LastUsed) > boundTokenTTL {
+	if !exists || sm.boundExpiredLocked(hist, sm.currentTime()) {
 		return "", "", nil, false
 	}
 	return hist.OwnerKey, hist.Cwd, cloneEnv(hist.Env), true
@@ -350,8 +395,9 @@ func (sm *Manager) LookupHistory(prev string) (ownerKey, cwd string, env map[str
 func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bool) (string, error) {
 	sm.mu.Lock()
 	hist, exists := sm.bound[prev]
-	if !exists || time.Since(hist.LastUsed) > boundTokenTTL {
-		if exists && time.Since(hist.LastUsed) > boundTokenTTL {
+	now := sm.currentTime()
+	if !exists || sm.boundExpiredLocked(hist, now) {
+		if exists {
 			delete(sm.bound, prev)
 		}
 		sm.mu.Unlock()
@@ -374,13 +420,13 @@ func (sm *Manager) RegisterReconnect(prev string, ownerAlive func(key string) bo
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	hist, exists = sm.bound[prev]
-	if !exists || time.Since(hist.LastUsed) > boundTokenTTL {
-		if exists && time.Since(hist.LastUsed) > boundTokenTTL {
+	now = sm.currentTime()
+	if !exists || sm.boundExpiredLocked(hist, now) {
+		if exists {
 			delete(sm.bound, prev)
 		}
 		return "", ErrUnknownToken
 	}
-	now := time.Now()
 	hist.LastUsed = now
 	sm.pending[token] = &pendingSession{
 		OwnerKey:  ownerKey,
@@ -404,7 +450,7 @@ func (sm *Manager) TrackRequest(remappedID string, sessionID int) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.inflight[remappedID] = sessionID
-	sm.lastActive[sessionID] = time.Now()
+	sm.lastActive[sessionID] = sm.currentTime()
 }
 
 // CompleteRequest removes a remapped request ID from the inflight map.

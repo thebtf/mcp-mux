@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -301,7 +303,7 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
 
-	// Assert the handoff path was taken via structural log inspection rather
+	// Assert the handoff result via structural log inspection rather
 	// than polling d.owners. The supervisor goroutine started by
 	// supervisor.Add(o) can race through o.Serve() → proactive-init write
 	// failure → OnUpstreamExit → delete(d.owners, sid) fast enough on
@@ -313,16 +315,26 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	logs := logBuf.String()
 
 	wantHandoff := "snapshot: reattached owner " + sid[:8] + " from handoff"
-	if !strings.Contains(logs, wantHandoff) {
+	if runtime.GOOS == "windows" {
+		if strings.Contains(logs, wantHandoff) {
+			t.Errorf("did not expect Windows fixture without Job authority to reattach the owner.\nLogs:\n%s", logs)
+		}
+		if !strings.Contains(logs, "Windows handoff missing Job authority — falling back to spawn") {
+			t.Errorf("missing safe Windows snapshot fallback marker.\nLogs:\n%s", logs)
+		}
+	} else if !strings.Contains(logs, wantHandoff) {
 		t.Errorf("expected log %q (handoff path marker), not found.\nLogs:\n%s",
 			wantHandoff, logs)
 	}
 
-	// "handoff.receive.ok upstreams=1" proves the receive side consumed the
-	// mock conn pair end-to-end (token auth, protocol version, 1 FdTransfer).
-	if !strings.Contains(logs, "handoff.receive.ok upstreams=1") {
+	wantAccepted := 1
+	if runtime.GOOS == "windows" {
+		wantAccepted = 0
+	}
+	wantHandoffLog := fmt.Sprintf("handoff.receive.ok upstreams=%d", wantAccepted)
+	if !strings.Contains(logs, wantHandoffLog) {
 		t.Errorf("expected %q in logs, not found.\nLogs:\n%s",
-			"handoff.receive.ok upstreams=1", logs)
+			wantHandoffLog, logs)
 	}
 }
 
@@ -525,12 +537,10 @@ func TestLoadSnapshot_ShutsDownRestoredOwnerWhenGenerationFails(t *testing.T) {
 }
 
 // TestLoadSnapshot_Reattach_PartialHandoff exercises FR-7: when the handoff
-// delivers FDs for a subset of the snapshot's owners, the remainder MUST
-// fall through to the legacy SpawnUpstreamBackground path. The snapshot
-// lists two owners (sid1, sid2) but performHandoff only transfers sid1 —
-// so sid1 reattaches via handoff (classification_source == "handoff") and
-// sid2 comes back through the legacy path (classification_source !=
-// "handoff"). Both must be present in d.owners after loadSnapshot returns.
+// delivers handles for a subset of the snapshot's owners, the remainder MUST
+// fall through to the legacy SpawnUpstreamBackground path. On Windows this
+// legacy two-handle fixture also lacks Job authority, so both owners safely
+// fall back to snapshot respawn instead of adopting an unauthoritative tree.
 func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	os.Remove(SnapshotPath())
 
@@ -639,7 +649,7 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	d, logBuf := testDaemonWithLog(t)
 	restored := d.loadSnapshot()
 	if restored != 2 {
-		t.Fatalf("loadSnapshot() restored %d owners, want 2 (sid1 via handoff, sid2 via legacy)", restored)
+		t.Fatalf("loadSnapshot() restored %d owners, want 2", restored)
 	}
 
 	// FR-7 is verified by structural log inspection rather than by probing
@@ -654,9 +664,15 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	// for every successful registration regardless of path.
 	logs := logBuf.String()
 
-	// Positive: sid1 took the handoff path.
 	wantSid1Handoff := "snapshot: reattached owner " + sid1[:8] + " from handoff"
-	if !strings.Contains(logs, wantSid1Handoff) {
+	if runtime.GOOS == "windows" {
+		if strings.Contains(logs, wantSid1Handoff) {
+			t.Errorf("did not expect Windows fixture without Job authority to reattach sid1.\nLogs:\n%s", logs)
+		}
+		if !strings.Contains(logs, "Windows handoff missing Job authority — falling back to spawn") {
+			t.Errorf("missing safe Windows snapshot fallback marker.\nLogs:\n%s", logs)
+		}
+	} else if !strings.Contains(logs, wantSid1Handoff) {
 		t.Errorf("expected log %q for sid1 (handoff path), not found.\nLogs:\n%s", wantSid1Handoff, logs)
 	}
 
@@ -676,8 +692,12 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 		}
 	}
 
-	// Handoff receive must have delivered exactly one upstream.
-	if !strings.Contains(logs, "handoff.receive.ok upstreams=1") {
-		t.Errorf("expected %q in logs, not found.\nLogs:\n%s", "handoff.receive.ok upstreams=1", logs)
+	wantAccepted := 1
+	if runtime.GOOS == "windows" {
+		wantAccepted = 0
+	}
+	wantHandoffLog := fmt.Sprintf("handoff.receive.ok upstreams=%d", wantAccepted)
+	if !strings.Contains(logs, wantHandoffLog) {
+		t.Errorf("expected %q in logs, not found.\nLogs:\n%s", wantHandoffLog, logs)
 	}
 }

@@ -224,6 +224,21 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		}
 		return Response{OK: true, Token: newToken}, nil
 
+	case "can_suspend":
+		sh, ok := s.handler.(SuspendCheckHandler)
+		if !ok {
+			return Response{OK: false, Message: "can_suspend not supported"}, nil
+		}
+		result, err := sh.HandleCanSuspend(req.PrevToken)
+		if err != nil {
+			return Response{OK: false, Message: err.Error()}, nil
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("marshal can_suspend: %v", err)}, nil
+		}
+		return Response{OK: true, Data: data}, nil
+
 	case "reconnect-give-up":
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {

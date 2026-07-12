@@ -44,6 +44,24 @@ type launcherChildOutput struct {
 	err  error
 }
 
+const (
+	launcherDormantReadyMethod  = "$/mcp-mux/launcher/dormant-ready"
+	launcherCommitDormantMethod = "$/mcp-mux/launcher/commit-dormant"
+	launcherDormantAckMethod    = "$/mcp-mux/launcher/dormant-ack"
+	launcherDormantNackMethod   = "$/mcp-mux/launcher/dormant-nack"
+	launcherDormantExitCode     = 75
+	launcherDormantExitTimeout  = 2 * time.Second
+)
+
+type launcherChildState uint8
+
+const (
+	launcherChildActive launcherChildState = iota
+	launcherChildQuiescing
+	launcherChildAwaitingDormantExit
+	launcherChildDormant
+)
+
 func shouldSuperviseEngineProcess(args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -98,6 +116,11 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 	if err != nil {
 		return err
 	}
+	childWait := child.waitCh
+	var childStdoutEOF bool
+	var childExited bool
+	var childExitErr error
+	var dormantInvalid bool
 	var enginePoll <-chan time.Time
 	var engineTicker *time.Ticker
 	if cfg.EnginePollInterval > 0 {
@@ -112,6 +135,92 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 	inflight := make(map[string]string)
 	var initializeRequest []byte
 	var initializedNotification []byte
+	state := launcherChildActive
+	var pendingFrames [][]byte
+	var dormantExitTimer *time.Timer
+	var dormantExitC <-chan time.Time
+
+	stopDormantExitTimer := func() {
+		if dormantExitTimer == nil {
+			return
+		}
+		dormantExitTimer.Stop()
+		dormantExitTimer = nil
+		dormantExitC = nil
+	}
+	resetDormantExitTimer := func() {
+		stopDormantExitTimer()
+		dormantExitTimer = time.NewTimer(launcherDormantExitTimeout)
+		dormantExitC = dormantExitTimer.C
+	}
+	resetChildObservation := func() {
+		childWait = child.waitCh
+		childStdoutEOF = false
+		childExited = false
+		childExitErr = nil
+		dormantInvalid = false
+	}
+	childTerminalAction := func() (enterDormant, restart bool) {
+		if !childStdoutEOF || !childExited {
+			return false, false
+		}
+		if state == launcherChildAwaitingDormantExit && !dormantInvalid && launcherChildExitCode(childExitErr) == launcherDormantExitCode {
+			return true, false
+		}
+		return false, true
+	}
+	flushPending := func() error {
+		for len(pendingFrames) > 0 {
+			raw := pendingFrames[0]
+			if err := writeLauncherSupervisorFrame(child.stdin, raw); err != nil {
+				return err
+			}
+			if msg, parseErr := jsonrpc.Parse(raw); parseErr == nil && msg.IsRequest() {
+				inflight[string(msg.ID)] = msg.Method
+			}
+			pendingFrames = pendingFrames[1:]
+		}
+		return nil
+	}
+	restartAndFlush := func() error {
+		stopDormantExitTimer()
+		preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
+		launcherDrainInflight(cfg.Stdout, inflight, "initialize")
+		if child != nil {
+			child.kill()
+			child.waitOrKill(2 * time.Second)
+		}
+		var restartErr error
+		child, childOut, childEnginePath, restartErr = restartLauncherSupervisorChild(
+			cfg, initializeRequest, initializedNotification, preserveInitialize, inflight,
+		)
+		if restartErr != nil {
+			return restartErr
+		}
+		resetChildObservation()
+		state = launcherChildActive
+		return flushPending()
+	}
+	wakeAndFlush := func() error {
+		var startErr error
+		child, childOut, childEnginePath, startErr = startLauncherSupervisorChild(
+			cfg, initializeRequest, initializedNotification, false, inflight,
+		)
+		if startErr != nil {
+			child, childOut, childEnginePath, startErr = restartLauncherSupervisorChild(
+				cfg, initializeRequest, initializedNotification, false, inflight,
+			)
+		}
+		if startErr != nil {
+			return startErr
+		}
+		resetChildObservation()
+		state = launcherChildActive
+		if err := flushPending(); err != nil {
+			return restartAndFlush()
+		}
+		return nil
+	}
 
 	for {
 		select {
@@ -132,40 +241,135 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 			if msg.IsNotification() && msg.Method == "notifications/initialized" {
 				initializedNotification = cloneBytes(msg.Raw)
 			}
+			if state != launcherChildActive {
+				pendingFrames = append(pendingFrames, cloneBytes(msg.Raw))
+				if state == launcherChildDormant {
+					if err := wakeAndFlush(); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 			if msg.IsRequest() {
 				inflight[string(msg.ID)] = msg.Method
 			}
 			if err := writeLauncherSupervisorFrame(child.stdin, msg.Raw); err != nil {
-				preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
-				launcherDrainInflight(cfg.Stdout, inflight, "initialize")
-				child.kill()
-				child, childOut, childEnginePath, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
-				if err != nil {
+				if err := restartAndFlush(); err != nil {
 					return err
 				}
 			}
 
 		case out := <-childOut:
 			if out.err != nil {
-				preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
-				launcherDrainInflight(cfg.Stdout, inflight, "initialize")
-				child.kill()
-				child, childOut, childEnginePath, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
-				if err != nil {
-					return err
+				childOut = nil
+				childStdoutEOF = errors.Is(out.err, io.EOF)
+				enterDormant, restart := childTerminalAction()
+				if enterDormant {
+					stopDormantExitTimer()
+					child = nil
+					childEnginePath = ""
+					state = launcherChildDormant
+					if len(pendingFrames) > 0 {
+						if err := wakeAndFlush(); err != nil {
+							return err
+						}
+					}
+				} else if restart || state == launcherChildActive || !childStdoutEOF {
+					if err := restartAndFlush(); err != nil {
+						return err
+					}
 				}
 				continue
 			}
 
 			raw := bytes.TrimRight(out.data, "\r\n")
-			if msg, parseErr := jsonrpc.Parse(raw); parseErr == nil && msg.IsResponse() {
-				delete(inflight, string(msg.ID))
+			if msg, parseErr := jsonrpc.Parse(raw); parseErr == nil {
+				if msg.IsNotification() {
+					switch msg.Method {
+					case launcherDormantReadyMethod:
+						if state == launcherChildActive {
+							state = launcherChildQuiescing
+							resetDormantExitTimer()
+							commit := []byte(fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"method\":%q}", launcherCommitDormantMethod))
+							if err := writeLauncherSupervisorFrame(child.stdin, commit); err != nil {
+								if err := restartAndFlush(); err != nil {
+									return err
+								}
+							}
+						}
+						continue
+					case launcherDormantAckMethod:
+						if state == launcherChildQuiescing {
+							state = launcherChildAwaitingDormantExit
+							resetDormantExitTimer()
+						}
+						continue
+					case launcherDormantNackMethod:
+						if state == launcherChildQuiescing || state == launcherChildAwaitingDormantExit {
+							stopDormantExitTimer()
+							state = launcherChildActive
+							if err := flushPending(); err != nil {
+								if err := restartAndFlush(); err != nil {
+									return err
+								}
+							}
+						}
+						continue
+					}
+				}
+				if msg.IsResponse() {
+					delete(inflight, string(msg.ID))
+				}
+			}
+			if state == launcherChildAwaitingDormantExit {
+				if _, err := cfg.Stdout.Write(out.data); err != nil {
+					child.kill()
+					return nil
+				}
+				dormantInvalid = true
+				continue
 			}
 			if _, err := cfg.Stdout.Write(out.data); err != nil {
 				child.kill()
 				return nil
 			}
+
+		case <-dormantExitC:
+			if err := restartAndFlush(); err != nil {
+				return err
+			}
+
+		case exitErr := <-childWait:
+			childWait = nil
+			if child != nil {
+				child.waitCh = nil
+			}
+			childExited = true
+			childExitErr = exitErr
+			enterDormant, restart := childTerminalAction()
+			if enterDormant {
+				stopDormantExitTimer()
+				child = nil
+				childOut = nil
+				childEnginePath = ""
+				state = launcherChildDormant
+				if len(pendingFrames) > 0 {
+					if err := wakeAndFlush(); err != nil {
+						return err
+					}
+				}
+			} else if restart {
+				if err := restartAndFlush(); err != nil {
+					return err
+				}
+			} else if state == launcherChildActive {
+				resetDormantExitTimer()
+			}
+
 		case <-enginePoll:
+			if state != launcherChildActive {
+				continue
+			}
 			activeEnginePath, ok := cfg.ResolveActiveEngine(cfg.LauncherPath)
 			if !ok || activeEnginePath == "" || samePath(activeEnginePath, childEnginePath) {
 				continue
@@ -174,10 +378,13 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 			launcherDrainInflight(cfg.Stdout, inflight, "initialize")
 			child.kill()
 			child.waitOrKill(2 * time.Second)
-			child, childOut, childEnginePath, err = restartLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, preserveInitialize, inflight)
+			child, childOut, childEnginePath, err = restartLauncherSupervisorChild(
+				cfg, initializeRequest, initializedNotification, preserveInitialize, inflight,
+			)
 			if err != nil {
 				return err
 			}
+			resetChildObservation()
 			launcherNotifyListChangedAfterEngineReplacement(cfg.Stdout, cfg.Stderr, cfg.Args)
 		}
 	}
@@ -245,19 +452,17 @@ func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeReques
 		return nil, nil, "", fmt.Errorf("start engine child: %w", err)
 	}
 
+	var prelude [][]byte
 	if len(initializeRequest) > 0 {
-		response, err := replayLauncherSupervisorHandshake(child, initializeRequest, initializedNotification, cfg.ReplayTimeout)
+		response, preserved, err := replayLauncherSupervisorHandshake(child, initializeRequest, initializedNotification, cfg.ReplayTimeout)
 		if err != nil {
 			child.kill()
 			child.waitOrKill(2 * time.Second)
 			return nil, nil, "", fmt.Errorf("replay initialize into replacement engine: %w", err)
 		}
+		prelude = preserved
 		if forwardInitializeResponse {
-			if _, err := cfg.Stdout.Write(response); err != nil {
-				child.kill()
-				child.waitOrKill(2 * time.Second)
-				return nil, nil, "", fmt.Errorf("forward replayed initialize response: %w", err)
-			}
+			prelude = append(prelude, response)
 			if msg, parseErr := jsonrpc.Parse(bytes.TrimRight(response, "\r\n")); parseErr == nil && msg.IsResponse() && inflight != nil {
 				delete(inflight, string(msg.ID))
 			}
@@ -265,7 +470,12 @@ func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeReques
 	}
 
 	out := make(chan launcherChildOutput, 16)
-	go pumpLauncherSupervisorStdout(child.stdout, out)
+	go func() {
+		for _, line := range prelude {
+			out <- launcherChildOutput{data: line}
+		}
+		pumpLauncherSupervisorStdout(child.stdout, out)
+	}()
 	return child, out, enginePath, nil
 }
 
@@ -322,20 +532,38 @@ func pumpLauncherSupervisorStdout(r *bufio.Reader, out chan<- launcherChildOutpu
 	}
 }
 
-func replayLauncherSupervisorHandshake(child *supervisedEngineChild, initializeRequest, initializedNotification []byte, timeout time.Duration) ([]byte, error) {
+func replayLauncherSupervisorHandshake(child *supervisedEngineChild, initializeRequest, initializedNotification []byte, timeout time.Duration) ([]byte, [][]byte, error) {
+	request, err := jsonrpc.Parse(bytes.TrimSpace(initializeRequest))
+	if err != nil || !request.IsRequest() || request.Method != "initialize" {
+		return nil, nil, errors.New("cached initialize request is invalid")
+	}
+	initializeID := string(request.ID)
 	if err := writeLauncherSupervisorFrame(child.stdin, initializeRequest); err != nil {
-		return nil, fmt.Errorf("write initialize: %w", err)
+		return nil, nil, fmt.Errorf("write initialize: %w", err)
 	}
-	response, err := readLauncherSupervisorLineWithTimeout(child.stdout, timeout)
-	if err != nil {
-		return nil, fmt.Errorf("read initialize response: %w", err)
-	}
-	if len(initializedNotification) > 0 {
-		if err := writeLauncherSupervisorFrame(child.stdin, initializedNotification); err != nil {
-			return nil, fmt.Errorf("write initialized notification: %w", err)
+
+	deadline := time.Now().Add(timeout)
+	var preserved [][]byte
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, nil, fmt.Errorf("read initialize response: timeout after %s", timeout)
 		}
+		line, err := readLauncherSupervisorLineWithTimeout(child.stdout, remaining)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read initialize response: %w", err)
+		}
+		msg, parseErr := jsonrpc.Parse(bytes.TrimRight(line, "\r\n"))
+		if parseErr == nil && msg.IsResponse() && string(msg.ID) == initializeID {
+			if len(initializedNotification) > 0 {
+				if err := writeLauncherSupervisorFrame(child.stdin, initializedNotification); err != nil {
+					return nil, nil, fmt.Errorf("write initialized notification: %w", err)
+				}
+			}
+			return line, preserved, nil
+		}
+		preserved = append(preserved, line)
 	}
-	return response, nil
 }
 
 func readLauncherSupervisorLineWithTimeout(r *bufio.Reader, timeout time.Duration) ([]byte, error) {
@@ -364,6 +592,17 @@ func readLauncherSupervisorLineWithTimeout(r *bufio.Reader, timeout time.Duratio
 func writeLauncherSupervisorFrame(w io.Writer, raw []byte) error {
 	_, err := fmt.Fprintf(w, "%s\n", raw)
 	return err
+}
+
+func launcherChildExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
 }
 
 func launcherDrainInflight(stdout io.Writer, inflight map[string]string, preserveMethod string) {
