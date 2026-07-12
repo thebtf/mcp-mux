@@ -63,6 +63,13 @@ func attachHandoffAuthority(p *Process, pid int, authority uintptr, requireAutho
 	if err := syscall.Kill(pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
 		return fmt.Errorf("upstream: validate process group %d: %w", pid, err)
 	}
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		return fmt.Errorf("upstream: read process group for pid %d: %w", pid, err)
+	}
+	if pgid != pid {
+		return fmt.Errorf("upstream: pid %d belongs to process group %d", pid, pgid)
+	}
 	p.authorityMu.Lock()
 	p.spawnPgid = pid
 	p.authorityMu.Unlock()

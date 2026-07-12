@@ -284,6 +284,19 @@ type splitResilientReadWriter struct {
 	written bytes.Buffer
 }
 
+type dormantReadyWriter struct {
+	bytes.Buffer
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (w *dormantReadyWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(resilientDormantReadyMethod)) {
+		w.once.Do(func() { close(w.ready) })
+	}
+	return w.Buffer.Write(p)
+}
+
 func (rw *splitResilientReadWriter) Write(p []byte) (int, error) {
 	return rw.written.Write(p)
 }
@@ -390,6 +403,127 @@ func TestResilientClient_DemandBeforeCommitDropsPrivateCommit(t *testing.T) {
 	}
 	if got := strings.Count(upstream.String(), `"id":9`); got != 1 {
 		t.Fatalf("host demand forwarded %d times, want once: %s", got, upstream.String())
+	}
+}
+
+func TestResilientClient_InjectRaceDormantCommit(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		host := &dormantReadyWriter{ready: make(chan struct{})}
+		rc := &resilientClient{
+			cfg:        ResilientClientConfig{Stdout: host},
+			msgFromCC:  make(chan []byte, 4),
+			stdoutDead: make(chan struct{}),
+			log:        resilientTestLogger(t),
+		}
+		result := make(chan struct {
+			demand    []byte
+			committed bool
+			err       error
+		}, 1)
+		go func() {
+			demand, committed, err := rc.negotiateDormant(&sync.Mutex{}, make(chan error))
+			result <- struct {
+				demand    []byte
+				committed bool
+				err       error
+			}{demand, committed, err}
+		}()
+		<-host.ready
+
+		commit := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":%q}`, resilientDormantCommitMethod))
+		frame := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call"}`, i+100))
+		start := make(chan struct{})
+		injectErr := make(chan error, 1)
+		go func() {
+			<-start
+			rc.localWork.Add(1)
+			rc.msgFromCC <- commit
+		}()
+		go func() {
+			<-start
+			injectErr <- rc.injectFrame(frame)
+		}()
+		close(start)
+
+		got := <-result
+		if got.err != nil {
+			t.Fatalf("iteration %d negotiateDormant: %v", i, got.err)
+		}
+		err := <-injectErr
+		if got.committed {
+			if !errors.Is(err, ErrInjectClosed) {
+				t.Fatalf("iteration %d committed injection error = %v, want ErrInjectClosed", i, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("iteration %d NACK injection error = %v", i, err)
+		}
+
+		var upstream bytes.Buffer
+		if err := rc.forwardToIPC(&upstream, got.demand); err != nil {
+			t.Fatalf("iteration %d forward demand: %v", i, err)
+		}
+		rc.localWork.Add(-1)
+		ipcEOF := make(chan struct{})
+		done := make(chan struct{})
+		go rc.runIPCWriter(&upstream, ipcEOF, done)
+		deadline := time.Now().Add(time.Second)
+		for rc.localWork.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		close(ipcEOF)
+		<-done
+		if strings.Contains(upstream.String(), resilientDormantCommitMethod) {
+			t.Fatalf("iteration %d private commit leaked upstream: %s", i, upstream.String())
+		}
+		if got := strings.Count(upstream.String(), fmt.Sprintf(`"id":%d`, i+100)); got != 1 {
+			t.Fatalf("iteration %d injected frame forwarded %d times, want once: %s", i, got, upstream.String())
+		}
+	}
+}
+
+func TestResilientClient_QueuedInjectsKeepFIFOAcrossDormantNack(t *testing.T) {
+	var host bytes.Buffer
+	rc := &resilientClient{
+		cfg:        ResilientClientConfig{Stdout: &host},
+		msgFromCC:  make(chan []byte, 3),
+		stdoutDead: make(chan struct{}),
+		log:        resilientTestLogger(t),
+	}
+	commit := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":%q}`, resilientDormantCommitMethod))
+	rc.localWork.Add(1)
+	rc.msgFromCC <- commit
+	if err := rc.injectFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"first"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.injectFrame([]byte(`{"jsonrpc":"2.0","id":2,"method":"second"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	demand, committed, err := rc.negotiateDormant(&sync.Mutex{}, make(chan error))
+	if err != nil || committed {
+		t.Fatalf("negotiateDormant = (%s, %v, %v), want NACK", demand, committed, err)
+	}
+	var upstream bytes.Buffer
+	if err := rc.forwardToIPC(&upstream, demand); err != nil {
+		t.Fatal(err)
+	}
+	rc.localWork.Add(-1)
+	ipcEOF := make(chan struct{})
+	done := make(chan struct{})
+	go rc.runIPCWriter(&upstream, ipcEOF, done)
+	deadline := time.Now().Add(time.Second)
+	for rc.localWork.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(ipcEOF)
+	<-done
+	got := upstream.String()
+	if strings.Contains(got, resilientDormantCommitMethod) ||
+		strings.Count(got, `"id":1`) != 1 || strings.Count(got, `"id":2`) != 1 ||
+		strings.Index(got, `"id":1`) > strings.Index(got, `"id":2`) {
+		t.Fatalf("FIFO or lifecycle filtering failed: %s", got)
 	}
 }
 

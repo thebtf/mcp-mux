@@ -128,6 +128,8 @@ type resilientClient struct {
 	lastHostActivity   atomic.Int64
 	localWork          atomic.Int64
 	closed             atomic.Bool
+	dormantMu          sync.Mutex
+	dormantCommitted   bool
 	log                *log.Logger
 }
 
@@ -535,6 +537,20 @@ func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-ch
 		msg, err := jsonrpc.Parse(data)
 		if err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
 			rc.localWork.Add(-1)
+			rc.dormantMu.Lock()
+			select {
+			case demand := <-rc.msgFromCC:
+				rc.dormantMu.Unlock()
+				if err := rc.writeDormantNotification(stdoutMu, resilientDormantNackMethod); err != nil {
+					rc.localWork.Add(-1)
+					return nil, false, err
+				}
+				rc.log.Printf("shim.dormant.nack reason=injected_demand")
+				return demand, false, nil
+			default:
+				rc.dormantCommitted = true
+				rc.dormantMu.Unlock()
+			}
 			if err := rc.writeDormantNotification(stdoutMu, resilientDormantAckMethod); err != nil {
 				return nil, false, err
 			}
@@ -997,7 +1013,9 @@ func (rc *resilientClient) replayInit(conn interface {
 }
 
 func (rc *resilientClient) injectFrame(b []byte) error {
-	if rc.closed.Load() {
+	rc.dormantMu.Lock()
+	defer rc.dormantMu.Unlock()
+	if rc.closed.Load() || rc.dormantCommitted {
 		rc.log.Printf("proxy.inject.dropped reason=closed")
 		return ErrInjectClosed
 	}

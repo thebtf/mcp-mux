@@ -80,9 +80,15 @@ func attachFromFDs(pid int, stdinFD, stdoutFD, authorityFD uintptr, command stri
 	if err := attachHandoffAuthority(p, pid, authorityFD, requireAuthority); err != nil {
 		return nil, err
 	}
+	leaderDone, err := watchAttachedLeader(p, pid)
+	if err != nil {
+		return nil, err
+	}
 	authorityAdopted = true
 
+	stdoutDrained := make(chan struct{})
 	go func() {
+		defer close(stdoutDrained)
 		defer func() { _ = stdoutFile.Close() }()
 		scanner := bufio.NewScanner(stdoutFile)
 		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -97,13 +103,26 @@ func attachFromFDs(pid int, stdinFD, stdoutFD, authorityFD uintptr, command stri
 			scanErr = nil
 		}
 		p.lineBuf.markDoneWithErr(scanErr)
+	}()
+
+	go func() {
+		exitErr := io.EOF
+		select {
+		case err := <-leaderDone:
+			if err != nil {
+				exitErr = err
+			}
+		case <-stdoutDrained:
+		}
 		p.mu.Lock()
 		attached := p.detach == detachAttached
 		p.mu.Unlock()
 		if attached {
 			_ = terminateProcessTree(p)
 		}
-		p.ExitErr = io.EOF
+		_ = stdoutFile.Close()
+		<-stdoutDrained
+		p.ExitErr = exitErr
 		close(p.Done)
 	}()
 

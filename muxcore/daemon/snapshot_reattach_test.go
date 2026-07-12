@@ -18,7 +18,21 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
+
+func reattachFixturePID(t *testing.T) int {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return os.Getpid()
+	}
+	proc, err := upstream.Start("sleep", []string{"30"}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("start handoff fixture process: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Close() })
+	return proc.PID()
+}
 
 // syncBuffer is a thread-safe bytes.Buffer — the daemon writes logs from
 // multiple goroutines concurrently (supervisor, reaper, owner callbacks).
@@ -268,7 +282,7 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 			{
 				ServerID: sid,
 				Command:  "echo",
-				PID:      os.Getpid(), // valid PID > 0; not verified by AttachFromFDs
+				PID:      reattachFixturePID(t),
 				StdinFD:  stdinFD,
 				StdoutFD: stdoutFD,
 			},
@@ -715,7 +729,7 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 			{
 				ServerID: sid1, // Only sid1 transferred — sid2 falls through.
 				Command:  "echo",
-				PID:      os.Getpid(),
+				PID:      reattachFixturePID(t),
 				StdinFD:  stdinFD,
 				StdoutFD: stdoutFD,
 			},
