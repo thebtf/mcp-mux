@@ -402,7 +402,7 @@ active engine. The daemon updates on next natural restart.
 
 **When a same-protocol graceful restart is safe and actually runs, it preserves:**
 
-- **Upstream processes themselves** — they keep running across the daemon restart, with in-flight requests intact
+- **The upstream process tree** — a same-v2 handoff retains it after successor adoption; a restart with live sessions is deferred instead
 - Cached MCP responses (init, tools, prompts, resources)
 - Server classification (shared/isolated/session-aware)
 - Session metadata (cwd, env)
@@ -517,15 +517,18 @@ old snapshots.
 
 ### Known limitations
 
-- **First restart after v0.20.x → v0.21.0:** legacy path, in-flight requests dropped once.
-  Subsequent restarts use handoff.
+- **Protocol transition boundary:** the first handoff v1 → v2 restart, and a
+  rollback across that same boundary, reject live transfer before owner detach
+  and take one bounded snapshot-backed shutdown-and-respawn path. Same-v2
+  restarts retain stdio and full-tree authority only after final successor
+  adoption.
 - **Per-upstream 30s transfer bound:** upstreams that don't drain within 30s fall back to
   respawn for that entry only.
 - **macOS launchd cross-parentage:** verified via CI; spawns outside the mcp-mux process
   tree inherit correctly.
-- **Windows `JOB_OBJECT_LIMIT_BREAKAWAY_OK` requires `CREATE_BREAKAWAY_FROM_JOB` on
-  grandchildren:** upstreams that spawn language servers without that flag will still be
-  killed by `TerminateJobObject` in the explicit-kill path.
+- **Windows process tree:** each upstream is governed by a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; final authority loss intentionally
+  terminates descendants, including those that outlive their leader.
 
 ### Post-deploy verification
 
