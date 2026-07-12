@@ -281,6 +281,8 @@ func (w *windowsFDConn) closeReceivedHandles(fds []uintptr) {
 	}
 }
 
+func (w *windowsFDConn) SetDeadline(deadline time.Time) error { return w.conn.SetDeadline(deadline) }
+
 func (w *windowsFDConn) Close() error { return w.conn.Close() }
 
 // listenHandoffWindows binds a named pipe and accepts one connection within

@@ -114,10 +114,34 @@ func removeOwnerSocketWithRetry(path string) error {
 // Receipt ACKs only prove that the successor owns valid handles. The predecessor
 // commits a detached tree only after the final adoption ACK names its server ID.
 func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []HandoffUpstream) (HandoffResult, error) {
+	stop := bindHandoffContext(ctx, conn)
+	defer stop()
 	if err := acceptHandoffHello(conn, token); err != nil {
-		return HandoffResult{Phase: "hello"}, err
+		return HandoffResult{Phase: "hello"}, handoffContextError(ctx, err)
 	}
 	return performHandoffAfterHello(ctx, conn, upstreams)
+}
+
+func bindHandoffContext(ctx context.Context, conn fdConn) func() {
+	if deadline, ok := ctx.Deadline(); ok {
+		if setter, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = setter.SetDeadline(deadline)
+		}
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() {
+		stop()
+		if setter, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = setter.SetDeadline(time.Time{})
+		}
+	}
+}
+
+func handoffContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(ctxErr, err)
+	}
+	return err
 }
 
 func acceptHandoffHello(conn fdConn, token string) error {
@@ -144,7 +168,13 @@ func acceptHandoffHello(conn fdConn, token string) error {
 }
 
 func performHandoffAfterHello(ctx context.Context, conn fdConn, upstreams []HandoffUpstream) (result HandoffResult, retErr error) {
-	_ = ctx
+	stop := bindHandoffContext(ctx, conn)
+	defer func() {
+		stop()
+		if retErr != nil {
+			retErr = handoffContextError(ctx, retErr)
+		}
+	}()
 
 	settled := false
 	defer func() {
@@ -368,7 +398,13 @@ type handoffReceipt struct {
 }
 
 func prepareHandoffReceive(ctx context.Context, conn fdConn, token string) (receipt *handoffReceipt, retErr error) {
-	_ = ctx
+	stop := bindHandoffContext(ctx, conn)
+	defer func() {
+		stop()
+		if retErr != nil {
+			retErr = handoffContextError(ctx, retErr)
+		}
+	}()
 	cleanup := true
 	defer func() {
 		if cleanup {

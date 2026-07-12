@@ -301,6 +301,8 @@ func (u *unixFDConn) closeReceivedHandles(fds []uintptr) {
 	}
 }
 
+func (u *unixFDConn) SetDeadline(deadline time.Time) error { return u.conn.SetDeadline(deadline) }
+
 // Close releases the underlying socket and any SCM_RIGHTS handles already
 // captured by the decoder but not yet claimed by RecvFDs.
 func (u *unixFDConn) Close() error {

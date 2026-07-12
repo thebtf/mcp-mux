@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 // mockFDConn implements fdConn using in-memory channels for unit testing.
@@ -307,6 +309,91 @@ func (c *scriptedHandoffConn) closeReceivedHandles(fds []uintptr) {
 }
 
 func (c *scriptedHandoffConn) Close() error { return nil }
+
+type stallingHandoffConn struct {
+	*scriptedHandoffConn
+	operation string
+	at        int
+	reads     int
+	writes    int
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *stallingHandoffConn) WriteJSON(v any) error {
+	at := c.writes
+	c.writes++
+	if c.operation == "write" && at == c.at {
+		<-c.closed
+		return io.ErrClosedPipe
+	}
+	return c.scriptedHandoffConn.WriteJSON(v)
+}
+
+func (c *stallingHandoffConn) ReadJSON(v any) error {
+	at := c.reads
+	c.reads++
+	if c.operation == "read" && at == c.at {
+		<-c.closed
+		return io.ErrClosedPipe
+	}
+	return c.scriptedHandoffConn.ReadJSON(v)
+}
+
+func (c *stallingHandoffConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
+func TestPerformHandoffTotalDeadlineBoundsEveryPhase(t *testing.T) {
+	upstream := HandoffUpstream{ServerID: "s1", PID: 1, StdinFD: 11, StdoutFD: 12}
+	tests := []struct {
+		name      string
+		operation string
+		at        int
+		reads     []scriptedHandoffRead
+	}{
+		{name: "hello", operation: "read", at: 0},
+		{name: "ready", operation: "write", at: 0, reads: []scriptedHandoffRead{{msg: NewHelloMsg("secret")}}},
+		{name: "transfer", operation: "write", at: 1, reads: []scriptedHandoffRead{{msg: NewHelloMsg("secret")}}},
+		{name: "done", operation: "write", at: 2, reads: []scriptedHandoffRead{{msg: NewHelloMsg("secret")}, {msg: NewAckTransferMsg("s1", true, nil)}}},
+		{name: "final-ack", operation: "read", at: 2, reads: []scriptedHandoffRead{{msg: NewHelloMsg("secret")}, {msg: NewAckTransferMsg("s1", true, nil)}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conn := &stallingHandoffConn{
+				scriptedHandoffConn: &scriptedHandoffConn{schema: handoffHandleSchema{count: 2}, reads: tt.reads},
+				operation:           tt.operation,
+				at:                  tt.at,
+				closed:              make(chan struct{}),
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+
+			done := make(chan error, 1)
+			started := time.Now()
+			go func() {
+				_, err := performHandoff(ctx, conn, "secret", []HandoffUpstream{upstream})
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("performHandoff() error = %v, want context deadline exceeded", err)
+				}
+				if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+					t.Fatalf("performHandoff() took %s, want total deadline bound", elapsed)
+				}
+			case <-time.After(200 * time.Millisecond):
+				_ = conn.Close()
+				<-done
+				t.Fatal("performHandoff() ignored total deadline")
+			}
+		})
+	}
+}
 
 func TestPerformHandoffFinalAckControlsLeaseSettlement(t *testing.T) {
 	var committed, aborted int

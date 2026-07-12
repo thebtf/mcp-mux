@@ -1704,19 +1704,20 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 	}
 	conn := cr.conn
 	defer conn.Close() //nolint:errcheck
+	ctx, cancel := context.WithTimeout(context.Background(), handoffTotalTimeout)
+	defer cancel()
+	stopDeadline := bindHandoffContext(ctx, conn)
+	defer stopDeadline()
 
 	// Version/token negotiation happens before detaching any owner. A v1 peer
 	// therefore falls back to one bounded cold respawn without losing authority.
 	if err := acceptHandoffHello(conn, token); err != nil {
-		return fmt.Errorf("protocol hello: %w", err)
+		return fmt.Errorf("protocol hello: %w", handoffContextError(ctx, err))
 	}
 
 	// Detach only after the successor proved it speaks the exact v2 schema.
 	// Each entry carries abort/commit operations retained until final adoption.
 	upstreams := d.collectHandoffUpstreams()
-
-	ctx, cancel := context.WithTimeout(context.Background(), handoffTotalTimeout)
-	defer cancel()
 
 	result, err := performHandoffAfterHello(ctx, conn, upstreams)
 	if err != nil {

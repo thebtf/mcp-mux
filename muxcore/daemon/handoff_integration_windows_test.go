@@ -5,18 +5,74 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/thebtf/mcp-mux/muxcore/classify"
+	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 	"golang.org/x/sys/windows"
 )
+
+type failFinalAckCaptureConn struct {
+	fdConn
+	received  []uintptr
+	observers []windows.Handle
+}
+
+func (c *failFinalAckCaptureConn) RecvFDs() ([]uintptr, []byte, error) {
+	fds, header, err := c.fdConn.RecvFDs()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, fd := range fds {
+		var observer windows.Handle
+		if err := windows.DuplicateHandle(
+			windows.CurrentProcess(), windows.Handle(fd),
+			windows.CurrentProcess(), &observer,
+			0, false, windows.DUPLICATE_SAME_ACCESS,
+		); err != nil {
+			for _, handle := range c.observers {
+				_ = windows.CloseHandle(handle)
+			}
+			c.observers = nil
+			return nil, nil, err
+		}
+		c.observers = append(c.observers, observer)
+	}
+	c.received = append(c.received, fds...)
+	return fds, header, err
+}
+
+func (c *failFinalAckCaptureConn) WriteJSON(v any) error {
+	switch v.(type) {
+	case HandoffAckMsg, *HandoffAckMsg:
+		_ = c.fdConn.Close()
+		return io.ErrClosedPipe
+	default:
+		return c.fdConn.WriteJSON(v)
+	}
+}
+
+var compareObjectHandlesProc = windows.NewLazySystemDLL("kernelbase.dll").NewProc("CompareObjectHandles")
+
+func sameKernelObject(a, b windows.Handle) bool {
+	equal, _, _ := compareObjectHandlesProc.Call(uintptr(a), uintptr(b))
+	return equal != 0
+}
 
 // TestHandoffIntegration_FullRoundtripWindows runs the full handoff
 // protocol between two goroutines over a named pipe with DuplicateHandle
@@ -382,5 +438,232 @@ func TestHandoffIntegration_UncommittedThreeHandlesAreClosed(t *testing.T) {
 		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil,
 	); err == nil {
 		t.Fatalf("uncommitted Job handle %d remained open", received.AuthorityFD)
+	}
+}
+
+func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
+	const roleEnv = "MCPMUX_TEST_FINAL_ACK_ROLLBACK_ROLE"
+	switch os.Getenv(roleEnv) {
+	case "upstream":
+		pidFile, err := os.OpenFile(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open pid file: %v", err)
+		}
+		_, _ = fmt.Fprintln(pidFile, os.Getpid())
+		_ = pidFile.Close()
+		go func() {
+			for range time.NewTicker(10 * time.Millisecond).C {
+				_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"handoff"}}`)
+			}
+		}()
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	case "successor":
+		snapshotData, err := base64.StdEncoding.DecodeString(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_SNAPSHOT"))
+		if err != nil {
+			t.Fatalf("decode snapshot: %v", err)
+		}
+		if err := os.WriteFile(SnapshotPath(), snapshotData, 0o600); err != nil {
+			t.Fatalf("write successor snapshot: %v", err)
+		}
+		oldPID, err := strconv.Atoi(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_OLD_PID"))
+		if err != nil {
+			t.Fatalf("parse predecessor pid: %v", err)
+		}
+		origWindow := restoreHealthGateWindow
+		restoreHealthGateWindow = time.Hour
+		defer func() { restoreHealthGateWindow = origWindow }()
+
+		var failedConn *failFinalAckCaptureConn
+		origHook := dialHandoffHook
+		dialHandoffHook = func(name string, timeout time.Duration) (fdConn, error) {
+			conn, err := dialHandoffWindows(name, timeout)
+			if err != nil {
+				return nil, err
+			}
+			failedConn = &failFinalAckCaptureConn{fdConn: conn}
+			return failedConn, nil
+		}
+		defer func() { dialHandoffHook = origHook }()
+
+		d, logs := testDaemonWithLog(t)
+		if restored := d.loadSnapshot(); restored != 1 {
+			t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+		}
+		entry := d.Entry("aabbccdd-final-ack-rollback")
+		if entry == nil || entry.Owner == nil {
+			t.Fatalf("fallback owner missing after final ACK failure; logs:\n%s", logs.String())
+		}
+		if entry.RestoreSource != "snapshot_fallback" {
+			t.Fatalf("restore_source=%q, want snapshot_fallback after final ACK failure; logs:\n%s", entry.RestoreSource, logs.String())
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		newPID := 0
+		for time.Now().Before(deadline) {
+			pidData, _ := os.ReadFile(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS"))
+			for _, field := range strings.Fields(string(pidData)) {
+				pid, _ := strconv.Atoi(field)
+				if pid > 0 && pid != oldPID {
+					newPID = pid
+					break
+				}
+			}
+			if newPID > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if newPID <= 0 || newPID == oldPID {
+			t.Fatalf("fallback upstream pid=%d, want fresh process distinct from %d; logs:\n%s", newPID, oldPID, logs.String())
+		}
+
+		processHandle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(newPID))
+		if err != nil {
+			t.Fatalf("OpenProcess fallback pid %d: %v", newPID, err)
+		}
+		defer windows.CloseHandle(processHandle)
+		if status, err := windows.WaitForSingleObject(processHandle, 0); err != nil || status != uint32(windows.WAIT_TIMEOUT) {
+			t.Fatalf("fallback process is not alive: WaitForSingleObject=(%d, %v)", status, err)
+		}
+
+		if failedConn == nil || len(failedConn.received) != 3 {
+			t.Fatalf("received handles=%v, want stdin/stdout/authority", failedConn)
+		}
+		defer func() {
+			for _, handle := range failedConn.observers {
+				_ = windows.CloseHandle(handle)
+			}
+		}()
+		for i, handle := range failedConn.received {
+			if sameKernelObject(windows.Handle(handle), failedConn.observers[i]) {
+				t.Fatalf("rolled-back handle %d still refers to transferred kernel object", handle)
+			}
+		}
+		return
+	}
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+
+	const sid = "aabbccdd-final-ack-rollback"
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	args := []string{"-test.run=^TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner$"}
+	pidPath := filepath.Join(t.TempDir(), "pids")
+	upstreamEnv := map[string]string{
+		roleEnv:                               "upstream",
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS": pidPath,
+	}
+
+	proc, err := upstream.Start(exe, args, upstreamEnv, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("start predecessor upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.AbortDetach() })
+	oldPID, stdinFD, stdoutFD, authorityFD, err := proc.DetachWithAuthority()
+	if err != nil {
+		t.Fatalf("DetachWithAuthority: %v", err)
+	}
+
+	snap := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{{
+			ServerID:       sid,
+			Command:        exe,
+			Args:           args,
+			Cwd:            t.TempDir(),
+			Mode:           "global",
+			Classification: classify.ModeShared,
+			CachedInit:     "e30=",
+			CachedTools:    "e30=",
+			Env:            upstreamEnv,
+		}},
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	tokenFile, err := os.CreateTemp("", "mcp-mux-final-ack-rollback-*.tok")
+	if err != nil {
+		t.Fatalf("CreateTemp token: %v", err)
+	}
+	tokenPath := tokenFile.Name()
+	_ = tokenFile.Close()
+	t.Cleanup(func() { _ = os.Remove(tokenPath) })
+	const token = "final-ack-rollback-token"
+	if err := os.WriteFile(tokenPath, []byte(token), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
+	name := randomPipeName(t)
+	ln, err := listenHandoffPipe(name)
+	if err != nil {
+		t.Fatalf("listenHandoffPipe: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(),
+		roleEnv+"=successor",
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_OLD_PID="+strconv.Itoa(oldPID),
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS="+pidPath,
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_SNAPSHOT="+base64.StdEncoding.EncodeToString(data),
+		"MCPMUX_HANDOFF_TOKEN_PATH="+tokenPath,
+		"MCPMUX_HANDOFF_SOCKET="+name,
+	)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start successor: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, err := ln.Accept()
+		accepted <- acceptResult{conn: conn, err: err}
+	}()
+	var raw net.Conn
+	select {
+	case result := <-accepted:
+		if result.err != nil {
+			t.Fatalf("accept successor: %v", result.err)
+		}
+		raw = result.conn
+	case <-time.After(5 * time.Second):
+		_ = ln.Close()
+		_ = cmd.Process.Kill()
+		t.Fatal("successor did not connect to handoff pipe")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, handoffErr := performHandoff(ctx, newWindowsFDConn(raw), token, []HandoffUpstream{{
+		ServerID: sid, Command: exe, PID: oldPID,
+		StdinFD: stdinFD, StdoutFD: stdoutFD, AuthorityFD: authorityFD,
+		commit: proc.CommitDetach, abort: proc.AbortDetach,
+	}})
+	if handoffErr == nil {
+		t.Fatal("predecessor handoff error=nil, want final ACK failure")
+	}
+	select {
+	case <-proc.Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("predecessor did not abort the uncommitted upstream")
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("successor rollback failed: %v", err)
 	}
 }
