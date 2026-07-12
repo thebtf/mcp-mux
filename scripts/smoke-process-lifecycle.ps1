@@ -38,6 +38,8 @@ $FixtureRecords = Join-Path $RunDir "fixture-records"
 $captured = [System.Collections.Generic.List[object]]::new()
 $sessions = [System.Collections.Generic.List[hashtable]]::new()
 $stderrTails = [System.Collections.Generic.List[string]]::new()
+$parentageObservations = [System.Collections.Generic.List[object]]::new()
+$parentageSnapshots = [System.Collections.Generic.List[object]]::new()
 $evidence = [ordered]@{
     verdict = "UNKNOWN"
     timestamp_utc = (Get-Date).ToUniversalTime().ToString("o")
@@ -49,6 +51,8 @@ $evidence = [ordered]@{
         critical = $true
     }
     parallel_sessions = $ParallelSessions
+    fixture_advertised_idle_timeout_seconds = 20
+    fixture_idle_timeout_rationale = "Measured response window ~5.1s plus two Windows metadata snapshots of 3.9-4.8s and margin; fixture-only calibration."
     run_dir = $RunDir
     candidate_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash
     engine_v1 = ""
@@ -67,6 +71,8 @@ $evidence = [ordered]@{
     captured_survivors_after_cleanup = @()
     scoped_survivors_after_cleanup = @()
     launcher_only_convergences = 0
+    parentage_observations = @()
+    parentage_snapshots = @()
     stderr_tail = @()
     error = ""
 }
@@ -190,23 +196,56 @@ function Get-Identity {
 
 function Test-IdentityAlive {
     param([object]$Identity)
+    return (Get-CapturedIdentityState -Identity $Identity) -eq "alive"
+}
+
+function Get-CapturedIdentityState {
+    param([object]$Identity)
     try {
         $process = [System.Diagnostics.Process]::GetProcessById($Identity.pid)
         $path = [System.IO.Path]::GetFullPath($process.MainModule.FileName)
         $ticks = $process.StartTime.ToUniversalTime().Ticks
         $process.Dispose()
+    } catch [System.ArgumentException] {
+        return "absent"
     } catch {
-        return $false
+        throw "cannot inspect captured process $($Identity.label):$($Identity.pid): $($_.Exception.Message)"
     }
-    return $path -ieq $Identity.executable -and $ticks -eq $Identity.start_ticks
+    if ($path -ine $Identity.executable -or $ticks -ne $Identity.start_ticks) {
+        return "mismatch"
+    }
+    return "alive"
 }
 
 function Stop-CapturedIdentity {
     param([object]$Identity)
-    if (-not (Test-IdentityAlive -Identity $Identity)) {
+    $state = Get-CapturedIdentityState -Identity $Identity
+    if ($state -eq "absent") {
         return
     }
-    Stop-Process -Id $Identity.pid -Force -ErrorAction Stop
+    if ($state -eq "mismatch") {
+        throw "captured process identity mismatch before stop: $($Identity.label):$($Identity.pid)"
+    }
+    try {
+        Stop-Process -Id $Identity.pid -Force -ErrorAction Stop
+    } catch {
+        $state = Get-CapturedIdentityState -Identity $Identity
+        if ($state -eq "absent") {
+            return
+        }
+        if ($state -eq "mismatch") {
+            throw "captured process identity mismatch after stop race: $($Identity.label):$($Identity.pid)"
+        }
+        throw "failed to stop captured process $($Identity.label):$($Identity.pid): $($_.Exception.Message)"
+    }
+    $state = Get-CapturedIdentityState -Identity $Identity
+    if ($state -eq "absent") {
+        return
+    }
+    if ($state -eq "mismatch") {
+        throw "captured process identity mismatch after stop: $($Identity.label):$($Identity.pid)"
+    }
+    throw "captured process survived stop: $($Identity.label):$($Identity.pid)"
 }
 
 function Send-Message {
@@ -281,6 +320,63 @@ function Start-Sessions {
     return @($engineIdentities)
 }
 
+function Get-StableProbeMetadataSet {
+    param([object[]]$Probes, [string]$Phase)
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    $started = [DateTime]::UtcNow
+    $expectedPids = @($Probes.leader_pid) + @($Probes.descendant_pid)
+    $previous = ""
+    $attempts = 0
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $attempts++
+        $queriedUtc = (Get-Date).ToUniversalTime().ToString("o")
+        $rows = @(Get-CimInstance Win32_Process -Filter "name = 'lifecycle-upstream.exe'" -ErrorAction SilentlyContinue | Where-Object { [int]$_.ProcessId -in $expectedPids })
+        $rawRows = @($rows | Sort-Object ProcessId | ForEach-Object {
+            [pscustomobject]@{ pid = [int]$_.ProcessId; parent_pid = [int]$_.ParentProcessId; creation_date = [string]$_.CreationDate; executable_path = [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) }
+        })
+        $signature = $rawRows | ForEach-Object { "$($_.pid)|$($_.parent_pid)|$($_.creation_date)|$($_.executable_path)" } | Join-String -Separator ";"
+        [void]$parentageSnapshots.Add([pscustomobject]@{
+            phase = $Phase; attempt = $attempts; queried_utc = $queriedUtc
+            elapsed_ms = [int](([DateTime]::UtcNow - $started).TotalMilliseconds)
+            expected_pids = @($expectedPids | Sort-Object); rows = $rawRows
+        })
+        if ($rawRows.Count -eq $expectedPids.Count -and $signature -eq $previous) {
+            foreach ($probe in $Probes) {
+                $leaderRow = $rawRows | Where-Object { $_.pid -eq $probe.leader_pid } | Select-Object -First 1
+                $descendantRow = $rawRows | Where-Object { $_.pid -eq $probe.descendant_pid } | Select-Object -First 1
+                $leaderStart = [datetime]::new([int64]$probe.leader_identity.start_ticks, [DateTimeKind]::Utc)
+                $descendantStart = [datetime]::new([int64]$probe.descendant_identity.start_ticks, [DateTimeKind]::Utc)
+                $leaderCreated = [datetime]$leaderRow.creation_date
+                $descendantCreated = [datetime]$descendantRow.creation_date
+                $leaderStartDeltaMs = [math]::Abs(($leaderCreated.ToUniversalTime() - $leaderStart).TotalMilliseconds)
+                $descendantStartDeltaMs = [math]::Abs(($descendantCreated.ToUniversalTime() - $descendantStart).TotalMilliseconds)
+                $fixtureRecordPath = Join-Path $FixtureRecords "generation-$($probe.leader_pid).json"
+                if (-not (Test-Path -LiteralPath $fixtureRecordPath -PathType Leaf)) { throw "$Phase session $($probe.session) fixture record is missing for leader $($probe.leader_pid)" }
+                $fixtureRecord = Get-Content -Raw -LiteralPath $fixtureRecordPath | ConvertFrom-Json
+                $observation = [pscustomobject]@{
+                    phase = $Phase; session = $probe.session; checked_utc = (Get-Date).ToUniversalTime().ToString("o")
+                    stabilization_duration_ms = [int](([DateTime]::UtcNow - $started).TotalMilliseconds); stabilization_attempts = $attempts
+                    response_leader_pid = $probe.leader_pid; response_descendant_pid = $probe.descendant_pid
+                    leader_identity_executable = $probe.leader_identity.executable; leader_identity_start_ticks = $probe.leader_identity.start_ticks; leader_identity_start_utc = $leaderStart.ToString("o")
+                    leader_cim_parent_pid = $leaderRow.parent_pid; leader_cim_creation_date = $leaderRow.creation_date; leader_cim_executable_path = $leaderRow.executable_path; leader_cim_start_delta_ms = [math]::Round($leaderStartDeltaMs, 3)
+                    descendant_identity_executable = $probe.descendant_identity.executable; descendant_identity_start_ticks = $probe.descendant_identity.start_ticks; descendant_identity_start_utc = $descendantStart.ToString("o")
+                    descendant_cim_parent_pid = $descendantRow.parent_pid; descendant_cim_creation_date = $descendantRow.creation_date; descendant_cim_executable_path = $descendantRow.executable_path; descendant_cim_start_delta_ms = [math]::Round($descendantStartDeltaMs, 3)
+                    fixture_record_path = $fixtureRecordPath; fixture_record_leader_pid = [int]$fixtureRecord.leader_pid; fixture_record_descendant_pid = [int]$fixtureRecord.descendant_pid; fixture_record_started_utc = [string]$fixtureRecord.started_utc
+                }
+                [void]$parentageObservations.Add($observation)
+                if ($fixtureRecord.leader_pid -ne $probe.leader_pid -or $fixtureRecord.descendant_pid -ne $probe.descendant_pid) { throw "$Phase session $($probe.session) fixture record does not match response identities" }
+                if ($leaderRow.executable_path -ine $probe.leader_identity.executable -or $leaderStartDeltaMs -ge 1000) { throw "$Phase session $($probe.session) leader PID identity mismatch" }
+                if ($descendantRow.executable_path -ine $probe.descendant_identity.executable -or $descendantStartDeltaMs -ge 1000) { throw "$Phase session $($probe.session) descendant PID identity mismatch" }
+                if ($descendantRow.parent_pid -ne $probe.leader_pid) { throw "$Phase descendant $($probe.descendant_pid) is not a child of leader $($probe.leader_pid)" }
+            }
+            return
+        }
+        $previous = $signature
+        Start-Sleep -Milliseconds 25
+    }
+    throw "$Phase CIM metadata did not stabilize for all expected fixture identities after $attempts attempts"
+}
+
 function Invoke-ParallelProbe {
     param([int]$BaseId, [string]$Phase, [string]$ExpectedEngine = "")
     foreach ($session in $sessions) {
@@ -288,11 +384,6 @@ function Invoke-ParallelProbe {
             jsonrpc = "2.0"; id = ($BaseId + $session.index); method = "tools/call"
             params = @{ name = "lifecycle_probe"; arguments = @{} }
         }
-    }
-    $script:LastProbeEngines = if ([string]::IsNullOrWhiteSpace($ExpectedEngine)) {
-        @()
-    } else {
-        @(Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase $Phase)
     }
     $probes = @()
     foreach ($session in $sessions) {
@@ -308,6 +399,10 @@ function Invoke-ParallelProbe {
             session = $session.index
             leader_pid = $leader.pid
             descendant_pid = $descendant.pid
+            leader_created_utc = $leader.created_utc
+            leader_start_ticks = $leader.start_ticks
+            descendant_created_utc = $descendant.created_utc
+            descendant_start_ticks = $descendant.start_ticks
             leader_identity = $leader
             descendant_identity = $descendant
         }
@@ -318,12 +413,11 @@ function Invoke-ParallelProbe {
     if (@($probes.descendant_pid | Sort-Object -Unique).Count -ne $ParallelSessions) {
         throw "$Phase did not create $ParallelSessions unique descendants"
     }
-    $rows = @(Get-CimInstance Win32_Process -Filter "name = 'lifecycle-upstream.exe'" -ErrorAction SilentlyContinue)
-    foreach ($probe in $probes) {
-        $descendant = $rows | Where-Object { [int]$_.ProcessId -eq $probe.descendant_pid } | Select-Object -First 1
-        if ($null -eq $descendant -or [int]$descendant.ParentProcessId -ne $probe.leader_pid) {
-            throw "$Phase descendant $($probe.descendant_pid) is not a child of leader $($probe.leader_pid)"
-        }
+    Get-StableProbeMetadataSet -Probes $probes -Phase $Phase
+    $script:LastProbeEngines = if ([string]::IsNullOrWhiteSpace($ExpectedEngine)) {
+        @()
+    } else {
+        @(Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase $Phase)
     }
     return @($probes)
 }
@@ -479,7 +573,7 @@ try {
     $initialEngines = @(Start-Sessions -ExpectedEngine $engineV1)
     $evidence.initial_engine_pids = @($initialEngines.pid)
     $initial = Invoke-ParallelProbe -BaseId 100 -Phase "initial"
-    $evidence.initial = @($initial | Select-Object session, leader_pid, descendant_pid)
+    $evidence.initial = @($initial | Select-Object * -ExcludeProperty leader_identity, descendant_identity)
     $initialDaemon = Wait-DaemonIdentity -Label "initial-daemon" -ExpectedEngine $engineV1
     $evidence.daemon_pids += $initialDaemon.pid
 
@@ -492,7 +586,10 @@ try {
     Assert-UniqueFromPrevious -Current $wake -Previous $initial -Phase "demand wake"
     $wakeDaemon = Wait-DaemonIdentity -Label "wake-daemon" -ExpectedEngine $engineV1
     $evidence.daemon_pids += $wakeDaemon.pid
-    $evidence.wake = @($wake | Select-Object session, leader_pid, descendant_pid)
+    $evidence.wake = @($wake | Select-Object * -ExcludeProperty leader_identity, descendant_identity)
+
+    $wakeMustExit = @($wakeEngines) + @($wakeDaemon) + @($wake.leader_identity) + @($wake.descendant_identity)
+    Wait-LauncherOnly -MustExit $wakeMustExit -Phase "wake idle"
 
     $engineV2 = Install-Engine -Marker "lifecycle-engine-v2"
     $evidence.engine_v2 = $engineV2
@@ -502,7 +599,7 @@ try {
     $postUpgrade = Invoke-ParallelProbe -BaseId 300 -Phase "post-upgrade" -ExpectedEngine $engineV2
     $upgradeEngines = @($script:LastProbeEngines)
     $evidence.post_upgrade_engine_pids = @($upgradeEngines.pid)
-    $evidence.post_upgrade = @($postUpgrade | Select-Object session, leader_pid, descendant_pid)
+    $evidence.post_upgrade = @($postUpgrade | Select-Object * -ExcludeProperty leader_identity, descendant_identity)
 
     $allMustExit = @($wakeEngines) + @($upgradeEngines) + @($wakeDaemon) + @($wake.leader_identity) + @($wake.descendant_identity) + @($postUpgrade.leader_identity) + @($postUpgrade.descendant_identity)
     Wait-LauncherOnly -MustExit $allMustExit -Phase "post-upgrade idle"
@@ -575,6 +672,8 @@ try {
         }
     }
     $evidence.captured_processes = @($captured | Select-Object label, pid, parent_pid, executable, created_utc)
+    $evidence.parentage_observations = @($parentageObservations)
+    $evidence.parentage_snapshots = @($parentageSnapshots)
     $evidence.stderr_tail = @($stderrTails)
     Remove-Item -LiteralPath $RunDir -Recurse -Force -ErrorAction SilentlyContinue
 }

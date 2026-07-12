@@ -76,7 +76,9 @@ func main() {
 				"protocolVersion": "2025-11-25",
 				"capabilities": map[string]any{
 					"tools": map[string]any{},
-					"x-mux": map[string]any{"sharing": "isolated", "idleTimeout": 5},
+					// 20s covers the measured ~5.1s response window plus two 3.9-4.8s
+					// Windows process-metadata snapshots used by the smoke's parent proof.
+					"x-mux": map[string]any{"sharing": "isolated", "idleTimeout": 20},
 				},
 				"serverInfo": map[string]any{"name": "lifecycle-smoke", "version": "1"},
 			}
