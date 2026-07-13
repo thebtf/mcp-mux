@@ -669,6 +669,37 @@ func TestHandleRefreshSessionToken_UnknownToken(t *testing.T) {
 	}
 }
 
+func TestLookupReconnectOwnerFor_ExactOwnerSnapshotsPlaceholderPromotion(t *testing.T) {
+	d := testDaemon(t)
+	const sid = "owner-reconnect-snapshot"
+	entry := &OwnerEntry{ServerID: sid}
+	stubOwner := new(owner.Owner)
+	d.owners[sid] = entry
+	d.lookupReconnectHistory = func(o *owner.Owner, token string) (string, string, map[string]string, bool) {
+		return sid, "", nil, o == stubOwner && token == "snapshot-token"
+	}
+
+	// Production promotes a placeholder once. Repeating the transition makes
+	// the lock handoff observable to -race without changing lookup semantics.
+	const iterations = 10_000
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < iterations; i++ {
+			d.mu.Lock()
+			entry.Owner = stubOwner
+			d.mu.Unlock()
+			d.mu.Lock()
+			entry.Owner = nil
+			d.mu.Unlock()
+		}
+	}()
+	for i := 0; i < iterations; i++ {
+		d.lookupReconnectOwnerFor("snapshot-token", sid)
+	}
+	<-done
+}
+
 func TestHandleRefreshSessionToken_ShuttingDownIsTransient(t *testing.T) {
 	d := testDaemon(t)
 	d.shuttingDown.Store(true)

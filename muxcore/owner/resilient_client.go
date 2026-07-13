@@ -339,6 +339,8 @@ func (rc *resilientClient) runProxy(conn interface {
 			idleTicker = time.NewTicker(interval)
 			idleC = idleTicker.C
 		}
+		// nextGateAttempt, gateFailures, and gateUnavailable intentionally reset
+		// per IPC connection so a reconnect can re-probe an upgraded daemon.
 		var nextGateAttempt time.Time
 		var gateFailures int
 		var gateUnavailable bool

@@ -656,15 +656,17 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	// upstream I/O). Re-acquire to delete the map entry afterwards.
 	d.mu.Lock()
 	var (
-		found bool
-		sid   string
-		entry *OwnerEntry
+		found           bool
+		sid             string
+		entry           *OwnerEntry
+		ownerToShutdown *owner.Owner
 	)
 	for s, e := range d.owners {
 		if strings.HasPrefix(s, sidPrefix) {
 			found = true
 			sid = s
 			entry = e
+			ownerToShutdown = e.Owner
 			break
 		}
 	}
@@ -673,14 +675,14 @@ func (d *Daemon) cleanupDeadOwner(serviceName string) {
 	if !found {
 		return
 	}
-	if entry.Owner != nil {
+	if ownerToShutdown != nil {
 		d.logger.Printf("cleaning up zombie owner %s", sid[:8])
 		// Synchronous shutdown ensures the IPC socket file is removed before
 		// the entry is deleted from the registry. Without this, a concurrent
 		// Spawn for the same SID could call ipc.Listen and find the stale
 		// socket still present. Safe to block here because cleanupDeadOwner
 		// itself is always called from a goroutine (line ~199).
-		entry.Owner.Shutdown()
+		ownerToShutdown.Shutdown()
 	}
 
 	// FR-4 / BUG-003: guard the delete with an identity check. Between the
@@ -1068,11 +1070,15 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 				return e.Owner.IPCPath(), sid, token, nil
 			}
 			retryEntry := d.owners[sid]
+			var retryOwner *owner.Owner
+			if retryEntry != nil {
+				retryOwner = retryEntry.Owner
+			}
 			// Creation failed or entry was removed — signal retry so Spawn's
 			// retry loop can start fresh. Previously recursed directly into
 			// d.Spawn(req); see errSpawnRetry / Spawn comment for rationale.
 			d.mu.Unlock()
-			if retryEntry != nil && retryEntry.Owner != nil && retryEntry.Owner.IsClassifiedIsolated() {
+			if retryEntry != nil && retryOwner != nil && retryOwner.IsClassifiedIsolated() {
 				*isolatedRetry = d.promoteIsolatedRetry(reqPtr, retryEntry)
 			}
 			return "", "", "", errSpawnRetry
@@ -1438,15 +1444,19 @@ func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error
 func (d *Daemon) HandleSpawnResponseFailure(serverID, token string) {
 	d.mu.RLock()
 	entry := d.owners[serverID]
+	var o *owner.Owner
+	if entry != nil {
+		o = entry.Owner
+	}
 	d.mu.RUnlock()
-	if entry == nil || entry.Owner == nil {
+	if entry == nil || o == nil {
 		return
 	}
-	if !entry.Owner.SessionMgr().RemovePendingForOwnerToken(serverID, token) {
+	if !o.SessionMgr().RemovePendingForOwnerToken(serverID, token) {
 		return
 	}
 	d.logger.Printf("owner %s: revoked undelivered spawn reservation", shortServerID(serverID))
-	if entry.Owner.SessionCount() != 0 || entry.Owner.SessionMgr().PendingCount() != 0 {
+	if o.SessionCount() != 0 || o.SessionMgr().PendingCount() != 0 {
 		return
 	}
 
@@ -2146,15 +2156,19 @@ func statusInt(v any) int {
 func (d *Daemon) ownerIsAccepting(serverID string) bool {
 	d.mu.RLock()
 	entry, ok := d.owners[serverID]
+	var o *owner.Owner
+	if entry != nil {
+		o = entry.Owner
+	}
 	d.mu.RUnlock()
-	if !ok || entry == nil || entry.Owner == nil {
+	if !ok || o == nil {
 		return false
 	}
-	if !entry.Owner.IsAccepting() {
+	if !o.IsAccepting() {
 		return false
 	}
 	select {
-	case <-entry.Owner.Done():
+	case <-o.Done():
 		return false
 	default:
 		return true
@@ -2169,31 +2183,38 @@ func (d *Daemon) lookupReconnectOwnerFor(prevToken, serverID string) (*OwnerEntr
 	if serverID != "" {
 		d.mu.RLock()
 		entry := d.owners[serverID]
+		var o *owner.Owner
+		if entry != nil {
+			o = entry.Owner
+		}
 		d.mu.RUnlock()
-		if entry == nil || entry.Owner == nil {
+		if entry == nil || o == nil {
 			return nil, ""
 		}
-		ownerKey, _, _, ok := d.lookupHistory(entry.Owner, prevToken)
+		ownerKey, _, _, ok := d.lookupHistory(o, prevToken)
 		if !ok || ownerKey != serverID {
 			return nil, ""
 		}
 		return entry, ownerKey
 	}
 
+	type reconnectOwnerCandidate struct {
+		entry *OwnerEntry
+		owner *owner.Owner
+	}
 	d.mu.RLock()
-	entries := make([]*OwnerEntry, 0, len(d.owners))
+	entries := make([]reconnectOwnerCandidate, 0, len(d.owners))
 	for _, entry := range d.owners {
-		entries = append(entries, entry)
+		if entry != nil && entry.Owner != nil {
+			entries = append(entries, reconnectOwnerCandidate{entry: entry, owner: entry.Owner})
+		}
 	}
 	d.mu.RUnlock()
 
-	for _, entry := range entries {
-		if entry == nil || entry.Owner == nil {
-			continue
-		}
-		ownerKey, _, _, ok := d.lookupHistory(entry.Owner, prevToken)
+	for _, candidate := range entries {
+		ownerKey, _, _, ok := d.lookupHistory(candidate.owner, prevToken)
 		if ok {
-			return entry, ownerKey
+			return candidate.entry, ownerKey
 		}
 	}
 	return nil, ""
@@ -2770,24 +2791,24 @@ func (d *Daemon) shutdown(beforeDone func()) {
 
 		// Shutdown all owners
 		d.mu.Lock()
-		entries := make([]*OwnerEntry, 0, len(d.owners))
+		owners := make([]*owner.Owner, 0, len(d.owners))
 		for _, e := range d.owners {
-			entries = append(entries, e)
+			if e.Owner != nil {
+				owners = append(owners, e.Owner)
+			}
 		}
 		d.owners = make(map[string]*OwnerEntry)
 		d.mu.Unlock()
 
-		for _, e := range entries {
-			if e.Owner != nil {
-				e.Owner.Shutdown()
-			}
+		for _, o := range owners {
+			o.Shutdown()
 		}
 
 		if beforeDone != nil {
 			beforeDone()
 		}
 
-		d.logger.Printf("daemon stopped (%d owners shut down)", len(entries))
+		d.logger.Printf("daemon stopped (%d owners shut down)", len(owners))
 		close(d.done)
 	})
 }
