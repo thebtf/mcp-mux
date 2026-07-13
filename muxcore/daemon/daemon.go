@@ -23,6 +23,7 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
@@ -121,8 +122,8 @@ type Daemon struct {
 	isolatedIdleTimeout time.Duration
 
 	// admissionBufferTimeout bounds the wait at the spawn-time admission
-	// gate (CR-002): when a cross-cwd Spawn lands on an existing global
-	// owner that is not yet classified, the caller waits up to this
+	// gate (CR-002): when a fresh global Spawn lands on an existing owner
+	// that is not yet classified, the caller waits up to this
 	// duration for Owner.Classified() to close before deciding whether to
 	// bind (shareable) or fall through to a fresh isolated-seeded owner.
 	// On timeout, the caller falls through to a fresh spawn (safe default:
@@ -793,40 +794,33 @@ func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSn
 	return snap, ok
 }
 
-// waitForCrossCwdClassify is the CR-002 admission gate. When a Spawn lands
-// on an existing global owner whose primary cwd differs from the requesting
-// session's cwd AND whose classification is not yet known, this function
-// blocks the caller up to d.admissionBufferTimeout for Owner.Classified()
-// to close. Three outcomes:
+// waitForCrossCwdClassify is the CR-002 fresh-consumer admission gate. The
+// historical name predates the same-CWD isolation race: every fresh global
+// Spawn that lands on an existing unclassified owner now waits up to
+// d.admissionBufferTimeout for Owner.Classified() to close. Three outcomes:
 //
-//   - shareable=true, err=nil → owner is safe to bind cross-cwd (same cwd
-//     OR already classified as shared/session-aware OR newly classified
-//     shareable). Caller proceeds with PreRegisterForOwner.
+//   - shareable=true, err=nil → owner is already or newly classified as
+//     shared/session-aware. Caller proceeds with PreRegisterForOwner.
 //   - shareable=false, err=nil → owner classified isolated during the wait.
-//     Caller MUST NOT bind cross-cwd; fall through to fresh spawn under a
-//     CR-001 deterministic isolated-seeded sid for the requesting cwd.
+//     Caller MUST NOT bind the fresh consumer; fall through to a fresh spawn
+//     under a CR-001 deterministic isolated-seeded sid for the requester.
 //   - shareable=false, err non-nil → wait timed out. Safe default: caller
 //     treats as isolated and falls through to fresh spawn. The original
-//     owner continues serving its primary-cwd sessions unaffected.
+//     owner continues serving its first admitted consumer unaffected.
 //
-// Same-cwd binds skip the gate (return immediately as shareable=true).
 // This is the only safety property the admission gate provides: an
-// unclassified upstream NEVER receives frames from a cross-cwd session
-// because that session never gets an IPC path until classification
-// resolves. The Owner.crossCwdBuffer post-attach buffer (mentioned in
-// spec AC2 prose) is unnecessary under this simpler implementation —
-// frames literally don't exist on the daemon yet because the shim hasn't
-// dialed IPC (the daemon's Spawn RPC response is the gate).
+// unclassified global upstream NEVER receives frames from a second fresh
+// consumer because that consumer never gets an IPC path until classification
+// resolves. The Owner.crossCwdBuffer post-attach buffer (mentioned in spec
+// AC2 prose) is unnecessary under this simpler implementation — frames
+// literally don't exist on the daemon yet because the shim hasn't dialed IPC
+// (the daemon's Spawn RPC response is the gate).
 func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shareable bool, err error) {
 	if entry == nil || entry.Owner == nil {
 		return false, fmt.Errorf("admission gate: owner not live")
 	}
-	// Same-cwd: no gate. Primary-cwd sessions always pass through.
 	canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
-	if canonEntryCwd == canonReqCwd {
-		return true, nil
-	}
 	// Already classified: respect the verdict immediately.
 	if entry.Owner.IsClassifiedShareable() {
 		return true, nil
@@ -839,8 +833,8 @@ func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shar
 		return false, nil
 	default:
 	}
-	// Not classified yet AND cross-cwd → wait.
-	d.logger.Printf("admission-gate: cross-cwd Spawn from %q waiting on owner %s classify (primary cwd %q)",
+	// Not classified yet → wait.
+	d.logger.Printf("admission-gate: fresh Spawn from %q waiting on owner %s classify (primary cwd %q)",
 		canonReqCwd, shortServerID(entry.ServerID), canonEntryCwd)
 	timer := time.NewTimer(d.admissionBufferTimeout)
 	defer timer.Stop()
@@ -993,6 +987,19 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 	}
 
 	d.mu.Lock()
+	if mode == serverid.ModeIsolated {
+		if _, occupied := d.owners[sid]; occupied {
+			baseSID := serverid.GenerateContextKey(serverid.ModeIsolated, req.Command, req.Args, nil, req.Cwd)
+			ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseSID, &atomic.Int64{})
+			for {
+				candidate := fmt.Sprintf("%s-r%d", baseSID, ctr.(*atomic.Int64).Add(1))
+				if _, used := d.owners[candidate]; !used {
+					sid = candidate
+					break
+				}
+			}
+		}
+	}
 
 	// 1. Exact match (same command+args+cwd)?
 	if entry, ok := d.owners[sid]; ok {
@@ -1030,21 +1037,22 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 				}
 				e.LastSession = time.Now()
 				d.mu.Unlock()
-				// CR-002 admission gate: if this Spawn's cwd differs from the
-				// existing owner's primary cwd AND the owner is not yet
-				// classified, wait for classify before binding. Isolated
+				// CR-002 admission gate: a fresh global Spawn waits for an
+				// existing owner's classification before binding. Isolated
 				// classification forces fall-through to a fresh isolated-seeded
-				// owner for THIS cwd; shareable classification permits the bind.
-				shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
-				if gateErr != nil {
-					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
-					reqPtr.Mode = "isolated"
-					return "", "", "", errSpawnRetry
-				}
-				if !shareable {
-					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(sid), req.Cwd)
-					reqPtr.Mode = "isolated"
-					return "", "", "", errSpawnRetry
+				// owner; shareable classification permits the bind.
+				if mode == serverid.ModeGlobal {
+					shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
+					if gateErr != nil {
+						d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
+					if !shareable {
+						d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(sid), req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
 				}
 				if !e.Owner.PreRegister(token, req.Cwd, req.Env) {
 					if e.Owner.IsClassifiedIsolated() {
@@ -1110,19 +1118,21 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 				}
 				current.LastSession = time.Now()
 				d.mu.Unlock()
-				// CR-002 admission gate: same logic as the placeholder-wait
-				// path. Cross-cwd binding on an unclassified owner waits for
-				// Classified(); isolated verdict forces fall-through.
-				shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
-				if gateErr != nil {
-					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
-					reqPtr.Mode = "isolated"
-					return "", "", "", errSpawnRetry
-				}
-				if !shareable {
-					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
-					reqPtr.Mode = "isolated"
-					return "", "", "", errSpawnRetry
+				// CR-002 admission gate: same fresh-global logic as the
+				// placeholder-wait path. An unclassified owner waits for
+				// Classified(); an isolated verdict forces fall-through.
+				if mode == serverid.ModeGlobal {
+					shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
+					if gateErr != nil {
+						d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
+					if !shareable {
+						d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
 				}
 				if !probeOwner.PreRegister(token, req.Cwd, req.Env) {
 					if probeOwner.IsClassifiedIsolated() {
@@ -1281,11 +1291,15 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 		OnCacheReady: func(serverID string) {
 			d.mu.RLock()
 			entry, ok := d.owners[serverID]
+			var cachedOwner *owner.Owner
+			if ok {
+				cachedOwner = entry.Owner
+			}
 			d.mu.RUnlock()
-			if !ok || entry.Owner == nil {
+			if !ok || cachedOwner == nil {
 				return
 			}
-			snap := entry.Owner.ExportSnapshot()
+			snap := cachedOwner.ExportSnapshot()
 			d.updateTemplate(req.Command, req.Args, snap)
 		},
 		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
@@ -1329,6 +1343,9 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 			return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, ownerErr)
 		}
 		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
+	}
+	if d.sessionHandler != nil {
+		o.MarkClassifiedAs(classify.ModeShared)
 	}
 
 	// Register owner with the supervisor for lifecycle management.

@@ -519,12 +519,10 @@ func TestDedup_IsolatedServersDistinctByCwd(t *testing.T) {
 	}
 }
 
-// TestDedup_IsolatedSameContextReuses asserts the reuse half of the post-CR-001
-// contract: two isolated spawns with identical (cmd, args, cwd) hit the same
-// owner. This is the half that fixes Engram #244 Bug 2's accumulation pattern
-// — every reconnect of the same isolated upstream from the same project now
-// rebinds instead of spawning a fresh subprocess.
-func TestDedup_IsolatedSameContextReuses(t *testing.T) {
+// TestDedup_ExplicitIsolatedSameContextGetsFreshOwner keeps explicit isolation
+// private per fresh consumer. Reconnects return through refresh-token rather
+// than a fresh Spawn, so a new Spawn must not attach to an existing owner.
+func TestDedup_ExplicitIsolatedSameContextGetsFreshOwner(t *testing.T) {
 	cwd := t.TempDir()
 
 	d := testDaemon(t)
@@ -553,10 +551,10 @@ func TestDedup_IsolatedSameContextReuses(t *testing.T) {
 		t.Fatalf("Spawn() isolated-2 error: %v", err)
 	}
 
-	if sid1 != sid2 {
-		t.Errorf("isolated servers with identical (cmd, args, cwd) must reuse owner: got %s vs %s", sid1, sid2)
+	if sid1 == sid2 {
+		t.Errorf("fresh isolated servers with identical (cmd, args, cwd) must not reuse owner: %s", sid1)
 	}
-	if d.OwnerCount() != 1 {
-		t.Errorf("OwnerCount = %d, want 1 for two isolated spawns of identical context", d.OwnerCount())
+	if d.OwnerCount() != 2 {
+		t.Errorf("OwnerCount = %d, want 2 for two fresh isolated spawns of identical context", d.OwnerCount())
 	}
 }

@@ -186,8 +186,8 @@ type Process struct {
 	// authorityMu protects the one-shot PGID/Job authority. Finalization,
 	// detach commit, and leader-exit cleanup atomically take and retire it.
 	authorityMu sync.Mutex
-	spawnPgid  int
-	jobHandle  uintptr
+	spawnPgid   int
+	jobHandle   uintptr
 
 	lineBuf *lineBuffer
 
@@ -248,14 +248,20 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// Stdin can still use StdinPipe: the caller drives writes and the pipe
 	// close is an intentional shutdown signal, not a race.
 	//
-	// Stderr uses StderrPipe but is synchronized the same way as stdout:
-	// a stderrDrained channel ensures proc.Wait() is only called after the
-	// stderr scanner goroutine has finished reading. Without that ordering,
-	// Cmd.Wait() closes the StderrPipe while the scanner may still be reading,
-	// which can silently drop the last lines of crash diagnostics.
+	// Stderr also uses an owned os.Pipe. procgroup starts cmd.Wait in its own
+	// reaper goroutine immediately after spawn, so exec.Cmd.StderrPipe would be
+	// invalid here: Cmd.Wait closes that pipe and can race the scanner, silently
+	// dropping the last crash diagnostics. Owned pipe ends remain valid until
+	// the drain goroutines close them explicitly.
 	stdoutR, stdoutW, pipeErr := os.Pipe()
 	if pipeErr != nil {
 		return nil, fmt.Errorf("upstream: os.Pipe: %w", pipeErr)
+	}
+	stderrR, stderrW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return nil, fmt.Errorf("upstream: stderr os.Pipe: %w", pipeErr)
 	}
 
 	// Capture pipe handles inside the PreStart callback so procgroup still owns
@@ -266,9 +272,10 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		Args:    args,
 		Dir:     cwd,
 		Env:     merged,
-		// stdout: use our own pipe (see rationale above). stdin / stderr
-		// still use exec.Cmd's built-in pipes.
+		// stdout/stderr: use owned pipes (see rationale above). stdin still
+		// uses exec.Cmd's built-in pipe because the caller drives writes.
 		Stdout:      stdoutW,
+		Stderr:      stderrW,
 		DisableTree: true,
 		PreStart: func(cmd *exec.Cmd) error {
 			stdin, err := cmd.StdinPipe()
@@ -276,14 +283,9 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 				captureErr = fmt.Errorf("upstream: stdin pipe: %w", err)
 				return captureErr
 			}
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				captureErr = fmt.Errorf("upstream: stderr pipe: %w", err)
-				return captureErr
-			}
 			p.stdin = stdin
 			p.stdout = stdoutR
-			p.stderr = stderr
+			p.stderr = stderrR
 			// Capture raw *os.File references for Detach(). stdoutR is always
 			// *os.File (from os.Pipe above). stdin from StdinPipe is also *os.File
 			// on all supported platforms; the type assertion is defensive.
@@ -302,12 +304,16 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	if err != nil {
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return nil, fmt.Errorf("upstream: spawn %s: %w", command, err)
 	}
 	if captureErr != nil {
 		// Should not happen — Spawn already propagates PreStart errors — but be safe.
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		_ = proc.Kill()
 		return nil, captureErr
 	}
@@ -317,12 +323,14 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// Scanner then sees EOF naturally. Without this close, the pipe never
 	// reaches EOF because one writer (us) remains open forever.
 	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
 	// Upstream owns the single transferable tree authority. Procgroup tree
 	// management is disabled for this spawn to avoid a second Job/PGID owner.
 	if err := afterSpawnWindows(p, proc.PID()); err != nil {
 		_ = proc.Kill()
 		_ = stdoutR.Close()
+		_ = stderrR.Close()
 		return nil, fmt.Errorf("upstream: tree authority: %w", err)
 	}
 
@@ -339,12 +347,10 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	p.lineBuf = newLineBuffer()
 
 	// stdoutDrained and stderrDrained are closed by their respective drain
-	// goroutines once the scanner has finished and markDoneWithErr has been
-	// called. The Wait goroutine blocks on both before calling proc.Wait(),
-	// guaranteeing that all output is consumed before the OS reclaims the
-	// pipes. Without this ordering, Cmd.Wait() closes the pipes (stdout via
-	// our os.Pipe close, stderr via StderrPipe's internal close) while the
-	// scanners may still be reading, causing data loss or spurious errors.
+	// goroutines once the scanners finish. Both read ends are owned here, so
+	// procgroup's concurrent cmd.Wait cannot close them. The finalizer still
+	// waits for both drains before publishing Process.Done, guaranteeing that
+	// all buffered output is visible to callers that observe completion.
 	stdoutDrained := make(chan struct{})
 	stderrDrained := make(chan struct{})
 
@@ -387,6 +393,7 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// goroutines have finished (see stdoutDrained/stderrDrained ordering).
 	go func() {
 		defer close(stderrDrained)
+		defer func() { _ = p.stderr.Close() }()
 		scanner := bufio.NewScanner(p.stderr)
 		scanner.Buffer(make([]byte, 64*1024), 64*1024) // 64KB — handles any build output line
 		for scanner.Scan() {

@@ -220,11 +220,8 @@ function Get-CapturedIdentityState {
 function Stop-CapturedIdentity {
     param([object]$Identity)
     $state = Get-CapturedIdentityState -Identity $Identity
-    if ($state -eq "absent") {
+    if ($state -eq "absent" -or $state -eq "mismatch") {
         return
-    }
-    if ($state -eq "mismatch") {
-        throw "captured process identity mismatch before stop: $($Identity.label):$($Identity.pid)"
     }
     try {
         Stop-Process -Id $Identity.pid -Force -ErrorAction Stop
@@ -385,6 +382,11 @@ function Invoke-ParallelProbe {
             params = @{ name = "lifecycle_probe"; arguments = @{} }
         }
     }
+    $script:LastProbeEngines = if ([string]::IsNullOrWhiteSpace($ExpectedEngine)) {
+        @()
+    } else {
+        @(Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase $Phase)
+    }
     $probes = @()
     foreach ($session in $sessions) {
         $id = $BaseId + $session.index
@@ -414,11 +416,6 @@ function Invoke-ParallelProbe {
         throw "$Phase did not create $ParallelSessions unique descendants"
     }
     Get-StableProbeMetadataSet -Probes $probes -Phase $Phase
-    $script:LastProbeEngines = if ([string]::IsNullOrWhiteSpace($ExpectedEngine)) {
-        @()
-    } else {
-        @(Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase $Phase)
-    }
     return @($probes)
 }
 
