@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,16 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	muxowner "github.com/thebtf/mcp-mux/muxcore/owner"
 )
+
+var isolatedTestNamespaceSeq atomic.Uint32
+
+func isolatedTestNamespace(prefix string) string {
+	return fmt.Sprintf("%s-%s-%s",
+		prefix,
+		strconv.FormatInt(int64(os.Getpid()), 36),
+		strconv.FormatUint(uint64(isolatedTestNamespaceSeq.Add(1)), 36),
+	)
+}
 
 func isolatedHandler(_ context.Context, stdin io.Reader, stdout io.Writer) error {
 	scanner := bufio.NewScanner(stdin)
@@ -168,6 +180,7 @@ func TestSpawn_ExplicitIsolatedFreshStormGetsPrivateOwners(t *testing.T) {
 	}
 	d, err := New(Config{
 		Name:         "explicit-isolated-fresh",
+		Namespace:    isolatedTestNamespace("e"),
 		ControlPath:  shortSocketPath(t, "explicit-isolated-fresh.ctl.sock"),
 		HandlerFunc:  countingHandler,
 		SkipSnapshot: true,
@@ -255,6 +268,7 @@ func TestSpawn_ExplicitIsolatedFreshStormGetsPrivateOwners(t *testing.T) {
 func TestRefreshSessionToken_IsolatedOwnerReattachesSameGeneration(t *testing.T) {
 	d, err := New(Config{
 		Name:         "isolated-refresh-same-generation",
+		Namespace:    isolatedTestNamespace("r"),
 		ControlPath:  shortSocketPath(t, "isolated-refresh-same-generation.ctl.sock"),
 		HandlerFunc:  isolatedCapabilityHandler,
 		SkipSnapshot: true,
@@ -329,6 +343,7 @@ func TestRefreshSessionToken_IsolatedOwnerReattachesSameGeneration(t *testing.T)
 func TestResilientClient_IsolatedIdleWakeReusesOwnerGeneration(t *testing.T) {
 	d, err := New(Config{
 		Name:         "isolated-idle-wake-same-generation",
+		Namespace:    isolatedTestNamespace("w"),
 		ControlPath:  shortSocketPath(t, "isolated-idle-wake-same-generation.ctl.sock"),
 		HandlerFunc:  isolatedCapabilityHandler,
 		SkipSnapshot: true,
@@ -470,6 +485,7 @@ func TestSpawn_GlobalAdmissionWaitsForSameCwdClassification(t *testing.T) {
 			name := fmt.Sprintf("same-cwd-admission-%s-%d", tc.name, time.Now().UnixNano())
 			d, err := New(Config{
 				Name:                   name,
+				Namespace:              isolatedTestNamespace("a" + tc.name[:1]),
 				ControlPath:            shortSocketPath(t, "same-cwd-admission-"+tc.name+".ctl.sock"),
 				HandlerFunc:            blockedToolsHandler(gate),
 				AdmissionBufferTimeout: time.Second,
@@ -537,6 +553,7 @@ func TestSpawn_IsolatedStormLeavesNoPendingAndReaps(t *testing.T) {
 	shortIdle := 20 * time.Millisecond
 	d, err := New(Config{
 		Name:                "isolated-pending-test",
+		Namespace:           isolatedTestNamespace("p"),
 		ControlPath:         shortSocketPath(t, "isolated-pending.ctl.sock"),
 		HandlerFunc:         isolatedHandler,
 		OwnerIdleTimeout:    time.Hour,
