@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -114,23 +113,56 @@ func TestAttachedCloseTimeoutTerminatesTransferredTree(t *testing.T) {
 	testAttachedTimeoutTermination(t, false)
 }
 
+func TestAttachedTimeoutTreeHelper(t *testing.T) {
+	switch os.Getenv(attachedLeaderHelperEnv) {
+	case "timeout-descendant":
+		time.Sleep(30 * time.Second)
+	case "timeout-leader":
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := exec.Command(exe, "-test.run=^TestAttachedTimeoutTreeHelper$")
+		child.Env = append(os.Environ(), attachedLeaderHelperEnv+"=timeout-descendant")
+		child.Stdout = os.Stdout
+		child.Stderr = io.Discard
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(child.Process.Pid); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(30 * time.Second)
+	}
+}
+
 func testAttachedTimeoutTermination(t *testing.T, soft bool) {
 	t.Helper()
-	var command string
-	var args []string
-	if runtime.GOOS == "windows" {
-		command = "ping"
-		args = []string{"-n", "30", "127.0.0.1"}
-	} else {
-		command = "sleep"
-		args = []string{"30"}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
 	}
-
-	proc, err := Start(command, args, nil, "", nil)
+	args := []string{"-test.run=^TestAttachedTimeoutTreeHelper$"}
+	proc, err := Start(exe, args, map[string]string{
+		attachedLeaderHelperEnv: "timeout-leader",
+	}, "", nil)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.AbortDetach() })
+	line, err := proc.ReadLine()
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	descendantPID, err := strconv.Atoi(string(line))
+	if err != nil {
+		t.Fatalf("parse descendant pid %q: %v", line, err)
+	}
+	waitDescendant, closeDescendantWaiter, err := processExitWaiter(descendantPID)
+	if err != nil {
+		t.Fatalf("watch descendant: %v", err)
+	}
+	defer closeDescendantWaiter()
 	waitLeader, closeWaiter, err := processExitWaiter(proc.PID())
 	if err != nil {
 		t.Fatalf("watch leader: %v", err)
@@ -148,7 +180,7 @@ func testAttachedTimeoutTermination(t *testing.T, soft bool) {
 	if err := proc.CommitDetach(); err != nil {
 		t.Fatalf("CommitDetach: %v", err)
 	}
-	adopted, err := AttachFromFDsWithAuthority(pid, stdinFD, stdoutFD, stderrFD, authorityFD, command, nil)
+	adopted, err := AttachFromFDsWithAuthority(pid, stdinFD, stdoutFD, stderrFD, authorityFD, exe, nil)
 	if err != nil {
 		t.Fatalf("AttachFromFDsWithAuthority: %v", err)
 	}
@@ -178,5 +210,8 @@ func testAttachedTimeoutTermination(t *testing.T, soft bool) {
 	}
 	if !waitLeader(5 * time.Second) {
 		t.Fatalf("attached leader pid %d survived SoftClose timeout escalation", pid)
+	}
+	if !waitDescendant(5 * time.Second) {
+		t.Fatalf("attached descendant pid %d survived SoftClose timeout escalation", descendantPID)
 	}
 }
