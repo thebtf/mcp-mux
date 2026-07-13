@@ -500,10 +500,14 @@ Planned-restart proof:
   PID/process tree, a complete accepted/aborted final partition, and no
   orphan descendant after final cleanup.
 
-Serena note: its web dashboard is configured separately from mux lifecycle. If
-the runtime proof uses Serena and the dashboard must not run, add
-`--enable-web-dashboard false` to `start-mcp-server`; do not treat a separately
-configured dashboard as evidence that muxcore leaked an upstream descendant.
+Serena note: its web dashboard is configured separately from mux lifecycle. To
+prevent automatic dashboard opening during a Serena runtime proof, add
+`--open-web-dashboard false` to `start-mcp-server` or set
+`web_dashboard_open_on_launch: false` in `serena_config.yml`; these leave the
+dashboard active. Set `web_dashboard: false` only when the dashboard itself
+must be disabled. Do not treat dashboard configuration as evidence that muxcore
+leaked an upstream descendant; see the [Serena dashboard
+documentation](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
 Broken signals:
 

@@ -204,10 +204,11 @@ no daemon is running.
 negative value disables that stage; invalid values keep the default. These are
 separate from owner cleanup and daemon auto-exit settings.
 
-Serena's web dashboard is a separate Serena feature, not a mux lifecycle
-process. If it should not run, pass `--enable-web-dashboard false` to Serena's
-`start-mcp-server` command or set `web_dashboard: false` in
-`serena_config.yml`; see the
+Serena's web dashboard is configured separately from mux lifecycle. To prevent
+it opening automatically, pass `--open-web-dashboard false` to Serena's
+`start-mcp-server` command or set `web_dashboard_open_on_launch: false` in
+`serena_config.yml`; this leaves the dashboard active. Set
+`web_dashboard: false` only when the dashboard itself must be disabled; see the
 [Serena dashboard documentation](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
 **Disable daemon mode** (legacy per-session owner behavior):
