@@ -85,6 +85,61 @@ func TestPreRegisterBind(t *testing.T) {
 	}
 }
 
+func TestPreRegisterClonesMutableEnv(t *testing.T) {
+	sm := NewManager()
+	env := map[string]string{"TOKEN": "original"}
+	sm.PreRegisterForOwner("clone-token", "clone-owner", "/project", env)
+	env["TOKEN"] = "mutated"
+	env["LATE"] = "added"
+
+	s := &Session{ID: 2001}
+	sm.RegisterSession(s, "")
+	if ok := sm.Bind("clone-token", "clone-owner", s); !ok {
+		t.Fatal("Bind returned false for cloned pending env")
+	}
+	if got := s.Env["TOKEN"]; got != "original" {
+		t.Fatalf("bound TOKEN = %q, want original", got)
+	}
+	if _, ok := s.Env["LATE"]; ok {
+		t.Fatal("late caller mutation leaked into pending env")
+	}
+}
+
+func TestNilSessionContextDoesNotRefreshUnrelatedHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		act  func(*Manager)
+	}{
+		{
+			name: "replace",
+			act: func(sm *Manager) {
+				sm.RegisterSession(&Session{ID: 77}, "")
+			},
+		},
+		{
+			name: "remove",
+			act: func(sm *Manager) {
+				sm.RemoveSession(77)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := NewManager()
+			lastUsed := time.Unix(123, 0)
+			sm.sessions[77] = &Context{}
+			sm.bound["historical"] = &boundHistory{
+				OwnerKey: "owner",
+				LastUsed: lastUsed,
+			}
+
+			tc.act(sm)
+			if got := sm.bound["historical"].LastUsed; !got.Equal(lastUsed) {
+				t.Fatalf("unrelated historical LastUsed = %v, want %v", got, lastUsed)
+			}
+		})
+	}
+}
+
 func TestPreRegisterForOwnerAndRemovePendingForOwner(t *testing.T) {
 	sm := NewManager()
 

@@ -1052,6 +1052,9 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 						reqPtr.Mode = "isolated"
 						return "", "", "", errSpawnRetry
 					}
+					if req.Cwd != "" {
+						e.Owner.AddCwd(req.Cwd)
+					}
 				}
 				if !e.Owner.PreRegister(token, req.Cwd, req.Env) {
 					if e.Owner.IsClassifiedIsolated() {
@@ -1131,6 +1134,9 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 						d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
 						reqPtr.Mode = "isolated"
 						return "", "", "", errSpawnRetry
+					}
+					if req.Cwd != "" {
+						probeOwner.AddCwd(req.Cwd)
 					}
 				}
 				if !probeOwner.PreRegister(token, req.Cwd, req.Env) {

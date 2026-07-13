@@ -183,7 +183,7 @@ func (sm *Manager) ImportBoundHistory(entries []BoundHistorySnapshot) int {
 func (sm *Manager) RegisterSession(session *Session, cwd string) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	if previous := sm.sessions[session.ID]; previous != nil && previous.Session != session {
+	if previous := sm.sessions[session.ID]; previous != nil && previous.Session != nil && previous.Session != session {
 		now := sm.currentTime()
 		for _, hist := range sm.bound {
 			if hist.Session == previous.Session {
@@ -203,7 +203,7 @@ func (sm *Manager) RemoveSession(sessionID int) {
 	removed := sm.sessions[sessionID]
 	delete(sm.sessions, sessionID)
 	delete(sm.lastActive, sessionID)
-	if removed != nil {
+	if removed != nil && removed.Session != nil {
 		now := sm.currentTime()
 		for _, hist := range sm.bound {
 			if hist.Session == removed.Session {
@@ -238,7 +238,7 @@ func (sm *Manager) PreRegisterForOwner(token, ownerKey, cwd string, env map[stri
 	sm.pending[token] = &pendingSession{
 		OwnerKey:  ownerKey,
 		Cwd:       cwd,
-		Env:       env,
+		Env:       cloneEnv(env),
 		CreatedAt: sm.currentTime(),
 	}
 }

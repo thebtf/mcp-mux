@@ -74,7 +74,10 @@ func resumeProcessThreads(pid int) error {
 				return fmt.Errorf("ResumeThread %d: %w", entry.ThreadID, resumeErr)
 			}
 			if previous == 0 {
-				return fmt.Errorf("ResumeThread %d: thread was not suspended", entry.ThreadID)
+				// CREATE_SUSPENDED applies to the primary thread. Security,
+				// monitoring, or debugger software may inject an already-running
+				// thread before this snapshot; it is not our suspension to release.
+				continue
 			}
 			resumed++
 		}
