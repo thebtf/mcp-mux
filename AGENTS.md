@@ -71,8 +71,35 @@ do not call the full critical muxcore scope shipped.
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
 ```
+
+### v0.27.1 - idle-gate rolling-compatibility hotfix
+
+**No required consumer code changes for ordinary `engine.New` users.** This
+patch closes the control-plane retry herd discovered after the v0.27.0
+lifecycle release:
+
+- a v0.27.1 shim talking to a pre-v0.27 daemon treats the legacy
+  `unknown command: can_suspend` response as a permanent unavailable safety
+  gate for that connected shim. It keeps the data-plane IPC session open and
+  stops polling instead of opening a fresh control connection every five
+  seconds;
+- unknown-token, owner-gone, persistent-owner, malformed, missing, and other
+  non-transient protocol verdicts follow the same fail-closed one-shot path.
+  Transport failure and daemon shutdown remain retryable with capped,
+  per-token jittered exponential backoff; busy, pending-request, and
+  active-progress denials remain recheckable;
+- product shims send the spawn-returned `server_id` with `can_suspend`, so the
+  daemon checks exactly one owner's reconnect history. Legacy callers that omit
+  `server_id` retain the compatibility scan, while cross-owner and stale-token
+  checks still fail closed.
+
+Consumer impact: update to v0.27.1. Existing v0.27.0 shim engines must enter the
+new binary generation before the permanent-retry fix applies; the stable
+launcher/active-engine update path performs that replacement without requiring
+consumer source changes. Do not add product-local gate polling, token indexes,
+or stale-process kill loops.
 
 ### v0.27.0 - lifecycle convergence and process-tree authority
 
@@ -108,12 +135,13 @@ For direct `owner.RunResilientClient` consumers, the new
 always-connected shim behavior. The private launcher dormant notifications and
 exit code are an `mcp-mux` product protocol, not a consumer API to copy.
 
-Consumer impact: update to v0.27.0. Do not add product-local request replay,
+Consumer impact: update to v0.27.1. Do not add product-local request replay,
 shim polling, stale-process sweeps, PID-only kills, launcher respawn loops, or
 handoff retry protocols; those compete with muxcore ownership. If Serena's web
-dashboard must not run, disable it in Serena itself with
-`--enable-web-dashboard false` or `web_dashboard: false` in
-`serena_config.yml`; dashboard policy is separate from muxcore tree cleanup.
+dashboard should not open automatically, use `--open-web-dashboard false` or
+`web_dashboard_open_on_launch: false`. To disable the dashboard service itself,
+set `web_dashboard: false` in `serena_config.yml`; dashboard policy is separate
+from muxcore tree cleanup.
 
 Rollback: point the product back to its previous muxcore/binary. Expect the
 first restart across the v2/v1 boundary to take the same bounded snapshot

@@ -7,6 +7,35 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-07-13
+
+### Fixed
+
+- Fixed a permanent `can_suspend` retry herd during rolling coexistence: a
+  v0.27 shim could retry the v0.26.13 `unknown command: can_suspend` response
+  every five seconds, driving the daemon to multiple CPU cores when hundreds of
+  retained transports were present.
+- Fixed malformed, missing, unknown-token, owner-gone, and persistent-owner
+  gate outcomes being retried indefinitely. They now keep the data-plane IPC
+  connection open and disable idle suspension for that connection.
+- Fixed healthy `can_suspend` checks scaling with daemon owner count. Product
+  shims now send the exact spawn-returned owner ID, while the owner-local token
+  history and current owner entry remain authoritative.
+
+### Changed
+
+- Retryable daemon/transport failures now use capped per-token exponential
+  backoff with jitter. Busy, pending-request, and active-progress denials remain
+  recheckable without a synchronized fixed cadence.
+
+### Verification
+
+- Added the exact v0.26.13 wire response, malformed-response, live cross-owner,
+  stale same-ID recreation, deterministic lookup-count, and retry-cap tests.
+- Added mixed-version runtime proof with a real v0.26.13 daemon and v0.27.1
+  shim: one failed gate probe, no later polling across two former retry windows,
+  live host stdio, and zero run-scoped survivors.
+
 ## [0.27.0] - 2026-07-13
 
 ### Added
@@ -62,5 +91,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/thebtf/mcp-mux/compare/v0.26.13...v0.27.0

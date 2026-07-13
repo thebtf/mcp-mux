@@ -14,10 +14,10 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
 ```
 
-Use v0.27.0 as the current consumer target. It includes the v0.25.3 native
+Use v0.27.1 as the current consumer target. It includes the v0.25.3 native
 SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
@@ -31,7 +31,26 @@ request. Reconnect timeout now enters degraded retry instead of closing the
 parent stdio transport, and zero-session disposable owners are cleaned
 automatically after a short safety-gated delay. v0.27.0 adds opt-in shim
 idle/dormant controls, protocol-v2 tree-authority handoff, and full process-tree
-containment.
+containment. v0.27.1 prevents permanent idle-gate outcomes from creating a
+control-plane retry herd and binds normal product gate checks to one exact
+owner.
+
+### v0.27.1 - idle-gate rolling-compatibility hotfix
+
+**No required consumer code changes for ordinary `engine.New` users.** Direct
+`owner.RunResilientClient` consumers that opt into `IdleSuspendGate` gain safer
+failure handling:
+
+- `owner.ErrIdleSuspendGateUnavailable` keeps the current IPC connection open
+  and disables further suspension attempts for that connection;
+- transient gate errors use capped, per-token jittered exponential backoff;
+- the product daemon's additive `control.SuspendCheckForOwnerHandler` path uses
+  the spawn-returned owner ID to avoid daemon-wide token-history scans. The
+  legacy `SuspendCheckHandler` path remains available for older callers.
+
+The safety contract remains fail closed: an unavailable or invalid gate never
+authorizes suspension. Persistent owners and owners with pending requests,
+active progress, or declared busy work remain connected.
 
 ### v0.27.0 - lifecycle convergence and process-tree authority
 
