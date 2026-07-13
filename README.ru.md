@@ -412,7 +412,7 @@ stdio-транспорт, но не воспроизводит уже отпра
 
 - Upstream спавнится с `Setpgid=true` — ядро помещает потомка в собственную process group.
 - Плановый рестарт: старый daemon открывает Unix domain socket, новый daemon подключается
-  с 128-битным общим токеном, FDs (stdin, stdout) передаются через SCM_RIGHTS ancillary
+  с 128-битным общим токеном, FDs (stdin, stdout, stderr) передаются через SCM_RIGHTS ancillary
   control message.
 - Очистка нацеливается на process group, включая потомков, которые пережили
   лидера или унаследовали его stdio. При handoff v2 полномочия над PGID сохраняются

@@ -14,7 +14,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added bounded shim idle suspension and launcher dormancy. Disposable product
   shims park their daemon session after safe inactivity, retain exact-owner
   reconnect for a grace window, and wake only when the host sends new demand.
-- Added handoff protocol v2 for transactional transfer of owner stdio and the
+- Added handoff protocol v2 for transactional transfer of owner stdin, stdout,
+  stderr, and the
   single process-tree authority across same-version engine replacement.
 - Added cross-platform process-lifecycle acceptance covering eight parallel
   isolated sessions, launcher-only convergence, demand wake, installed

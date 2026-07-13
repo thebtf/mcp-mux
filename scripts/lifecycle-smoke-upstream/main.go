@@ -66,7 +66,8 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var req request
-		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil || len(req.ID) == 0 {
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil ||
+			req.JSONRPC != "2.0" || len(req.ID) == 0 || string(req.ID) == "null" {
 			continue
 		}
 		var result any

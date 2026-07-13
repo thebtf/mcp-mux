@@ -290,14 +290,12 @@ func (u *unixFDConn) RecvFDs() ([]uintptr, []byte, error) {
 }
 
 func (u *unixFDConn) handoffSchema() handoffHandleSchema {
-	return handoffHandleSchema{count: 2}
+	return handoffHandleSchema{count: 3}
 }
 
 func (u *unixFDConn) closeReceivedHandles(fds []uintptr) {
 	for _, fd := range fds {
-		if fd != 0 {
-			_ = syscall.Close(int(fd))
-		}
+		_ = syscall.Close(int(fd))
 	}
 }
 

@@ -127,6 +127,8 @@ type resilientClient struct {
 	effectiveIdleDelay atomic.Int64
 	lastHostActivity   atomic.Int64
 	localWork          atomic.Int64
+	suspendMu          sync.Mutex
+	suspending         bool
 	closed             atomic.Bool
 	dormantMu          sync.Mutex
 	dormantCommitted   bool
@@ -252,6 +254,7 @@ func (rc *resilientClient) runStdinReader(done chan<- error) {
 
 		raw := make([]byte, len(msg.Raw))
 		copy(raw, msg.Raw)
+		rc.suspendMu.Lock()
 		rc.lastHostActivity.Store(time.Now().UnixNano())
 
 		if msg.IsRequest() {
@@ -271,6 +274,7 @@ func (rc *resilientClient) runStdinReader(done chan<- error) {
 			}
 			rc.msgFromCC <- raw
 		}
+		rc.suspendMu.Unlock()
 	}
 }
 
@@ -301,10 +305,14 @@ func (rc *resilientClient) runProxy(conn interface {
 	io.Closer
 }, stdoutMu *sync.Mutex, stdinDone <-chan error) error {
 	for {
+		rc.suspendMu.Lock()
+		rc.suspending = false
+		rc.suspendMu.Unlock()
+
 		ipcEOF := make(chan struct{})
 		go rc.runIPCReader(conn, ipcEOF)
 
-		writerDone := make(chan struct{})
+		writerDone := make(chan []byte, 1)
 		go rc.runIPCWriter(conn, ipcEOF, writerDone)
 
 		var idleTicker *time.Ticker
@@ -429,7 +437,7 @@ func (rc *resilientClient) runProxy(conn interface {
 						continue connected
 					}
 				}
-				if !rc.shouldIdleSuspend() {
+				if !rc.beginIdleSuspend() {
 					continue connected
 				}
 				if idleTicker != nil {
@@ -438,9 +446,9 @@ func (rc *resilientClient) runProxy(conn interface {
 				delay := time.Duration(rc.effectiveIdleDelay.Load())
 				rc.log.Printf("shim.suspend.idle after=%s", delay)
 				conn.Close()
-				<-writerDone
+				deferred := <-writerDone
 
-				demand, graceExpired, err := rc.waitForSuspendedDemand(stdinDone)
+				demand, graceExpired, err := rc.waitForSuspendedDemand(stdinDone, deferred)
 				if err != nil {
 					if errors.Is(err, io.EOF) {
 						return nil
@@ -502,7 +510,17 @@ func (rc *resilientClient) shouldIdleSuspend() bool {
 	return time.Since(time.Unix(0, last)) >= delay
 }
 
-func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error) ([]byte, bool, error) {
+func (rc *resilientClient) beginIdleSuspend() bool {
+	rc.suspendMu.Lock()
+	defer rc.suspendMu.Unlock()
+	if !rc.shouldIdleSuspend() {
+		return false
+	}
+	rc.suspending = true
+	return true
+}
+
+func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error, deferred []byte) ([]byte, bool, error) {
 	var graceTimer *time.Timer
 	var graceC <-chan time.Time
 	if rc.cfg.IdleDormantGrace > 0 {
@@ -511,18 +529,30 @@ func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error) ([]byt
 		graceC = graceTimer.C
 	}
 
-	select {
-	case data := <-rc.msgFromCC:
-		return data, false, nil
-	case err := <-stdinDone:
-		if err == io.EOF {
-			return nil, false, io.EOF
+	for {
+		var data []byte
+		if deferred != nil {
+			data = deferred
+			deferred = nil
+		} else {
+			select {
+			case data = <-rc.msgFromCC:
+			case err := <-stdinDone:
+				if err == io.EOF {
+					return nil, false, io.EOF
+				}
+				return nil, false, fmt.Errorf("resilient: stdin while suspended: %w", err)
+			case <-rc.stdoutDead:
+				return nil, false, io.EOF
+			case <-graceC:
+				return nil, true, nil
+			}
 		}
-		return nil, false, fmt.Errorf("resilient: stdin while suspended: %w", err)
-	case <-rc.stdoutDead:
-		return nil, false, io.EOF
-	case <-graceC:
-		return nil, true, nil
+		if msg, err := jsonrpc.Parse(data); err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
+			rc.localWork.Add(-1)
+			continue
+		}
+		return data, false, nil
 	}
 }
 
@@ -644,13 +674,21 @@ func (rc *resilientClient) observeIPCResponse(data []byte) {
 // Stops when ipcEOF is closed (preventing writes to a dead connection).
 // Closes writerDone when it exits.
 // Tracks request IDs so orphaned in-flight requests can get error responses on reconnect.
-func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, writerDone chan<- struct{}) {
-	defer close(writerDone)
+func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, writerDone chan<- []byte) {
+	var deferred []byte
+	defer func() { writerDone <- deferred }()
 	for {
 		select {
 		case <-ipcEOF:
 			return
 		case data := <-rc.msgFromCC:
+			rc.suspendMu.Lock()
+			suspending := rc.suspending
+			rc.suspendMu.Unlock()
+			if suspending {
+				deferred = data
+				return
+			}
 			if msg, err := jsonrpc.Parse(data); err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
 				rc.localWork.Add(-1)
 				continue
@@ -1022,6 +1060,8 @@ func (rc *resilientClient) injectFrame(b []byte) error {
 	// Copy the caller's buffer — they may reuse or pool it after inject returns.
 	data := make([]byte, len(b))
 	copy(data, b)
+	rc.suspendMu.Lock()
+	defer rc.suspendMu.Unlock()
 	rc.lastHostActivity.Store(time.Now().UnixNano())
 	rc.localWork.Add(1)
 	select {

@@ -17,6 +17,31 @@ import (
 	"time"
 )
 
+func TestBeginExitFinalizationSerializesDetachLease(t *testing.T) {
+	t.Run("exit wins", func(t *testing.T) {
+		p := &Process{pid: 1, detach: detachAttached}
+		if !p.beginExitFinalization() {
+			t.Fatal("exit finalizer did not claim attached process")
+		}
+		if _, _, _, _, _, err := p.DetachWithAuthority(); !errors.Is(err, ErrAlreadyClosed) {
+			t.Fatalf("DetachWithAuthority after exit claim = %v, want ErrAlreadyClosed", err)
+		}
+	})
+
+	t.Run("detach wins", func(t *testing.T) {
+		p := &Process{pid: 1, detach: detachPrepared}
+		if p.beginExitFinalization() {
+			t.Fatal("exit finalizer stole a prepared detach lease")
+		}
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
+			t.Fatal("prepared detach was marked closed by exit finalizer")
+		}
+	})
+}
+
 func TestStartAndClose(t *testing.T) {
 	// Use a simple process that exits immediately
 	var cmd string

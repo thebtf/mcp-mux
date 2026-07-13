@@ -641,10 +641,17 @@ Most consumers should use `engine.Run` and the daemon control command instead
 of calling this directly. The direct API is useful when implementing a custom
 daemon supervisor.
 
-The current wire contract is `protocol_version: 2`. It transfers stdio and the
+The current wire contract is `protocol_version: 2`. It transfers stdin,
+stdout, stderr, and the
 platform tree authority, then commits predecessor detach only after the final
 accepted/aborted partition. A v1 peer is rejected during `Hello`, before any
 detach, so the caller can take the bounded snapshot-backed respawn path.
+
+The existing `NewFdTransferMsg(serverID, stdinMeta, stdoutMeta)` constructor
+remains source-compatible and supplies the protocol-v2 stderr metadata default.
+Code that constructs transfers explicitly should prefer
+`NewFdTransferMsgWithStderr`; every v2 `HandoffUpstream` must provide a valid
+`StderrFD`.
 
 ### Quick start
 
@@ -706,8 +713,8 @@ defer daemon.DeleteHandoffToken(path)
 
 | Platform | Requirement |
 | --- | --- |
-| Unix (Linux, macOS) | `conn` must be `*net.UnixConn`; stdio file descriptors transfer with `SCM_RIGHTS`, while the process-group id remains the tree authority. |
-| Windows | `conn` must be a winio named-pipe connection; stdio and the Job Object authority transfer with `DuplicateHandle`. |
+| Unix (Linux, macOS) | `conn` must be `*net.UnixConn`; stdin, stdout, and stderr file descriptors transfer with `SCM_RIGHTS`, while the process-group id remains the tree authority. |
+| Windows | `conn` must be a winio named-pipe connection; stdin, stdout, stderr, and the Job Object authority transfer with `DuplicateHandle`. |
 
 On Windows the successor PID is supplied automatically through the handoff
 protocol's `HelloMsg.SourcePID`; no additional caller configuration is needed.

@@ -89,7 +89,9 @@ func TestReadyMsgRoundtrip(t *testing.T) {
 // TestFdTransferMsgRoundtrip verifies FdTransferMsg round-trips including
 // both HandleMeta nested structs.
 func TestFdTransferMsgRoundtrip(t *testing.T) {
-	orig := NewFdTransferMsg("ab3c", HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"}, HandleMeta{Kind: "tree_authority"})
+	orig := NewFdTransferMsgWithStderr(
+		"ab3c", HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"}, HandleMeta{Kind: "stderr"}, HandleMeta{Kind: "tree_authority"},
+	)
 	if orig.Type != MsgFdTransfer {
 		t.Fatalf("NewFdTransferMsg: Type = %q, want %q", orig.Type, MsgFdTransfer)
 	}
@@ -121,8 +123,24 @@ func TestFdTransferMsgRoundtrip(t *testing.T) {
 	if got.StdoutHandleMeta.Kind != orig.StdoutHandleMeta.Kind {
 		t.Errorf("StdoutHandleMeta.Kind: got %q, want %q", got.StdoutHandleMeta.Kind, orig.StdoutHandleMeta.Kind)
 	}
+	if got.StderrHandleMeta.Kind != orig.StderrHandleMeta.Kind {
+		t.Errorf("StderrHandleMeta.Kind: got %q, want %q", got.StderrHandleMeta.Kind, orig.StderrHandleMeta.Kind)
+	}
 	if got.AuthorityHandleMeta == nil || got.AuthorityHandleMeta.Kind != "tree_authority" {
 		t.Errorf("AuthorityHandleMeta: got %+v, want tree_authority", got.AuthorityHandleMeta)
+	}
+}
+
+func TestNewFdTransferMsg_LegacySignatureBuildsV2StderrMetadata(t *testing.T) {
+	msg := NewFdTransferMsg("legacy", HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"})
+	if msg.ProtocolVersion != HandoffProtocolVersion {
+		t.Fatalf("ProtocolVersion = %d, want %d", msg.ProtocolVersion, HandoffProtocolVersion)
+	}
+	if msg.StderrHandleMeta.Kind != "stderr" {
+		t.Fatalf("StderrHandleMeta.Kind = %q, want stderr", msg.StderrHandleMeta.Kind)
+	}
+	if msg.AuthorityHandleMeta != nil {
+		t.Fatalf("AuthorityHandleMeta = %+v, want nil", msg.AuthorityHandleMeta)
 	}
 }
 
@@ -390,7 +408,7 @@ func TestMessageTypeField(t *testing.T) {
 		{
 			name:     "FdTransferMsg",
 			wantType: MsgFdTransfer,
-			gotType:  NewFdTransferMsg("id", HandleMeta{Kind: "pipe"}, HandleMeta{Kind: "pipe"}).Type,
+			gotType:  NewFdTransferMsgWithStderr("id", HandleMeta{Kind: "pipe"}, HandleMeta{Kind: "pipe"}, HandleMeta{Kind: "pipe"}).Type,
 		},
 		{
 			name:     "AckTransferMsg",

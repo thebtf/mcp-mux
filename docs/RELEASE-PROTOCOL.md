@@ -48,6 +48,10 @@ Before tagging or publishing:
    .\tests\critical\run-all.ps1 -TimeoutSeconds 120
    ```
 
+   The current-topology oracle also needs `mcp-launcher`. If it is not on
+   `PATH`, pass `-Launcher C:\path\to\mcp-launcher.exe` or set
+   `MCP_LAUNCHER`; the critical report records the resolved path.
+
    The existing critical suite is necessary but not sufficient for v0.27.0:
    release evidence must also cover idle-to-dormant wake, full-tree cleanup on
    Windows and Unix, one v1-to-v2 bounded snapshot respawn, and one same-v2

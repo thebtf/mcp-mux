@@ -9,17 +9,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func duplicateAttachHandles(stdinFD, stdoutFD, authorityFD uintptr) (uintptr, uintptr, uintptr, error) {
+func duplicateAttachHandles(stdinFD, stdoutFD, stderrFD, authorityFD uintptr) (uintptr, uintptr, uintptr, uintptr, error) {
 	in, err := unix.Dup(int(stdinFD))
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	out, err := unix.Dup(int(stdoutFD))
 	if err != nil {
 		_ = unix.Close(in)
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
-	return uintptr(in), uintptr(out), authorityFD, nil
+	errOut, err := unix.Dup(int(stderrFD))
+	if err != nil {
+		_ = unix.Close(in)
+		_ = unix.Close(out)
+		return 0, 0, 0, 0, err
+	}
+	return uintptr(in), uintptr(out), uintptr(errOut), authorityFD, nil
 }
 
 func processExitWaiter(pid int) (func(time.Duration) bool, func(), error) {

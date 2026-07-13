@@ -73,6 +73,7 @@ type HandoffUpstream struct {
 	PID         int
 	StdinFD     uintptr
 	StdoutFD    uintptr
+	StderrFD    uintptr
 	AuthorityFD uintptr
 
 	abort  func() error
@@ -195,7 +196,7 @@ func performHandoffAfterHello(ctx context.Context, conn fdConn, upstreams []Hand
 			return HandoffResult{Phase: "ready"}, fmt.Errorf("performHandoff: duplicate server_id %q", u.ServerID)
 		}
 		seen[u.ServerID] = struct{}{}
-		if u.PID <= 0 || u.StdinFD == 0 || u.StdoutFD == 0 ||
+		if u.PID <= 0 || u.StdinFD == 0 || u.StdoutFD == 0 || u.StderrFD == 0 ||
 			(schema.requiresAuthority && u.AuthorityFD == 0) ||
 			(!schema.requiresAuthority && u.AuthorityFD != 0) {
 			preAborted = append(preAborted, u.ServerID)
@@ -215,12 +216,13 @@ func performHandoffAfterHello(ctx context.Context, conn fdConn, upstreams []Hand
 	receipted := make([]string, 0, len(ready))
 	rejected := make([]string, 0)
 	for _, u := range ready {
-		meta := NewFdTransferMsg(
+		meta := NewFdTransferMsgWithStderr(
 			u.ServerID,
 			HandleMeta{Kind: "stdin"},
 			HandleMeta{Kind: "stdout"},
+			HandleMeta{Kind: "stderr"},
 		)
-		handles := []uintptr{u.StdinFD, u.StdoutFD}
+		handles := []uintptr{u.StdinFD, u.StdoutFD, u.StderrFD}
 		if schema.requiresAuthority {
 			authority := HandleMeta{Kind: "tree_authority"}
 			meta.AuthorityHandleMeta = &authority
@@ -485,9 +487,10 @@ func prepareHandoffReceive(ctx context.Context, conn fdConn, token string) (rece
 			PID:      ref.PID,
 			StdinFD:  fds[0],
 			StdoutFD: fds[1],
+			StderrFD: fds[2],
 		}
 		if schema.requiresAuthority {
-			u.AuthorityFD = fds[2]
+			u.AuthorityFD = fds[3]
 		}
 		receipt.received[u.ServerID] = u
 		receipt.owned[u.ServerID] = true
@@ -536,7 +539,7 @@ func validateTransfer(transfer FdTransferMsg, refs map[string]UpstreamRef, recei
 	if len(fds) != schema.count {
 		return fmt.Errorf("receiveHandoff: server_id %q received %d handles, want %d", transfer.ServerID, len(fds), schema.count)
 	}
-	if transfer.StdinHandleMeta.Kind != "stdin" || transfer.StdoutHandleMeta.Kind != "stdout" {
+	if transfer.StdinHandleMeta.Kind != "stdin" || transfer.StdoutHandleMeta.Kind != "stdout" || transfer.StderrHandleMeta.Kind != "stderr" {
 		return fmt.Errorf("receiveHandoff: invalid stdio metadata for %q", transfer.ServerID)
 	}
 	if schema.requiresAuthority {
@@ -657,7 +660,7 @@ func (r *handoffReceipt) closeOwned() {
 			continue
 		}
 		u := r.received[id]
-		fds := []uintptr{u.StdinFD, u.StdoutFD}
+		fds := []uintptr{u.StdinFD, u.StdoutFD, u.StderrFD}
 		if u.AuthorityFD != 0 {
 			fds = append(fds, u.AuthorityFD)
 		}
@@ -695,9 +698,9 @@ func receiveHandoff(ctx context.Context, conn fdConn, token string) ([]HandoffUp
 		accepted = append(accepted, u.ServerID)
 	}
 	if err := receipt.finalize(accepted); err != nil {
-		fds := make([]uintptr, 0, len(received)*3)
+		fds := make([]uintptr, 0, len(received)*4)
 		for _, u := range received {
-			fds = append(fds, u.StdinFD, u.StdoutFD)
+			fds = append(fds, u.StdinFD, u.StdoutFD, u.StderrFD)
 			if u.AuthorityFD != 0 {
 				fds = append(fds, u.AuthorityFD)
 			}

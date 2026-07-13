@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
 
 // ErrAlreadyShutDown is returned by ShutdownForHandoff if Shutdown (or a prior
@@ -22,6 +23,7 @@ type HandoffPayload struct {
 	PID         int
 	StdinFD     uintptr
 	StdoutFD    uintptr
+	StderrFD    uintptr
 	AuthorityFD uintptr
 	Command     string
 	Args        []string
@@ -96,11 +98,12 @@ func (o *Owner) teardownExceptUpstream() {
 //
 // Error cases:
 //   - ErrAlreadyShutDown — Shutdown or ShutdownForHandoff was already called.
-//     o.done may or may not be closed depending on how shutdown originally ended.
+//     o.done reflects how that earlier shutdown completed.
 //   - ErrNoUpstream — owner has no subprocess to hand off (nil upstream).
-//     o.done is NOT closed; the owner remains in a limbo state.
+//     The already-torn-down owner is completed and o.done is closed.
 //   - wrapped upstream.ErrAlreadyDetached / ErrDetachUnsupported — Detach failed.
-//     o.done is NOT closed; the owner remains in a limbo state.
+//     The upstream is aborted or closed, then o.done is closed. A failed handoff
+//     never leaves a torn-down owner or process tree in limbo.
 func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 	var payload HandoffPayload
 	var retErr error
@@ -117,15 +120,21 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 
 		if up == nil {
 			retErr = ErrNoUpstream
-			// Do NOT close(o.done) — owner failed to hand off; caller must
-			// decide whether to hard-shutdown or retry.
+			close(o.done)
 			return
 		}
 
-		pid, stdinFD, stdoutFD, authorityFD, err := up.DetachWithAuthority()
+		pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := up.DetachWithAuthority()
 		if err != nil {
-			retErr = fmt.Errorf("owner: detach upstream: %w", err)
-			// Do NOT close(o.done) — detach failed; upstream is still owned.
+			cleanupErr := up.AbortDetach()
+			if errors.Is(cleanupErr, upstream.ErrDetachNotPrepared) {
+				cleanupErr = up.Close()
+			} else {
+				cleanupErr = errors.Join(cleanupErr, up.Close())
+			}
+			retErr = errors.Join(fmt.Errorf("owner: detach upstream: %w", err), cleanupErr)
+			o.logger.Printf("owner handoff failed; upstream terminated: %v", retErr)
+			close(o.done)
 			return
 		}
 
@@ -134,6 +143,7 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 			PID:         pid,
 			StdinFD:     stdinFD,
 			StdoutFD:    stdoutFD,
+			StderrFD:    stderrFD,
 			AuthorityFD: authorityFD,
 			Command:     o.command,
 			Args:        o.args,

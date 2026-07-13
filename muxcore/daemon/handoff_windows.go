@@ -270,7 +270,7 @@ func (w *windowsFDConn) RecvFDs() ([]uintptr, []byte, error) {
 }
 
 func (w *windowsFDConn) handoffSchema() handoffHandleSchema {
-	return handoffHandleSchema{count: 3, requiresAuthority: true}
+	return handoffHandleSchema{count: 4, requiresAuthority: true}
 }
 
 func (w *windowsFDConn) closeReceivedHandles(fds []uintptr) {

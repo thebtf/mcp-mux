@@ -17,23 +17,30 @@ func duplicateAttachHandle(handle uintptr) (uintptr, error) {
 	return uintptr(duplicate), err
 }
 
-func duplicateAttachHandles(stdinFD, stdoutFD, authorityFD uintptr) (uintptr, uintptr, uintptr, error) {
+func duplicateAttachHandles(stdinFD, stdoutFD, stderrFD, authorityFD uintptr) (uintptr, uintptr, uintptr, uintptr, error) {
 	in, err := duplicateAttachHandle(stdinFD)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	out, err := duplicateAttachHandle(stdoutFD)
 	if err != nil {
 		_ = windows.CloseHandle(windows.Handle(in))
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
+	}
+	errOut, err := duplicateAttachHandle(stderrFD)
+	if err != nil {
+		_ = windows.CloseHandle(windows.Handle(in))
+		_ = windows.CloseHandle(windows.Handle(out))
+		return 0, 0, 0, 0, err
 	}
 	authority, err := duplicateAttachHandle(authorityFD)
 	if err != nil {
 		_ = windows.CloseHandle(windows.Handle(in))
 		_ = windows.CloseHandle(windows.Handle(out))
-		return 0, 0, 0, err
+		_ = windows.CloseHandle(windows.Handle(errOut))
+		return 0, 0, 0, 0, err
 	}
-	return in, out, authority, nil
+	return in, out, errOut, authority, nil
 }
 
 func processExitWaiter(pid int) (func(time.Duration) bool, func(), error) {

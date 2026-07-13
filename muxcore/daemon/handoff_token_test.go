@@ -28,7 +28,7 @@ func (c *jsonFDConn) WriteJSON(v any) error                      { return nil }
 func (c *jsonFDConn) ReadJSON(v any) error                       { b := <-c.readCh; return json.Unmarshal(b, v) }
 func (c *jsonFDConn) SendFDs(fds []uintptr, header []byte) error { return nil }
 func (c *jsonFDConn) RecvFDs() ([]uintptr, []byte, error)        { return nil, nil, nil }
-func (c *jsonFDConn) handoffSchema() handoffHandleSchema         { return handoffHandleSchema{count: 2} }
+func (c *jsonFDConn) handoffSchema() handoffHandleSchema         { return handoffHandleSchema{count: 3} }
 func (c *jsonFDConn) closeReceivedHandles([]uintptr)             {}
 func (c *jsonFDConn) Close() error                               { return nil }
 

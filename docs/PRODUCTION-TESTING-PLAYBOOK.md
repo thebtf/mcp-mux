@@ -537,6 +537,7 @@ with this table:
 | 6 | Isolated Short Idle Cleanup (v0.25.0) | Target isolated owner reaped within ~70s of zero sessions (60s idle + 10s sweep) |  | PASS/FAIL |
 | 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
 | 8 | Lifecycle Convergence and Tree Authority (v0.27.0) | Dormant wake is exact-once; v1 fallback is bounded; same-v2 handoff retains one full-tree authority |  | PASS/FAIL |
+| 9 | Critical muxcore consumer handoff | `CONSUMER_HANDOFF_PASS`, or `CONSUMER_HANDOFF_BLOCKED` with the full critical scope not called shipped |  | PASS/BLOCKED |
 
 Overall verdict:
 
@@ -544,3 +545,8 @@ Overall verdict:
 - `PARTIALLY_WORKS`: all required scenarios PASS but surprises need a release
   note or operator decision.
 - `BROKEN`: any required scenario FAIL.
+
+The release closeout must name every affected consumer and record exactly one
+of `CONSUMER_HANDOFF_PASS` or `CONSUMER_HANDOFF_BLOCKED`. The PASS marker is
+valid only after the released muxcore tag resolves and every touched Engram
+issue/comment has been re-read.

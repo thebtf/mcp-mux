@@ -92,6 +92,7 @@ func TestHandoffDarwin_LaunchdStyleSpawn(t *testing.T) {
 			PID:      os.Getpid(),
 			StdinFD:  tmpFile.Fd(),
 			StdoutFD: tmpFile.Fd(),
+			StderrFD: tmpFile.Fd(),
 		},
 	}
 

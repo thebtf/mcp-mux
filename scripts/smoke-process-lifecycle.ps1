@@ -555,7 +555,7 @@ try {
         $env:GOTMPDIR = Join-Path $RunDir "go-tmp"
         $env:GO111MODULE = "off"
         New-Item -ItemType Directory -Force -Path $env:GOCACHE, $env:GOTMPDIR | Out-Null
-        & go build -trimpath -o $Fixture .\scripts\lifecycle-smoke-upstream\main.go
+        & go build -trimpath -o $Fixture (Join-Path $RepoRoot "scripts\lifecycle-smoke-upstream\main.go")
         if ($LASTEXITCODE -ne 0) {
             throw "fixture build exited with code $LASTEXITCODE"
         }

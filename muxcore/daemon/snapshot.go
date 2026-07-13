@@ -293,6 +293,7 @@ func (d *Daemon) loadSnapshot() int {
 				PID:         hu.PID,
 				StdinFD:     hu.StdinFD,
 				StdoutFD:    hu.StdoutFD,
+				StderrFD:    hu.StderrFD,
 				AuthorityFD: hu.AuthorityFD,
 				Command:     hu.Command,
 				Args:        ownerSnap.Args,

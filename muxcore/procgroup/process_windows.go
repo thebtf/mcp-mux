@@ -122,6 +122,7 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 	job, wait, owner := p.takeJobAuthority()
 	if !owner {
 		waitAuthority(wait)
+		<-p.done
 		return nil
 	}
 
@@ -165,6 +166,7 @@ func (p *Process) killPlatform() error {
 	job, wait, owner := p.takeJobAuthority()
 	if !owner {
 		waitAuthority(wait)
+		<-p.done
 		return nil
 	}
 	err := windows.TerminateJobObject(job, 1)

@@ -258,7 +258,7 @@ func TestHandoffIntegration_FullRoundtripWindows(t *testing.T) {
 	}
 }
 
-func TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease(t *testing.T) {
+func TestHandoffIntegration_FourHandleAuthoritySurvivesPredecessorRelease(t *testing.T) {
 	if os.Getenv("MCPMUX_TEST_HANDOFF_SUCCESSOR") == "1" {
 		conn, err := dialHandoffWindows(os.Getenv("MCPMUX_TEST_HANDOFF_PIPE"), 5*time.Second)
 		if err != nil {
@@ -270,10 +270,10 @@ func TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease(t *te
 		}
 		received, ok := receipt.take("authority-roundtrip")
 		if !ok {
-			t.Fatal("successor did not receipt three-handle transfer")
+			t.Fatal("successor did not receipt four-handle transfer")
 		}
 		adopted, err := upstream.AttachFromFDsWithAuthority(
-			received.PID, received.StdinFD, received.StdoutFD, received.AuthorityFD, received.Command,
+			received.PID, received.StdinFD, received.StdoutFD, received.StderrFD, received.AuthorityFD, received.Command, nil,
 		)
 		if err != nil {
 			_ = receipt.finalize(nil)
@@ -318,12 +318,12 @@ func TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease(t *te
 	}
 	t.Cleanup(func() { _ = proc.AbortDetach() })
 
-	pid, stdinFD, stdoutFD, authorityFD, err := proc.DetachWithAuthority()
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
 	if err != nil {
 		t.Fatalf("DetachWithAuthority: %v", err)
 	}
-	if stdinFD == 0 || stdoutFD == 0 || authorityFD == 0 {
-		t.Fatalf("detached handles = [%d %d %d], want three non-zero handles", stdinFD, stdoutFD, authorityFD)
+	if stdinFD == 0 || stdoutFD == 0 || stderrFD == 0 || authorityFD == 0 {
+		t.Fatalf("detached handles = [%d %d %d %d], want four non-zero handles", stdinFD, stdoutFD, stderrFD, authorityFD)
 	}
 	name := randomPipeName(t)
 	connCh := make(chan fdConn, 1)
@@ -336,7 +336,7 @@ func TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease(t *te
 		t.Fatalf("os.Executable: %v", err)
 	}
 	commitMarker := filepath.Join(t.TempDir(), "committed")
-	cmd := exec.Command(exe, "-test.run=^TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease$")
+	cmd := exec.Command(exe, "-test.run=^TestHandoffIntegration_FourHandleAuthoritySurvivesPredecessorRelease$")
 	cmd.Env = append(os.Environ(),
 		"MCPMUX_TEST_HANDOFF_SUCCESSOR=1",
 		"MCPMUX_TEST_HANDOFF_PIPE="+name,
@@ -362,6 +362,7 @@ func TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease(t *te
 		PID:         pid,
 		StdinFD:     stdinFD,
 		StdoutFD:    stdoutFD,
+		StderrFD:    stderrFD,
 		AuthorityFD: authorityFD,
 		commit:      proc.CommitDetach,
 		abort:       proc.AbortDetach,
@@ -377,13 +378,13 @@ func TestHandoffIntegration_ThreeHandleAuthoritySurvivesPredecessorRelease(t *te
 	}
 }
 
-func TestHandoffIntegration_UncommittedThreeHandlesAreClosed(t *testing.T) {
+func TestHandoffIntegration_UncommittedFourHandlesAreClosed(t *testing.T) {
 	proc, err := upstream.Start("ping", []string{"-n", "30", "127.0.0.1"}, nil, "", nil)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.AbortDetach() })
-	pid, stdinFD, stdoutFD, authorityFD, err := proc.DetachWithAuthority()
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
 	if err != nil {
 		t.Fatalf("DetachWithAuthority: %v", err)
 	}
@@ -400,7 +401,7 @@ func TestHandoffIntegration_UncommittedThreeHandlesAreClosed(t *testing.T) {
 		if err == nil {
 			_, err = performHandoff(context.Background(), newWindowsFDConn(raw), "abort-token", []HandoffUpstream{{
 				ServerID: "uncommitted", Command: "ping", PID: pid,
-				StdinFD: stdinFD, StdoutFD: stdoutFD, AuthorityFD: authorityFD,
+				StdinFD: stdinFD, StdoutFD: stdoutFD, StderrFD: stderrFD, AuthorityFD: authorityFD,
 				commit: proc.CommitDetach, abort: proc.AbortDetach,
 			}})
 		}
@@ -427,7 +428,7 @@ func TestHandoffIntegration_UncommittedThreeHandlesAreClosed(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("predecessor did not abort the uncommitted upstream")
 	}
-	for _, handle := range []uintptr{received.StdinFD, received.StdoutFD} {
+	for _, handle := range []uintptr{received.StdinFD, received.StdoutFD, received.StderrFD} {
 		if _, err := windows.GetFileType(windows.Handle(handle)); err == nil {
 			t.Fatalf("uncommitted stdio handle %d remained open", handle)
 		}
@@ -527,17 +528,18 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 			t.Fatalf("fallback process is not alive: WaitForSingleObject=(%d, %v)", status, err)
 		}
 
-		if failedConn == nil || len(failedConn.received) != 3 {
-			t.Fatalf("received handles=%v, want stdin/stdout/authority", failedConn)
+		if failedConn == nil || len(failedConn.received) != 4 {
+			t.Fatalf("received handles=%v, want stdin/stdout/stderr/authority", failedConn)
 		}
 		defer func() {
 			for _, handle := range failedConn.observers {
 				_ = windows.CloseHandle(handle)
 			}
 		}()
+		handleKinds := []string{"stdin", "stdout", "stderr", "authority"}
 		for i, handle := range failedConn.received {
 			if sameKernelObject(windows.Handle(handle), failedConn.observers[i]) {
-				t.Fatalf("rolled-back handle %d still refers to transferred kernel object", handle)
+				t.Fatalf("rolled-back %s handle %d still refers to transferred kernel object", handleKinds[i], handle)
 			}
 		}
 		return
@@ -562,7 +564,7 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 		t.Fatalf("start predecessor upstream: %v", err)
 	}
 	t.Cleanup(func() { _ = proc.AbortDetach() })
-	oldPID, stdinFD, stdoutFD, authorityFD, err := proc.DetachWithAuthority()
+	oldPID, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
 	if err != nil {
 		t.Fatalf("DetachWithAuthority: %v", err)
 	}
@@ -652,7 +654,7 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 	defer cancel()
 	_, handoffErr := performHandoff(ctx, newWindowsFDConn(raw), token, []HandoffUpstream{{
 		ServerID: sid, Command: exe, PID: oldPID,
-		StdinFD: stdinFD, StdoutFD: stdoutFD, AuthorityFD: authorityFD,
+		StdinFD: stdinFD, StdoutFD: stdoutFD, StderrFD: stderrFD, AuthorityFD: authorityFD,
 		commit: proc.CommitDetach, abort: proc.AbortDetach,
 	}})
 	if handoffErr == nil {

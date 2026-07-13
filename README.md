@@ -435,7 +435,7 @@ transport but does not replay already-sent requests.
 
 - Upstream spawns with `Setpgid=true` — the kernel places the child in its own process group.
 - Planned restart: old daemon opens a Unix domain socket, successor daemon connects with a 128-bit
-  shared token, FDs (stdin, stdout) transfer via the SCM_RIGHTS ancillary control message.
+  shared token, FDs (stdin, stdout, stderr) transfer via the SCM_RIGHTS ancillary control message.
 - Cleanup targets the process group, including descendants that outlive the
   leader or inherit its stdio. Planned v2 handoff retains the PGID authority
   until the successor's final adoption acknowledgment.

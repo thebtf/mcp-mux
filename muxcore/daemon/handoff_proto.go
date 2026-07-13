@@ -81,6 +81,7 @@ type FdTransferMsg struct {
 	ServerID            string      `json:"server_id"`
 	StdinHandleMeta     HandleMeta  `json:"stdin_handle_meta"`
 	StdoutHandleMeta    HandleMeta  `json:"stdout_handle_meta"`
+	StderrHandleMeta    HandleMeta  `json:"stderr_handle_meta"`
 	AuthorityHandleMeta *HandleMeta `json:"authority_handle_meta,omitempty"`
 }
 
@@ -149,14 +150,23 @@ func NewReadyMsg(upstreams []UpstreamRef) ReadyMsg {
 	}
 }
 
-// NewFdTransferMsg constructs a FdTransferMsg with the mandatory fields set.
-func NewFdTransferMsg(serverID string, stdinMeta, stdoutMeta HandleMeta, authorityMeta ...HandleMeta) FdTransferMsg {
+// NewFdTransferMsg constructs a v2 FdTransferMsg while preserving the public
+// v1 constructor signature. Direct handoff consumers still compile unchanged;
+// the v2 stderr metadata defaults to the protocol-mandated "stderr" kind.
+func NewFdTransferMsg(serverID string, stdinMeta, stdoutMeta HandleMeta) FdTransferMsg {
+	return NewFdTransferMsgWithStderr(serverID, stdinMeta, stdoutMeta, HandleMeta{Kind: "stderr"})
+}
+
+// NewFdTransferMsgWithStderr constructs a v2 FdTransferMsg with explicit
+// stderr metadata and optional platform tree-authority metadata.
+func NewFdTransferMsgWithStderr(serverID string, stdinMeta, stdoutMeta, stderrMeta HandleMeta, authorityMeta ...HandleMeta) FdTransferMsg {
 	msg := FdTransferMsg{
 		Type:             MsgFdTransfer,
 		ProtocolVersion:  HandoffProtocolVersion,
 		ServerID:         serverID,
 		StdinHandleMeta:  stdinMeta,
 		StdoutHandleMeta: stdoutMeta,
+		StderrHandleMeta: stderrMeta,
 	}
 	if len(authorityMeta) > 0 {
 		msg.AuthorityHandleMeta = &authorityMeta[0]

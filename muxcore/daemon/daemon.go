@@ -1651,6 +1651,7 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 			PID:         payload.PID,
 			StdinFD:     payload.StdinFD,
 			StdoutFD:    payload.StdoutFD,
+			StderrFD:    payload.StderrFD,
 			AuthorityFD: payload.AuthorityFD,
 			abort:       payload.Abort,
 			commit:      payload.Commit,

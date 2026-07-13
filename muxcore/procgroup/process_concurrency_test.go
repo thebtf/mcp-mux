@@ -50,6 +50,42 @@ func TestConcurrentTreeFinalizationIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestConcurrentFinalizerWaitsForPublishedDone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*Process) error
+	}{
+		{name: "kill", call: func(p *Process) error { return p.killPlatform() }},
+		{name: "graceful", call: func(p *Process) error { return p.gracefulKillPlatform(time.Millisecond) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Process{done: make(chan struct{})}
+			p.platform.state = authorityFinalizing
+			p.platform.finalized = make(chan struct{})
+
+			returned := make(chan error, 1)
+			go func() { returned <- tc.call(p) }()
+			close(p.platform.finalized)
+
+			select {
+			case err := <-returned:
+				t.Fatalf("finalizer returned before Done was published: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			close(p.done)
+			select {
+			case err := <-returned:
+				if err != nil {
+					t.Fatalf("finalizer error: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("finalizer did not return after Done")
+			}
+		})
+	}
+}
+
 func TestDisableTreeKillStillTerminatesLeader(t *testing.T) {
 	opts := longRunningCmd()
 	opts.DisableTree = true

@@ -42,6 +42,7 @@ func TestPerformHandoff_PublicAPI(t *testing.T) {
 			PID:      os.Getpid(),
 			StdinFD:  tmpFile.Fd(),
 			StdoutFD: tmpFile.Fd(),
+			StderrFD: tmpFile.Fd(),
 		},
 	}
 
@@ -116,6 +117,9 @@ func TestPerformHandoff_PublicAPI(t *testing.T) {
 		}
 		if u.StdoutFD != 0 && u.StdoutFD != u.StdinFD {
 			_ = os.NewFile(u.StdoutFD, "").Close()
+		}
+		if u.StderrFD != 0 && u.StderrFD != u.StdinFD && u.StderrFD != u.StdoutFD {
+			_ = os.NewFile(u.StderrFD, "").Close()
 		}
 	}
 }

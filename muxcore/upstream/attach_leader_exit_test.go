@@ -4,11 +4,14 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -36,6 +39,7 @@ func TestAttachedLeaderExitFinalizesDescendant(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		_, _ = os.Stderr.WriteString("stderr-after-handoff\n")
 		return
 	}
 
@@ -65,18 +69,21 @@ func TestAttachedLeaderExitFinalizesDescendant(t *testing.T) {
 	}
 	defer closeWaiter()
 
-	pid, stdinFD, stdoutFD, authorityFD, err := proc.DetachWithAuthority()
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
 	if err != nil {
 		t.Fatalf("DetachWithAuthority: %v", err)
 	}
-	stdinFD, stdoutFD, authorityFD, err = duplicateAttachHandles(stdinFD, stdoutFD, authorityFD)
+	stdinFD, stdoutFD, stderrFD, authorityFD, err = duplicateAttachHandles(stdinFD, stdoutFD, stderrFD, authorityFD)
 	if err != nil {
 		t.Fatalf("duplicate handoff handles: %v", err)
 	}
 	if err := proc.CommitDetach(); err != nil {
 		t.Fatalf("CommitDetach: %v", err)
 	}
-	adopted, err := AttachFromFDsWithAuthority(pid, stdinFD, stdoutFD, authorityFD, exe)
+	var adoptedStderr bytes.Buffer
+	adopted, err := AttachFromFDsWithAuthority(
+		pid, stdinFD, stdoutFD, stderrFD, authorityFD, exe, log.New(&adoptedStderr, "", 0),
+	)
 	if err != nil {
 		t.Fatalf("AttachFromFDsWithAuthority: %v", err)
 	}
@@ -89,6 +96,9 @@ func TestAttachedLeaderExitFinalizesDescendant(t *testing.T) {
 	case <-adopted.Done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("attached upstream Done did not close after leader exit")
+	}
+	if !strings.Contains(adoptedStderr.String(), "stderr-after-handoff") {
+		t.Fatalf("successor did not drain transferred stderr: %q", adoptedStderr.String())
 	}
 	if !waitDescendant(5 * time.Second) {
 		t.Fatalf("descendant pid %d survived attached leader exit", descendantPID)

@@ -264,6 +264,12 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	}
 	defer stdoutR.Close()
 	defer stdoutW.Close()
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stderr: %v", err)
+	}
+	defer stderrR.Close()
+	defer stderrW.Close()
 
 	// Prepare mock conn pair: oldDaemonConn (sender) <--> successorConn (receiver).
 	oldDaemonConn, successorConn := newMockFDConnPair()
@@ -276,6 +282,7 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	// receiveHandoff to time out on a half-done protocol.
 	stdinFD := dupFDForHandoff(t, stdinR)
 	stdoutFD := dupFDForHandoff(t, stdoutW)
+	stderrFD := dupFDForHandoff(t, stderrR)
 	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
@@ -285,6 +292,7 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 				PID:      reattachFixturePID(t),
 				StdinFD:  stdinFD,
 				StdoutFD: stdoutFD,
+				StderrFD: stderrFD,
 			},
 		}
 		ctx := context.Background()
@@ -718,11 +726,18 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	}
 	defer stdoutR.Close()
 	defer stdoutW.Close()
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stderr: %v", err)
+	}
+	defer stderrR.Close()
+	defer stderrW.Close()
 
 	oldDaemonConn, successorConn := newMockFDConnPair()
 
 	stdinFD := dupFDForHandoff(t, stdinR)
 	stdoutFD := dupFDForHandoff(t, stdoutW)
+	stderrFD := dupFDForHandoff(t, stderrR)
 	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
@@ -732,6 +747,7 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 				PID:      reattachFixturePID(t),
 				StdinFD:  stdinFD,
 				StdoutFD: stdoutFD,
+				StderrFD: stderrFD,
 			},
 		}
 		_, err := performHandoff(context.Background(), oldDaemonConn, testToken, upstreams)

@@ -60,3 +60,17 @@ jobs:
           files: coverage.out,muxcore/coverage.out
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  bsd-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Compile muxcore upstream for FreeBSD
+        working-directory: muxcore
+        env:
+          GOOS: freebsd
+          GOARCH: amd64
+        run: go test -c -o /tmp/muxcore-upstream-freebsd.test ./upstream

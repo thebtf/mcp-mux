@@ -326,7 +326,7 @@ func TestResilientClient_WriterOwnedFrameBlocksIdleSuspend(t *testing.T) {
 
 			writer := &blockingResilientWriter{entered: make(chan struct{}), release: make(chan struct{})}
 			ipcEOF := make(chan struct{})
-			done := make(chan struct{})
+			done := make(chan []byte, 1)
 			go rc.runIPCWriter(writer, ipcEOF, done)
 			select {
 			case <-writer.entered:
@@ -354,6 +354,58 @@ func TestResilientClient_WriterOwnedFrameBlocksIdleSuspend(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("IPC writer did not stop")
 			}
+		})
+	}
+}
+
+func TestResilientClient_SuspendBarrierDefersNewHostFrame(t *testing.T) {
+	frame := []byte(`{"jsonrpc":"2.0","id":91,"method":"tools/call"}`)
+	for _, source := range []string{"stdin", "inject"} {
+		t.Run(source, func(t *testing.T) {
+			rc := &resilientClient{
+				cfg: ResilientClientConfig{
+					IdleSuspendDelay: time.Nanosecond,
+					Stdin:            strings.NewReader(string(frame) + "\n"),
+				},
+				msgFromCC:  make(chan []byte, 1),
+				msgFromIPC: make(chan []byte, 1),
+				log:        resilientTestLogger(t),
+			}
+			rc.initialized.Store(true)
+			rc.effectiveIdleDelay.Store(int64(time.Nanosecond))
+			rc.lastHostActivity.Store(time.Now().Add(-time.Second).UnixNano())
+			if !rc.beginIdleSuspend() {
+				t.Fatal("idle suspend barrier was not acquired")
+			}
+
+			var oldIPC bytes.Buffer
+			ipcEOF := make(chan struct{})
+			writerDone := make(chan []byte, 1)
+			go rc.runIPCWriter(&oldIPC, ipcEOF, writerDone)
+			if source == "inject" {
+				if err := rc.injectFrame(frame); err != nil {
+					t.Fatalf("injectFrame: %v", err)
+				}
+			} else {
+				stdinDone := make(chan error, 1)
+				go rc.runStdinReader(stdinDone)
+			}
+
+			select {
+			case deferred := <-writerDone:
+				if !bytes.Equal(deferred, frame) {
+					t.Fatalf("deferred frame = %s, want %s", deferred, frame)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("writer did not defer frame at suspend barrier")
+			}
+			if oldIPC.Len() != 0 {
+				t.Fatalf("post-barrier frame reached old IPC: %s", oldIPC.String())
+			}
+			if got := rc.localWork.Load(); got != 1 {
+				t.Fatalf("deferred local work = %d, want 1 until wake write", got)
+			}
+			rc.localWork.Add(-1)
 		})
 	}
 }
@@ -386,7 +438,7 @@ func TestResilientClient_DemandBeforeCommitDropsPrivateCommit(t *testing.T) {
 	}
 	rc.localWork.Add(-1)
 	ipcEOF := make(chan struct{})
-	done := make(chan struct{})
+	done := make(chan []byte, 1)
 	go rc.runIPCWriter(&upstream, ipcEOF, done)
 	deadline := time.Now().Add(time.Second)
 	for rc.localWork.Load() != 0 && time.Now().Before(deadline) {
@@ -466,7 +518,7 @@ func TestResilientClient_InjectRaceDormantCommit(t *testing.T) {
 		}
 		rc.localWork.Add(-1)
 		ipcEOF := make(chan struct{})
-		done := make(chan struct{})
+		done := make(chan []byte, 1)
 		go rc.runIPCWriter(&upstream, ipcEOF, done)
 		deadline := time.Now().Add(time.Second)
 		for rc.localWork.Load() != 0 && time.Now().Before(deadline) {
@@ -511,7 +563,7 @@ func TestResilientClient_QueuedInjectsKeepFIFOAcrossDormantNack(t *testing.T) {
 	}
 	rc.localWork.Add(-1)
 	ipcEOF := make(chan struct{})
-	done := make(chan struct{})
+	done := make(chan []byte, 1)
 	go rc.runIPCWriter(&upstream, ipcEOF, done)
 	deadline := time.Now().Add(time.Second)
 	for rc.localWork.Load() != 0 && time.Now().Before(deadline) {

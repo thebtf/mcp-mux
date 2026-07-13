@@ -16,11 +16,13 @@ func TestUpstreamJob_SurvivesDaemonJobClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if p.jobHandle == 0 {
+	p.authorityMu.Lock()
+	original := windows.Handle(p.jobHandle)
+	p.authorityMu.Unlock()
+	if original == 0 {
 		t.Fatal("Start succeeded without a Windows tree authority")
 	}
 
-	original := windows.Handle(p.jobHandle)
 	var successor windows.Handle
 	current := windows.CurrentProcess()
 	if err := windows.DuplicateHandle(
@@ -28,7 +30,9 @@ func TestUpstreamJob_SurvivesDaemonJobClose(t *testing.T) {
 	); err != nil {
 		t.Fatalf("DuplicateHandle: %v", err)
 	}
+	p.authorityMu.Lock()
 	p.jobHandle = uintptr(successor)
+	p.authorityMu.Unlock()
 	if err := windows.CloseHandle(original); err != nil {
 		t.Fatalf("close predecessor authority: %v", err)
 	}
@@ -40,7 +44,9 @@ func TestUpstreamJob_SurvivesDaemonJobClose(t *testing.T) {
 	default:
 	}
 
+	p.authorityMu.Lock()
 	p.jobHandle = 0
+	p.authorityMu.Unlock()
 	if err := windows.CloseHandle(successor); err != nil {
 		t.Fatalf("close successor authority: %v", err)
 	}

@@ -56,6 +56,11 @@ Ordinary `engine.New` consumers require no source changes:
 go get github.com/thebtf/mcp-mux/muxcore@v0.27.0
 ```
 
+Direct low-level handoff consumers keep the existing three-argument
+`daemon.NewFdTransferMsg` source contract. Protocol-v2 integrations should use
+`daemon.NewFdTransferMsgWithStderr` and populate `HandoffUpstream.StderrFD` so
+stderr ownership moves with stdin, stdout, and the tree authority.
+
 Consumers should remove product-local stale-process sweeps, PID-only kills,
 request replay, shim polling, launcher respawn loops, and handoff retry
 protocols that duplicate muxcore lifecycle authority. Consumer-specific
@@ -66,7 +71,7 @@ customer-mode smoke remains required after the dependency bump.
 - The first restart from handoff protocol v1 to v2 rejects live authority
   transfer before detaching anything, then performs one bounded
   snapshot-backed restart.
-- Later v2-to-v2 restarts transfer stdio and process-tree authority
+- Later v2-to-v2 restarts transfer stdin, stdout, stderr, and process-tree authority
   transactionally.
 - Rollback to a pre-v0.27 binary is supported through the same bounded
   cross-version snapshot restart. Do not force mixed-version live handoff.
@@ -85,3 +90,12 @@ The release candidate passed:
 
 See [the production testing playbook](docs/PRODUCTION-TESTING-PLAYBOOK.md) for
 the lifecycle-convergence scenario and required evidence.
+
+## Consumer handoff closeout
+
+This release impacts `aimux` and `engram`. The final GitHub release closeout
+must record `CONSUMER_HANDOFF_PASS` after `muxcore/v0.27.0` resolves and fresh
+Engram adoption issues/comments for both consumers have been re-read. If that
+cannot be completed, it must record `CONSUMER_HANDOFF_BLOCKED` and must not call
+the full critical muxcore scope shipped. Source release notes deliberately do
+not predeclare the post-tag result.

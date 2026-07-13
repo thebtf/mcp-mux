@@ -108,6 +108,7 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 	pgid, wait, owner := p.takeGroupAuthority()
 	if !owner {
 		waitAuthority(wait)
+		<-p.done
 		return nil
 	}
 	termErr := signalProcessGroup(pgid, syscall.SIGTERM)
@@ -142,6 +143,7 @@ func (p *Process) killPlatform() error {
 	pgid, wait, owner := p.takeGroupAuthority()
 	if !owner {
 		waitAuthority(wait)
+		<-p.done
 		return nil
 	}
 	err := signalProcessGroup(pgid, syscall.SIGKILL)
