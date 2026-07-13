@@ -52,6 +52,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   `initialize` handshake is replayed.
 - Fixed partial handoff adoption and handle-cleanup paths so uncommitted process
   authorities are aborted and closed.
+- Fixed timeout escalation for handoff-adopted processes whose transferred
+  tree authority exists without a local `procgroup.Process`, and made legacy
+  two-FD public handoff input fail fast with an explicit compatibility error.
 
 ### Documentation
 

@@ -59,6 +59,13 @@ built-in daemon to revoke the exact pending reservation when a successful
 spawn response cannot be delivered. Ordinary `engine.New` consumers inherit
 this behavior automatically.
 
+Direct `daemon.PerformHandoff` callers that still construct the pre-v0.27
+two-FD `HandoffUpstream` shape receive the explicit
+`daemon.ErrHandoffV2HandlesRequired` sentinel. Supply stderr and, on Windows,
+the Job authority obtained from `DetachWithAuthority`, or use the bounded
+snapshot/cold-restart path. The public API no longer silently reports those
+legacy values as ordinary per-owner aborts.
+
 Reconnect remains transport continuity, not request replay. Muxcore returns an
 explicit JSON-RPC error with the original id for every already-sent in-flight
 request and never sends that request to the successor. It replays only the

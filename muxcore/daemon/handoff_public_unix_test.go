@@ -4,10 +4,31 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"net"
 	"os"
 	"testing"
 	"time"
 )
+
+func TestPerformHandoff_PublicLegacyTwoFDInputFailsFast(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	result, err := PerformHandoff(context.Background(), left, "token", []HandoffUpstream{{
+		ServerID: "legacy-two-fd",
+		PID:      os.Getpid(),
+		StdinFD:  1,
+		StdoutFD: 2,
+	}})
+	if !errors.Is(err, ErrHandoffV2HandlesRequired) {
+		t.Fatalf("PerformHandoff error = %v, want ErrHandoffV2HandlesRequired", err)
+	}
+	if result.Phase != "validation" || len(result.Aborted) != 1 || result.Aborted[0] != "legacy-two-fd" {
+		t.Fatalf("PerformHandoff result = %+v, want explicit validation abort", result)
+	}
+}
 
 // TestPerformHandoff_PublicAPI verifies that PerformHandoff + ReceiveHandoff
 // (public API) produce identical behavior to the internal performHandoff /

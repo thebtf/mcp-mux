@@ -69,6 +69,11 @@ The control server also has an additive optional
 `control.SpawnResponseFailureHandler` hook. The built-in daemon implements it;
 ordinary engine consumers do not need to wire it themselves.
 
+Direct callers of `daemon.PerformHandoff` must provide the complete v2 handle
+set. Legacy two-FD values now fail fast with
+`daemon.ErrHandoffV2HandlesRequired` so the caller can take the documented
+bounded cold-restart path instead of receiving an ambiguous per-owner abort.
+
 Consumers should remove product-local stale-process sweeps, PID-only kills,
 request replay, shim polling, launcher respawn loops, and handoff retry
 protocols that duplicate muxcore lifecycle authority. Consumer-specific

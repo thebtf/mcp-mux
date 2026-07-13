@@ -52,7 +52,7 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 	case <-time.After(timeout):
 	}
 
-	if p.proc != nil {
+	if p.proc != nil || p.pid > 0 {
 		killErr := terminateProcessTree(p)
 		select {
 		case <-p.Done:
@@ -478,7 +478,7 @@ func (p *Process) Close() error {
 		return terminateProcessTree(p)
 	case <-time.After(stdinWait):
 	}
-	if p.proc != nil {
+	if p.proc != nil || p.pid > 0 {
 		return terminateProcessTree(p)
 	}
 	return nil
