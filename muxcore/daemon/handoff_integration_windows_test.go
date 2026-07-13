@@ -3,13 +3,76 @@
 package daemon
 
 import (
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
+
+	"github.com/thebtf/mcp-mux/muxcore/classify"
+	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
+	"golang.org/x/sys/windows"
 )
+
+type failFinalAckCaptureConn struct {
+	fdConn
+	received  []uintptr
+	observers []windows.Handle
+}
+
+func (c *failFinalAckCaptureConn) RecvFDs() ([]uintptr, []byte, error) {
+	fds, header, err := c.fdConn.RecvFDs()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, fd := range fds {
+		var observer windows.Handle
+		if err := windows.DuplicateHandle(
+			windows.CurrentProcess(), windows.Handle(fd),
+			windows.CurrentProcess(), &observer,
+			0, false, windows.DUPLICATE_SAME_ACCESS,
+		); err != nil {
+			for _, handle := range c.observers {
+				_ = windows.CloseHandle(handle)
+			}
+			c.observers = nil
+			return nil, nil, err
+		}
+		c.observers = append(c.observers, observer)
+	}
+	c.received = append(c.received, fds...)
+	return fds, header, err
+}
+
+func (c *failFinalAckCaptureConn) WriteJSON(v any) error {
+	switch v.(type) {
+	case HandoffAckMsg, *HandoffAckMsg:
+		_ = c.fdConn.Close()
+		return io.ErrClosedPipe
+	default:
+		return c.fdConn.WriteJSON(v)
+	}
+}
+
+var compareObjectHandlesProc = windows.NewLazySystemDLL("kernelbase.dll").NewProc("CompareObjectHandles")
+
+func sameKernelObject(a, b windows.Handle) bool {
+	equal, _, _ := compareObjectHandlesProc.Call(uintptr(a), uintptr(b))
+	return equal != 0
+}
 
 // TestHandoffIntegration_FullRoundtripWindows runs the full handoff
 // protocol between two goroutines over a named pipe with DuplicateHandle
@@ -192,5 +255,417 @@ func TestHandoffIntegration_FullRoundtripWindows(t *testing.T) {
 	}
 	if transferredCount != 1 {
 		t.Errorf("transferredCount: got %d, want 1", transferredCount)
+	}
+}
+
+func TestHandoffIntegration_FourHandleAuthoritySurvivesPredecessorRelease(t *testing.T) {
+	if os.Getenv("MCPMUX_TEST_HANDOFF_SUCCESSOR") == "1" {
+		conn, err := dialHandoffWindows(os.Getenv("MCPMUX_TEST_HANDOFF_PIPE"), 5*time.Second)
+		if err != nil {
+			t.Fatalf("successor dial: %v", err)
+		}
+		receipt, err := prepareHandoffReceive(context.Background(), conn, "authority-token")
+		if err != nil {
+			t.Fatalf("successor receive: %v", err)
+		}
+		received, ok := receipt.take("authority-roundtrip")
+		if !ok {
+			t.Fatal("successor did not receipt four-handle transfer")
+		}
+		adopted, err := upstream.AttachFromFDsWithAuthority(
+			received.PID, received.StdinFD, received.StdoutFD, received.StderrFD, received.AuthorityFD, received.Command, nil,
+		)
+		if err != nil {
+			_ = receipt.finalize(nil)
+			t.Fatalf("successor adoption: %v", err)
+		}
+		if err := receipt.finalize([]string{"authority-roundtrip"}); err != nil {
+			t.Fatalf("successor finalize: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(os.Getenv("MCPMUX_TEST_HANDOFF_COMMITTED")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("predecessor did not publish commit marker")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		processHandle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(received.PID))
+		if err != nil {
+			t.Fatalf("OpenProcess adopted upstream: %v", err)
+		}
+		defer windows.CloseHandle(processHandle)
+		if status, err := windows.WaitForSingleObject(processHandle, 0); err != nil || status != uint32(windows.WAIT_TIMEOUT) {
+			t.Fatalf("upstream did not survive predecessor release: WaitForSingleObject = (%d, %v)", status, err)
+		}
+		if err := windows.TerminateJobObject(windows.Handle(received.AuthorityFD), 1); err != nil {
+			t.Fatalf("transferred Job authority is unusable after predecessor release: %v", err)
+		}
+		if status, err := windows.WaitForSingleObject(processHandle, 5000); err != nil || status != windows.WAIT_OBJECT_0 {
+			t.Fatalf("WaitForSingleObject adopted upstream = (%d, %v), want process exit", status, err)
+		}
+		if err := adopted.Close(); err != nil {
+			t.Fatalf("adopted Close: %v", err)
+		}
+		return
+	}
+
+	proc, err := upstream.Start("ping", []string{"-n", "30", "127.0.0.1"}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.AbortDetach() })
+
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
+	if err != nil {
+		t.Fatalf("DetachWithAuthority: %v", err)
+	}
+	if stdinFD == 0 || stdoutFD == 0 || stderrFD == 0 || authorityFD == 0 {
+		t.Fatalf("detached handles = [%d %d %d %d], want four non-zero handles", stdinFD, stdoutFD, stderrFD, authorityFD)
+	}
+	name := randomPipeName(t)
+	connCh := make(chan fdConn, 1)
+	go func() {
+		conn, _ := listenHandoffWindows(name, 5*time.Second)
+		connCh <- conn
+	}()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	commitMarker := filepath.Join(t.TempDir(), "committed")
+	cmd := exec.Command(exe, "-test.run=^TestHandoffIntegration_FourHandleAuthoritySurvivesPredecessorRelease$")
+	cmd.Env = append(os.Environ(),
+		"MCPMUX_TEST_HANDOFF_SUCCESSOR=1",
+		"MCPMUX_TEST_HANDOFF_PIPE="+name,
+		"MCPMUX_TEST_HANDOFF_COMMITTED="+commitMarker,
+	)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start successor: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	conn := <-connCh
+	if conn == nil {
+		t.Fatal("successor did not connect to handoff pipe")
+	}
+	defer conn.Close()
+	_, handoffErr := performHandoff(context.Background(), conn, "authority-token", []HandoffUpstream{{
+		ServerID:    "authority-roundtrip",
+		Command:     "ping",
+		PID:         pid,
+		StdinFD:     stdinFD,
+		StdoutFD:    stdoutFD,
+		StderrFD:    stderrFD,
+		AuthorityFD: authorityFD,
+		commit:      proc.CommitDetach,
+		abort:       proc.AbortDetach,
+	}})
+	if err := os.WriteFile(commitMarker, nil, 0o600); err != nil {
+		t.Fatalf("write commit marker: %v", err)
+	}
+	if handoffErr != nil {
+		t.Fatalf("performHandoff: %v", handoffErr)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("successor failed: %v", err)
+	}
+}
+
+func TestHandoffIntegration_UncommittedFourHandlesAreClosed(t *testing.T) {
+	proc, err := upstream.Start("ping", []string{"-n", "30", "127.0.0.1"}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.AbortDetach() })
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
+	if err != nil {
+		t.Fatalf("DetachWithAuthority: %v", err)
+	}
+
+	name := randomPipeName(t)
+	ln, err := listenHandoffPipe(name)
+	if err != nil {
+		t.Fatalf("listenHandoffPipe: %v", err)
+	}
+	defer ln.Close()
+	senderResult := make(chan error, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err == nil {
+			_, err = performHandoff(context.Background(), newWindowsFDConn(raw), "abort-token", []HandoffUpstream{{
+				ServerID: "uncommitted", Command: "ping", PID: pid,
+				StdinFD: stdinFD, StdoutFD: stdoutFD, StderrFD: stderrFD, AuthorityFD: authorityFD,
+				commit: proc.CommitDetach, abort: proc.AbortDetach,
+			}})
+		}
+		senderResult <- err
+	}()
+
+	raw, err := dialHandoffPipe(name, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dialHandoffPipe: %v", err)
+	}
+	receipt, err := prepareHandoffReceive(context.Background(), newWindowsFDConn(raw), "abort-token")
+	if err != nil {
+		t.Fatalf("prepareHandoffReceive: %v", err)
+	}
+	received := receipt.received["uncommitted"]
+	if err := receipt.finalize(nil); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if err := <-senderResult; err != nil {
+		t.Fatalf("performHandoff: %v", err)
+	}
+	select {
+	case <-proc.Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("predecessor did not abort the uncommitted upstream")
+	}
+	for _, handle := range []uintptr{received.StdinFD, received.StdoutFD, received.StderrFD} {
+		if _, err := windows.GetFileType(windows.Handle(handle)); err == nil {
+			t.Fatalf("uncommitted stdio handle %d remained open", handle)
+		}
+	}
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	if err := windows.QueryInformationJobObject(
+		windows.Handle(received.AuthorityFD), windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil,
+	); err == nil {
+		t.Fatalf("uncommitted Job handle %d remained open", received.AuthorityFD)
+	}
+}
+
+func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
+	const roleEnv = "MCPMUX_TEST_FINAL_ACK_ROLLBACK_ROLE"
+	switch os.Getenv(roleEnv) {
+	case "upstream":
+		pidFile, err := os.OpenFile(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open pid file: %v", err)
+		}
+		_, _ = fmt.Fprintln(pidFile, os.Getpid())
+		_ = pidFile.Close()
+		go func() {
+			for range time.NewTicker(10 * time.Millisecond).C {
+				_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"handoff"}}`)
+			}
+		}()
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	case "successor":
+		snapshotData, err := base64.StdEncoding.DecodeString(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_SNAPSHOT"))
+		if err != nil {
+			t.Fatalf("decode snapshot: %v", err)
+		}
+		if err := os.WriteFile(SnapshotPath(), snapshotData, 0o600); err != nil {
+			t.Fatalf("write successor snapshot: %v", err)
+		}
+		oldPID, err := strconv.Atoi(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_OLD_PID"))
+		if err != nil {
+			t.Fatalf("parse predecessor pid: %v", err)
+		}
+		origWindow := restoreHealthGateWindow
+		restoreHealthGateWindow = time.Hour
+		defer func() { restoreHealthGateWindow = origWindow }()
+
+		var failedConn *failFinalAckCaptureConn
+		origHook := dialHandoffHook
+		dialHandoffHook = func(name string, timeout time.Duration) (fdConn, error) {
+			conn, err := dialHandoffWindows(name, timeout)
+			if err != nil {
+				return nil, err
+			}
+			failedConn = &failFinalAckCaptureConn{fdConn: conn}
+			return failedConn, nil
+		}
+		defer func() { dialHandoffHook = origHook }()
+
+		d, logs := testDaemonWithLog(t)
+		if restored := d.loadSnapshot(); restored != 1 {
+			t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+		}
+		entry := d.Entry("aabbccdd-final-ack-rollback")
+		if entry == nil || entry.Owner == nil {
+			t.Fatalf("fallback owner missing after final ACK failure; logs:\n%s", logs.String())
+		}
+		if entry.RestoreSource != "snapshot_fallback" {
+			t.Fatalf("restore_source=%q, want snapshot_fallback after final ACK failure; logs:\n%s", entry.RestoreSource, logs.String())
+		}
+
+		deadline := time.Now().Add(5 * time.Second)
+		newPID := 0
+		for time.Now().Before(deadline) {
+			pidData, _ := os.ReadFile(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS"))
+			for _, field := range strings.Fields(string(pidData)) {
+				pid, _ := strconv.Atoi(field)
+				if pid > 0 && pid != oldPID {
+					newPID = pid
+					break
+				}
+			}
+			if newPID > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if newPID <= 0 || newPID == oldPID {
+			t.Fatalf("fallback upstream pid=%d, want fresh process distinct from %d; logs:\n%s", newPID, oldPID, logs.String())
+		}
+
+		processHandle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(newPID))
+		if err != nil {
+			t.Fatalf("OpenProcess fallback pid %d: %v", newPID, err)
+		}
+		defer windows.CloseHandle(processHandle)
+		if status, err := windows.WaitForSingleObject(processHandle, 0); err != nil || status != uint32(windows.WAIT_TIMEOUT) {
+			t.Fatalf("fallback process is not alive: WaitForSingleObject=(%d, %v)", status, err)
+		}
+
+		if failedConn == nil || len(failedConn.received) != 4 {
+			t.Fatalf("received handles=%v, want stdin/stdout/stderr/authority", failedConn)
+		}
+		defer func() {
+			for _, handle := range failedConn.observers {
+				_ = windows.CloseHandle(handle)
+			}
+		}()
+		handleKinds := []string{"stdin", "stdout", "stderr", "authority"}
+		for i, handle := range failedConn.received {
+			if sameKernelObject(windows.Handle(handle), failedConn.observers[i]) {
+				t.Fatalf("rolled-back %s handle %d still refers to transferred kernel object", handleKinds[i], handle)
+			}
+		}
+		return
+	}
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+
+	const sid = "aabbccdd-final-ack-rollback"
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	args := []string{"-test.run=^TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner$"}
+	pidPath := filepath.Join(t.TempDir(), "pids")
+	upstreamEnv := map[string]string{
+		roleEnv:                               "upstream",
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS": pidPath,
+	}
+
+	proc, err := upstream.Start(exe, args, upstreamEnv, t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("start predecessor upstream: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.AbortDetach() })
+	oldPID, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
+	if err != nil {
+		t.Fatalf("DetachWithAuthority: %v", err)
+	}
+
+	snap := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{{
+			ServerID:       sid,
+			Command:        exe,
+			Args:           args,
+			Cwd:            t.TempDir(),
+			Mode:           "global",
+			Classification: classify.ModeShared,
+			CachedInit:     "e30=",
+			CachedTools:    "e30=",
+			Env:            upstreamEnv,
+		}},
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o600); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+
+	tokenFile, err := os.CreateTemp("", "mcp-mux-final-ack-rollback-*.tok")
+	if err != nil {
+		t.Fatalf("CreateTemp token: %v", err)
+	}
+	tokenPath := tokenFile.Name()
+	_ = tokenFile.Close()
+	t.Cleanup(func() { _ = os.Remove(tokenPath) })
+	const token = "final-ack-rollback-token"
+	if err := os.WriteFile(tokenPath, []byte(token), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
+	name := randomPipeName(t)
+	ln, err := listenHandoffPipe(name)
+	if err != nil {
+		t.Fatalf("listenHandoffPipe: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(),
+		roleEnv+"=successor",
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_OLD_PID="+strconv.Itoa(oldPID),
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS="+pidPath,
+		"MCPMUX_TEST_FINAL_ACK_ROLLBACK_SNAPSHOT="+base64.StdEncoding.EncodeToString(data),
+		"MCPMUX_HANDOFF_TOKEN_PATH="+tokenPath,
+		"MCPMUX_HANDOFF_SOCKET="+name,
+	)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start successor: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, err := ln.Accept()
+		accepted <- acceptResult{conn: conn, err: err}
+	}()
+	var raw net.Conn
+	select {
+	case result := <-accepted:
+		if result.err != nil {
+			t.Fatalf("accept successor: %v", result.err)
+		}
+		raw = result.conn
+	case <-time.After(5 * time.Second):
+		_ = ln.Close()
+		_ = cmd.Process.Kill()
+		t.Fatal("successor did not connect to handoff pipe")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, handoffErr := performHandoff(ctx, newWindowsFDConn(raw), token, []HandoffUpstream{{
+		ServerID: sid, Command: exe, PID: oldPID,
+		StdinFD: stdinFD, StdoutFD: stdoutFD, StderrFD: stderrFD, AuthorityFD: authorityFD,
+		commit: proc.CommitDetach, abort: proc.AbortDetach,
+	}})
+	if handoffErr == nil {
+		t.Fatal("predecessor handoff error=nil, want final ACK failure")
+	}
+	select {
+	case <-proc.Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("predecessor did not abort the uncommitted upstream")
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("successor rollback failed: %v", err)
 	}
 }

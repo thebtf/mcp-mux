@@ -226,10 +226,21 @@ type mockDaemonHandler struct {
 	stopReq       Request
 	refreshArg    string
 	giveUpArg     string
+	spawnStarted  chan struct{}
+	spawnRelease  <-chan struct{}
+	rollbackCh    chan struct{}
+	rollbackSID   string
+	rollbackToken string
 }
 
 func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, error) {
 	m.spawnCalled = true
+	if m.spawnStarted != nil {
+		close(m.spawnStarted)
+	}
+	if m.spawnRelease != nil {
+		<-m.spawnRelease
+	}
 	if m.spawnErr != nil {
 		return "", "", "", m.spawnErr
 	}
@@ -242,6 +253,14 @@ func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, er
 		srvID = "test-server-id"
 	}
 	return ipcPath, srvID, "test-token", nil
+}
+
+func (m *mockDaemonHandler) HandleSpawnResponseFailure(serverID, token string) {
+	m.rollbackSID = serverID
+	m.rollbackToken = token
+	if m.rollbackCh != nil {
+		close(m.rollbackCh)
+	}
 }
 
 func (m *mockDaemonHandler) HandleRemove(serverID string) error {
@@ -516,6 +535,60 @@ func TestSpawnWithDaemonHandler(t *testing.T) {
 	}
 	if !handler.spawnCalled {
 		t.Error("HandleSpawn was not called")
+	}
+	if handler.rollbackSID != "" || handler.rollbackToken != "" {
+		t.Fatalf("successful spawn unexpectedly rolled back (%q, %q)", handler.rollbackSID, handler.rollbackToken)
+	}
+}
+
+func TestUndeliveredSpawnResponseRollsBackReservation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	rolledBack := make(chan struct{})
+	handler := &mockDaemonHandler{
+		spawnIPCPath: "/tmp/spawned.sock",
+		spawnSrvID:   "srv-undelivered",
+		spawnStarted: started,
+		spawnRelease: release,
+		rollbackCh:   rolledBack,
+	}
+	srv := &Server{handler: handler, logger: testLogger(t)}
+	serverConn, clientConn := net.Pipe()
+	srv.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		srv.handleConn(serverConn)
+		close(done)
+	}()
+
+	request, err := json.Marshal(Request{Cmd: "spawn", Command: "fixture"})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	request = append(request, '\n')
+	if _, err := clientConn.Write(request); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("spawn handler was not entered")
+	}
+	_ = clientConn.Close()
+	close(release)
+
+	select {
+	case <-rolledBack:
+	case <-time.After(time.Second):
+		t.Fatal("undelivered spawn response did not trigger rollback")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("control handler did not finish")
+	}
+	if handler.rollbackSID != "srv-undelivered" || handler.rollbackToken != "test-token" {
+		t.Fatalf("rollback = (%q, %q), want exact spawn reservation", handler.rollbackSID, handler.rollbackToken)
 	}
 }
 

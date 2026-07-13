@@ -44,6 +44,13 @@ func TestReaperGracePeriodExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn() error: %v", err)
 	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("owner entry missing after spawn")
+	}
+	if removed := entry.Owner.SessionMgr().RemovePendingForOwner(sid); removed != 1 {
+		t.Fatalf("RemovePendingForOwner() = %d, want 1", removed)
+	}
 
 	// Simulate zero sessions by setting LastSession to the past
 	d.mu.Lock()

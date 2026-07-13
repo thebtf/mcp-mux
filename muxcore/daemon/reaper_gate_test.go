@@ -52,6 +52,14 @@ func TestShouldEvict_PendingRequests(t *testing.T) {
 	}
 }
 
+func TestShouldEvict_PendingSession(t *testing.T) {
+	s := baseSample()
+	s.PendingSessions = 1
+	if shouldEvict(s, time.Now(), 10*time.Minute, 60*time.Second).evict {
+		t.Fatal("pending session reservation should block eviction")
+	}
+}
+
 func TestShouldEvict_ActiveProgressTokens(t *testing.T) {
 	s := baseSample()
 	s.ActiveProgressTokens = 2

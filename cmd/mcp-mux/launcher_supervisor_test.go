@@ -80,6 +80,12 @@ func TestLauncherSupervisorRespawnsChildWithoutClosingTransport(t *testing.T) {
 	}
 }
 
+func TestLauncherReplayBudgetExceedsDaemonSpawnBudget(t *testing.T) {
+	if defaultLauncherReplayTimeout <= defaultDaemonSpawnTimeout {
+		t.Fatalf("launcher replay timeout = %s, must exceed daemon spawn timeout %s", defaultLauncherReplayTimeout, defaultDaemonSpawnTimeout)
+	}
+}
+
 func TestLauncherSupervisorRetriesInitializeWithoutClosingTransport(t *testing.T) {
 	dir := t.TempDir()
 	generationFile := filepath.Join(dir, "generation.txt")
@@ -222,6 +228,9 @@ func TestLauncherSupervisorChildHelper(t *testing.T) {
 	}
 	generation := incrementSupervisorGeneration(os.Getenv("MCP_MUX_TEST_SUPERVISOR_GEN_FILE"))
 	crashOn := os.Getenv("MCP_MUX_TEST_SUPERVISOR_CRASH_ON")
+	dormantMode := os.Getenv("MCP_MUX_TEST_SUPERVISOR_DORMANT_MODE")
+	dormantReplyDelay, _ := time.ParseDuration(os.Getenv("MCP_MUX_TEST_SUPERVISOR_DORMANT_REPLY_DELAY"))
+	eventFile := os.Getenv("MCP_MUX_TEST_SUPERVISOR_EVENT_FILE")
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -232,6 +241,7 @@ func TestLauncherSupervisorChildHelper(t *testing.T) {
 		if err := json.Unmarshal(line, &msg); err != nil {
 			os.Exit(2)
 		}
+		recordSupervisorEvent(eventFile, generation, "recv", msg.Method, string(msg.ID))
 		switch msg.Method {
 		case "initialize":
 			if generation == 1 && crashOn == "initialize" {
@@ -239,6 +249,58 @@ func TestLauncherSupervisorChildHelper(t *testing.T) {
 			}
 			fmt.Printf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"generation-%d"}}}`+"\n", msg.ID, generation)
 		case "notifications/initialized":
+			if generation == 1 {
+				switch dormantMode {
+				case "ack", "nack", "crash-before-ack", "trailing", "silent-before-ack", "ack-close-stdout-live", "ack-wrong-exit", "post-ack-many":
+					recordSupervisorEvent(eventFile, generation, "send", launcherDormantReadyMethod, "")
+					fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantReadyMethod)
+				case "exit75-without-ack":
+					os.Exit(launcherDormantExitCode)
+				}
+			}
+		case launcherCommitDormantMethod:
+			if generation != 1 {
+				continue
+			}
+			recordSupervisorEvent(eventFile, generation, "commit", msg.Method, "")
+			if dormantReplyDelay > 0 {
+				time.Sleep(dormantReplyDelay)
+			}
+			switch dormantMode {
+			case "ack":
+				recordSupervisorEvent(eventFile, generation, "send", launcherDormantAckMethod, "")
+				fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantAckMethod)
+				os.Exit(launcherDormantExitCode)
+			case "nack":
+				recordSupervisorEvent(eventFile, generation, "send", launcherDormantNackMethod, "")
+				fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantNackMethod)
+			case "crash-before-ack":
+				os.Exit(42)
+			case "trailing":
+				fmt.Printf(`{"jsonrpc":"2.0","method":"test/trailing"}` + "\n")
+				recordSupervisorEvent(eventFile, generation, "send", launcherDormantAckMethod, "")
+				fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantAckMethod)
+				os.Exit(launcherDormantExitCode)
+			case "silent-before-ack":
+				select {}
+			case "ack-close-stdout-live":
+				recordSupervisorEvent(eventFile, generation, "send", launcherDormantAckMethod, "")
+				fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantAckMethod)
+				_ = os.Stdout.Close()
+				time.Sleep(10 * time.Second)
+				os.Exit(0)
+			case "ack-wrong-exit":
+				recordSupervisorEvent(eventFile, generation, "send", launcherDormantAckMethod, "")
+				fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantAckMethod)
+				os.Exit(42)
+			case "post-ack-many":
+				recordSupervisorEvent(eventFile, generation, "send", launcherDormantAckMethod, "")
+				fmt.Printf(`{"jsonrpc":"2.0","method":%q}`+"\n", launcherDormantAckMethod)
+				for i := 0; i < 32; i++ {
+					fmt.Printf(`{"jsonrpc":"2.0","method":"test/post-ack-%d"}`+"\n", i)
+				}
+				os.Exit(launcherDormantExitCode)
+			}
 		case "tools/call":
 			if generation == 1 && crashOn == "tools" {
 				os.Exit(42)
@@ -251,6 +313,18 @@ func TestLauncherSupervisorChildHelper(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func recordSupervisorEvent(path string, generation int, phase, method, id string) {
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = fmt.Fprintf(f, "generation=%d phase=%s method=%s id=%s\n", generation, phase, method, id)
 }
 
 func incrementSupervisorGeneration(path string) int {

@@ -24,7 +24,9 @@ import (
 //
 // Returns an error if the FD attachment fails or the IPC listener cannot bind.
 func NewOwnerFromHandoff(cfg OwnerConfig, payload HandoffPayload) (*Owner, error) {
-	proc, err := upstream.AttachFromFDs(payload.PID, payload.StdinFD, payload.StdoutFD, payload.Command)
+	proc, err := upstream.AttachFromFDsWithAuthority(
+		payload.PID, payload.StdinFD, payload.StdoutFD, payload.StderrFD, payload.AuthorityFD, payload.Command, cfg.Logger,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("owner: NewOwnerFromHandoff: attach FDs: %w", err)
 	}

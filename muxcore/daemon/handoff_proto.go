@@ -9,7 +9,12 @@ import (
 // The protocol_version field is mandatory in every message; a successor daemon
 // that receives an unknown version must reject the handoff and fall back to
 // the legacy shutdown-and-respawn path (FR-6, FR-8).
-const HandoffProtocolVersion = 1
+// Version 2 adds an explicit optional tree-authority handle to FdTransferMsg
+// and moves the commit boundary to HandoffAckMsg.Accepted/Aborted. Version 1
+// peers are intentionally rejected during Hello: an old predecessor cannot
+// transfer the Windows Job handle, so the safe migration is one bounded
+// shutdown-and-respawn rather than an authority-less live handoff.
+const HandoffProtocolVersion = 2
 
 // MsgType identifies the kind of handoff control message.
 type MsgType string
@@ -43,8 +48,9 @@ type UpstreamRef struct {
 	PID      int    `json:"pid"`
 }
 
-// HandleMeta carries metadata about a process handle (stdin or stdout pipe).
-// The actual handle/fd is transferred out-of-band.
+// HandleMeta carries metadata about a process handle (stdin/stdout pipe or
+// the optional platform tree authority). The actual handle/fd is transferred
+// out-of-band.
 type HandleMeta struct {
 	Kind string `json:"kind"`
 }
@@ -70,11 +76,13 @@ type ReadyMsg struct {
 // metadata; the actual file descriptors travel out-of-band via platform-specific
 // mechanisms (SCM_RIGHTS on Unix, DuplicateHandle on Windows).
 type FdTransferMsg struct {
-	Type             MsgType    `json:"type"`
-	ProtocolVersion  int        `json:"protocol_version"`
-	ServerID         string     `json:"server_id"`
-	StdinHandleMeta  HandleMeta `json:"stdin_handle_meta"`
-	StdoutHandleMeta HandleMeta `json:"stdout_handle_meta"`
+	Type                MsgType     `json:"type"`
+	ProtocolVersion     int         `json:"protocol_version"`
+	ServerID            string      `json:"server_id"`
+	StdinHandleMeta     HandleMeta  `json:"stdin_handle_meta"`
+	StdoutHandleMeta    HandleMeta  `json:"stdout_handle_meta"`
+	StderrHandleMeta    HandleMeta  `json:"stderr_handle_meta"`
+	AuthorityHandleMeta *HandleMeta `json:"authority_handle_meta,omitempty"`
 }
 
 // AckTransferMsg is sent by the successor daemon after attempting to reattach
@@ -100,9 +108,11 @@ type DoneMsg struct {
 // HandoffAckMsg is the terminal acknowledgment sent by the successor daemon.
 // After receiving this message, the old daemon exits.
 type HandoffAckMsg struct {
-	Type            MsgType `json:"type"`
-	ProtocolVersion int     `json:"protocol_version"`
-	Status          string  `json:"status"`
+	Type            MsgType  `json:"type"`
+	ProtocolVersion int      `json:"protocol_version"`
+	Status          string   `json:"status"`
+	Accepted        []string `json:"accepted"`
+	Aborted         []string `json:"aborted"`
 }
 
 // Constructor helpers. Each function sets Type and ProtocolVersion correctly.
@@ -140,15 +150,28 @@ func NewReadyMsg(upstreams []UpstreamRef) ReadyMsg {
 	}
 }
 
-// NewFdTransferMsg constructs a FdTransferMsg with the mandatory fields set.
+// NewFdTransferMsg constructs a v2 FdTransferMsg while preserving the public
+// v1 constructor signature. Direct handoff consumers still compile unchanged;
+// the v2 stderr metadata defaults to the protocol-mandated "stderr" kind.
 func NewFdTransferMsg(serverID string, stdinMeta, stdoutMeta HandleMeta) FdTransferMsg {
-	return FdTransferMsg{
+	return NewFdTransferMsgWithStderr(serverID, stdinMeta, stdoutMeta, HandleMeta{Kind: "stderr"})
+}
+
+// NewFdTransferMsgWithStderr constructs a v2 FdTransferMsg with explicit
+// stderr metadata and optional platform tree-authority metadata.
+func NewFdTransferMsgWithStderr(serverID string, stdinMeta, stdoutMeta, stderrMeta HandleMeta, authorityMeta ...HandleMeta) FdTransferMsg {
+	msg := FdTransferMsg{
 		Type:             MsgFdTransfer,
 		ProtocolVersion:  HandoffProtocolVersion,
 		ServerID:         serverID,
 		StdinHandleMeta:  stdinMeta,
 		StdoutHandleMeta: stdoutMeta,
+		StderrHandleMeta: stderrMeta,
 	}
+	if len(authorityMeta) > 0 {
+		msg.AuthorityHandleMeta = &authorityMeta[0]
+	}
+	return msg
 }
 
 // NewAckTransferMsg constructs an AckTransferMsg with the mandatory fields set.
@@ -180,6 +203,18 @@ func NewHandoffAckMsg(status string) HandoffAckMsg {
 		Type:            MsgHandoffAck,
 		ProtocolVersion: HandoffProtocolVersion,
 		Status:          status,
+	}
+}
+
+// NewHandoffAckResult constructs the v2 commit decision. Accepted and Aborted
+// must form an exact partition of the IDs announced in ReadyMsg.
+func NewHandoffAckResult(accepted, aborted []string) HandoffAckMsg {
+	return HandoffAckMsg{
+		Type:            MsgHandoffAck,
+		ProtocolVersion: HandoffProtocolVersion,
+		Status:          "accepted",
+		Accepted:        accepted,
+		Aborted:         aborted,
 	}
 }
 

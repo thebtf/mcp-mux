@@ -23,6 +23,7 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
@@ -121,8 +122,8 @@ type Daemon struct {
 	isolatedIdleTimeout time.Duration
 
 	// admissionBufferTimeout bounds the wait at the spawn-time admission
-	// gate (CR-002): when a cross-cwd Spawn lands on an existing global
-	// owner that is not yet classified, the caller waits up to this
+	// gate (CR-002): when a fresh global Spawn lands on an existing owner
+	// that is not yet classified, the caller waits up to this
 	// duration for Owner.Classified() to close before deciding whether to
 	// bind (shareable) or fall through to a fresh isolated-seeded owner.
 	// On timeout, the caller falls through to a fresh spawn (safe default:
@@ -293,11 +294,10 @@ type Config struct {
 
 	// IsolatedIdleTimeout is the shorter idle timeout applied by the reaper
 	// to owners whose post-init classification was isolated. Isolated owners
-	// cannot be reattached by future Spawn calls (their server_id is either
-	// a random UUID from the forced-isolated retry path or a cwd-keyed hash
-	// whose listener was closed by the isolation verdict), so holding them
-	// across the longer shared/general OwnerIdleTimeout wastes upstream
-	// processes for no possible cache benefit.
+	// reject fresh Spawn admission while retaining exact-token reconnect on
+	// their authenticated listener. Once the reconnect window is no longer
+	// needed, holding them across the longer shared/general OwnerIdleTimeout
+	// wastes upstream processes for no possible shared-cache benefit.
 	//
 	// Default (nil): 60 seconds. Pass a pointer to zero (new(time.Duration)
 	// or DurationPtr(0)) to disable the optimization, in which case isolated
@@ -793,40 +793,33 @@ func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSn
 	return snap, ok
 }
 
-// waitForCrossCwdClassify is the CR-002 admission gate. When a Spawn lands
-// on an existing global owner whose primary cwd differs from the requesting
-// session's cwd AND whose classification is not yet known, this function
-// blocks the caller up to d.admissionBufferTimeout for Owner.Classified()
-// to close. Three outcomes:
+// waitForCrossCwdClassify is the CR-002 fresh-consumer admission gate. The
+// historical name predates the same-CWD isolation race: every fresh global
+// Spawn that lands on an existing unclassified owner now waits up to
+// d.admissionBufferTimeout for Owner.Classified() to close. Three outcomes:
 //
-//   - shareable=true, err=nil → owner is safe to bind cross-cwd (same cwd
-//     OR already classified as shared/session-aware OR newly classified
-//     shareable). Caller proceeds with PreRegisterForOwner.
+//   - shareable=true, err=nil → owner is already or newly classified as
+//     shared/session-aware. Caller proceeds with PreRegisterForOwner.
 //   - shareable=false, err=nil → owner classified isolated during the wait.
-//     Caller MUST NOT bind cross-cwd; fall through to fresh spawn under a
-//     CR-001 deterministic isolated-seeded sid for the requesting cwd.
+//     Caller MUST NOT bind the fresh consumer; fall through to a fresh spawn
+//     under a CR-001 deterministic isolated-seeded sid for the requester.
 //   - shareable=false, err non-nil → wait timed out. Safe default: caller
 //     treats as isolated and falls through to fresh spawn. The original
-//     owner continues serving its primary-cwd sessions unaffected.
+//     owner continues serving its first admitted consumer unaffected.
 //
-// Same-cwd binds skip the gate (return immediately as shareable=true).
 // This is the only safety property the admission gate provides: an
-// unclassified upstream NEVER receives frames from a cross-cwd session
-// because that session never gets an IPC path until classification
-// resolves. The Owner.crossCwdBuffer post-attach buffer (mentioned in
-// spec AC2 prose) is unnecessary under this simpler implementation —
-// frames literally don't exist on the daemon yet because the shim hasn't
-// dialed IPC (the daemon's Spawn RPC response is the gate).
+// unclassified global upstream NEVER receives frames from a second fresh
+// consumer because that consumer never gets an IPC path until classification
+// resolves. The Owner.crossCwdBuffer post-attach buffer (mentioned in spec
+// AC2 prose) is unnecessary under this simpler implementation — frames
+// literally don't exist on the daemon yet because the shim hasn't dialed IPC
+// (the daemon's Spawn RPC response is the gate).
 func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shareable bool, err error) {
 	if entry == nil || entry.Owner == nil {
 		return false, fmt.Errorf("admission gate: owner not live")
 	}
-	// Same-cwd: no gate. Primary-cwd sessions always pass through.
 	canonEntryCwd := serverid.CanonicalizePath(entry.Cwd)
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
-	if canonEntryCwd == canonReqCwd {
-		return true, nil
-	}
 	// Already classified: respect the verdict immediately.
 	if entry.Owner.IsClassifiedShareable() {
 		return true, nil
@@ -839,8 +832,8 @@ func (d *Daemon) waitForCrossCwdClassify(entry *OwnerEntry, reqCwd string) (shar
 		return false, nil
 	default:
 	}
-	// Not classified yet AND cross-cwd → wait.
-	d.logger.Printf("admission-gate: cross-cwd Spawn from %q waiting on owner %s classify (primary cwd %q)",
+	// Not classified yet → wait.
+	d.logger.Printf("admission-gate: fresh Spawn from %q waiting on owner %s classify (primary cwd %q)",
 		canonReqCwd, shortServerID(entry.ServerID), canonEntryCwd)
 	timer := time.NewTimer(d.admissionBufferTimeout)
 	defer timer.Stop()
@@ -888,8 +881,9 @@ func (d *Daemon) warnDeprecatedMode(cmd string, args []string, legacyMode string
 // divergence. spawnOnce now returns errSpawnRetry on those paths; Spawn loops
 // up to maxSpawnRetries times and surfaces an error on exhaustion.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
+	var isolatedRetry int64
 	for attempt := 0; attempt < maxSpawnRetries; attempt++ {
-		ipcPath, sid, token, err := d.spawnOnce(&req)
+		ipcPath, sid, token, err := d.spawnOnce(&req, &isolatedRetry)
 		if !errors.Is(err, errSpawnRetry) {
 			return ipcPath, sid, token, err
 		}
@@ -897,10 +891,19 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	return "", "", "", fmt.Errorf("spawn %s: exhausted retry budget after %d attempts", req.Command, maxSpawnRetries)
 }
 
+func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) int64 {
+	base := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
+	ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(base, &atomic.Int64{})
+	n := ctr.(*atomic.Int64).Add(1)
+	d.logger.Printf("forced-isolated retry: bumping counter for base=%s to r%d", shortServerID(base), n)
+	req.Mode = "isolated"
+	return n
+}
+
 // spawnOnce performs one attempt at creating or reusing an owner. It takes req
 // by pointer because some retry paths mutate req.Mode (isolated promotion) and
 // the mutation must persist across iterations of the Spawn retry loop.
-func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, error) {
+func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (string, string, string, error) {
 	req := *reqPtr
 	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
 	// Mode now gets the global identity (one upstream per (cmd, args)) per the
@@ -963,10 +966,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// race-bump again. Reaper cleans orphaned -rN owners per CR-003 idle-
 	// isolated timeout.
 	if mode == serverid.ModeIsolated {
-		if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
-			if n := ctrI.(*atomic.Int64).Load(); n > 0 {
-				sid = fmt.Sprintf("%s-r%d", sid, n)
+		n := *isolatedRetry
+		if n == 0 {
+			if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
+				n = ctrI.(*atomic.Int64).Load()
 			}
+		}
+		if n > 0 {
+			sid = fmt.Sprintf("%s-r%d", sid, n)
 		}
 	}
 
@@ -979,6 +986,19 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	}
 
 	d.mu.Lock()
+	if mode == serverid.ModeIsolated {
+		if _, occupied := d.owners[sid]; occupied {
+			baseSID := serverid.GenerateContextKey(serverid.ModeIsolated, req.Command, req.Args, nil, req.Cwd)
+			ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseSID, &atomic.Int64{})
+			for {
+				candidate := fmt.Sprintf("%s-r%d", baseSID, ctr.(*atomic.Int64).Add(1))
+				if _, used := d.owners[candidate]; !used {
+					sid = candidate
+					break
+				}
+			}
+		}
+	}
 
 	// 1. Exact match (same command+args+cwd)?
 	if entry, ok := d.owners[sid]; ok {
@@ -1016,30 +1036,43 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				}
 				e.LastSession = time.Now()
 				d.mu.Unlock()
-				// CR-002 admission gate: if this Spawn's cwd differs from the
-				// existing owner's primary cwd AND the owner is not yet
-				// classified, wait for classify before binding. Isolated
+				// CR-002 admission gate: a fresh global Spawn waits for an
+				// existing owner's classification before binding. Isolated
 				// classification forces fall-through to a fresh isolated-seeded
-				// owner for THIS cwd; shareable classification permits the bind.
-				shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
-				if gateErr != nil {
-					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
-					reqPtr.Mode = "isolated"
+				// owner; shareable classification permits the bind.
+				if mode == serverid.ModeGlobal {
+					shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
+					if gateErr != nil {
+						d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
+					if !shareable {
+						d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(sid), req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
+					if req.Cwd != "" {
+						e.Owner.AddCwd(req.Cwd)
+					}
+				}
+				if !e.Owner.PreRegister(token, req.Cwd, req.Env) {
+					if e.Owner.IsClassifiedIsolated() {
+						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, e)
+					}
 					return "", "", "", errSpawnRetry
 				}
-				if !shareable {
-					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(sid), req.Cwd)
-					reqPtr.Mode = "isolated"
-					return "", "", "", errSpawnRetry
-				}
-				e.Owner.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, req.Env)
 				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", shortServerID(sid), req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
+			retryEntry := d.owners[sid]
 			// Creation failed or entry was removed — signal retry so Spawn's
 			// retry loop can start fresh. Previously recursed directly into
 			// d.Spawn(req); see errSpawnRetry / Spawn comment for rationale.
 			d.mu.Unlock()
+			if retryEntry != nil && retryEntry.Owner != nil && retryEntry.Owner.IsClassifiedIsolated() {
+				*isolatedRetry = d.promoteIsolatedRetry(reqPtr, retryEntry)
+			}
 			return "", "", "", errSpawnRetry
 		}
 		// FR-4 — spawn-time listener health gate.
@@ -1087,21 +1120,31 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				}
 				current.LastSession = time.Now()
 				d.mu.Unlock()
-				// CR-002 admission gate: same logic as the placeholder-wait
-				// path. Cross-cwd binding on an unclassified owner waits for
-				// Classified(); isolated verdict forces fall-through.
-				shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
-				if gateErr != nil {
-					d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
-					reqPtr.Mode = "isolated"
+				// CR-002 admission gate: same fresh-global logic as the
+				// placeholder-wait path. An unclassified owner waits for
+				// Classified(); an isolated verdict forces fall-through.
+				if mode == serverid.ModeGlobal {
+					shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
+					if gateErr != nil {
+						d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
+					if !shareable {
+						d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
+						reqPtr.Mode = "isolated"
+						return "", "", "", errSpawnRetry
+					}
+					if req.Cwd != "" {
+						probeOwner.AddCwd(req.Cwd)
+					}
+				}
+				if !probeOwner.PreRegister(token, req.Cwd, req.Env) {
+					if probeOwner.IsClassifiedIsolated() {
+						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, current)
+					}
 					return "", "", "", errSpawnRetry
 				}
-				if !shareable {
-					d.logger.Printf("admission-gate: owner %s classified isolated — fresh isolated spawn for cwd=%q", shortServerID(probeSID), req.Cwd)
-					reqPtr.Mode = "isolated"
-					return "", "", "", errSpawnRetry
-				}
-				probeOwner.SessionMgr().PreRegisterForOwner(token, probeSID, req.Cwd, req.Env)
 				// Note: no log here — this path is the hot path (every CC
 				// session reconnect). Logging each reuse produced 500+
 				// lines/minute during multi-session incidents.
@@ -1143,30 +1186,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		if entry.Owner.SessionCount() > 0 {
 			d.logger.Printf("owner %s not accepting but has %d active sessions, leaving alive",
 				shortServerID(sid), entry.Owner.SessionCount())
-			// CR-002 codex PR #121 fix: under CR-001 deterministic isolated
-			// identity, switching Mode to "isolated" alone is insufficient when
-			// the ORIGINAL mode was already isolated — the retry would recompute
-			// the same sid and re-hit this same closed-listener entry, looping
-			// until maxSpawnRetries exhausts. Bump a per-base-sid retry counter
-			// so spawnOnce's sid computation appends `-r<N>` and produces a
-			// distinct sid for this retry.
-			//
-			// The base sid for the counter is the SAME sid we matched on (the
-			// entry's closed-listener sid), so the counter is keyed correctly
-			// regardless of whether we entered via mode=global or mode=isolated.
-			// For non-isolated original modes, the retry's Mode switch to
-			// isolated produces a different base hash anyway, but bumping the
-			// counter is harmless (the retry will read counter under the new
-			// base, which is initially 0).
-			baseForCounter := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
-			ctrI, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseForCounter, &atomic.Int64{})
-			newCounter := ctrI.(*atomic.Int64).Add(1)
-			d.logger.Printf("forced-isolated retry: bumping counter for base=%s to r%d",
-				shortServerID(baseForCounter), newCounter)
 			// DON'T delete or shutdown the old entry. Fall through — the retry
 			// will compute a unique sid via the counter suffix.
 			d.mu.Unlock()
-			reqPtr.Mode = "isolated"
+			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, entry)
 			return "", "", "", errSpawnRetry
 		}
 		d.mu.Unlock()
@@ -1192,7 +1215,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				// Dedup hot path is silent — logging every reuse produced 500+ lines/minute.
 				existing.Owner.AddCwd(req.Cwd)
 			}
-			existing.Owner.SessionMgr().PreRegisterForOwner(token, existingSID, req.Cwd, req.Env)
+			if !existing.Owner.PreRegister(token, req.Cwd, req.Env) {
+				if existing.Owner.IsClassifiedIsolated() {
+					*isolatedRetry = d.promoteIsolatedRetry(reqPtr, existing)
+				}
+				return "", "", "", errSpawnRetry
+			}
 			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
 	}
@@ -1268,11 +1296,15 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		OnCacheReady: func(serverID string) {
 			d.mu.RLock()
 			entry, ok := d.owners[serverID]
+			var cachedOwner *owner.Owner
+			if ok {
+				cachedOwner = entry.Owner
+			}
 			d.mu.RUnlock()
-			if !ok || entry.Owner == nil {
+			if !ok || cachedOwner == nil {
 				return
 			}
-			snap := entry.Owner.ExportSnapshot()
+			snap := cachedOwner.ExportSnapshot()
 			d.updateTemplate(req.Command, req.Args, snap)
 		},
 		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
@@ -1317,6 +1349,9 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		}
 		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
 	}
+	if d.sessionHandler != nil {
+		o.MarkClassifiedAs(classify.ModeShared)
+	}
 
 	// Register owner with the supervisor for lifecycle management.
 	// Suture will call owner.Serve(ctx) in its own goroutine and handle
@@ -1346,14 +1381,22 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		o.SpawnUpstreamBackground()
 	}
 
-	// PreRegister with the MERGED env (not raw req.Env) so the session — bound
-	// to this token on handshake — sees daemon-filled credentials too.
+	// PreRegisterInitial with the MERGED env (not raw req.Env) so the creating
+	// session sees daemon-filled credentials even if proactive initialization
+	// classifies this owner as isolated before Spawn returns. Reuse paths call
+	// ordinary PreRegister and therefore cannot claim a classified-isolated
+	// owner's reconnect-only listener.
 	// owner.go:~815 gates muxEnv injection on `len(s.Env) > 0` and sends s.Env
 	// as _meta.muxEnv; session-aware upstreams (pr-review-mcp etc.) look up
 	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
-	o.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, sessionEnv)
+	if !o.PreRegisterInitial(token, req.Cwd, sessionEnv) {
+		if o.IsClassifiedIsolated() {
+			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
+		}
+		return "", "", "", errSpawnRetry
+	}
 	return ipcPath, sid, token, nil
 }
 
@@ -1383,6 +1426,43 @@ func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error
 		d.reconnectFallbackSpawned.Add(1)
 	}
 	return ipcPath, serverID, token, err
+}
+
+// HandleSpawnResponseFailure revokes the exact pending reservation whose
+// successful Spawn response could not be delivered to its shim. When that was
+// the final reservation and no session ever bound, schedule normal safety-gated
+// zero-session cleanup for the same owner entry instead of waiting for the
+// generic pending-token TTL.
+func (d *Daemon) HandleSpawnResponseFailure(serverID, token string) {
+	d.mu.RLock()
+	entry := d.owners[serverID]
+	d.mu.RUnlock()
+	if entry == nil || entry.Owner == nil {
+		return
+	}
+	if !entry.Owner.SessionMgr().RemovePendingForOwnerToken(serverID, token) {
+		return
+	}
+	d.logger.Printf("owner %s: revoked undelivered spawn reservation", shortServerID(serverID))
+	if entry.Owner.SessionCount() != 0 || entry.Owner.SessionMgr().PendingCount() != 0 {
+		return
+	}
+
+	d.mu.Lock()
+	current, ok := d.owners[serverID]
+	if !ok || current != entry || current.Owner == nil || current.Owner.SessionCount() != 0 || current.Owner.SessionMgr().PendingCount() != 0 {
+		d.mu.Unlock()
+		return
+	}
+	zeroAt := time.Now()
+	current.LastSession = zeroAt
+	delay := d.zeroSessionCleanupDelay
+	if override := current.Owner.IdleTimeout(); override > 0 {
+		delay = override
+	}
+	d.mu.Unlock()
+
+	d.scheduleZeroSessionCleanup(serverID, entry, zeroAt, delay)
 }
 
 // HandleRemove implements control.DaemonHandler.
@@ -1586,9 +1666,9 @@ func successorExecutableFor(explicitOverride string) (string, error) {
 	return os.Executable()
 }
 
-// collectHandoffUpstreams calls ShutdownForHandoff on every live owner and
-// returns the HandoffUpstream list. Owners that fail to detach are logged and
-// skipped; per-upstream atomicity (FR-7) is enforced inside performHandoff.
+// collectHandoffUpstreams prepares every live process-backed owner and retains
+// its commit/abort lease until the successor's final adoption decision. Owners
+// that fail to prepare are logged and skipped.
 // Must NOT hold d.mu while calling ShutdownForHandoff (it may block).
 func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 	d.mu.RLock()
@@ -1609,11 +1689,15 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 			continue
 		}
 		upstreams = append(upstreams, HandoffUpstream{
-			ServerID: payload.ServerID,
-			Command:  payload.Command,
-			PID:      payload.PID,
-			StdinFD:  payload.StdinFD,
-			StdoutFD: payload.StdoutFD,
+			ServerID:    payload.ServerID,
+			Command:     payload.Command,
+			PID:         payload.PID,
+			StdinFD:     payload.StdinFD,
+			StdoutFD:    payload.StdoutFD,
+			StderrFD:    payload.StderrFD,
+			AuthorityFD: payload.AuthorityFD,
+			abort:       payload.Abort,
+			commit:      payload.Commit,
 		})
 	}
 	return upstreams
@@ -1701,30 +1785,22 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 	}
 	conn := cr.conn
 	defer conn.Close() //nolint:errcheck
-
-	// Collect HandoffUpstream list by detaching all live owners.
-	// ShutdownForHandoff detaches FDs from the Owner; they are no longer managed
-	// by any Owner after this call and must be closed explicitly by this function.
-	// Failing to close them would exhaust file descriptors and prevent upstreams
-	// from receiving EOF on their pipes if the handoff protocol fails.
-	upstreams := d.collectHandoffUpstreams()
-	defer func() {
-		for _, u := range upstreams {
-			if u.StdinFD > 2 {
-				_ = os.NewFile(u.StdinFD, "").Close()
-			}
-			if u.StdoutFD > 2 {
-				_ = os.NewFile(u.StdoutFD, "").Close()
-			}
-		}
-	}()
-
-	// Run handoff protocol with 30s deadline. The existing _ = ctx reservation
-	// in performHandoff (T009 integration) becomes meaningful here.
 	ctx, cancel := context.WithTimeout(context.Background(), handoffTotalTimeout)
 	defer cancel()
+	stopDeadline := bindHandoffContext(ctx, conn)
+	defer stopDeadline()
 
-	result, err := performHandoff(ctx, conn, token, upstreams)
+	// Version/token negotiation happens before detaching any owner. A v1 peer
+	// therefore falls back to one bounded cold respawn without losing authority.
+	if err := acceptHandoffHello(conn, token); err != nil {
+		return fmt.Errorf("protocol hello: %w", handoffContextError(ctx, err))
+	}
+
+	// Detach only after the successor proved it speaks the exact v2 schema.
+	// Each entry carries abort/commit operations retained until final adoption.
+	upstreams := d.collectHandoffUpstreams()
+
+	result, err := performHandoffAfterHello(ctx, conn, upstreams)
 	if err != nil {
 		return fmt.Errorf("protocol error: %w", err)
 	}
@@ -1836,6 +1912,42 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 	d.reconnectRefreshed.Add(1)
 	d.logger.Printf("shim.reconnect.refresh_ok owner=%s", shortServerID(ownerKey))
 	return newToken, nil
+}
+
+// HandleCanSuspend verifies owner-wide safety before a shim intentionally
+// releases its data-plane session.
+func (d *Daemon) HandleCanSuspend(prevToken string) (control.SuspendCheckResponse, error) {
+	if d.shuttingDown.Load() {
+		return control.SuspendCheckResponse{}, ErrDaemonShuttingDown
+	}
+	if prevToken == "" {
+		return control.SuspendCheckResponse{}, ErrUnknownToken
+	}
+	entry, ownerKey := d.lookupReconnectOwner(prevToken)
+	if entry == nil || entry.Owner == nil {
+		return control.SuspendCheckResponse{}, ErrUnknownToken
+	}
+
+	d.mu.RLock()
+	current, ok := d.owners[ownerKey]
+	persistent := ok && current == entry && entry.Persistent
+	d.mu.RUnlock()
+	if !ok || current != entry {
+		return control.SuspendCheckResponse{}, ErrOwnerGone
+	}
+	if persistent {
+		return control.SuspendCheckResponse{Reason: "persistent"}, nil
+	}
+	if entry.Owner.PendingRequests() > 0 {
+		return control.SuspendCheckResponse{Reason: "pending_requests"}, nil
+	}
+	if entry.Owner.ActiveProgressTokens() > 0 {
+		return control.SuspendCheckResponse{Reason: "active_progress"}, nil
+	}
+	if entry.Owner.HasActiveBusyWork() {
+		return control.SuspendCheckResponse{Reason: "busy"}, nil
+	}
+	return control.SuspendCheckResponse{Allowed: true}, nil
 }
 
 // HandleStatus implements control.CommandHandler.
@@ -2077,8 +2189,9 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // findSharedOwnerLocked looks for an accepting owner that matches the requested
 // command+args and is compatible with the caller's env and cwd for shared reuse.
 // Dedup is optimistic: unclassified owners are assumed shareable. If an owner
-// later classifies as isolated, it closes its IPC listener — extra sessions get
-// EOF and reconnect with their own owner.
+// later classifies as isolated, fresh token admission is revoked while its IPC
+// listener remains available for exact-token reconnect. Extra sessions get EOF
+// and reconnect with their own owner.
 //
 // Lock semantics (FR-8 / BUG-007): this function MUST be called with d.mu
 // Lock-held (write lock, not RLock). It drops d.mu via d.mu.Unlock() while

@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +18,21 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
+
+func reattachFixturePID(t *testing.T) int {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return os.Getpid()
+	}
+	proc, err := upstream.Start("sleep", []string{"30"}, nil, "", nil)
+	if err != nil {
+		t.Fatalf("start handoff fixture process: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.Close() })
+	return proc.PID()
+}
 
 // syncBuffer is a thread-safe bytes.Buffer — the daemon writes logs from
 // multiple goroutines concurrently (supervisor, reaper, owner callbacks).
@@ -246,6 +264,12 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	}
 	defer stdoutR.Close()
 	defer stdoutW.Close()
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stderr: %v", err)
+	}
+	defer stderrR.Close()
+	defer stderrW.Close()
 
 	// Prepare mock conn pair: oldDaemonConn (sender) <--> successorConn (receiver).
 	oldDaemonConn, successorConn := newMockFDConnPair()
@@ -258,15 +282,17 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	// receiveHandoff to time out on a half-done protocol.
 	stdinFD := dupFDForHandoff(t, stdinR)
 	stdoutFD := dupFDForHandoff(t, stdoutW)
+	stderrFD := dupFDForHandoff(t, stderrR)
 	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
 			{
 				ServerID: sid,
 				Command:  "echo",
-				PID:      os.Getpid(), // valid PID > 0; not verified by AttachFromFDs
+				PID:      reattachFixturePID(t),
 				StdinFD:  stdinFD,
 				StdoutFD: stdoutFD,
+				StderrFD: stderrFD,
 			},
 		}
 		ctx := context.Background()
@@ -301,7 +327,7 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
 
-	// Assert the handoff path was taken via structural log inspection rather
+	// Assert the handoff result via structural log inspection rather
 	// than polling d.owners. The supervisor goroutine started by
 	// supervisor.Add(o) can race through o.Serve() → proactive-init write
 	// failure → OnUpstreamExit → delete(d.owners, sid) fast enough on
@@ -313,16 +339,26 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	logs := logBuf.String()
 
 	wantHandoff := "snapshot: reattached owner " + sid[:8] + " from handoff"
-	if !strings.Contains(logs, wantHandoff) {
+	if runtime.GOOS == "windows" {
+		if strings.Contains(logs, wantHandoff) {
+			t.Errorf("did not expect Windows fixture without Job authority to reattach the owner.\nLogs:\n%s", logs)
+		}
+		if !strings.Contains(logs, "Windows handoff missing Job authority — falling back to spawn") {
+			t.Errorf("missing safe Windows snapshot fallback marker.\nLogs:\n%s", logs)
+		}
+	} else if !strings.Contains(logs, wantHandoff) {
 		t.Errorf("expected log %q (handoff path marker), not found.\nLogs:\n%s",
 			wantHandoff, logs)
 	}
 
-	// "handoff.receive.ok upstreams=1" proves the receive side consumed the
-	// mock conn pair end-to-end (token auth, protocol version, 1 FdTransfer).
-	if !strings.Contains(logs, "handoff.receive.ok upstreams=1") {
+	wantAccepted := 1
+	if runtime.GOOS == "windows" {
+		wantAccepted = 0
+	}
+	wantHandoffLog := fmt.Sprintf("handoff.receive.ok upstreams=%d", wantAccepted)
+	if !strings.Contains(logs, wantHandoffLog) {
 		t.Errorf("expected %q in logs, not found.\nLogs:\n%s",
-			"handoff.receive.ok upstreams=1", logs)
+			wantHandoffLog, logs)
 	}
 }
 
@@ -403,6 +439,101 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	if strings.Contains(logs, dontWantHandoff) {
 		t.Errorf("did not expect %q (socket was unreachable, handoff must fail).\nLogs:\n%s",
 			dontWantHandoff, logs)
+	}
+}
+
+func TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn(t *testing.T) {
+	if marker := os.Getenv("MCPMUX_TEST_V1_FALLBACK_SPAWN"); marker != "" {
+		if err := os.WriteFile(marker, nil, 0o600); err != nil {
+			t.Fatalf("write spawn marker: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	}
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { os.Remove(SnapshotPath()) })
+
+	const sid = "aabbccdd-version-skew-fallback"
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	spawnMarker := filepath.Join(t.TempDir(), "spawned")
+	t.Setenv("MCPMUX_TEST_V1_FALLBACK_SPAWN", spawnMarker)
+	snapshot := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{{
+			ServerID:       sid,
+			Command:        exe,
+			Args:           []string{"-test.run=^TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn$"},
+			Cwd:            ".",
+			Mode:           "global",
+			Classification: classify.ModeShared,
+			CachedInit:     "e30=",
+			CachedTools:    "e30=",
+		}},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+
+	tokenFile, err := os.CreateTemp("", "mcp-mux-handoff-v1-*.tok")
+	if err != nil {
+		t.Fatalf("CreateTemp token: %v", err)
+	}
+	tokenPath := tokenFile.Name()
+	if err := tokenFile.Close(); err != nil {
+		t.Fatalf("Close token: %v", err)
+	}
+	t.Cleanup(func() { os.Remove(tokenPath) })
+	if err := os.WriteFile(tokenPath, []byte("version-skew-token"), 0o600); err != nil {
+		t.Fatalf("WriteFile token: %v", err)
+	}
+
+	legacy := &scriptedHandoffConn{reads: []scriptedHandoffRead{{
+		msg: ReadyMsg{
+			Type:            MsgReady,
+			ProtocolVersion: HandoffProtocolVersion - 1,
+			Upstreams: []UpstreamRef{{
+				ServerID: sid,
+				Command:  "go",
+				PID:      os.Getpid(),
+			}},
+		},
+	}}}
+	origHook := dialHandoffHook
+	dialHandoffHook = func(string, time.Duration) (fdConn, error) { return legacy, nil }
+	t.Cleanup(func() { dialHandoffHook = origHook })
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenPath)
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "/mock/legacy-v1")
+
+	d, logBuf := testDaemonWithLog(t)
+	if restored := d.loadSnapshot(); restored != 1 {
+		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(spawnMarker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot fallback did not spawn a fresh upstream; logs:\n%s", logBuf.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "handoff.receive.fail reason=handoff: protocol version mismatch") {
+		t.Fatalf("missing v1 rejection marker; logs:\n%s", logs)
+	}
+	if strings.Contains(logs, "snapshot: reattached owner "+sid[:8]+" from handoff") {
+		t.Fatalf("legacy v1 peer was reattached without v2 authority; logs:\n%s", logs)
 	}
 }
 
@@ -525,12 +656,10 @@ func TestLoadSnapshot_ShutsDownRestoredOwnerWhenGenerationFails(t *testing.T) {
 }
 
 // TestLoadSnapshot_Reattach_PartialHandoff exercises FR-7: when the handoff
-// delivers FDs for a subset of the snapshot's owners, the remainder MUST
-// fall through to the legacy SpawnUpstreamBackground path. The snapshot
-// lists two owners (sid1, sid2) but performHandoff only transfers sid1 —
-// so sid1 reattaches via handoff (classification_source == "handoff") and
-// sid2 comes back through the legacy path (classification_source !=
-// "handoff"). Both must be present in d.owners after loadSnapshot returns.
+// delivers handles for a subset of the snapshot's owners, the remainder MUST
+// fall through to the legacy SpawnUpstreamBackground path. On Windows this
+// legacy two-handle fixture also lacks Job authority, so both owners safely
+// fall back to snapshot respawn instead of adopting an unauthoritative tree.
 func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	os.Remove(SnapshotPath())
 
@@ -597,20 +726,28 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	}
 	defer stdoutR.Close()
 	defer stdoutW.Close()
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe stderr: %v", err)
+	}
+	defer stderrR.Close()
+	defer stderrW.Close()
 
 	oldDaemonConn, successorConn := newMockFDConnPair()
 
 	stdinFD := dupFDForHandoff(t, stdinR)
 	stdoutFD := dupFDForHandoff(t, stdoutW)
+	stderrFD := dupFDForHandoff(t, stderrR)
 	senderErrCh := make(chan error, 1)
 	go func() {
 		upstreams := []HandoffUpstream{
 			{
 				ServerID: sid1, // Only sid1 transferred — sid2 falls through.
 				Command:  "echo",
-				PID:      os.Getpid(),
+				PID:      reattachFixturePID(t),
 				StdinFD:  stdinFD,
 				StdoutFD: stdoutFD,
+				StderrFD: stderrFD,
 			},
 		}
 		_, err := performHandoff(context.Background(), oldDaemonConn, testToken, upstreams)
@@ -639,7 +776,7 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	d, logBuf := testDaemonWithLog(t)
 	restored := d.loadSnapshot()
 	if restored != 2 {
-		t.Fatalf("loadSnapshot() restored %d owners, want 2 (sid1 via handoff, sid2 via legacy)", restored)
+		t.Fatalf("loadSnapshot() restored %d owners, want 2", restored)
 	}
 
 	// FR-7 is verified by structural log inspection rather than by probing
@@ -654,9 +791,15 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	// for every successful registration regardless of path.
 	logs := logBuf.String()
 
-	// Positive: sid1 took the handoff path.
 	wantSid1Handoff := "snapshot: reattached owner " + sid1[:8] + " from handoff"
-	if !strings.Contains(logs, wantSid1Handoff) {
+	if runtime.GOOS == "windows" {
+		if strings.Contains(logs, wantSid1Handoff) {
+			t.Errorf("did not expect Windows fixture without Job authority to reattach sid1.\nLogs:\n%s", logs)
+		}
+		if !strings.Contains(logs, "Windows handoff missing Job authority — falling back to spawn") {
+			t.Errorf("missing safe Windows snapshot fallback marker.\nLogs:\n%s", logs)
+		}
+	} else if !strings.Contains(logs, wantSid1Handoff) {
 		t.Errorf("expected log %q for sid1 (handoff path), not found.\nLogs:\n%s", wantSid1Handoff, logs)
 	}
 
@@ -676,8 +819,12 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 		}
 	}
 
-	// Handoff receive must have delivered exactly one upstream.
-	if !strings.Contains(logs, "handoff.receive.ok upstreams=1") {
-		t.Errorf("expected %q in logs, not found.\nLogs:\n%s", "handoff.receive.ok upstreams=1", logs)
+	wantAccepted := 1
+	if runtime.GOOS == "windows" {
+		wantAccepted = 0
+	}
+	wantHandoffLog := fmt.Sprintf("handoff.receive.ok upstreams=%d", wantAccepted)
+	if !strings.Contains(logs, wantHandoffLog) {
+		t.Errorf("expected %q in logs, not found.\nLogs:\n%s", wantHandoffLog, logs)
 	}
 }

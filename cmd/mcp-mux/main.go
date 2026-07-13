@@ -264,22 +264,43 @@ func main() {
 						return newIPC, newToken, nil
 					}
 				}
+				idleDelay, dormantGrace := shimLifecycleDurations(os.Getenv)
+				if os.Getenv(envLauncherExe) == "" {
+					dormantGrace = -1
+				}
+				var suspendGate func() (bool, string, error)
+				if idleDelay > 0 {
+					suspendGate = func() (bool, string, error) {
+						return canSuspendViaDaemon(currentToken)
+					}
+				}
+
 				resilientStart := time.Now()
-				if err := owner.RunResilientClient(owner.ResilientClientConfig{
-					Stdin:          os.Stdin,
-					Stdout:         os.Stdout,
-					InitialIPCPath: daemonIPC,
-					Token:          daemonToken,
-					RefreshToken:   refreshFn,
-					Reconnect:      reconnectFn,
-					Logger:         logger,
-				}); err != nil {
+				err = owner.RunResilientClient(owner.ResilientClientConfig{
+					Stdin:            os.Stdin,
+					Stdout:           os.Stdout,
+					InitialIPCPath:   daemonIPC,
+					Token:            daemonToken,
+					RefreshToken:     refreshFn,
+					Reconnect:        reconnectFn,
+					IdleSuspendDelay: idleDelay,
+					IdleSuspendGate:  suspendGate,
+					IdleDormantGrace: dormantGrace,
+					Logger:           logger,
+				})
+				if err != nil {
+					exitCode := resilientClientExitCode(err)
+					if errors.Is(err, owner.ErrIdleDormant) {
+						logger.Printf("shim startup step=resilient_end status=dormant duration=%v total=%v",
+							time.Since(resilientStart), time.Since(shimStart))
+						os.Exit(exitCode)
+					}
 					if strings.Contains(err.Error(), "reconnect timeout") {
 						reportReconnectGiveUp("timeout", logger)
 					}
 					logger.Printf("shim startup step=resilient_end status=error duration=%v err=%q total=%v",
 						time.Since(resilientStart), err.Error(), time.Since(shimStart))
-					os.Exit(1)
+					os.Exit(exitCode)
 				}
 				logger.Printf("shim startup step=resilient_end status=ok duration=%v total=%v reason=session_ended",
 					time.Since(resilientStart), time.Since(shimStart))

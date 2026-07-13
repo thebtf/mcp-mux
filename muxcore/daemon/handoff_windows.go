@@ -232,7 +232,24 @@ func (w *windowsFDConn) SendFDs(fds []uintptr, header []byte) error {
 		Header:          header,
 		Handles:         duplicated,
 	}
-	return w.WriteJSON(&batch)
+	if err := w.WriteJSON(&batch); err != nil {
+		// DuplicateHandle is a push into the target process. If the target never
+		// learns the values, close them in-place or they become invisible leases.
+		for _, handle := range duplicated {
+			var ignore windows.Handle
+			_ = windows.DuplicateHandle(
+				targetProc,
+				windows.Handle(handle),
+				0,
+				&ignore,
+				0,
+				false,
+				windows.DUPLICATE_CLOSE_SOURCE,
+			)
+		}
+		return err
+	}
+	return nil
 }
 
 // RecvFDs reads a windowsHandleBatch message from the pipe and returns the
@@ -251,6 +268,20 @@ func (w *windowsFDConn) RecvFDs() ([]uintptr, []byte, error) {
 	}
 	return batch.Handles, batch.Header, nil
 }
+
+func (w *windowsFDConn) handoffSchema() handoffHandleSchema {
+	return handoffHandleSchema{count: 4, requiresAuthority: true}
+}
+
+func (w *windowsFDConn) closeReceivedHandles(fds []uintptr) {
+	for _, fd := range fds {
+		if fd != 0 {
+			_ = windows.CloseHandle(windows.Handle(fd))
+		}
+	}
+}
+
+func (w *windowsFDConn) SetDeadline(deadline time.Time) error { return w.conn.SetDeadline(deadline) }
 
 func (w *windowsFDConn) Close() error { return w.conn.Close() }
 

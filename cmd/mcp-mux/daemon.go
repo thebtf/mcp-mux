@@ -20,7 +20,10 @@ import (
 
 var daemonStarter = startDaemonProcess
 
-const daemonPingTimeout = 500 * time.Millisecond
+const (
+	daemonPingTimeout         = 500 * time.Millisecond
+	defaultDaemonSpawnTimeout = 30 * time.Second
+)
 
 // runGlobalDaemon starts the global daemon process. This is invoked via
 // `mcp-mux daemon` subcommand. The daemon manages all upstream MCP servers,
@@ -335,7 +338,7 @@ func spawnViaDaemon(command string, args []string, cwd, mode string, env map[str
 }
 
 func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
-	return spawnViaDaemonWithReasonTimeout(command, args, cwd, mode, env, reconnectReason, logger, 30*time.Second)
+	return spawnViaDaemonWithReasonTimeout(command, args, cwd, mode, env, reconnectReason, logger, defaultDaemonSpawnTimeout)
 }
 
 func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger, timeout time.Duration) (string, string, error) {

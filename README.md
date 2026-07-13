@@ -186,11 +186,30 @@ no daemon is running.
 **Lifecycle:**
 
 - Shim connects → daemon starts or is reused.
-- CC session exits → grace period begins (default 30 s).
-- If no new session reconnects within the grace period → daemon stops the upstream process.
-- Servers declaring `x-mux.persistent: true` skip the grace period; they stay alive indefinitely
-  until explicitly stopped or until the daemon exits.
+- A non-persistent initialized shim with no requests or queued work parks its
+  daemon IPC session after 10 minutes without host traffic. New host demand
+  reconnects to the exact owner.
+- If no demand arrives for another 30 seconds, the stable launcher parks the
+  engine process too. The next host frame starts the current active engine,
+  replays the cached `initialize` handshake, and forwards that demand once.
+- When the last session disconnects, a disposable owner is eligible for the
+  existing 30-second safety-gated zero-session cleanup. The general owner idle
+  timeout remains 10 minutes; isolated owners use their shorter lifecycle rule.
+- Servers declaring `x-mux.persistent: true` do not suspend or reap while idle;
+  they stay alive until explicitly stopped or until the daemon exits.
 - Daemon auto-exits after 5 minutes with no owners and no connected sessions.
+
+`MCPMUX_SHIM_IDLE_TIMEOUT` and `MCPMUX_SHIM_DORMANT_GRACE` override the
+10-minute and 30-second product-shim stages with Go duration strings. Zero or a
+negative value disables that stage; invalid values keep the default. These are
+separate from owner cleanup and daemon auto-exit settings.
+
+Serena's web dashboard is configured separately from mux lifecycle. To prevent
+it opening automatically, pass `--open-web-dashboard false` to Serena's
+`start-mcp-server` command or set `web_dashboard_open_on_launch: false` in
+`serena_config.yml`; this leaves the dashboard active. Set
+`web_dashboard: false` only when the dashboard itself must be disabled; see the
+[Serena dashboard documentation](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
 **Disable daemon mode** (legacy per-session owner behavior):
 
@@ -216,6 +235,12 @@ During reconnect, the shim:
 5. Replays cached `initialize` request to warm the replacement owner
 6. Sends `notifications/tools/list_changed` so the host can refresh discovery
 7. Flushes any still-valid buffered requests and resumes normal proxy
+
+Reconnect is transport continuity, not request replay. A request already sent
+to the lost owner receives one explicit JSON-RPC error with its original id and
+is never sent to the successor. Only the cached `initialize` handshake is
+replayed to warm the replacement connection; host frames accepted afterward
+are forwarded once.
 
 Reconnect timeout: 30 seconds. If reconnect is still unavailable after that
 window and a reconnect path exists, the shim does **not** exit. It enters
@@ -376,9 +401,9 @@ mcp-mux upgrade
 The daemon keeps running with its current engine. New shim processes use the new
 active engine. The daemon updates on next natural restart.
 
-**When graceful restart is safe and actually runs (v0.21.0+), it preserves:**
+**When a same-protocol graceful restart is safe and actually runs, it preserves:**
 
-- **Upstream processes themselves** — they keep running across the daemon restart, with in-flight requests intact
+- **The upstream process tree** — a same-v2 handoff retains it after successor adoption; a restart with live sessions is deferred instead
 - Cached MCP responses (init, tools, prompts, resources)
 - Server classification (shared/isolated/session-aware)
 - Session metadata (cwd, env)
@@ -387,19 +412,20 @@ active engine. The daemon updates on next natural restart.
 
 **Only the daemon restarts** — upstreams are reattached via FD passing (Unix SCM_RIGHTS, Windows DuplicateHandle). See the next section for the lifecycle contract.
 
-## Upstream Lifecycle — Survives Daemon Restart (v0.21.0+)
+## Upstream Lifecycle — Transactional Restart and Full-Tree Cleanup
 
-Starting in v0.21.0, an upstream MCP server process **survives daemon restart without losing
-in-flight requests**. This restores the "drop-in MCP process manager" contract: behavioral
-equivalence to running the server as a direct child of the stdio client (the CC baseline).
+Handoff protocol v2 keeps an upstream process tree alive across a planned
+same-v2 daemon restart only after the successor adopts both stdio and the
+tree authority. Ordinary reconnect after an owner loss preserves the host
+transport but does not replay already-sent requests.
 
 ### The contract
 
-| Trigger | Pre-v0.21.0 | v0.21.0+ |
+| Trigger | Pre-v0.21.0 | v0.27.0 contract |
 |---|---|---|
 | `mcp-mux upgrade --restart` with live sessions | Upstream killed + respawned, in-flight requests dropped | Daemon restart deferred; existing stdio transports remain on the current daemon while new shims use the new engine pointer |
-| `mcp-mux upgrade --restart` with zero live sessions | Upstream killed + respawned, in-flight requests dropped | Upstream keeps running, new daemon reattaches FDs when graceful restart runs |
-| Daemon crash (SIGKILL) | Upstream killed with daemon | Upstream survives (Unix: own process group; Windows: Job Object without KILL_ON_JOB_CLOSE) |
+| `mcp-mux upgrade --restart` with zero live sessions | Upstream killed + respawned, in-flight requests dropped | Same-v2 handoff retains the upstream tree; the first v1-to-v2 restart takes one snapshot-backed respawn |
+| Daemon/owner loss | Upstream lifecycle was leader-oriented | Recovery is demand-driven; abandoned generations are cleaned as full trees and already-sent requests receive explicit errors instead of replay |
 | `mux_restart <sid>` (operator-initiated) | Hard kill — unchanged | Hard kill — unchanged (explicit operator intent) |
 | Reaper idle-eviction | Hard SIGKILL | Soft-close: 30s stdin drain → SIGTERM only after timeout |
 
@@ -409,44 +435,48 @@ equivalence to running the server as a direct child of the stdio client (the CC 
 
 - Upstream spawns with `Setpgid=true` — the kernel places the child in its own process group.
 - Planned restart: old daemon opens a Unix domain socket, successor daemon connects with a 128-bit
-  shared token, FDs (stdin, stdout) transfer via the SCM_RIGHTS ancillary control message.
-- Crash: absence of a shared process group means SIGHUP/SIGTERM to the daemon doesn't cascade.
+  shared token, FDs (stdin, stdout, stderr) transfer via the SCM_RIGHTS ancillary control message.
+- Cleanup targets the process group, including descendants that outlive the
+  leader or inherit its stdio. Planned v2 handoff retains the PGID authority
+  until the successor's final adoption acknowledgment.
 
 **Windows:**
 
-- Each upstream gets its own anonymous Job Object with `JOB_OBJECT_LIMIT_BREAKAWAY_OK` but
-  **no** `KILL_ON_JOB_CLOSE`. The child survives daemon exit.
+- Each upstream starts suspended and is placed in its own anonymous Job Object
+  with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before it can execute.
 - Planned restart: successor is spawned with a named-pipe address; handles are duplicated via
-  `DuplicateHandle` with `DUPLICATE_SAME_ACCESS`.
-- Crash: absence of `KILL_ON_JOB_CLOSE` plus the child not being a daemon descendant =
-  survives.
+  `DuplicateHandle` with `DUPLICATE_SAME_ACCESS`, including the Job authority.
+- The predecessor retains its Job lease until the successor commits adoption;
+  abort or final authority loss terminates the whole tree.
 
 ### Handoff protocol
 
-Old daemon → successor handshake is JSON-over-socket with a mandatory `protocol_version: 1`
+Old daemon → successor handshake is JSON-over-socket with a mandatory `protocol_version: 2`
 field on every message:
 
 ```
 Hello ──(token, source_pid)──>
        <──(protocol_version check, refs list)── Ready
-FdTransfer ──(server_id, handle_meta)──>
+FdTransfer ──(server_id, stdio + tree-authority metadata)──>
              <──(SCM_RIGHTS / DuplicateHandle)── AckTransfer (ok/aborted)
        ...repeat per upstream...
 Done   ──(transferred, aborted lists)──>
-       <──(accepted)── HandoffAck
+       <──(accepted + aborted partition)── HandoffAck
 ```
 
 - **Token auth (FR-11):** constant-time compare, 128-bit random, 0600 file.
-- **Per-upstream atomicity (FR-7):** each transfer either succeeds or falls back to respawn
-  for that one upstream — other upstreams are unaffected.
+- **Per-upstream atomicity (FR-7):** receipt does not detach the predecessor.
+  Each tree commits only if the final acknowledgment accepts its server id;
+  every other prepared tree aborts and is eligible for snapshot respawn.
 - **30s accept + total timeout** on both sides.
-- **Version skew (FR-3):** mismatched `protocol_version` → old daemon falls back to legacy
-  shutdown+respawn (FR-8).
+- **Version skew (FR-3):** negotiation happens before any owner detaches. A
+  mismatched `protocol_version`, including the first v1-to-v2 restart, takes
+  one bounded snapshot-backed shutdown+respawn path (FR-8).
 
 ### FR-8 degraded fallback
 
-If any of the following happens, the daemon automatically falls back to the pre-v0.21.0
-kill-and-respawn path — **no upstream is lost, zero-deployment-impact guarantee (FR-9):**
+If any of the following happens, the daemon automatically falls back to the
+bounded snapshot-backed shutdown-and-respawn path:
 
 - Platform unsupported (socket bind failure on an exotic OS)
 - Successor spawn failure
@@ -456,8 +486,9 @@ kill-and-respawn path — **no upstream is lost, zero-deployment-impact guarante
 - Any other `performHandoff` error
 
 All paths log `handoff.fallback reason=…` — search `mcp-muxd-debug.log` for operator diagnostics.
-After fallback the successor daemon respawns upstreams from snapshot; `drainOrphanedInflight`
-returns JSON-RPC errors to in-flight callers (same as v0.20.x).
+After fallback the successor daemon respawns upstreams from snapshot;
+`drainOrphanedInflight` returns JSON-RPC errors by original id to in-flight
+callers. It does not replay those requests.
 
 ### Operator visibility
 
@@ -473,11 +504,13 @@ New counters in `mux_list` / `HandleStatus`:
 Structured log markers: `handoff.start`, `handoff.upstream.transferred`, `handoff.complete`,
 `handoff.fallback`, `handoff.receive.{start,complete,fail}`.
 
-### Migration from v0.20.x
+### Migration to v0.27.0
 
-No code changes. Run `mcp-mux upgrade --restart` once — the first restart still goes through
-the legacy path (the old daemon has no handoff code). From the second restart onward,
-in-flight requests survive.
+No consumer code change is required. The first restart from a v1 handoff binary
+to v0.27.0 rejects live transfer before detach and uses one bounded
+snapshot-backed respawn. Subsequent v2-to-v2 planned restarts retain stdio and
+tree authority transactionally. Rollback across the same v2/v1 boundary uses
+the bounded respawn again; do not force mixed-version live handoff.
 
 Snapshot back-compat: v0.20.x `OwnerSnapshot` files load without errors; new fields
 (`UpstreamPID`, `HandoffSocketPath`, `SpawnPgid`) are `omitempty` and default to zero on
@@ -485,15 +518,18 @@ old snapshots.
 
 ### Known limitations
 
-- **First restart after v0.20.x → v0.21.0:** legacy path, in-flight requests dropped once.
-  Subsequent restarts use handoff.
+- **Protocol transition boundary:** the first handoff v1 → v2 restart, and a
+  rollback across that same boundary, reject live transfer before owner detach
+  and take one bounded snapshot-backed shutdown-and-respawn path. Same-v2
+  restarts retain stdio and full-tree authority only after final successor
+  adoption.
 - **Per-upstream 30s transfer bound:** upstreams that don't drain within 30s fall back to
   respawn for that entry only.
 - **macOS launchd cross-parentage:** verified via CI; spawns outside the mcp-mux process
   tree inherit correctly.
-- **Windows `JOB_OBJECT_LIMIT_BREAKAWAY_OK` requires `CREATE_BREAKAWAY_FROM_JOB` on
-  grandchildren:** upstreams that spawn language servers without that flag will still be
-  killed by `TerminateJobObject` in the explicit-kill path.
+- **Windows process tree:** each upstream is governed by a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; final authority loss intentionally
+  terminates descendants, including those that outlive their leader.
 
 ### Post-deploy verification
 
@@ -540,7 +576,10 @@ All configuration is via environment variables. No config file is required.
 | `MCP_MUX_NO_DAEMON` | `0` | Set to `1` to disable daemon mode (legacy per-session owner) |
 | `MCP_MUX_ISOLATED` | `0` | Set to `1` to force isolated mode for this invocation |
 | `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global deduplication) |
-| `MCP_MUX_GRACE` | `30s` | Grace period before an idle owner stops its upstream |
+| `MCPMUX_SHIM_IDLE_TIMEOUT` | `10m` | Safe host-idle period before a non-persistent shim parks its daemon IPC session; zero or negative disables |
+| `MCPMUX_SHIM_DORMANT_GRACE` | `30s` | Exact-owner reconnect window before a supervised launcher becomes dormant; zero or negative disables |
+| `MCP_MUX_OWNER_IDLE` | `10m` | General owner idle timeout; overridden per owner by `x-mux.idleTimeout` |
+| `MCP_MUX_GRACE` | `10m` | Legacy alias used only when `MCP_MUX_OWNER_IDLE` is unset |
 | `MCP_MUX_IDLE_TIMEOUT` | `5m` | Daemon auto-exit after this period with no activity |
 
 ## Control Plane MCP Server

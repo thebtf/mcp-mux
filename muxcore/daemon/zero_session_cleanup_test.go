@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"bufio"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +60,44 @@ func TestZeroSessionCleanupAutoReapsDisposableOwner(t *testing.T) {
 
 	waitForOwnerMissing(t, d, sid)
 	assertOwnerRemovalStatus(t, d.HandleStatus(), 1, "idle", 1)
+}
+
+func TestSpawnResponseFailureRevokesReservationAndSchedulesCleanup(t *testing.T) {
+	cleanupDelay := 100 * time.Millisecond
+	d := testZeroSessionCleanupDaemon(t, cleanupDelay)
+
+	ipcPath, sid, initialToken := spawnLifecycleOwner(t, d, "undelivered-spawn")
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("owner entry missing after spawn")
+	}
+	conn := dialLifecycleSession(t, ipcPath, initialToken)
+	waitOwnerSessionCount(t, entry, 1)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close() error = %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+
+	_, reusedSID, token := spawnLifecycleOwner(t, d, "undelivered-spawn")
+	if reusedSID != sid {
+		t.Fatalf("undelivered spawn created owner %q, want reuse of %q", reusedSID, sid)
+	}
+	if !entry.Owner.SessionMgr().IsPreRegistered(token) {
+		t.Fatal("spawn token was not pending before rollback")
+	}
+
+	// The disconnect above already scheduled zero-session cleanup. The new
+	// reservation must keep that stale timer from removing the reused owner.
+	time.Sleep(2 * cleanupDelay)
+	if d.Entry(sid) != entry || !entry.Owner.SessionMgr().IsPreRegistered(token) {
+		t.Fatal("pending spawn token did not retain owner before rollback")
+	}
+
+	d.HandleSpawnResponseFailure(sid, token)
+	if entry.Owner.SessionMgr().IsPreRegistered(token) {
+		t.Fatal("undelivered spawn token remained pending")
+	}
+	waitForOwnerMissing(t, d, sid)
 }
 
 func TestZeroSessionCleanupPersistentOwnerSurvives(t *testing.T) {
@@ -123,4 +164,98 @@ func TestZeroSessionCleanupStaleTimerDoesNotRemoveReattachedOwner(t *testing.T) 
 	}
 	waitOwnerSessionCount(t, entry, 0)
 	waitForOwnerMissing(t, d, sid1)
+}
+
+func TestZeroSessionCleanupReconnectReservationClosesWakeRace(t *testing.T) {
+	d := testZeroSessionCleanupDaemon(t, time.Hour)
+
+	ipcPath, sid, prevToken := spawnLifecycleOwner(t, d, "zero-cleanup-wake-race")
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("owner entry missing after spawn")
+	}
+	conn := dialLifecycleSession(t, ipcPath, prevToken)
+	waitOwnerSessionCount(t, entry, 1)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("initial conn.Close() error = %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+	time.Sleep(20 * time.Millisecond)
+
+	d.mu.Lock()
+	zeroAt := time.Now().Add(-time.Second)
+	entry.LastSession = zeroAt
+	d.mu.Unlock()
+
+	ownerAliveEntered := make(chan struct{})
+	releaseOwnerAlive := make(chan struct{})
+	type reconnectResult struct {
+		token string
+		err   error
+	}
+	reconnected := make(chan reconnectResult, 1)
+	go func() {
+		token, err := entry.Owner.SessionMgr().RegisterReconnect(prevToken, func(string) bool {
+			close(ownerAliveEntered)
+			<-releaseOwnerAlive
+			return true
+		})
+		reconnected <- reconnectResult{token: token, err: err}
+	}()
+
+	select {
+	case <-ownerAliveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("ownerAlive barrier was not reached")
+	}
+	if got := entry.Owner.SessionMgr().PendingCount(); got != 1 {
+		t.Fatalf("PendingCount() at ownerAlive barrier = %d, want 1", got)
+	}
+	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond); err != nil {
+		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() error = %v", err)
+	} else if removed {
+		t.Fatal("zero-session cleanup removed owner with reconnect reservation")
+	}
+	close(releaseOwnerAlive)
+
+	result := <-reconnected
+	if result.err != nil {
+		t.Fatalf("RegisterReconnect() error = %v", result.err)
+	}
+	wakeConn := dialLifecycleSession(t, ipcPath, result.token)
+	waitOwnerSessionCount(t, entry, 1)
+	if _, err := fmt.Fprintln(wakeConn, `{"jsonrpc":"2.0","id":99,"method":"wake"}`); err != nil {
+		t.Fatalf("write wake request: %v", err)
+	}
+	if err := wakeConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+	reader := bufio.NewReader(wakeConn)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read wake response: %v", err)
+	}
+	if !strings.Contains(response, `"result"`) || strings.Contains(response, `-32603`) {
+		t.Fatalf("wake response = %s, want successful result without orphan error", response)
+	}
+	if err := wakeConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() for replay check error = %v", err)
+	}
+	if replay, err := reader.ReadString('\n'); err == nil {
+		t.Fatalf("unexpected replayed wake response: %s", replay)
+	}
+	if err := wakeConn.Close(); err != nil {
+		t.Fatalf("wake conn.Close() error = %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+
+	d.mu.Lock()
+	zeroAt = time.Now().Add(-time.Second)
+	entry.LastSession = zeroAt
+	d.mu.Unlock()
+	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond); err != nil {
+		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() after bind error = %v", err)
+	} else if !removed {
+		t.Fatal("zero-session cleanup did not remove owner after reservation was consumed")
+	}
 }

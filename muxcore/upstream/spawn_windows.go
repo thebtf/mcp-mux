@@ -3,8 +3,8 @@
 package upstream
 
 import (
+	"errors"
 	"fmt"
-	"log"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -12,53 +12,27 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// applyUnixSpawnAttrs is a no-op on Windows — Setpgid does not exist.
-// Windows per-process isolation is handled by per-upstream Job Objects
-// assigned in afterSpawnWindows (T015), not by spawn-time SysProcAttr.
-// Defined here with the same signature as spawn_unix.go so process.go
-// can call it under both build tags.
+var isProcessInJobProc = windows.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob")
+
 func applyUnixSpawnAttrs(sysAttr *syscall.SysProcAttr) *syscall.SysProcAttr {
+	if sysAttr == nil {
+		sysAttr = &syscall.SysProcAttr{}
+	}
+	// The upstream cannot execute until its single transferable Job authority
+	// is established. afterSpawnWindows resumes the primary thread.
+	sysAttr.CreationFlags |= windows.CREATE_NO_WINDOW | windows.CREATE_SUSPENDED
 	return sysAttr
 }
 
-// cmdApplyUnixSpawnAttrs is a legacy wrapper kept for call sites that take
-// an *exec.Cmd rather than *syscall.SysProcAttr directly. No-op on Windows.
-// Kept for backwards-compatibility with code paths outside procgroup.
 func cmdApplyUnixSpawnAttrs(cmd *exec.Cmd) {}
 
-// createUpstreamJob creates an anonymous Windows Job Object for a single
-// upstream process and assigns the process to it.
-//
-// Design (C1 corrected): Each upstream gets its OWN Job Object distinct
-// from the daemon-wide procgroup job. Windows 8+ nested jobs allow a
-// process to be in multiple jobs simultaneously.
-//
-// NO JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Windows kills every process in a
-// job as soon as the LAST explicit handle to that job closes (membership
-// does NOT refcount the handle). If the daemon is the only handle-holder
-// and sets KILL_ON_JOB_CLOSE, closing the daemon's handle kills the child —
-// defeating FR-1. For planned handoff (T017), the daemon DuplicateHandle's
-// the job to the successor before exiting, keeping the handle count > 0.
-// For unplanned daemon death (SIGKILL), the absence of KILL_ON_JOB_CLOSE
-// is what lets the child survive. Intentional kill paths go through
-// TerminateJobObject explicitly, not via handle close.
-//
-// JOB_OBJECT_LIMIT_BREAKAWAY_OK: permits children spawned by the upstream to
-// escape this job when they are created with CREATE_BREAKAWAY_FROM_JOB. This
-// does NOT automatically exclude grandchildren — breakaway only happens if the
-// spawning process passes CREATE_BREAKAWAY_FROM_JOB to CreateProcess. Language
-// servers that do not use that flag will still be part of this job and will be
-// killed by TerminateJobObject. The flag is set here so that upstreams that DO
-// pass CREATE_BREAKAWAY_FROM_JOB can escape gracefully.
 func createUpstreamJob(processHandle windows.Handle) (windows.Handle, error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return 0, fmt.Errorf("CreateJobObject: %w", err)
 	}
-
 	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
-
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	if _, err := windows.SetInformationJobObject(
 		job,
 		windows.JobObjectExtendedLimitInformation,
@@ -68,71 +42,229 @@ func createUpstreamJob(processHandle windows.Handle) (windows.Handle, error) {
 		_ = windows.CloseHandle(job)
 		return 0, fmt.Errorf("SetInformationJobObject: %w", err)
 	}
-
 	if err := windows.AssignProcessToJobObject(job, processHandle); err != nil {
 		_ = windows.CloseHandle(job)
 		return 0, fmt.Errorf("AssignProcessToJobObject: %w", err)
 	}
-
 	return job, nil
 }
 
-// closeUpstreamJob closes the daemon's handle to the upstream's Job Object.
-// This does NOT kill the upstream (KILL_ON_JOB_CLOSE is intentionally absent;
-// see createUpstreamJob). The upstream process remains alive with the job
-// still associated, but the daemon relinquishes its handle.
-//
-// Intentional kill path: call terminateUpstreamJob (or equivalent wrapper
-// over windows.TerminateJobObject) BEFORE closing — this kills every
-// process in the job synchronously regardless of handle state.
-//
-// For planned handoff (T017 + T020), the daemon duplicates this handle
-// to the successor via DuplicateHandle BEFORE calling closeUpstreamJob.
-func closeUpstreamJob(job windows.Handle) {
-	if job != 0 {
-		_ = windows.CloseHandle(job)
-	}
-}
-
-// releaseJobHandle closes the daemon's copy of the per-upstream Job Object
-// handle stored in p.jobHandle, and zeroes the field. Safe to call multiple
-// times (guarded by the != 0 check). Called from Process.Close() and
-// Process.Detach() so the kernel object is released when ownership ends.
-//
-// On the planned-handoff path (T020), the caller must DuplicateHandle the job
-// into the successor process BEFORE calling releaseJobHandle — otherwise the
-// last handle closes and KILL_ON_JOB_CLOSE (if ever added) would fire.
-// Currently KILL_ON_JOB_CLOSE is absent, so closing this handle is safe even
-// without a prior duplicate; the upstream process continues running.
-func releaseJobHandle(p *Process) {
-	if p.jobHandle != 0 {
-		closeUpstreamJob(windows.Handle(p.jobHandle))
-		p.jobHandle = 0
-	}
-}
-
-// afterSpawnWindows is called after procgroup.Spawn succeeds on Windows.
-// It opens a process handle for the spawned PID, creates a per-upstream
-// Job Object, assigns the process to it, and stores the job handle in p.
-// On failure, logs a warning but does not abort — upstream still runs
-// without the custom job (graceful degradation per AC8).
-func afterSpawnWindows(p *Process, pid int) {
-	// F75-11: least privilege — AssignProcessToJobObject requires only
-	// PROCESS_SET_QUOTA and PROCESS_TERMINATE (MSDN), NOT PROCESS_ALL_ACCESS.
-	handle, err := windows.OpenProcess(
-		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
-		false, uint32(pid))
+func resumeProcessThreads(pid int) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
-		log.Printf("[upstream] WARNING: OpenProcess pid=%d for job assignment: %v", pid, err)
-		return
+		return fmt.Errorf("CreateToolhelp32Snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snapshot)
+
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	if err := windows.Thread32First(snapshot, &entry); err != nil {
+		return fmt.Errorf("Thread32First: %w", err)
+	}
+
+	resumed := 0
+	for {
+		if entry.OwnerProcessID == uint32(pid) {
+			thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+			if err != nil {
+				return fmt.Errorf("OpenThread %d: %w", entry.ThreadID, err)
+			}
+			previous, resumeErr := windows.ResumeThread(thread)
+			_ = windows.CloseHandle(thread)
+			if resumeErr != nil {
+				return fmt.Errorf("ResumeThread %d: %w", entry.ThreadID, resumeErr)
+			}
+			if previous == 0 {
+				// CREATE_SUSPENDED applies to the primary thread. Security,
+				// monitoring, or debugger software may inject an already-running
+				// thread before this snapshot; it is not our suspension to release.
+				continue
+			}
+			resumed++
+		}
+
+		err = windows.Thread32Next(snapshot, &entry)
+		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("Thread32Next: %w", err)
+		}
+	}
+	if resumed == 0 {
+		return fmt.Errorf("no threads found for suspended pid %d", pid)
+	}
+	return nil
+}
+
+func afterSpawnWindows(p *Process, pid int) error {
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false, uint32(pid),
+	)
+	if err != nil {
+		return fmt.Errorf("OpenProcess pid=%d: %w", pid, err)
 	}
 	defer windows.CloseHandle(handle)
 
 	job, err := createUpstreamJob(handle)
 	if err != nil {
-		log.Printf("[upstream] WARNING: createUpstreamJob pid=%d: %v", pid, err)
-		return
+		return err
+	}
+	p.authorityMu.Lock()
+	p.jobHandle = uintptr(job)
+	p.authorityMu.Unlock()
+
+	if err := resumeProcessThreads(pid); err != nil {
+		p.authorityMu.Lock()
+		if p.jobHandle == uintptr(job) {
+			p.jobHandle = 0
+		}
+		p.authorityMu.Unlock()
+		_ = windows.TerminateJobObject(job, 1)
+		_ = windows.CloseHandle(job)
+		return err
+	}
+	return nil
+}
+
+func (p *Process) takeJobAuthority() windows.Handle {
+	p.authorityMu.Lock()
+	job := windows.Handle(p.jobHandle)
+	p.jobHandle = 0
+	p.authorityMu.Unlock()
+	return job
+}
+
+func terminateProcessTree(p *Process) error {
+	job := p.takeJobAuthority()
+	if job == 0 {
+		if p.proc == nil {
+			return nil
+		}
+		return p.proc.Kill()
+	}
+	err := windows.TerminateJobObject(job, 1)
+	_ = windows.CloseHandle(job)
+	if err != nil {
+		return fmt.Errorf("TerminateJobObject: %w", err)
+	}
+	return nil
+}
+
+func releaseTreeAuthority(p *Process) error {
+	job := p.takeJobAuthority()
+	if job == 0 {
+		return nil
+	}
+	if err := windows.CloseHandle(job); err != nil {
+		return fmt.Errorf("CloseHandle(job): %w", err)
+	}
+	return nil
+}
+
+func handoffAuthority(p *Process) (uintptr, error) {
+	p.authorityMu.Lock()
+	defer p.authorityMu.Unlock()
+	if p.jobHandle == 0 {
+		return 0, errors.New("upstream: Windows Job authority unavailable")
+	}
+	return p.jobHandle, nil
+}
+
+func processInJob(process, job windows.Handle) (bool, error) {
+	var inJob int32
+	ok, _, callErr := isProcessInJobProc.Call(
+		uintptr(process),
+		uintptr(job),
+		uintptr(unsafe.Pointer(&inJob)),
+	)
+	if ok == 0 {
+		if callErr == windows.ERROR_SUCCESS {
+			callErr = windows.ERROR_INVALID_HANDLE
+		}
+		return false, callErr
+	}
+	return inJob != 0, nil
+}
+
+func prepareLegacyDetach(p *Process, pid int) error {
+	p.authorityMu.Lock()
+	job := windows.Handle(p.jobHandle)
+	p.authorityMu.Unlock()
+	if job == 0 {
+		return errors.New("upstream: Windows Job authority unavailable")
 	}
 
+	target, err := windows.OpenProcess(
+		windows.PROCESS_DUP_HANDLE|windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false, uint32(pid),
+	)
+	if err != nil {
+		return fmt.Errorf("OpenProcess pid=%d for legacy detach: %w", pid, err)
+	}
+	defer windows.CloseHandle(target)
+
+	inJob, err := processInJob(target, job)
+	if err != nil {
+		return fmt.Errorf("validate legacy detach Job: %w", err)
+	}
+	if !inJob {
+		return fmt.Errorf("upstream: pid %d is not contained by detach Job", pid)
+	}
+
+	var remoteLease windows.Handle
+	if err := windows.DuplicateHandle(
+		windows.CurrentProcess(),
+		job,
+		target,
+		&remoteLease,
+		0,
+		false,
+		windows.DUPLICATE_SAME_ACCESS,
+	); err != nil {
+		return fmt.Errorf("duplicate legacy self-lease: %w", err)
+	}
+	return nil
+}
+
+func attachHandoffAuthority(p *Process, pid int, authority uintptr, requireAuthority bool) error {
+	process, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false, uint32(pid),
+	)
+	if err != nil {
+		return fmt.Errorf("OpenProcess pid=%d for attach: %w", pid, err)
+	}
+	defer windows.CloseHandle(process)
+
+	var job windows.Handle
+	if authority == 0 {
+		if requireAuthority {
+			return errors.New("upstream: Windows handoff missing Job authority")
+		}
+		job, err = createUpstreamJob(process)
+		if err != nil {
+			return fmt.Errorf("reacquire legacy Job authority: %w", err)
+		}
+	} else {
+		job = windows.Handle(authority)
+		inJob, err := processInJob(process, job)
+		if err != nil {
+			return fmt.Errorf("validate transferred Job authority: %w", err)
+		}
+		if !inJob {
+			return fmt.Errorf("upstream: transferred Job does not contain pid %d", pid)
+		}
+	}
+
+	p.authorityMu.Lock()
 	p.jobHandle = uintptr(job)
+	p.authorityMu.Unlock()
+	return nil
+}
+
+func closeHandoffAuthority(authority uintptr) {
+	if authority != 0 {
+		_ = windows.CloseHandle(windows.Handle(authority))
+	}
 }

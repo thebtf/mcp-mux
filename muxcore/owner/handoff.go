@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
 
 // ErrAlreadyShutDown is returned by ShutdownForHandoff if Shutdown (or a prior
@@ -18,13 +19,35 @@ var ErrNoUpstream = errors.New("owner: no upstream to hand off")
 // HandoffPayload carries the detached upstream process information needed for
 // the new owner to adopt the process without restarting it.
 type HandoffPayload struct {
-	ServerID string
-	PID      int
-	StdinFD  uintptr
-	StdoutFD uintptr
-	Command  string
-	Args     []string
-	Cwd      string
+	ServerID    string
+	PID         int
+	StdinFD     uintptr
+	StdoutFD    uintptr
+	StderrFD    uintptr
+	AuthorityFD uintptr
+	Command     string
+	Args        []string
+	Cwd         string
+
+	abort  func() error
+	commit func() error
+}
+
+// Abort terminates a prepared detached tree. It is safe to call repeatedly.
+func (p HandoffPayload) Abort() error {
+	if p.abort == nil {
+		return nil
+	}
+	return p.abort()
+}
+
+// Commit releases the predecessor's stdio and tree authority only after the
+// successor reports that the owner was constructed and registered.
+func (p HandoffPayload) Commit() error {
+	if p.commit == nil {
+		return nil
+	}
+	return p.commit()
 }
 
 // HasHandoffUpstream reports whether this owner has a subprocess that can be
@@ -69,17 +92,18 @@ func (o *Owner) teardownExceptUpstream() {
 // detaches from it — returning the PID and file descriptors so the caller can
 // transfer ownership to a new daemon without restarting the upstream.
 //
-// After a successful ShutdownForHandoff the upstream process continues running.
-// o.done is closed and o.Done() returns immediately. A subsequent call to
-// Shutdown() is a safe no-op because shutdownOnce has already fired.
+// After a successful ShutdownForHandoff the upstream process continues running
+// under a prepared lease. o.done is closed; the caller must later invoke the
+// payload's Commit or Abort operation exactly once (both are idempotent).
 //
 // Error cases:
 //   - ErrAlreadyShutDown — Shutdown or ShutdownForHandoff was already called.
-//     o.done may or may not be closed depending on how shutdown originally ended.
+//     o.done reflects how that earlier shutdown completed.
 //   - ErrNoUpstream — owner has no subprocess to hand off (nil upstream).
-//     o.done is NOT closed; the owner remains in a limbo state.
+//     The already-torn-down owner is completed and o.done is closed.
 //   - wrapped upstream.ErrAlreadyDetached / ErrDetachUnsupported — Detach failed.
-//     o.done is NOT closed; the owner remains in a limbo state.
+//     The upstream is aborted or closed, then o.done is closed. A failed handoff
+//     never leaves a torn-down owner or process tree in limbo.
 func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 	var payload HandoffPayload
 	var retErr error
@@ -96,26 +120,36 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 
 		if up == nil {
 			retErr = ErrNoUpstream
-			// Do NOT close(o.done) — owner failed to hand off; caller must
-			// decide whether to hard-shutdown or retry.
+			close(o.done)
 			return
 		}
 
-		pid, stdinFD, stdoutFD, err := up.Detach()
+		pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := up.DetachWithAuthority()
 		if err != nil {
-			retErr = fmt.Errorf("owner: detach upstream: %w", err)
-			// Do NOT close(o.done) — detach failed; upstream is still owned.
+			cleanupErr := up.AbortDetach()
+			if errors.Is(cleanupErr, upstream.ErrDetachNotPrepared) {
+				cleanupErr = up.Close()
+			} else {
+				cleanupErr = errors.Join(cleanupErr, up.Close())
+			}
+			retErr = errors.Join(fmt.Errorf("owner: detach upstream: %w", err), cleanupErr)
+			o.logger.Printf("owner handoff failed; upstream terminated: %v", retErr)
+			close(o.done)
 			return
 		}
 
 		payload = HandoffPayload{
-			ServerID: o.serverID,
-			PID:      pid,
-			StdinFD:  stdinFD,
-			StdoutFD: stdoutFD,
-			Command:  o.command,
-			Args:     o.args,
-			Cwd:      o.cwd,
+			ServerID:    o.serverID,
+			PID:         pid,
+			StdinFD:     stdinFD,
+			StdoutFD:    stdoutFD,
+			StderrFD:    stderrFD,
+			AuthorityFD: authorityFD,
+			Command:     o.command,
+			Args:        o.args,
+			Cwd:         o.cwd,
+			abort:       up.AbortDetach,
+			commit:      up.CommitDetach,
 		}
 
 		o.logger.Printf("owner handed off (pid=%d)", pid)

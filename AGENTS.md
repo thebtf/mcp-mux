@@ -66,13 +66,63 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.26.x)
+## muxcore Library API (v0.27.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.13
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.0
 ```
+
+### v0.27.0 - lifecycle convergence and process-tree authority
+
+**No required consumer code changes for ordinary `engine.New` users.** This
+release converges disposable owner, shim, launcher, and subprocess lifecycles:
+
+- the `mcp-mux` product shim parks its daemon IPC session after 10 minutes of
+  safe inactivity, waits 30 seconds for exact-owner demand, then lets the stable
+  launcher become dormant until the next host frame. Product operators can
+  override these Go durations with `MCPMUX_SHIM_IDLE_TIMEOUT` and
+  `MCPMUX_SHIM_DORMANT_GRACE`; zero or negative disables the corresponding
+  stage. Invalid values retain the defaults;
+- persistent owners never enter this idle-suspend path. Keep `Persistent: true`
+  or `x-mux.persistent: true` for background jobs, indexes, caches, or other
+  state that must survive zero connected sessions;
+- reconnect preserves the host stdio transport, not arbitrary requests. An
+  already-sent in-flight request receives an explicit JSON-RPC error with its
+  original id and is never replayed. Muxcore replays only the cached
+  `initialize` handshake needed to warm the replacement connection, then sends
+  new buffered host demand once;
+- handoff `protocol_version` is now `2`. The first v1-to-v2 restart rejects live
+  handoff before any owner detaches and takes one bounded snapshot-backed
+  shutdown-and-respawn path. Later v2-to-v2 restarts transfer stdio and the
+  single process-tree authority transactionally, preserving the existing
+  upstream generation only after the successor's final adoption acknowledgment;
+- subprocess cleanup now covers the full tree: Unix process groups and Windows
+  Job Objects are finalized once, including descendants that inherit stdio or
+  outlive their leader.
+
+For direct `owner.RunResilientClient` consumers, the new
+`ResilientClientConfig.IdleSuspendDelay`, `IdleSuspendGate`, and
+`IdleDormantGrace` fields are opt-in; their zero values keep the previous
+always-connected shim behavior. The private launcher dormant notifications and
+exit code are an `mcp-mux` product protocol, not a consumer API to copy.
+
+Consumer impact: update to v0.27.0. Do not add product-local request replay,
+shim polling, stale-process sweeps, PID-only kills, launcher respawn loops, or
+handoff retry protocols; those compete with muxcore ownership. If Serena's web
+dashboard must not run, disable it in Serena itself with
+`--enable-web-dashboard false` or `web_dashboard: false` in
+`serena_config.yml`; dashboard policy is separate from muxcore tree cleanup.
+
+Rollback: point the product back to its previous muxcore/binary. Expect the
+first restart across the v2/v1 boundary to take the same bounded snapshot
+respawn path; do not force mixed-version live handoff.
+
+Release evidence must include the root and muxcore test suites, `go vet`, the
+repository critical suite, focused idle/dormant and full-tree tests on Windows
+and Unix, one v1-to-v2 fallback proof, one same-v2 authority-retention proof,
+and the consumer handoff gate from `docs/RELEASE-PROTOCOL.md`.
 
 ### v0.26.13 - transport degraded retry and automatic zero-session cleanup
 

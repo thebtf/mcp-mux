@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 // mockServerAbsPath returns the absolute path to the mock server source so
@@ -118,5 +119,27 @@ func TestSpawn_ParallelStormSharedConverges(t *testing.T) {
 	// losing-race paths.
 	if got := d.OwnerCount(); got != 1 {
 		t.Errorf("OwnerCount = %d after storm, want 1", got)
+	}
+
+	var sharedSID string
+	for sid := range seen {
+		sharedSID = sid
+	}
+	entry := d.Entry(sharedSID)
+	if entry == nil || entry.Owner == nil {
+		t.Fatalf("shared owner %q missing after storm", sharedSID)
+	}
+	wantCwds := make(map[string]struct{}, N)
+	for _, cwd := range cwds {
+		wantCwds[serverid.CanonicalizePath(cwd)] = struct{}{}
+	}
+	gotCwds := entry.Owner.ExportSnapshot().CwdSet
+	if len(gotCwds) != len(wantCwds) {
+		t.Fatalf("shared owner cwdSet = %v, want %d distinct roots", gotCwds, len(wantCwds))
+	}
+	for _, cwd := range gotCwds {
+		if _, ok := wantCwds[cwd]; !ok {
+			t.Fatalf("shared owner cwdSet contains unexpected root %q; want %v", cwd, wantCwds)
+		}
 	}
 }

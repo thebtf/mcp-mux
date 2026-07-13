@@ -35,52 +35,35 @@ import (
 // Safe to call after Close() — returns (0, nil) if already closed or detached.
 func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return 0, nil
-	}
-	if p.detached {
+	if p.closed || p.detach != detachAttached {
 		p.mu.Unlock()
 		return 0, nil
 	}
 	p.closed = true
 	p.mu.Unlock()
 
-	// Release the Windows Job Object handle (no-op on non-Windows).
-	releaseJobHandle(p)
-
-	// Phase 1: close stdin — polite MCP shutdown signal.
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
 
-	// Phase 2: wait for voluntary exit.
 	select {
 	case <-p.Done:
-		// Exited cleanly on its own.
-		return softCloseExitCode(p.ExitErr), nil
+		return softCloseExitCode(p.ExitErr), terminateProcessTree(p)
 	case <-time.After(timeout):
 	}
 
-	// Phase 3: timeout — escalate to GracefulKill.
-	if p.proc != nil {
-		killErr := p.proc.GracefulKill(3 * time.Second)
-		// Wait for the process to fully exit so ExitErr is populated.
+	if p.proc != nil || p.pid > 0 {
+		killErr := terminateProcessTree(p)
 		select {
 		case <-p.Done:
 		case <-time.After(5 * time.Second):
-			return -1, fmt.Errorf("upstream: process did not exit after GracefulKill")
+			return -1, fmt.Errorf("upstream: process tree did not exit after termination")
 		}
 		if killErr != nil {
 			return softCloseExitCode(p.ExitErr), killErr
 		}
-		// GracefulKill succeeded but we still escalated past the voluntary-exit window.
-		// Return a non-nil error so callers (SoftShutdown, SoftRemove) can detect the
-		// forced-kill path even when GracefulKill itself had no error.
 		return softCloseExitCode(p.ExitErr), fmt.Errorf("upstream: forced kill after soft-close timeout")
 	}
-
-	// In-process handler did not exit within timeout.
 	return -1, fmt.Errorf("upstream: handler did not exit after %v", timeout)
 }
 
@@ -107,6 +90,23 @@ var ErrAlreadyDetached = errors.New("upstream: process already detached")
 // ErrDetachUnsupported is returned by Detach when the Process is not backed
 // by an OS child process (for example, NewProcessFromHandler).
 var ErrDetachUnsupported = errors.New("upstream: detach unsupported for handler-based process")
+
+// ErrDetachNotPrepared indicates CommitDetach or AbortDetach was called before
+// a successful detach preparation.
+var ErrDetachNotPrepared = errors.New("upstream: detach not prepared")
+
+// ErrDetachCommitted indicates an abort arrived after ownership was committed
+// to a successor.
+var ErrDetachCommitted = errors.New("upstream: detach already committed")
+
+type detachState uint8
+
+const (
+	detachAttached detachState = iota
+	detachPrepared
+	detachCommitted
+	detachAborted
+)
 
 // lineBuffer is a mutex-protected deque of lines for buffering stdout.
 // A drain goroutine pushes lines; ReadLine pops them.
@@ -169,38 +169,55 @@ func (lb *lineBuffer) pop() ([]byte, error) {
 // Process represents a running upstream MCP server process.
 type Process struct {
 	proc       *procgroup.Process
+	pid        int
 	stdin      io.WriteCloser
 	stdout     io.ReadCloser
 	stderr     io.ReadCloser
 	stdinFile  *os.File // raw OS file for Detach; nil for handler-based processes
 	stdoutFile *os.File // raw OS file for Detach; nil for handler-based processes
-	// stdinFD / stdoutFD cache the OS file descriptors captured ONCE at
-	// PreStart time — before any reader/writer goroutine touches the File
-	// objects. Calling (*os.File).Fd() from Detach() at runtime would race
-	// with the spawn goroutine's internal reads/writes on the same file
-	// (observed on CI ubuntu -race: TestDetach_DoubleDetach). Caching at
-	// spawn time eliminates the race.
+	stderrFile *os.File // raw OS file for transactional handoff
+	// stdinFD / stdoutFD / stderrFD cache the OS handles captured once through
+	// SyscallConn during PreStart, before reader/writer goroutines start. Calling
+	// (*os.File).Fd() from Detach at runtime would switch the File to blocking
+	// mode and race with active stream I/O.
 	stdinFD  uintptr
 	stdoutFD uintptr
-	// spawnPgid is the process group ID of the spawned upstream. On Unix,
-	// Setpgid=true causes the child's PGID to equal its PID (kernel guarantee).
-	// Set after procgroup.Spawn returns successfully. Zero for handler-based processes.
-	spawnPgid int
-	// jobHandle is the Windows Job Object handle for this upstream. 0 on
-	// non-Windows or if creation failed (graceful degradation per AC8).
-	jobHandle uintptr
+	stderrFD uintptr
+	// stdoutDrain/stderrDrain own the blocking read authorities. Transactional
+	// detach quiesces and joins both before exposing their OS handles.
+	stdoutDrain *streamReadControl
+	stderrDrain *streamReadControl
+	// authorityMu protects the one-shot PGID/Job authority. Finalization,
+	// detach commit, and leader-exit cleanup atomically take and retire it.
+	authorityMu sync.Mutex
+	spawnPgid   int
+	jobHandle   uintptr
 
 	lineBuf *lineBuffer
 
 	mu           sync.Mutex
 	closed       bool
-	detached     bool
+	detach       detachState
 	drainTimeout time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
 
 	// Done is closed when the process exits.
 	Done chan struct{}
 	// ExitErr holds the error from Wait(), available after Done is closed.
 	ExitErr error
+}
+
+// beginExitFinalization atomically decides whether this Process still owns
+// leader-exit cleanup. A detach that reaches detachPrepared first owns the
+// tree lease; an exit finalizer that reaches this method first marks the
+// Process closed so a later detach cannot expose handles from a dying tree.
+func (p *Process) beginExitFinalization() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.detach != detachAttached {
+		return false
+	}
+	p.closed = true
+	return true
 }
 
 // SetDrainTimeout sets the graceful shutdown wait time after stdin close.
@@ -249,14 +266,20 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// Stdin can still use StdinPipe: the caller drives writes and the pipe
 	// close is an intentional shutdown signal, not a race.
 	//
-	// Stderr uses StderrPipe but is synchronized the same way as stdout:
-	// a stderrDrained channel ensures proc.Wait() is only called after the
-	// stderr scanner goroutine has finished reading. Without that ordering,
-	// Cmd.Wait() closes the StderrPipe while the scanner may still be reading,
-	// which can silently drop the last lines of crash diagnostics.
+	// Stderr also uses an owned os.Pipe. procgroup starts cmd.Wait in its own
+	// reaper goroutine immediately after spawn, so exec.Cmd.StderrPipe would be
+	// invalid here: Cmd.Wait closes that pipe and can race the scanner, silently
+	// dropping the last crash diagnostics. Owned pipe ends remain valid until
+	// the drain goroutines close them explicitly.
 	stdoutR, stdoutW, pipeErr := os.Pipe()
 	if pipeErr != nil {
 		return nil, fmt.Errorf("upstream: os.Pipe: %w", pipeErr)
+	}
+	stderrR, stderrW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		return nil, fmt.Errorf("upstream: stderr os.Pipe: %w", pipeErr)
 	}
 
 	// Capture pipe handles inside the PreStart callback so procgroup still owns
@@ -267,32 +290,43 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		Args:    args,
 		Dir:     cwd,
 		Env:     merged,
-		// stdout: use our own pipe (see rationale above). stdin / stderr
-		// still use exec.Cmd's built-in pipes.
-		Stdout: stdoutW,
+		// stdout/stderr: use owned pipes (see rationale above). stdin still
+		// uses exec.Cmd's built-in pipe because the caller drives writes.
+		Stdout:      stdoutW,
+		Stderr:      stderrW,
+		DisableTree: true,
 		PreStart: func(cmd *exec.Cmd) error {
 			stdin, err := cmd.StdinPipe()
 			if err != nil {
 				captureErr = fmt.Errorf("upstream: stdin pipe: %w", err)
 				return captureErr
 			}
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				captureErr = fmt.Errorf("upstream: stderr pipe: %w", err)
-				return captureErr
-			}
 			p.stdin = stdin
 			p.stdout = stdoutR
-			p.stderr = stderr
+			p.stderr = stderrR
 			// Capture raw *os.File references for Detach(). stdoutR is always
 			// *os.File (from os.Pipe above). stdin from StdinPipe is also *os.File
 			// on all supported platforms; the type assertion is defensive.
 			if f, ok := stdin.(*os.File); ok {
 				p.stdinFile = f
-				p.stdinFD = f.Fd() // cache pre-goroutine (NFR-5, race-safe)
+				p.stdinFD, err = rawFileHandle(f)
+				if err != nil {
+					captureErr = fmt.Errorf("upstream: stdin raw handle: %w", err)
+					return captureErr
+				}
 			}
 			p.stdoutFile = stdoutR
-			p.stdoutFD = stdoutR.Fd() // cache pre-goroutine (race-safe)
+			p.stdoutFD, err = rawFileHandle(stdoutR)
+			if err != nil {
+				captureErr = fmt.Errorf("upstream: stdout raw handle: %w", err)
+				return captureErr
+			}
+			p.stderrFile = stderrR
+			p.stderrFD, err = rawFileHandle(stderrR)
+			if err != nil {
+				captureErr = fmt.Errorf("upstream: stderr raw handle: %w", err)
+				return captureErr
+			}
 			cmd.SysProcAttr = applyUnixSpawnAttrs(cmd.SysProcAttr)
 			return nil
 		},
@@ -300,14 +334,24 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 
 	proc, err := procgroup.Spawn(opts)
 	if err != nil {
+		if p.stdin != nil {
+			_ = p.stdin.Close()
+		}
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return nil, fmt.Errorf("upstream: spawn %s: %w", command, err)
 	}
 	if captureErr != nil {
 		// Should not happen — Spawn already propagates PreStart errors — but be safe.
+		if p.stdin != nil {
+			_ = p.stdin.Close()
+		}
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		_ = proc.Kill()
 		return nil, captureErr
 	}
@@ -317,85 +361,50 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	// Scanner then sees EOF naturally. Without this close, the pipe never
 	// reaches EOF because one writer (us) remains open forever.
 	_ = stdoutW.Close()
+	_ = stderrW.Close()
 
-	// Windows: assign upstream to its own Job Object for per-process kill
-	// semantics (C1). No-op on non-Windows (see spawn_other.go).
-	afterSpawnWindows(p, proc.PID())
+	// Upstream owns the single transferable tree authority. Procgroup tree
+	// management is disabled for this spawn to avoid a second Job/PGID owner.
+	if err := afterSpawnWindows(p, proc.PID()); err != nil {
+		_ = proc.Kill()
+		if p.stdin != nil {
+			_ = p.stdin.Close()
+		}
+		_ = stdoutR.Close()
+		_ = stderrR.Close()
+		return nil, fmt.Errorf("upstream: tree authority: %w", err)
+	}
 
 	p.proc = proc
+	p.pid = proc.PID()
 	// On Unix, Setpgid=true guarantees PGID == PID after spawn.
 	// We read proc.PID() to stay within the procgroup abstraction.
 	// spawnPgid is zero for handler-based processes.
 	if pid := proc.PID(); pid != 0 {
+		p.authorityMu.Lock()
 		p.spawnPgid = pid
+		p.authorityMu.Unlock()
 	}
 	p.lineBuf = newLineBuffer()
 
-	// stdoutDrained and stderrDrained are closed by their respective drain
-	// goroutines once the scanner has finished and markDoneWithErr has been
-	// called. The Wait goroutine blocks on both before calling proc.Wait(),
-	// guaranteeing that all output is consumed before the OS reclaims the
-	// pipes. Without this ordering, Cmd.Wait() closes the pipes (stdout via
-	// our os.Pipe close, stderr via StderrPipe's internal close) while the
-	// scanners may still be reading, causing data loss or spurious errors.
-	stdoutDrained := make(chan struct{})
-	stderrDrained := make(chan struct{})
+	// Both readers publish cancellable read authority. Transactional handoff
+	// joins them before duplicating the OS handles, so successor adoption never
+	// races an outstanding predecessor ReadFile/read syscall.
+	stdoutDrained := p.startStdoutDrain(stdoutR)
+	stderrDrained := p.startStderrDrain(stderrR, logger, proc.PID())
 
-	// Drain stdout into an internal buffer before the OS pipe is closed.
-	// ReadLine reads from memory, not directly from cmd.StdoutPipe, so
-	// proc.Wait() no longer races with external readers.
+	// Observe leader exit independently of output drains. A descendant may
+	// inherit stdout/stderr, so waiting for EOF before tree finalization would
+	// deadlock and leak that descendant.
 	go func() {
-		defer close(stdoutDrained)
-		defer func() { _ = p.stdout.Close() }()
-		scanner := bufio.NewScanner(p.stdout)
-		scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			cp := make([]byte, len(line))
-			copy(cp, line)
-			p.lineBuf.push(cp)
-		}
-		// Propagate real scanner errors (e.g., bufio.ErrTooLong) so ReadLine
-		// surfaces them instead of io.EOF. But cmd.StdoutPipe closes on
-		// process exit and the scanner then returns os.ErrClosed ("read |N:
-		// file already closed") — that is the expected clean-close path, not
-		// a failure, so normalise it to nil (pop() will return io.EOF).
-		err := scanner.Err()
-		if errors.Is(err, os.ErrClosed) {
-			err = nil
-		}
-		p.lineBuf.markDoneWithErr(err)
-	}()
-
-	// Forward stderr to logger (prefix with [upstream]) so diagnostics are visible.
-	// Buffer must be large enough for long lines (MSBuild paths, NuGet restore logs).
-	// If scanner stops reading (line too long), stderr pipe fills → upstream blocks.
-	//
-	// When the caller supplies a logger, route stderr there — the daemon runs
-	// detached with os.Stderr discarded, so writing to os.Stderr would drop
-	// every crash diagnostic (the exact failure mode we are fixing here).
-	//
-	// close(stderrDrained) signals the Wait goroutine below that all stderr
-	// output has been consumed; proc.Wait() is only called after both drain
-	// goroutines have finished (see stdoutDrained/stderrDrained ordering).
-	go func() {
-		defer close(stderrDrained)
-		scanner := bufio.NewScanner(p.stderr)
-		scanner.Buffer(make([]byte, 64*1024), 64*1024) // 64KB — handles any build output line
-		for scanner.Scan() {
-			if logger != nil {
-				logger.Printf("[upstream:%d] %s", proc.PID(), scanner.Text())
-			} else {
-				fmt.Fprintf(os.Stderr, "[upstream:%d] %s\n", proc.PID(), scanner.Text())
+		<-proc.Done()
+		attached := p.beginExitFinalization()
+		if attached {
+			if p.stdin != nil {
+				_ = p.stdin.Close()
 			}
+			_ = terminateProcessTree(p)
 		}
-	}()
-
-	// Bridge procgroup's done channel into upstream's Done channel and capture
-	// the exit error. Wait for both drain goroutines to finish before calling
-	// proc.Wait() — this ensures stdout and stderr are fully consumed before
-	// the OS reclaims the pipes, preventing data loss and spurious errors.
-	go func() {
 		<-stdoutDrained
 		<-stderrDrained
 		p.ExitErr = proc.Wait()
@@ -449,8 +458,7 @@ func (p *Process) Close() error {
 		p.mu.Unlock()
 		return nil
 	}
-	if p.detached {
-		// Ownership transferred via Detach — do not signal the process.
+	if p.detach != detachAttached {
 		p.mu.Unlock()
 		return nil
 	}
@@ -459,42 +467,26 @@ func (p *Process) Close() error {
 	p.mu.Unlock()
 
 	if stdinWait <= 0 {
-		stdinWait = 5 * time.Second // default
+		stdinWait = 5 * time.Second
 	}
-
-	// Release the Windows Job Object handle (no-op on non-Windows).
-	// Done before stdin close so the handle is freed regardless of whether
-	// the process exits cleanly or requires a forced kill below.
-	releaseJobHandle(p)
-
-	// Phase 1: close stdin — the polite MCP shutdown signal.
-	// Nil-safe for test-constructed Process values (no real process attached).
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
 
-	// Phase 2: wait for voluntary exit (drainTimeout or default 5s).
 	select {
 	case <-p.Done:
-		return nil // process exited cleanly
+		return terminateProcessTree(p)
 	case <-time.After(stdinWait):
 	}
-
-	// Phase 3: delegate tree kill to procgroup — SIGTERM→wait→SIGKILL on Unix,
-	// CTRL_BREAK_EVENT→wait→TerminateJobObject on Windows.
-	if p.proc != nil {
-		return p.proc.GracefulKill(3 * time.Second)
+	if p.proc != nil || p.pid > 0 {
+		return terminateProcessTree(p)
 	}
-
 	return nil
 }
 
 // PID returns the process ID of the upstream process.
 func (p *Process) PID() int {
-	if p.proc != nil {
-		return p.proc.PID()
-	}
-	return 0
+	return p.pid
 }
 
 // Detach releases ownership of the upstream process without terminating it.
@@ -515,35 +507,137 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 	if p.closed {
 		return 0, 0, 0, ErrAlreadyClosed
 	}
-	if p.detached {
+	if p.detach != detachAttached {
 		return 0, 0, 0, ErrAlreadyDetached
 	}
-	if p.proc == nil {
+	if p.pid <= 0 {
 		return 0, 0, 0, ErrDetachUnsupported
 	}
-	p.detached = true
-
-	pid = p.proc.PID()
-
-	// Return cached FDs (captured in PreStart, race-safe). Calling
-	// (*os.File).Fd() here would race with the spawn goroutines' Read/Write
-	// on the same file objects — observed on ubuntu -race as a data race
-	// between os.(*File).fd() and os.(*File).Fd() in TestDetach_DoubleDetach.
+	pid = p.pid
+	if err := prepareLegacyDetach(p, pid); err != nil {
+		return 0, 0, 0, err
+	}
+	p.detach = detachPrepared
 	if p.stdinFile != nil {
 		stdinFD = p.stdinFD
 	}
 	if p.stdoutFile != nil {
 		stdoutFD = p.stdoutFD
 	}
+	return
+}
 
-	// Release our copy of the Windows Job Object handle. On the planned-handoff
-	// path (T020), the caller must DuplicateHandle the job into the successor
-	// process BEFORE calling Detach — by this point our copy is redundant and
-	// must be freed to avoid a kernel handle leak on every spawned upstream.
-	// No-op on non-Windows (see spawn_other.go).
-	releaseJobHandle(p)
+// DetachWithAuthority prepares a handoff while retaining the predecessor's
+// authority until the successor receives a duplicated handle.
+func (p *Process) DetachWithAuthority() (pid int, stdinFD, stdoutFD, stderrFD, authorityFD uintptr, err error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0, 0, 0, 0, 0, ErrAlreadyClosed
+	}
+	if p.detach != detachAttached {
+		p.mu.Unlock()
+		return 0, 0, 0, 0, 0, ErrAlreadyDetached
+	}
+	if p.pid <= 0 {
+		p.mu.Unlock()
+		return 0, 0, 0, 0, 0, ErrDetachUnsupported
+	}
+	pid = p.pid
+	authorityFD, err = handoffAuthority(p)
+	if err != nil {
+		p.mu.Unlock()
+		return 0, 0, 0, 0, 0, err
+	}
+	// Preparation is intentionally one-way: if stream quiescence fails, this
+	// lease is aborted and the tree is terminated so no half-detached process
+	// can survive without a reader or owner.
+	p.detach = detachPrepared
+	p.mu.Unlock()
 
-	return pid, stdinFD, stdoutFD, nil
+	if err = p.quiesceStreamsForHandoff(); err != nil {
+		abortErr := p.AbortDetach()
+		return 0, 0, 0, 0, 0, errors.Join(fmt.Errorf("upstream: quiesce handoff streams: %w", err), abortErr)
+	}
+
+	if p.stdinFile != nil {
+		stdinFD = p.stdinFD
+	}
+	if p.stdoutFile != nil {
+		stdoutFD = p.stdoutFD
+	}
+	if p.stderrFile != nil {
+		stderrFD = p.stderrFD
+	}
+	return
+}
+
+// CommitDetach commits a prepared transfer after the successor has adopted
+// stdio and tree authority. It is idempotent.
+func (p *Process) CommitDetach() error {
+	p.mu.Lock()
+	switch p.detach {
+	case detachCommitted:
+		p.mu.Unlock()
+		return nil
+	case detachPrepared:
+		p.detach = detachCommitted
+	case detachAborted, detachAttached:
+		p.mu.Unlock()
+		return ErrDetachNotPrepared
+	}
+	p.mu.Unlock()
+
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
+	if p.stdout != nil {
+		_ = p.stdout.Close()
+	}
+	if p.stderr != nil {
+		_ = p.stderr.Close()
+	}
+	return releaseTreeAuthority(p)
+}
+
+// AbortDetach terminates a tree whose prepared transfer did not commit. It is
+// idempotent and leaves no authority for a later finalizer to reuse.
+func (p *Process) AbortDetach() error {
+	p.mu.Lock()
+	switch p.detach {
+	case detachAborted:
+		p.mu.Unlock()
+		return nil
+	case detachCommitted:
+		p.mu.Unlock()
+		return ErrDetachCommitted
+	case detachAttached:
+		p.mu.Unlock()
+		return ErrDetachNotPrepared
+	case detachPrepared:
+		p.detach = detachAborted
+		p.closed = true
+	}
+	p.mu.Unlock()
+
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
+	err := terminateProcessTree(p)
+	if p.stdout != nil {
+		_ = p.stdout.Close()
+	}
+	if p.stderr != nil {
+		_ = p.stderr.Close()
+	}
+	if p.proc != nil {
+		select {
+		case <-p.Done:
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("upstream: abort detach timed out waiting for tree exit")
+		}
+	}
+	return err
 }
 
 // NewProcessFromHandler creates a Process that runs an in-process handler via

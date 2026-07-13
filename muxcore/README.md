@@ -14,10 +14,10 @@ Pin the tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.26.13
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.0
 ```
 
-Use v0.26.13 as the current consumer target. It includes the v0.25.3 native
+Use v0.27.0 as the current consumer target. It includes the v0.25.3 native
 SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
@@ -29,7 +29,61 @@ exit/update by draining current in-flight requests with explicit JSON-RPC
 errors and automatically respawning the replacement upstream for the next
 request. Reconnect timeout now enters degraded retry instead of closing the
 parent stdio transport, and zero-session disposable owners are cleaned
-automatically after a short safety-gated delay.
+automatically after a short safety-gated delay. v0.27.0 adds opt-in shim
+idle/dormant controls, protocol-v2 tree-authority handoff, and full process-tree
+containment.
+
+### v0.27.0 - lifecycle convergence and process-tree authority
+
+**No required consumer code changes for ordinary `engine.New` users.** The new
+direct resilient-client controls are additive:
+
+| API | Semantics |
+| --- | --- |
+| `owner.ResilientClientConfig.IdleSuspendDelay` | Parks daemon IPC after safe host inactivity. Zero disables and preserves the prior always-connected behavior. |
+| `owner.ResilientClientConfig.IdleSuspendGate` | Optional final safety check before parking. A nil gate relies on local checks; errors and denials keep IPC connected. |
+| `owner.ResilientClientConfig.IdleDormantGrace` | Positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. Zero or negative keeps the suspended shim process alive. |
+
+The `mcp-mux` product wires 10-minute idle and 30-second dormant defaults from
+`MCPMUX_SHIM_IDLE_TIMEOUT` and `MCPMUX_SHIM_DORMANT_GRACE`. Those environment
+variables belong to the product wrapper; native muxcore consumers opt in with
+the fields above and should use their own launcher protocol if they want process
+dormancy. Persistent owners (`engine.Config.Persistent` or
+`x-mux.persistent: true`) remain connected and are not idle-suspended.
+
+The stable launcher also keeps its replacement-handshake budget longer than
+the shim's daemon-spawn budget, so cold wake cannot create retry fanout merely
+because startup crossed five seconds. At the lower control layer,
+`control.SpawnResponseFailureHandler` is an additive optional hook used by the
+built-in daemon to revoke the exact pending reservation when a successful
+spawn response cannot be delivered. Ordinary `engine.New` consumers inherit
+this behavior automatically.
+
+Direct `daemon.PerformHandoff` callers that still construct the pre-v0.27
+two-FD `HandoffUpstream` shape receive the explicit
+`daemon.ErrHandoffV2HandlesRequired` sentinel. Supply stderr and, on Windows,
+the Job authority obtained from `DetachWithAuthority`, or use the bounded
+snapshot/cold-restart path. The public API no longer silently reports those
+legacy values as ordinary per-owner aborts.
+
+Reconnect remains transport continuity, not request replay. Muxcore returns an
+explicit JSON-RPC error with the original id for every already-sent in-flight
+request and never sends that request to the successor. It replays only the
+cached `initialize` request used to warm the replacement connection, then
+forwards new buffered demand once.
+
+Handoff messages now require `protocol_version: 2`. Negotiation precedes every
+detach, so the first v1-to-v2 restart takes one bounded snapshot-backed
+shutdown-and-respawn path without losing predecessor tree authority. Same-v2
+handoff transfers stdio plus the single tree authority and commits each detach
+only after the successor returns a complete accepted/aborted partition. Unix
+process groups and Windows Job Objects now contain and finalize complete trees,
+including descendants that outlive the leader or inherit stdio.
+
+Do not add consumer-side request replay, shim polling, stale-process sweeps,
+PID-only kills, launcher respawn loops, or parallel handoff protocols. Rollback
+to a v1 binary is supported through the same bounded snapshot respawn; mixed-v1
+and-v2 live handoff is intentionally rejected.
 
 ### v0.26.13 - transport degraded retry and automatic zero-session cleanup
 
@@ -602,6 +656,18 @@ Most consumers should use `engine.Run` and the daemon control command instead
 of calling this directly. The direct API is useful when implementing a custom
 daemon supervisor.
 
+The current wire contract is `protocol_version: 2`. It transfers stdin,
+stdout, stderr, and the
+platform tree authority, then commits predecessor detach only after the final
+accepted/aborted partition. A v1 peer is rejected during `Hello`, before any
+detach, so the caller can take the bounded snapshot-backed respawn path.
+
+The existing `NewFdTransferMsg(serverID, stdinMeta, stdoutMeta)` constructor
+remains source-compatible and supplies the protocol-v2 stderr metadata default.
+Code that constructs transfers explicitly should prefer
+`NewFdTransferMsgWithStderr`; every v2 `HandoffUpstream` must provide a valid
+`StderrFD`.
+
 ### Quick start
 
 ```go
@@ -655,15 +721,15 @@ defer daemon.DeleteHandoffToken(path)
 | Error / Field | Meaning |
 | --- | --- |
 | `daemon.ErrTokenMismatch` | Successor presented the wrong pre-shared token; comparison is constant-time. |
-| `daemon.ErrProtocolVersionMismatch` | Handoff protocol versions differ; fall back to shutdown/restore. |
+| `daemon.ErrProtocolVersionMismatch` | Handoff protocol versions differ; no owner detached, so fall back to bounded snapshot shutdown/restore. |
 | `result.Aborted` | Per-upstream list of server IDs not transferred. Other upstreams may still succeed. |
 
 ### Platform constraints
 
 | Platform | Requirement |
 | --- | --- |
-| Unix (Linux, macOS) | `conn` must be `*net.UnixConn`; file descriptors transfer with `SCM_RIGHTS`. |
-| Windows | `conn` must be a winio named-pipe connection; handles transfer with `DuplicateHandle`. |
+| Unix (Linux, macOS) | `conn` must be `*net.UnixConn`; stdin, stdout, and stderr file descriptors transfer with `SCM_RIGHTS`, while the process-group id remains the tree authority. |
+| Windows | `conn` must be a winio named-pipe connection; stdin, stdout, stderr, and the Job Object authority transfer with `DuplicateHandle`. |
 
 On Windows the successor PID is supplied automatically through the handoff
 protocol's `HelloMsg.SourcePID`; no additional caller configuration is needed.

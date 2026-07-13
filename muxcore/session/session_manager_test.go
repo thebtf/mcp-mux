@@ -85,6 +85,61 @@ func TestPreRegisterBind(t *testing.T) {
 	}
 }
 
+func TestPreRegisterClonesMutableEnv(t *testing.T) {
+	sm := NewManager()
+	env := map[string]string{"TOKEN": "original"}
+	sm.PreRegisterForOwner("clone-token", "clone-owner", "/project", env)
+	env["TOKEN"] = "mutated"
+	env["LATE"] = "added"
+
+	s := &Session{ID: 2001}
+	sm.RegisterSession(s, "")
+	if ok := sm.Bind("clone-token", "clone-owner", s); !ok {
+		t.Fatal("Bind returned false for cloned pending env")
+	}
+	if got := s.Env["TOKEN"]; got != "original" {
+		t.Fatalf("bound TOKEN = %q, want original", got)
+	}
+	if _, ok := s.Env["LATE"]; ok {
+		t.Fatal("late caller mutation leaked into pending env")
+	}
+}
+
+func TestNilSessionContextDoesNotRefreshUnrelatedHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		act  func(*Manager)
+	}{
+		{
+			name: "replace",
+			act: func(sm *Manager) {
+				sm.RegisterSession(&Session{ID: 77}, "")
+			},
+		},
+		{
+			name: "remove",
+			act: func(sm *Manager) {
+				sm.RemoveSession(77)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := NewManager()
+			lastUsed := time.Unix(123, 0)
+			sm.sessions[77] = &Context{}
+			sm.bound["historical"] = &boundHistory{
+				OwnerKey: "owner",
+				LastUsed: lastUsed,
+			}
+
+			tc.act(sm)
+			if got := sm.bound["historical"].LastUsed; !got.Equal(lastUsed) {
+				t.Fatalf("unrelated historical LastUsed = %v, want %v", got, lastUsed)
+			}
+		})
+	}
+}
+
 func TestPreRegisterForOwnerAndRemovePendingForOwner(t *testing.T) {
 	sm := NewManager()
 
@@ -112,6 +167,49 @@ func TestPreRegisterForOwnerAndRemovePendingForOwner(t *testing.T) {
 	}
 	if s.Cwd != "/project/b" {
 		t.Fatalf("session.Cwd = %q, want /project/b", s.Cwd)
+	}
+}
+
+func TestRemovePendingForOwnerExceptPreservesCreatingToken(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("creating", "owner-a", "/project", nil)
+	sm.PreRegisterForOwner("provisional-1", "owner-a", "/project", nil)
+	sm.PreRegisterForOwner("provisional-2", "owner-a", "/project", nil)
+	sm.PreRegisterForOwner("foreign", "owner-b", "/other", nil)
+
+	if removed := sm.RemovePendingForOwnerExcept("owner-a", "creating"); removed != 2 {
+		t.Fatalf("RemovePendingForOwnerExcept() = %d, want 2", removed)
+	}
+	if !sm.IsPreRegistered("creating") {
+		t.Fatal("creating token was removed")
+	}
+	if sm.IsPreRegistered("provisional-1") || sm.IsPreRegistered("provisional-2") {
+		t.Fatal("provisional owner-a token survived")
+	}
+	if !sm.IsPreRegistered("foreign") {
+		t.Fatal("foreign owner token was removed")
+	}
+}
+
+func TestRemovePendingForOwnerTokenRequiresExactReservation(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("target", "owner-a", "/project/a", nil)
+	sm.PreRegisterForOwner("other", "owner-a", "/project/b", nil)
+
+	if sm.RemovePendingForOwnerToken("owner-b", "target") {
+		t.Fatal("wrong owner removed target reservation")
+	}
+	if sm.RemovePendingForOwnerToken("owner-a", "missing") {
+		t.Fatal("missing token reported as removed")
+	}
+	if !sm.RemovePendingForOwnerToken("owner-a", "target") {
+		t.Fatal("exact reservation was not removed")
+	}
+	if sm.IsPreRegistered("target") {
+		t.Fatal("target reservation survived exact removal")
+	}
+	if !sm.IsPreRegistered("other") {
+		t.Fatal("unrelated reservation was removed")
 	}
 }
 
@@ -416,10 +514,65 @@ func TestRegisterReconnect_OwnerGone(t *testing.T) {
 	}
 
 	_, err := sm.RegisterReconnect("tok-owner-gone", func(key string) bool {
+		if got := sm.PendingCount(); got != 1 {
+			t.Fatalf("PendingCount() during ownerAlive = %d, want 1 reservation", got)
+		}
 		return false
 	})
 	if !errors.Is(err, ErrOwnerGone) {
 		t.Fatalf("RegisterReconnect() error = %v, want ErrOwnerGone", err)
+	}
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after owner-gone rollback = %d, want 0", got)
+	}
+}
+
+func TestPendingCountExcludesHistoryAndExpiredReservations(t *testing.T) {
+	now := time.Now()
+	sm := NewManager()
+	sm.now = func() time.Time { return now }
+	seedBoundHistory(t, sm, "bound-only", "owner-pending-count")
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() with reconnect history only = %d, want 0", got)
+	}
+
+	sm.PreRegisterForOwner("pending", "owner-pending-count", "/project/pending", nil)
+	if got := sm.PendingCount(); got != 1 {
+		t.Fatalf("PendingCount() = %d, want 1", got)
+	}
+	now = now.Add(pendingTokenTTL + time.Second)
+	if swept := sm.SweepExpiredPending(); swept != 1 {
+		t.Fatalf("SweepExpiredPending() = %d, want 1", swept)
+	}
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after expiry sweep = %d, want 0", got)
+	}
+	if _, _, _, ok := sm.LookupHistory("bound-only"); !ok {
+		t.Fatal("pending sweep removed reconnect history")
+	}
+}
+
+func TestRegisterReconnect_ExpiredReservationReturnsErrorWithoutRetention(t *testing.T) {
+	now := time.Now()
+	sm := NewManager()
+	sm.now = func() time.Time { return now }
+	seedBoundHistory(t, sm, "previous", "owner-expired-reservation")
+
+	_, err := sm.RegisterReconnect("previous", func(string) bool {
+		now = now.Add(pendingTokenTTL + time.Second)
+		if swept := sm.SweepExpiredPending(); swept != 1 {
+			t.Fatalf("SweepExpiredPending() = %d, want 1", swept)
+		}
+		return true
+	})
+	if !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("RegisterReconnect() error = %v, want ErrUnknownToken", err)
+	}
+	if got := sm.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after expired reservation = %d, want 0", got)
+	}
+	if _, _, _, ok := sm.LookupHistory("previous"); !ok {
+		t.Fatal("expired reconnect reservation removed previous live history")
 	}
 }
 

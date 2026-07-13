@@ -104,6 +104,7 @@ func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *Owne
 
 	sample := evictionSample{
 		Sessions:             entry.Owner.SessionCount(),
+		PendingSessions:      entry.Owner.SessionMgr().PendingCount(),
 		Persistent:           entry.Persistent,
 		PendingRequests:      entry.Owner.PendingRequests(),
 		ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),

@@ -26,6 +26,10 @@ type fdConn interface {
 	SendFDs(fds []uintptr, header []byte) error
 	// RecvFDs receives OS file descriptors alongside an out-of-band header.
 	RecvFDs() (fds []uintptr, header []byte, err error)
+	// handoffSchema describes the exact v2 handle payload for this transport.
+	handoffSchema() handoffHandleSchema
+	// closeReceivedHandles releases handles received into this process.
+	closeReceivedHandles(fds []uintptr)
 	// Close releases the underlying transport.
 	Close() error
 }
@@ -35,12 +39,19 @@ var errPlatformUnsupported = errors.New("handoff: platform not yet implemented")
 
 // stubFDConn is a placeholder for platforms not yet implemented.
 // All operations return errPlatformUnsupported except Close.
+type handoffHandleSchema struct {
+	count             int
+	requiresAuthority bool
+}
+
 type stubFDConn struct{}
 
 func (stubFDConn) WriteJSON(v any) error                      { return errPlatformUnsupported }
 func (stubFDConn) ReadJSON(v any) error                       { return errPlatformUnsupported }
 func (stubFDConn) SendFDs(fds []uintptr, header []byte) error { return errPlatformUnsupported }
 func (stubFDConn) RecvFDs() ([]uintptr, []byte, error)        { return nil, nil, errPlatformUnsupported }
+func (stubFDConn) handoffSchema() handoffHandleSchema         { return handoffHandleSchema{} }
+func (stubFDConn) closeReceivedHandles([]uintptr)             {}
 func (stubFDConn) Close() error                               { return nil }
 
 // ErrTokenMismatch is returned by performHandoff when the successor daemon
@@ -57,11 +68,16 @@ type HandoffResult struct {
 // HandoffUpstream is the caller-provided description of one upstream owner
 // to be handed off to the successor daemon.
 type HandoffUpstream struct {
-	ServerID string
-	Command  string
-	PID      int
-	StdinFD  uintptr
-	StdoutFD uintptr
+	ServerID    string
+	Command     string
+	PID         int
+	StdinFD     uintptr
+	StdoutFD    uintptr
+	StderrFD    uintptr
+	AuthorityFD uintptr
+
+	abort  func() error
+	commit func() error
 }
 
 func (d *Daemon) retireOldOwnerSockets(ipcPath, controlPath string) bool {
@@ -95,168 +111,602 @@ func removeOwnerSocketWithRetry(path string) error {
 	return err
 }
 
-// performHandoff runs the old-daemon side of the two-daemon handoff protocol.
-// conn is the fdConn dialed/accepted by the caller; token is the pre-shared
-// authentication token (FR-11); upstreams is the list of owners to transfer.
-//
-// Protocol:
-//
-//  1. Wait for Hello msg from successor; verify version + token.
-//  2. Send Ready listing all upstreams.
-//  3. For each upstream: send FdTransfer + SendFDs; read AckTransfer.
-//     Aborted if ok:false OR SendFDs side-channel error.
-//  4. Send Done with transferred/aborted split.
-//  5. Read HandoffAck from successor.
-//
-// Returns HandoffResult with per-upstream outcome. Total error only on
-// protocol-level failures (token reject, version mismatch, conn drop).
+// performHandoff runs the old-daemon side of the v2 two-phase handoff.
+// Receipt ACKs only prove that the successor owns valid handles. The predecessor
+// commits a detached tree only after the final adoption ACK names its server ID.
 func performHandoff(ctx context.Context, conn fdConn, token string, upstreams []HandoffUpstream) (HandoffResult, error) {
-	// ctx is reserved for future deadline/cancellation propagation to conn
-	// reads and writes (T009). Currently fdConn does not expose a deadline API;
-	// callers should set a deadline on the underlying transport before calling.
-	_ = ctx
+	stop := bindHandoffContext(ctx, conn)
+	defer stop()
+	if err := acceptHandoffHello(conn, token); err != nil {
+		return HandoffResult{Phase: "hello"}, handoffContextError(ctx, err)
+	}
+	return performHandoffAfterHello(ctx, conn, upstreams)
+}
 
-	// Step 1: Read Hello from successor.
+func bindHandoffContext(ctx context.Context, conn fdConn) func() {
+	if deadline, ok := ctx.Deadline(); ok {
+		if setter, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = setter.SetDeadline(deadline)
+		}
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() {
+		stop()
+		if setter, ok := conn.(interface{ SetDeadline(time.Time) error }); ok {
+			_ = setter.SetDeadline(time.Time{})
+		}
+	}
+}
+
+func handoffContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(ctxErr, err)
+	}
+	return err
+}
+
+func acceptHandoffHello(conn fdConn, token string) error {
 	var hello HelloMsg
 	if err := conn.ReadJSON(&hello); err != nil {
-		return HandoffResult{Phase: "hello"}, fmt.Errorf("performHandoff: read hello: %w", err)
+		return fmt.Errorf("performHandoff: read hello: %w", err)
 	}
-	// Step 2: Validate protocol version.
+	if hello.Type != MsgHello {
+		return fmt.Errorf("performHandoff: expected hello, got %q", hello.Type)
+	}
 	if err := validateProtocolVersion(hello.ProtocolVersion); err != nil {
-		return HandoffResult{Phase: "hello"}, err
+		return err
 	}
-	// Step 3: Validate token using constant-time comparison to prevent timing
-	// side-channels. verifyHandoffToken (used on the accept path) already does
-	// this; performHandoff must be consistent.
 	if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(token)) != 1 {
-		return HandoffResult{Phase: "hello"}, ErrTokenMismatch
+		return ErrTokenMismatch
 	}
-	// Platform hook: Windows uses the successor PID for DuplicateHandle.
-	// Unix ignores (unixFDConn does not implement SetTargetPID).
 	if setter, ok := conn.(interface{ SetTargetPID(int) }); ok {
 		if hello.SourcePID <= 0 {
-			return HandoffResult{Phase: "hello"},
-				fmt.Errorf("performHandoff: invalid source_pid: %d", hello.SourcePID)
+			return fmt.Errorf("performHandoff: invalid source_pid: %d", hello.SourcePID)
 		}
 		setter.SetTargetPID(hello.SourcePID)
 	}
-	// Step 4: Send Ready listing all upstreams.
-	refs := make([]UpstreamRef, len(upstreams))
-	for i, u := range upstreams {
+	return nil
+}
+
+func performHandoffAfterHello(ctx context.Context, conn fdConn, upstreams []HandoffUpstream) (result HandoffResult, retErr error) {
+	stop := bindHandoffContext(ctx, conn)
+	defer func() {
+		stop()
+		if retErr != nil {
+			retErr = handoffContextError(ctx, retErr)
+		}
+	}()
+
+	settled := false
+	defer func() {
+		if !settled {
+			retErr = errors.Join(retErr, settleHandoffUpstreams(upstreams, nil))
+		}
+	}()
+
+	schema := conn.handoffSchema()
+	seen := make(map[string]struct{}, len(upstreams))
+	ready := make([]HandoffUpstream, 0, len(upstreams))
+	preAborted := make([]string, 0)
+	for _, u := range upstreams {
+		if u.ServerID == "" {
+			return HandoffResult{Phase: "ready"}, errors.New("performHandoff: empty server_id")
+		}
+		if _, ok := seen[u.ServerID]; ok {
+			return HandoffResult{Phase: "ready"}, fmt.Errorf("performHandoff: duplicate server_id %q", u.ServerID)
+		}
+		seen[u.ServerID] = struct{}{}
+		if u.PID <= 0 || u.StdinFD == 0 || u.StdoutFD == 0 || u.StderrFD == 0 ||
+			(schema.requiresAuthority && u.AuthorityFD == 0) ||
+			(!schema.requiresAuthority && u.AuthorityFD != 0) {
+			preAborted = append(preAborted, u.ServerID)
+			continue
+		}
+		ready = append(ready, u)
+	}
+
+	refs := make([]UpstreamRef, len(ready))
+	for i, u := range ready {
 		refs[i] = UpstreamRef{ServerID: u.ServerID, Command: u.Command, PID: u.PID}
 	}
 	if err := conn.WriteJSON(NewReadyMsg(refs)); err != nil {
 		return HandoffResult{Phase: "ready"}, fmt.Errorf("performHandoff: send ready: %w", err)
 	}
-	// Step 5: Transfer each upstream.
-	var transferred, aborted []string
-	for _, u := range upstreams {
-		// Send FdTransfer control message.
-		if err := conn.WriteJSON(NewFdTransferMsg(u.ServerID, HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"})); err != nil {
-			aborted = append(aborted, u.ServerID)
-			continue
+
+	receipted := make([]string, 0, len(ready))
+	rejected := make([]string, 0)
+	for _, u := range ready {
+		meta := NewFdTransferMsgWithStderr(
+			u.ServerID,
+			HandleMeta{Kind: "stdin"},
+			HandleMeta{Kind: "stdout"},
+			HandleMeta{Kind: "stderr"},
+		)
+		handles := []uintptr{u.StdinFD, u.StdoutFD, u.StderrFD}
+		if schema.requiresAuthority {
+			authority := HandleMeta{Kind: "tree_authority"}
+			meta.AuthorityHandleMeta = &authority
+			handles = append(handles, u.AuthorityFD)
 		}
-		// Transfer FDs out-of-band. The actual FdTransferMsg metadata was
-		// sent via WriteJSON above — SCM_RIGHTS carries only the handle
-		// numbers themselves, no additional header bytes. Linux accepts
-		// SCM_RIGHTS with 0-byte data on SOCK_STREAM; macOS/BSD may
-		// reject. The Unix impl (unixFDConn) uses a 1-byte sentinel
-		// internally on platforms that require it. Call with nil header
-		// from the protocol layer.
-		if err := conn.SendFDs([]uintptr{u.StdinFD, u.StdoutFD}, nil); err != nil {
-			// Drain the AckTransfer the successor may send (best-effort).
-			var ack AckTransferMsg
-			_ = conn.ReadJSON(&ack)
-			aborted = append(aborted, u.ServerID)
-			continue
+		if err := conn.WriteJSON(meta); err != nil {
+			return HandoffResult{Phase: "fd-transfer"}, fmt.Errorf("performHandoff: send fd_transfer %s: %w", u.ServerID, err)
 		}
-		// Read AckTransfer from successor.
+		if err := conn.SendFDs(handles, nil); err != nil {
+			return HandoffResult{Phase: "fd-transfer"}, fmt.Errorf("performHandoff: send handles %s: %w", u.ServerID, err)
+		}
+
 		var ack AckTransferMsg
 		if err := conn.ReadJSON(&ack); err != nil {
-			aborted = append(aborted, u.ServerID)
-			continue
+			return HandoffResult{Phase: "receipt-ack"}, fmt.Errorf("performHandoff: read receipt ack %s: %w", u.ServerID, err)
 		}
-		if !ack.OK {
-			aborted = append(aborted, u.ServerID)
+		if ack.Type != MsgAckTransfer {
+			return HandoffResult{Phase: "receipt-ack"}, fmt.Errorf("performHandoff: expected ack_transfer, got %q", ack.Type)
+		}
+		if err := validateProtocolVersion(ack.ProtocolVersion); err != nil {
+			return HandoffResult{Phase: "receipt-ack"}, err
+		}
+		if ack.ServerID != u.ServerID {
+			return HandoffResult{Phase: "receipt-ack"}, fmt.Errorf("performHandoff: receipt ack server_id %q, want %q", ack.ServerID, u.ServerID)
+		}
+		if ack.OK {
+			receipted = append(receipted, u.ServerID)
 		} else {
-			transferred = append(transferred, u.ServerID)
+			rejected = append(rejected, u.ServerID)
 		}
 	}
-	// Step 6: Send Done.
-	if err := conn.WriteJSON(NewDoneMsg(transferred, aborted)); err != nil {
-		return HandoffResult{Transferred: transferred, Aborted: aborted, Phase: "done-send"},
+
+	if err := conn.WriteJSON(NewDoneMsg(receipted, rejected)); err != nil {
+		return HandoffResult{Transferred: nil, Aborted: append(preAborted, rejected...), Phase: "done-send"},
 			fmt.Errorf("performHandoff: send done: %w", err)
 	}
-	// Step 7: Read HandoffAck (consume; old daemon exits regardless).
+
 	var finalAck HandoffAckMsg
-	_ = conn.ReadJSON(&finalAck)
-	return HandoffResult{Transferred: transferred, Aborted: aborted, Phase: "done"}, nil
+	if err := conn.ReadJSON(&finalAck); err != nil {
+		return HandoffResult{Phase: "final-ack"}, fmt.Errorf("performHandoff: read handoff_ack: %w", err)
+	}
+	if finalAck.Type != MsgHandoffAck {
+		return HandoffResult{Phase: "final-ack"}, fmt.Errorf("performHandoff: expected handoff_ack, got %q", finalAck.Type)
+	}
+	if err := validateProtocolVersion(finalAck.ProtocolVersion); err != nil {
+		return HandoffResult{Phase: "final-ack"}, err
+	}
+
+	readyIDs := make([]string, len(ready))
+	for i := range ready {
+		readyIDs[i] = ready[i].ServerID
+	}
+	acceptedSet, err := validateFinalPartition(readyIDs, receipted, finalAck.Accepted, finalAck.Aborted)
+	if err != nil {
+		return HandoffResult{Phase: "final-ack"}, err
+	}
+
+	settled = true
+	settleErr := settleHandoffUpstreams(upstreams, acceptedSet)
+	result = HandoffResult{
+		Transferred: orderedIDs(upstreams, acceptedSet, true),
+		Aborted:     orderedIDs(upstreams, acceptedSet, false),
+		Phase:       "committed",
+	}
+	if settleErr != nil {
+		return result, fmt.Errorf("performHandoff: settle leases: %w", settleErr)
+	}
+	return result, nil
 }
 
-// receiveHandoff runs the new-daemon side of the two-daemon handoff protocol.
-// Returns the list of upstreams successfully received; callers use this to
-// bind them to re-created Owner instances.
-func receiveHandoff(ctx context.Context, conn fdConn, token string) (received []HandoffUpstream, err error) {
-	// ctx is reserved for future deadline/cancellation propagation (T009).
-	_ = ctx
+func orderedIDs(upstreams []HandoffUpstream, accepted map[string]struct{}, wantAccepted bool) []string {
+	ids := make([]string, 0, len(upstreams))
+	for _, u := range upstreams {
+		_, ok := accepted[u.ServerID]
+		if ok == wantAccepted {
+			ids = append(ids, u.ServerID)
+		}
+	}
+	return ids
+}
 
-	// Step 1: Send Hello with token.
+func settleHandoffUpstreams(upstreams []HandoffUpstream, accepted map[string]struct{}) error {
+	var errs []error
+	for i := range upstreams {
+		u := &upstreams[i]
+		_, ok := accepted[u.ServerID]
+		var err error
+		if ok {
+			if u.commit != nil {
+				err = u.commit()
+			}
+		} else if u.abort != nil {
+			err = u.abort()
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", u.ServerID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func validateFinalPartition(ready, receipted, accepted, aborted []string) (map[string]struct{}, error) {
+	readySet, err := exactIDSet("ready", ready)
+	if err != nil {
+		return nil, err
+	}
+	receiptSet, err := exactIDSet("receipted", receipted)
+	if err != nil {
+		return nil, err
+	}
+	acceptedSet, err := exactIDSet("accepted", accepted)
+	if err != nil {
+		return nil, err
+	}
+	abortedSet, err := exactIDSet("aborted", aborted)
+	if err != nil {
+		return nil, err
+	}
+	for id := range acceptedSet {
+		if _, ok := receiptSet[id]; !ok {
+			return nil, fmt.Errorf("handoff: accepted server_id %q was not receipted", id)
+		}
+	}
+	for id := range acceptedSet {
+		if _, duplicate := abortedSet[id]; duplicate {
+			return nil, fmt.Errorf("handoff: server_id %q is both accepted and aborted", id)
+		}
+	}
+	if len(acceptedSet)+len(abortedSet) != len(readySet) {
+		return nil, fmt.Errorf("handoff: final partition has %d ids, want %d", len(acceptedSet)+len(abortedSet), len(readySet))
+	}
+	for id := range readySet {
+		if _, ok := acceptedSet[id]; ok {
+			continue
+		}
+		if _, ok := abortedSet[id]; !ok {
+			return nil, fmt.Errorf("handoff: final partition missing server_id %q", id)
+		}
+	}
+	for id := range acceptedSet {
+		if _, ok := readySet[id]; !ok {
+			return nil, fmt.Errorf("handoff: unknown accepted server_id %q", id)
+		}
+	}
+	for id := range abortedSet {
+		if _, ok := readySet[id]; !ok {
+			return nil, fmt.Errorf("handoff: unknown aborted server_id %q", id)
+		}
+	}
+	return acceptedSet, nil
+}
+
+func exactIDSet(label string, ids []string) (map[string]struct{}, error) {
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return nil, fmt.Errorf("handoff: %s contains empty server_id", label)
+		}
+		if _, exists := set[id]; exists {
+			return nil, fmt.Errorf("handoff: %s contains duplicate server_id %q", label, id)
+		}
+		set[id] = struct{}{}
+	}
+	return set, nil
+}
+
+type handoffReceipt struct {
+	conn      fdConn
+	order     []string
+	received  map[string]HandoffUpstream
+	rejected  map[string]struct{}
+	owned     map[string]bool
+	taken     map[string]bool
+	finalized bool
+}
+
+func prepareHandoffReceive(ctx context.Context, conn fdConn, token string) (receipt *handoffReceipt, retErr error) {
+	stop := bindHandoffContext(ctx, conn)
+	defer func() {
+		stop()
+		if retErr != nil {
+			retErr = handoffContextError(ctx, retErr)
+		}
+	}()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			if receipt != nil {
+				receipt.closeOwned()
+			}
+			_ = conn.Close()
+		}
+	}()
+
 	if err := conn.WriteJSON(NewHelloMsgWithPID(token, os.Getpid())); err != nil {
 		return nil, fmt.Errorf("receiveHandoff: send hello: %w", err)
 	}
-	// Step 2: Read Ready; record upstream list.
 	var ready ReadyMsg
 	if err := conn.ReadJSON(&ready); err != nil {
 		return nil, fmt.Errorf("receiveHandoff: read ready: %w", err)
 	}
+	if ready.Type != MsgReady {
+		return nil, fmt.Errorf("receiveHandoff: expected ready, got %q", ready.Type)
+	}
 	if err := validateProtocolVersion(ready.ProtocolVersion); err != nil {
 		return nil, err
 	}
-	// Build a ref map for command/pid lookup during ack construction.
-	refMap := make(map[string]UpstreamRef, len(ready.Upstreams))
+
+	refs := make(map[string]UpstreamRef, len(ready.Upstreams))
+	order := make([]string, 0, len(ready.Upstreams))
 	for _, ref := range ready.Upstreams {
-		refMap[ref.ServerID] = ref
+		if ref.ServerID == "" || ref.PID <= 0 {
+			return nil, fmt.Errorf("receiveHandoff: invalid ready upstream %+v", ref)
+		}
+		if _, duplicate := refs[ref.ServerID]; duplicate {
+			return nil, fmt.Errorf("receiveHandoff: duplicate ready server_id %q", ref.ServerID)
+		}
+		refs[ref.ServerID] = ref
+		order = append(order, ref.ServerID)
 	}
-	// Step 3: For each upstream reference: read FdTransfer, RecvFDs, send Ack.
+	receipt = &handoffReceipt{
+		conn:     conn,
+		order:    order,
+		received: make(map[string]HandoffUpstream, len(order)),
+		rejected: make(map[string]struct{}),
+		owned:    make(map[string]bool, len(order)),
+		taken:    make(map[string]bool, len(order)),
+	}
+	schema := conn.handoffSchema()
+
 	for range ready.Upstreams {
 		var transfer FdTransferMsg
 		if err := conn.ReadJSON(&transfer); err != nil {
-			return nil, fmt.Errorf("receiveHandoff: read fd_transfer: %w", err)
+			return receipt, fmt.Errorf("receiveHandoff: read fd_transfer: %w", err)
 		}
-		if err := validateProtocolVersion(transfer.ProtocolVersion); err != nil {
-			return nil, err
-		}
+
 		fds, _, recvErr := conn.RecvFDs()
-		if recvErr != nil || len(fds) < 2 {
-			reason := "recv fds failed"
-			if recvErr != nil {
-				reason = recvErr.Error()
+		protocolErr := validateTransfer(transfer, refs, receipt, schema, fds, recvErr)
+		if protocolErr != nil {
+			conn.closeReceivedHandles(fds)
+			reason := protocolErr.Error()
+			if err := conn.WriteJSON(NewAckTransferMsg(transfer.ServerID, false, &reason)); err != nil {
+				return receipt, fmt.Errorf("receiveHandoff: send receipt nack: %w", err)
 			}
-			if werr := conn.WriteJSON(NewAckTransferMsg(transfer.ServerID, false, &reason)); werr != nil {
-				return nil, fmt.Errorf("receiveHandoff: send ack (failure): %w", werr)
+			if _, known := refs[transfer.ServerID]; !known {
+				return receipt, protocolErr
 			}
+			if _, duplicate := receipt.received[transfer.ServerID]; duplicate {
+				return receipt, protocolErr
+			}
+			if _, duplicate := receipt.rejected[transfer.ServerID]; duplicate {
+				return receipt, protocolErr
+			}
+			receipt.rejected[transfer.ServerID] = struct{}{}
 			continue
 		}
-		if werr := conn.WriteJSON(NewAckTransferMsg(transfer.ServerID, true, nil)); werr != nil {
-			return nil, fmt.Errorf("receiveHandoff: send ack (success): %w", werr)
-		}
-		ref := refMap[transfer.ServerID]
-		received = append(received, HandoffUpstream{
+
+		ref := refs[transfer.ServerID]
+		u := HandoffUpstream{
 			ServerID: transfer.ServerID,
 			Command:  ref.Command,
 			PID:      ref.PID,
 			StdinFD:  fds[0],
 			StdoutFD: fds[1],
-		})
+			StderrFD: fds[2],
+		}
+		if schema.requiresAuthority {
+			u.AuthorityFD = fds[3]
+		}
+		receipt.received[u.ServerID] = u
+		receipt.owned[u.ServerID] = true
+		if err := conn.WriteJSON(NewAckTransferMsg(u.ServerID, true, nil)); err != nil {
+			return receipt, fmt.Errorf("receiveHandoff: send receipt ack: %w", err)
+		}
 	}
-	// Step 4: Read Done; cross-check is left to callers if needed.
+
 	var done DoneMsg
 	if err := conn.ReadJSON(&done); err != nil {
-		return nil, fmt.Errorf("receiveHandoff: read done: %w", err)
+		return receipt, fmt.Errorf("receiveHandoff: read done: %w", err)
 	}
-	// Step 5: Send HandoffAck.
-	if err := conn.WriteJSON(NewHandoffAckMsg("accepted")); err != nil {
-		return nil, fmt.Errorf("receiveHandoff: send handoff_ack: %w", err)
+	if done.Type != MsgDone {
+		return receipt, fmt.Errorf("receiveHandoff: expected done, got %q", done.Type)
+	}
+	if err := validateProtocolVersion(done.ProtocolVersion); err != nil {
+		return receipt, err
+	}
+	if err := receipt.validateDone(done); err != nil {
+		return receipt, err
+	}
+
+	cleanup = false
+	return receipt, nil
+}
+
+func validateTransfer(transfer FdTransferMsg, refs map[string]UpstreamRef, receipt *handoffReceipt, schema handoffHandleSchema, fds []uintptr, recvErr error) error {
+	if transfer.Type != MsgFdTransfer {
+		return fmt.Errorf("receiveHandoff: expected fd_transfer, got %q", transfer.Type)
+	}
+	if err := validateProtocolVersion(transfer.ProtocolVersion); err != nil {
+		return err
+	}
+	if _, ok := refs[transfer.ServerID]; !ok {
+		return fmt.Errorf("receiveHandoff: unknown server_id %q", transfer.ServerID)
+	}
+	if _, ok := receipt.received[transfer.ServerID]; ok {
+		return fmt.Errorf("receiveHandoff: duplicate server_id %q", transfer.ServerID)
+	}
+	if _, ok := receipt.rejected[transfer.ServerID]; ok {
+		return fmt.Errorf("receiveHandoff: duplicate server_id %q", transfer.ServerID)
+	}
+	if recvErr != nil {
+		return fmt.Errorf("receiveHandoff: recv handles: %w", recvErr)
+	}
+	if len(fds) != schema.count {
+		return fmt.Errorf("receiveHandoff: server_id %q received %d handles, want %d", transfer.ServerID, len(fds), schema.count)
+	}
+	if transfer.StdinHandleMeta.Kind != "stdin" || transfer.StdoutHandleMeta.Kind != "stdout" || transfer.StderrHandleMeta.Kind != "stderr" {
+		return fmt.Errorf("receiveHandoff: invalid stdio metadata for %q", transfer.ServerID)
+	}
+	if schema.requiresAuthority {
+		if transfer.AuthorityHandleMeta == nil || transfer.AuthorityHandleMeta.Kind != "tree_authority" {
+			return fmt.Errorf("receiveHandoff: missing tree authority metadata for %q", transfer.ServerID)
+		}
+	} else if transfer.AuthorityHandleMeta != nil {
+		return fmt.Errorf("receiveHandoff: unexpected tree authority metadata for %q", transfer.ServerID)
+	}
+	for _, fd := range fds {
+		if fd == 0 {
+			return fmt.Errorf("receiveHandoff: zero handle for %q", transfer.ServerID)
+		}
+	}
+	return nil
+}
+
+func (r *handoffReceipt) validateDone(done DoneMsg) error {
+	received := make([]string, 0, len(r.received))
+	rejected := make([]string, 0, len(r.rejected))
+	for _, id := range r.order {
+		if _, ok := r.received[id]; ok {
+			received = append(received, id)
+		} else if _, ok := r.rejected[id]; ok {
+			rejected = append(rejected, id)
+		}
+	}
+	transferredSet, err := exactIDSet("done.transferred", done.Transferred)
+	if err != nil {
+		return err
+	}
+	abortedSet, err := exactIDSet("done.aborted", done.Aborted)
+	if err != nil {
+		return err
+	}
+	if !sameIDSet(transferredSet, received) || !sameIDSet(abortedSet, rejected) {
+		return fmt.Errorf("receiveHandoff: done partition does not match validated receipts")
+	}
+	return nil
+}
+
+func sameIDSet(got map[string]struct{}, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for _, id := range want {
+		if _, ok := got[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *handoffReceipt) upstreams() []HandoffUpstream {
+	out := make([]HandoffUpstream, 0, len(r.received))
+	for _, id := range r.order {
+		if u, ok := r.received[id]; ok {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func (r *handoffReceipt) take(serverID string) (HandoffUpstream, bool) {
+	u, ok := r.received[serverID]
+	if !ok || !r.owned[serverID] {
+		return HandoffUpstream{}, false
+	}
+	r.owned[serverID] = false
+	r.taken[serverID] = true
+	return u, true
+}
+
+func (r *handoffReceipt) finalize(accepted []string) error {
+	if r == nil {
+		return nil
+	}
+	if r.finalized {
+		return errors.New("receiveHandoff: receipt already finalized")
+	}
+	r.finalized = true
+	defer r.conn.Close() //nolint:errcheck
+
+	acceptedSet, err := exactIDSet("accepted", accepted)
+	if err != nil {
+		r.closeOwned()
+		return err
+	}
+	for id := range acceptedSet {
+		if !r.taken[id] {
+			r.closeOwned()
+			return fmt.Errorf("receiveHandoff: accepted server_id %q was not adopted", id)
+		}
+	}
+
+	aborted := make([]string, 0, len(r.order)-len(accepted))
+	orderedAccepted := make([]string, 0, len(accepted))
+	for _, id := range r.order {
+		if _, ok := acceptedSet[id]; ok {
+			orderedAccepted = append(orderedAccepted, id)
+		} else {
+			aborted = append(aborted, id)
+		}
+	}
+	r.closeOwned()
+	if err := r.conn.WriteJSON(NewHandoffAckResult(orderedAccepted, aborted)); err != nil {
+		return fmt.Errorf("receiveHandoff: send handoff_ack: %w", err)
+	}
+	return nil
+}
+
+func (r *handoffReceipt) closeOwned() {
+	if r == nil || r.conn == nil {
+		return
+	}
+	for id, owned := range r.owned {
+		if !owned {
+			continue
+		}
+		u := r.received[id]
+		fds := []uintptr{u.StdinFD, u.StdoutFD, u.StderrFD}
+		if u.AuthorityFD != 0 {
+			fds = append(fds, u.AuthorityFD)
+		}
+		r.conn.closeReceivedHandles(fds)
+		r.owned[id] = false
+	}
+}
+
+func (r *handoffReceipt) abort() {
+	if r == nil || r.finalized {
+		return
+	}
+	r.finalized = true
+	r.closeOwned()
+	_ = r.conn.Close()
+}
+
+// receiveHandoff preserves the public receive API by treating receipt as
+// adoption. The daemon startup path uses prepareHandoffReceive directly and
+// finalizes only after Owner construction and registration.
+func receiveHandoff(ctx context.Context, conn fdConn, token string) ([]HandoffUpstream, error) {
+	receipt, err := prepareHandoffReceive(ctx, conn, token)
+	if err != nil {
+		return nil, err
+	}
+	received := receipt.upstreams()
+	accepted := make([]string, 0, len(received))
+	for i := range received {
+		u, ok := receipt.take(received[i].ServerID)
+		if !ok {
+			receipt.abort()
+			return nil, fmt.Errorf("receiveHandoff: take %q failed", received[i].ServerID)
+		}
+		received[i] = u
+		accepted = append(accepted, u.ServerID)
+	}
+	if err := receipt.finalize(accepted); err != nil {
+		fds := make([]uintptr, 0, len(received)*4)
+		for _, u := range received {
+			fds = append(fds, u.StdinFD, u.StdoutFD, u.StderrFD)
+			if u.AuthorityFD != 0 {
+				fds = append(fds, u.AuthorityFD)
+			}
+		}
+		conn.closeReceivedHandles(fds)
+		return nil, err
 	}
 	return received, nil
 }

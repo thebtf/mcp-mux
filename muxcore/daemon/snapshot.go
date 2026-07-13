@@ -133,14 +133,13 @@ var dialHandoffHook func(socketPath string, timeout time.Duration) (fdConn, erro
 // env vars. If both are set, dials the handoff socket, authenticates with the token,
 // and receives the list of upstream FDs from the old daemon.
 // Returns nil on any failure (FR-8 fallback: caller uses SpawnUpstreamBackground for all owners).
-func (d *Daemon) tryHandoffReceive(ctx context.Context) map[string]HandoffUpstream {
+func (d *Daemon) tryHandoffReceive(ctx context.Context) *handoffReceipt {
 	tokenPath := os.Getenv("MCPMUX_HANDOFF_TOKEN_PATH")
 	socketPath := os.Getenv("MCPMUX_HANDOFF_SOCKET")
 
 	if tokenPath == "" || socketPath == "" {
 		return nil
 	}
-
 	defer deleteHandoffToken(tokenPath) //nolint:errcheck
 
 	token, err := readHandoffToken(tokenPath)
@@ -158,23 +157,18 @@ func (d *Daemon) tryHandoffReceive(ctx context.Context) map[string]HandoffUpstre
 		d.logger.Printf("handoff.receive.fail reason=%v", err)
 		return nil
 	}
-	defer conn.Close() //nolint:errcheck
 
-	receiveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	receiveCtx, cancel := context.WithTimeout(ctx, handoffTotalTimeout)
 	defer cancel()
 
-	received, err := receiveHandoff(receiveCtx, conn, token)
+	receipt, err := prepareHandoffReceive(receiveCtx, conn, token)
 	if err != nil {
+		_ = conn.Close()
 		d.logger.Printf("handoff.receive.fail reason=%v", err)
 		return nil
 	}
-
-	result := make(map[string]HandoffUpstream, len(received))
-	for _, hu := range received {
-		result[hu.ServerID] = hu
-	}
-	d.logger.Printf("handoff.receive.ok upstreams=%d", len(result))
-	return result
+	d.logger.Printf("handoff.receive.prepared upstreams=%d", len(receipt.received))
+	return receipt
 }
 
 // loadSnapshot checks for a snapshot file and restores owners from it.
@@ -198,7 +192,14 @@ func (d *Daemon) loadSnapshot() int {
 	// Check for handoff env vars. If both are set, receive transferred FDs from
 	// the old daemon instead of respawning upstreams from scratch (FR-1 to FR-3).
 	// Returns nil if env vars are absent or handoff fails (FR-8 fallback for all owners).
-	handoffMap := d.tryHandoffReceive(context.Background())
+	handoffReceipt := d.tryHandoffReceive(context.Background())
+	handoffAccepted := make([]string, 0)
+	type adoptedHandoffOwner struct {
+		snapshot mcpsnapshot.OwnerSnapshot
+		cfg      owner.OwnerConfig
+		entry    *OwnerEntry
+	}
+	handoffOwners := make([]adoptedHandoffOwner, 0)
 
 	restored := 0
 	for _, ownerSnap := range snap.Owners {
@@ -279,17 +280,24 @@ func (d *Daemon) loadSnapshot() int {
 		var o *owner.Owner
 		reattachedFromHandoff := false
 
-		// FR-7 partial fallback: attempt handoff reattach if this serverID was received.
-		if hu, ok := handoffMap[sid]; ok {
+		// FR-7 partial fallback: take ownership only while constructing this owner.
+		var hu HandoffUpstream
+		var hasHandoff bool
+		if handoffReceipt != nil {
+			hu, hasHandoff = handoffReceipt.take(sid)
+		}
+		if hasHandoff {
 			cfg.CachedClassification = ownerSnap.Classification
 			payload := owner.HandoffPayload{
-				ServerID: sid,
-				PID:      hu.PID,
-				StdinFD:  hu.StdinFD,
-				StdoutFD: hu.StdoutFD,
-				Command:  hu.Command,
-				Args:     ownerSnap.Args,
-				Cwd:      ownerSnap.Cwd,
+				ServerID:    sid,
+				PID:         hu.PID,
+				StdinFD:     hu.StdinFD,
+				StdoutFD:    hu.StdoutFD,
+				StderrFD:    hu.StderrFD,
+				AuthorityFD: hu.AuthorityFD,
+				Command:     hu.Command,
+				Args:        ownerSnap.Args,
+				Cwd:         ownerSnap.Cwd,
 			}
 			var handoffErr error
 			o, handoffErr = owner.NewOwnerFromHandoff(cfg, payload)
@@ -330,8 +338,7 @@ func (d *Daemon) loadSnapshot() int {
 			serviceToken = d.supervisor.Add(o)
 		}
 
-		d.mu.Lock()
-		d.owners[sid] = &OwnerEntry{
+		entry := &OwnerEntry{
 			Owner:                       o,
 			ServerID:                    sid,
 			Command:                     ownerSnap.Command,
@@ -347,7 +354,17 @@ func (d *Daemon) loadSnapshot() int {
 			IdleTimeout:                 d.ownerIdleTimeout,
 			serviceToken:                serviceToken,
 		}
+		d.mu.Lock()
+		d.owners[sid] = entry
 		d.mu.Unlock()
+		if reattachedFromHandoff {
+			handoffAccepted = append(handoffAccepted, sid)
+			handoffOwners = append(handoffOwners, adoptedHandoffOwner{
+				snapshot: ownerSnap,
+				cfg:      cfg,
+				entry:    entry,
+			})
+		}
 
 		// Rehydrate forced-isolated retry counter when the restored sid carries
 		// a `-rN` suffix. Without this, a fresh Spawn for the same (cmd,args,cwd)
@@ -369,6 +386,66 @@ func (d *Daemon) loadSnapshot() int {
 
 		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)
 		restored++
+	}
+	if handoffReceipt != nil {
+		if err := handoffReceipt.finalize(handoffAccepted); err != nil {
+			d.logger.Printf("handoff.receive.commit_fail accepted=%d reason=%v", len(handoffAccepted), err)
+			for _, adopted := range handoffOwners {
+				sid := adopted.snapshot.ServerID
+				result, removeErr := d.removeOwnerIfCurrent(sid, adopted.entry, ownerRemovalReasonRestoreFailed, false)
+				if removeErr != nil {
+					d.logger.Printf("handoff.receive.rollback_remove_fail server_id=%s reason=%v", shortServerID(sid), removeErr)
+				}
+				if !result.Removed {
+					adopted.entry.Owner.Shutdown()
+				}
+
+				o, restoreErr := owner.NewOwnerFromSnapshot(adopted.cfg, adopted.snapshot)
+				if restoreErr != nil {
+					restored--
+					d.logger.Printf("handoff.receive.rollback_respawn_fail server_id=%s reason=%v", shortServerID(sid), restoreErr)
+					continue
+				}
+				ownerGeneration, generationErr := generateGeneration("owner")
+				if generationErr != nil {
+					restored--
+					o.Shutdown()
+					d.logger.Printf("handoff.receive.rollback_generation_fail server_id=%s reason=%v", shortServerID(sid), generationErr)
+					continue
+				}
+				var serviceToken suture.ServiceToken
+				if d.supervisor != nil {
+					serviceToken = d.supervisor.Add(o)
+				}
+				entry := &OwnerEntry{
+					Owner:                       o,
+					ServerID:                    sid,
+					Command:                     adopted.snapshot.Command,
+					Args:                        adopted.snapshot.Args,
+					Cwd:                         adopted.snapshot.Cwd,
+					Mode:                        adopted.snapshot.Mode,
+					Env:                         adopted.cfg.Env,
+					Persistent:                  adopted.snapshot.Persistent,
+					LastSession:                 time.Now(),
+					OwnerGeneration:             ownerGeneration,
+					RestoredFromOwnerGeneration: adopted.snapshot.OwnerGeneration,
+					RestoreSource:               "snapshot_fallback",
+					IdleTimeout:                 d.ownerIdleTimeout,
+					serviceToken:                serviceToken,
+				}
+				d.mu.Lock()
+				d.owners[sid] = entry
+				d.mu.Unlock()
+				d.rehydrateRetryCounter(sid, adopted.snapshot.Command, adopted.snapshot.Args, adopted.snapshot.Cwd)
+				if adopted.snapshot.CachedInit != "" && adopted.snapshot.CachedTools != "" {
+					d.updateTemplate(adopted.snapshot.Command, adopted.snapshot.Args, adopted.snapshot)
+				}
+				o.SpawnUpstreamBackground()
+				d.logger.Printf("handoff.receive.rollback_respawn_ok server_id=%s", shortServerID(sid))
+			}
+		} else {
+			d.logger.Printf("handoff.receive.ok upstreams=%d", len(handoffAccepted))
+		}
 	}
 	if restored > 0 {
 		d.restoredOwnerCount.Add(uint64(restored))

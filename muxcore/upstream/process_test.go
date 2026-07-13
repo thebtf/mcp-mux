@@ -6,12 +6,41 @@ import (
 	"errors"
 	"io"
 	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestBeginExitFinalizationSerializesDetachLease(t *testing.T) {
+	t.Run("exit wins", func(t *testing.T) {
+		p := &Process{pid: 1, detach: detachAttached}
+		if !p.beginExitFinalization() {
+			t.Fatal("exit finalizer did not claim attached process")
+		}
+		if _, _, _, _, _, err := p.DetachWithAuthority(); !errors.Is(err, ErrAlreadyClosed) {
+			t.Fatalf("DetachWithAuthority after exit claim = %v, want ErrAlreadyClosed", err)
+		}
+	})
+
+	t.Run("detach wins", func(t *testing.T) {
+		p := &Process{pid: 1, detach: detachPrepared}
+		if p.beginExitFinalization() {
+			t.Fatal("exit finalizer stole a prepared detach lease")
+		}
+		p.mu.Lock()
+		closed := p.closed
+		p.mu.Unlock()
+		if closed {
+			t.Fatal("prepared detach was marked closed by exit finalizer")
+		}
+	})
+}
 
 func TestStartAndClose(t *testing.T) {
 	// Use a simple process that exits immediately
@@ -444,4 +473,85 @@ func TestDetach_HandlerBasedProcessUnsupported(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("handler-based process did not exit after context cancellation")
 	}
+}
+
+func TestClose_LeaderExitsOnEOFKillsRemainingDescendant(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	env := map[string]string{}
+	for _, entry := range os.Environ() {
+		if key, value, ok := strings.Cut(entry, "="); ok {
+			env[key] = value
+		}
+	}
+	env["MCP_MUX_UPSTREAM_HELPER"] = "leader-exits-on-eof"
+	env["MCP_MUX_UPSTREAM_DESCENDANT_PID_FILE"] = pidFile
+
+	p, err := Start(os.Args[0], []string{"-test.run=TestUpstreamLeaderExitHelper"}, env, "", nil)
+	if err != nil {
+		t.Fatalf("Start helper: %v", err)
+	}
+	p.SetDrainTimeout(200 * time.Millisecond)
+
+	descendantPID := waitForUpstreamDescendantPID(t, pidFile)
+	t.Cleanup(func() { killUpstreamTestProcess(descendantPID) })
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !waitForUpstreamTestProcessExit(descendantPID, 5*time.Second) {
+		t.Fatalf("descendant pid %d survived Close after leader exited on EOF", descendantPID)
+	}
+}
+
+func TestUpstreamLeaderExitHelper(t *testing.T) {
+	if os.Getenv("MCP_MUX_UPSTREAM_HELPER") != "leader-exits-on-eof" {
+		return
+	}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", "ping -n 999 127.0.0.1 >nul")
+	} else {
+		cmd = exec.Command("sleep", "999")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start descendant: %v", err)
+	}
+	pidFile := os.Getenv("MCP_MUX_UPSTREAM_DESCENDANT_PID_FILE")
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(cmd.Process.Pid)), 0o600); err != nil {
+		_ = cmd.Process.Kill()
+		t.Fatalf("write descendant pid: %v", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		t.Fatalf("release descendant: %v", err)
+	}
+
+	_, _ = io.Copy(io.Discard, os.Stdin)
+}
+
+func waitForUpstreamDescendantPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, convErr := strconv.Atoi(string(data))
+			if convErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("descendant pid file was not populated: %s", path)
+	return 0
+}
+
+func waitForUpstreamTestProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !upstreamTestProcessAlive(pid) {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return !upstreamTestProcessAlive(pid)
 }
