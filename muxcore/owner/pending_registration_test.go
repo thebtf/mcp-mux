@@ -6,19 +6,34 @@ import (
 	"testing"
 )
 
-func TestPreRegisterPurgedWhenIsolatedClassificationClosesListener(t *testing.T) {
+func TestPreRegisterPurgedWhenIsolatedClassificationRestrictsFreshAdmission(t *testing.T) {
 	o := NewTestOwner("", "isolated-owner")
 
-	if !o.PreRegister("token", "/project", nil) {
-		t.Fatal("PreRegister rejected while owner was accepting")
+	if !o.PreRegisterInitial("initial-token", "/project", nil) {
+		t.Fatal("PreRegisterInitial rejected the creating shim")
+	}
+	if !o.PreRegister("provisional-token", "/project", nil) {
+		t.Fatal("PreRegister rejected provisional fan-in before classification")
 	}
 	o.classifyFromCapabilities([]byte(`{"result":{"capabilities":{"x-mux":{"sharing":"isolated"}}}}`))
 
-	if got := o.SessionMgr().PendingCount(); got != 0 {
-		t.Fatalf("PendingCount after isolated classification = %d, want 0", got)
+	if got := o.SessionMgr().PendingCount(); got != 1 {
+		t.Fatalf("PendingCount after isolated classification = %d, want creating token only", got)
+	}
+	if !o.SessionMgr().IsPreRegistered("initial-token") {
+		t.Fatal("isolated classification revoked the creating shim token")
+	}
+	if o.SessionMgr().IsPreRegistered("provisional-token") {
+		t.Fatal("isolated classification retained a provisional fan-in token")
+	}
+	if !o.IsAccepting() {
+		t.Fatal("isolated classification closed the listener needed for token reconnect")
 	}
 	if o.PreRegister("late-token", "/project", nil) {
-		t.Fatal("PreRegister accepted after listener closed")
+		t.Fatal("PreRegister accepted a fresh token after isolated classification")
+	}
+	if o.PreRegisterInitial("other-initial", "/project", nil) {
+		t.Fatal("PreRegisterInitial accepted a second creating token")
 	}
 }
 

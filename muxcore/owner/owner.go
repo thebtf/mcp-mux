@@ -155,7 +155,8 @@ type Owner struct {
 	initReadyOnce        sync.Once
 
 	sessionMgr             *SessionManager
-	tokenHandshake         bool // true when daemon manages this owner (shims send token)
+	tokenHandshake         bool   // true when daemon manages this owner (shims send token)
+	initialAdmissionToken  string // creating shim token preserved when isolation revokes provisional fan-in
 	rejectionLogger        *rejectionLogger
 	progressOwners         map[string]int      // progressToken → session ID for targeted routing
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
@@ -675,7 +676,9 @@ func (o *Owner) SessionMgr() *SessionManager {
 	return o.sessionMgr
 }
 
-// PreRegister atomically reserves a shim token while this owner is accepting.
+// PreRegister atomically reserves a token for a fresh shim while this owner is
+// accepting fresh consumers. A classified-isolated owner keeps its listener
+// alive for exact-token reconnects, but generic fresh admission remains closed.
 // The owner lock always precedes the session-manager lock; accept-loop session
 // lookups release the session-manager lock before entering owner state.
 func (o *Owner) PreRegister(token, cwd string, env map[string]string) bool {
@@ -685,9 +688,33 @@ func (o *Owner) PreRegister(token, cwd string, env map[string]string) bool {
 	case <-o.listenerDone:
 		return false
 	default:
-		o.sessionMgr.PreRegisterForOwner(token, o.serverID, cwd, env)
-		return true
 	}
+	if o.autoClassification == classify.ModeIsolated {
+		return false
+	}
+	o.sessionMgr.PreRegisterForOwner(token, o.serverID, cwd, env)
+	return true
+}
+
+// PreRegisterInitial reserves the creating shim's token. Unlike PreRegister,
+// it remains valid if proactive initialization classifies the new owner as
+// isolated before Daemon.Spawn returns. Only one distinct initial token may be
+// installed; later fresh consumers must use PreRegister and are rejected once
+// isolation is known.
+func (o *Owner) PreRegisterInitial(token, cwd string, env map[string]string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	select {
+	case <-o.listenerDone:
+		return false
+	default:
+	}
+	if o.initialAdmissionToken != "" && o.initialAdmissionToken != token {
+		return false
+	}
+	o.initialAdmissionToken = token
+	o.sessionMgr.PreRegisterForOwner(token, o.serverID, cwd, env)
+	return true
 }
 
 // readToken reads the handshake token sent by the shim immediately after connecting.
@@ -776,17 +803,6 @@ func (o *Owner) AddSession(s *Session) {
 			}
 			go lc.OnProjectConnect(project)
 		}
-	}
-
-	// For template-restored isolated owners, close the IPC listener after the first
-	// session connects. Normal owners close the listener during classification
-	// (classifyFromCapabilities/classifyFromToolList), but template owners skip
-	// classification (already set from snapshot) so the listener stays open.
-	o.mu.RLock()
-	isIsolated := o.autoClassification == classify.ModeIsolated && o.classificationSource != ""
-	o.mu.RUnlock()
-	if isIsolated {
-		o.closeListener()
 	}
 
 	// Notify upstream that roots may have changed (new client = new potential root)
@@ -2693,10 +2709,10 @@ func (o *Owner) IsAccepting() bool {
 //
 // Returns:
 //   - false if listenerDone has been signalled (explicit closeListener — an
-//     owner that legitimately closed its own listener, e.g. an isolated
-//     server after its first session, will return false here; callers that
-//     need to distinguish "legitimately closed" from "zombie" must pair
-//     IsReachable with IsAccepting to tell them apart).
+//     owner that deliberately retired its endpoint will return false here;
+//     callers that need to distinguish "deliberately retired" from "zombie"
+//     must pair IsReachable with IsAccepting to tell them apart). Classified
+//     isolated owners keep the endpoint reachable for exact-token reconnect.
 //   - true if ipcPath is empty (test owners / pre-bind SessionHandler-only
 //     fixtures have no path to probe — they are treated as reachable so
 //     unit-test flows are not short-circuited).
@@ -2759,9 +2775,8 @@ func (o *Owner) IsClassifiedShareable() bool {
 // IsClassifiedIsolated returns true if the owner has been classified AND the
 // classification is isolated. Returns false when classification is still
 // pending OR when the mode is shared/session-aware. Used by the reaper to
-// apply a shorter idle timeout to isolated owners, which cannot be reattached
-// by future Spawn calls (their server_id is either a random UUID or a
-// cwd-keyed hash whose listener was closed by the isolation verdict).
+// apply a shorter idle timeout to isolated owners, which reject fresh Spawn
+// admission while retaining their authenticated listener for token reconnect.
 func (o *Owner) IsClassifiedIsolated() bool {
 	select {
 	case <-o.classified:
@@ -3426,13 +3441,13 @@ func (o *Owner) classifyFromCapabilities(initJSON []byte) {
 	if mode == classify.ModeIsolated {
 		o.mu.Lock()
 		primaryCwd, cwdCount := o.resetCwdSetToPrimary()
+		removed := o.sessionMgr.RemovePendingForOwnerExcept(o.serverID, o.initialAdmissionToken)
 		o.mu.Unlock()
 
 		if primaryCwd != "" {
 			o.logger.Printf("reset cwd_set to primary cwd: %s (now %d roots)", primaryCwd, cwdCount)
 		}
-		o.logger.Printf("closing IPC listener — server declares isolated via x-mux")
-		o.closeListener()
+		o.logger.Printf("restricting IPC listener to reconnect tokens — server declares isolated via x-mux (revoked_pending=%d)", removed)
 		o.evictExtraSessions()
 	}
 }
@@ -3467,14 +3482,14 @@ func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 	if mode == classify.ModeIsolated {
 		o.mu.Lock()
 		primaryCwd, cwdCount := o.resetCwdSetToPrimary()
+		removed := o.sessionMgr.RemovePendingForOwnerExcept(o.serverID, o.initialAdmissionToken)
 		o.mu.Unlock()
 
 		o.logger.Printf("auto-classification: ISOLATED (matched: %v)", matched)
 		if primaryCwd != "" {
 			o.logger.Printf("reset cwd_set to primary cwd: %s (now %d roots)", primaryCwd, cwdCount)
 		}
-		o.logger.Printf("closing IPC listener — server requires per-session isolation")
-		o.closeListener()
+		o.logger.Printf("restricting IPC listener to reconnect tokens — server requires per-session isolation (revoked_pending=%d)", removed)
 		// Disconnect extra sessions that were dedup'd before classification.
 		// Keep only the first session — others will reconnect and get their own owner.
 		o.evictExtraSessions()

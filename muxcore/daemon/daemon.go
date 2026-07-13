@@ -294,11 +294,10 @@ type Config struct {
 
 	// IsolatedIdleTimeout is the shorter idle timeout applied by the reaper
 	// to owners whose post-init classification was isolated. Isolated owners
-	// cannot be reattached by future Spawn calls (their server_id is either
-	// a random UUID from the forced-isolated retry path or a cwd-keyed hash
-	// whose listener was closed by the isolation verdict), so holding them
-	// across the longer shared/general OwnerIdleTimeout wastes upstream
-	// processes for no possible cache benefit.
+	// reject fresh Spawn admission while retaining exact-token reconnect on
+	// their authenticated listener. Once the reconnect window is no longer
+	// needed, holding them across the longer shared/general OwnerIdleTimeout
+	// wastes upstream processes for no possible shared-cache benefit.
 	//
 	// Default (nil): 60 seconds. Pass a pointer to zero (new(time.Duration)
 	// or DurationPtr(0)) to disable the optimization, in which case isolated
@@ -1376,14 +1375,17 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 		o.SpawnUpstreamBackground()
 	}
 
-	// PreRegister with the MERGED env (not raw req.Env) so the session — bound
-	// to this token on handshake — sees daemon-filled credentials too.
+	// PreRegisterInitial with the MERGED env (not raw req.Env) so the creating
+	// session sees daemon-filled credentials even if proactive initialization
+	// classifies this owner as isolated before Spawn returns. Reuse paths call
+	// ordinary PreRegister and therefore cannot claim a classified-isolated
+	// owner's reconnect-only listener.
 	// owner.go:~815 gates muxEnv injection on `len(s.Env) > 0` and sends s.Env
 	// as _meta.muxEnv; session-aware upstreams (pr-review-mcp etc.) look up
 	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
-	if !o.PreRegister(token, req.Cwd, sessionEnv) {
+	if !o.PreRegisterInitial(token, req.Cwd, sessionEnv) {
 		if o.IsClassifiedIsolated() {
 			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
 		}
@@ -2143,8 +2145,9 @@ func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 // findSharedOwnerLocked looks for an accepting owner that matches the requested
 // command+args and is compatible with the caller's env and cwd for shared reuse.
 // Dedup is optimistic: unclassified owners are assumed shareable. If an owner
-// later classifies as isolated, it closes its IPC listener — extra sessions get
-// EOF and reconnect with their own owner.
+// later classifies as isolated, fresh token admission is revoked while its IPC
+// listener remains available for exact-token reconnect. Extra sessions get EOF
+// and reconnect with their own owner.
 //
 // Lock semantics (FR-8 / BUG-007): this function MUST be called with d.mu
 // Lock-held (write lock, not RLock). It drops d.mu via d.mu.Unlock() while

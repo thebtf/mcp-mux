@@ -246,6 +246,14 @@ func (sm *Manager) PreRegisterForOwner(token, ownerKey, cwd string, env map[stri
 // RemovePendingForOwner removes pending tokens associated with ownerKey.
 // Owner-keyless legacy pending tokens are intentionally TTL-only.
 func (sm *Manager) RemovePendingForOwner(ownerKey string) int {
+	return sm.RemovePendingForOwnerExcept(ownerKey, "")
+}
+
+// RemovePendingForOwnerExcept removes pending tokens associated with ownerKey,
+// preserving keepToken when non-empty. Isolated classification uses this to
+// revoke provisional fan-in without invalidating the creating shim's initial
+// admission token.
+func (sm *Manager) RemovePendingForOwnerExcept(ownerKey, keepToken string) int {
 	if ownerKey == "" {
 		return 0
 	}
@@ -253,7 +261,7 @@ func (sm *Manager) RemovePendingForOwner(ownerKey string) int {
 	defer sm.mu.Unlock()
 	removed := 0
 	for token, ps := range sm.pending {
-		if ps.OwnerKey == ownerKey {
+		if ps.OwnerKey == ownerKey && token != keepToken {
 			delete(sm.pending, token)
 			removed++
 		}

@@ -115,6 +115,27 @@ func TestPreRegisterForOwnerAndRemovePendingForOwner(t *testing.T) {
 	}
 }
 
+func TestRemovePendingForOwnerExceptPreservesCreatingToken(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("creating", "owner-a", "/project", nil)
+	sm.PreRegisterForOwner("provisional-1", "owner-a", "/project", nil)
+	sm.PreRegisterForOwner("provisional-2", "owner-a", "/project", nil)
+	sm.PreRegisterForOwner("foreign", "owner-b", "/other", nil)
+
+	if removed := sm.RemovePendingForOwnerExcept("owner-a", "creating"); removed != 2 {
+		t.Fatalf("RemovePendingForOwnerExcept() = %d, want 2", removed)
+	}
+	if !sm.IsPreRegistered("creating") {
+		t.Fatal("creating token was removed")
+	}
+	if sm.IsPreRegistered("provisional-1") || sm.IsPreRegistered("provisional-2") {
+		t.Fatal("provisional owner-a token survived")
+	}
+	if !sm.IsPreRegistered("foreign") {
+		t.Fatal("foreign owner token was removed")
+	}
+}
+
 func TestBindRejectsWrongOwnerWithoutConsumingToken(t *testing.T) {
 	sm := NewManager()
 	sm.PreRegisterForOwner("owned-token", "owner-a", "/project/a", map[string]string{"A": "1"})
