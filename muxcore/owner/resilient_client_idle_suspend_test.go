@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
 func TestResilientClient_IdleSuspendsAndReconnectsOnDemand(t *testing.T) {
@@ -819,6 +821,79 @@ func TestResilientClient_ZeroIdleSuspendDelayDoesNotSuspend(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("resilient client did not exit")
+	}
+}
+
+func TestResilientClient_PersistentOwnerRequiresExplicitDisposableShimPolicy(t *testing.T) {
+	rc := &resilientClient{}
+	rc.initialized.Store(true)
+	rc.persistent.Store(true)
+	rc.effectiveIdleDelay.Store(int64(time.Millisecond))
+	rc.lastHostActivity.Store(time.Now().Add(-time.Second).UnixNano())
+	if rc.shouldIdleSuspend() {
+		t.Fatal("persistent owner suspended without an explicit background-event policy")
+	}
+	rc.cfg.AllowPersistentIdleSuspend = true
+	if !rc.shouldIdleSuspend() {
+		t.Fatal("explicit disposable-shim policy did not allow persistent owner suspension")
+	}
+}
+
+func TestResilientClient_PersistentOwnerRetainsTransportForBackgroundNotification(t *testing.T) {
+	path := newTestIPCPath(t)
+	listener, err := ipc.Listen(path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		if !scanner.Scan() {
+			return
+		}
+		_, _ = fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"x-mux":{"persistent":true}}}}`)
+		time.Sleep(125 * time.Millisecond) // longer than the candidate idle delay
+		_, _ = fmt.Fprintln(conn, `{"jsonrpc":"2.0","method":"notifications/background"}`)
+		for scanner.Scan() {
+		}
+	}()
+
+	stdinR, stdinW := io.Pipe()
+	stdoutR, stdoutW := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunResilientClient(ResilientClientConfig{
+			ProbeGracePeriod: time.Nanosecond,
+			Stdin:            stdinR,
+			Stdout:           stdoutW,
+			InitialIPCPath:   path,
+			IdleSuspendDelay: 25 * time.Millisecond,
+			Logger:           resilientTestLogger(t),
+		})
+	}()
+	lines := make(chan []byte, 4)
+	go func() {
+		scanner := bufio.NewScanner(stdoutR)
+		for scanner.Scan() {
+			lines <- append([]byte(nil), scanner.Bytes()...)
+		}
+	}()
+	_, _ = io.WriteString(stdinW, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`+"\n")
+	waitForResponseID(t, lines, 1)
+	waitForNotificationMethod(t, lines, "notifications/background")
+	_ = stdinW.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunResilientClient: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("persistent client did not exit after EOF")
 	}
 }
 

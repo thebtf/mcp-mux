@@ -93,6 +93,11 @@ type ResilientClientConfig struct {
 	// value enables the private supervised-launcher dormant handshake; zero or
 	// negative keeps the suspended shim alive for backward compatibility.
 	IdleDormantGrace time.Duration
+	// AllowPersistentIdleSuspend is an explicit consumer assertion that this
+	// transport has no unbuffered server-to-client background traffic. Persistent
+	// owners stay connected by default because MCP permits notifications/requests
+	// at any time and muxcore has no reverse wake channel.
+	AllowPersistentIdleSuspend bool
 
 	// KeepaliveInterval is no longer used. Previous revisions emitted a
 	// synthetic notifications/progress with progressToken="mux-reconnect"
@@ -551,7 +556,7 @@ func idleSuspendGateRetryDelay(failures int, token string) time.Duration {
 
 func (rc *resilientClient) shouldIdleSuspend() bool {
 	delay := time.Duration(rc.effectiveIdleDelay.Load())
-	if delay <= 0 || !rc.initialized.Load() || rc.persistent.Load() {
+	if delay <= 0 || !rc.initialized.Load() || (rc.persistent.Load() && !rc.cfg.AllowPersistentIdleSuspend) {
 		return false
 	}
 	if rc.countInflight() != 0 || rc.localWork.Load() != 0 || len(rc.msgFromIPC) != 0 {

@@ -62,10 +62,15 @@ direct resilient-client controls are additive:
 | `owner.ResilientClientConfig.IdleSuspendDelay` | Parks daemon IPC after safe host inactivity. Zero disables and preserves the prior always-connected behavior. |
 | `owner.ResilientClientConfig.IdleSuspendGate` | Optional final safety check before parking. A nil gate relies on local checks; errors and denials keep IPC connected. |
 | `owner.ResilientClientConfig.IdleDormantGrace` | Positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. Zero or negative keeps the suspended shim process alive. |
+| `owner.ResilientClientConfig.AllowPersistentIdleSuspend` | False by default. Set true only when this shim has no unbuffered server-to-client background traffic, or the consumer owns buffering/replay. Persistent owners otherwise retain their downstream transport. |
 
 The `mcp-mux` product wires 10-minute idle and 30-second dormant defaults from
 `MCPMUX_SHIM_IDLE_TIMEOUT` and `MCPMUX_SHIM_DORMANT_GRACE`. Those environment
 variables belong to the product wrapper; native muxcore consumers opt in with
+`engine.Config` or `owner.ResilientClientConfig`. Products with custom shims
+must migrate that shim to these provider controls before removing local retry
+or stale-daemon kill logic; a dependency bump alone cannot change a wrapper
+that bypasses muxcore's client lifecycle.
 the fields above and should use their own launcher protocol if they want process
 dormancy. Persistent owners (`engine.Config.Persistent` or
 `x-mux.persistent: true`) remain connected and are not idle-suspended.

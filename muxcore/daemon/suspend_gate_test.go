@@ -27,13 +27,9 @@ func TestHandleCanSuspendSafetyGates(t *testing.T) {
 	d.owners[sid].Persistent = true
 	d.mu.Unlock()
 	got, err = d.HandleCanSuspend("suspend-token")
-	if err != nil || got.Allowed || got.Reason != "persistent" {
-		t.Fatalf("HandleCanSuspend persistent = (%+v, %v)", got, err)
+	if err != nil || !got.Allowed {
+		t.Fatalf("HandleCanSuspend persistent owner = (%+v, %v), want downstream suspension allowed", got, err)
 	}
-
-	d.mu.Lock()
-	d.owners[sid].Persistent = false
-	d.mu.Unlock()
 	o.RegisterBusy("background", time.Now(), time.Minute, "test", -1)
 	got, err = d.HandleCanSuspend("suspend-token")
 	if err != nil || got.Allowed || got.Reason != "busy" {

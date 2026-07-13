@@ -1952,13 +1952,9 @@ func (d *Daemon) handleCanSuspend(prevToken, serverID string) (control.SuspendCh
 
 	d.mu.RLock()
 	current, ok := d.owners[ownerKey]
-	persistent := ok && current == entry && entry.Persistent
 	d.mu.RUnlock()
 	if !ok || current != entry {
 		return control.SuspendCheckResponse{}, ErrOwnerGone
-	}
-	if persistent {
-		return control.SuspendCheckResponse{Reason: "persistent"}, nil
 	}
 	if entry.Owner.PendingRequests() > 0 {
 		return control.SuspendCheckResponse{Reason: "pending_requests"}, nil

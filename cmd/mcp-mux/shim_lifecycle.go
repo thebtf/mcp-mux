@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	envShimIdleTimeout  = "MCPMUX_SHIM_IDLE_TIMEOUT"
-	envShimDormantGrace = "MCPMUX_SHIM_DORMANT_GRACE"
+	envShimIdleTimeout      = "MCPMUX_SHIM_IDLE_TIMEOUT"
+	envShimDormantGrace     = "MCPMUX_SHIM_DORMANT_GRACE"
+	envLauncherDormantLease = "MCPMUX_LAUNCHER_DORMANT_LEASE"
 
 	defaultShimIdleTimeout  = 10 * time.Minute
 	defaultShimDormantGrace = 30 * time.Second
@@ -34,6 +35,18 @@ func shimLifecycleDurations(getenv func(string) string) (time.Duration, time.Dur
 	}
 	return parse(envShimIdleTimeout, defaultShimIdleTimeout),
 		parse(envShimDormantGrace, defaultShimDormantGrace)
+}
+
+func launcherDormantLease(getenv func(string) string) time.Duration {
+	raw := strings.TrimSpace(getenv(envLauncherDormantLease))
+	if raw == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 func resilientClientExitCode(err error) int {

@@ -25,6 +25,7 @@ type launcherSupervisorConfig struct {
 	RespawnDelay        time.Duration
 	ReplayTimeout       time.Duration
 	EnginePollInterval  time.Duration
+	DormantLease        time.Duration
 }
 
 type supervisedEngineChild struct {
@@ -143,6 +144,8 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 	var pendingFrames [][]byte
 	var dormantExitTimer *time.Timer
 	var dormantExitC <-chan time.Time
+	var dormantLeaseTimer *time.Timer
+	var dormantLeaseC <-chan time.Time
 
 	stopDormantExitTimer := func() {
 		if dormantExitTimer == nil {
@@ -156,6 +159,20 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 		stopDormantExitTimer()
 		dormantExitTimer = time.NewTimer(launcherDormantExitTimeout)
 		dormantExitC = dormantExitTimer.C
+	}
+	stopDormantLeaseTimer := func() {
+		if dormantLeaseTimer != nil {
+			dormantLeaseTimer.Stop()
+			dormantLeaseTimer = nil
+			dormantLeaseC = nil
+		}
+	}
+	resetDormantLeaseTimer := func() {
+		stopDormantLeaseTimer()
+		if cfg.DormantLease > 0 {
+			dormantLeaseTimer = time.NewTimer(cfg.DormantLease)
+			dormantLeaseC = dormantLeaseTimer.C
+		}
 	}
 	resetChildObservation := func() {
 		childWait = child.waitCh
@@ -188,6 +205,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 	}
 	restartAndFlush := func() error {
 		stopDormantExitTimer()
+		stopDormantLeaseTimer()
 		preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
 		launcherDrainInflight(cfg.Stdout, inflight, "initialize")
 		if child != nil {
@@ -206,6 +224,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 		return flushPending()
 	}
 	wakeAndFlush := func() error {
+		stopDormantLeaseTimer()
 		var startErr error
 		child, childOut, childEnginePath, startErr = startLauncherSupervisorChild(
 			cfg, initializeRequest, initializedNotification, false, inflight,
@@ -230,6 +249,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 		select {
 		case ev := <-stdinCh:
 			if ev.err != nil {
+				stopDormantLeaseTimer()
 				child.closeStdin()
 				child.waitOrKill(2 * time.Second)
 				if ev.err == io.EOF {
@@ -273,6 +293,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 					child = nil
 					childEnginePath = ""
 					state = launcherChildDormant
+					resetDormantLeaseTimer()
 					if len(pendingFrames) > 0 {
 						if err := wakeAndFlush(); err != nil {
 							return err
@@ -343,6 +364,11 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 				return err
 			}
 
+		case <-dormantLeaseC:
+			if state == launcherChildDormant {
+				return nil
+			}
+
 		case exitErr := <-childWait:
 			childWait = nil
 			if child != nil {
@@ -357,6 +383,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 				childOut = nil
 				childEnginePath = ""
 				state = launcherChildDormant
+				resetDormantLeaseTimer()
 				if len(pendingFrames) > 0 {
 					if err := wakeAndFlush(); err != nil {
 						return err

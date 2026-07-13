@@ -188,6 +188,17 @@ type Config struct {
 	// stdin is an internal pipe (not a CC shutdown signal).
 	StdinEOFPolicy owner.StdinEOFPolicy
 
+	// IdleSuspendDelay and IdleDormantGrace expose muxcore's reusable
+	// downstream-shim lifecycle to engine.New consumers. Zero values preserve
+	// the pre-v0.27 always-connected behavior. A positive dormant grace needs a
+	// consumer-owned capable supervisor; otherwise leave it zero.
+	IdleSuspendDelay time.Duration
+	IdleDormantGrace time.Duration
+	// AllowPersistentIdleSuspend is an explicit assertion that this product has
+	// no unbuffered server-to-client background traffic for the suspended shim.
+	// Persistent owners retain their downstream transports by default.
+	AllowPersistentIdleSuspend bool
+
 	// AuthorizeSession, when non-nil, is invoked once per session AFTER the
 	// initial IPC handshake completes (peer credentials populated on
 	// SessionMeta.Conn) and BEFORE any frame is dispatched to SessionHandler
@@ -519,16 +530,19 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	}
 
 	return runResilientClient(owner.ResilientClientConfig{
-		Stdin:          os.Stdin,
-		Stdout:         os.Stdout,
-		InitialIPCPath: ipcPath,
-		Token:          token,
-		OnInject:       e.cfg.OnInject,
-		RefreshToken:   refreshFn,
-		Reconnect:      reconnectFn,
-		StdinEOFPolicy: e.cfg.StdinEOFPolicy,
-		EnginePrefix:   e.cfg.Name,
-		Logger:         e.logger,
+		Stdin:                      os.Stdin,
+		Stdout:                     os.Stdout,
+		InitialIPCPath:             ipcPath,
+		Token:                      token,
+		OnInject:                   e.cfg.OnInject,
+		RefreshToken:               refreshFn,
+		Reconnect:                  reconnectFn,
+		StdinEOFPolicy:             e.cfg.StdinEOFPolicy,
+		IdleSuspendDelay:           e.cfg.IdleSuspendDelay,
+		IdleDormantGrace:           e.cfg.IdleDormantGrace,
+		AllowPersistentIdleSuspend: e.cfg.AllowPersistentIdleSuspend,
+		EnginePrefix:               e.cfg.Name,
+		Logger:                     e.logger,
 	})
 }
 

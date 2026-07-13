@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ const (
 	envDisableLauncher  = "MCPMUX_DISABLE_LAUNCHER"
 	envLauncherExe      = "MCPMUX_LAUNCHER_EXE"
 	envActiveEngineFile = "MCPMUX_ACTIVE_ENGINE_FILE"
+	envLauncherProtocol = "MCPMUX_LAUNCHER_PROTOCOL"
 	envLauncherTrace    = "MCPMUX_LAUNCHER_TRACE"
 )
 
@@ -69,6 +71,7 @@ func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int
 			Stdin:             os.Stdin,
 			Stdout:            os.Stdout,
 			Stderr:            os.Stderr,
+			DormantLease:      launcherDormantLease(os.Getenv),
 		})
 	}
 
@@ -147,6 +150,10 @@ func launcherEnv(launcherPath string) []string {
 	env = setEnv(env, envEngineMode, "1")
 	env = setEnv(env, envLauncherExe, launcherPath)
 	env = setEnv(env, envActiveEngineFile, activeEngineFile(launcherPath))
+	// This is only an advertisement. The engine additionally proves that its
+	// direct parent is this launcher and that it is the active engine before it
+	// sends launcher-private lifecycle frames.
+	env = setEnv(env, envLauncherProtocol, "1:"+strconv.Itoa(os.Getpid()))
 	return env
 }
 

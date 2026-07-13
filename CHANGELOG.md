@@ -24,6 +24,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+- Persistent owner retention and downstream transport retention are separate:
+  persistent consumers retain transports by default, while products with an
+  explicit no-background-events or buffering contract can opt into
+  `AllowPersistentIdleSuspend`.
+- Private dormant frames now require a PID-bound direct-launcher capability plus
+  active-engine proof. Old launchers stay fail-closed; verified active children
+  may bootstrap the stable launcher for future invocations.
+- `MCPMUX_LAUNCHER_DORMANT_LEASE` offers explicit bounded full-transport exit
+  for hosts proven to relaunch after closure; it is disabled by default.
+
 - Retryable daemon/transport failures now use capped per-token exponential
   backoff with jitter. Busy, pending-request, and active-progress denials remain
   recheckable without a synchronized fixed cadence.

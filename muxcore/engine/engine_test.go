@@ -508,11 +508,14 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	defer srv.Close()
 
 	e, err := New(Config{
-		Name:      name,
-		Namespace: name,
-		Command:   "test-command",
-		Args:      []string{"--flag"},
-		BaseDir:   baseDir,
+		Name:                       name,
+		Namespace:                  name,
+		Command:                    "test-command",
+		Args:                       []string{"--flag"},
+		BaseDir:                    baseDir,
+		IdleSuspendDelay:           7 * time.Second,
+		IdleDormantGrace:           11 * time.Second,
+		AllowPersistentIdleSuspend: true,
 	})
 	if err != nil {
 		t.Fatalf("New() unexpected error: %v", err)
@@ -534,6 +537,9 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		}
 		if cfg.Token != "token-initial" {
 			t.Fatalf("Token = %q, want token-initial", cfg.Token)
+		}
+		if cfg.IdleSuspendDelay != 7*time.Second || cfg.IdleDormantGrace != 11*time.Second || !cfg.AllowPersistentIdleSuspend {
+			t.Fatalf("lifecycle config not forwarded: %+v", cfg)
 		}
 
 		path, token, err := cfg.RefreshToken()

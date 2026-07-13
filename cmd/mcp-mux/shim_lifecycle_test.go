@@ -47,6 +47,18 @@ func TestShimLifecycleDurationsInvalidFallsBackSafely(t *testing.T) {
 	}
 }
 
+func TestLauncherDormantLeaseIsExplicitOptIn(t *testing.T) {
+	if got := launcherDormantLease(func(string) string { return "" }); got != 0 {
+		t.Fatalf("default dormant lease = %s, want disabled", got)
+	}
+	if got := launcherDormantLease(func(string) string { return "-1s" }); got != 0 {
+		t.Fatalf("negative dormant lease = %s, want disabled", got)
+	}
+	if got := launcherDormantLease(func(string) string { return "45s" }); got != 45*time.Second {
+		t.Fatalf("dormant lease = %s, want 45s", got)
+	}
+}
+
 func TestResilientClientExitCodeMapsDormantSentinel(t *testing.T) {
 	if got := resilientClientExitCode(owner.ErrIdleDormant); got != launcherDormantExitCode {
 		t.Fatalf("dormant exit code = %d, want %d", got, launcherDormantExitCode)

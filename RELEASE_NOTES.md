@@ -6,6 +6,19 @@
 
 ## Summary
 
+Persistent daemon/owner state and downstream transport lifetime are now
+separate. Persistent products such as Aimux and Engram retain their transport
+by default because MCP permits background notifications. They may opt into
+`AllowPersistentIdleSuspend` only after proving no-background-events or a
+buffer/replay policy. Ordinary `engine.New` users remain source-compatible.
+
+Mixed old-launcher/new-engine sessions are fail-closed: private dormant frames
+require the direct launcher's PID-bound advertisement plus an active-engine
+pointer proof. A verified engine can update the stable launcher for future
+invocations through the existing two-rename swap. A silent host has no MCP
+completion signal, so full dormant exit is the explicit
+`MCPMUX_LAUNCHER_DORMANT_LEASE` opt-in, not a default promise.
+
 v0.27.1 fixes a control-plane retry herd introduced by the v0.27.0 idle-shim
 lifecycle. During rolling coexistence, a new shim could ask a v0.26.13 daemon
 whether it was safe to suspend. The old daemon correctly replied

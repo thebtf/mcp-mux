@@ -267,7 +267,18 @@ func main() {
 					}
 				}
 				idleDelay, dormantGrace := shimLifecycleDurations(os.Getenv)
-				if os.Getenv(envLauncherExe) == "" {
+				if !launcherLifecycleCapable() {
+					// A v0.26 launcher cannot understand the private dormant control
+					// frames. Bootstrap only when the active child can prove its direct
+					// launcher identity; this session stays fail-closed and the next
+					// invocation receives the upgraded capability.
+					if launcherBootstrapEligible() {
+						if updated, bootstrapErr := bootstrapStableLauncher(); bootstrapErr != nil {
+							logger.Printf("launcher.bootstrap status=skipped error=%q", bootstrapErr.Error())
+						} else if updated {
+							logger.Printf("launcher.bootstrap status=updated future_invocations=true")
+						}
+					}
 					dormantGrace = -1
 				}
 				var suspendGate func() (bool, string, error)
