@@ -888,8 +888,9 @@ func (d *Daemon) warnDeprecatedMode(cmd string, args []string, legacyMode string
 // divergence. spawnOnce now returns errSpawnRetry on those paths; Spawn loops
 // up to maxSpawnRetries times and surfaces an error on exhaustion.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
+	var isolatedRetry int64
 	for attempt := 0; attempt < maxSpawnRetries; attempt++ {
-		ipcPath, sid, token, err := d.spawnOnce(&req)
+		ipcPath, sid, token, err := d.spawnOnce(&req, &isolatedRetry)
 		if !errors.Is(err, errSpawnRetry) {
 			return ipcPath, sid, token, err
 		}
@@ -897,10 +898,19 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	return "", "", "", fmt.Errorf("spawn %s: exhausted retry budget after %d attempts", req.Command, maxSpawnRetries)
 }
 
+func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) int64 {
+	base := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
+	ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(base, &atomic.Int64{})
+	n := ctr.(*atomic.Int64).Add(1)
+	d.logger.Printf("forced-isolated retry: bumping counter for base=%s to r%d", shortServerID(base), n)
+	req.Mode = "isolated"
+	return n
+}
+
 // spawnOnce performs one attempt at creating or reusing an owner. It takes req
 // by pointer because some retry paths mutate req.Mode (isolated promotion) and
 // the mutation must persist across iterations of the Spawn retry loop.
-func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, error) {
+func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (string, string, string, error) {
 	req := *reqPtr
 	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
 	// Mode now gets the global identity (one upstream per (cmd, args)) per the
@@ -963,10 +973,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// race-bump again. Reaper cleans orphaned -rN owners per CR-003 idle-
 	// isolated timeout.
 	if mode == serverid.ModeIsolated {
-		if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
-			if n := ctrI.(*atomic.Int64).Load(); n > 0 {
-				sid = fmt.Sprintf("%s-r%d", sid, n)
+		n := *isolatedRetry
+		if n == 0 {
+			if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
+				n = ctrI.(*atomic.Int64).Load()
 			}
+		}
+		if n > 0 {
+			sid = fmt.Sprintf("%s-r%d", sid, n)
 		}
 	}
 
@@ -1032,14 +1046,23 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 					reqPtr.Mode = "isolated"
 					return "", "", "", errSpawnRetry
 				}
-				e.Owner.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, req.Env)
+				if !e.Owner.PreRegister(token, req.Cwd, req.Env) {
+					if e.Owner.IsClassifiedIsolated() {
+						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, e)
+					}
+					return "", "", "", errSpawnRetry
+				}
 				d.logger.Printf("reusing owner %s for %s (waited for concurrent create)", shortServerID(sid), req.Command)
 				return e.Owner.IPCPath(), sid, token, nil
 			}
+			retryEntry := d.owners[sid]
 			// Creation failed or entry was removed — signal retry so Spawn's
 			// retry loop can start fresh. Previously recursed directly into
 			// d.Spawn(req); see errSpawnRetry / Spawn comment for rationale.
 			d.mu.Unlock()
+			if retryEntry != nil && retryEntry.Owner != nil && retryEntry.Owner.IsClassifiedIsolated() {
+				*isolatedRetry = d.promoteIsolatedRetry(reqPtr, retryEntry)
+			}
 			return "", "", "", errSpawnRetry
 		}
 		// FR-4 — spawn-time listener health gate.
@@ -1101,7 +1124,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 					reqPtr.Mode = "isolated"
 					return "", "", "", errSpawnRetry
 				}
-				probeOwner.SessionMgr().PreRegisterForOwner(token, probeSID, req.Cwd, req.Env)
+				if !probeOwner.PreRegister(token, req.Cwd, req.Env) {
+					if probeOwner.IsClassifiedIsolated() {
+						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, current)
+					}
+					return "", "", "", errSpawnRetry
+				}
 				// Note: no log here — this path is the hot path (every CC
 				// session reconnect). Logging each reuse produced 500+
 				// lines/minute during multi-session incidents.
@@ -1143,30 +1171,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 		if entry.Owner.SessionCount() > 0 {
 			d.logger.Printf("owner %s not accepting but has %d active sessions, leaving alive",
 				shortServerID(sid), entry.Owner.SessionCount())
-			// CR-002 codex PR #121 fix: under CR-001 deterministic isolated
-			// identity, switching Mode to "isolated" alone is insufficient when
-			// the ORIGINAL mode was already isolated — the retry would recompute
-			// the same sid and re-hit this same closed-listener entry, looping
-			// until maxSpawnRetries exhausts. Bump a per-base-sid retry counter
-			// so spawnOnce's sid computation appends `-r<N>` and produces a
-			// distinct sid for this retry.
-			//
-			// The base sid for the counter is the SAME sid we matched on (the
-			// entry's closed-listener sid), so the counter is keyed correctly
-			// regardless of whether we entered via mode=global or mode=isolated.
-			// For non-isolated original modes, the retry's Mode switch to
-			// isolated produces a different base hash anyway, but bumping the
-			// counter is harmless (the retry will read counter under the new
-			// base, which is initially 0).
-			baseForCounter := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
-			ctrI, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseForCounter, &atomic.Int64{})
-			newCounter := ctrI.(*atomic.Int64).Add(1)
-			d.logger.Printf("forced-isolated retry: bumping counter for base=%s to r%d",
-				shortServerID(baseForCounter), newCounter)
 			// DON'T delete or shutdown the old entry. Fall through — the retry
 			// will compute a unique sid via the counter suffix.
 			d.mu.Unlock()
-			reqPtr.Mode = "isolated"
+			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, entry)
 			return "", "", "", errSpawnRetry
 		}
 		d.mu.Unlock()
@@ -1192,7 +1200,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 				// Dedup hot path is silent — logging every reuse produced 500+ lines/minute.
 				existing.Owner.AddCwd(req.Cwd)
 			}
-			existing.Owner.SessionMgr().PreRegisterForOwner(token, existingSID, req.Cwd, req.Env)
+			if !existing.Owner.PreRegister(token, req.Cwd, req.Env) {
+				if existing.Owner.IsClassifiedIsolated() {
+					*isolatedRetry = d.promoteIsolatedRetry(reqPtr, existing)
+				}
+				return "", "", "", errSpawnRetry
+			}
 			return existing.Owner.IPCPath(), existingSID, token, nil
 		}
 	}
@@ -1353,7 +1366,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request) (string, string, string, err
 	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
-	o.SessionMgr().PreRegisterForOwner(token, sid, req.Cwd, sessionEnv)
+	if !o.PreRegister(token, req.Cwd, sessionEnv) {
+		if o.IsClassifiedIsolated() {
+			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
+		}
+		return "", "", "", errSpawnRetry
+	}
 	return ipcPath, sid, token, nil
 }
 

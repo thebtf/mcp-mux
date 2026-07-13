@@ -670,9 +670,24 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 }
 
 // SessionMgr returns the owner's SessionManager.
-// Used by the daemon to call PreRegister before the shim connects.
+// Used for owner session state and observability.
 func (o *Owner) SessionMgr() *SessionManager {
 	return o.sessionMgr
+}
+
+// PreRegister atomically reserves a shim token while this owner is accepting.
+// The owner lock always precedes the session-manager lock; accept-loop session
+// lookups release the session-manager lock before entering owner state.
+func (o *Owner) PreRegister(token, cwd string, env map[string]string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	select {
+	case <-o.listenerDone:
+		return false
+	default:
+		o.sessionMgr.PreRegisterForOwner(token, o.serverID, cwd, env)
+		return true
+	}
 }
 
 // readToken reads the handshake token sent by the shim immediately after connecting.
@@ -2332,8 +2347,11 @@ func (o *Owner) resetCwdSetToPrimary() (string, int) {
 // Nil-safe: owners constructed for tests may not have a listener.
 func (o *Owner) closeListener() {
 	o.closeListenerOnce.Do(func() {
+		o.mu.Lock()
 		o.isAccepting.Store(false)
 		close(o.listenerDone)
+		o.sessionMgr.RemovePendingForOwner(o.serverID)
+		o.mu.Unlock()
 		if o.listener != nil {
 			o.listener.Close()
 		}
