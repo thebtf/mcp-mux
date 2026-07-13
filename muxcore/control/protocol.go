@@ -110,6 +110,13 @@ type SuspendCheckHandler interface {
 	HandleCanSuspend(prevToken string) (SuspendCheckResponse, error)
 }
 
+// SuspendCheckForOwnerHandler optionally binds a suspend check to the exact
+// owner returned by spawn. It prevents a daemon-wide token-history scan while
+// retaining the legacy SuspendCheckHandler path for older consumers.
+type SuspendCheckForOwnerHandler interface {
+	HandleCanSuspendForOwner(prevToken, serverID string) (SuspendCheckResponse, error)
+}
+
 // OwnerStopHandler is an optional daemon-side extension for stopping a specific
 // owner through the daemon registry instead of the owner's own control socket.
 type OwnerStopHandler interface {

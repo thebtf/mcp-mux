@@ -199,7 +199,7 @@ func main() {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
-			daemonIPC, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 			if err != nil {
 				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q daemon_required=true",
 					time.Since(spawnStart), err.Error())
@@ -215,6 +215,7 @@ func main() {
 				// than replaying a consumed token into "unknown token".
 				currentIPC := daemonIPC
 				currentToken := daemonToken
+				currentServerID := daemonServerID
 				refreshFn := func() (string, string, error) {
 					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
 					time.Sleep(jitter)
@@ -248,7 +249,7 @@ func main() {
 							}
 							return "", "", err
 						}
-						newIPC, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
+						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
@@ -260,6 +261,7 @@ func main() {
 							return "", "", err
 						}
 						currentIPC = newIPC
+						currentServerID = newServerID
 						currentToken = newToken
 						return newIPC, newToken, nil
 					}
@@ -271,7 +273,7 @@ func main() {
 				var suspendGate func() (bool, string, error)
 				if idleDelay > 0 {
 					suspendGate = func() (bool, string, error) {
-						return canSuspendViaDaemon(currentToken)
+						return canSuspendViaDaemon(currentToken, currentServerID)
 					}
 				}
 

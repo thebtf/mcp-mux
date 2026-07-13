@@ -146,6 +146,143 @@ func TestResilientClient_IdleSuspendGateDenialKeepsIPCConnected(t *testing.T) {
 	}
 }
 
+func TestResilientClient_IdleSuspendGateUnavailableStopsRetries(t *testing.T) {
+	path := newTestIPCPath(t)
+	srv, _ := startEchoIPCServer(t, path)
+
+	ccStdinR, ccStdinW := io.Pipe()
+	ccStdoutR, ccStdoutW := io.Pipe()
+	var gateCalls atomic.Int32
+	cfg := ResilientClientConfig{
+		ProbeGracePeriod: time.Nanosecond,
+		Stdin:            ccStdinR,
+		Stdout:           ccStdoutW,
+		InitialIPCPath:   path,
+		IdleSuspendDelay: 10 * time.Millisecond,
+		IdleSuspendGate: func() (bool, string, error) {
+			gateCalls.Add(1)
+			return false, "unsupported", ErrIdleSuspendGateUnavailable
+		},
+		Logger: resilientTestLogger(t),
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- RunResilientClient(cfg) }()
+	outLines := make(chan []byte, 10)
+	go func() {
+		scanner := bufio.NewScanner(ccStdoutR)
+		for scanner.Scan() {
+			outLines <- append([]byte(nil), scanner.Bytes()...)
+		}
+		close(outLines)
+	}()
+	if _, err := io.WriteString(ccStdinW, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	waitForResponseID(t, outLines, 1)
+
+	deadline := time.Now().Add(time.Second)
+	for gateCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := gateCalls.Load(); got != 1 {
+		t.Fatalf("unavailable gate calls = %d, want 1", got)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := gateCalls.Load(); got != 1 {
+		t.Fatalf("unavailable gate retried %d times, want 1", got)
+	}
+	select {
+	case <-srv.closed:
+		t.Fatal("IPC session closed after unavailable gate")
+	default:
+	}
+
+	_ = ccStdinW.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunResilientClient: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("resilient client did not exit after stdin EOF")
+	}
+}
+
+func TestResilientClient_IdleSuspendGateDenialRechecks(t *testing.T) {
+	originalRetry := idleSuspendGateRetry
+	idleSuspendGateRetry = 5 * time.Millisecond
+	t.Cleanup(func() { idleSuspendGateRetry = originalRetry })
+
+	path := newTestIPCPath(t)
+	srv, _ := startEchoIPCServer(t, path)
+	ccStdinR, ccStdinW := io.Pipe()
+	ccStdoutR, ccStdoutW := io.Pipe()
+	var gateCalls atomic.Int32
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunResilientClient(ResilientClientConfig{
+			ProbeGracePeriod: time.Nanosecond,
+			Stdin:            ccStdinR,
+			Stdout:           ccStdoutW,
+			InitialIPCPath:   path,
+			IdleSuspendDelay: 10 * time.Millisecond,
+			IdleSuspendGate: func() (bool, string, error) {
+				gateCalls.Add(1)
+				return false, "busy", nil
+			},
+			Logger: resilientTestLogger(t),
+		})
+	}()
+	outLines := make(chan []byte, 10)
+	go func() {
+		scanner := bufio.NewScanner(ccStdoutR)
+		for scanner.Scan() {
+			outLines <- append([]byte(nil), scanner.Bytes()...)
+		}
+		close(outLines)
+	}()
+	if _, err := io.WriteString(ccStdinW, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"); err != nil {
+		t.Fatalf("write initialize: %v", err)
+	}
+	waitForResponseID(t, outLines, 1)
+
+	deadline := time.Now().Add(time.Second)
+	for gateCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := gateCalls.Load(); got < 2 {
+		t.Fatalf("denied gate calls = %d, want recheck", got)
+	}
+	select {
+	case <-srv.closed:
+		t.Fatal("IPC session closed despite busy gate denial")
+	default:
+	}
+
+	_ = ccStdinW.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunResilientClient: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("resilient client did not exit after stdin EOF")
+	}
+}
+
+func TestIdleSuspendGateRetryDelayBacksOffAndJitters(t *testing.T) {
+	first := idleSuspendGateRetryDelay(0, "token-a")
+	second := idleSuspendGateRetryDelay(1, "token-a")
+	third := idleSuspendGateRetryDelay(2, "token-a")
+	if first < idleSuspendGateRetry || second <= first || third <= second {
+		t.Fatalf("retry delays = %s, %s, %s; want increasing exponential backoff", first, second, third)
+	}
+	if first == idleSuspendGateRetryDelay(0, "token-b") {
+		t.Fatal("distinct session tokens received the same retry schedule")
+	}
+}
+
 func TestResilientClient_ActivityDuringIdleGateDefersSuspend(t *testing.T) {
 	path := newTestIPCPath(t)
 	srv, _ := startEchoIPCServer(t, path)

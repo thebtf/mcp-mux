@@ -1917,13 +1917,23 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 // HandleCanSuspend verifies owner-wide safety before a shim intentionally
 // releases its data-plane session.
 func (d *Daemon) HandleCanSuspend(prevToken string) (control.SuspendCheckResponse, error) {
+	return d.handleCanSuspend(prevToken, "")
+}
+
+// HandleCanSuspendForOwner uses the owner identity returned by spawn to avoid
+// searching unrelated owners' reconnect histories.
+func (d *Daemon) HandleCanSuspendForOwner(prevToken, serverID string) (control.SuspendCheckResponse, error) {
+	return d.handleCanSuspend(prevToken, serverID)
+}
+
+func (d *Daemon) handleCanSuspend(prevToken, serverID string) (control.SuspendCheckResponse, error) {
 	if d.shuttingDown.Load() {
 		return control.SuspendCheckResponse{}, ErrDaemonShuttingDown
 	}
 	if prevToken == "" {
 		return control.SuspendCheckResponse{}, ErrUnknownToken
 	}
-	entry, ownerKey := d.lookupReconnectOwner(prevToken)
+	entry, ownerKey := d.lookupReconnectOwnerFor(prevToken, serverID)
 	if entry == nil || entry.Owner == nil {
 		return control.SuspendCheckResponse{}, ErrUnknownToken
 	}
@@ -2150,6 +2160,24 @@ func (d *Daemon) ownerIsAccepting(serverID string) bool {
 }
 
 func (d *Daemon) lookupReconnectOwner(prevToken string) (*OwnerEntry, string) {
+	return d.lookupReconnectOwnerFor(prevToken, "")
+}
+
+func (d *Daemon) lookupReconnectOwnerFor(prevToken, serverID string) (*OwnerEntry, string) {
+	if serverID != "" {
+		d.mu.RLock()
+		entry := d.owners[serverID]
+		d.mu.RUnlock()
+		if entry == nil || entry.Owner == nil {
+			return nil, ""
+		}
+		ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(prevToken)
+		if !ok || ownerKey != serverID {
+			return nil, ""
+		}
+		return entry, ownerKey
+	}
+
 	d.mu.RLock()
 	entries := make([]*OwnerEntry, 0, len(d.owners))
 	for _, entry := range d.owners {

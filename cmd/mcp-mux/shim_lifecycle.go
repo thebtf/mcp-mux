@@ -47,16 +47,20 @@ func resilientClientExitCode(err error) int {
 	}
 }
 
-func canSuspendViaDaemon(token string) (bool, string, error) {
+func canSuspendViaDaemon(token, serverID string) (bool, string, error) {
 	resp, err := control.SendWithTimeout(
 		serverid.DaemonControlPath("", engineName),
-		control.Request{Cmd: "can_suspend", PrevToken: token},
+		control.Request{Cmd: "can_suspend", PrevToken: token, ServerID: serverID},
 		2*time.Second,
 	)
 	if err != nil {
 		return false, "", err
 	}
 	if !resp.OK {
+		switch resp.Message {
+		case "can_suspend not supported", "unknown token", "owner gone":
+			return false, "", owner.ErrIdleSuspendGateUnavailable
+		}
 		return false, resp.Message, fmt.Errorf("can_suspend: %s", resp.Message)
 	}
 	var verdict control.SuspendCheckResponse

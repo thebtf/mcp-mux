@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"path/filepath"
@@ -25,13 +26,23 @@ const (
 	msgFromCCBufferSize       = 1000
 	msgFromIPCBufferSize      = 1000
 	defaultMaxRefreshAttempts = 3
-	idleSuspendGateRetry      = 5 * time.Second
+	idleSuspendGateRetryMax   = time.Minute
 
 	resilientDormantReadyMethod  = "$/mcp-mux/launcher/dormant-ready"
 	resilientDormantCommitMethod = "$/mcp-mux/launcher/commit-dormant"
 	resilientDormantAckMethod    = "$/mcp-mux/launcher/dormant-ack"
 	resilientDormantNackMethod   = "$/mcp-mux/launcher/dormant-nack"
 )
+
+// idleSuspendGateRetry is a variable so focused tests can exercise retries
+// without waiting for the production safety interval. Production never writes it.
+var idleSuspendGateRetry = 5 * time.Second
+
+// ErrIdleSuspendGateUnavailable tells the resilient shim that its safety gate
+// cannot become usable during this connection (for example, an older daemon
+// does not implement the control verb). The shim keeps the IPC connection open
+// and never parks it without a successful safety verdict.
+var ErrIdleSuspendGateUnavailable = errors.New("idle suspend gate unavailable")
 
 // StdinEOFPolicy controls shim behavior when stdin returns EOF.
 type StdinEOFPolicy int
@@ -329,6 +340,8 @@ func (rc *resilientClient) runProxy(conn interface {
 			idleC = idleTicker.C
 		}
 		var nextGateAttempt time.Time
+		var gateFailures int
+		var gateUnavailable bool
 
 	connected:
 		for {
@@ -421,21 +434,36 @@ func (rc *resilientClient) runProxy(conn interface {
 				if !rc.shouldIdleSuspend() {
 					continue connected
 				}
+				if gateUnavailable {
+					continue connected
+				}
 				if !nextGateAttempt.IsZero() && time.Now().Before(nextGateAttempt) {
 					continue connected
 				}
 				if rc.cfg.IdleSuspendGate != nil {
 					allowed, reason, err := rc.cfg.IdleSuspendGate()
 					if err != nil {
-						nextGateAttempt = time.Now().Add(idleSuspendGateRetry)
+						if errors.Is(err, ErrIdleSuspendGateUnavailable) {
+							gateUnavailable = true
+							if idleTicker != nil {
+								idleTicker.Stop()
+								idleC = nil
+							}
+							rc.log.Printf("shim.suspend.disabled reason=gate_unavailable error=%v", err)
+							continue connected
+						}
+						gateFailures++
+						nextGateAttempt = time.Now().Add(idleSuspendGateRetryDelay(gateFailures, rc.cfg.Token))
 						rc.log.Printf("shim.suspend.denied reason=gate_error error=%v", err)
 						continue connected
 					}
 					if !allowed {
-						nextGateAttempt = time.Now().Add(idleSuspendGateRetry)
+						gateFailures = 0
+						nextGateAttempt = time.Now().Add(idleSuspendGateRetryDelay(gateFailures, rc.cfg.Token))
 						rc.log.Printf("shim.suspend.denied reason=%q", reason)
 						continue connected
 					}
+					gateFailures = 0
 				}
 				if !rc.beginIdleSuspend() {
 					continue connected
@@ -493,6 +521,21 @@ func (rc *resilientClient) runProxy(conn interface {
 			}
 		}
 	}
+}
+
+func idleSuspendGateRetryDelay(failures int, token string) time.Duration {
+	delay := idleSuspendGateRetry
+	for i := 0; i < failures && delay < idleSuspendGateRetryMax; i++ {
+		if delay > idleSuspendGateRetryMax/2 {
+			delay = idleSuspendGateRetryMax
+			break
+		}
+		delay *= 2
+	}
+
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(token))
+	return delay + time.Duration(hash.Sum64()%uint64(delay/4+1))
 }
 
 func (rc *resilientClient) shouldIdleSuspend() bool {
