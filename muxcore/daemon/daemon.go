@@ -111,6 +111,8 @@ type Daemon struct {
 	done           chan struct{}
 	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	sessionHandler muxcore.SessionHandler
+	// lookupReconnectHistory is a narrow test seam; nil uses SessionMgr directly.
+	lookupReconnectHistory func(*owner.Owner, string) (string, string, map[string]string, bool)
 
 	// isolatedIdleTimeout is the shorter idle timeout applied to owners whose
 	// classification verdict is isolated. The forced-isolated retry path
@@ -2171,7 +2173,7 @@ func (d *Daemon) lookupReconnectOwnerFor(prevToken, serverID string) (*OwnerEntr
 		if entry == nil || entry.Owner == nil {
 			return nil, ""
 		}
-		ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(prevToken)
+		ownerKey, _, _, ok := d.lookupHistory(entry.Owner, prevToken)
 		if !ok || ownerKey != serverID {
 			return nil, ""
 		}
@@ -2189,12 +2191,19 @@ func (d *Daemon) lookupReconnectOwnerFor(prevToken, serverID string) (*OwnerEntr
 		if entry == nil || entry.Owner == nil {
 			continue
 		}
-		ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(prevToken)
+		ownerKey, _, _, ok := d.lookupHistory(entry.Owner, prevToken)
 		if ok {
 			return entry, ownerKey
 		}
 	}
 	return nil, ""
+}
+
+func (d *Daemon) lookupHistory(o *owner.Owner, token string) (string, string, map[string]string, bool) {
+	if d.lookupReconnectHistory != nil {
+		return d.lookupReconnectHistory(o, token)
+	}
+	return o.SessionMgr().LookupHistory(token)
 }
 
 func shortServerID(serverID string) string {

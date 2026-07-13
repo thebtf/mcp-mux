@@ -281,6 +281,14 @@ func TestIdleSuspendGateRetryDelayBacksOffAndJitters(t *testing.T) {
 	if first == idleSuspendGateRetryDelay(0, "token-b") {
 		t.Fatal("distinct session tokens received the same retry schedule")
 	}
+	for failures := 0; failures < 16; failures++ {
+		if got := idleSuspendGateRetryDelay(failures, "token-a"); got > idleSuspendGateRetryMax {
+			t.Fatalf("retry delay at failure %d = %s, exceeds cap %s", failures, got, idleSuspendGateRetryMax)
+		}
+	}
+	if a, b := idleSuspendGateRetryDelay(16, "token-a"), idleSuspendGateRetryDelay(16, "token-b"); a == b {
+		t.Fatalf("capped retry delays synchronized: %s", a)
+	}
 }
 
 func TestResilientClient_ActivityDuringIdleGateDefersSuspend(t *testing.T) {

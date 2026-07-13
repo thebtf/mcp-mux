@@ -57,15 +57,23 @@ func canSuspendViaDaemon(token, serverID string) (bool, string, error) {
 		return false, "", err
 	}
 	if !resp.OK {
-		switch resp.Message {
-		case "can_suspend not supported", "unknown token", "owner gone":
-			return false, "", owner.ErrIdleSuspendGateUnavailable
+		// A shutting-down daemon is expected to come back. Every other negative
+		// protocol verdict is unsafe to retry for this connected shim, including
+		// v0.26.13's "unknown command: can_suspend" response.
+		if resp.Message == "daemon shutting down" {
+			return false, resp.Message, fmt.Errorf("can_suspend: %s", resp.Message)
 		}
-		return false, resp.Message, fmt.Errorf("can_suspend: %s", resp.Message)
+		return false, resp.Message, owner.ErrIdleSuspendGateUnavailable
 	}
-	var verdict control.SuspendCheckResponse
+	var verdict struct {
+		Allowed *bool  `json:"allowed"`
+		Reason  string `json:"reason"`
+	}
 	if err := json.Unmarshal(resp.Data, &verdict); err != nil {
-		return false, "", fmt.Errorf("can_suspend response: %w", err)
+		return false, "", owner.ErrIdleSuspendGateUnavailable
 	}
-	return verdict.Allowed, verdict.Reason, nil
+	if verdict.Allowed == nil || (!*verdict.Allowed && verdict.Reason == "") || verdict.Reason == "persistent" {
+		return false, verdict.Reason, owner.ErrIdleSuspendGateUnavailable
+	}
+	return *verdict.Allowed, verdict.Reason, nil
 }

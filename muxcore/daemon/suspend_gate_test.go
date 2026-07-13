@@ -2,9 +2,10 @@ package daemon
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 func TestHandleCanSuspendSafetyGates(t *testing.T) {
@@ -52,20 +53,47 @@ func TestHandleCanSuspendForOwnerUsesExactOwnerWithoutFanout(t *testing.T) {
 	const targetSID = "owner-suspend-target"
 	target := testReconnectOwner(t, targetSID)
 	seedReconnectHistory(t, target, "suspend-target-token", "/project/suspend", nil)
+	unrelatedSID := "owner-suspend-unrelated"
+	unrelated := testReconnectOwner(t, unrelatedSID)
+	seedReconnectHistory(t, unrelated, "unrelated-token", "/project/unrelated", nil)
 
 	d.mu.Lock()
 	d.owners[targetSID] = &OwnerEntry{Owner: target, ServerID: targetSID}
-	for i := 0; i < 256; i++ {
-		sid := fmt.Sprintf("unrelated-suspend-owner-%03d", i)
-		d.owners[sid] = &OwnerEntry{ServerID: sid}
-	}
+	d.owners[unrelatedSID] = &OwnerEntry{Owner: unrelated, ServerID: unrelatedSID}
 	d.mu.Unlock()
+	var lookups []string
+	d.lookupReconnectHistory = func(o *owner.Owner, token string) (string, string, map[string]string, bool) {
+		lookups = append(lookups, o.ServerID())
+		return o.SessionMgr().LookupHistory(token)
+	}
 
 	got, err := d.HandleCanSuspendForOwner("suspend-target-token", targetSID)
 	if err != nil || !got.Allowed {
 		t.Fatalf("HandleCanSuspendForOwner target = (%+v, %v), want allowed", got, err)
 	}
-	if _, err := d.HandleCanSuspendForOwner("suspend-target-token", "unrelated-suspend-owner-000"); !errors.Is(err, ErrUnknownToken) {
+	if len(lookups) != 1 || lookups[0] != targetSID {
+		t.Fatalf("exact-owner lookups = %v, want only %q", lookups, targetSID)
+	}
+
+	lookups = nil
+	if _, err := d.HandleCanSuspendForOwner("suspend-target-token", unrelatedSID); !errors.Is(err, ErrUnknownToken) {
 		t.Fatalf("HandleCanSuspendForOwner forged owner error = %v, want ErrUnknownToken", err)
+	}
+	if len(lookups) != 1 || lookups[0] != unrelatedSID {
+		t.Fatalf("forged-owner lookups = %v, want only %q", lookups, unrelatedSID)
+	}
+
+	// A recreated owner with the same ServerID must not inherit the removed
+	// owner's token history and authorize its stale shim.
+	recreated := testReconnectOwner(t, targetSID)
+	d.mu.Lock()
+	d.owners[targetSID] = &OwnerEntry{Owner: recreated, ServerID: targetSID}
+	d.mu.Unlock()
+	lookups = nil
+	if _, err := d.HandleCanSuspendForOwner("suspend-target-token", targetSID); !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("recreated owner accepted stale token: %v", err)
+	}
+	if len(lookups) != 1 || lookups[0] != targetSID {
+		t.Fatalf("recreated-owner lookups = %v, want only %q", lookups, targetSID)
 	}
 }

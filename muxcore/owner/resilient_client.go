@@ -533,9 +533,18 @@ func idleSuspendGateRetryDelay(failures int, token string) time.Duration {
 		delay *= 2
 	}
 
+	if delay >= idleSuspendGateRetryMax {
+		// Keep the cap dispersed: different tokens choose a stable point in the
+		// final quarter rather than synchronizing on the cap itself.
+		delay = idleSuspendGateRetryMax * 3 / 4
+	}
 	hash := fnv.New64a()
 	_, _ = hash.Write([]byte(token))
-	return delay + time.Duration(hash.Sum64()%uint64(delay/4+1))
+	jitter := delay / 4
+	if room := idleSuspendGateRetryMax - delay; jitter > room {
+		jitter = room
+	}
+	return delay + time.Duration(hash.Sum64()%uint64(jitter+1))
 }
 
 func (rc *resilientClient) shouldIdleSuspend() bool {

@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
+	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 func TestShimLifecycleDurationsDefaults(t *testing.T) {
@@ -58,6 +64,72 @@ func TestCanSuspendViaDaemonUnsupportedDisablesGate(t *testing.T) {
 	if !errors.Is(err, owner.ErrIdleSuspendGateUnavailable) {
 		t.Fatalf("canSuspendViaDaemon() error = %v, want ErrIdleSuspendGateUnavailable", err)
 	}
+}
+
+func TestCanSuspendViaDaemonPermanentWireResponses(t *testing.T) {
+	for name, response := range map[string]control.Response{
+		// This is the exact default response from muxcore/v0.26.13's control server.
+		"v02613_unknown_command": {OK: false, Message: "unknown command: can_suspend"},
+		"unknown_token":          {OK: false, Message: "unknown token"},
+		"owner_gone":             {OK: false, Message: "owner gone"},
+		"unknown_protocol":       {OK: false, Message: "unexpected gate state"},
+		"malformed_json":         {OK: true, Data: []byte(`[]`)},
+		"missing_allowed":        {OK: true, Data: []byte(`{"reason":"busy"}`)},
+		"persistent":             {OK: true, Data: []byte(`{"allowed":false,"reason":"persistent"}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := startCanSuspendWireServer(t, shortTempDir(t, name), response)
+			_, _, err := canSuspendViaDaemon("previous-token", "owner-1")
+			if !errors.Is(err, owner.ErrIdleSuspendGateUnavailable) {
+				t.Fatalf("canSuspendViaDaemon() error = %v, want unavailable", err)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("can_suspend wire calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestCanSuspendViaDaemonDaemonShutdownRetries(t *testing.T) {
+	startCanSuspendWireServer(t, shortTempDir(t, "suspend-shutdown"), control.Response{OK: false, Message: "daemon shutting down"})
+	_, _, err := canSuspendViaDaemon("previous-token", "owner-1")
+	if errors.Is(err, owner.ErrIdleSuspendGateUnavailable) || err == nil {
+		t.Fatalf("canSuspendViaDaemon() error = %v, want retryable shutdown error", err)
+	}
+}
+
+func startCanSuspendWireServer(t *testing.T, tempDir string, response control.Response) *atomic.Int32 {
+	t.Helper()
+	t.Setenv("TEMP", tempDir)
+	t.Setenv("TMP", tempDir)
+	path := serverid.DaemonControlPath("", engineName)
+	_ = os.Remove(path)
+	listener, err := ipc.Listen(path)
+	if err != nil {
+		t.Fatalf("listen legacy can_suspend wire: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close(); _ = os.Remove(path) })
+	var calls atomic.Int32
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				var req control.Request
+				if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&req); err != nil {
+					return
+				}
+				if req.Cmd == "can_suspend" {
+					calls.Add(1)
+				}
+				_ = json.NewEncoder(conn).Encode(response)
+			}()
+		}
+	}()
+	return &calls
 }
 
 type suspendTestHandler struct {
