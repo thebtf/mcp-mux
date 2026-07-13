@@ -269,6 +269,23 @@ func (sm *Manager) RemovePendingForOwnerExcept(ownerKey, keepToken string) int {
 	return removed
 }
 
+// RemovePendingForOwnerToken revokes one exact unconsumed reservation. Both
+// ownerKey and token must match so a late control-plane rollback cannot remove
+// a reservation belonging to a replacement owner or another concurrent shim.
+func (sm *Manager) RemovePendingForOwnerToken(ownerKey, token string) bool {
+	if ownerKey == "" || token == "" {
+		return false
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	pending, ok := sm.pending[token]
+	if !ok || pending.OwnerKey != ownerKey {
+		return false
+	}
+	delete(sm.pending, token)
+	return true
+}
+
 // IsPreRegistered reports whether the given token has been pre-registered but
 // not yet consumed by a successful Bind. This is a side-effect-free read used
 // by Owner.acceptLoop (FR-28) to gate connections before session construction.

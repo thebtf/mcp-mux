@@ -191,6 +191,28 @@ func TestRemovePendingForOwnerExceptPreservesCreatingToken(t *testing.T) {
 	}
 }
 
+func TestRemovePendingForOwnerTokenRequiresExactReservation(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("target", "owner-a", "/project/a", nil)
+	sm.PreRegisterForOwner("other", "owner-a", "/project/b", nil)
+
+	if sm.RemovePendingForOwnerToken("owner-b", "target") {
+		t.Fatal("wrong owner removed target reservation")
+	}
+	if sm.RemovePendingForOwnerToken("owner-a", "missing") {
+		t.Fatal("missing token reported as removed")
+	}
+	if !sm.RemovePendingForOwnerToken("owner-a", "target") {
+		t.Fatal("exact reservation was not removed")
+	}
+	if sm.IsPreRegistered("target") {
+		t.Fatal("target reservation survived exact removal")
+	}
+	if !sm.IsPreRegistered("other") {
+		t.Fatal("unrelated reservation was removed")
+	}
+}
+
 func TestBindRejectsWrongOwnerWithoutConsumingToken(t *testing.T) {
 	sm := NewManager()
 	sm.PreRegisterForOwner("owned-token", "owner-a", "/project/a", map[string]string{"A": "1"})

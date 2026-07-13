@@ -44,6 +44,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   surviving after their CLI consumer or upstream leader exited.
 - Fixed duplicate isolated process trees caused by concurrent startup,
   proactive classification, dormant wake, token-refresh, and cleanup races.
+- Fixed dormant wake abandoning successful-but-undelivered spawn reservations:
+  the launcher replay budget now exceeds the child spawn budget, and control
+  write failure revokes the exact pending token before normal owner cleanup.
 - Fixed request-loss ambiguity during reconnect: already-sent requests receive
   an explicit JSON-RPC error with their original ID, while only the cached
   `initialize` handshake is replayed.

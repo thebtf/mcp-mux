@@ -89,6 +89,15 @@ type DaemonHandler interface {
 	HandleListOwners(req Request) (ListOwnersResponse, error)
 }
 
+// SpawnResponseFailureHandler is an optional daemon-side lifecycle hook. The
+// control server invokes it only when HandleSpawn succeeded but the response
+// could not be delivered to the requesting shim. Implementations should revoke
+// the exact unconsumed reservation so an abandoned startup cannot pin an owner
+// until the generic pending-token TTL expires.
+type SpawnResponseFailureHandler interface {
+	HandleSpawnResponseFailure(serverID, token string)
+}
+
 // SuspendCheckResponse is the safety verdict for intentionally parking one
 // reconnectable shim session.
 type SuspendCheckResponse struct {

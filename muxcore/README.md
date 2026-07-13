@@ -51,6 +51,14 @@ the fields above and should use their own launcher protocol if they want process
 dormancy. Persistent owners (`engine.Config.Persistent` or
 `x-mux.persistent: true`) remain connected and are not idle-suspended.
 
+The stable launcher also keeps its replacement-handshake budget longer than
+the shim's daemon-spawn budget, so cold wake cannot create retry fanout merely
+because startup crossed five seconds. At the lower control layer,
+`control.SpawnResponseFailureHandler` is an additive optional hook used by the
+built-in daemon to revoke the exact pending reservation when a successful
+spawn response cannot be delivered. Ordinary `engine.New` consumers inherit
+this behavior automatically.
+
 Reconnect remains transport continuity, not request replay. Muxcore returns an
 explicit JSON-RPC error with the original id for every already-sent in-flight
 request and never sends that request to the successor. It replays only the

@@ -51,6 +51,10 @@ const (
 	launcherDormantNackMethod   = "$/mcp-mux/launcher/dormant-nack"
 	launcherDormantExitCode     = 75
 	launcherDormantExitTimeout  = 2 * time.Second
+	// The supervisor must not kill a replacement while the child is still
+	// inside its own legal daemon-spawn budget. Doing so abandons a control
+	// request after the daemon may already have created an owner reservation.
+	defaultLauncherReplayTimeout = defaultDaemonSpawnTimeout + 5*time.Second
 )
 
 type launcherChildState uint8
@@ -106,7 +110,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 		cfg.RespawnDelay = 100 * time.Millisecond
 	}
 	if cfg.ReplayTimeout == 0 {
-		cfg.ReplayTimeout = 5 * time.Second
+		cfg.ReplayTimeout = defaultLauncherReplayTimeout
 	}
 	if cfg.EnginePollInterval == 0 {
 		cfg.EnginePollInterval = 5 * time.Second

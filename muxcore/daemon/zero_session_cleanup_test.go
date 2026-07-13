@@ -62,6 +62,25 @@ func TestZeroSessionCleanupAutoReapsDisposableOwner(t *testing.T) {
 	assertOwnerRemovalStatus(t, d.HandleStatus(), 1, "idle", 1)
 }
 
+func TestSpawnResponseFailureRevokesReservationAndSchedulesCleanup(t *testing.T) {
+	d := testZeroSessionCleanupDaemon(t, 25*time.Millisecond)
+
+	_, sid, token := spawnLifecycleOwner(t, d, "undelivered-spawn")
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("owner entry missing after spawn")
+	}
+	if !entry.Owner.SessionMgr().IsPreRegistered(token) {
+		t.Fatal("spawn token was not pending before rollback")
+	}
+
+	d.HandleSpawnResponseFailure(sid, token)
+	if entry.Owner.SessionMgr().IsPreRegistered(token) {
+		t.Fatal("undelivered spawn token remained pending")
+	}
+	waitForOwnerMissing(t, d, sid)
+}
+
 func TestZeroSessionCleanupPersistentOwnerSurvives(t *testing.T) {
 	d := testZeroSessionCleanupDaemon(t, 25*time.Millisecond)
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -109,7 +110,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		// Bound the write phase on the error path too — a non-reading client
 		// must not block writeResponse indefinitely.
 		_ = conn.SetWriteDeadline(time.Now().Add(clientDeadline))
-		s.writeResponse(conn, Response{OK: false, Message: fmt.Sprintf("invalid request: %v", err)})
+		_ = s.writeResponse(conn, Response{OK: false, Message: fmt.Sprintf("invalid request: %v", err)})
 		return
 	}
 
@@ -123,9 +124,13 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(clientDeadline)); err != nil {
 		s.logger.Printf("control: set write deadline: %v", err)
+		s.rollbackUndeliveredSpawn(req, resp, err)
 		return
 	}
-	s.writeResponse(conn, resp)
+	writeErr := s.writeResponse(conn, resp)
+	if writeErr != nil {
+		s.rollbackUndeliveredSpawn(req, resp, writeErr)
+	}
 	if hasAfterFn {
 		s.logger.Printf("control.handleConn cmd=%s phase=write_done", req.Cmd)
 		conn.Close()
@@ -134,6 +139,18 @@ func (s *Server) handleConn(conn net.Conn) {
 		afterFn()
 		s.logger.Printf("control.handleConn cmd=%s phase=afterFn_returned", req.Cmd)
 	}
+}
+
+func (s *Server) rollbackUndeliveredSpawn(req Request, resp Response, writeErr error) {
+	if req.Cmd != "spawn" || !resp.OK || resp.ServerID == "" || resp.Token == "" {
+		return
+	}
+	handler, ok := s.handler.(SpawnResponseFailureHandler)
+	if !ok {
+		return
+	}
+	s.logger.Printf("control: spawn response undelivered for server %s: %v", resp.ServerID, writeErr)
+	handler.HandleSpawnResponseFailure(resp.ServerID, resp.Token)
 }
 
 func (s *Server) dispatch(req Request) (Response, func()) {
@@ -269,16 +286,23 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 	}
 }
 
-func (s *Server) writeResponse(conn net.Conn, resp Response) {
+func (s *Server) writeResponse(conn net.Conn, resp Response) error {
 	data, err := json.Marshal(resp)
 	if err != nil {
 		s.logger.Printf("control: marshal response: %v", err)
-		return
+		return err
 	}
 	data = append(data, '\n')
-	if _, err := conn.Write(data); err != nil {
-		s.logger.Printf("control: write response: %v", err)
+	n, err := conn.Write(data)
+	if n == len(data) {
+		return nil
 	}
+	if err != nil {
+		s.logger.Printf("control: write response: %v", err)
+		return err
+	}
+	s.logger.Printf("control: short write response: wrote %d of %d bytes", n, len(data))
+	return io.ErrShortWrite
 }
 
 var errUnknownToken = errors.New("unknown token")

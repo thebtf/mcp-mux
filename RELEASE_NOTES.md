@@ -21,6 +21,10 @@ forever.
 - An isolated server remains private. A returning consumer inside the grace
   window reconnects to the same owner generation by token; a fresh consumer
   cannot attach to it.
+- Dormant wake no longer races a five-second launcher replay deadline against
+  the shim's legal 30-second daemon-spawn budget. If a successful spawn reply
+  still cannot be delivered, muxcore revokes that exact unconsumed reservation
+  and schedules the now-unclaimed owner for normal safety-gated cleanup.
 - When an owner is no longer needed, muxcore finalizes the complete subprocess
   tree, including descendants that inherited stdio or outlived their leader.
 - Upstream crash and engine update continuity still preserve the MCP host
@@ -60,6 +64,10 @@ Direct low-level handoff consumers keep the existing three-argument
 `daemon.NewFdTransferMsg` source contract. Protocol-v2 integrations should use
 `daemon.NewFdTransferMsgWithStderr` and populate `HandoffUpstream.StderrFD` so
 stderr ownership moves with stdin, stdout, and the tree authority.
+
+The control server also has an additive optional
+`control.SpawnResponseFailureHandler` hook. The built-in daemon implements it;
+ordinary engine consumers do not need to wire it themselves.
 
 Consumers should remove product-local stale-process sweeps, PID-only kills,
 request replay, shim polling, launcher respawn loops, and handoff retry

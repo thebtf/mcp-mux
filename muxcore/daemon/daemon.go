@@ -1428,6 +1428,43 @@ func (d *Daemon) HandleSpawn(req control.Request) (string, string, string, error
 	return ipcPath, serverID, token, err
 }
 
+// HandleSpawnResponseFailure revokes the exact pending reservation whose
+// successful Spawn response could not be delivered to its shim. When that was
+// the final reservation and no session ever bound, schedule normal safety-gated
+// zero-session cleanup for the same owner entry instead of waiting for the
+// generic pending-token TTL.
+func (d *Daemon) HandleSpawnResponseFailure(serverID, token string) {
+	d.mu.RLock()
+	entry := d.owners[serverID]
+	d.mu.RUnlock()
+	if entry == nil || entry.Owner == nil {
+		return
+	}
+	if !entry.Owner.SessionMgr().RemovePendingForOwnerToken(serverID, token) {
+		return
+	}
+	d.logger.Printf("owner %s: revoked undelivered spawn reservation", shortServerID(serverID))
+	if entry.Owner.SessionCount() != 0 || entry.Owner.SessionMgr().PendingCount() != 0 {
+		return
+	}
+
+	d.mu.Lock()
+	current, ok := d.owners[serverID]
+	if !ok || current != entry || current.Owner == nil || current.Owner.SessionCount() != 0 || current.Owner.SessionMgr().PendingCount() != 0 {
+		d.mu.Unlock()
+		return
+	}
+	zeroAt := time.Now()
+	current.LastSession = zeroAt
+	delay := d.zeroSessionCleanupDelay
+	if override := current.Owner.IdleTimeout(); override > 0 {
+		delay = override
+	}
+	d.mu.Unlock()
+
+	d.scheduleZeroSessionCleanup(serverID, entry, zeroAt, delay)
+}
+
 // HandleRemove implements control.DaemonHandler.
 func (d *Daemon) HandleRemove(serverID string) error {
 	return d.Remove(serverID)

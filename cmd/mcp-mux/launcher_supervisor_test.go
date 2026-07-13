@@ -80,6 +80,12 @@ func TestLauncherSupervisorRespawnsChildWithoutClosingTransport(t *testing.T) {
 	}
 }
 
+func TestLauncherReplayBudgetExceedsDaemonSpawnBudget(t *testing.T) {
+	if defaultLauncherReplayTimeout <= defaultDaemonSpawnTimeout {
+		t.Fatalf("launcher replay timeout = %s, must exceed daemon spawn timeout %s", defaultLauncherReplayTimeout, defaultDaemonSpawnTimeout)
+	}
+}
+
 func TestLauncherSupervisorRetriesInitializeWithoutClosingTransport(t *testing.T) {
 	dir := t.TempDir()
 	generationFile := filepath.Join(dir, "generation.txt")
