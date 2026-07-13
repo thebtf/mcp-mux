@@ -63,15 +63,34 @@ func TestZeroSessionCleanupAutoReapsDisposableOwner(t *testing.T) {
 }
 
 func TestSpawnResponseFailureRevokesReservationAndSchedulesCleanup(t *testing.T) {
-	d := testZeroSessionCleanupDaemon(t, 25*time.Millisecond)
+	cleanupDelay := 100 * time.Millisecond
+	d := testZeroSessionCleanupDaemon(t, cleanupDelay)
 
-	_, sid, token := spawnLifecycleOwner(t, d, "undelivered-spawn")
+	ipcPath, sid, initialToken := spawnLifecycleOwner(t, d, "undelivered-spawn")
 	entry := d.Entry(sid)
 	if entry == nil || entry.Owner == nil {
 		t.Fatal("owner entry missing after spawn")
 	}
+	conn := dialLifecycleSession(t, ipcPath, initialToken)
+	waitOwnerSessionCount(t, entry, 1)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close() error = %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+
+	_, reusedSID, token := spawnLifecycleOwner(t, d, "undelivered-spawn")
+	if reusedSID != sid {
+		t.Fatalf("undelivered spawn created owner %q, want reuse of %q", reusedSID, sid)
+	}
 	if !entry.Owner.SessionMgr().IsPreRegistered(token) {
 		t.Fatal("spawn token was not pending before rollback")
+	}
+
+	// The disconnect above already scheduled zero-session cleanup. The new
+	// reservation must keep that stale timer from removing the reused owner.
+	time.Sleep(2 * cleanupDelay)
+	if d.Entry(sid) != entry || !entry.Owner.SessionMgr().IsPreRegistered(token) {
+		t.Fatal("pending spawn token did not retain owner before rollback")
 	}
 
 	d.HandleSpawnResponseFailure(sid, token)
