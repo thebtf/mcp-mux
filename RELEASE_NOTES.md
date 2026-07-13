@@ -1,6 +1,6 @@
 # mcp-mux v0.27.1
 
-**Release date:** 2026-07-13
+**Release date:** 2026-07-14
 
 **Type:** Non-breaking patch release
 
