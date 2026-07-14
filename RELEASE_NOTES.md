@@ -15,8 +15,10 @@ gate. Ordinary `engine.New` users remain source-compatible and receive that
 gate automatically when they enable `IdleSuspendDelay`.
 
 Mixed old-launcher/new-engine sessions are fail-closed: private dormant frames
-require the direct launcher's PID-bound advertisement, direct-parent executable
-identity, and active-engine pointer proof. A verified engine can update the
+require the direct launcher's PID-bound advertisement plus the current engine's
+provider-derived version-store layout, active-engine pointer, direct-parent
+stable-launcher identity, and stable-launcher content identity. A verified
+engine can update the
 stable launcher only for future invocations through the existing two-rename
 swap; the already-running old launcher still needs one explicit host/session
 restart (or exact scoped maintenance cleanup). A silent host has no MCP
@@ -76,18 +78,10 @@ Serena dashboard policy is independent of mux process lifecycle:
 
 ## Verification
 
-The candidate passed:
-
-- root and muxcore full suites, `go vet`, and focused Windows race suites with
-  isolated build/temp caches;
-- full root and muxcore race suites under WSL/Linux;
-- a real v0.26.13-daemon/v0.27.1-shim smoke that observed one permanent gate
-  probe, no later retry across 12 seconds, a successful request over the same
-  host stdio afterward, and zero run-scoped survivors;
-- the Windows eight-session lifecycle smoke through initial start,
-  launcher-only dormancy, wake, active-engine switch, and final cleanup: 8/8
-  responses in all three phases, three launcher-only convergences, and zero
-  stale descendants or survivors.
+Before release, the final candidate SHA must pass root and muxcore full suites,
+`go vet`, focused Windows races, Linux races, cross-platform builds, and the
+Windows lifecycle smoke. Earlier Windows artifacts are useful regression
+evidence only; they do not certify a later repaired SHA.
 
 GitHub issue [#138](https://github.com/thebtf/mcp-mux/issues/138) tracks the
 regression and release proof.

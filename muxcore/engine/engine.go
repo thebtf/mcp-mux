@@ -547,7 +547,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		RefreshToken:     refreshFn,
 		Reconnect:        reconnectFn,
 		StdinEOFPolicy:   e.cfg.StdinEOFPolicy,
-		IdleSuspendDelay: e.cfg.IdleSuspendDelay,
+		IdleSuspendDelay: idleSuspendDelay(e.cfg),
 		IdleSuspendGate: func() (bool, string, error) {
 			return canSuspendViaDaemon(ctlPath, currentToken, serverID)
 		},
@@ -556,6 +556,13 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		EnginePrefix:               e.cfg.Name,
 		Logger:                     e.logger,
 	})
+}
+
+func idleSuspendDelay(cfg Config) time.Duration {
+	if cfg.Persistent && !cfg.AllowPersistentIdleSuspend {
+		return 0
+	}
+	return cfg.IdleSuspendDelay
 }
 
 func (e *MuxEngine) ensureDaemonForReconnect(ctlPath, operation string) error {

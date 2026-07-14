@@ -593,10 +593,12 @@ engine after the shim idle/grace sequence and retains a small launcher stub for
 later demand. `MCPMUX_LAUNCHER_DORMANT_LEASE` bounds the complete disposable
 launcher/engine tree only as an explicit host-compatibility opt-in.
 
-Private dormant frames require a PID-bound direct-launcher advertisement, a
-direct-parent executable match, and an active-engine-pointer proof. An already
-running old launcher cannot gain that protocol in memory: its current session
-stays fail-closed and receives no private dormant frames. A verified child may
+Private dormant frames require a PID-bound direct-launcher advertisement plus
+the current engine's provider-derived version-store layout, active-engine
+pointer, direct-parent stable-launcher identity, and stable-launcher content
+identity. Custom or copied engine paths fail closed. An already running old
+launcher cannot gain that protocol in memory: its current session stays
+fail-closed and receives no private dormant frames. A verified child may
 bootstrap the stable launcher for future invocations with the rollback-capable
 two-rename swap; restart the affected host/session once (or perform exact scoped
 cleanup during maintenance) before expecting launcher dormancy or a lease.

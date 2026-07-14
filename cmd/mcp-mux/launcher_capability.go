@@ -17,8 +17,9 @@ var (
 )
 
 // launcherLifecycleCapable proves that a current engine was directly launched
-// by a current stable launcher. An inherited environment alone is not enough:
-// old launchers must never receive private dormant frames on host stdout.
+// by the stable launcher installed beside its version store. Environment paths
+// are only advertisements: old launchers must never receive private dormant
+// frames on host stdout.
 func launcherLifecycleCapable() bool {
 	parts := strings.Split(strings.TrimSpace(os.Getenv(envLauncherProtocol)), ":")
 	if len(parts) != 2 || parts[0] != "1" {
@@ -28,12 +29,15 @@ func launcherLifecycleCapable() bool {
 	if err != nil || launcherPID <= 0 || launcherPID != os.Getppid() {
 		return false
 	}
-	// The PID proves the capability belongs to this direct parent instance; the
-	// executable identity proves that parent is the installed stable launcher,
-	// not an arbitrary parent that copied the environment; the active pointer
-	// proves this child is the engine that launcher selected.
+	enginePath, launcherPath, activeFile, ok := currentEngineInstallLayout()
+	if !ok || !launcherActiveEngineMatches(enginePath, activeFile) || !sameFile(launcherPath, enginePath) {
+		return false
+	}
+	// The PID proves the capability belongs to this direct parent instance. The
+	// parent path, active pointer, and launcher bytes all come from the current
+	// engine's installed layout, not caller-controlled environment paths.
 	parentPath, err := launcherParentExecutable()
-	return err == nil && samePath(parentPath, os.Getenv(envLauncherExe)) && launcherActiveEngineMatchesSelf()
+	return err == nil && samePath(parentPath, launcherPath)
 }
 
 // launcherBootstrapEligible is deliberately stricter than an env check. It
@@ -41,29 +45,37 @@ func launcherLifecycleCapable() bool {
 // launcher for future invocations, but it does not let a copied/inherited env
 // replace an arbitrary executable.
 func launcherBootstrapEligible() bool {
-	launcherPath := strings.TrimSpace(os.Getenv(envLauncherExe))
-	activeFile := strings.TrimSpace(os.Getenv(envActiveEngineFile))
-	if launcherPath == "" || activeFile == "" {
-		return false
-	}
-	if !launcherActiveEngineMatchesSelf() {
+	enginePath, launcherPath, activeFile, ok := currentEngineInstallLayout()
+	if !ok || !launcherActiveEngineMatches(enginePath, activeFile) {
 		return false
 	}
 	parentPath, err := launcherParentExecutable()
 	return err == nil && samePath(parentPath, launcherPath)
 }
 
-func launcherActiveEngineMatchesSelf() bool {
-	activeFile := strings.TrimSpace(os.Getenv(envActiveEngineFile))
-	if activeFile == "" {
-		return false
-	}
-	enginePath, err := launcherCurrentExecutable()
-	if err != nil {
-		return false
-	}
+func launcherActiveEngineMatches(enginePath, activeFile string) bool {
 	activePath, ok := launcherActivePointer(activeFile)
 	return ok && samePath(activePath, enginePath)
+}
+
+// currentEngineInstallLayout derives the only stable launcher that can govern
+// this engine. Custom or copied engine paths deliberately fail closed.
+func currentEngineInstallLayout() (enginePath, launcherPath, activeFile string, ok bool) {
+	enginePath, err := launcherCurrentExecutable()
+	if err != nil || filepath.Base(enginePath) != engineFileName() {
+		return "", "", "", false
+	}
+	versionDir := filepath.Dir(enginePath)
+	storeDir := filepath.Dir(versionDir)
+	launcherName := strings.TrimSuffix(strings.TrimSuffix(engineFileName(), ".exe"), "-engine")
+	if filepath.Base(versionDir) == "." || filepath.Base(storeDir) != "mcp-mux.versions" {
+		return "", "", "", false
+	}
+	launcherPath = filepath.Join(filepath.Dir(storeDir), launcherName)
+	if !samePath(storeDir, versionStoreDir(launcherPath)) {
+		return "", "", "", false
+	}
+	return enginePath, launcherPath, activeEngineFile(launcherPath), true
 }
 
 // bootstrapStableLauncher copies the verified active engine beside the running
@@ -74,10 +86,9 @@ func bootstrapStableLauncher() (bool, error) {
 	if !launcherBootstrapEligible() {
 		return false, fmt.Errorf("launcher bootstrap identity proof failed")
 	}
-	launcherPath := filepath.Clean(os.Getenv(envLauncherExe))
-	enginePath, err := launcherCurrentExecutable()
-	if err != nil {
-		return false, fmt.Errorf("resolve active engine: %w", err)
+	enginePath, launcherPath, _, ok := currentEngineInstallLayout()
+	if !ok {
+		return false, fmt.Errorf("resolve installed launcher identity")
 	}
 	if sameFile(launcherPath, enginePath) {
 		return false, nil

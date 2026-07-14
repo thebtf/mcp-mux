@@ -526,6 +526,7 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		BaseDir:                    baseDir,
 		IdleSuspendDelay:           7 * time.Second,
 		IdleDormantGrace:           11 * time.Second,
+		Persistent:                 true,
 		AllowPersistentIdleSuspend: true,
 	})
 	if err != nil {
@@ -631,6 +632,15 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	}
 	if handler.spawnRequests[1].ReconnectReason != "fallback_spawn" {
 		t.Fatalf("fallback spawn ReconnectReason = %q, want fallback_spawn", handler.spawnRequests[1].ReconnectReason)
+	}
+}
+
+func TestIdleSuspendDelayKeepsPersistentEngineConnectedByDefault(t *testing.T) {
+	if got := idleSuspendDelay(Config{Persistent: true, IdleSuspendDelay: 7 * time.Second}); got != 0 {
+		t.Fatalf("idleSuspendDelay(default persistent) = %s, want disabled", got)
+	}
+	if got := idleSuspendDelay(Config{Persistent: true, AllowPersistentIdleSuspend: true, IdleSuspendDelay: 7 * time.Second}); got != 7*time.Second {
+		t.Fatalf("idleSuspendDelay(explicit persistent opt-in) = %s, want 7s", got)
 	}
 }
 
