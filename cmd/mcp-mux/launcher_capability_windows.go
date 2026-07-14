@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -44,4 +45,16 @@ func directParentExecutable() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("current process %d not found", pid)
+}
+
+func launcherAttestationServerPID(conn net.Conn) (int, error) {
+	handleConn, ok := conn.(interface{ Fd() uintptr })
+	if !ok {
+		return 0, fmt.Errorf("launcher attestation connection exposes no Windows handle")
+	}
+	var peerPID uint32
+	if err := windows.GetNamedPipeServerProcessId(windows.Handle(handleConn.Fd()), &peerPID); err != nil {
+		return 0, err
+	}
+	return int(peerPID), nil
 }

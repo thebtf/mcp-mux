@@ -14,13 +14,16 @@ buffer/replay policy; that opt-in still requires muxcore's exact-owner daemon
 gate. Ordinary `engine.New` users remain source-compatible and receive that
 gate automatically when they enable `IdleSuspendDelay`.
 
-Mixed old-launcher/new-engine sessions are fail-closed: private dormant frames
-require the direct launcher's PID-bound advertisement plus the current engine's
-provider-derived version-store layout, active-engine pointer, direct-parent
-stable-launcher identity, and stable-launcher content identity. A verified
-engine can update the
-stable launcher only for future invocations through the existing two-rename
-swap; the already-running old launcher still needs one explicit host/session
+The installed stable launcher and active versioned engine are distinct binaries
+and may differ byte-for-byte. Private dormant frames require protocol-v2
+target-bound attestation over a one-shot current-user-only local IPC endpoint.
+The engine verifies that the endpoint server PID is its direct parent and keeps
+the proof bytes separate from host stdio. Provider-derived version-store layout,
+active-engine pointer, and direct-parent executable path checks remain
+mandatory; custom, copied, or environment-forwarded engine paths fail closed.
+A verified engine can update the stable launcher only for future invocations
+through the existing two-rename swap. An already-running v0.27.0-or-older
+launcher lacks the v2 attestation server and needs one explicit host/session
 restart (or exact scoped maintenance cleanup). A silent host has no MCP
 completion signal, so full dormant exit is the explicit
 `MCPMUX_LAUNCHER_DORMANT_LEASE` opt-in, not a default promise.
@@ -60,12 +63,12 @@ go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
 ```
 
 Ordinary `engine.New` consumers need no source changes. Existing v0.27.0 shim
-engines must enter the v0.27.1 binary generation before the retry fix applies;
-the stable launcher and active-engine update path prepare that replacement, but
-an already-running old launcher requires one host/session restart before it can
-use dormant lifecycle frames.
-Do not add product-local retry loops, token indexes, PID-only cleanup, or stale
-process sweeps.
+engines must enter the v0.27.1 binary generation before the retry fix applies.
+The active engine can bootstrap the stable launcher for future invocations, but
+an already-running v0.27.0-or-older launcher cannot acquire the target-bound v2
+attestation server in memory; restart that host/session before expecting
+launcher dormancy. Do not add product-local retry loops, token indexes, PID-only
+cleanup, or stale process sweeps.
 
 ## Serena dashboard
 

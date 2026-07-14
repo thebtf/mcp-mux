@@ -450,7 +450,7 @@ func startSupervisedChildCommand(cmd *exec.Cmd) (*supervisedEngineChild, error) 
 		_ = stdin.Close()
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startLauncherEnvCommand(cmd); err != nil {
 		_ = stdin.Close()
 		return nil, err
 	}

@@ -31,10 +31,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - `engine.New` now automatically binds positive `IdleSuspendDelay` values to
   the exact spawn-returned daemon owner/token safety gate; direct resilient
   clients still supply their own gate.
-- Private dormant frames now require a PID-bound direct-launcher capability plus
-  direct-parent executable and active-engine proof. Old launchers stay
-  fail-closed; verified active children may bootstrap the stable launcher for
-  future invocations after one host/session restart.
+- Private dormant frames now require protocol-v2 target-bound launcher
+  attestation over a one-shot local IPC endpoint, plus direct-parent executable
+  and active-engine proof. Forwarded environments from old launchers fail
+  closed; verified active children may bootstrap the stable launcher for future
+  invocations after one host/session restart.
 - `MCPMUX_LAUNCHER_DORMANT_LEASE` offers explicit bounded full-transport exit
   for hosts proven to relaunch after closure; it is disabled by default.
 
@@ -49,6 +50,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added mixed-version runtime proof with a real v0.26.13 daemon and v0.27.1
   shim: one failed gate probe, no later polling across two former retry windows,
   live host stdio, and zero run-scoped survivors.
+- Added live Windows and Linux proof that a direct child accepts launcher
+  attestation while the same endpoint forwarded through an intermediate old
+  launcher is rejected without writing private bytes to host stdout.
+- Added Unix success-path socket removal and command-start cancellation
+  regressions so failed supervisor respawn loops cannot accumulate attestation
+  endpoints or file descriptors.
 
 ## [0.27.0] - 2026-07-13
 

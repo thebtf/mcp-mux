@@ -593,19 +593,29 @@ engine after the shim idle/grace sequence and retains a small launcher stub for
 later demand. `MCPMUX_LAUNCHER_DORMANT_LEASE` bounds the complete disposable
 launcher/engine tree only as an explicit host-compatibility opt-in.
 
-Private dormant frames require a PID-bound direct-launcher advertisement plus
-the current engine's provider-derived version-store layout, active-engine
-pointer, direct-parent stable-launcher identity, and stable-launcher content
-identity. Custom or copied engine paths fail closed. An already running old
-launcher cannot gain that protocol in memory: its current session stays
-fail-closed and receives no private dormant frames. A verified child may
-bootstrap the stable launcher for future invocations with the rollback-capable
-two-rename swap; restart the affected host/session once (or perform exact scoped
-cleanup during maintenance) before expecting launcher dormancy or a lease.
+The installed stable launcher and active versioned engine are distinct binaries
+and may differ byte-for-byte. Private dormant frames require protocol-v2
+target-bound attestation: before spawning the engine, the launcher binds a
+one-shot current-user-only local IPC endpoint; the engine verifies that the
+endpoint's server PID is its direct parent and exchanges fixed proof bytes on
+that side channel, never on host stdio. The provider-derived version-store
+layout, active-engine pointer, and direct-parent executable path must also match
+the installed stable launcher. Custom or copied engine paths fail closed.
+
+Forwarding the endpoint environment through a v0.27.0-or-older launcher does
+not transfer capability: the endpoint server remains an ancestor rather than
+the engine's direct parent. That running session stays fail-closed and receives
+no private dormant frames. The verified child may bootstrap the stable launcher
+for future invocations with the rollback-capable two-rename swap; restart only a
+host/session still running under the pre-v2 launcher before expecting launcher
+dormancy or a lease.
+
 Customer-mode proof remains required for host relaunch behavior and live Windows
-executable swapping. Windows uses the parent process image, Linux uses
-`/proc/<ppid>/exe`, and macOS uses `kern.procargs2`; unsupported platforms,
-including BSD targets without this proof, fail closed and never emit private
+executable swapping. Windows verifies the named-pipe server with
+`GetNamedPipeServerProcessId`, Linux uses `SO_PEERCRED`, and macOS uses
+`LOCAL_PEERPID`; the existing parent-image checks use the Windows process image,
+`/proc/<ppid>/exe`, and `kern.procargs2` respectively. Unsupported platforms,
+including BSD targets without both proofs, fail closed and never emit private
 dormant frames.
 
 ## Control Plane MCP Server

@@ -57,6 +57,9 @@ func main() {
 	if handled, exitCode := maybeRunLauncher(); handled {
 		os.Exit(exitCode)
 	}
+	// Consume the one-shot launcher attestation before daemon startup can delay
+	// the child beyond the bounded parent listener lifetime.
+	launcherLifecycleOK := launcherLifecycleCapable()
 
 	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
 	if len(os.Args) > 1 {
@@ -163,7 +166,7 @@ func main() {
 	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
 	var logger *log.Logger
 	if shimLogPath := os.Getenv("MCP_MUX_SHIM_LOG"); shimLogPath != "" {
-		f, err := os.OpenFile(shimLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		f, err := os.OpenFile(shimLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err == nil {
 			multi := io.MultiWriter(os.Stderr, f)
 			logger = log.New(multi, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds)
@@ -267,7 +270,7 @@ func main() {
 					}
 				}
 				idleDelay, dormantGrace := shimLifecycleDurations(os.Getenv)
-				if !launcherLifecycleCapable() {
+				if !launcherLifecycleOK {
 					// A v0.26 launcher cannot understand the private dormant control
 					// frames. Bootstrap only when the active child can prove its direct
 					// launcher identity; this session stays fail-closed and the next
@@ -673,7 +676,7 @@ func runUpgrade(restart bool, forceDaemonRestart bool) {
 		// This prevents shims from spawning a competing daemon during the restart window.
 		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
 		lockPath := serverid.DaemonLockPath("", engineName)
-		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
+		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
 		if lockErr == nil {
 			if flockErr := lockFile(lock); flockErr == nil {
 				defer func() {
@@ -829,12 +832,14 @@ func sleepWithin(deadline time.Time, requested time.Duration) bool {
 	return true
 }
 
-var statusControlSendWithTimeout = control.SendWithTimeout
-var statusDaemonControlTimeout = 15 * time.Second
-var statusDaemonRetryWindow = 5 * time.Second
-var statusDaemonRetryDelay = 25 * time.Millisecond
-var statusSleep = time.Sleep
-var statusPipeHints = discoverStatusPipeHints
+var (
+	statusControlSendWithTimeout = control.SendWithTimeout
+	statusDaemonControlTimeout   = 15 * time.Second
+	statusDaemonRetryWindow      = 5 * time.Second
+	statusDaemonRetryDelay       = 25 * time.Millisecond
+	statusSleep                  = time.Sleep
+	statusPipeHints              = discoverStatusPipeHints
+)
 
 func runStatus() {
 	runStatusWithWriters(os.Stdout, os.Stderr)
