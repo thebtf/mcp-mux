@@ -28,9 +28,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   persistent consumers retain transports by default, while products with an
   explicit no-background-events or buffering contract can opt into
   `AllowPersistentIdleSuspend`.
+- `engine.New` now automatically binds positive `IdleSuspendDelay` values to
+  the exact spawn-returned daemon owner/token safety gate; direct resilient
+  clients still supply their own gate.
 - Private dormant frames now require a PID-bound direct-launcher capability plus
-  active-engine proof. Old launchers stay fail-closed; verified active children
-  may bootstrap the stable launcher for future invocations.
+  direct-parent executable and active-engine proof. Old launchers stay
+  fail-closed; verified active children may bootstrap the stable launcher for
+  future invocations after one host/session restart.
 - `MCPMUX_LAUNCHER_DORMANT_LEASE` offers explicit bounded full-transport exit
   for hosts proven to relaunch after closure; it is disabled by default.
 

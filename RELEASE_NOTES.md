@@ -10,12 +10,16 @@ Persistent daemon/owner state and downstream transport lifetime are now
 separate. Persistent products such as Aimux and Engram retain their transport
 by default because MCP permits background notifications. They may opt into
 `AllowPersistentIdleSuspend` only after proving no-background-events or a
-buffer/replay policy. Ordinary `engine.New` users remain source-compatible.
+buffer/replay policy; that opt-in still requires muxcore's exact-owner daemon
+gate. Ordinary `engine.New` users remain source-compatible and receive that
+gate automatically when they enable `IdleSuspendDelay`.
 
 Mixed old-launcher/new-engine sessions are fail-closed: private dormant frames
-require the direct launcher's PID-bound advertisement plus an active-engine
-pointer proof. A verified engine can update the stable launcher for future
-invocations through the existing two-rename swap. A silent host has no MCP
+require the direct launcher's PID-bound advertisement, direct-parent executable
+identity, and active-engine pointer proof. A verified engine can update the
+stable launcher only for future invocations through the existing two-rename
+swap; the already-running old launcher still needs one explicit host/session
+restart (or exact scoped maintenance cleanup). A silent host has no MCP
 completion signal, so full dormant exit is the explicit
 `MCPMUX_LAUNCHER_DORMANT_LEASE` opt-in, not a default promise.
 
@@ -43,8 +47,9 @@ multiple daemon CPU cores even though their upstream owners were idle.
   rejected.
 
 The lifecycle behavior shipped in v0.27.0 remains unchanged: disposable shims
-can become dormant, exact-owner wake remains available, persistent owners stay
-alive, and full subprocess trees are finalized when their owner is removed.
+can become dormant, exact-owner wake remains available, persistent owners retain
+transport by default, and full subprocess trees are finalized when their owner
+is removed.
 
 ## Upgrade
 
@@ -54,7 +59,9 @@ go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
 
 Ordinary `engine.New` consumers need no source changes. Existing v0.27.0 shim
 engines must enter the v0.27.1 binary generation before the retry fix applies;
-the stable launcher and active-engine update path perform this replacement.
+the stable launcher and active-engine update path prepare that replacement, but
+an already-running old launcher requires one host/session restart before it can
+use dormant lifecycle frames.
 Do not add product-local retry loops, token indexes, PID-only cleanup, or stale
 process sweeps.
 

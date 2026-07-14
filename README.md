@@ -593,11 +593,18 @@ engine after the shim idle/grace sequence and retains a small launcher stub for
 later demand. `MCPMUX_LAUNCHER_DORMANT_LEASE` bounds the complete disposable
 launcher/engine tree only as an explicit host-compatibility opt-in.
 
-Private dormant frames require a PID-bound direct-launcher advertisement and an
-active-engine-pointer proof. Old-launcher sessions stay fail-closed; a verified
-child may bootstrap the stable launcher for future invocations with the
-rollback-capable two-rename swap. Customer-mode proof remains required for host
-relaunch behavior and live Windows executable swapping.
+Private dormant frames require a PID-bound direct-launcher advertisement, a
+direct-parent executable match, and an active-engine-pointer proof. An already
+running old launcher cannot gain that protocol in memory: its current session
+stays fail-closed and receives no private dormant frames. A verified child may
+bootstrap the stable launcher for future invocations with the rollback-capable
+two-rename swap; restart the affected host/session once (or perform exact scoped
+cleanup during maintenance) before expecting launcher dormancy or a lease.
+Customer-mode proof remains required for host relaunch behavior and live Windows
+executable swapping. Windows uses the parent process image, Linux uses
+`/proc/<ppid>/exe`, and macOS uses `kern.procargs2`; unsupported platforms,
+including BSD targets without this proof, fail closed and never emit private
+dormant frames.
 
 ## Control Plane MCP Server
 

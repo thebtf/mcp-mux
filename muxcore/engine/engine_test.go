@@ -36,9 +36,13 @@ func (pingOnlyControlHandler) HandleStatus() map[string]interface{} {
 }
 
 type runClientControlHandler struct {
-	mu            sync.Mutex
-	spawnRequests []control.Request
-	refreshTokens []string
+	mu              sync.Mutex
+	spawnRequests   []control.Request
+	refreshTokens   []string
+	suspendRequests []control.Request
+	suspendAllowed  bool
+	suspendReason   string
+	suspendErr      error
 }
 
 func (h *runClientControlHandler) HandleShutdown(int) string {
@@ -75,6 +79,13 @@ func (h *runClientControlHandler) HandleRefreshSessionToken(prevToken string) (s
 		return "token-after-fallback", nil
 	}
 	return "token-refreshed", nil
+}
+
+func (h *runClientControlHandler) HandleCanSuspendForOwner(prevToken, serverID string) (control.SuspendCheckResponse, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.suspendRequests = append(h.suspendRequests, control.Request{PrevToken: prevToken, ServerID: serverID})
+	return control.SuspendCheckResponse{Allowed: h.suspendAllowed, Reason: h.suspendReason}, h.suspendErr
 }
 
 func (h *runClientControlHandler) HandleReconnectGiveUp(string) error {
@@ -500,7 +511,7 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	name := "er"
 	ctlPath := serverid.DaemonControlPath(baseDir, name)
 
-	handler := &runClientControlHandler{}
+	handler := &runClientControlHandler{suspendAllowed: true}
 	srv, err := control.NewServer(ctlPath, handler, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("start control server: %v", err)
@@ -541,6 +552,12 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		if cfg.IdleSuspendDelay != 7*time.Second || cfg.IdleDormantGrace != 11*time.Second || !cfg.AllowPersistentIdleSuspend {
 			t.Fatalf("lifecycle config not forwarded: %+v", cfg)
 		}
+		if cfg.IdleSuspendGate == nil {
+			t.Fatal("IdleSuspendGate is nil; engine.New must bind the daemon exact-owner gate")
+		}
+		if allowed, reason, err := cfg.IdleSuspendGate(); err != nil || !allowed || reason != "" {
+			t.Fatalf("IdleSuspendGate() = (%v, %q, %v), want exact-owner approval", allowed, reason, err)
+		}
 
 		path, token, err := cfg.RefreshToken()
 		if err != nil {
@@ -548,6 +565,9 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		}
 		if path != "ipc-initial" || token != "token-refreshed" {
 			t.Fatalf("RefreshToken() = (%q, %q), want (ipc-initial, token-refreshed)", path, token)
+		}
+		if allowed, _, err := cfg.IdleSuspendGate(); err != nil || !allowed {
+			t.Fatalf("IdleSuspendGate() after refresh = (%v, %v), want current-token approval", allowed, err)
 		}
 
 		path, token, err = cfg.Reconnect()
@@ -557,6 +577,9 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		if path != "ipc-fallback" || token != "token-fallback" {
 			t.Fatalf("Reconnect() = (%q, %q), want (ipc-fallback, token-fallback)", path, token)
 		}
+		if allowed, _, err := cfg.IdleSuspendGate(); err != nil || !allowed {
+			t.Fatalf("IdleSuspendGate() after fallback spawn = (%v, %v), want current owner/token approval", allowed, err)
+		}
 
 		path, token, err = cfg.RefreshToken()
 		if err != nil {
@@ -564,6 +587,9 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		}
 		if path != "ipc-fallback" || token != "token-after-fallback" {
 			t.Fatalf("RefreshToken() after fallback spawn = (%q, %q), want (ipc-fallback, token-after-fallback)", path, token)
+		}
+		if allowed, _, err := cfg.IdleSuspendGate(); err != nil || !allowed {
+			t.Fatalf("IdleSuspendGate() after fallback refresh = (%v, %v), want current-token approval", allowed, err)
 		}
 		return stopErr
 	}
@@ -585,11 +611,51 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	if len(handler.spawnRequests) != 2 {
 		t.Fatalf("spawnRequests = %d, want 2", len(handler.spawnRequests))
 	}
+	wantSuspendRequests := []control.Request{
+		{PrevToken: "token-initial", ServerID: "sid-initial"},
+		{PrevToken: "token-refreshed", ServerID: "sid-initial"},
+		{PrevToken: "token-fallback", ServerID: "sid-fallback"},
+		{PrevToken: "token-after-fallback", ServerID: "sid-fallback"},
+	}
+	if len(handler.suspendRequests) != len(wantSuspendRequests) {
+		t.Fatalf("suspend requests = %+v, want %+v", handler.suspendRequests, wantSuspendRequests)
+	}
+	for i, want := range wantSuspendRequests {
+		got := handler.suspendRequests[i]
+		if got.PrevToken != want.PrevToken || got.ServerID != want.ServerID {
+			t.Fatalf("suspend request %d = %+v, want %+v", i, got, want)
+		}
+	}
 	if handler.spawnRequests[0].ReconnectReason != "" {
 		t.Fatalf("initial spawn ReconnectReason = %q, want empty", handler.spawnRequests[0].ReconnectReason)
 	}
 	if handler.spawnRequests[1].ReconnectReason != "fallback_spawn" {
 		t.Fatalf("fallback spawn ReconnectReason = %q, want fallback_spawn", handler.spawnRequests[1].ReconnectReason)
+	}
+}
+
+func TestDecodeCanSuspendResponseFailsClosed(t *testing.T) {
+	cases := []struct {
+		name        string
+		resp        *control.Response
+		wantAllowed bool
+		wantErr     error
+	}{
+		{name: "old daemon", resp: &control.Response{OK: false, Message: "can_suspend not supported"}, wantErr: owner.ErrIdleSuspendGateUnavailable},
+		{name: "malformed reply", resp: &control.Response{OK: true, Data: []byte(`[]`)}, wantErr: owner.ErrIdleSuspendGateUnavailable},
+		{name: "missing denial reason", resp: &control.Response{OK: true, Data: []byte(`{"allowed":false}`)}, wantErr: owner.ErrIdleSuspendGateUnavailable},
+		{name: "missing allowed", resp: &control.Response{OK: true, Data: []byte(`{"reason":"busy"}`)}, wantErr: owner.ErrIdleSuspendGateUnavailable},
+		{name: "legacy persistent", resp: &control.Response{OK: true, Data: []byte(`{"allowed":false,"reason":"persistent"}`)}, wantErr: owner.ErrIdleSuspendGateUnavailable},
+		{name: "busy", resp: &control.Response{OK: true, Data: []byte(`{"allowed":false,"reason":"busy"}`)}},
+		{name: "allowed", resp: &control.Response{OK: true, Data: []byte(`{"allowed":true}`)}, wantAllowed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			allowed, _, err := decodeCanSuspendResponse(tc.resp)
+			if allowed != tc.wantAllowed || !errors.Is(err, tc.wantErr) {
+				t.Fatalf("decodeCanSuspendResponse() = (%v, %v), want (%v, %v)", allowed, err, tc.wantAllowed, tc.wantErr)
+			}
+		})
 	}
 }
 

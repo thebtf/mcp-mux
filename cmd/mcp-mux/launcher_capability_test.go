@@ -29,6 +29,11 @@ func TestLauncherLifecycleCapabilityRequiresDirectCurrentLauncher(t *testing.T) 
 	if !launcherLifecycleCapable() {
 		t.Fatal("verified direct launcher was not accepted")
 	}
+	launcherParentExecutable = func() (string, error) { return filepath.Join(dir, "spoofing-parent.exe"), nil }
+	if launcherLifecycleCapable() {
+		t.Fatal("forged environment and active pointer accepted a non-launcher direct parent")
+	}
+	launcherParentExecutable = func() (string, error) { return launcherPath, nil }
 
 	t.Setenv(envLauncherProtocol, "1:1")
 	if launcherLifecycleCapable() {
@@ -77,5 +82,40 @@ func TestBootstrapStableLauncherUsesSwapAfterIdentityProof(t *testing.T) {
 	launcherParentExecutable = func() (string, error) { return "", errors.New("gone") }
 	if _, err := bootstrapStableLauncher(); err == nil {
 		t.Fatal("bootstrap accepted unavailable direct parent")
+	}
+}
+
+func TestLauncherMigrationRequiresOneFutureInvocation(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, "mcp-mux.exe")
+	enginePath := filepath.Join(dir, "engine.exe")
+	activeFile := filepath.Join(dir, "active.txt")
+	writeTestFile(t, launcherPath, "old launcher")
+	writeTestFile(t, enginePath, "capable launcher")
+	writeTestFile(t, activeFile, enginePath+"\n")
+	t.Setenv(envLauncherExe, launcherPath)
+	t.Setenv(envActiveEngineFile, activeFile)
+	t.Setenv(envLauncherProtocol, "") // Current old launcher cannot send private frames.
+
+	origExe, origParent := launcherCurrentExecutable, launcherParentExecutable
+	t.Cleanup(func() {
+		launcherCurrentExecutable, launcherParentExecutable = origExe, origParent
+	})
+	launcherCurrentExecutable = func() (string, error) { return enginePath, nil }
+	launcherParentExecutable = func() (string, error) { return launcherPath, nil }
+
+	if launcherLifecycleCapable() {
+		t.Fatal("old launcher generation was allowed to receive private dormant frames")
+	}
+	updated, err := bootstrapStableLauncher()
+	if err != nil || !updated {
+		t.Fatalf("bootstrapStableLauncher() = (%v, %v), want future-launcher update", updated, err)
+	}
+	if launcherLifecycleCapable() {
+		t.Fatal("current old launcher generation became capable without a host restart")
+	}
+	t.Setenv(envLauncherProtocol, "1:"+strconv.Itoa(os.Getppid()))
+	if !launcherLifecycleCapable() {
+		t.Fatal("future invocation from the bootstrapped capable launcher was not accepted")
 	}
 }

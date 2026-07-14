@@ -37,9 +37,11 @@ owner.
 
 ### v0.27.1 - idle-gate rolling-compatibility hotfix
 
-**No required consumer code changes for ordinary `engine.New` users.** Direct
-`owner.RunResilientClient` consumers that opt into `IdleSuspendGate` gain safer
-failure handling:
+**No required consumer code changes for ordinary `engine.New` users.** A
+positive `engine.Config.IdleSuspendDelay` now automatically wires the exact
+spawn-returned owner/token safety check. Direct `owner.RunResilientClient`
+consumers remain responsible for supplying `IdleSuspendGate` before enabling
+suspension; a nil direct-client gate is only local checking.
 
 - `owner.ErrIdleSuspendGateUnavailable` keeps the current IPC connection open
   and disables further suspension attempts for that connection;
@@ -49,8 +51,9 @@ failure handling:
   legacy `SuspendCheckHandler` path remains available for older callers.
 
 The safety contract remains fail closed: an unavailable or invalid gate never
-authorizes suspension. Persistent owners and owners with pending requests,
-active progress, or declared busy work remain connected.
+authorizes suspension. Persistent owners retain their downstream transport by
+default; explicit `AllowPersistentIdleSuspend` still requires the same exact
+pending-request, active-progress, and busy-work gate.
 
 ### v0.27.0 - lifecycle convergence and process-tree authority
 
@@ -71,9 +74,11 @@ variables belong to the product wrapper; native muxcore consumers opt in with
 must migrate that shim to these provider controls before removing local retry
 or stale-daemon kill logic; a dependency bump alone cannot change a wrapper
 that bypasses muxcore's client lifecycle.
-the fields above and should use their own launcher protocol if they want process
-dormancy. Persistent owners (`engine.Config.Persistent` or
-`x-mux.persistent: true`) remain connected and are not idle-suspended.
+Native engine consumers use the automatic gate above and need their own
+launcher protocol only if they want process dormancy. Persistent owners
+(`engine.Config.Persistent` or `x-mux.persistent: true`) remain connected
+unless they explicitly set `AllowPersistentIdleSuspend`; that opt-in never
+bypasses the daemon safety gate.
 
 The stable launcher also keeps its replacement-handshake budget longer than
 the shim's daemon-spawn budget, so cold wake cannot create retry fanout merely

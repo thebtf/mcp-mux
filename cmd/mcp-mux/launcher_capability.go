@@ -28,9 +28,12 @@ func launcherLifecycleCapable() bool {
 	if err != nil || launcherPID <= 0 || launcherPID != os.Getppid() {
 		return false
 	}
-	// The PID proves the capability belongs to this direct parent instance;
-	// the active pointer proves this child is the installed engine it launched.
-	return launcherActiveEngineMatchesSelf()
+	// The PID proves the capability belongs to this direct parent instance; the
+	// executable identity proves that parent is the installed stable launcher,
+	// not an arbitrary parent that copied the environment; the active pointer
+	// proves this child is the engine that launcher selected.
+	parentPath, err := launcherParentExecutable()
+	return err == nil && samePath(parentPath, os.Getenv(envLauncherExe)) && launcherActiveEngineMatchesSelf()
 }
 
 // launcherBootstrapEligible is deliberately stricter than an env check. It
