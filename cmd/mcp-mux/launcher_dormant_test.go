@@ -27,6 +27,10 @@ type dormantSupervisorHarness struct {
 }
 
 func newDormantSupervisorHarness(t *testing.T, mode string, replyDelay time.Duration) *dormantSupervisorHarness {
+	return newDormantSupervisorHarnessWithLease(t, mode, replyDelay, 0)
+}
+
+func newDormantSupervisorHarnessWithLease(t *testing.T, mode string, replyDelay, dormantLease time.Duration) *dormantSupervisorHarness {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -81,10 +85,28 @@ func newDormantSupervisorHarness(t *testing.T, mode string, replyDelay time.Dura
 			RespawnDelay:       20 * time.Millisecond,
 			ReplayTimeout:      2 * time.Second,
 			EnginePollInterval: -1,
+			DormantLease:       dormantLease,
 		})
 	}()
 
 	return h
+}
+
+func TestLauncherSupervisorDormantLeaseTerminatesCompleteTransport(t *testing.T) {
+	h := newDormantSupervisorHarnessWithLease(t, "ack", 0, 75*time.Millisecond)
+	h.initialize(t)
+	waitSupervisorEvent(t, h.eventFile, "phase=send method="+launcherDormantAckMethod)
+	select {
+	case code := <-h.codeCh:
+		if code != 0 {
+			t.Fatalf("supervisor lease exit code = %d, stderr:\n%s", code, h.stderr.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("supervisor did not exit at dormant lease; stderr:\n%s", h.stderr.String())
+	}
+	if got := readSupervisorGeneration(t, h.generationFile); got != 1 {
+		t.Fatalf("generation after dormant lease = %d, want no wake", got)
+	}
 }
 
 func (h *dormantSupervisorHarness) initialize(t *testing.T) {

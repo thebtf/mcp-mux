@@ -331,19 +331,20 @@ func daemonExecutableForSpawn(currentExe string) string {
 	return currentExe
 }
 
-// spawnViaDaemon sends a spawn request to the daemon and returns the IPC path and handshake token.
+// spawnViaDaemon sends a spawn request to the daemon and returns the IPC path,
+// owner ID, and handshake token.
 // Emits a "daemon_rpc_spawn" log line with the total RPC duration for post-mortem latency analysis.
-func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
+func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, string, error) {
 	return spawnViaDaemonWithReason(command, args, cwd, mode, env, "", logger)
 }
 
-func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
+func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, string, error) {
 	return spawnViaDaemonWithReasonTimeout(command, args, cwd, mode, env, reconnectReason, logger, defaultDaemonSpawnTimeout)
 }
 
-func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger, timeout time.Duration) (string, string, error) {
+func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
 	if timeout <= 0 {
-		return "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
+		return "", "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
 	}
 	ctlPath := serverid.DaemonControlPath("", engineName)
 
@@ -362,14 +363,14 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
 		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%q", rpcDur, err.Error())
-		return "", "", fmt.Errorf("spawn via daemon: %w", err)
+		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
 		logger.Printf("daemon_rpc_spawn status=not_ok duration=%v msg=%q", rpcDur, resp.Message)
 		if resp.Message == daemon.ErrDaemonShuttingDown.Error() {
-			return "", "", fmt.Errorf("daemon spawn failed: %w", daemon.ErrDaemonShuttingDown)
+			return "", "", "", fmt.Errorf("daemon spawn failed: %w", daemon.ErrDaemonShuttingDown)
 		}
-		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 
 	// Safe ID truncation: resp.ServerID may be shorter than 8 chars in edge cases
@@ -381,7 +382,7 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 	}
 	logger.Printf("daemon_rpc_spawn status=ok duration=%v server=%s ipc=%q",
 		rpcDur, shortID, resp.IPCPath)
-	return resp.IPCPath, resp.Token, nil
+	return resp.IPCPath, resp.ServerID, resp.Token, nil
 }
 
 // refreshTokenViaDaemon asks the daemon to mint a fresh reconnect token for a

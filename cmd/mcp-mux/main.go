@@ -163,7 +163,7 @@ func main() {
 	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
 	var logger *log.Logger
 	if shimLogPath := os.Getenv("MCP_MUX_SHIM_LOG"); shimLogPath != "" {
-		f, err := os.OpenFile(shimLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		f, err := os.OpenFile(shimLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err == nil {
 			multi := io.MultiWriter(os.Stderr, f)
 			logger = log.New(multi, fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds)
@@ -188,6 +188,9 @@ func main() {
 	// gets rejected as "invalid/missing token".
 	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
 	if !noDaemon {
+		// Consume the one-shot launcher attestation before daemon startup can
+		// delay the child beyond the bounded parent listener lifetime.
+		launcherLifecycleOK := launcherLifecycleCapable()
 		ensureStart := time.Now()
 		if err := ensureDaemon(logger); err != nil {
 			logger.Printf("shim startup step=ensure_daemon status=error duration=%v err=%q daemon_required=true",
@@ -199,7 +202,7 @@ func main() {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
-			daemonIPC, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
 			if err != nil {
 				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q daemon_required=true",
 					time.Since(spawnStart), err.Error())
@@ -215,6 +218,7 @@ func main() {
 				// than replaying a consumed token into "unknown token".
 				currentIPC := daemonIPC
 				currentToken := daemonToken
+				currentServerID := daemonServerID
 				refreshFn := func() (string, string, error) {
 					jitter := time.Duration(os.Getpid()%500) * time.Millisecond
 					time.Sleep(jitter)
@@ -248,7 +252,7 @@ func main() {
 							}
 							return "", "", err
 						}
-						newIPC, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
+						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
@@ -260,18 +264,30 @@ func main() {
 							return "", "", err
 						}
 						currentIPC = newIPC
+						currentServerID = newServerID
 						currentToken = newToken
 						return newIPC, newToken, nil
 					}
 				}
 				idleDelay, dormantGrace := shimLifecycleDurations(os.Getenv)
-				if os.Getenv(envLauncherExe) == "" {
+				if !launcherLifecycleOK {
+					// A v0.26 launcher cannot understand the private dormant control
+					// frames. Bootstrap only when the active child can prove its direct
+					// launcher identity; this session stays fail-closed and the next
+					// invocation receives the upgraded capability.
+					if launcherBootstrapEligible() {
+						if updated, bootstrapErr := bootstrapStableLauncher(); bootstrapErr != nil {
+							logger.Printf("launcher.bootstrap status=skipped error=%q", bootstrapErr.Error())
+						} else if updated {
+							logger.Printf("launcher.bootstrap status=updated future_invocations=true")
+						}
+					}
 					dormantGrace = -1
 				}
 				var suspendGate func() (bool, string, error)
 				if idleDelay > 0 {
 					suspendGate = func() (bool, string, error) {
-						return canSuspendViaDaemon(currentToken)
+						return canSuspendViaDaemon(currentToken, currentServerID)
 					}
 				}
 
@@ -660,7 +676,7 @@ func runUpgrade(restart bool, forceDaemonRestart bool) {
 		// This prevents shims from spawning a competing daemon during the restart window.
 		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
 		lockPath := serverid.DaemonLockPath("", engineName)
-		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
+		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
 		if lockErr == nil {
 			if flockErr := lockFile(lock); flockErr == nil {
 				defer func() {
@@ -816,12 +832,14 @@ func sleepWithin(deadline time.Time, requested time.Duration) bool {
 	return true
 }
 
-var statusControlSendWithTimeout = control.SendWithTimeout
-var statusDaemonControlTimeout = 15 * time.Second
-var statusDaemonRetryWindow = 5 * time.Second
-var statusDaemonRetryDelay = 25 * time.Millisecond
-var statusSleep = time.Sleep
-var statusPipeHints = discoverStatusPipeHints
+var (
+	statusControlSendWithTimeout = control.SendWithTimeout
+	statusDaemonControlTimeout   = 15 * time.Second
+	statusDaemonRetryWindow      = 5 * time.Second
+	statusDaemonRetryDelay       = 25 * time.Millisecond
+	statusSleep                  = time.Sleep
+	statusPipeHints              = discoverStatusPipeHints
+)
 
 func runStatus() {
 	runStatusWithWriters(os.Stdout, os.Stderr)

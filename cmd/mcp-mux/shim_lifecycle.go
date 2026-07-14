@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	envShimIdleTimeout  = "MCPMUX_SHIM_IDLE_TIMEOUT"
-	envShimDormantGrace = "MCPMUX_SHIM_DORMANT_GRACE"
+	envShimIdleTimeout      = "MCPMUX_SHIM_IDLE_TIMEOUT"
+	envShimDormantGrace     = "MCPMUX_SHIM_DORMANT_GRACE"
+	envLauncherDormantLease = "MCPMUX_LAUNCHER_DORMANT_LEASE"
 
 	defaultShimIdleTimeout  = 10 * time.Minute
 	defaultShimDormantGrace = 30 * time.Second
@@ -36,6 +37,18 @@ func shimLifecycleDurations(getenv func(string) string) (time.Duration, time.Dur
 		parse(envShimDormantGrace, defaultShimDormantGrace)
 }
 
+func launcherDormantLease(getenv func(string) string) time.Duration {
+	raw := strings.TrimSpace(getenv(envLauncherDormantLease))
+	if raw == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
 func resilientClientExitCode(err error) int {
 	switch {
 	case err == nil:
@@ -47,21 +60,33 @@ func resilientClientExitCode(err error) int {
 	}
 }
 
-func canSuspendViaDaemon(token string) (bool, string, error) {
+func canSuspendViaDaemon(token, serverID string) (bool, string, error) {
 	resp, err := control.SendWithTimeout(
 		serverid.DaemonControlPath("", engineName),
-		control.Request{Cmd: "can_suspend", PrevToken: token},
+		control.Request{Cmd: "can_suspend", PrevToken: token, ServerID: serverID},
 		2*time.Second,
 	)
 	if err != nil {
 		return false, "", err
 	}
 	if !resp.OK {
-		return false, resp.Message, fmt.Errorf("can_suspend: %s", resp.Message)
+		// A shutting-down daemon is expected to come back. Every other negative
+		// protocol verdict is unsafe to retry for this connected shim, including
+		// v0.26.13's "unknown command: can_suspend" response.
+		if resp.Message == "daemon shutting down" {
+			return false, resp.Message, fmt.Errorf("can_suspend: %s", resp.Message)
+		}
+		return false, resp.Message, owner.ErrIdleSuspendGateUnavailable
 	}
-	var verdict control.SuspendCheckResponse
+	var verdict struct {
+		Allowed *bool  `json:"allowed"`
+		Reason  string `json:"reason"`
+	}
 	if err := json.Unmarshal(resp.Data, &verdict); err != nil {
-		return false, "", fmt.Errorf("can_suspend response: %w", err)
+		return false, "", owner.ErrIdleSuspendGateUnavailable
 	}
-	return verdict.Allowed, verdict.Reason, nil
+	if verdict.Allowed == nil || (!*verdict.Allowed && verdict.Reason == "") || verdict.Reason == "persistent" {
+		return false, verdict.Reason, owner.ErrIdleSuspendGateUnavailable
+	}
+	return *verdict.Allowed, verdict.Reason, nil
 }

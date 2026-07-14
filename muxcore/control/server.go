@@ -242,11 +242,15 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		return Response{OK: true, Token: newToken}, nil
 
 	case "can_suspend":
-		sh, ok := s.handler.(SuspendCheckHandler)
-		if !ok {
+		var result SuspendCheckResponse
+		var err error
+		if sh, ok := s.handler.(SuspendCheckForOwnerHandler); ok {
+			result, err = sh.HandleCanSuspendForOwner(req.PrevToken, req.ServerID)
+		} else if sh, ok := s.handler.(SuspendCheckHandler); ok {
+			result, err = sh.HandleCanSuspend(req.PrevToken)
+		} else {
 			return Response{OK: false, Message: "can_suspend not supported"}, nil
 		}
-		result, err := sh.HandleCanSuspend(req.PrevToken)
 		if err != nil {
 			return Response{OK: false, Message: err.Error()}, nil
 		}

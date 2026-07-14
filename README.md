@@ -578,9 +578,45 @@ All configuration is via environment variables. No config file is required.
 | `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global deduplication) |
 | `MCPMUX_SHIM_IDLE_TIMEOUT` | `10m` | Safe host-idle period before a non-persistent shim parks its daemon IPC session; zero or negative disables |
 | `MCPMUX_SHIM_DORMANT_GRACE` | `30s` | Exact-owner reconnect window before a supervised launcher becomes dormant; zero or negative disables |
+| `MCPMUX_LAUNCHER_DORMANT_LEASE` | disabled | Explicit opt-in to exit a dormant launcher after this additional no-demand lease. Use only with a host proven to relaunch after transport closure. |
 | `MCP_MUX_OWNER_IDLE` | `10m` | General owner idle timeout; overridden per owner by `x-mux.idleTimeout` |
 | `MCP_MUX_GRACE` | `10m` | Legacy alias used only when `MCP_MUX_OWNER_IDLE` is unset |
 | `MCP_MUX_IDLE_TIMEOUT` | `5m` | Daemon auto-exit after this period with no activity |
+
+### Transport lifecycle and host boundary
+
+MCP stdio has no standard logical-completion signal: the host owns termination by
+closing child stdin, while a server may send notifications or requests during an
+otherwise silent interval. `mcp-mux` therefore exits on host EOF but does not
+kill a silent live stdio transport by default. A capable launcher parks its
+engine after the shim idle/grace sequence and retains a small launcher stub for
+later demand. `MCPMUX_LAUNCHER_DORMANT_LEASE` bounds the complete disposable
+launcher/engine tree only as an explicit host-compatibility opt-in.
+
+The installed stable launcher and active versioned engine are distinct binaries
+and may differ byte-for-byte. Private dormant frames require protocol-v2
+target-bound attestation: before spawning the engine, the launcher binds a
+one-shot current-user-only local IPC endpoint; the engine verifies that the
+endpoint's server PID is its direct parent and exchanges fixed proof bytes on
+that side channel, never on host stdio. The provider-derived version-store
+layout, active-engine pointer, and direct-parent executable path must also match
+the installed stable launcher. Custom or copied engine paths fail closed.
+
+Forwarding the endpoint environment through a v0.27.0-or-older launcher does
+not transfer capability: the endpoint server remains an ancestor rather than
+the engine's direct parent. That running session stays fail-closed and receives
+no private dormant frames. The verified child may bootstrap the stable launcher
+for future invocations with the rollback-capable two-rename swap; restart only a
+host/session still running under the pre-v2 launcher before expecting launcher
+dormancy or a lease.
+
+Customer-mode proof remains required for host relaunch behavior and live Windows
+executable swapping. Windows verifies the named-pipe server with
+`GetNamedPipeServerProcessId`, Linux uses `SO_PEERCRED`, and macOS uses
+`LOCAL_PEERPID`; the existing parent-image checks use the Windows process image,
+`/proc/<ppid>/exe`, and `kern.procargs2` respectively. Unsupported platforms,
+including BSD targets without both proofs, fail closed and never emit private
+dormant frames.
 
 ## Control Plane MCP Server
 

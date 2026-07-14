@@ -7,6 +7,56 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.27.1] - 2026-07-14
+
+### Fixed
+
+- Fixed a permanent `can_suspend` retry herd during rolling coexistence: a
+  v0.27 shim could retry the v0.26.13 `unknown command: can_suspend` response
+  every five seconds, driving the daemon to multiple CPU cores when hundreds of
+  retained transports were present.
+- Fixed malformed, missing, unknown-token, owner-gone, and persistent-owner
+  gate outcomes being retried indefinitely. They now keep the data-plane IPC
+  connection open and disable idle suspension for that connection.
+- Fixed healthy `can_suspend` checks scaling with daemon owner count. Product
+  shims now send the exact spawn-returned owner ID, while the owner-local token
+  history and current owner entry remain authoritative.
+
+### Changed
+
+- Persistent owner retention and downstream transport retention are separate:
+  persistent consumers retain transports by default, while products with an
+  explicit no-background-events or buffering contract can opt into
+  `AllowPersistentIdleSuspend`.
+- `engine.New` now automatically binds positive `IdleSuspendDelay` values to
+  the exact spawn-returned daemon owner/token safety gate; direct resilient
+  clients still supply their own gate.
+- Private dormant frames now require protocol-v2 target-bound launcher
+  attestation over a one-shot local IPC endpoint, plus direct-parent executable
+  and active-engine proof. Forwarded environments from old launchers fail
+  closed; verified active children may bootstrap the stable launcher for future
+  invocations after one host/session restart.
+- `MCPMUX_LAUNCHER_DORMANT_LEASE` offers explicit bounded full-transport exit
+  for hosts proven to relaunch after closure; it is disabled by default.
+
+- Retryable daemon/transport failures now use capped per-token exponential
+  backoff with jitter. Busy, pending-request, and active-progress denials remain
+  recheckable without a synchronized fixed cadence.
+
+### Verification
+
+- Added the exact v0.26.13 wire response, malformed-response, live cross-owner,
+  stale same-ID recreation, deterministic lookup-count, and retry-cap tests.
+- Added mixed-version runtime proof with a real v0.26.13 daemon and v0.27.1
+  shim: one failed gate probe, no later polling across two former retry windows,
+  live host stdio, and zero run-scoped survivors.
+- Added live Windows and Linux proof that a direct child accepts launcher
+  attestation while the same endpoint forwarded through an intermediate old
+  launcher is rejected without writing private bytes to host stdout.
+- Added Unix success-path socket removal and command-start cancellation
+  regressions so failed supervisor respawn loops cannot accumulate attestation
+  endpoints or file descriptors.
+
 ## [0.27.0] - 2026-07-13
 
 ### Added
@@ -62,5 +112,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...HEAD
+[0.27.1]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/thebtf/mcp-mux/compare/v0.26.13...v0.27.0

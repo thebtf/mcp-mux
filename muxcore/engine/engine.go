@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -63,6 +64,10 @@ const (
 	// It should not pay the upstream spawn/init budget because it only consults
 	// live owner session history and mints a token.
 	refreshRPCTimeout = 5 * time.Second
+
+	// suspendCheckRPCTimeout bounds the exact-owner daemon safety check before a
+	// reusable engine parks its IPC transport.
+	suspendCheckRPCTimeout = 2 * time.Second
 
 	// reconnectDaemonWaitTimeout gives a planned restart successor a short
 	// window to bind the control socket before an existing shim self-starts
@@ -187,6 +192,20 @@ type Config struct {
 	// Set to owner.StdinEOFWaitForDisconnect for engine consumers where
 	// stdin is an internal pipe (not a CC shutdown signal).
 	StdinEOFPolicy owner.StdinEOFPolicy
+
+	// IdleSuspendDelay and IdleDormantGrace expose muxcore's reusable
+	// downstream-shim lifecycle to engine.New consumers. Zero values preserve
+	// the pre-v0.27 always-connected behavior. A positive delay automatically
+	// asks the owning daemon to prove the exact owner has no pending, progress,
+	// or busy work before the transport can park; old or unavailable daemons
+	// fail closed. A positive dormant grace still needs a consumer-owned capable
+	// supervisor; otherwise leave it zero.
+	IdleSuspendDelay time.Duration
+	IdleDormantGrace time.Duration
+	// AllowPersistentIdleSuspend is an explicit assertion that this product has
+	// no unbuffered server-to-client background traffic for the suspended shim.
+	// Persistent owners retain their downstream transports by default.
+	AllowPersistentIdleSuspend bool
 
 	// AuthorizeSession, when non-nil, is invoked once per session AFTER the
 	// initial IPC handshake completes (peer credentials populated on
@@ -476,7 +495,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	env := collectEnv()
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
-	ipcPath, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
+	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
 	if err != nil {
 		return fmt.Errorf("engine client: spawn: %w", err)
 	}
@@ -509,27 +528,41 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "reconnect"); err != nil {
 			return "", "", err
 		}
-		newIPC, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", e.logger)
+		newIPC, newServerID, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", e.logger)
 		if err != nil {
 			return "", "", err
 		}
 		currentIPC = newIPC
+		serverID = newServerID
 		currentToken = newToken
 		return newIPC, newToken, nil
 	}
 
 	return runResilientClient(owner.ResilientClientConfig{
-		Stdin:          os.Stdin,
-		Stdout:         os.Stdout,
-		InitialIPCPath: ipcPath,
-		Token:          token,
-		OnInject:       e.cfg.OnInject,
-		RefreshToken:   refreshFn,
-		Reconnect:      reconnectFn,
-		StdinEOFPolicy: e.cfg.StdinEOFPolicy,
-		EnginePrefix:   e.cfg.Name,
-		Logger:         e.logger,
+		Stdin:            os.Stdin,
+		Stdout:           os.Stdout,
+		InitialIPCPath:   ipcPath,
+		Token:            token,
+		OnInject:         e.cfg.OnInject,
+		RefreshToken:     refreshFn,
+		Reconnect:        reconnectFn,
+		StdinEOFPolicy:   e.cfg.StdinEOFPolicy,
+		IdleSuspendDelay: idleSuspendDelay(e.cfg),
+		IdleSuspendGate: func() (bool, string, error) {
+			return canSuspendViaDaemon(ctlPath, currentToken, serverID)
+		},
+		IdleDormantGrace:           e.cfg.IdleDormantGrace,
+		AllowPersistentIdleSuspend: e.cfg.AllowPersistentIdleSuspend,
+		EnginePrefix:               e.cfg.Name,
+		Logger:                     e.logger,
 	})
+}
+
+func idleSuspendDelay(cfg Config) time.Duration {
+	if cfg.Persistent && !cfg.AllowPersistentIdleSuspend {
+		return 0
+	}
+	return cfg.IdleSuspendDelay
 }
 
 func (e *MuxEngine) ensureDaemonForReconnect(ctlPath, operation string) error {
@@ -741,12 +774,13 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 }
 
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path
-// and handshake token for the owner that will serve our server identity.
-func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, error) {
+// server identity, and handshake token for the owner that will serve our server
+// identity.
+func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, string, error) {
 	return spawnViaDaemonWithReason(ctlPath, command, args, cwd, mode, env, "", logger)
 }
 
-func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, error) {
+func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, string, error) {
 	// spawnRPCTimeout covers daemon processing + upstream process start + proactive init.
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:             "spawn",
@@ -758,10 +792,10 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 		ReconnectReason: reconnectReason,
 	}, spawnRPCTimeout)
 	if err != nil {
-		return "", "", fmt.Errorf("spawn via daemon: %w", err)
+		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
-		return "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 
 	sid := resp.ServerID
@@ -769,7 +803,45 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 		sid = sid[:8]
 	}
 	logger.Printf("engine client: daemon spawned server %s at %s", sid, resp.IPCPath)
-	return resp.IPCPath, resp.Token, nil
+	return resp.IPCPath, resp.ServerID, resp.Token, nil
+}
+
+// canSuspendViaDaemon binds parking to the exact owner returned by spawn. It
+// deliberately shares the product shim's failure direction: unsupported,
+// malformed, mismatched, and unavailable daemon replies never permit parking.
+func canSuspendViaDaemon(ctlPath, token, serverID string) (bool, string, error) {
+	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+		Cmd:       "can_suspend",
+		PrevToken: token,
+		ServerID:  serverID,
+	}, suspendCheckRPCTimeout)
+	if err != nil {
+		return false, "", err
+	}
+	return decodeCanSuspendResponse(resp)
+}
+
+func decodeCanSuspendResponse(resp *control.Response) (bool, string, error) {
+	if resp == nil {
+		return false, "", owner.ErrIdleSuspendGateUnavailable
+	}
+	if !resp.OK {
+		if resp.Message == daemon.ErrDaemonShuttingDown.Error() {
+			return false, resp.Message, fmt.Errorf("can_suspend: %s", resp.Message)
+		}
+		return false, resp.Message, owner.ErrIdleSuspendGateUnavailable
+	}
+	var verdict struct {
+		Allowed *bool  `json:"allowed"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal(resp.Data, &verdict); err != nil {
+		return false, "", owner.ErrIdleSuspendGateUnavailable
+	}
+	if verdict.Allowed == nil || (!*verdict.Allowed && verdict.Reason == "") || verdict.Reason == "persistent" {
+		return false, "", owner.ErrIdleSuspendGateUnavailable
+	}
+	return *verdict.Allowed, verdict.Reason, nil
 }
 
 func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (string, error) {

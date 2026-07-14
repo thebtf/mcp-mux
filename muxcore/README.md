@@ -10,15 +10,19 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 ## Install
 
-Pin the tagged muxcore module. Do not depend on `latest` for production
+Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
+After the `muxcore/v0.27.1` tag is published and resolves through the Go proxy,
+upgrade with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
 ```
 
-Use v0.27.0 as the current consumer target. It includes the v0.25.3 native
-SessionHandler hot-update contract (`RestartWithSuccessor` /
+Until that tag resolves, keep production consumers on v0.26.13; do not pin this
+branch or a pseudo-version. Use v0.27.1 as the consumer target after publication.
+
+v0.27.1 includes the v0.25.3 native SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
 v0.26.6 auto-managed engine namespace. It also preserves snapshot-restored
@@ -31,7 +35,34 @@ request. Reconnect timeout now enters degraded retry instead of closing the
 parent stdio transport, and zero-session disposable owners are cleaned
 automatically after a short safety-gated delay. v0.27.0 adds opt-in shim
 idle/dormant controls, protocol-v2 tree-authority handoff, and full process-tree
-containment.
+containment. v0.27.1 prevents permanent idle-gate outcomes from creating a
+control-plane retry herd and binds normal product gate checks to one exact
+owner.
+
+### v0.27.1 - idle-gate rolling-compatibility hotfix
+
+**No required consumer code changes for ordinary `engine.New` users.** A
+positive `engine.Config.IdleSuspendDelay` now automatically wires the exact
+spawn-returned owner/token safety check. Direct `owner.RunResilientClient`
+consumers remain responsible for supplying `IdleSuspendGate` before enabling
+suspension; a nil direct-client gate is only local checking.
+
+- `owner.ErrIdleSuspendGateUnavailable` keeps the current IPC connection open
+  and disables further suspension attempts for that connection;
+- transient gate errors use capped, per-token jittered exponential backoff;
+- the product daemon's additive `control.SuspendCheckForOwnerHandler` path uses
+  the spawn-returned owner ID to avoid daemon-wide token-history scans. The
+  legacy `SuspendCheckHandler` path remains available for older callers.
+
+The safety contract remains fail closed: an unavailable or invalid gate never
+authorizes suspension. Persistent owners retain their downstream transport by
+default; explicit `AllowPersistentIdleSuspend` still requires the same exact
+pending-request, active-progress, and busy-work gate.
+
+Release-candidate handoff status: `CONSUMER_HANDOFF_BLOCKED`. Aimux remains on
+v0.26.13 until `muxcore/v0.27.1` is published and its consumer smoke tests pass.
+Adopting the product-private dormant launcher is separately blocked on the
+reusable native-consumer contract tracked in mcp-mux issue #140.
 
 ### v0.27.0 - lifecycle convergence and process-tree authority
 
@@ -43,13 +74,20 @@ direct resilient-client controls are additive:
 | `owner.ResilientClientConfig.IdleSuspendDelay` | Parks daemon IPC after safe host inactivity. Zero disables and preserves the prior always-connected behavior. |
 | `owner.ResilientClientConfig.IdleSuspendGate` | Optional final safety check before parking. A nil gate relies on local checks; errors and denials keep IPC connected. |
 | `owner.ResilientClientConfig.IdleDormantGrace` | Positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. Zero or negative keeps the suspended shim process alive. |
+| `owner.ResilientClientConfig.AllowPersistentIdleSuspend` | False by default. Set true only when this shim has no unbuffered server-to-client background traffic, or the consumer owns buffering/replay. Persistent owners otherwise retain their downstream transport. |
 
 The `mcp-mux` product wires 10-minute idle and 30-second dormant defaults from
 `MCPMUX_SHIM_IDLE_TIMEOUT` and `MCPMUX_SHIM_DORMANT_GRACE`. Those environment
 variables belong to the product wrapper; native muxcore consumers opt in with
-the fields above and should use their own launcher protocol if they want process
-dormancy. Persistent owners (`engine.Config.Persistent` or
-`x-mux.persistent: true`) remain connected and are not idle-suspended.
+`engine.Config` or `owner.ResilientClientConfig`. Products with custom shims
+must migrate that shim to these provider controls before removing local retry
+or stale-daemon kill logic; a dependency bump alone cannot change a wrapper
+that bypasses muxcore's client lifecycle.
+Native engine consumers use the automatic gate above and need their own
+launcher protocol only if they want process dormancy. Persistent owners
+(`engine.Config.Persistent` or `x-mux.persistent: true`) remain connected
+unless they explicitly set `AllowPersistentIdleSuspend`; that opt-in never
+bypasses the daemon safety gate.
 
 The stable launcher also keeps its replacement-handshake budget longer than
 the shim's daemon-spawn budget, so cold wake cannot create retry fanout merely
