@@ -267,7 +267,17 @@ func TestLauncherAttestationHelper(t *testing.T) {
 	}
 }
 
+func requireLauncherAttestationPlatform(t *testing.T) {
+	t.Helper()
+	switch runtime.GOOS {
+	case "windows", "linux", "darwin":
+	default:
+		t.Skip("launcher attestation is unsupported on this platform")
+	}
+}
+
 func TestLauncherAttestationBindsServerToDirectParent(t *testing.T) {
+	requireLauncherAttestationPlatform(t)
 	for _, tc := range []struct {
 		name string
 		mode string
@@ -296,6 +306,7 @@ func TestLauncherAttestationBindsServerToDirectParent(t *testing.T) {
 }
 
 func TestLauncherAttestationSuccessRemovesUnixEndpoint(t *testing.T) {
+	requireLauncherAttestationPlatform(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows named pipes do not leave filesystem socket paths")
 	}

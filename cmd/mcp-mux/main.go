@@ -57,9 +57,6 @@ func main() {
 	if handled, exitCode := maybeRunLauncher(); handled {
 		os.Exit(exitCode)
 	}
-	// Consume the one-shot launcher attestation before daemon startup can delay
-	// the child beyond the bounded parent listener lifetime.
-	launcherLifecycleOK := launcherLifecycleCapable()
 
 	// Check for subcommands BEFORE flag.Parse() — subcommands have their own flags.
 	if len(os.Args) > 1 {
@@ -191,6 +188,9 @@ func main() {
 	// gets rejected as "invalid/missing token".
 	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
 	if !noDaemon {
+		// Consume the one-shot launcher attestation before daemon startup can
+		// delay the child beyond the bounded parent listener lifetime.
+		launcherLifecycleOK := launcherLifecycleCapable()
 		ensureStart := time.Now()
 		if err := ensureDaemon(logger); err != nil {
 			logger.Printf("shim startup step=ensure_daemon status=error duration=%v err=%q daemon_required=true",

@@ -23,28 +23,33 @@ func directParentExecutable() (string, error) {
 	}
 	for {
 		if entry.ProcessID == pid {
-			h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ParentProcessID)
-			if err != nil {
-				return "", err
-			}
-			defer windows.CloseHandle(h)
-			size := uint32(windows.MAX_PATH)
-			buf := make([]uint16, size)
-			for {
-				if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err == nil {
-					return windows.UTF16ToString(buf[:size]), nil
-				} else if err != windows.ERROR_INSUFFICIENT_BUFFER {
-					return "", err
-				}
-				size *= 2
-				buf = make([]uint16, size)
-			}
+			return windowsProcessExecutable(entry.ParentProcessID)
 		}
 		if err := windows.Process32Next(snapshot, &entry); err != nil {
 			break
 		}
 	}
 	return "", fmt.Errorf("current process %d not found", pid)
+}
+
+func windowsProcessExecutable(pid uint32) (string, error) {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return "", err
+	}
+	defer windows.CloseHandle(h)
+
+	size := uint32(windows.MAX_PATH)
+	buf := make([]uint16, size)
+	for {
+		if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err == nil {
+			return windows.UTF16ToString(buf[:size]), nil
+		} else if err != windows.ERROR_INSUFFICIENT_BUFFER {
+			return "", err
+		}
+		size *= 2
+		buf = make([]uint16, size)
+	}
 }
 
 func launcherAttestationServerPID(conn net.Conn) (int, error) {

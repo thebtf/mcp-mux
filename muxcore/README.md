@@ -10,15 +10,19 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 ## Install
 
-Pin the tagged muxcore module. Do not depend on `latest` for production
+Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
+After the `muxcore/v0.27.1` tag is published and resolves through the Go proxy,
+upgrade with:
 
 ```bash
 go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
 ```
 
-Use v0.27.1 as the current consumer target. It includes the v0.25.3 native
-SessionHandler hot-update contract (`RestartWithSuccessor` /
+Until that tag resolves, keep production consumers on v0.26.13; do not pin this
+branch or a pseudo-version. Use v0.27.1 as the consumer target after publication.
+
+v0.27.1 includes the v0.25.3 native SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
 v0.26.6 auto-managed engine namespace. It also preserves snapshot-restored
@@ -54,6 +58,11 @@ The safety contract remains fail closed: an unavailable or invalid gate never
 authorizes suspension. Persistent owners retain their downstream transport by
 default; explicit `AllowPersistentIdleSuspend` still requires the same exact
 pending-request, active-progress, and busy-work gate.
+
+Release-candidate handoff status: `CONSUMER_HANDOFF_BLOCKED`. Aimux remains on
+v0.26.13 until `muxcore/v0.27.1` is published and its consumer smoke tests pass.
+Adopting the product-private dormant launcher is separately blocked on the
+reusable native-consumer contract tracked in mcp-mux issue #140.
 
 ### v0.27.0 - lifecycle convergence and process-tree authority
 
