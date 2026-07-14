@@ -67,7 +67,7 @@ func currentEngineInstallLayout() (enginePath, launcherPath, activeFile string, 
 	}
 	versionDir := filepath.Dir(enginePath)
 	storeDir := filepath.Dir(versionDir)
-	launcherName := strings.TrimSuffix(strings.TrimSuffix(engineFileName(), ".exe"), "-engine")
+	launcherName := launcherFileName()
 	if filepath.Base(versionDir) == "." || filepath.Base(storeDir) != "mcp-mux.versions" {
 		return "", "", "", false
 	}

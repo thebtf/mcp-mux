@@ -4,15 +4,15 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
-	"strings"
 	"testing"
 )
 
 func launcherCapabilityTestLayout(t *testing.T, launcherContents, engineContents string) (string, string, string) {
 	t.Helper()
 	dir := t.TempDir()
-	launcherPath := filepath.Join(dir, strings.TrimSuffix(strings.TrimSuffix(engineFileName(), ".exe"), "-engine"))
+	launcherPath := filepath.Join(dir, launcherFileName())
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "candidate", engineFileName())
 	writeTestFile(t, launcherPath, launcherContents)
 	writeTestFile(t, enginePath, engineContents)
@@ -20,6 +20,16 @@ func launcherCapabilityTestLayout(t *testing.T, launcherContents, engineContents
 		t.Fatalf("write active engine: %v", err)
 	}
 	return launcherPath, enginePath, activeEngineFile(launcherPath)
+}
+
+func TestLauncherFileNamePreservesPlatformExtension(t *testing.T) {
+	want := "mcp-mux"
+	if runtime.GOOS == "windows" {
+		want = "mcp-mux.exe"
+	}
+	if got := launcherFileName(); got != want {
+		t.Fatalf("launcherFileName() = %q, want %q", got, want)
+	}
 }
 
 func TestLauncherLifecycleCapabilityRejectsForgedEnvironment(t *testing.T) {

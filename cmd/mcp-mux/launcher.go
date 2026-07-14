@@ -543,6 +543,12 @@ func engineFileName() string {
 	return "mcp-mux-engine"
 }
 
+func launcherFileName() string {
+	engineName := engineFileName()
+	ext := filepath.Ext(engineName)
+	return strings.TrimSuffix(strings.TrimSuffix(engineName, ext), "-engine") + ext
+}
+
 func samePath(a, b string) bool {
 	absA, errA := filepath.Abs(a)
 	absB, errB := filepath.Abs(b)
