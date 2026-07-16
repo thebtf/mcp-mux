@@ -190,7 +190,8 @@ type Owner struct {
 	// where the upstream is started asynchronously via SpawnUpstreamBackground.
 	// It is closed (under mu) when background spawn finishes (success or failure),
 	// allowing Serve to block instead of treating nil upstream as dead.
-	backgroundSpawnCh chan struct{}
+	backgroundSpawnCh         chan struct{}
+	beforeBackgroundSpawnWait func() // test-only synchronization seam; nil in production
 
 	respawnMu sync.Mutex
 	respawn   *upstreamRespawn
@@ -1289,6 +1290,23 @@ func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
 }
 
 func (o *Owner) ensureUpstreamReadyForRequest() error {
+	o.mu.RLock()
+	backgroundSpawnCh := o.backgroundSpawnCh
+	o.mu.RUnlock()
+	if backgroundSpawnCh != nil {
+		if o.beforeBackgroundSpawnWait != nil {
+			o.beforeBackgroundSpawnWait()
+		}
+		timer := time.NewTimer(upstreamRespawnWaitTimeout)
+		defer timer.Stop()
+		select {
+		case <-backgroundSpawnCh:
+		case <-timer.C:
+			return fmt.Errorf("background upstream spawn still pending after %s", upstreamRespawnWaitTimeout)
+		case <-o.done:
+			return errors.New("owner shutting down")
+		}
+	}
 	if o.hasWritableUpstream() && !o.upstreamDead.Load() {
 		return nil
 	}
