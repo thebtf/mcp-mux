@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-07-17
+
+### Fixed
+
+- Fixed snapshot/template background startup racing the first uncached request
+  into a second upstream respawn for the same owner. The request path now waits
+  on the existing bounded background start before deciding whether a replacement
+  is needed, preserving one authoritative upstream process tree.
+
 ## [0.27.1] - 2026-07-14
 
 ### Fixed
@@ -112,6 +121,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.2...HEAD
+[0.27.2]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/thebtf/mcp-mux/compare/v0.26.13...v0.27.0

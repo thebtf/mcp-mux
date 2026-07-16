@@ -12,17 +12,17 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-After the `muxcore/v0.27.1` tag is published and resolves through the Go proxy,
+After the `muxcore/v0.27.2` tag is published and resolves through the Go proxy,
 upgrade with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.2
 ```
 
-Until that tag resolves, keep production consumers on v0.26.13; do not pin this
-branch or a pseudo-version. Use v0.27.1 as the consumer target after publication.
+Until that tag resolves, keep production consumers on v0.27.1; do not pin this
+branch or a pseudo-version. Use v0.27.2 as the consumer target after publication.
 
-v0.27.1 includes the v0.25.3 native SessionHandler hot-update contract (`RestartWithSuccessor` /
+v0.27.2 includes the v0.25.3 native SessionHandler hot-update contract (`RestartWithSuccessor` /
 `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
 occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
 v0.26.6 auto-managed engine namespace. It also preserves snapshot-restored
@@ -37,7 +37,25 @@ automatically after a short safety-gated delay. v0.27.0 adds opt-in shim
 idle/dormant controls, protocol-v2 tree-authority handoff, and full process-tree
 containment. v0.27.1 prevents permanent idle-gate outcomes from creating a
 control-plane retry herd and binds normal product gate checks to one exact
-owner.
+owner. v0.27.2 makes a first uncached request join an already-pending
+snapshot/template background start instead of creating a competing upstream
+generation for the same owner.
+
+### v0.27.2 - template background-spawn ownership gate
+
+**No required consumer code changes for ordinary `engine.New` users.** When a
+snapshot/template owner already has `SpawnUpstreamBackground` in progress, the
+request-readiness path waits for that bounded start before deciding whether a
+request-triggered respawn is needed. A completed start with a writable upstream
+is reused; timeout, owner shutdown, or a completed start without a usable
+upstream follows the existing explicit error/respawn behavior.
+
+This preserves one authoritative upstream process tree per owner and prevents
+duplicate source-checkout launches, locked entrypoint replacement failures, and
+respawn storms from this race. Consumers must not add product-local spawn locks,
+file-replacement retries, PID sweeps, stale-process kill loops, or parallel
+lifecycle mechanisms. Demand-driven template materialization is a separate
+future architecture change; v0.27.2 is the conservative ownership repair.
 
 ### v0.27.1 - idle-gate rolling-compatibility hotfix
 
@@ -59,10 +77,10 @@ authorizes suspension. Persistent owners retain their downstream transport by
 default; explicit `AllowPersistentIdleSuspend` still requires the same exact
 pending-request, active-progress, and busy-work gate.
 
-Release-candidate handoff status: `CONSUMER_HANDOFF_BLOCKED`. Aimux remains on
-v0.26.13 until `muxcore/v0.27.1` is published and its consumer smoke tests pass.
-Adopting the product-private dormant launcher is separately blocked on the
-reusable native-consumer contract tracked in mcp-mux issue #140.
+`muxcore/v0.27.1` is published and its consumer handoff completed. Aimux's
+v0.27.1 adoption retained persistent connected transport; native persistent-
+client dormancy remains separately blocked on the reusable consumer contract
+tracked in mcp-mux issue #140.
 
 ### v0.27.0 - lifecycle convergence and process-tree authority
 
