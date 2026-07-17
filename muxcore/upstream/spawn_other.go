@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"syscall"
+	"time"
 )
 
 func afterSpawnWindows(p *Process, pid int) error { return nil }
@@ -19,7 +20,9 @@ func (p *Process) takeProcessGroupAuthority() int {
 }
 
 func terminateProcessTree(p *Process) error {
-	pgid := p.takeProcessGroupAuthority()
+	p.authorityMu.Lock()
+	defer p.authorityMu.Unlock()
+	pgid := p.spawnPgid
 	if pgid <= 0 {
 		if p.proc == nil {
 			return nil
@@ -28,9 +31,32 @@ func terminateProcessTree(p *Process) error {
 	}
 	err := syscall.Kill(-pgid, syscall.SIGKILL)
 	if errors.Is(err, syscall.ESRCH) {
+		p.spawnPgid = 0
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+
+	deadline := time.NewTimer(processTreeRetirementTimeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		err = syscall.Kill(-pgid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			p.spawnPgid = 0
+			return nil
+		}
+		if err != nil && !errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("probe process group %d: %w", pgid, err)
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return fmt.Errorf("process group %d retirement not proven after %s", pgid, processTreeRetirementTimeout)
+		}
+	}
 }
 
 func releaseTreeAuthority(p *Process) error {

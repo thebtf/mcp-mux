@@ -1,7 +1,13 @@
 package owner
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -131,6 +137,7 @@ func TestShutdownForHandoff_DetachFailureAbortsTreeAndCompletesOwner(t *testing.
 	if err != nil {
 		t.Fatalf("NewOwner: %v", err)
 	}
+	waitForCondition(t, 5*time.Second, o.CacheReady, "owner did not finish initial materialization")
 
 	o.mu.RLock()
 	proc := o.upstream
@@ -155,5 +162,108 @@ func TestShutdownForHandoff_DetachFailureAbortsTreeAndCompletesOwner(t *testing.
 	case <-proc.Done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("upstream tree survived detach failure cleanup")
+	}
+}
+
+func TestShutdownForHandoffWaitsForMaterializationQuiescence(t *testing.T) {
+	toolsSeen := make(chan struct{})
+	releaseTools := make(chan struct{})
+	var toolsOnce sync.Once
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"handoff","version":"1"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				toolsOnce.Do(func() { close(toolsSeen) })
+				<-releaseTools
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, OwnerSnapshot{})
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	o.SpawnUpstreamBackground()
+	select {
+	case <-toolsSeen:
+	case <-time.After(time.Second):
+		t.Fatal("materialization did not reach discovery")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, handoffErr := o.ShutdownForHandoff()
+		errCh <- handoffErr
+	}()
+	select {
+	case err := <-errCh:
+		t.Fatalf("handoff returned before materialization quiesced: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseTools)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, upstream.ErrDetachUnsupported) {
+			t.Fatalf("ShutdownForHandoff error=%v, want ErrDetachUnsupported", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handoff did not continue after materialization quiesced")
+	}
+	select {
+	case <-o.Done():
+	case <-time.After(time.Second):
+		t.Fatal("handoff failure left owner incomplete")
+	}
+}
+
+func TestHandoffAdoptsCacheWithoutProactiveInitialize(t *testing.T) {
+	received := make(chan string, 1)
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			received <- scanner.Text()
+		}
+		return scanner.Err()
+	})
+	snap := controllerSnapshot()
+	snap.Classification = "session-aware"
+	o, err := newOwnerWithProcess(OwnerConfig{
+		IPCPath:              testIPCPath(t),
+		ServerID:             "handoff-cache-adoption",
+		CachedClassification: snap.Classification,
+		AdoptedSnapshot:      &snap,
+		Logger:               testLogger(t),
+	}, HandoffPayload{ServerID: "handoff-cache-adoption", Command: "adopted"}, proc)
+	if err != nil {
+		t.Fatalf("newOwnerWithProcess: %v", err)
+	}
+	defer o.Shutdown()
+	if !o.CacheReady() || !strings.Contains(string(o.getCachedResponse("tools/list")), "old-tool") {
+		t.Fatalf("handoff did not adopt coherent cache: %#v", o.Status())
+	}
+	select {
+	case line := <-received:
+		t.Fatalf("handoff sent duplicate proactive request: %s", line)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

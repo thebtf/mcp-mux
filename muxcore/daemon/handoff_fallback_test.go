@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 // setupTestHandoffTimeouts overrides the package-level handoff timeout
@@ -27,7 +28,7 @@ func setupTestHandoffTimeouts(t *testing.T) {
 
 func seedProcessBackedOwner(t *testing.T, d *Daemon) {
 	t.Helper()
-	_, _, _, err := d.Spawn(control.Request{
+	_, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -37,6 +38,10 @@ func seedProcessBackedOwner(t *testing.T, d *Daemon) {
 	if err != nil {
 		t.Fatalf("Spawn() process-backed owner: %v", err)
 	}
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		entry := d.Entry(sid)
+		return entry != nil && entry.Owner != nil && entry.Owner.MaterializationState() == owner.MaterializationReady
+	}, "process-backed owner did not finish eager materialization")
 }
 
 // TestHandoffFallbackOnAcceptTimeout verifies that HandleGracefulRestart returns

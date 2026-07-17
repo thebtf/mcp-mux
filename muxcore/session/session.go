@@ -39,9 +39,9 @@ type Session struct {
 	Env          map[string]string // per-session env diff bound via token handshake
 	reader       *jsonrpc.Scanner
 	writer       io.Writer
-	conn         net.Conn   // underlying connection for write deadlines (nil for stdio)
-	closer       io.Closer  // underlying connection (net.Conn for IPC sessions, nil for stdio)
-	mu           sync.Mutex // protects writer
+	conn         net.Conn    // underlying connection for write deadlines (nil for stdio)
+	closer       io.Closer   // underlying connection (net.Conn for IPC sessions, nil for stdio)
+	mu           sync.Mutex  // protects writer
 	notifCh      chan []byte // async notification send buffer (drained by drainNotifications goroutine)
 	done         chan struct{}
 	closed       atomic.Bool

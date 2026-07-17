@@ -301,6 +301,19 @@ func (sm *Manager) IsPreRegistered(token string) bool {
 	return ok
 }
 
+// LookupPendingForOwner returns an unconsumed token's project context without
+// consuming it. The owner key must match exactly when the reservation is
+// owner-scoped. Returned environment data is cloned for authorization use.
+func (sm *Manager) LookupPendingForOwner(token, ownerKey string) (cwd string, env map[string]string, ok bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	pending, ok := sm.pending[token]
+	if !ok || (pending.OwnerKey != "" && pending.OwnerKey != ownerKey) {
+		return "", nil, false
+	}
+	return pending.Cwd, cloneEnv(pending.Env), true
+}
+
 // SweepExpiredPending removes pending tokens older than pendingTokenTTL.
 // Returns the number of swept entries. Called periodically by the daemon
 // to prevent memory leaks from orphan tokens (shim never connected after

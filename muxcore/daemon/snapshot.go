@@ -7,6 +7,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,6 +65,8 @@ func (d *Daemon) rehydrateRetryCounter(sid, cmd string, args []string, cwd strin
 	}
 }
 
+const restartMaterializationBarrierTimeout = 15 * time.Second
+
 // DaemonSnapshot is an alias for mcpsnapshot.DaemonSnapshot.
 // Re-exported here so daemon-internal code can reference it without
 // the package qualifier while tests continue to use the type directly.
@@ -74,36 +77,96 @@ func SnapshotPath() string {
 	return mcpsnapshot.SnapshotPath("")
 }
 
-// SerializeSnapshot walks all owners, exports their state, and delegates
-// to mcpsnapshot.Serialize for the atomic write.
-func (d *Daemon) SerializeSnapshot() (string, error) {
-	d.mu.RLock()
-	owners := make([]mcpsnapshot.OwnerSnapshot, 0, len(d.owners))
-	sessions := make([]mcpsnapshot.SessionSnapshot, 0)
+// snapshotOwnerPin is an immutable daemon-side view paired with an owner
+// lifetime lease. Owner-local state is exported only after d.mu is released.
+type snapshotOwnerPin struct {
+	entry                       *OwnerEntry
+	owner                       *owner.Owner
+	serverID                    string
+	mode                        string
+	env                         map[string]string
+	persistent                  bool
+	ownerGeneration             string
+	restoredFromOwnerGeneration string
+	restoreSource               string
+}
 
-	for sid, entry := range d.owners {
-		if entry.Owner == nil {
-			continue // skip placeholders
+type snapshotRestartLease struct {
+	once sync.Once
+	pins []*owner.RestartPin
+}
+
+func (l *snapshotRestartLease) Release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		for _, pin := range l.pins {
+			pin.Release()
 		}
-		snap := entry.Owner.ExportSnapshot()
-		snap.ServerID = sid
-		snap.Mode = entry.Mode
+	})
+}
+
+// SerializeSnapshot walks all owners, exports their state, and delegates
+// to mcpsnapshot.Serialize for the atomic write. Standalone callers release
+// restart pins after the snapshot is durable; graceful restart uses the
+// pinned variant below and retains the lease through predecessor shutdown.
+func (d *Daemon) SerializeSnapshot() (string, error) {
+	path, lease, err := d.serializeSnapshotPinned()
+	lease.Release()
+	return path, err
+}
+
+func (d *Daemon) serializeSnapshotPinned() (string, *snapshotRestartLease, error) {
+	pins, err := d.acquireSnapshotOwnerPins()
+	if err != nil {
+		return "", nil, err
+	}
+	defer d.releaseSnapshotOwnerPins(pins)
+
+	barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), restartMaterializationBarrierTimeout)
+	defer cancelBarrier()
+	ownerPins := make([]*owner.RestartPin, 0, len(pins))
+	keepOwnerPins := false
+	defer func() {
+		if keepOwnerPins {
+			return
+		}
+		for _, pin := range ownerPins {
+			pin.Release()
+		}
+	}()
+	for _, pin := range pins {
+		if d.beforeSnapshotOwnerExport != nil {
+			d.beforeSnapshotOwnerExport()
+		}
+		ownerPin, err := pin.owner.AcquireRestartPin(barrierCtx)
+		if err != nil {
+			return "", nil, fmt.Errorf("serialize owner %s materialization: %w", pin.serverID, err)
+		}
+		ownerPins = append(ownerPins, ownerPin)
+	}
+
+	owners := make([]mcpsnapshot.OwnerSnapshot, 0, len(pins))
+	sessions := make([]mcpsnapshot.SessionSnapshot, 0)
+	for i, pin := range pins {
+		snap, ownerSessions := ownerPins[i].Snapshot, ownerPins[i].Sessions
+		snap.ServerID = pin.serverID
+		snap.Mode = pin.mode
 		if snap.Env == nil {
-			snap.Env = entry.Env
+			snap.Env = cloneSnapshotStringMap(pin.env)
 		}
-		snap.Persistent = entry.Persistent
-		snap.OwnerGeneration = entry.OwnerGeneration
-		snap.RestoredFromGeneration = entry.RestoredFromOwnerGeneration
-		snap.RestoreSource = entry.RestoreSource
+		snap.Persistent = pin.persistent || snap.Persistent
+		snap.OwnerGeneration = pin.ownerGeneration
+		snap.RestoredFromGeneration = pin.restoredFromOwnerGeneration
+		snap.RestoreSource = pin.restoreSource
 		owners = append(owners, snap)
 
-		// Collect session metadata from this owner.
-		for _, ss := range entry.Owner.ExportSessions() {
-			ss.OwnerServerID = sid
+		for _, ss := range ownerSessions {
+			ss.OwnerServerID = pin.serverID
 			sessions = append(sessions, ss)
 		}
 	}
-	d.mu.RUnlock()
 
 	data := &DaemonSnapshot{
 		Version:          mcpsnapshot.SnapshotVersion,
@@ -115,7 +178,71 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 		Sessions:         sessions,
 	}
 
-	return mcpsnapshot.Serialize(data, d.logger)
+	path, err := mcpsnapshot.Serialize(data, d.logger)
+	if err != nil {
+		return "", nil, err
+	}
+	keepOwnerPins = true
+	return path, &snapshotRestartLease{pins: ownerPins}, nil
+}
+
+func (d *Daemon) acquireSnapshotOwnerPins() ([]snapshotOwnerPin, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for sid, entry := range d.owners {
+		if entry != nil && entry.Owner != nil && entry.removalInProgress {
+			return nil, fmt.Errorf("snapshot owner %s removal is still finalizing", shortServerID(sid))
+		}
+	}
+	pins := make([]snapshotOwnerPin, 0, len(d.owners))
+	for sid, entry := range d.owners {
+		if entry.Owner == nil {
+			continue
+		}
+		if entry.snapshotPins == 0 {
+			entry.snapshotUnpinned = make(chan struct{})
+		}
+		entry.snapshotPins++
+		pins = append(pins, snapshotOwnerPin{
+			entry:                       entry,
+			owner:                       entry.Owner,
+			serverID:                    sid,
+			mode:                        entry.Mode,
+			env:                         cloneSnapshotStringMap(entry.Env),
+			persistent:                  entry.Persistent,
+			ownerGeneration:             entry.OwnerGeneration,
+			restoredFromOwnerGeneration: entry.RestoredFromOwnerGeneration,
+			restoreSource:               entry.RestoreSource,
+		})
+	}
+	return pins, nil
+}
+
+func (d *Daemon) releaseSnapshotOwnerPins(pins []snapshotOwnerPin) {
+	d.mu.Lock()
+	for _, pin := range pins {
+		entry := pin.entry
+		if entry.snapshotPins <= 0 {
+			continue
+		}
+		entry.snapshotPins--
+		if entry.snapshotPins == 0 {
+			close(entry.snapshotUnpinned)
+			entry.snapshotUnpinned = nil
+		}
+	}
+	d.mu.Unlock()
+}
+
+func cloneSnapshotStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 // DeserializeSnapshot reads and validates a snapshot from the well-known path.
@@ -171,6 +298,159 @@ func (d *Daemon) tryHandoffReceive(ctx context.Context) *handoffReceipt {
 	return receipt
 }
 
+type snapshotRestorePlan struct {
+	snapshot mcpsnapshot.OwnerSnapshot
+	cfg      owner.OwnerConfig
+	env      map[string]string
+}
+
+func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) snapshotRestorePlan {
+	restoredEnv := mergeEnv(ownerSnap.Env)
+	command := ownerSnap.Command
+	args := append([]string(nil), ownerSnap.Args...)
+	cfg := owner.OwnerConfig{
+		Command:               command,
+		Args:                  args,
+		Env:                   restoredEnv,
+		Cwd:                   ownerSnap.Cwd,
+		IPCPath:               serverid.IPCPath("", d.namespace, ownerSnap.ServerID),
+		ControlPath:           serverid.ControlPath("", d.namespace, ownerSnap.ServerID),
+		ServerID:              ownerSnap.ServerID,
+		TokenHandshake:        true,
+		MaterializationPolicy: owner.MaterializationOnDemand,
+		PersistentPending:     ownerSnap.Persistent,
+		PersistentRequired:    d.persistent,
+		HandlerFunc:           d.handlerFunc,
+		SessionHandler:        d.sessionHandler,
+		AuthorizeSession:      d.authorizeSession,
+		OnFrameReceived:       d.onFrameReceived,
+		OnZeroSessions:        d.onZeroSessions,
+		OnUpstreamExit:        d.onUpstreamExit,
+		OnPersistentDetected: func(expected *owner.Owner) {
+			d.setOwnerPersistent(expected, true)
+		},
+		OnPersistentResolved: d.resolveOwnerPersistent,
+		OnCacheReady:         d.publishOwnerCache,
+		OnCacheInvalidated:   d.invalidateOwnerTemplate,
+		Logger:               log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", shortServerID(ownerSnap.ServerID)), log.LstdFlags|log.Lmicroseconds),
+	}
+	if d.persistent || ownerSnap.Persistent {
+		cfg.MaterializationPolicy = owner.MaterializationPersistent
+	}
+	return snapshotRestorePlan{snapshot: ownerSnap, cfg: cfg, env: restoredEnv}
+}
+
+func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffUpstream, restoreSource string, eager, publishTemplate bool) (*OwnerEntry, bool, error) {
+	snap := plan.snapshot
+	if isRestartRestoreMode() {
+		d.retireOldOwnerSockets(plan.cfg.IPCPath, plan.cfg.ControlPath)
+	}
+
+	var restoredOwner *owner.Owner
+	reattached := false
+	var err error
+	if handoff != nil {
+		plan.cfg.CachedClassification = snap.Classification
+		plan.cfg.AdoptedSnapshot = &snap
+		payload := owner.HandoffPayload{
+			ServerID:    snap.ServerID,
+			PID:         handoff.PID,
+			StdinFD:     handoff.StdinFD,
+			StdoutFD:    handoff.StdoutFD,
+			StderrFD:    handoff.StderrFD,
+			AuthorityFD: handoff.AuthorityFD,
+			Command:     handoff.Command,
+			Args:        snap.Args,
+			Cwd:         snap.Cwd,
+		}
+		restoredOwner, err = owner.NewOwnerFromHandoff(plan.cfg, payload)
+		reattached = err == nil
+	} else {
+		restoredOwner, err = owner.NewOwnerFromSnapshot(plan.cfg, snap)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	ownerGeneration, err := generateGeneration("owner")
+	if err != nil {
+		restoredOwner.Shutdown()
+		d.logger.Printf("snapshot: failed to generate owner generation for %s: %v", shortServerID(snap.ServerID), err)
+		return nil, false, err
+	}
+	var serviceToken suture.ServiceToken
+	if d.supervisor != nil {
+		serviceToken = d.supervisor.Add(restoredOwner)
+	}
+	effectivePersistent := d.persistent || snap.Persistent
+	entry := &OwnerEntry{
+		Owner:                       restoredOwner,
+		ServerID:                    snap.ServerID,
+		Command:                     snap.Command,
+		Args:                        append([]string(nil), snap.Args...),
+		Cwd:                         snap.Cwd,
+		Mode:                        snap.Mode,
+		Env:                         plan.env,
+		Persistent:                  effectivePersistent,
+		LastSession:                 time.Now(),
+		OwnerGeneration:             ownerGeneration,
+		RestoredFromOwnerGeneration: snap.OwnerGeneration,
+		RestoreSource:               restoreSource,
+		IdleTimeout:                 d.ownerIdleTimeout,
+		serviceToken:                serviceToken,
+	}
+	d.mu.Lock()
+	if _, exists := d.owners[snap.ServerID]; exists {
+		d.mu.Unlock()
+		if d.supervisor != nil {
+			d.supervisor.Remove(serviceToken)
+		}
+		restoredOwner.Shutdown()
+		return nil, false, fmt.Errorf("snapshot owner %s already registered", shortServerID(snap.ServerID))
+	}
+	d.owners[snap.ServerID] = entry
+	d.mu.Unlock()
+	restoredOwner.ResolvePersistent(effectivePersistent)
+	d.rehydrateRetryCounter(snap.ServerID, snap.Command, snap.Args, snap.Cwd)
+	if publishTemplate && snap.CachedInit != "" && snap.CachedTools != "" {
+		snap.Persistent = effectivePersistent
+		if !d.publishOwnerCache(restoredOwner, snap) {
+			d.logger.Printf("snapshot: cache publish rejected for stale owner %s", shortServerID(snap.ServerID))
+		}
+	}
+	if eager && !reattached {
+		restoredOwner.SpawnUpstreamBackground()
+	}
+	if reattached {
+		d.logger.Printf("snapshot: reattached owner %s from handoff (pid=%d)", shortServerID(snap.ServerID), handoff.PID)
+	} else {
+		d.logger.Printf("snapshot: restored owner %s for %s %v source=%s eager=%v", shortServerID(snap.ServerID), snap.Command, snap.Args, restoreSource, eager)
+	}
+	return entry, reattached, nil
+}
+
+func (d *Daemon) activateRestartStaging() int {
+	d.mu.Lock()
+	plans := append([]snapshotRestorePlan(nil), d.restartStaging...)
+	d.restartStaging = nil
+	d.mu.Unlock()
+
+	restored := 0
+	for _, plan := range plans {
+		if _, _, err := d.restoreSnapshotPlan(plan, nil, "snapshot_fallback", true, true); err != nil {
+			d.logger.Printf("snapshot: staged restore failed for %s (%s): %v", shortServerID(plan.snapshot.ServerID), plan.snapshot.Command, err)
+			continue
+		}
+		restored++
+	}
+	if restored > 0 {
+		d.restoredOwnerCount.Add(uint64(restored))
+		d.runRestoreHealthGate()
+	}
+	d.logger.Printf("snapshot: activated %d/%d staged owners after predecessor finalization", restored, len(plans))
+	return restored
+}
+
 // loadSnapshot checks for a snapshot file and restores owners from it.
 // Called on daemon startup. If no snapshot exists, returns 0 (cold start).
 // Returns the number of owners restored.
@@ -181,7 +461,7 @@ func (d *Daemon) loadSnapshot() int {
 		return 0
 	}
 	if snap == nil {
-		return 0 // cold start
+		return 0
 	}
 
 	d.mu.Lock()
@@ -189,282 +469,101 @@ func (d *Daemon) loadSnapshot() int {
 	d.predecessorDaemonGeneration = snap.DaemonGeneration
 	d.mu.Unlock()
 
-	// Check for handoff env vars. If both are set, receive transferred FDs from
-	// the old daemon instead of respawning upstreams from scratch (FR-1 to FR-3).
-	// Returns nil if env vars are absent or handoff fails (FR-8 fallback for all owners).
+	restartMode := isRestartRestoreMode()
 	handoffReceipt := d.tryHandoffReceive(context.Background())
 	handoffAccepted := make([]string, 0)
 	type adoptedHandoffOwner struct {
-		snapshot mcpsnapshot.OwnerSnapshot
-		cfg      owner.OwnerConfig
-		entry    *OwnerEntry
+		plan  snapshotRestorePlan
+		entry *OwnerEntry
 	}
-	handoffOwners := make([]adoptedHandoffOwner, 0)
-
+	adopted := make([]adoptedHandoffOwner, 0)
+	staged := make([]snapshotRestorePlan, 0)
 	restored := 0
-	for _, ownerSnap := range snap.Owners {
-		sid := ownerSnap.ServerID
-		ipcPath := serverid.IPCPath("", d.namespace, sid)
-		controlPath := serverid.ControlPath("", d.namespace, sid)
 
-		if ownerSnap.Classification == classify.ModeIsolated &&
-			len(ownerSnap.CwdSet) > 1 {
-			shortSID := sid
-			if len(shortSID) > 8 {
-				shortSID = shortSID[:8]
-			}
-			d.logger.Printf("snapshot: healing poisoned isolated owner %s: cwdSet %v → [%s]",
-				shortSID, ownerSnap.CwdSet, ownerSnap.Cwd)
+	for _, ownerSnap := range snap.Owners {
+		if ownerSnap.Classification == classify.ModeIsolated && len(ownerSnap.CwdSet) > 1 {
+			d.logger.Printf("snapshot: healing poisoned isolated owner %s: cwdSet %v -> [%s]",
+				shortServerID(ownerSnap.ServerID), ownerSnap.CwdSet, ownerSnap.Cwd)
 			ownerSnap.CwdSet = []string{ownerSnap.Cwd}
 		}
+		plan := d.makeSnapshotRestorePlan(ownerSnap)
 
-		// Merge daemon os.Environ() into the snapshotted env on restore. A
-		// pre-fix daemon may have serialised an owner with a trimmed shim env
-		// (missing GITHUB_PERSONAL_ACCESS_TOKEN, etc.); without this merge,
-		// loading that snapshot after the fix would re-install the trimmed
-		// env and session-aware upstreams would fail with "No GitHub token
-		// available for session ..." until the next cold spawn. Daemon env
-		// values fill gaps but cannot override whatever the snapshot stored.
-		restoredEnv := mergeEnv(ownerSnap.Env)
-		cmd, args := ownerSnap.Command, ownerSnap.Args
-		cfg := owner.OwnerConfig{
-			Command:        cmd,
-			Args:           args,
-			Env:            restoredEnv,
-			Cwd:            ownerSnap.Cwd,
-			IPCPath:        ipcPath,
-			ControlPath:    controlPath,
-			ServerID:       sid,
-			TokenHandshake: true,
-			HandlerFunc:    d.handlerFunc,
-			SessionHandler: d.sessionHandler,
-			// Forward v0.24 multi-tenant callbacks to restored owners. Fresh
-			// spawn in spawnOnce already does this; without it, snapshot/
-			// handoff-restored owners would silently lose AuthorizeSession +
-			// OnFrameReceived after a graceful daemon restart, breaking the
-			// pre-dispatch admission gate and per-frame hook for the
-			// reattached upstream. Closes CodeRabbit CRIT review on PR #113.
-			AuthorizeSession: d.authorizeSession,
-			OnFrameReceived:  d.onFrameReceived,
-			OnZeroSessions: func(serverID string) {
-				d.onZeroSessions(serverID)
-			},
-			OnUpstreamExit: func(serverID string) {
-				d.onUpstreamExit(serverID)
-			},
-			OnPersistentDetected: func(serverID string) {
-				d.SetPersistent(serverID, true)
-			},
-			OnCacheReady: func(serverID string) {
-				d.mu.RLock()
-				entry, ok := d.owners[serverID]
-				d.mu.RUnlock()
-				if !ok || entry.Owner == nil {
-					return
+		if restartMode {
+			if handoffReceipt != nil {
+				if transferred, ok := handoffReceipt.take(ownerSnap.ServerID); ok {
+					entry, _, restoreErr := d.restoreSnapshotPlan(plan, &transferred, "snapshot_handoff", false, false)
+					if restoreErr == nil {
+						handoffAccepted = append(handoffAccepted, ownerSnap.ServerID)
+						adopted = append(adopted, adoptedHandoffOwner{plan: plan, entry: entry})
+						restored++
+						continue
+					}
+					d.logger.Printf("snapshot: handoff reattach failed for %s: %v; staging eager fallback",
+						shortServerID(ownerSnap.ServerID), restoreErr)
 				}
-				s := entry.Owner.ExportSnapshot()
-				d.updateTemplate(cmd, args, s)
-			},
-			Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
-		}
-
-		// During restart restore, predecessor's owner sockets may still be
-		// active. Unconditionally remove them — predecessor is shutting down
-		// (#101). Snapshot-only SessionHandler restart needs the same path as
-		// FD handoff because there is no upstream process to keep the socket
-		// alive across daemons.
-		if isRestartRestoreMode() {
-			d.retireOldOwnerSockets(ipcPath, controlPath)
-		}
-
-		var o *owner.Owner
-		reattachedFromHandoff := false
-
-		// FR-7 partial fallback: take ownership only while constructing this owner.
-		var hu HandoffUpstream
-		var hasHandoff bool
-		if handoffReceipt != nil {
-			hu, hasHandoff = handoffReceipt.take(sid)
-		}
-		if hasHandoff {
-			cfg.CachedClassification = ownerSnap.Classification
-			payload := owner.HandoffPayload{
-				ServerID:    sid,
-				PID:         hu.PID,
-				StdinFD:     hu.StdinFD,
-				StdoutFD:    hu.StdoutFD,
-				StderrFD:    hu.StderrFD,
-				AuthorityFD: hu.AuthorityFD,
-				Command:     hu.Command,
-				Args:        ownerSnap.Args,
-				Cwd:         ownerSnap.Cwd,
 			}
-			var handoffErr error
-			o, handoffErr = owner.NewOwnerFromHandoff(cfg, payload)
-			if handoffErr != nil {
-				d.logger.Printf("snapshot: handoff reattach failed for %s: %v — falling back to spawn",
-					sid[:8], handoffErr)
-				o = nil
-			} else {
-				reattachedFromHandoff = true
-				d.logger.Printf("snapshot: reattached owner %s from handoff (pid=%d)", sid[:8], hu.PID)
-			}
-		}
-
-		// Legacy path: restore from snapshot (runs when handoff not available or failed).
-		if o == nil {
-			var snapErr error
-			o, snapErr = owner.NewOwnerFromSnapshot(cfg, ownerSnap)
-			if snapErr != nil {
-				d.logger.Printf("snapshot: failed to restore owner %s (%s): %v", sid[:8], ownerSnap.Command, snapErr)
-				continue
-			}
-		}
-
-		ownerGeneration, genErr := generateGeneration("owner")
-		if genErr != nil {
-			d.logger.Printf("snapshot: failed to generate owner generation for %s: %v", sid[:8], genErr)
-			o.Shutdown()
+			// No transferred process authority: keep metadata successor-local.
+			// IPC binding, supervisor registration, and process start wait until
+			// final ACK plus control-socket takeover prove predecessor finalization.
+			staged = append(staged, plan)
 			continue
 		}
-		restoreSource := "snapshot_fallback"
-		if reattachedFromHandoff {
-			restoreSource = "snapshot_handoff"
-		}
 
-		// Register with supervisor only after generation metadata is ready.
-		var serviceToken suture.ServiceToken
-		if d.supervisor != nil {
-			serviceToken = d.supervisor.Add(o)
+		if _, _, restoreErr := d.restoreSnapshotPlan(plan, nil, "snapshot_fallback", true, true); restoreErr != nil {
+			d.logger.Printf("snapshot: failed to restore owner %s (%s): %v", shortServerID(ownerSnap.ServerID), ownerSnap.Command, restoreErr)
+			continue
 		}
-
-		entry := &OwnerEntry{
-			Owner:                       o,
-			ServerID:                    sid,
-			Command:                     ownerSnap.Command,
-			Args:                        ownerSnap.Args,
-			Cwd:                         ownerSnap.Cwd,
-			Mode:                        ownerSnap.Mode,
-			Env:                         restoredEnv,
-			Persistent:                  ownerSnap.Persistent,
-			LastSession:                 time.Now(),
-			OwnerGeneration:             ownerGeneration,
-			RestoredFromOwnerGeneration: ownerSnap.OwnerGeneration,
-			RestoreSource:               restoreSource,
-			IdleTimeout:                 d.ownerIdleTimeout,
-			serviceToken:                serviceToken,
-		}
-		d.mu.Lock()
-		d.owners[sid] = entry
-		d.mu.Unlock()
-		if reattachedFromHandoff {
-			handoffAccepted = append(handoffAccepted, sid)
-			handoffOwners = append(handoffOwners, adoptedHandoffOwner{
-				snapshot: ownerSnap,
-				cfg:      cfg,
-				entry:    entry,
-			})
-		}
-
-		// Rehydrate forced-isolated retry counter when the restored sid carries
-		// a `-rN` suffix. Without this, a fresh Spawn for the same (cmd,args,cwd)
-		// after restart would compute the base `isolated-<hex16>` sid (counter
-		// starts at 0 in memory), miss the restored owner's `-r1` sid, and
-		// create a duplicate owner — exactly the continuity break codex flagged
-		// on PR #121.
-		d.rehydrateRetryCounter(sid, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)
-
-		// Seed template cache from snapshot so new isolated spawns can use it immediately.
-		if ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
-			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
-		}
-
-		// Only spawn a fresh upstream when not reattached from handoff.
-		if !reattachedFromHandoff {
-			o.SpawnUpstreamBackground()
-		}
-
-		d.logger.Printf("snapshot: restored owner %s for %s %v", sid[:8], ownerSnap.Command, ownerSnap.Args)
 		restored++
 	}
+
 	if handoffReceipt != nil {
-		if err := handoffReceipt.finalize(handoffAccepted); err != nil {
-			d.logger.Printf("handoff.receive.commit_fail accepted=%d reason=%v", len(handoffAccepted), err)
-			for _, adopted := range handoffOwners {
-				sid := adopted.snapshot.ServerID
-				result, removeErr := d.removeOwnerIfCurrent(sid, adopted.entry, ownerRemovalReasonRestoreFailed, false)
+		if finalizeErr := handoffReceipt.finalize(handoffAccepted); finalizeErr != nil {
+			d.logger.Printf("handoff.receive.commit_fail accepted=%d reason=%v", len(handoffAccepted), finalizeErr)
+			fallback := make([]snapshotRestorePlan, 0, len(adopted))
+			for _, item := range adopted {
+				sid := item.plan.snapshot.ServerID
+				result, removeErr := d.removeOwnerIfCurrent(sid, item.entry, ownerRemovalReasonRestoreFailed, false)
 				if removeErr != nil {
 					d.logger.Printf("handoff.receive.rollback_remove_fail server_id=%s reason=%v", shortServerID(sid), removeErr)
 				}
 				if !result.Removed {
-					adopted.entry.Owner.Shutdown()
+					item.entry.Owner.Shutdown()
 				}
-
-				o, restoreErr := owner.NewOwnerFromSnapshot(adopted.cfg, adopted.snapshot)
-				if restoreErr != nil {
-					restored--
-					d.logger.Printf("handoff.receive.rollback_respawn_fail server_id=%s reason=%v", shortServerID(sid), restoreErr)
-					continue
-				}
-				ownerGeneration, generationErr := generateGeneration("owner")
-				if generationErr != nil {
-					restored--
-					o.Shutdown()
-					d.logger.Printf("handoff.receive.rollback_generation_fail server_id=%s reason=%v", shortServerID(sid), generationErr)
-					continue
-				}
-				var serviceToken suture.ServiceToken
-				if d.supervisor != nil {
-					serviceToken = d.supervisor.Add(o)
-				}
-				entry := &OwnerEntry{
-					Owner:                       o,
-					ServerID:                    sid,
-					Command:                     adopted.snapshot.Command,
-					Args:                        adopted.snapshot.Args,
-					Cwd:                         adopted.snapshot.Cwd,
-					Mode:                        adopted.snapshot.Mode,
-					Env:                         adopted.cfg.Env,
-					Persistent:                  adopted.snapshot.Persistent,
-					LastSession:                 time.Now(),
-					OwnerGeneration:             ownerGeneration,
-					RestoredFromOwnerGeneration: adopted.snapshot.OwnerGeneration,
-					RestoreSource:               "snapshot_fallback",
-					IdleTimeout:                 d.ownerIdleTimeout,
-					serviceToken:                serviceToken,
-				}
-				d.mu.Lock()
-				d.owners[sid] = entry
-				d.mu.Unlock()
-				d.rehydrateRetryCounter(sid, adopted.snapshot.Command, adopted.snapshot.Args, adopted.snapshot.Cwd)
-				if adopted.snapshot.CachedInit != "" && adopted.snapshot.CachedTools != "" {
-					d.updateTemplate(adopted.snapshot.Command, adopted.snapshot.Args, adopted.snapshot)
-				}
-				o.SpawnUpstreamBackground()
-				d.logger.Printf("handoff.receive.rollback_respawn_ok server_id=%s", shortServerID(sid))
+				fallback = append(fallback, item.plan)
 			}
+			// A failed global final ACK discards cache-only/no-handle staging.
+			// Only previously detached owners receive one post-barrier fallback.
+			d.logger.Printf("handoff.receive.discard_staging count=%d", len(staged))
+			staged = fallback
+			restored = 0
 		} else {
-			d.logger.Printf("handoff.receive.ok upstreams=%d", len(handoffAccepted))
+			for _, item := range adopted {
+				snapshot := item.plan.snapshot
+				if snapshot.CachedInit != "" && snapshot.CachedTools != "" {
+					d.updateTemplate(snapshot.Command, snapshot.Args, snapshot)
+				}
+			}
+			d.logger.Printf("handoff.receive.ok upstreams=%d staged=%d", len(handoffAccepted), len(staged))
 		}
 	}
-	if restored > 0 {
-		d.restoredOwnerCount.Add(uint64(restored))
+
+	if restartMode {
+		d.mu.Lock()
+		d.restartStaging = append([]snapshotRestorePlan(nil), staged...)
+		d.mu.Unlock()
+		if restored > 0 {
+			d.restoredOwnerCount.Add(uint64(restored))
+		}
+		planned := restored + len(staged)
+		d.logger.Printf("snapshot: restored %d process-backed owners; staged %d/%d metadata owners", restored, len(staged), len(snap.Owners))
+		return planned
 	}
 
+	if restored > 0 {
+		d.restoredOwnerCount.Add(uint64(restored))
+		d.runRestoreHealthGate()
+	}
 	d.logger.Printf("snapshot: restored %d/%d owners", restored, len(snap.Owners))
-
-	// FR-3 — post-restore listener health gate.
-	//
-	// Snapshot restore synchronously calls ipc.Listen, so a bind failure would
-	// already have aborted the entry above. But the listener can die AFTER
-	// successful bind for reasons that do not flow through closeListener()
-	// and therefore leave IsAccepting() lying. Observed in production on
-	// 2026-04-17 after a graceful-restart: 6/9 restored owners passed
-	// IsAccepting but refused ipc.Dial from a fresh shim. Until the exact
-	// trigger is pinned down, validate every restored owner defensively and
-	// tear down the zombies so the next shim request cold-spawns a fresh one.
-	d.runRestoreHealthGate()
-
 	return restored
 }
 

@@ -93,3 +93,31 @@ func TestHandleCanSuspendForOwnerUsesExactOwnerWithoutFanout(t *testing.T) {
 		t.Fatalf("recreated-owner lookups = %v, want only %q", lookups, targetSID)
 	}
 }
+
+func TestHandleCanSuspendBlocksPersistentDiscovery(t *testing.T) {
+	d := testDaemon(t)
+	const sid = "owner-suspend-materializing"
+	o, err := owner.NewOwnerFromSnapshot(owner.OwnerConfig{
+		IPCPath:           shortSocketPath(t, "suspend-materializing.sock"),
+		ServerID:          sid,
+		SessionHandler:    noopSessionHandler{},
+		PersistentPending: true,
+		Logger:            testLogger(t),
+	}, owner.OwnerSnapshot{})
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	t.Cleanup(o.Shutdown)
+	seedReconnectHistory(t, o, "suspend-materializing-token", "/project/suspend", nil)
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid}
+	d.mu.Unlock()
+
+	got, err := d.HandleCanSuspend("suspend-materializing-token")
+	if err != nil {
+		t.Fatalf("HandleCanSuspend: %v", err)
+	}
+	if got.Allowed || got.Reason != "pending_persistent" {
+		t.Fatalf("HandleCanSuspend=%+v, want pending_persistent denial", got)
+	}
+}

@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
@@ -136,6 +139,174 @@ func TestStopOwnerResultMessageTreatsPostRemovalErrorAsWarning(t *testing.T) {
 	_, err = stopOwnerResultMessage("stopped", ownerRemovalResult{Removed: false}, errors.New("server not found"))
 	if err == nil {
 		t.Fatal("expected pre-removal error to remain an error")
+	}
+}
+
+func TestOwnerRemovalRetriesBeforeForgettingEntry(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-finalization-retry"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_retry"}
+	o.SessionMgr().PreRegisterForOwner("pending-finalization", sid, "/owned", nil)
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() {
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=false", got, soft, o)
+		}
+		d.mu.RLock()
+		current := d.owners[sid]
+		d.mu.RUnlock()
+		if current != entry {
+			t.Fatal("owner entry was forgotten before finalization proof")
+		}
+		if !o.SessionMgr().IsPreRegistered("pending-finalization") {
+			t.Fatal("owner tokens were removed before finalization proof")
+		}
+		if calls.Add(1) == 1 {
+			return 0, false, errors.New("retirement not yet proven")
+		}
+		return 0, true, nil
+	}
+
+	result, err := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonOperatorHard, false)
+	if err != nil {
+		t.Fatalf("removeOwnerIfCurrent() error: %v", err)
+	}
+	if !result.Removed || calls.Load() != 2 {
+		t.Fatalf("result=%+v finalizer_calls=%d, want removed after second proof", result, calls.Load())
+	}
+	if d.Entry(sid) != nil {
+		t.Fatal("owner entry survived proven finalization")
+	}
+}
+
+func TestReaperFinalizationRetryRetainsLivePIDAndOwnerState(t *testing.T) {
+	d := testDaemon(t)
+	generationFile := t.TempDir() + string(os.PathSeparator) + "reaper-generation.txt"
+	command, args, env := daemonRespawnHelperCommand(generationFile)
+	path, sid, token, err := d.Spawn(control.Request{Cmd: "spawn", Command: command, Args: args, Env: env, Mode: "global"})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("spawned owner missing")
+	}
+	conn, _ := connectSpawnedOwner(t, path, token)
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return entry.Owner.SessionCount() == 1 && entry.Owner.MaterializationState() == owner.MaterializationReady
+	}, "owner did not become ready while session was retained")
+	_ = conn.Close()
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return entry.Owner.SessionCount() == 0 && entry.Owner.SessionMgr().PendingCount() == 0
+	}, "owner did not become idle after session close")
+	pid, _ := entry.Owner.Status()["upstream_pid"].(int)
+	if !daemonTestProcessAlive(pid) {
+		t.Fatalf("upstream pid %d is not live before reaper retry", pid)
+	}
+	if ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(token); !ok || ownerKey != sid {
+		t.Fatalf("reconnect history before reaper=(%q,%v), want owner %q", ownerKey, ok, sid)
+	}
+
+	d.mu.Lock()
+	entry.LastSession = time.Now().Add(-time.Second)
+	entry.IdleTimeout = time.Millisecond
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		call := calls.Add(1)
+		if got != entry.Owner || !soft {
+			t.Fatalf("finalizer call %d got owner=%p soft=%v, want owner=%p soft=true", call, got, soft, entry.Owner)
+		}
+		if call <= ownerFinalizationAttempts {
+			if current := d.Entry(sid); current != entry {
+				t.Fatalf("call %d forgot owner before process retirement proof", call)
+			}
+			if !daemonTestProcessAlive(pid) {
+				t.Fatalf("call %d lost live pid %d before retryable finalization", call, pid)
+			}
+			if ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(token); !ok || ownerKey != sid {
+				t.Fatalf("call %d removed owner history before proof: owner=%q ok=%v", call, ownerKey, ok)
+			}
+			return 0, false, errors.New("synthetic whole-tree proof pending")
+		}
+		return original(got, soft)
+	}
+
+	if affected := (&Reaper{daemon: d, logger: d.logger}).sweep(); affected != 0 {
+		t.Fatalf("first reaper sweep affected=%d, want retained owner while finalization is retryable", affected)
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("synchronous finalizer calls=%d, want %d", got, ownerFinalizationAttempts)
+	}
+	if current := d.Entry(sid); current != entry {
+		t.Fatal("reaper forgot owner after unproven finalization")
+	}
+	if !daemonTestProcessAlive(pid) {
+		t.Fatalf("upstream pid %d died before scheduled finalization retry", pid)
+	}
+
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		return d.Entry(sid) == nil && !daemonTestProcessAlive(pid)
+	}, "scheduled finalization retry did not retire process and remove owner")
+	if calls.Load() < ownerFinalizationAttempts+1 {
+		t.Fatalf("finalizer calls=%d, want scheduled retry after %d synchronous attempts", calls.Load(), ownerFinalizationAttempts)
+	}
+	if _, _, _, ok := entry.Owner.SessionMgr().LookupHistory(token); ok {
+		t.Fatal("owner history survived proven final removal")
+	}
+}
+
+func TestOwnerRemovalKeepsEntryWhenFinalizationUnproven(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-finalization-blocked"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_blocked"}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() {
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(*owner.Owner, bool) (int, bool, error) {
+		calls.Add(1)
+		return 0, false, errors.New("retirement unproven")
+	}
+
+	result, err := d.finalizeAndRemoveOwner(sid, entry, ownerRemovalReasonOperatorHard, false, nil, false)
+	if err == nil || result.Removed {
+		t.Fatalf("result=%+v err=%v, want blocked removal", result, err)
+	}
+	if calls.Load() != ownerFinalizationAttempts {
+		t.Fatalf("finalizer calls=%d, want %d", calls.Load(), ownerFinalizationAttempts)
+	}
+	if d.Entry(sid) != entry {
+		t.Fatal("owner entry was forgotten without finalization proof")
+	}
+	d.mu.RLock()
+	removalInProgress := entry.removalInProgress
+	d.mu.RUnlock()
+	if removalInProgress {
+		t.Fatal("blocked removal did not release retryable registry state")
 	}
 }
 

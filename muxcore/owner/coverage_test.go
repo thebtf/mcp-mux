@@ -277,6 +277,9 @@ func newMinimalOwner() *Owner {
 		logger:                 log.New(io.Discard, "", 0),
 		done:                   make(chan struct{}),
 		listenerDone:           make(chan struct{}),
+		materializationStop:    make(chan struct{}),
+		pendingDemands:         make(map[string]*localDemand),
+		materializationState:   MaterializationCacheOnly,
 	}
 }
 
@@ -492,8 +495,8 @@ func TestCheckPersistent_True(t *testing.T) {
 	o.serverID = "srv-1"
 
 	called := false
-	o.onPersistentDetected = func(id string) {
-		if id != "srv-1" {
+	o.onPersistentDetected = func(got *Owner) {
+		if got != o {
 			return
 		}
 		called = true
@@ -510,7 +513,7 @@ func TestCheckPersistent_True(t *testing.T) {
 func TestCheckPersistent_False(t *testing.T) {
 	o := newMinimalOwner()
 	called := false
-	o.onPersistentDetected = func(id string) { called = true }
+	o.onPersistentDetected = func(*Owner) { called = true }
 
 	initJSON := []byte(`{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"x-mux":{"persistent":false}}}}`)
 	o.checkPersistent(initJSON)
@@ -523,7 +526,7 @@ func TestCheckPersistent_False(t *testing.T) {
 func TestCheckPersistent_NoXMux(t *testing.T) {
 	o := newMinimalOwner()
 	called := false
-	o.onPersistentDetected = func(id string) { called = true }
+	o.onPersistentDetected = func(*Owner) { called = true }
 
 	initJSON := []byte(`{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}`)
 	o.checkPersistent(initJSON)

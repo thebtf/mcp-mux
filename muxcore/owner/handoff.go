@@ -67,24 +67,65 @@ func (o *Owner) HasHandoffUpstream() bool {
 // ShutdownForHandoff. Safe to call with an already-empty sessions map.
 // closeListenerOnce ensures the listener is closed at most once.
 func (o *Owner) teardownExceptUpstream() {
-	if o.controlServer != nil {
-		socketPath := o.controlServer.SocketPath()
-		o.controlServer.Close()
-		ipc.Cleanup(socketPath)
-	}
+	o.teardownOnce.Do(func() {
+		if o.controlServer != nil {
+			socketPath := o.controlServer.SocketPath()
+			o.controlServer.Close()
+			ipc.Cleanup(socketPath)
+		}
 
-	o.closeListener()
+		o.closeListener()
 
-	o.mu.Lock()
-	for _, s := range o.sessions {
-		s.Close()
-	}
-	o.sessions = make(map[int]*Session)
-	o.mu.Unlock()
+		o.mu.Lock()
+		for _, s := range o.sessions {
+			s.Close()
+		}
+		o.sessions = make(map[int]*Session)
+		o.mu.Unlock()
 
-	if o.rejectionLogger != nil {
-		o.rejectionLogger.Close()
+		if o.rejectionLogger != nil {
+			o.rejectionLogger.Close()
+		}
+	})
+}
+
+func (o *Owner) beginHandoffTransition() *upstream.Process {
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.RLock()
+	proc := o.upstream
+	o.mu.RUnlock()
+	if proc != nil {
+		o.retiringProcess = proc
+		o.materializationState = MaterializationFinalizing
+		o.upstreamDead.Store(true)
 	}
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+	return proc
+}
+
+func (o *Owner) recordFailedHandoffTransition(proc *upstream.Process, err error, proven bool) {
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	if proven {
+		o.mu.Lock()
+		if o.upstream == proc {
+			o.upstream = nil
+		}
+		o.mu.Unlock()
+		if o.retiringProcess == proc {
+			o.retiringProcess = nil
+		}
+		o.materializationBlockedErr = nil
+		o.materializationState = MaterializationCacheOnly
+	} else {
+		o.materializationState = MaterializationFinalizeBlocked
+		o.materializationBlockedErr = errors.Join(errFinalizationUnproven, err)
+		o.retiringProcess = proc
+	}
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
 }
 
 // ShutdownForHandoff performs the same cleanup as Shutdown (closes listener,
@@ -105,60 +146,69 @@ func (o *Owner) teardownExceptUpstream() {
 //     The upstream is aborted or closed, then o.done is closed. A failed handoff
 //     never leaves a torn-down owner or process tree in limbo.
 func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
-	var payload HandoffPayload
-	var retErr error
-	attempted := false
-
-	o.shutdownOnce.Do(func() {
-		attempted = true
-
-		o.teardownExceptUpstream()
-
-		o.mu.Lock()
-		up := o.upstream
-		o.mu.Unlock()
-
-		if up == nil {
-			retErr = ErrNoUpstream
-			close(o.done)
-			return
-		}
-
-		pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := up.DetachWithAuthority()
-		if err != nil {
-			cleanupErr := up.AbortDetach()
-			if errors.Is(cleanupErr, upstream.ErrDetachNotPrepared) {
-				cleanupErr = up.Close()
-			} else {
-				cleanupErr = errors.Join(cleanupErr, up.Close())
-			}
-			retErr = errors.Join(fmt.Errorf("owner: detach upstream: %w", err), cleanupErr)
-			o.logger.Printf("owner handoff failed; upstream terminated: %v", retErr)
-			close(o.done)
-			return
-		}
-
-		payload = HandoffPayload{
-			ServerID:    o.serverID,
-			PID:         pid,
-			StdinFD:     stdinFD,
-			StdoutFD:    stdoutFD,
-			StderrFD:    stderrFD,
-			AuthorityFD: authorityFD,
-			Command:     o.command,
-			Args:        o.args,
-			Cwd:         o.cwd,
-			abort:       up.AbortDetach,
-			commit:      up.CommitDetach,
-		}
-
-		o.logger.Printf("owner handed off (pid=%d)", pid)
-		close(o.done)
-	})
-
-	if !attempted {
-		// shutdownOnce already fired — either Shutdown or ShutdownForHandoff ran.
+	o.removalMu.Lock()
+	defer o.removalMu.Unlock()
+	select {
+	case <-o.done:
 		return HandoffPayload{}, ErrAlreadyShutDown
+	default:
 	}
-	return payload, retErr
+
+	if err := o.quiesceMaterializationForHandoff(); err != nil {
+		up := o.beginHandoffTransition()
+		o.teardownExceptUpstream()
+		closeErr := error(nil)
+		proven := up == nil
+		if up != nil {
+			closeErr = up.Close()
+			proven = up.RetirementProven()
+		}
+		retErr := errors.Join(fmt.Errorf("owner: quiesce materialization for handoff: %w", err), closeErr)
+		o.recordFailedHandoffTransition(up, retErr, proven)
+		if proven {
+			o.completeShutdown("owner handoff quiesce failed; upstream finalized")
+		}
+		return HandoffPayload{}, retErr
+	}
+
+	up := o.beginHandoffTransition()
+	o.teardownExceptUpstream()
+	if up == nil {
+		o.completeShutdown("owner handoff completed without upstream")
+		return HandoffPayload{}, ErrNoUpstream
+	}
+
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := up.DetachWithAuthority()
+	if err != nil {
+		cleanupErr := up.AbortDetach()
+		if errors.Is(cleanupErr, upstream.ErrDetachNotPrepared) {
+			cleanupErr = up.Close()
+		} else {
+			cleanupErr = errors.Join(cleanupErr, up.Close())
+		}
+		retErr := errors.Join(fmt.Errorf("owner: detach upstream: %w", err), cleanupErr)
+		proven := up.RetirementProven()
+		o.recordFailedHandoffTransition(up, retErr, proven)
+		if proven {
+			o.completeShutdown("owner handoff failed; upstream finalized")
+		}
+		o.logger.Printf("owner handoff failed: %v", retErr)
+		return HandoffPayload{}, retErr
+	}
+
+	payload := HandoffPayload{
+		ServerID:    o.serverID,
+		PID:         pid,
+		StdinFD:     stdinFD,
+		StdoutFD:    stdoutFD,
+		StderrFD:    stderrFD,
+		AuthorityFD: authorityFD,
+		Command:     o.command,
+		Args:        o.args,
+		Cwd:         o.cwd,
+		abort:       up.AbortDetach,
+		commit:      up.CommitDetach,
+	}
+	o.completeShutdown(fmt.Sprintf("owner handed off (pid=%d)", pid))
+	return payload, nil
 }

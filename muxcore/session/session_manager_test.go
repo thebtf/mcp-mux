@@ -105,6 +105,26 @@ func TestPreRegisterClonesMutableEnv(t *testing.T) {
 	}
 }
 
+func TestLookupPendingForOwnerIsExactAndSideEffectFree(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("pending", "owner-a", "/project/a", map[string]string{"TOKEN": "original"})
+	if _, _, ok := sm.LookupPendingForOwner("pending", "owner-b"); ok {
+		t.Fatal("lookup accepted wrong owner")
+	}
+	cwd, env, ok := sm.LookupPendingForOwner("pending", "owner-a")
+	if !ok || cwd != "/project/a" || env["TOKEN"] != "original" {
+		t.Fatalf("lookup = (%q, %v, %v), want exact pending context", cwd, env, ok)
+	}
+	env["TOKEN"] = "mutated"
+	_, again, ok := sm.LookupPendingForOwner("pending", "owner-a")
+	if !ok || again["TOKEN"] != "original" {
+		t.Fatal("lookup leaked mutable environment or consumed token")
+	}
+	if !sm.Bind("pending", "owner-a", &Session{ID: 2002}) {
+		t.Fatal("side-effect-free lookup consumed pending token")
+	}
+}
+
 func TestNilSessionContextDoesNotRefreshUnrelatedHistory(t *testing.T) {
 	for _, tc := range []struct {
 		name string

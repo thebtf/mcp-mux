@@ -248,3 +248,25 @@ func TestShouldEvict_IsolatedDisabledByZero(t *testing.T) {
 		t.Errorf("reason = %q, want %q when isolated short-timeout disabled", d.reason, "idle")
 	}
 }
+
+func TestShouldEvict_MaterializationBlocksZombieAndIdleRemoval(t *testing.T) {
+	s := baseSample()
+	s.UpstreamDead = true
+	s.MaterializationBlocked = true
+	if decision := shouldEvict(s, time.Now(), 10*time.Minute, 60*time.Second); decision.evict {
+		t.Fatalf("materializing owner was evicted: %+v", decision)
+	}
+}
+
+func TestShouldEvict_CacheOnlyOwnerIsNotZombie(t *testing.T) {
+	s := baseSample()
+	s.UpstreamDead = true
+	s.CacheReady = true
+	decision := shouldEvict(s, time.Now(), 10*time.Minute, 60*time.Second)
+	if !decision.evict {
+		t.Fatal("cache-only owner past idle timeout should follow ordinary idle eviction")
+	}
+	if decision.reason != "idle" {
+		t.Fatalf("cache-only owner reason=%q, want idle", decision.reason)
+	}
+}

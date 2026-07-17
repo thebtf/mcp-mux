@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 // TestGlobalFirst_EnvIncompatibleOwnersDistinct proves spec AC8 (CR-002):
@@ -368,6 +369,42 @@ func TestDeriveEnvBucketedSid_NoExistingEntry(t *testing.T) {
 	got := d.deriveEnvBucketedSid(base, map[string]string{"GITHUB_TOKEN": "x"})
 	if got != base {
 		t.Errorf("no existing entry: got %q, want %q", got, base)
+	}
+}
+
+func TestReusedOwnerPreRegisterKeepsEffectiveEnv(t *testing.T) {
+	const inheritedKey = "MCPMUX_REUSE_CONFIG_PATH"
+	t.Setenv(inheritedKey, "daemon-config")
+
+	d := testDaemon(t)
+	command := "reuse-effective-env"
+	snap := daemonMaterializationSnapshot(false)
+	d.updateTemplate(command, nil, snap)
+	cwd := t.TempDir()
+
+	_, sid, _, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: cwd})
+	if err != nil {
+		t.Fatalf("first Spawn: %v", err)
+	}
+	_, reusedSID, token, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: cwd})
+	if err != nil {
+		t.Fatalf("reused Spawn: %v", err)
+	}
+	if reusedSID != sid {
+		t.Fatalf("reused Spawn sid = %q, want %q", reusedSID, sid)
+	}
+
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatalf("owner %q missing after reuse", sid)
+	}
+	session := &owner.Session{ID: 991}
+	entry.Owner.SessionMgr().RegisterSession(session, "")
+	if !entry.Owner.SessionMgr().Bind(token, sid, session) {
+		t.Fatal("reused token did not bind")
+	}
+	if got := session.Env[inheritedKey]; got != "daemon-config" {
+		t.Fatalf("reused session effective env %s = %q, want daemon-config", inheritedKey, got)
 	}
 }
 

@@ -12,6 +12,37 @@ import (
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 )
 
+func TestSerializeSnapshotPinnedRetainsOwnerBarrierUntilRelease(t *testing.T) {
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+
+	d := testDaemon(t)
+	command := "pinned-snapshot-owner"
+	d.updateTemplate(command, nil, daemonMaterializationSnapshot(false))
+	_, sid, _, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	path, lease, err := d.serializeSnapshotPinned()
+	if err != nil {
+		t.Fatalf("serializeSnapshotPinned: %v", err)
+	}
+	if path == "" || lease == nil {
+		t.Fatalf("pinned snapshot result path=%q lease=%v", path, lease)
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner.Status()["restart_pin_count"] != int64(1) {
+		t.Fatalf("restart barrier was released before predecessor completion: entry=%+v", entry)
+	}
+
+	lease.Release()
+	lease.Release()
+	if got := entry.Owner.Status()["restart_pin_count"]; got != int64(0) {
+		t.Fatalf("restart lease release count = %v, want 0", got)
+	}
+}
+
 func TestSnapshotRoundTrip(t *testing.T) {
 	d := testDaemon(t)
 
@@ -67,6 +98,76 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	// Verify file was consumed (deleted)
 	if _, err := os.Stat(SnapshotPath()); !os.IsNotExist(err) {
 		t.Error("snapshot file should be deleted after successful load")
+	}
+}
+
+func TestSerializeSnapshotPinsOwnerAgainstConcurrentRemoval(t *testing.T) {
+	d := testDaemon(t)
+	req := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	}
+	_, sid, _, err := d.Spawn(req)
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	d.beforeSnapshotOwnerExport = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { d.beforeSnapshotOwnerExport = nil })
+
+	type serializeResult struct {
+		path string
+		err  error
+	}
+	serializeDone := make(chan serializeResult, 1)
+	go func() {
+		path, serializeErr := d.SerializeSnapshot()
+		serializeDone <- serializeResult{path: path, err: serializeErr}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SerializeSnapshot did not reach pinned owner export")
+	}
+
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- d.Remove(sid) }()
+	select {
+	case err := <-removeDone:
+		t.Fatalf("Remove completed while snapshot held owner pin: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	result := <-serializeDone
+	if result.err != nil {
+		t.Fatalf("SerializeSnapshot() error: %v", result.err)
+	}
+	defer os.Remove(result.path)
+
+	select {
+	case err := <-removeDone:
+		if err != nil {
+			t.Fatalf("Remove() after snapshot release: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Remove remained blocked after snapshot released owner pin")
+	}
+
+	snap, err := DeserializeSnapshot(testLogger(t))
+	if err != nil {
+		t.Fatalf("DeserializeSnapshot() error: %v", err)
+	}
+	if snap == nil || len(snap.Owners) != 1 || snap.Owners[0].ServerID != sid {
+		t.Fatalf("snapshot lost pinned owner %s: %#v", sid, snap)
 	}
 }
 

@@ -6,7 +6,6 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +24,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -100,6 +100,35 @@ type OwnerEntry struct {
 	// the cause correctly instead of defaulting to HintNone.
 	// In-memory only — not serialized.
 	terminationHint TerminationHint
+	// snapshotPins leases this entry across restart serialization without
+	// holding d.mu while owner-local locks are acquired. snapshotUnpinned is
+	// closed when the final lease releases so removal paths can retry.
+	snapshotPins     int
+	snapshotUnpinned chan struct{}
+	// removalInProgress prevents restart serialization from pinning an owner
+	// after teardown has begun but before whole-tree finalization is proven.
+	removalInProgress bool
+	removalRetrying   bool
+}
+
+type templateEntry struct {
+	snapshot       mcpsnapshot.OwnerSnapshot
+	classification classify.SharingMode
+	envIdentity    envidentity.Identity
+	canonicalCwd   string
+}
+
+type templateFamily struct {
+	revision uint64
+	entries  map[string]templateEntry
+}
+
+type templateMatch struct {
+	snapshot    mcpsnapshot.OwnerSnapshot
+	key         string
+	scope       string
+	revision    uint64
+	envIdentity envidentity.Identity
 }
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
@@ -142,9 +171,27 @@ type Daemon struct {
 	// session disconnects. It uses the same activity gates as the reaper but
 	// does not wait for the coarse reaper interval/ownerIdleTimeout path.
 	zeroSessionCleanupDelay time.Duration
-	idleTimeout             time.Duration                        // daemon-level auto-exit timeout (zero owners + zero sessions)
-	templateCache           map[string]mcpsnapshot.OwnerSnapshot // command+args key → cached init data
+	idleTimeout             time.Duration // daemon-level auto-exit timeout (zero owners + zero sessions)
+	templateCache           map[string]*templateFamily
 
+	// beforeTemplatePromotion is a narrow deterministic test seam. Production
+	// leaves it nil. It runs after a cache-only owner is constructed but before
+	// the template revision is revalidated and the placeholder is promoted.
+	beforeTemplatePromotion func()
+	// beforeOwnerCachePublish is a deterministic test seam for the cold-start
+	// registration barrier. Production leaves it nil.
+	beforeOwnerCachePublish func(*owner.Owner)
+	// beforeColdOwnerPromotion verifies daemon-managed cold owners remain inert
+	// until their exact OwnerEntry can be installed. Production leaves it nil.
+	beforeColdOwnerPromotion func(*owner.Owner)
+	// beforeSnapshotOwnerExport is a narrow deterministic test seam. It runs
+	// while the daemon read lock pins OwnerEntry lifetime during serialization.
+	beforeSnapshotOwnerExport func()
+
+	// restartStaging holds metadata-only snapshot entries that must not bind
+	// owner IPC or start an upstream until control-socket takeover proves the
+	// predecessor has finalized its non-transferred process authority.
+	restartStaging []snapshotRestorePlan
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
 	// supervisor.Remove in daemon.Remove. Context-cancelled on Shutdown.
@@ -443,7 +490,7 @@ func New(cfg Config) (*Daemon, error) {
 		isolatedIdleTimeout:     isolatedIdleTimeout,
 		admissionBufferTimeout:  admissionBufferTimeout,
 		idleTimeout:             idleTimeout,
-		templateCache:           make(map[string]mcpsnapshot.OwnerSnapshot),
+		templateCache:           make(map[string]*templateFamily),
 		crashTracker:            make(map[string][]time.Time),
 		supervisorCtx:           supCtx,
 		supervisorCancel:        supCancel,
@@ -483,12 +530,16 @@ func New(cfg Config) (*Daemon, error) {
 		if isSnapshotRestartMode() && !isHandoffMode() {
 			modeLabel = "snapshot restart mode"
 		}
-		if restored := d.loadSnapshot(); restored > 0 {
-			logger.Printf("startup: restored %d owners from snapshot (%s)", restored, modeLabel)
-		}
+		planned := d.loadSnapshot()
 		if err := d.retryControlBind(cfg.ControlPath); err != nil {
-			supCancel()
+			d.shutdown(nil)
 			return nil, fmt.Errorf("daemon: %w", err)
+		}
+		// The control endpoint can bind only after the predecessor has released
+		// it. This is the predecessor-finalized barrier for metadata-only owners.
+		d.activateRestartStaging()
+		if planned > 0 {
+			logger.Printf("startup: restored %d owners from snapshot (%s)", d.OwnerCount(), modeLabel)
 		}
 		logger.Printf("daemon started, control socket: %s (%s)", cfg.ControlPath, modeLabel)
 	} else {
@@ -771,30 +822,167 @@ func generateGeneration(prefix string) (string, error) {
 	return prefix + "_" + token, nil
 }
 
-// Spawn creates or returns an existing owner for the given server identity.
-// Deduplication: if a shared owner for the same command+args already exists
-// templateKey returns a cache key based on command+args only (ignoring cwd/env).
-// All instances of the same server share identical init/tools responses.
+// templateKey identifies a command family. Context compatibility is enforced
+// separately by each revisioned template entry.
 func templateKey(command string, args []string) string {
 	return serverid.GenerateContextKey(serverid.ModeGlobal, command, args, nil, "")
 }
 
-// updateTemplate stores an owner's cached state as a template for future isolated spawns.
-func (d *Daemon) updateTemplate(command string, args []string, snap mcpsnapshot.OwnerSnapshot) {
-	key := templateKey(command, args)
-	d.mu.Lock()
-	d.templateCache[key] = snap
-	d.mu.Unlock()
-	d.logger.Printf("template cache updated for %s (key=%s)", command, key[:8])
+func templateScope(mode classify.SharingMode, cwd, envFingerprint string) (string, bool) {
+	switch mode {
+	case classify.ModeIsolated:
+		return string(mode) + "\x00" + envFingerprint + "\x00" + serverid.CanonicalizePath(cwd), true
+	case classify.ModeShared, classify.ModeSessionAware:
+		return string(mode) + "\x00" + envFingerprint, true
+	default:
+		return "", false
+	}
 }
 
-// getTemplate returns a cached template for the given command+args, if available.
+func cloneTemplateSnapshot(snap mcpsnapshot.OwnerSnapshot) mcpsnapshot.OwnerSnapshot {
+	clone := snap
+	clone.Args = append([]string(nil), snap.Args...)
+	clone.Env = make(map[string]string, len(snap.Env))
+	for key, value := range snap.Env {
+		clone.Env[key] = value
+	}
+	clone.CwdSet = append([]string(nil), snap.CwdSet...)
+	clone.ClassificationReason = append([]string(nil), snap.ClassificationReason...)
+	// A template carries discovery metadata, never live reconnect or process
+	// authority from the owner that published it.
+	clone.BoundTokens = nil
+	clone.UpstreamPID = 0
+	clone.HandoffSocketPath = ""
+	clone.SpawnPgid = 0
+	return clone
+}
+
+// updateTemplate atomically publishes one coherent, context-scoped cache
+// revision. A new verdict for the same effective env replaces any older
+// sharing verdict for that env so stale shared classification cannot survive
+// a later isolated discovery result.
+func (d *Daemon) updateTemplate(command string, args []string, snap mcpsnapshot.OwnerSnapshot) {
+	d.mu.Lock()
+	key, revision, ok := d.updateTemplateLocked(command, args, snap)
+	d.mu.Unlock()
+	if ok {
+		d.logger.Printf("template cache updated for %s (key=%s revision=%d scope=%s)", command, key[:8], revision, snap.Classification)
+	}
+}
+
+// updateTemplateLocked publishes one coherent template while d.mu is held.
+// Keeping owner-entry persistence and the matching template under the same
+// critical section prevents mixed-generation daemon state.
+func (d *Daemon) updateTemplateLocked(command string, args []string, snap mcpsnapshot.OwnerSnapshot) (string, uint64, bool) {
+	effectiveEnv := mergeEnv(snap.Env)
+	envIdentity := envidentity.Build(effectiveEnv)
+	scope, ok := templateScope(snap.Classification, snap.Cwd, envIdentity.Fingerprint)
+	if !ok || snap.CachedInit == "" || snap.CachedTools == "" {
+		return "", 0, false
+	}
+	snap.Command = command
+	snap.Args = append([]string(nil), args...)
+	snap.Env = effectiveEnv
+	snap = cloneTemplateSnapshot(snap)
+	entry := templateEntry{
+		snapshot:       snap,
+		classification: snap.Classification,
+		envIdentity:    envIdentity,
+		canonicalCwd:   serverid.CanonicalizePath(snap.Cwd),
+	}
+	if d.templateCache == nil {
+		d.templateCache = make(map[string]*templateFamily)
+	}
+	key := templateKey(command, args)
+	family := d.templateCache[key]
+	if family == nil {
+		family = &templateFamily{entries: make(map[string]templateEntry)}
+		d.templateCache[key] = family
+	}
+	family.revision++
+	for existingScope, existing := range family.entries {
+		if envidentity.Equal(existing.envIdentity, envIdentity, existing.snapshot.Env, effectiveEnv) && existing.classification != entry.classification {
+			delete(family.entries, existingScope)
+		}
+	}
+	family.entries[scope] = entry
+	return key, family.revision, true
+}
+
+func (d *Daemon) getCompatibleTemplate(command string, args []string, cwd string, effectiveEnv map[string]string) (templateMatch, bool) {
+	key := templateKey(command, args)
+	envIdentity := envidentity.Build(effectiveEnv)
+	canonicalCwd := serverid.CanonicalizePath(cwd)
+	d.mu.RLock()
+	family := d.templateCache[key]
+	if family == nil {
+		d.mu.RUnlock()
+		return templateMatch{}, false
+	}
+	for _, mode := range []classify.SharingMode{classify.ModeIsolated, classify.ModeSessionAware, classify.ModeShared} {
+		scope, _ := templateScope(mode, canonicalCwd, envIdentity.Fingerprint)
+		entry, ok := family.entries[scope]
+		if !ok || !envidentity.Equal(entry.envIdentity, envIdentity, entry.snapshot.Env, effectiveEnv) {
+			continue
+		}
+		match := templateMatch{
+			snapshot:    cloneTemplateSnapshot(entry.snapshot),
+			key:         key,
+			scope:       scope,
+			revision:    family.revision,
+			envIdentity: envIdentity,
+		}
+		d.mu.RUnlock()
+		return match, true
+	}
+	d.mu.RUnlock()
+	return templateMatch{}, false
+}
+
+func (d *Daemon) templateMatchCurrentLocked(match templateMatch) bool {
+	family := d.templateCache[match.key]
+	if family == nil || family.revision != match.revision {
+		return false
+	}
+	entry, ok := family.entries[match.scope]
+	return ok && envidentity.Equal(entry.envIdentity, match.envIdentity, entry.snapshot.Env, match.snapshot.Env)
+}
+
+// getTemplate is retained for package-local readiness tests. Spawn uses the
+// context-authoritative getCompatibleTemplate path above.
 func (d *Daemon) getTemplate(command string, args []string) (mcpsnapshot.OwnerSnapshot, bool) {
 	key := templateKey(command, args)
 	d.mu.RLock()
-	snap, ok := d.templateCache[key]
+	family := d.templateCache[key]
+	if family != nil {
+		for _, entry := range family.entries {
+			snap := cloneTemplateSnapshot(entry.snapshot)
+			d.mu.RUnlock()
+			return snap, true
+		}
+	}
 	d.mu.RUnlock()
-	return snap, ok
+	return mcpsnapshot.OwnerSnapshot{}, false
+}
+
+func (d *Daemon) invalidateTemplate(command string, args []string) {
+	d.mu.Lock()
+	key, existed := d.invalidateTemplateLocked(command, args)
+	d.mu.Unlock()
+	if existed {
+		d.logger.Printf("template cache invalidated for %s (key=%s)", command, key[:8])
+	}
+}
+
+func (d *Daemon) invalidateTemplateLocked(command string, args []string) (string, bool) {
+	key := templateKey(command, args)
+	family := d.templateCache[key]
+	existed := family != nil && len(family.entries) > 0
+	if family != nil {
+		family.revision++
+		family.entries = make(map[string]templateEntry)
+	}
+	return key, existed
 }
 
 // waitForCrossCwdClassify is the CR-002 fresh-consumer admission gate. The
@@ -886,8 +1074,10 @@ func (d *Daemon) warnDeprecatedMode(cmd string, args []string, legacyMode string
 // up to maxSpawnRetries times and surfaces an error on exhaustion.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	var isolatedRetry int64
+	templateMismatches := 0
+	templateBypass := false
 	for attempt := 0; attempt < maxSpawnRetries; attempt++ {
-		ipcPath, sid, token, err := d.spawnOnce(&req, &isolatedRetry)
+		ipcPath, sid, token, err := d.spawnOnce(&req, &isolatedRetry, &templateMismatches, &templateBypass)
 		if !errors.Is(err, errSpawnRetry) {
 			return ipcPath, sid, token, err
 		}
@@ -907,7 +1097,7 @@ func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) i
 // spawnOnce performs one attempt at creating or reusing an owner. It takes req
 // by pointer because some retry paths mutate req.Mode (isolated promotion) and
 // the mutation must persist across iterations of the Spawn retry loop.
-func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (string, string, string, error) {
+func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templateMismatches *int, templateBypass *bool) (string, string, string, error) {
 	req := *reqPtr
 	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
 	// Mode now gets the global identity (one upstream per (cmd, args)) per the
@@ -940,6 +1130,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn: %w", err)
 	}
+	effectiveEnv := mergeEnv(req.Env)
 
 	// Circuit breaker: reject spawn if the upstream has been crash-looping.
 	// This prevents infinite respawn loops (shim reconnect → spawn → crash → repeat)
@@ -1030,10 +1221,9 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 				// returned baseSid. Now we must confirm the new request's env is
 				// compatible; if not, retry so Spawn re-derives the bucketed sid.
 				//
-				// mergeEnv normalizes req.Env to the post-merge form (matches
-				// e.Env's stored form) so envCompatible compares like-for-like
-				// per CodeRabbit PR #121 finding about merge-vs-raw asymmetry.
-				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, mergeEnv(req.Env)) {
+				// effectiveEnv is the same post-merge form stored on the owner,
+				// so envCompatible compares like-for-like across create waiters.
+				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, effectiveEnv) {
 					d.logger.Printf("env-incompat after create-wait: owner %s — retrying with bucketed sid", shortServerID(sid))
 					d.mu.Unlock()
 					return "", "", "", errSpawnRetry
@@ -1060,7 +1250,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 						e.Owner.AddCwd(req.Cwd)
 					}
 				}
-				if !e.Owner.PreRegister(token, req.Cwd, req.Env) {
+				if !e.Owner.PreRegister(token, req.Cwd, effectiveEnv) {
 					if e.Owner.IsClassifiedIsolated() {
 						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, e)
 					}
@@ -1121,7 +1311,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 				// entry. Without this, concurrent spawns with different
 				// credentials can collapse onto one upstream during startup
 				// storms, defeating the credentials-boundary guarantee.
-				if mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, mergeEnv(req.Env)) {
+				if mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, effectiveEnv) {
 					d.logger.Printf("env-incompat after CAS on fast path: owner %s — retrying with bucketed sid", shortServerID(probeSID))
 					d.mu.Unlock()
 					return "", "", "", errSpawnRetry
@@ -1147,7 +1337,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 						probeOwner.AddCwd(req.Cwd)
 					}
 				}
-				if !probeOwner.PreRegister(token, req.Cwd, req.Env) {
+				if !probeOwner.PreRegister(token, req.Cwd, effectiveEnv) {
 					if probeOwner.IsClassifiedIsolated() {
 						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, current)
 					}
@@ -1214,7 +1404,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 	//    across different CWDs — every process has exactly one CWD, so sharing an
 	//    unclassified server with a different CWD risks context leaks.
 	if mode == serverid.ModeCwd {
-		if existing := d.findSharedOwnerLocked(req.Command, req.Args, req.Env, req.Cwd); existing != nil {
+		if existing := d.findSharedOwnerLocked(req.Command, req.Args, effectiveEnv, req.Cwd); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
 			d.mu.Unlock()
@@ -1223,7 +1413,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 				// Dedup hot path is silent — logging every reuse produced 500+ lines/minute.
 				existing.Owner.AddCwd(req.Cwd)
 			}
-			if !existing.Owner.PreRegister(token, req.Cwd, req.Env) {
+			if !existing.Owner.PreRegister(token, req.Cwd, effectiveEnv) {
 				if existing.Owner.IsClassifiedIsolated() {
 					*isolatedRetry = d.promoteIsolatedRetry(reqPtr, existing)
 				}
@@ -1263,7 +1453,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 	// fail with "No GitHub token available for session ...". Merging from the
 	// daemon's own os.Environ() (which was snapshotted at daemon start from the
 	// user env) fills the gap without overriding anything the shim did send.
-	sessionEnv := mergeEnv(req.Env)
+	sessionEnv := effectiveEnv
 	if len(sessionEnv) > 0 {
 		// Log presence (NOT values) of common credential keys so env-passthrough
 		// regressions remain visible. `shim_vars` is the pre-merge count — that
@@ -1279,70 +1469,74 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 
 	// Build the shared owner config (used by both template and fresh paths).
 	controlPath := serverid.ControlPath("", d.namespace, sid)
+	materializationPolicy := owner.MaterializationEager
+	if d.persistent {
+		materializationPolicy = owner.MaterializationPersistent
+	}
 	ownerCfg := owner.OwnerConfig{
-		Command:          req.Command,
-		Args:             req.Args,
-		Env:              sessionEnv,
-		Cwd:              req.Cwd,
-		IPCPath:          ipcPath,
-		ControlPath:      controlPath,
-		ServerID:         sid,
-		TokenHandshake:   true, // daemon-managed owners: shims send a handshake token
-		HandlerFunc:      d.handlerFunc,
-		SessionHandler:   d.sessionHandler,
-		AuthorizeSession: d.authorizeSession,
-		OnFrameReceived:  d.onFrameReceived,
-		OnZeroSessions: func(serverID string) {
-			d.onZeroSessions(serverID)
+		Command:                     req.Command,
+		Args:                        req.Args,
+		Env:                         sessionEnv,
+		Cwd:                         req.Cwd,
+		IPCPath:                     ipcPath,
+		ControlPath:                 controlPath,
+		ServerID:                    sid,
+		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
+		MaterializationPolicy:       materializationPolicy,
+		DeferInitialMaterialization: true,
+		PersistentRequired:          d.persistent,
+		HandlerFunc:                 d.handlerFunc,
+		SessionHandler:              d.sessionHandler,
+		AuthorizeSession:            d.authorizeSession,
+		OnFrameReceived:             d.onFrameReceived,
+		OnZeroSessions:              d.onZeroSessions,
+		OnUpstreamExit:              d.onUpstreamExit,
+		OnPersistentDetected: func(expected *owner.Owner) {
+			d.setOwnerPersistent(expected, true)
 		},
-		OnUpstreamExit: func(serverID string) {
-			d.onUpstreamExit(serverID)
-		},
-		OnPersistentDetected: func(serverID string) {
-			d.SetPersistent(serverID, true)
-		},
-		OnCacheReady: func(serverID string) {
-			d.mu.RLock()
-			entry, ok := d.owners[serverID]
-			var cachedOwner *owner.Owner
-			if ok {
-				cachedOwner = entry.Owner
-			}
-			d.mu.RUnlock()
-			if !ok || cachedOwner == nil {
-				return
-			}
-			snap := cachedOwner.ExportSnapshot()
-			d.updateTemplate(req.Command, req.Args, snap)
-		},
-		Logger: log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
+		OnPersistentResolved: d.resolveOwnerPersistent,
+		OnCacheReady:         d.publishOwnerCache,
+		OnCacheInvalidated:   d.invalidateOwnerTemplate,
+		Logger:               log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 	}
 
-	// Try template-based spawn: if the daemon has seen this server before,
-	// create the owner from cached init data (instant response to CC) and
-	// start the real upstream process in the background.
+	// Template-backed owners stay cache-only until a cache miss, explicit
+	// persistent policy, or another owner-local materialization trigger occurs.
 	var o *owner.Owner
 	var ownerErr error
+	var selectedTemplate templateMatch
 	fromTemplate := false
-	if tmpl, ok := d.getTemplate(req.Command, req.Args); ok {
-		// Adapt template for this specific owner instance
-		tmpl.ServerID = sid
-		tmpl.Cwd = req.Cwd
-		tmpl.CwdSet = []string{req.Cwd}
-		tmpl.Env = sessionEnv
-		tmpl.Mode = req.Mode
+	templatePersistent := false
+	if !*templateBypass {
+		if match, ok := d.getCompatibleTemplate(req.Command, req.Args, req.Cwd, sessionEnv); ok {
+			tmpl := match.snapshot
+			// Adapt only instance identity. Compatibility was already decided
+			// from the template's original normalized env and sharing scope.
+			tmpl.ServerID = sid
+			tmpl.Cwd = req.Cwd
+			tmpl.CwdSet = []string{req.Cwd}
+			tmpl.Env = sessionEnv
+			tmpl.Mode = req.Mode
+			templatePersistent = d.persistent || tmpl.Persistent
 
-		o, ownerErr = owner.NewOwnerFromSnapshot(ownerCfg, tmpl)
-		if ownerErr != nil {
-			d.logger.Printf("template spawn failed for %s: %v, falling back to fresh spawn", sid[:8], ownerErr)
-			o = nil // fall through to fresh spawn
-		} else {
-			fromTemplate = true
-			d.logger.Printf("spawned owner %s from template cache (instant init) for %s", sid[:8], req.Command)
+			templateCfg := ownerCfg
+			templateCfg.PersistentPending = false
+			if templatePersistent {
+				templateCfg.MaterializationPolicy = owner.MaterializationPersistent
+			} else {
+				templateCfg.MaterializationPolicy = owner.MaterializationOnDemand
+			}
+			o, ownerErr = owner.NewOwnerFromSnapshot(templateCfg, tmpl)
+			if ownerErr != nil {
+				d.logger.Printf("template spawn failed for %s: %v, falling back to fresh spawn", sid[:8], ownerErr)
+				o = nil // fall through to fresh spawn
+			} else {
+				selectedTemplate = match
+				fromTemplate = true
+				d.logger.Printf("spawned owner %s from compatible template cache revision=%d for %s", sid[:8], match.revision, req.Command)
+			}
 		}
 	}
-
-	// Fresh spawn: no template available, or template spawn failed.
 	if o == nil {
 		o, ownerErr = owner.NewOwner(ownerCfg)
 		if ownerErr != nil {
@@ -1360,6 +1554,13 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 	if d.sessionHandler != nil {
 		o.MarkClassifiedAs(classify.ModeShared)
 	}
+	if !fromTemplate && d.beforeColdOwnerPromotion != nil {
+		d.beforeColdOwnerPromotion(o)
+	}
+
+	if fromTemplate && d.beforeTemplatePromotion != nil {
+		d.beforeTemplatePromotion()
+	}
 
 	// Register owner with the supervisor for lifecycle management.
 	// Suture will call owner.Serve(ctx) in its own goroutine and handle
@@ -1371,21 +1572,47 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64) (strin
 	// checks see the same credential-complete view that the upstream and
 	// session already got. Otherwise a daemon restart would round-trip
 	// trimmed env through the snapshot and re-surface the original bug.
+	effectivePersistent := d.persistent || templatePersistent
 	d.mu.Lock()
+	if d.owners[sid] != placeholder || (fromTemplate && !d.templateMatchCurrentLocked(selectedTemplate)) {
+		staleTemplate := fromTemplate && !d.templateMatchCurrentLocked(selectedTemplate)
+		if d.owners[sid] == placeholder {
+			d.deleteOwnerEntryLocked(sid)
+			if placeholder.creating != nil {
+				close(placeholder.creating)
+				placeholder.creating = nil
+			}
+		}
+		d.mu.Unlock()
+		d.supervisor.Remove(serviceToken)
+		o.Shutdown()
+		if staleTemplate {
+			*templateMismatches++
+			if *templateMismatches >= 2 {
+				*templateBypass = true
+			}
+			d.logger.Printf("template revision changed before promotion for %s (revision=%d mismatches=%d bypass=%v)", req.Command, selectedTemplate.revision, *templateMismatches, *templateBypass)
+		}
+		return "", "", "", errSpawnRetry
+	}
 	placeholder.Owner = o
 	placeholder.Mode = req.Mode
 	placeholder.Env = sessionEnv
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout
 	placeholder.serviceToken = serviceToken
-	placeholder.Persistent = d.persistent
+	placeholder.Persistent = effectivePersistent
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
 	d.mu.Unlock()
+	if !fromTemplate {
+		if startErr := o.StartInitialMaterialization(); startErr != nil {
+			_, removalErr := d.removeOwnerIfCurrent(sid, placeholder, ownerRemovalReasonRestoreFailed, false)
+			return "", "", "", errors.Join(fmt.Errorf("spawn %s: start upstream: %w", req.Command, startErr), removalErr)
+		}
+	}
 
-	// For template-spawned owners, start the upstream process in the background.
-	// The owner already serves cached responses; upstream refreshes caches when ready.
-	if fromTemplate {
+	if fromTemplate && templatePersistent {
 		o.SpawnUpstreamBackground()
 	}
 
@@ -1844,8 +2071,9 @@ func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOp
 	}
 
 	// Serialize snapshot first — needed for FR-8 fallback and successor seed
-	// regardless of whether handoff succeeds.
-	snapshotPath, err := d.SerializeSnapshot()
+	// regardless of whether handoff succeeds. Owner restart pins remain held
+	// until the predecessor has shut down after the control response is flushed.
+	snapshotPath, restartLease, err := d.serializeSnapshotPinned()
 	if err != nil {
 		d.shuttingDown.Store(false)
 		return "", nil, fmt.Errorf("snapshot: %w", err)
@@ -1865,18 +2093,24 @@ func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOp
 	// silent to the control-plane caller (it still gets a valid snapshot path).
 	if handoffErr := d.attemptHandoff(opts.SuccessorExe); handoffErr != nil {
 		if errors.Is(handoffErr, errNoHandoffUpstreams) {
-			return snapshotPath, d.afterSnapshotOnlyRestart(opts.SuccessorExe), nil
+			return snapshotPath, d.afterSnapshotOnlyRestart(opts.SuccessorExe, restartLease), nil
 		}
 		d.stats.fallback.Add(1)
 		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
 	}
 
-	return snapshotPath, func() { go d.Shutdown() }, nil
+	return snapshotPath, func() {
+		go func() {
+			defer restartLease.Release()
+			d.Shutdown()
+		}()
+	}, nil
 }
 
-func (d *Daemon) afterSnapshotOnlyRestart(successorExe string) func() {
+func (d *Daemon) afterSnapshotOnlyRestart(successorExe string, restartLease *snapshotRestartLease) func() {
 	return func() {
 		go func() {
+			defer restartLease.Release()
 			d.shutdown(func() {
 				d.logger.Printf("snapshot_restart.spawn_successor exe=%q flag=%q", successorExe, d.daemonFlag)
 				if err := spawnSnapshotSuccessorForRestart(successorExe, d.daemonFlag); err != nil {
@@ -1956,6 +2190,12 @@ func (d *Daemon) handleCanSuspend(prevToken, serverID string) (control.SuspendCh
 	if !ok || current != entry {
 		return control.SuspendCheckResponse{}, ErrOwnerGone
 	}
+	if entry.Owner.PersistentPending() {
+		return control.SuspendCheckResponse{Reason: "pending_persistent"}, nil
+	}
+	if entry.Owner.MaterializationBlocksEviction() {
+		return control.SuspendCheckResponse{Reason: "materializing"}, nil
+	}
 	if entry.Owner.PendingRequests() > 0 {
 		return control.SuspendCheckResponse{Reason: "pending_requests"}, nil
 	}
@@ -1970,40 +2210,63 @@ func (d *Daemon) handleCanSuspend(prevToken, serverID string) (control.SuspendCh
 
 // HandleStatus implements control.CommandHandler.
 func (d *Daemon) HandleStatus() map[string]any {
+	type statusOwner struct {
+		serverID                    string
+		owner                       *owner.Owner
+		persistent                  bool
+		ownerGeneration             string
+		restoredFromOwnerGeneration string
+		restoreSource               string
+		lastSession                 time.Time
+		idleTimeout                 time.Duration
+	}
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	servers := make([]map[string]any, 0, len(d.owners))
+	ownerViews := make([]statusOwner, 0, len(d.owners))
 	for sid, entry := range d.owners {
 		if entry.Owner == nil {
-			continue // placeholder still being created
+			continue
 		}
-		s := entry.Owner.Status()
-		s["server_id"] = sid
-		s["persistent"] = entry.Persistent
-		s["owner_generation"] = entry.OwnerGeneration
-		if entry.RestoredFromOwnerGeneration != "" {
-			s["restored_from_owner_generation"] = entry.RestoredFromOwnerGeneration
+		ownerViews = append(ownerViews, statusOwner{
+			serverID:                    sid,
+			owner:                       entry.Owner,
+			persistent:                  entry.Persistent,
+			ownerGeneration:             entry.OwnerGeneration,
+			restoredFromOwnerGeneration: entry.RestoredFromOwnerGeneration,
+			restoreSource:               entry.RestoreSource,
+			lastSession:                 entry.LastSession,
+			idleTimeout:                 entry.IdleTimeout,
+		})
+	}
+	removalStatus := d.ownerRemoval.statusMap()
+	zombieSpawn := d.zombieDetectedSpawn
+	zombieRestore := d.zombieDetectedRestore
+	d.mu.RUnlock()
+
+	servers := make([]map[string]any, 0, len(ownerViews))
+	for _, view := range ownerViews {
+		s := view.owner.Status()
+		s["server_id"] = view.serverID
+		s["persistent"] = view.persistent
+		s["owner_generation"] = view.ownerGeneration
+		if view.restoredFromOwnerGeneration != "" {
+			s["restored_from_owner_generation"] = view.restoredFromOwnerGeneration
 		}
-		if entry.RestoreSource != "" {
-			s["restore_source"] = entry.RestoreSource
+		if view.restoreSource != "" {
+			s["restore_source"] = view.restoreSource
 		} else {
 			s["restore_source"] = "fresh"
 		}
-		s["last_session"] = entry.LastSession.Format(time.RFC3339)
-		// Prefer the per-owner override from x-mux.idleTimeout capability
-		// (set via Owner.SetIdleTimeout after init); fall back to the
-		// daemon-wide default captured at spawn time.
-		effectiveIdleTimeout := entry.IdleTimeout
-		if override := entry.Owner.IdleTimeout(); override > 0 {
+		s["last_session"] = view.lastSession.Format(time.RFC3339)
+		effectiveIdleTimeout := view.idleTimeout
+		if override := view.owner.IdleTimeout(); override > 0 {
 			effectiveIdleTimeout = override
 		}
 		s["idle_timeout_s"] = effectiveIdleTimeout.Seconds()
-		if !entry.Owner.LastActivity().IsZero() {
-			s["last_activity"] = entry.Owner.LastActivity().Format(time.RFC3339)
+		if !view.owner.LastActivity().IsZero() {
+			s["last_activity"] = view.owner.LastActivity().Format(time.RFC3339)
 		}
-		s["active_progress_tokens"] = entry.Owner.ActiveProgressTokens()
-		s["busy"] = entry.Owner.HasActiveBusyWork()
+		s["active_progress_tokens"] = view.owner.ActiveProgressTokens()
+		s["busy"] = view.owner.HasActiveBusyWork()
 		servers = append(servers, s)
 	}
 
@@ -2013,17 +2276,17 @@ func (d *Daemon) HandleStatus() map[string]any {
 		"shutting_down":                   d.shuttingDown.Load(),
 		"pid":                             os.Getpid(),
 		"daemon_generation":               d.daemonGeneration,
-		"reaped_owner_count":              d.ownerRemoval.ByReason[ownerRemovalReasonIdle],
-		"owner_removal":                   d.ownerRemoval.statusMap(),
-		"owner_count":                     len(servers), // excludes placeholders still being created
+		"reaped_owner_count":              removalStatus["by_reason"].(map[string]uint64)[string(ownerRemovalReasonIdle)],
+		"owner_removal":                   removalStatus,
+		"owner_count":                     len(servers),
 		"servers":                         servers,
 		"owner_idle_timeout":              d.ownerIdleTimeout.String(),
 		"idle_timeout":                    d.idleTimeout.String(),
 		"shim_reconnect_refreshed":        d.reconnectRefreshed.Load(),
 		"shim_reconnect_fallback_spawned": d.reconnectFallbackSpawned.Load(),
 		"shim_reconnect_gave_up":          d.reconnectGaveUp.Load(),
-		"zombie_detections_spawn":         d.zombieDetectedSpawn,
-		"zombie_detections_restore":       d.zombieDetectedRestore,
+		"zombie_detections_spawn":         zombieSpawn,
+		"zombie_detections_restore":       zombieRestore,
 		"handoff": map[string]any{
 			"attempted":                      d.stats.attempted.Load(),
 			"transferred":                    d.stats.transferred.Load(),
@@ -2043,42 +2306,45 @@ func (d *Daemon) HandleStatus() map[string]any {
 // (Owner == nil) are excluded. Satisfies control.DaemonHandler.
 func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersResponse, error) {
 	const maxOwners = 200
+	type listOwner struct {
+		serverID   string
+		owner      *owner.Owner
+		command    string
+		args       []string
+		persistent bool
+	}
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	// Collect server IDs, skipping placeholder entries.
-	sids := make([]string, 0, len(d.owners))
+	views := make([]listOwner, 0, len(d.owners))
 	for sid, entry := range d.owners {
-		if entry.Owner == nil {
-			continue
-		}
-		sids = append(sids, sid)
-	}
-	sort.Strings(sids)
-
-	truncated := false
-	if len(sids) > maxOwners {
-		sids = sids[:maxOwners]
-		truncated = true
-	}
-
-	owners := make([]control.OwnerInfo, 0, len(sids))
-	for _, sid := range sids {
-		entry := d.owners[sid]
 		if entry == nil || entry.Owner == nil {
 			continue
 		}
-		s := entry.Owner.Status()
+		views = append(views, listOwner{
+			serverID:   sid,
+			owner:      entry.Owner,
+			command:    entry.Command,
+			args:       append([]string(nil), entry.Args...),
+			persistent: entry.Persistent,
+		})
+	}
+	d.mu.RUnlock()
+	sort.Slice(views, func(i, j int) bool { return views[i].serverID < views[j].serverID })
+	truncated := false
+	if len(views) > maxOwners {
+		views = views[:maxOwners]
+		truncated = true
+	}
 
+	owners := make([]control.OwnerInfo, 0, len(views))
+	for _, view := range views {
+		s := view.owner.Status()
 		cwd, _ := s["cwd"].(string)
 		muxVer, _ := s["mux_version"].(string)
 		classification, _ := s["auto_classification"].(string)
 		classificationSource, _ := s["classification_source"].(string)
-
 		sessions := statusInt(s["session_count"])
 		pending := statusInt(s["pending_requests"])
 		upstreamPID := statusInt(s["upstream_pid"])
-
 		var cwdSet []string
 		switch v := s["cwd_set"].(type) {
 		case []string:
@@ -2090,7 +2356,6 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 				}
 			}
 		}
-
 		var classificationReason []string
 		switch v := s["classification_reason"].(type) {
 		case []string:
@@ -2102,17 +2367,15 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 				}
 			}
 		}
-
 		cachedInit, _ := s["cached_init"].(bool)
 		cachedTools, _ := s["cached_tools"].(bool)
 		cachedPrompts, _ := s["cached_prompts"].(bool)
 		cachedResources, _ := s["cached_resources"].(bool)
-
 		owners = append(owners, control.OwnerInfo{
-			ServerID:             sid,
+			ServerID:             view.serverID,
 			EngineName:           d.name,
-			Command:              entry.Command,
-			Args:                 entry.Args,
+			Command:              view.command,
+			Args:                 view.args,
 			Cwd:                  cwd,
 			CwdSet:               cwdSet,
 			Sessions:             sessions,
@@ -2122,14 +2385,13 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 			ClassificationSource: classificationSource,
 			ClassificationReason: classificationReason,
 			MuxVersion:           muxVer,
-			Persistent:           entry.Persistent,
+			Persistent:           view.persistent,
 			CachedInit:           cachedInit,
 			CachedTools:          cachedTools,
 			CachedPrompts:        cachedPrompts,
 			CachedResources:      cachedResources,
 		})
 	}
-
 	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil
 }
 
@@ -2231,13 +2493,87 @@ func shortServerID(serverID string) string {
 }
 
 // SetPersistent marks an owner as persistent (survives zero-session periods).
+// Operator calls intentionally address the current server ID; owner callbacks
+// use the exact-owner fenced variants below.
 func (d *Daemon) SetPersistent(serverID string, persistent bool) {
 	d.mu.Lock()
-	if entry, ok := d.owners[serverID]; ok {
-		entry.Persistent = persistent
-		d.logger.Printf("owner %s persistent=%v", serverID[:8], persistent)
+	_, ok := d.owners[serverID]
+	if ok {
+		d.owners[serverID].Persistent = persistent
 	}
 	d.mu.Unlock()
+	if ok {
+		d.logger.Printf("owner %s persistent=%v", shortServerID(serverID), persistent)
+	}
+}
+
+func (d *Daemon) setOwnerPersistent(expected *owner.Owner, persistent bool) bool {
+	if expected == nil {
+		return false
+	}
+	serverID := expected.ServerID()
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	ok = ok && entry != nil && entry.Owner == expected
+	if ok {
+		entry.Persistent = persistent
+	}
+	d.mu.Unlock()
+	if ok {
+		d.logger.Printf("owner %s persistent=%v", shortServerID(serverID), persistent)
+	}
+	return ok
+}
+
+func (d *Daemon) resolveOwnerPersistent(expected *owner.Owner, reported bool) {
+	effective := d.persistent || reported
+	if d.setOwnerPersistent(expected, effective) {
+		expected.ResolvePersistent(effective)
+		d.logger.Printf("owner %s persistent=%v (reported=%v)", shortServerID(expected.ServerID()), effective, reported)
+	}
+}
+
+func (d *Daemon) publishOwnerCache(expected *owner.Owner, snap mcpsnapshot.OwnerSnapshot) bool {
+	if expected == nil {
+		return false
+	}
+	if d.beforeOwnerCachePublish != nil {
+		d.beforeOwnerCachePublish(expected)
+	}
+	serverID := expected.ServerID()
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if !ok || entry == nil || entry.Owner != expected {
+		d.mu.Unlock()
+		return false
+	}
+	snap.Persistent = d.persistent || snap.Persistent
+	entry.Persistent = snap.Persistent
+	key, revision, published := d.updateTemplateLocked(entry.Command, entry.Args, snap)
+	d.mu.Unlock()
+	if published {
+		d.logger.Printf("template cache updated for %s (key=%s revision=%d scope=%s)", entry.Command, key[:8], revision, snap.Classification)
+	}
+	return published
+}
+
+func (d *Daemon) invalidateOwnerTemplate(expected *owner.Owner) {
+	if expected == nil {
+		return
+	}
+	serverID := expected.ServerID()
+	d.mu.Lock()
+	entry, ok := d.owners[serverID]
+	if !ok || entry == nil || entry.Owner != expected {
+		d.mu.Unlock()
+		return
+	}
+	command := entry.Command
+	key, existed := d.invalidateTemplateLocked(command, entry.Args)
+	d.mu.Unlock()
+	if existed {
+		d.logger.Printf("template cache invalidated for %s (key=%s)", command, key[:8])
+	}
 }
 
 // findSharedOwnerLocked looks for an accepting owner that matches the requested
@@ -2455,41 +2791,7 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 // the key with different values. Presence in only one env remains compatible so
 // optional config defaults do not fragment owners by themselves.
 func envCompatible(a, b map[string]string) bool {
-	for k, va := range a {
-		if envTransient(k) {
-			continue
-		}
-		if !envIdentityKey(k) {
-			continue
-		}
-		vb, ok := b[k]
-		if !ok {
-			if envCredentialKey(k) {
-				return false
-			}
-			continue
-		}
-		if va != vb {
-			return false
-		}
-	}
-	// Symmetric check: a credential key present in b but missing in a
-	// must also split. The loop over a alone cannot see keys unique to b.
-	for k := range b {
-		if envTransient(k) {
-			continue
-		}
-		if !envIdentityKey(k) {
-			continue
-		}
-		if _, ok := a[k]; ok {
-			continue
-		}
-		if envCredentialKey(k) {
-			return false
-		}
-	}
-	return true
+	return envidentity.Compatible(a, b)
 }
 
 // envCredentialKey returns true if the key likely carries an authentication
@@ -2500,43 +2802,7 @@ func envCompatible(a, b map[string]string) bool {
 // uniquely-named "fake credential" var; false negatives leak real
 // credentials across sessions. The trade-off prefers the former.
 func envCredentialKey(key string) bool {
-	upper := strings.ToUpper(key)
-	switch {
-	case strings.HasSuffix(upper, "_TOKEN"):
-		return true
-	case strings.HasSuffix(upper, "_KEY"):
-		return true
-	case strings.HasSuffix(upper, "_API_KEY"):
-		return true
-	case strings.HasSuffix(upper, "_SECRET"):
-		return true
-	case strings.HasSuffix(upper, "_PASSWORD"):
-		return true
-	case strings.HasSuffix(upper, "_PASSWD"):
-		return true
-	case strings.HasSuffix(upper, "_CREDENTIALS"):
-		return true
-	case strings.HasSuffix(upper, "_AUTH"):
-		return true
-	// Exact-match keys that don't fit the suffix pattern.
-	case upper == "GH_TOKEN" || upper == "GITHUB_TOKEN":
-		return true
-	case upper == "GITHUB_PERSONAL_ACCESS_TOKEN":
-		return true
-	case upper == "OPENAI_API_KEY" || upper == "ANTHROPIC_API_KEY":
-		return true
-	case upper == "TAVILY_API_KEY" || upper == "GOOGLE_API_KEY":
-		return true
-	case upper == "AWS_ACCESS_KEY_ID" || upper == "AWS_SECRET_ACCESS_KEY":
-		return true
-	case upper == "AWS_SESSION_TOKEN":
-		return true
-	case upper == "SSH_AUTH_SOCK" || upper == "SSH_AGENT_PID":
-		return true
-	case upper == "DOCKER_AUTH_CONFIG":
-		return true
-	}
-	return false
+	return envidentity.IsCredentialKey(key)
 }
 
 // envIdentityKey returns true for env vars that should partition a global
@@ -2546,53 +2812,7 @@ func envCredentialKey(key string) bool {
 // remain identity keys via envCredentialKey; non-secret configuration keys use
 // conservative suffix/exact matches.
 func envIdentityKey(key string) bool {
-	if envCredentialKey(key) {
-		return true
-	}
-	upper := strings.ToUpper(key)
-	switch {
-	case strings.HasSuffix(upper, "_CONFIG"):
-		return true
-	case strings.HasSuffix(upper, "_CONFIG_FILE"):
-		return true
-	case strings.HasSuffix(upper, "_CONFIG_PATH"):
-		return true
-	case strings.HasSuffix(upper, "_CONFIG_DIR"):
-		return true
-	case strings.HasSuffix(upper, "_ENDPOINT"):
-		return true
-	case strings.HasSuffix(upper, "_BASE_URL"):
-		return true
-	case strings.HasSuffix(upper, "_URL"):
-		return true
-	case strings.HasSuffix(upper, "_HOST"):
-		return true
-	case strings.HasSuffix(upper, "_PORT"):
-		return true
-	case strings.HasSuffix(upper, "_REGION"):
-		return true
-	case strings.HasSuffix(upper, "_PROFILE"):
-		return true
-	case strings.HasSuffix(upper, "_CERT_PATH") || strings.HasSuffix(upper, "_CERT_FILE"):
-		return true
-	case upper == "CONFIG" || upper == "CONFIG_FILE" || upper == "CONFIG_PATH" || upper == "CONFIG_DIR":
-		return true
-	case upper == "HOST" || upper == "PORT" || upper == "URL" || upper == "BASE_URL" || upper == "ENDPOINT":
-		return true
-	case upper == "REGION" || upper == "PROFILE":
-		return true
-	case upper == "KUBECONFIG" || upper == "NODE_EXTRA_CA_CERTS" || upper == "CERT_PATH" || upper == "CERT_FILE":
-		return true
-	case upper == "HTTP_PROXY" || upper == "HTTPS_PROXY" || upper == "ALL_PROXY" || upper == "NO_PROXY":
-		return true
-	case strings.HasPrefix(upper, "NPM_CONFIG_"):
-		return true
-	case upper == "SSL_CERT_FILE" || upper == "SSL_CERT_DIR":
-		return true
-	case upper == "REQUESTS_CA_BUNDLE" || upper == "CURL_CA_BUNDLE":
-		return true
-	}
-	return false
+	return envidentity.IsIdentityKey(key)
 }
 
 // semanticEnvHash returns a stable 8-hex-char hash of env entries that
@@ -2601,31 +2821,7 @@ func envIdentityKey(key string) bool {
 // when env-incompat sessions need distinct owners under global-first
 // identity (CR-002 AC8). Empty / nil env returns "00000000".
 func semanticEnvHash(env map[string]string) string {
-	if len(env) == 0 {
-		return "00000000"
-	}
-	h := sha256.New()
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		if envTransient(k) {
-			continue
-		}
-		if !envIdentityKey(k) {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	if len(keys) == 0 {
-		return "00000000"
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		h.Write([]byte{0})
-		h.Write([]byte(k))
-		h.Write([]byte{0})
-		h.Write([]byte(env[k]))
-	}
-	return hex.EncodeToString(h.Sum(nil))[:8]
+	return envidentity.ShortHash(env)
 }
 
 // deriveEnvBucketedSid (CR-002 AC8) preserves the credentials-partition
@@ -2697,57 +2893,7 @@ func (d *Daemon) deriveEnvBucketedSid(baseSid string, reqEnv map[string]string) 
 // envTransient returns true for env vars that are per-session/transient
 // and should NOT affect dedup decisions.
 func envTransient(key string) bool {
-	switch {
-	// Claude Code-specific session vars
-	case strings.HasPrefix(key, "CLAUDE_CODE_"):
-		return true
-	case strings.HasPrefix(key, "CLAUDE_AUTO"):
-		return true
-	case key == "CLAUDE_CODE_ENTRYPOINT":
-		return true
-	// Windows Terminal / WSL session vars
-	case strings.HasPrefix(key, "WT_"):
-		return true
-	case key == "SESSIONNAME" || key == "WSLENV":
-		return true
-	// CR-002 codex PR #121 fix: cwd-derived vars MUST be transient so
-	// env-bucketing under global-first does not fragment owners across
-	// per-session working directories. Without this, two sessions with
-	// identical credentials from different cwds get different env-bucket
-	// sids because PWD/OLDPWD/INIT_CWD differ — defeating the global-first
-	// dedup goal and recreating per-cwd owner fan-out the spec explicitly
-	// targets (Engram #244 Bug 1).
-	case key == "PWD" || key == "OLDPWD" || key == "INIT_CWD":
-		return true
-	// npm launch-noise vars (per-script/cwd, not semantic to MCP identity).
-	// Per CodeRabbit PR #121: narrow from blanket `npm_*` prefix so
-	// credential-bearing keys like npm_config_registry / npm_config_token
-	// REMAIN part of identity — two sessions with different registries
-	// must NOT collapse onto a shared owner.
-	case strings.HasPrefix(key, "npm_lifecycle_"):
-		return true
-	case strings.HasPrefix(key, "npm_package_"):
-		return true
-	case key == "npm_execpath" || key == "npm_node_execpath" || key == "npm_command":
-		return true
-	// Terminal/shell-derived vars (per-shim-launch transients, not semantic
-	// to the upstream MCP server's identity).
-	case key == "TERM" || key == "TERM_PROGRAM" || key == "TERM_PROGRAM_VERSION":
-		return true
-	case key == "COLORTERM" || key == "LINES" || key == "COLUMNS":
-		return true
-	case key == "_" || key == "SHLVL" || key == "SHELL":
-		return true
-	// SSH session metadata (per-connection transients). Per CodeRabbit
-	// PR #121: do NOT match SSH_AUTH_SOCK / SSH_AGENT_PID — those bind
-	// credentials to the upstream and must stay in identity.
-	case key == "SSH_CLIENT" || key == "SSH_CONNECTION" || key == "SSH_TTY":
-		return true
-	// X11/Wayland display vars (per-session transients on Linux desktops).
-	case key == "DISPLAY" || key == "XAUTHORITY" || key == "WAYLAND_DISPLAY":
-		return true
-	}
-	return false
+	return envidentity.IsTransient(key)
 }
 
 // Shutdown gracefully stops all owners and the daemon.
@@ -2785,19 +2931,30 @@ func (d *Daemon) shutdown(beforeDone func()) {
 			}
 		}
 
-		// Shutdown all owners
-		d.mu.Lock()
-		owners := make([]*owner.Owner, 0, len(d.owners))
-		for _, e := range d.owners {
-			if e.Owner != nil {
-				owners = append(owners, e.Owner)
-			}
+		// Finalize each owner before deleting its registry entry. Placeholders own
+		// no process authority and may be removed directly.
+		type shutdownOwner struct {
+			serverID string
+			entry    *OwnerEntry
 		}
-		d.owners = make(map[string]*OwnerEntry)
-		d.mu.Unlock()
-
-		for _, o := range owners {
-			o.Shutdown()
+		d.mu.RLock()
+		owners := make([]shutdownOwner, 0, len(d.owners))
+		for serverID, entry := range d.owners {
+			owners = append(owners, shutdownOwner{serverID: serverID, entry: entry})
+		}
+		d.mu.RUnlock()
+		for _, item := range owners {
+			if item.entry == nil || item.entry.Owner == nil {
+				d.mu.Lock()
+				if d.owners[item.serverID] == item.entry {
+					d.deleteOwnerEntryLocked(item.serverID)
+				}
+				d.mu.Unlock()
+				continue
+			}
+			if _, err := d.finalizeAndRemoveOwner(item.serverID, item.entry, ownerRemovalReasonOperatorHard, false, nil, false); err != nil {
+				d.logger.Printf("owner %s shutdown finalization blocked: %v", shortServerID(item.serverID), err)
+			}
 		}
 
 		if beforeDone != nil {
@@ -2835,30 +2992,28 @@ func (d *Daemon) Entry(serverID string) *OwnerEntry {
 }
 
 // onZeroSessions is called by an owner when its last session disconnects.
-func (d *Daemon) onZeroSessions(serverID string) {
-	var (
-		entry  *OwnerEntry
-		zeroAt time.Time
-		delay  time.Duration
-	)
+func (d *Daemon) onZeroSessions(expected *owner.Owner) {
+	if expected == nil {
+		return
+	}
+	serverID := expected.ServerID()
+	delay := d.zeroSessionCleanupDelay
+	if override := expected.IdleTimeout(); override > 0 {
+		delay = override
+	}
+	zeroAt := time.Now()
 	d.mu.Lock()
 	entry, ok := d.owners[serverID]
+	ok = ok && entry != nil && entry.Owner == expected
 	if ok {
-		zeroAt = time.Now()
 		entry.LastSession = zeroAt
-		delay = d.zeroSessionCleanupDelay
-		if entry.Owner != nil {
-			if override := entry.Owner.IdleTimeout(); override > 0 {
-				delay = override
-			}
-		}
 	}
 	d.mu.Unlock()
-
-	if ok {
-		d.logger.Printf("owner %s: zero sessions (cleanup delay %s)", serverID[:8], delay)
-		d.scheduleZeroSessionCleanup(serverID, entry, zeroAt, delay)
+	if !ok {
+		return
 	}
+	d.logger.Printf("owner %s: zero sessions (cleanup delay %s)", shortServerID(serverID), delay)
+	d.scheduleZeroSessionCleanup(serverID, entry, zeroAt, delay)
 }
 
 func (d *Daemon) scheduleZeroSessionCleanup(serverID string, entry *OwnerEntry, zeroAt time.Time, delay time.Duration) {
@@ -2890,49 +3045,41 @@ func (d *Daemon) scheduleZeroSessionCleanup(serverID string, entry *OwnerEntry, 
 }
 
 // onUpstreamExit is called by an owner when its upstream process exits.
-func (d *Daemon) onUpstreamExit(serverID string) {
+func (d *Daemon) onUpstreamExit(expected *owner.Owner) {
+	if expected == nil {
+		return
+	}
+	serverID := expected.ServerID()
 	d.mu.Lock()
 	entry, ok := d.owners[serverID]
-
-	// If the current entry is a placeholder for a different pending owner
-	// creation (entry.Owner == nil), this callback is from a PRIOR owner
-	// whose entry was already replaced in the registry — typically via the
-	// FR-4 zombie-spawn tear-down path which deletes the entry under d.mu
-	// and then calls Shutdown outside the lock, after which a concurrent
-	// shim can install a fresh placeholder at the same serverID. Acting on
-	// the placeholder here would panic on entry.Owner.Shutdown() and would
-	// incorrectly delete the placeholder belonging to a completely different
-	// spawn goroutine. Skip cleanly — the prior owner's tear-down path is
-	// already draining it, and the placeholder will resolve on its own.
-	if ok && entry.Owner == nil {
+	if !ok || entry == nil || entry.Owner != expected {
 		d.mu.Unlock()
 		return
 	}
-
-	if ok {
-		// Record crash for circuit breaker before any other action.
-		cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
-		d.recordCrash(cmdKey)
-
-		if entry.Persistent {
-			d.mu.Unlock()
-			d.logger.Printf("owner %s: upstream exited, will re-spawn (persistent)", serverID[:8])
-			// Reaper handles re-spawn for persistent owners
-			return
-		}
-		d.mu.Unlock()
-		d.forgetOwnerIfCurrent(serverID, entry, ownerRemovalReasonUpstreamExit)
-		entry.Owner.Shutdown()
-		d.logger.Printf("owner %s: upstream exited, removed", shortServerID(serverID))
-		return
-	}
+	cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
+	d.recordCrash(cmdKey)
+	persistent := entry.Persistent
 	d.mu.Unlock()
+	if persistent {
+		d.logger.Printf("owner %s: upstream exited; owner-local persistent recovery remains authoritative", shortServerID(serverID))
+		return
+	}
+	result, err := d.removeOwnerIfCurrent(serverID, entry, ownerRemovalReasonUpstreamExit, false)
+	if err != nil {
+		d.logger.Printf("owner %s: upstream-exit removal blocked: %v", shortServerID(serverID), err)
+		return
+	}
+	if result.Removed {
+		d.logger.Printf("owner %s: upstream exited, removed", shortServerID(serverID))
+	}
 }
 
 // crashWindow is the time window for crash counting. If an upstream crashes
 // crashThreshold times within this window, further spawns are rejected.
-const crashWindow = 60 * time.Second
-const crashThreshold = 5
+const (
+	crashWindow    = 60 * time.Second
+	crashThreshold = 5
+)
 
 // concurrentCreateWaitTimeout is the maximum time a Spawn / findSharedOwner
 // goroutine will wait for another goroutine that is currently creating the

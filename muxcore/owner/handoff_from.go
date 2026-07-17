@@ -73,13 +73,16 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		env:                    cfg.Env,
 		handlerFunc:            cfg.HandlerFunc,
 		sessionHandler:         cfg.SessionHandler,
+		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               srvID,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
 		onUpstreamExit:         cfg.OnUpstreamExit,
 		onPersistentDetected:   cfg.OnPersistentDetected,
+		onPersistentResolved:   cfg.OnPersistentResolved,
 		onCacheReady:           cfg.OnCacheReady,
+		onCacheInvalidated:     cfg.OnCacheInvalidated,
 		authorizeSession:       cfg.AuthorizeSession,
 		onFrameReceived:        cfg.OnFrameReceived,
 		sessions:               make(map[int]*Session),
@@ -95,6 +98,12 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
+		materializationPolicy:  cfg.MaterializationPolicy,
+		materializationState:   MaterializationReady,
+		persistentRequired:     cfg.PersistentRequired,
+		materializationStop:    make(chan struct{}),
+		pendingDemands:         make(map[string]*localDemand),
+		persistentPending:      cfg.PersistentPending,
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
 
@@ -105,11 +114,27 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
 	o.cacheHandlerInterfaces()
 
-	// Apply cached classification if provided — skip the classify round-trip.
-	if cfg.CachedClassification != "" {
+	// Adopt the predecessor's last coherent cache generation before any reader or
+	// session goroutine starts. A live handoff must not issue a second initialize
+	// transaction to an already-initialized upstream.
+	if cfg.AdoptedSnapshot != nil {
+		snap := *cfg.AdoptedSnapshot
+		o.hydrateSnapshotCache(snap)
+		for _, c := range snap.CwdSet {
+			o.cwdSet[serverid.CanonicalizePath(c)] = true
+		}
+		if len(snap.BoundTokens) > 0 {
+			o.sessionMgr.ImportBoundHistory(boundTokenSnapshotsToSession(snap.BoundTokens))
+		}
+		if o.initDone {
+			o.initReadyOnce.Do(func() { close(o.initReady) })
+		}
+	}
+	if o.classificationSource == "" && cfg.CachedClassification != "" {
 		o.autoClassification = cfg.CachedClassification
 		o.classificationSource = "handoff"
-		o.classificationReason = nil
+	}
+	if o.classificationSource != "" || o.autoClassification != "" {
 		o.classifiedOnce.Do(func() { close(o.classified) })
 	}
 
@@ -130,9 +155,10 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		}
 	}
 
-	// Start goroutines — identical set to NewOwner.
+	// Start exactly one reader for the adopted initialized stream. Cache truth is
+	// staged above; no legacy proactive initialize/tools refresh is permitted.
 	go o.readUpstream(proc)
-	go o.sendProactiveInit(proc, nil)
+
 	go o.acceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 

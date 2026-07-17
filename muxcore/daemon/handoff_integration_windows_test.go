@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -22,6 +23,8 @@ import (
 	"unsafe"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 	"golang.org/x/sys/windows"
@@ -491,6 +494,9 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 		if restored := d.loadSnapshot(); restored != 1 {
 			t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 		}
+		if activated := d.activateRestartStaging(); activated != 1 {
+			t.Fatalf("activateRestartStaging()=%d, want 1; logs:\n%s", activated, logs.String())
+		}
 		entry := d.Entry("aabbccdd-final-ack-rollback")
 		if entry == nil || entry.Owner == nil {
 			t.Fatalf("fallback owner missing after final ACK failure; logs:\n%s", logs.String())
@@ -499,33 +505,30 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 			t.Fatalf("restore_source=%q, want snapshot_fallback after final ACK failure; logs:\n%s", entry.RestoreSource, logs.String())
 		}
 
-		deadline := time.Now().Add(5 * time.Second)
-		newPID := 0
-		for time.Now().Before(deadline) {
+		if !entry.Owner.CacheReady() {
+			t.Fatalf("fallback owner lost cached discovery state; logs:\n%s", logs.String())
+		}
+		if state := entry.Owner.MaterializationState(); state == owner.MaterializationCacheOnly {
+			t.Fatalf("fallback materialization state=%s after predecessor barrier, want eager restore", state)
+		}
+		var newPIDs []int
+		waitForDaemonCondition(t, 2*time.Second, func() bool {
 			pidData, _ := os.ReadFile(os.Getenv("MCPMUX_TEST_FINAL_ACK_ROLLBACK_PIDS"))
+			seen := make(map[int]struct{})
 			for _, field := range strings.Fields(string(pidData)) {
 				pid, _ := strconv.Atoi(field)
 				if pid > 0 && pid != oldPID {
-					newPID = pid
-					break
+					seen[pid] = struct{}{}
 				}
 			}
-			if newPID > 0 {
-				break
+			newPIDs = newPIDs[:0]
+			for pid := range seen {
+				newPIDs = append(newPIDs, pid)
 			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		if newPID <= 0 || newPID == oldPID {
-			t.Fatalf("fallback upstream pid=%d, want fresh process distinct from %d; logs:\n%s", newPID, oldPID, logs.String())
-		}
-
-		processHandle, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(newPID))
-		if err != nil {
-			t.Fatalf("OpenProcess fallback pid %d: %v", newPID, err)
-		}
-		defer windows.CloseHandle(processHandle)
-		if status, err := windows.WaitForSingleObject(processHandle, 0); err != nil || status != uint32(windows.WAIT_TIMEOUT) {
-			t.Fatalf("fallback process is not alive: WaitForSingleObject=(%d, %v)", status, err)
+			return len(newPIDs) == 1
+		}, "rollback fallback did not start exactly one fresh upstream generation")
+		if pid, _ := entry.Owner.Status()["upstream_pid"].(int); pid != newPIDs[0] {
+			t.Fatalf("fallback upstream pid=%d, want sole fresh pid %d", pid, newPIDs[0])
 		}
 
 		if failedConn == nil || len(failedConn.received) != 4 {
@@ -667,5 +670,246 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 	}
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("successor rollback failed: %v", err)
+	}
+}
+
+func TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration(t *testing.T) {
+	const roleEnv = "MCPMUX_TEST_MATERIALIZING_HANDOFF_ROLE"
+	const pipeEnv = "MCPMUX_TEST_MATERIALIZING_HANDOFF_PIPE"
+	const snapshotEnv = "MCPMUX_TEST_MATERIALIZING_HANDOFF_SNAPSHOT"
+	const ipcEnv = "MCPMUX_TEST_MATERIALIZING_HANDOFF_IPC"
+	const committedEnv = "MCPMUX_TEST_MATERIALIZING_HANDOFF_COMMITTED"
+	const pidPathEnv = "MCPMUX_TEST_MATERIALIZING_HANDOFF_PIDS"
+	switch os.Getenv(roleEnv) {
+	case "upstream":
+		pidFile, err := os.OpenFile(os.Getenv(pidPathEnv), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open pid file: %v", err)
+		}
+		_, _ = fmt.Fprintln(pidFile, os.Getpid())
+		_ = pidFile.Close()
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				t.Fatalf("decode upstream request: %v", err)
+			}
+			switch req.Method {
+			case "initialize":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared"}},"serverInfo":{"name":"materializing-handoff","version":"1"}}}`+"\n", req.ID)
+			case "tools/list":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"handoff-tool"}]}}`+"\n", req.ID)
+			case "ping":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"pid":%d}}`+"\n", req.ID, os.Getpid())
+			}
+			if err != nil {
+				t.Fatalf("write upstream response: %v", err)
+			}
+		}
+		return
+	case "successor":
+		rawSnapshot, err := base64.StdEncoding.DecodeString(os.Getenv(snapshotEnv))
+		if err != nil {
+			t.Fatalf("decode snapshot: %v", err)
+		}
+		var snapshot mcpsnapshot.OwnerSnapshot
+		if err := json.Unmarshal(rawSnapshot, &snapshot); err != nil {
+			t.Fatalf("unmarshal snapshot: %v", err)
+		}
+		conn, err := dialHandoffWindows(os.Getenv(pipeEnv), 5*time.Second)
+		if err != nil {
+			t.Fatalf("successor dial: %v", err)
+		}
+		receipt, err := prepareHandoffReceive(context.Background(), conn, "materializing-token")
+		if err != nil {
+			t.Fatalf("successor receive: %v", err)
+		}
+		received, ok := receipt.take(snapshot.ServerID)
+		if !ok {
+			t.Fatal("successor did not receive materializing owner")
+		}
+		successor, err := owner.NewOwnerFromHandoff(owner.OwnerConfig{
+			Command:              snapshot.Command,
+			Args:                 snapshot.Args,
+			Cwd:                  snapshot.Cwd,
+			Env:                  snapshot.Env,
+			IPCPath:              os.Getenv(ipcEnv),
+			ServerID:             snapshot.ServerID,
+			CachedClassification: snapshot.Classification,
+			AdoptedSnapshot:      &snapshot,
+		}, owner.HandoffPayload{
+			ServerID:    snapshot.ServerID,
+			PID:         received.PID,
+			StdinFD:     received.StdinFD,
+			StdoutFD:    received.StdoutFD,
+			StderrFD:    received.StderrFD,
+			AuthorityFD: received.AuthorityFD,
+			Command:     snapshot.Command,
+			Args:        snapshot.Args,
+			Cwd:         snapshot.Cwd,
+		})
+		if err != nil {
+			_ = receipt.finalize(nil)
+			t.Fatalf("successor adoption: %v", err)
+		}
+		defer successor.Shutdown()
+		if err := receipt.finalize([]string{snapshot.ServerID}); err != nil {
+			t.Fatalf("successor finalize: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(os.Getenv(committedEnv)); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("predecessor did not publish commit marker")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if successor.MaterializationState() != owner.MaterializationReady || successor.Status()["upstream_pid"] != received.PID {
+			t.Fatalf("successor status=%+v", successor.Status())
+		}
+		ownerConn, err := ipc.Dial(os.Getenv(ipcEnv))
+		if err != nil {
+			t.Fatalf("dial adopted owner: %v", err)
+		}
+		defer ownerConn.Close()
+		if _, err := fmt.Fprintln(ownerConn, `{"jsonrpc":"2.0","id":91,"method":"ping","params":{}}`); err != nil {
+			t.Fatalf("write adopted ping: %v", err)
+		}
+		responses := bufio.NewScanner(ownerConn)
+		for responses.Scan() {
+			if strings.Contains(responses.Text(), `"id":91`) {
+				if !strings.Contains(responses.Text(), `"pid":`) {
+					t.Fatalf("adopted ping response=%s", responses.Text())
+				}
+				return
+			}
+		}
+		t.Fatalf("adopted response stream ended: %v", responses.Err())
+	}
+
+	tmp := t.TempDir()
+	pidPath := filepath.Join(tmp, "pids")
+	committedPath := filepath.Join(tmp, "committed")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	publishEntered := make(chan struct{})
+	releasePublish := make(chan struct{})
+	predecessor, err := owner.NewOwner(owner.OwnerConfig{
+		Command:  exe,
+		Args:     []string{"-test.run=^TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration$"},
+		Env:      map[string]string{roleEnv: "upstream", pidPathEnv: pidPath},
+		Cwd:      t.TempDir(),
+		IPCPath:  shortSocketPath(t, "materializing-predecessor.sock"),
+		ServerID: "materializing-handoff-owner",
+		OnCacheReady: func(*owner.Owner, owner.OwnerSnapshot) bool {
+			close(publishEntered)
+			<-releasePublish
+			return true
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewOwner predecessor: %v", err)
+	}
+	predecessorClosed := false
+	t.Cleanup(func() {
+		if !predecessorClosed {
+			predecessor.Shutdown()
+		}
+	})
+	select {
+	case <-publishEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("predecessor did not reach materializing publish barrier")
+	}
+	type handoffResult struct {
+		payload owner.HandoffPayload
+		err     error
+	}
+	handoffDone := make(chan handoffResult, 1)
+	go func() {
+		payload, handoffErr := predecessor.ShutdownForHandoff()
+		handoffDone <- handoffResult{payload: payload, err: handoffErr}
+	}()
+	select {
+	case result := <-handoffDone:
+		t.Fatalf("handoff detached before cache/template commit: %+v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releasePublish)
+	var result handoffResult
+	select {
+	case result = <-handoffDone:
+		if result.err != nil {
+			t.Fatalf("ShutdownForHandoff: %v", result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handoff did not complete after coherent materialization")
+	}
+	predecessorClosed = true
+	snapshot := predecessor.ExportSnapshot()
+	snapshot.ServerID = result.payload.ServerID
+	snapshotData, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	name := randomPipeName(t)
+	connCh := make(chan fdConn, 1)
+	go func() {
+		conn, _ := listenHandoffWindows(name, 5*time.Second)
+		connCh <- conn
+	}()
+	successorIPC := shortSocketPath(t, "materializing-successor.sock")
+	cmd := exec.Command(exe, "-test.run=^TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration$")
+	cmd.Env = append(os.Environ(),
+		roleEnv+"=successor",
+		pipeEnv+"="+name,
+		snapshotEnv+"="+base64.StdEncoding.EncodeToString(snapshotData),
+		ipcEnv+"="+successorIPC,
+		committedEnv+"="+committedPath,
+	)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start successor: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	conn := <-connCh
+	if conn == nil {
+		t.Fatal("successor did not connect to handoff pipe")
+	}
+	defer conn.Close()
+	_, handoffErr := performHandoff(context.Background(), conn, "materializing-token", []HandoffUpstream{{
+		ServerID:    result.payload.ServerID,
+		Command:     result.payload.Command,
+		PID:         result.payload.PID,
+		StdinFD:     result.payload.StdinFD,
+		StdoutFD:    result.payload.StdoutFD,
+		StderrFD:    result.payload.StderrFD,
+		AuthorityFD: result.payload.AuthorityFD,
+		commit:      result.payload.Commit,
+		abort:       result.payload.Abort,
+	}})
+	if handoffErr != nil {
+		t.Fatalf("performHandoff: %v", handoffErr)
+	}
+	if err := os.WriteFile(committedPath, nil, 0o600); err != nil {
+		t.Fatalf("write commit marker: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("successor failed: %v", err)
+	}
+	pidData, _ := os.ReadFile(pidPath)
+	if got := len(strings.Fields(string(pidData))); got != 1 {
+		t.Fatalf("upstream starts=%d, want one transferred generation; data=%q", got, pidData)
 	}
 }

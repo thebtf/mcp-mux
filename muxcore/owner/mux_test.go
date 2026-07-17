@@ -924,15 +924,13 @@ func TestNewOwnerFromSnapshot_CachedInit(t *testing.T) {
 	}
 }
 
-func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
+func TestSnapshotOwnerServesCachedToolsWithoutMaterialization(t *testing.T) {
 	ipcPath := testIPCPath(t)
 	cwd := t.TempDir()
-
 	initResp := `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"snap-server","version":"0.1.0"}}}`
 	toolsResp := `{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"snapshot-tool"}]}}`
-
 	snap := OwnerSnapshot{
-		ServerID:       "test-background-refresh-cache",
+		ServerID:       "test-cache-only-hit",
 		Command:        "in-process-handler",
 		Cwd:            cwd,
 		CwdSet:         []string{cwd},
@@ -941,134 +939,42 @@ func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
 		CachedInit:     base64Encode([]byte(initResp)),
 		CachedTools:    base64Encode([]byte(toolsResp)),
 	}
-
 	handlerStarted := make(chan struct{})
-	initializeReceived := make(chan struct{})
-	allowInitializeResponse := make(chan struct{})
-	initializeReleased := false
-	defer func() {
-		if !initializeReleased {
-			close(allowInitializeResponse)
-		}
-	}()
-	handlerFunc := func(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
-		_ = ctx
+	handlerFunc := func(context.Context, io.Reader, io.Writer) error {
 		close(handlerStarted)
-		scanner := bufio.NewScanner(stdin)
-		var req struct {
-			ID     json.RawMessage `json:"id"`
-			Method string          `json:"method"`
-		}
-		for scanner.Scan() {
-			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
-				return err
-			}
-			if req.Method == "initialize" {
-				break
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			return err
-		}
-		if req.Method != "initialize" {
-			return io.ErrUnexpectedEOF
-		}
-		close(initializeReceived)
-		<-allowInitializeResponse
-		if _, err := fmt.Fprintf(stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"snap-server","version":"0.1.0"}}}`+"\n", req.ID); err != nil {
-			return err
-		}
-		if !scanner.Scan() {
-			return scanner.Err()
-		}
-		_, _ = io.Copy(io.Discard, stdin)
 		return nil
 	}
-
-	owner, err := NewOwnerFromSnapshot(OwnerConfig{
-		Command:     snap.Command,
-		Cwd:         snap.Cwd,
-		IPCPath:     ipcPath,
-		ServerID:    snap.ServerID,
-		HandlerFunc: handlerFunc,
-		Logger:      testLogger(t),
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		Command:               snap.Command,
+		Cwd:                   snap.Cwd,
+		IPCPath:               ipcPath,
+		ServerID:              snap.ServerID,
+		HandlerFunc:           handlerFunc,
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
 	}, snap)
 	if err != nil {
 		t.Fatalf("NewOwnerFromSnapshot() error: %v", err)
 	}
-	defer owner.Shutdown()
-
-	bgCh := owner.backgroundSpawnCh
-	if bgCh == nil {
-		t.Fatal("snapshot owner should expose backgroundSpawnCh before background spawn")
-	}
-	owner.SpawnUpstreamBackground()
-	select {
-	case <-handlerStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("background handler did not start")
-	}
-	select {
-	case <-initializeReceived:
-	case <-time.After(2 * time.Second):
-		t.Fatal("background handler did not receive proactive initialize")
-	}
-	select {
-	case <-bgCh:
-		t.Fatal("background spawn became publicly ready before proactive initialization")
-	default:
-	}
-
-	// A late initialize response from a dead predecessor must not release this
-	// generation's lifecycle gate or overwrite its public snapshot cache.
-	staleDone := make(chan struct{})
-	close(staleDone)
-	staleID := strconv.Quote(owner.proactiveNamespace + "-stale-0")
-	owner.registerProactive(staleID, proactiveRequest{method: "initialize", upstreamDone: staleDone})
-	if err := owner.handleUpstreamMessage(parseMessage([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"stale-server"}}}`, staleID)))); err != nil {
-		t.Fatalf("handle stale proactive initialize response: %v", err)
-	}
-	if cached := owner.getCachedResponse("initialize"); !strings.Contains(string(cached), "snap-server") {
-		t.Fatalf("stale generation response replaced public cached initialize: %s", cached)
-	}
-	select {
-	case <-bgCh:
-		t.Fatal("stale generation response released the current background spawn")
-	default:
-	}
-
-	// Session admission emits roots/listChanged synchronously. Discard that
-	// unrelated notification while this test deliberately holds initialize.
-	owner.mu.Lock()
-	owner.upstreamWriter = io.Discard
-	owner.mu.Unlock()
+	defer o.Shutdown()
 
 	conn, err := ipc.Dial(ipcPath)
 	if err != nil {
 		t.Fatalf("Dial() error: %v", err)
 	}
 	defer conn.Close()
-
 	scanner := bufio.NewScanner(conn)
 	readLineWithin := func(timeout time.Duration) string {
 		t.Helper()
 		done := make(chan scanResult, 1)
-		go func() {
-			ok := scanner.Scan()
-			done <- scanResult{ok: ok, line: scanner.Text(), err: scanner.Err()}
-		}()
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
+		go func() { done <- scanResult{ok: scanner.Scan(), line: scanner.Text(), err: scanner.Err()} }()
 		select {
 		case res := <-done:
 			if !res.ok {
-				if res.err != nil {
-					t.Fatalf("scanner error: %v", res.err)
-				}
-				t.Fatal("scanner returned EOF before any data")
+				t.Fatalf("cached response read failed: %v", res.err)
 			}
 			return res.line
-		case <-timer.C:
+		case <-time.After(timeout):
 			t.Fatalf("timeout waiting for cached response after %s", timeout)
 		}
 		return ""
@@ -1077,23 +983,8 @@ func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":42,"method":"initialize","params":{}}` + "\n")); err != nil {
 		t.Fatalf("write init: %v", err)
 	}
-	initLine := readLineWithin(500 * time.Millisecond)
-	if !strings.Contains(initLine, `"id":42`) || !strings.Contains(initLine, "snap-server") {
-		t.Fatalf("unexpected cached initialize response: %s", initLine)
-	}
-
-	owner.mu.Lock()
-	owner.upstreamWriter = nil
-	owner.mu.Unlock()
-
-	// The snapshot's cached initialize remains public readiness while the new
-	// generation-local lifecycle handshake is intentionally still pending.
-	close(allowInitializeResponse)
-	initializeReleased = true
-	select {
-	case <-bgCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("background spawn did not finish after proactive initialization")
+	if line := readLineWithin(500 * time.Millisecond); !strings.Contains(line, `"id":42`) || !strings.Contains(line, "snap-server") {
+		t.Fatalf("unexpected cached initialize response: %s", line)
 	}
 
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n")); err != nil {
@@ -1102,9 +993,17 @@ func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":43,"method":"tools/list","params":{}}` + "\n")); err != nil {
 		t.Fatalf("write tools/list: %v", err)
 	}
-	toolsLine := readLineWithin(500 * time.Millisecond)
-	if !strings.Contains(toolsLine, `"id":43`) || !strings.Contains(toolsLine, "snapshot-tool") {
-		t.Fatalf("unexpected cached tools/list response: %s", toolsLine)
+	if line := readLineWithin(500 * time.Millisecond); !strings.Contains(line, `"id":43`) || !strings.Contains(line, "snapshot-tool") {
+		t.Fatalf("unexpected cached tools/list response: %s", line)
+	}
+
+	if state := o.MaterializationState(); state != MaterializationCacheOnly {
+		t.Fatalf("materialization state = %s, want cache-only", state)
+	}
+	select {
+	case <-handlerStarted:
+		t.Fatal("cached initialize/tools hits materialized an upstream")
+	default:
 	}
 }
 

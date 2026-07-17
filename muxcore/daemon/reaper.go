@@ -4,7 +4,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 // Reaper periodically sweeps daemon owners for cleanup.
@@ -26,8 +26,8 @@ import (
 // The default idleTimeout is 10 minutes (was 30s grace in v0.10.x).
 // Overridable via MCP_MUX_OWNER_IDLE env or per-owner via x-mux.idleTimeout.
 //
-// Dead upstreams on persistent owners are still re-spawned, and the daemon
-// still auto-exits after its own idle period when it has zero owners.
+// Live and persistent upstream recovery is owner-controller owned. The reaper
+// never replaces an Owner generation.
 type Reaper struct {
 	daemon   *Daemon
 	interval time.Duration
@@ -135,49 +135,47 @@ func (r *Reaper) sweep() int {
 			continue
 		}
 
-		// Check if upstream is dead
+		// Terminal owners are never replaced here. Normal upstream loss stays
+		// inside the owner-local controller; explicit teardown is completed by
+		// the removal path that owns it.
 		select {
 		case <-entry.Owner.Done():
-			// Owner is shut down (upstream exited and was cleaned up)
-			if entry.Persistent {
-				r.logger.Printf("reaper: persistent owner %s dead, re-spawning", sid[:8])
-				r.respawn(entry)
-				affected++
-			}
 			continue
 		default:
 		}
 
 		sample := evictionSample{
-			Sessions:             entry.Owner.SessionCount(),
-			PendingSessions:      entry.Owner.SessionMgr().PendingCount(),
-			Persistent:           entry.Persistent,
-			PendingRequests:      entry.Owner.PendingRequests(),
-			ActiveProgressTokens: entry.Owner.ActiveProgressTokens(),
-			HasBusyWork:          entry.Owner.HasActiveBusyWork(),
-			UpstreamDead:         entry.Owner.UpstreamDead(),
-			IdleTimeout:          entry.IdleTimeout,
-			OwnerIdleOverride:    entry.Owner.IdleTimeout(),
-			LastSession:          entry.LastSession,
-			LastActivity:         entry.Owner.LastActivity(),
-			IsolatedClassified:   entry.Owner.IsClassifiedIsolated(),
+			Sessions:               entry.Owner.SessionCount(),
+			PendingSessions:        entry.Owner.SessionMgr().PendingCount(),
+			Persistent:             entry.Persistent,
+			PendingRequests:        entry.Owner.PendingRequests(),
+			ActiveProgressTokens:   entry.Owner.ActiveProgressTokens(),
+			HasBusyWork:            entry.Owner.HasActiveBusyWork(),
+			UpstreamDead:           entry.Owner.UpstreamDead(),
+			CacheReady:             entry.Owner.CacheReady(),
+			MaterializationBlocked: entry.Owner.MaterializationBlocksEviction(),
+			IdleTimeout:            entry.IdleTimeout,
+			OwnerIdleOverride:      entry.Owner.IdleTimeout(),
+			LastSession:            entry.LastSession,
+			LastActivity:           entry.Owner.LastActivity(),
+			IsolatedClassified:     entry.Owner.IsClassifiedIsolated(),
 		}
 		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout, r.daemon.isolatedIdleTimeout)
 		if decision.evict {
+			var result ownerRemovalResult
 			if decision.reason == "zombie" {
-				// Upstream is already dead — hard remove (no point in stdin close).
 				r.logger.Printf("reaper: owner %s upstream dead with 0 sessions, removing", sid[:8])
-				_, _ = r.daemon.removeOwner(sid, ownerRemovalReasonZombie, false)
+				result, _ = r.daemon.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonZombie, false)
 			} else {
-				// Idle eviction: give upstream a chance to exit cleanly via stdin close.
-				// SoftRemove closes stdin and waits up to 30s before SIGTERM/SIGKILL (US3).
 				r.logger.Printf(
 					"reaper: owner %s %s for %.0fs (timeout %.0fs), soft-removing",
 					sid[:8], decision.reason, decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
 				)
-				_, _ = r.daemon.removeOwner(sid, ownerRemovalReasonIdle, true)
+				result, _ = r.daemon.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonIdle, true)
 			}
-			affected++
+			if result.Removed {
+				affected++
+			}
 		}
 	}
 
@@ -189,13 +187,15 @@ func (r *Reaper) sweep() int {
 // logic (shouldEvict) is a pure function and can be unit-tested without
 // constructing a real Owner.
 type evictionSample struct {
-	Sessions             int
-	PendingSessions      int
-	Persistent           bool
-	PendingRequests      int64
-	ActiveProgressTokens int
-	HasBusyWork          bool
-	UpstreamDead         bool
+	Sessions               int
+	PendingSessions        int
+	Persistent             bool
+	PendingRequests        int64
+	ActiveProgressTokens   int
+	HasBusyWork            bool
+	UpstreamDead           bool
+	CacheReady             bool
+	MaterializationBlocked bool
 	// IdleTimeout is the owner-entry idle timeout (set at Spawn time
 	// from daemon defaults).
 	IdleTimeout time.Duration
@@ -241,9 +241,12 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault, isolatedIdleTim
 	if s.PendingSessions > 0 {
 		return evictionDecision{}
 	}
+	if s.MaterializationBlocked {
+		return evictionDecision{}
+	}
 	// Zombie: upstream dead + zero sessions = evict immediately once reconnect
 	// reservations have either rolled back or expired.
-	if s.UpstreamDead && s.Sessions == 0 {
+	if s.UpstreamDead && s.Sessions == 0 && !s.CacheReady {
 		return evictionDecision{evict: true, reason: "zombie"}
 	}
 	if s.Sessions != 0 {
@@ -294,39 +297,19 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault, isolatedIdleTim
 	}
 }
 
-// respawn attempts to re-create a persistent owner after upstream death.
-func (r *Reaper) respawn(entry *OwnerEntry) {
-	sid := entry.ServerID
-	// Remove the dead entry first
-	_ = r.daemon.Remove(sid)
-
-	// Re-spawn with same parameters
-	_, newSID, _, err := r.daemon.Spawn(control.Request{
-		Command: entry.Command,
-		Args:    entry.Args,
-		Cwd:     entry.Cwd,
-		Mode:    entry.Mode,
-		Env:     entry.Env,
-	})
-	if err != nil {
-		r.logger.Printf("reaper: failed to re-spawn %s: %v", sid[:8], err)
-		return
-	}
-
-	// Preserve persistent flag
-	r.daemon.SetPersistent(newSID, true)
-	r.logger.Printf("reaper: re-spawned %s as %s", sid[:8], newSID[:8])
-}
-
 // totalSessions returns the total number of sessions across all owners.
 func (r *Reaper) totalSessions() int {
 	r.daemon.mu.RLock()
-	defer r.daemon.mu.RUnlock()
-	total := 0
-	for _, e := range r.daemon.owners {
-		if e.Owner != nil {
-			total += e.Owner.SessionCount()
+	owners := make([]*owner.Owner, 0, len(r.daemon.owners))
+	for _, entry := range r.daemon.owners {
+		if entry.Owner != nil {
+			owners = append(owners, entry.Owner)
 		}
+	}
+	r.daemon.mu.RUnlock()
+	total := 0
+	for _, ownerRef := range owners {
+		total += ownerRef.SessionCount()
 	}
 	return total
 }

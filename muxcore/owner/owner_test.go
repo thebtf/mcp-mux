@@ -272,22 +272,18 @@ func TestServe_SessionHandlerOnly_BlocksUntilDone(t *testing.T) {
 func TestSpawnUpstreamBackground_SessionHandlerOnly_NoSubprocess(t *testing.T) {
 	ipcPath := testIPCPath(t)
 	var logs bytes.Buffer
-
 	snap := OwnerSnapshot{
 		ServerID: "test-sessionhandler-background-spawn",
 		Command:  "definitely-not-a-real-sessionhandler-upstream-command",
 		Cwd:      t.TempDir(),
-		CwdSet:   []string{},
 		Mode:     "global",
 	}
-
-	handler := &mockSessionHandler{}
 	o, err := NewOwnerFromSnapshot(OwnerConfig{
 		Command:        snap.Command,
 		Cwd:            snap.Cwd,
 		IPCPath:        ipcPath,
 		ServerID:       snap.ServerID,
-		SessionHandler: handler,
+		SessionHandler: &mockSessionHandler{},
 		Logger:         log.New(&logs, "[test] ", 0),
 	}, snap)
 	if err != nil {
@@ -295,50 +291,27 @@ func TestSpawnUpstreamBackground_SessionHandlerOnly_NoSubprocess(t *testing.T) {
 	}
 	defer o.Shutdown()
 
-	bgCh := o.backgroundSpawnCh
-	if bgCh == nil {
-		t.Fatal("snapshot owner should start with pending backgroundSpawnCh")
-	}
-
 	o.SpawnUpstreamBackground()
-
-	select {
-	case <-bgCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("SessionHandler-only background spawn did not finish")
+	if state := o.MaterializationState(); state != MaterializationReady {
+		t.Fatalf("materialization state = %s, want ready", state)
 	}
-
 	o.mu.RLock()
 	upstream := o.upstream
-	backgroundSpawnCh := o.backgroundSpawnCh
 	o.mu.RUnlock()
 	if upstream != nil {
-		t.Fatalf("SessionHandler-only background spawn created upstream: %v", upstream)
+		t.Fatalf("SessionHandler-only materialization created upstream: %v", upstream)
 	}
-	if backgroundSpawnCh != nil {
-		t.Fatal("SessionHandler-only background spawn did not clear backgroundSpawnCh")
-	}
-
-	logText := logs.String()
-	if strings.Contains(logText, "background upstream spawn failed") {
-		t.Fatalf("SessionHandler-only background spawn attempted subprocess:\n%s", logText)
-	}
-	if !strings.Contains(logText, "background SessionHandler-only spawn: no upstream process") {
-		t.Fatalf("missing SessionHandler-only no-op marker in logs:\n%s", logText)
+	if strings.Contains(logs.String(), "upstream spawn failed") {
+		t.Fatalf("SessionHandler-only path attempted subprocess:\n%s", logs.String())
 	}
 
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- o.Serve(context.Background())
-	}()
-
-	time.Sleep(100 * time.Millisecond)
+	go func() { errCh <- o.Serve(context.Background()) }()
 	select {
 	case err := <-errCh:
-		t.Fatalf("Serve returned immediately for restored SessionHandler-only owner: %v", err)
-	default:
+		t.Fatalf("Serve returned immediately for SessionHandler-only owner: %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
-
 	o.Shutdown()
 	select {
 	case err := <-errCh:

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,12 +12,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
@@ -207,6 +211,296 @@ func TestSnapshotRestartModeRestoresSessionHandlerOwner(t *testing.T) {
 	}
 }
 
+func TestSnapshotRestartDefersFreshGenerationUntilControlTakeover(t *testing.T) {
+	const roleEnv = "MCPMUX_TEST_SNAPSHOT_RESTART_BARRIER_ROLE"
+	if os.Getenv(roleEnv) == "upstream" {
+		pidFile, err := os.OpenFile(os.Getenv("MCPMUX_TEST_SNAPSHOT_RESTART_BARRIER_PIDS"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open pid file: %v", err)
+		}
+		_, _ = fmt.Fprintln(pidFile, os.Getpid())
+		_ = pidFile.Close()
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				t.Fatalf("decode upstream request: %v", err)
+			}
+			switch req.Method {
+			case "initialize":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"snapshot-barrier","version":"1"}}}`+"\n", req.ID)
+			case "tools/list":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}`+"\n", req.ID)
+			}
+			if err != nil {
+				t.Fatalf("write upstream response: %v", err)
+			}
+		}
+		return
+	}
+
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+	pidPath := filepath.Join(t.TempDir(), "upstream-pids.txt")
+	ctlPath := shortSocketPath(t, "snapshot-restart-barrier.ctl.sock")
+
+	predecessor, err := New(Config{
+		Name:        "snapshot-restart-barrier",
+		ControlPath: ctlPath,
+		GracePeriod: time.Second,
+		IdleTimeout: 5 * time.Second,
+		Logger:      testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("New(predecessor): %v", err)
+	}
+	predecessorStopped := false
+	t.Cleanup(func() {
+		if !predecessorStopped {
+			predecessor.Shutdown()
+		}
+	})
+
+	_, sid, _, err := predecessor.Spawn(control.Request{
+		Cmd:     "spawn",
+		Command: os.Args[0],
+		Args:    []string{"-test.run=^TestSnapshotRestartDefersFreshGenerationUntilControlTakeover$"},
+		Env: map[string]string{
+			roleEnv: "upstream",
+			"MCPMUX_TEST_SNAPSHOT_RESTART_BARRIER_PIDS": pidPath,
+		},
+		Cwd:  t.TempDir(),
+		Mode: "global",
+	})
+	if err != nil {
+		t.Fatalf("Spawn(predecessor): %v", err)
+	}
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return len(uniquePIDsFromFile(pidPath)) == 1
+	}, "predecessor upstream did not start")
+	if _, err := predecessor.SerializeSnapshot(); err != nil {
+		t.Fatalf("SerializeSnapshot(): %v", err)
+	}
+
+	origDelay := snapshotRestartControlBindDelay
+	origInterval := controlBindRetryInterval
+	origAttempts := controlBindMaxAttempts
+	snapshotRestartControlBindDelay = 0
+	controlBindRetryInterval = 20 * time.Millisecond
+	controlBindMaxAttempts = 200
+	t.Cleanup(func() {
+		snapshotRestartControlBindDelay = origDelay
+		controlBindRetryInterval = origInterval
+		controlBindMaxAttempts = origAttempts
+	})
+	t.Setenv(snapshotRestartEnv, "1")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", "")
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "")
+
+	logBuf := &syncBuffer{}
+	type newResult struct {
+		d   *Daemon
+		err error
+	}
+	successorDone := make(chan newResult, 1)
+	go func() {
+		d, newErr := New(Config{
+			Name:        "snapshot-restart-barrier",
+			ControlPath: ctlPath,
+			GracePeriod: time.Second,
+			IdleTimeout: 5 * time.Second,
+			Logger:      log.New(logBuf, "[successor] ", log.LstdFlags),
+		})
+		successorDone <- newResult{d: d, err: newErr}
+	}()
+
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return strings.Contains(logBuf.String(), "handoff.control_bind_wait")
+	}, "successor did not reach control-takeover barrier")
+	time.Sleep(100 * time.Millisecond)
+	if pids := uniquePIDsFromFile(pidPath); len(pids) != 1 {
+		t.Fatalf("successor started process before control takeover: pids=%v logs:\n%s", pids, logBuf.String())
+	}
+
+	predecessor.Shutdown()
+	predecessorStopped = true
+	result := <-successorDone
+	if result.err != nil {
+		t.Fatalf("New(successor): %v; logs:\n%s", result.err, logBuf.String())
+	}
+	successor := result.d
+	t.Cleanup(func() { successor.Shutdown() })
+
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return len(uniquePIDsFromFile(pidPath)) == 2
+	}, "successor did not start exactly one post-barrier generation")
+	time.Sleep(150 * time.Millisecond)
+	if pids := uniquePIDsFromFile(pidPath); len(pids) != 2 {
+		t.Fatalf("snapshot restart created duplicate generations: pids=%v logs:\n%s", pids, logBuf.String())
+	}
+	entry := successor.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatalf("successor owner %s missing; logs:\n%s", sid, logBuf.String())
+	}
+	if entry.RestoreSource != "snapshot_fallback" {
+		t.Fatalf("restore_source=%q, want snapshot_fallback", entry.RestoreSource)
+	}
+	if state := entry.Owner.MaterializationState(); state == owner.MaterializationCacheOnly {
+		t.Fatalf("post-barrier owner state=%s, want eager generation", state)
+	}
+}
+
+func uniquePIDsFromFile(path string) []int {
+	data, _ := os.ReadFile(path)
+	seen := make(map[int]struct{})
+	for _, field := range strings.Fields(string(data)) {
+		pid, err := strconv.Atoi(field)
+		if err == nil && pid > 0 {
+			seen[pid] = struct{}{}
+		}
+	}
+	pids := make([]int, 0, len(seen))
+	for pid := range seen {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+func TestMixedReadyCacheOnlyRestartHandoffKeepsOneAuthorityPerOwner(t *testing.T) {
+	const roleEnv = "MCPMUX_TEST_MIXED_RESTART_HANDOFF_ROLE"
+	const pidPathEnv = "MCPMUX_TEST_MIXED_RESTART_HANDOFF_PIDS"
+	if os.Getenv(roleEnv) == "upstream" {
+		pidFile, err := os.OpenFile(os.Getenv(pidPathEnv), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatalf("open mixed restart pid file: %v", err)
+		}
+		_, _ = fmt.Fprintln(pidFile, os.Getpid())
+		_ = pidFile.Close()
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				t.Fatalf("decode mixed restart upstream request: %v", err)
+			}
+			switch req.Method {
+			case "initialize":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared"}},"serverInfo":{"name":"mixed-restart","version":"1"}}}`+"\n", req.ID)
+			case "tools/list":
+				_, err = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}`+"\n", req.ID)
+			default:
+				continue
+			}
+			if err != nil {
+				t.Fatalf("write mixed restart upstream response: %v", err)
+			}
+		}
+		return
+	}
+
+	pidPath := filepath.Join(t.TempDir(), "mixed-restart-pids.txt")
+	command := os.Args[0]
+	args := []string{"-test.run=^TestMixedReadyCacheOnlyRestartHandoffKeepsOneAuthorityPerOwner$"}
+	launchEnv := mergeEnv(map[string]string{roleEnv: "upstream", pidPathEnv: pidPath})
+	proc, err := upstream.Start(command, args, launchEnv, t.TempDir(), testLogger(t))
+	if err != nil {
+		t.Fatalf("start adopted handoff process: %v", err)
+	}
+	t.Cleanup(func() { _ = proc.AbortDetach() })
+	waitForDaemonCondition(t, 3*time.Second, func() bool { return len(uniquePIDsFromFile(pidPath)) == 1 }, "adopted handoff process did not start")
+
+	pid, stdinFD, stdoutFD, stderrFD, authorityFD, err := proc.DetachWithAuthority()
+	if err != nil {
+		t.Fatalf("DetachWithAuthority: %v", err)
+	}
+	stdinDup := dupRawHandoffHandle(t, stdinFD)
+	stdoutDup := dupRawHandoffHandle(t, stdoutFD)
+	stderrDup := dupRawHandoffHandle(t, stderrFD)
+	authorityDup := dupRawHandoffHandle(t, authorityFD)
+	transferred := false
+	t.Cleanup(func() {
+		if transferred {
+			return
+		}
+		for _, handle := range []uintptr{stdinDup, stdoutDup, stderrDup, authorityDup} {
+			closeRawHandoffHandle(handle)
+		}
+	})
+
+	d := testDaemon(t)
+	adoptedSnapshot := daemonMaterializationSnapshot(false)
+	adoptedSnapshot.ServerID = "mixed-ready-adopted-owner"
+	adoptedSnapshot.Command = command
+	adoptedSnapshot.Args = args
+	adoptedSnapshot.Cwd = t.TempDir()
+	adoptedSnapshot.Env = map[string]string{roleEnv: "upstream", pidPathEnv: pidPath}
+	adoptedSnapshot.Mode = "global"
+	adoptedPlan := d.makeSnapshotRestorePlan(adoptedSnapshot)
+	adoptedEntry, reattached, err := d.restoreSnapshotPlan(adoptedPlan, &HandoffUpstream{
+		ServerID:    adoptedSnapshot.ServerID,
+		Command:     command,
+		PID:         pid,
+		StdinFD:     stdinDup,
+		StdoutFD:    stdoutDup,
+		StderrFD:    stderrDup,
+		AuthorityFD: authorityDup,
+	}, "snapshot_handoff", false, false)
+	if err != nil {
+		t.Fatalf("restore adopted plan: %v", err)
+	}
+	if !reattached {
+		t.Fatal("process-backed owner was not reattached")
+	}
+	transferred = true
+	if err := proc.CommitDetach(); err != nil {
+		t.Fatalf("CommitDetach: %v", err)
+	}
+	if state := adoptedEntry.Owner.MaterializationState(); state != owner.MaterializationReady {
+		t.Fatalf("adopted owner state=%s, want READY", state)
+	}
+
+	cacheSnapshot := daemonMaterializationSnapshot(false)
+	cacheSnapshot.ServerID = "mixed-cache-only-owner"
+	cacheSnapshot.Command = command
+	cacheSnapshot.Args = args
+	cacheSnapshot.Cwd = t.TempDir()
+	cacheSnapshot.Env = map[string]string{roleEnv: "upstream", pidPathEnv: pidPath}
+	cacheSnapshot.Mode = "global"
+	cacheEntry, reattached, err := d.restoreSnapshotPlan(d.makeSnapshotRestorePlan(cacheSnapshot), nil, "snapshot_fallback", false, true)
+	if err != nil {
+		t.Fatalf("restore cache-only plan: %v", err)
+	}
+	if reattached {
+		t.Fatal("no-handle owner unexpectedly reported reattached")
+	}
+	if state := cacheEntry.Owner.MaterializationState(); state != owner.MaterializationCacheOnly {
+		t.Fatalf("no-handle owner state=%s, want CACHE_ONLY", state)
+	}
+	if pids := uniquePIDsFromFile(pidPath); len(pids) != 1 {
+		t.Fatalf("mixed READY/CACHE_ONLY state has pids=%v, want sole adopted authority", pids)
+	}
+	if pid, _ := cacheEntry.Owner.Status()["upstream_pid"].(int); pid != 0 {
+		t.Fatalf("cache-only owner upstream pid=%d, want 0 before activation", pid)
+	}
+
+	cacheEntry.Owner.SpawnUpstreamBackground()
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return cacheEntry.Owner.MaterializationState() == owner.MaterializationReady && len(uniquePIDsFromFile(pidPath)) == 2
+	}, "cache-only owner did not activate exactly one eager generation")
+	adoptedPID, _ := adoptedEntry.Owner.Status()["upstream_pid"].(int)
+	cachePID, _ := cacheEntry.Owner.Status()["upstream_pid"].(int)
+	if adoptedPID <= 0 || cachePID <= 0 || adoptedPID == cachePID {
+		t.Fatalf("final owner authorities adopted=%d cache=%d, want two distinct positive pids", adoptedPID, cachePID)
+	}
+	if pids := uniquePIDsFromFile(pidPath); len(pids) != 2 {
+		t.Fatalf("mixed restart created duplicate process authorities: %v", pids)
+	}
+}
+
 func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	os.Remove(SnapshotPath())
 
@@ -326,6 +620,15 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	if restored != 1 {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
+	// loadSnapshot keeps no-handle entries metadata-only until the caller
+	// proves predecessor finalization. This direct unit test models that gate.
+	wantActivated := 0
+	if runtime.GOOS == "windows" {
+		wantActivated = 1
+	}
+	if activated := d.activateRestartStaging(); activated != wantActivated {
+		t.Fatalf("activateRestartStaging()=%d, want %d; logs:\n%s", activated, wantActivated, logBuf.String())
+	}
 
 	// Assert the handoff result via structural log inspection rather
 	// than polling d.owners. The supervisor goroutine started by
@@ -343,8 +646,8 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 		if strings.Contains(logs, wantHandoff) {
 			t.Errorf("did not expect Windows fixture without Job authority to reattach the owner.\nLogs:\n%s", logs)
 		}
-		if !strings.Contains(logs, "Windows handoff missing Job authority — falling back to spawn") {
-			t.Errorf("missing safe Windows snapshot fallback marker.\nLogs:\n%s", logs)
+		if !strings.Contains(logs, "Windows handoff missing Job authority") || !strings.Contains(logs, "staging eager fallback") {
+			t.Errorf("missing safe Windows staged fallback marker.\nLogs:\n%s", logs)
 		}
 	} else if !strings.Contains(logs, wantHandoff) {
 		t.Errorf("expected log %q (handoff path marker), not found.\nLogs:\n%s",
@@ -413,6 +716,7 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	if restored != 1 {
 		t.Fatalf("loadSnapshot() restored %d owners (want 1); FR-8 fallback failed", restored)
 	}
+	d.activateRestartStaging()
 
 	// Structural log assertions replace the d.owners poll (which races with
 	// OnUpstreamExit on fast schedulers — see F80-4 and the happy-path fix
@@ -517,15 +821,25 @@ func TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if _, err := os.Stat(spawnMarker); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("snapshot fallback did not spawn a fresh upstream; logs:\n%s", logBuf.String())
-		}
-		time.Sleep(20 * time.Millisecond)
+	if _, err := os.Stat(spawnMarker); !os.IsNotExist(err) {
+		t.Fatalf("snapshot stage started an upstream before predecessor barrier: err=%v logs:\n%s", err, logBuf.String())
+	}
+	if entry := d.Entry(sid); entry != nil {
+		t.Fatalf("snapshot stage bound owner IPC before predecessor barrier: %#v", entry)
+	}
+	if activated := d.activateRestartStaging(); activated != 1 {
+		t.Fatalf("activateRestartStaging()=%d, want 1", activated)
+	}
+	waitForDaemonCondition(t, 2*time.Second, func() bool {
+		_, err := os.Stat(spawnMarker)
+		return err == nil
+	}, "snapshot fallback did not start one eager restore generation")
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil || !entry.Owner.CacheReady() {
+		t.Fatalf("eager fallback owner missing cached discovery; logs:\n%s", logBuf.String())
+	}
+	if state := entry.Owner.MaterializationState(); state == owner.MaterializationCacheOnly {
+		t.Fatalf("fallback state=%s after predecessor barrier, want eager materialization", state)
 	}
 
 	logs := logBuf.String()
@@ -586,16 +900,15 @@ func TestLoadSnapshot_SessionHandlerRestoreDoesNotSpawnCommand(t *testing.T) {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		logs := buf.String()
-		if strings.Contains(logs, "background SessionHandler-only spawn: no upstream process") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("missing SessionHandler-only no-op marker in logs:\n%s", logs)
-		}
-		time.Sleep(10 * time.Millisecond)
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("restored SessionHandler owner missing")
+	}
+	if state := entry.Owner.MaterializationState(); state != owner.MaterializationReady {
+		t.Fatalf("SessionHandler materialization state=%s, want ready", state)
+	}
+	if pid, _ := entry.Owner.Status()["upstream_pid"].(int); pid != 0 {
+		t.Fatalf("SessionHandler restore spawned upstream pid %d", pid)
 	}
 
 	logs := buf.String()
@@ -778,17 +1091,12 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	if restored != 2 {
 		t.Fatalf("loadSnapshot() restored %d owners, want 2", restored)
 	}
+	d.activateRestartStaging()
 
-	// FR-7 is verified by structural log inspection rather than by probing
-	// d.owners — in the partial scenario both owners get removed from the
-	// map almost immediately after insertion (sid1's proactive init writes
-	// to a stub pipe with no reader and errors out; sid2 spawns "echo two"
-	// which exits cleanly after ~1ms). The code path that routes each
-	// owner through handoff vs. legacy is already complete by the time
-	// loadSnapshot returns, and daemon.Logger emits a stable marker per
-	// path: "snapshot: reattached owner <sid> from handoff" for the
-	// handoff path, "snapshot: restored owner <sid> for <cmd> <args>"
-	// for every successful registration regardless of path.
+	// After the modeled predecessor barrier, structural logs show which
+	// entries retained transferred authority and which started one fresh
+	// fallback generation. The map itself is intentionally ephemeral here:
+	// the test fixtures exit quickly after registration.
 	logs := logBuf.String()
 
 	wantSid1Handoff := "snapshot: reattached owner " + sid1[:8] + " from handoff"
@@ -796,8 +1104,8 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 		if strings.Contains(logs, wantSid1Handoff) {
 			t.Errorf("did not expect Windows fixture without Job authority to reattach sid1.\nLogs:\n%s", logs)
 		}
-		if !strings.Contains(logs, "Windows handoff missing Job authority — falling back to spawn") {
-			t.Errorf("missing safe Windows snapshot fallback marker.\nLogs:\n%s", logs)
+		if !strings.Contains(logs, "Windows handoff missing Job authority") || !strings.Contains(logs, "staging eager fallback") {
+			t.Errorf("missing safe Windows staged fallback marker.\nLogs:\n%s", logs)
 		}
 	} else if !strings.Contains(logs, wantSid1Handoff) {
 		t.Errorf("expected log %q for sid1 (handoff path), not found.\nLogs:\n%s", wantSid1Handoff, logs)
@@ -809,11 +1117,13 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 		t.Errorf("did not expect log %q for sid2 — sid2 was absent from handoff payload.\nLogs:\n%s", dontWantSid2Handoff, logs)
 	}
 
-	// Both owners must have been registered (positive check for both).
-	for _, expected := range []string{
-		"snapshot: restored owner " + sid1[:8] + " for echo [one]",
-		"snapshot: restored owner " + sid2[:8] + " for echo [two]",
-	} {
+	// The absent sid2 always takes the fresh-generation path. On Windows the
+	// fixture intentionally lacks transferable Job authority, so sid1 does too.
+	expectedFresh := []string{"snapshot: restored owner " + sid2[:8] + " for echo [two]"}
+	if runtime.GOOS == "windows" {
+		expectedFresh = append(expectedFresh, "snapshot: restored owner "+sid1[:8]+" for echo [one]")
+	}
+	for _, expected := range expectedFresh {
 		if !strings.Contains(logs, expected) {
 			t.Errorf("expected log %q, not found.\nLogs:\n%s", expected, logs)
 		}
