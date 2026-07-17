@@ -16,16 +16,19 @@ same open transport.
 
 Template reuse is fail-closed: authorization requires the full SHA-256 identity
 of the effective security-relevant environment and, for isolated templates, the
-exact canonical working directory. Missing, incompatible, or repeatedly racing
-templates take one bounded cold/eager path rather than replaying discovery from
-the wrong context.
+exact canonical working directory. A stricter per-CWD isolated entry shadows a
+later relaxed template, and Windows environment keys normalize case-insensitively
+before shim override, fingerprinting, or launch. Missing, incompatible, or
+repeatedly racing templates take one bounded cold/eager path rather than replaying
+discovery from the wrong context.
 
 ## Lifecycle and restart safety
 
 An installed generation remains authoritative during retirement until both
 `Process.Done` and process-group or Windows Job authority retirement are proven.
-If that proof is unavailable, muxcore reports `FINALIZE_BLOCKED`, retries the
-same generation, and does not admit an overlapping replacement.
+If that proof is unavailable, muxcore reports `FINALIZE_BLOCKED` and retries
+retirement proof for that same installed generation; it does not admit a
+competing replacement.
 
 Graceful-restart negotiation remains pre-detach: listener, spawn, accept,
 version, or token failures leave the predecessor serving. A later receipt or
@@ -71,6 +74,10 @@ materialization on the original transport, exact environment and isolated-CWD
 template authorization, bounded revision mismatch handling, failure cleanup,
 and process-tree retirement. It also covers pre-detach restart aborts,
 post-detach single-successor fallback, and transactional snapshot activation.
+
+Official CI and release artifacts use Go 1.25.12. Under that toolchain, root
+and muxcore `govulncheck` report zero reachable vulnerabilities; this result
+does not classify an imported-but-unreached advisory as reachable.
 
 Before release closeout, run the current root and muxcore suites, `go vet`, the
 repository critical suite, applicable native-consumer and lifecycle-playbook

@@ -28,7 +28,7 @@ health/status surface, and chosen update topology.
   sandboxed agent hosts can produce a host-specific Windows named-pipe
   `Access is denied` false failure. The script self-reexecs under `pwsh` when
   launched from Windows PowerShell 5.1.
-- Go toolchain matching CI (`go version` should be compatible with `go 1.25`).
+- Go 1.25.12 matching CI (`go version` should report Go 1.25.12).
 - `uvx` available for `mcp-server-time`.
 - `D:\Dev\mcp-launcher\mcp-launcher.exe` available for the topology PoC.
 - Do not run smoke tests directly against the production binary path
@@ -535,7 +535,8 @@ Focused automated proof:
 
 ```powershell
 Push-Location muxcore
-go test ./daemon -run 'Test(TemplateBackedIsolatedStormMaterializesOnlyDemandedOwner|TemplateBackedSharedStormConvergesOneOwnerOneGeneration|CodexEightEntryHandshakeBurstSameTransportWake|CompatibleTemplateCachedBurstThenUncachedWakeSameIPCSession|TemplateCompatibilityUsesExactEnvAndIsolatedCwd|TwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames|PersistentTemplateMaterializesEagerly)' -count=1
+$env:GOTOOLCHAIN = 'go1.25.12'
+go test ./daemon -run 'Test(TemplateBackedIsolatedStormMaterializesOnlyDemandedOwner|TemplateBackedSharedStormConvergesOneOwnerOneGeneration|CodexEightEntryHandshakeBurstSameTransportWake|CompatibleTemplateCachedBurstThenUncachedWakeSameIPCSession|TemplateCompatibilityUsesExactEnvAndIsolatedCwd|IncompatibleTemplateContextGetsNoCachedFramesAndOneColdProcess|TwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames|PersistentTemplateMaterializesEagerly)' -count=1
 Pop-Location
 ```
 
