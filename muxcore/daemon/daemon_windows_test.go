@@ -6,12 +6,14 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 )
 
 func TestDetachedDevNullDaemonAcceptsParentStatus(t *testing.T) {
@@ -93,6 +95,71 @@ func TestDetachedDaemonControlHelper(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	_ = os.WriteFile(resultPath, []byte("ok"), 0600)
 	os.Exit(0)
+}
+
+func TestWindowsEffectiveEnvUsesShimOverrideForIdentityTemplateAndLaunch(t *testing.T) {
+	t.Setenv("CONFIG_PATH", "A")
+	shimEnv := map[string]string{"config_path": "B"}
+
+	assertNormalized := func(label string, env map[string]string) {
+		t.Helper()
+		matches := 0
+		for key, value := range env {
+			if strings.EqualFold(key, "CONFIG_PATH") {
+				matches++
+				if value != "B" {
+					t.Fatalf("%s %q=%q, want shim value B", label, key, value)
+				}
+			}
+		}
+		if matches != 1 {
+			t.Fatalf("%s has %d case-insensitive CONFIG_PATH keys, want 1", label, matches)
+		}
+	}
+
+	effectiveEnv := mergeEnv(shimEnv)
+	assertNormalized("effective env", effectiveEnv)
+	identity := envidentity.Build(effectiveEnv)
+	secondEffectiveEnv := mergeEnv(shimEnv)
+	assertNormalized("second effective env", secondEffectiveEnv)
+	if second := envidentity.Build(secondEffectiveEnv); second != identity {
+		t.Fatalf("effective env identity changed across identical merges: first=%q second=%q", identity.Fingerprint, second.Fingerprint)
+	}
+
+	d := testDaemon(t)
+	command := "windows-case-insensitive-effective-env"
+	cwd := t.TempDir()
+	template := daemonMaterializationSnapshot(false)
+	template.Cwd = cwd
+	template.Env = shimEnv
+	d.updateTemplate(command, nil, template)
+
+	match, ok := d.getCompatibleTemplate(command, nil, cwd, effectiveEnv)
+	if !ok {
+		t.Fatal("normalized effective env did not authorize its template")
+	}
+	assertNormalized("template env", match.snapshot.Env)
+	if !reflect.DeepEqual(match.snapshot.Env, effectiveEnv) {
+		t.Fatal("template authorization did not retain the normalized effective env")
+	}
+
+	_, sid, _, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: cwd, Env: shimEnv})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatalf("spawned owner %q missing", sid)
+	}
+	assertNormalized("owner env", entry.Env)
+	if !reflect.DeepEqual(entry.Env, effectiveEnv) {
+		t.Fatal("owner launch context did not receive the normalized effective env")
+	}
+	launchSnapshot := entry.Owner.ExportSnapshot()
+	assertNormalized("owner snapshot env", launchSnapshot.Env)
+	if !reflect.DeepEqual(launchSnapshot.Env, effectiveEnv) {
+		t.Fatal("owner snapshot did not preserve the normalized launch env")
+	}
 }
 
 func waitForDaemonFile(t *testing.T, path string, timeout time.Duration) {

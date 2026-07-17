@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -892,9 +893,9 @@ func cloneTemplateSnapshot(snap mcpsnapshot.OwnerSnapshot) mcpsnapshot.OwnerSnap
 }
 
 // updateTemplate atomically publishes one coherent, context-scoped cache
-// revision. A new verdict for the same effective env replaces any older
-// sharing verdict for that env so stale shared classification cannot survive
-// a later isolated discovery result.
+// revision. A new isolated verdict removes older relaxed verdicts for the same
+// effective env, while existing per-CWD isolation boundaries survive later
+// shared or session-aware publications.
 func (d *Daemon) updateTemplate(command string, args []string, snap mcpsnapshot.OwnerSnapshot) {
 	d.mu.Lock()
 	key, revision, ok := d.updateTemplateLocked(command, args, snap)
@@ -935,9 +936,13 @@ func (d *Daemon) updateTemplateLocked(command string, args []string, snap mcpsna
 	}
 	family.revision++
 	for existingScope, existing := range family.entries {
-		if envidentity.Equal(existing.envIdentity, envIdentity, existing.snapshot.Env, effectiveEnv) && existing.classification != entry.classification {
-			delete(family.entries, existingScope)
+		if !envidentity.Equal(existing.envIdentity, envIdentity, existing.snapshot.Env, effectiveEnv) || existing.classification == entry.classification {
+			continue
 		}
+		if existing.classification == classify.ModeIsolated && entry.classification != classify.ModeIsolated {
+			continue
+		}
+		delete(family.entries, existingScope)
 	}
 	family.entries[scope] = entry
 	return key, family.revision, true
@@ -2911,9 +2916,9 @@ func argsEqual(a, b []string) bool {
 }
 
 // mergeEnv combines a shim-supplied env with the daemon's own os.Environ().
-// Shim-supplied entries win on key collision (per-session credentials and cwd
-// vars must override anything inherited by the daemon). Any key missing from
-// the shim env is filled from the daemon env.
+// Shim-supplied entries win on key collision (case-insensitively on Windows)
+// so launch and cache identity observe the same effective environment. Any key
+// missing from the shim env is filled from the daemon env.
 //
 // Why: some shim launch paths arrive with a drastically trimmed environment
 // (observed in CC sessions started in certain worktree layouts: ~18-25 vars
@@ -2926,13 +2931,40 @@ func argsEqual(a, b []string) bool {
 // returned directly.
 func mergeEnv(shimEnv map[string]string) map[string]string {
 	merged := make(map[string]string, len(shimEnv)+64)
-	for _, e := range os.Environ() {
-		if i := strings.IndexByte(e, '='); i > 0 {
-			merged[e[:i]] = e[i+1:]
+	if runtime.GOOS != "windows" {
+		for _, entry := range os.Environ() {
+			if i := strings.IndexByte(entry, '='); i > 0 {
+				merged[entry[:i]] = entry[i+1:]
+			}
+		}
+		for key, value := range shimEnv {
+			merged[key] = value
+		}
+		return merged
+	}
+
+	windowsKeys := make(map[string]string, len(shimEnv)+64)
+	set := func(key, value string) {
+		folded := strings.ToUpper(key)
+		if existing, ok := windowsKeys[folded]; ok {
+			merged[existing] = value
+			return
+		}
+		windowsKeys[folded] = key
+		merged[key] = value
+	}
+	for _, entry := range os.Environ() {
+		if i := strings.IndexByte(entry, '='); i > 0 {
+			set(entry[:i], entry[i+1:])
 		}
 	}
-	for k, v := range shimEnv {
-		merged[k] = v
+	shimKeys := make([]string, 0, len(shimEnv))
+	for key := range shimEnv {
+		shimKeys = append(shimKeys, key)
+	}
+	sort.Strings(shimKeys)
+	for _, key := range shimKeys {
+		set(key, shimEnv[key])
 	}
 	return merged
 }

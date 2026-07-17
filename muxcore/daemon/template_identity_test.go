@@ -4,6 +4,8 @@ import (
 	"io"
 	"log"
 	"testing"
+
+	"github.com/thebtf/mcp-mux/muxcore/classify"
 )
 
 func TestTemplateCompatibilityUsesExactEnvAndIsolatedCwd(t *testing.T) {
@@ -60,5 +62,61 @@ func TestTemplateCompatibilityUsesExactEnvAndIsolatedCwd(t *testing.T) {
 	}
 	if _, ok := d.getCompatibleTemplate(command, args, "/project/b", compatible); !ok {
 		t.Fatal("second isolated template was not retained for its exact CWD")
+	}
+}
+
+func TestTemplateIsolationBoundarySurvivesRelaxedFamilyPublish(t *testing.T) {
+	for _, relaxed := range []classify.SharingMode{classify.ModeShared, classify.ModeSessionAware} {
+		t.Run(string(relaxed), func(t *testing.T) {
+			d := &Daemon{
+				templateCache: make(map[string]*templateFamily),
+				logger:        log.New(io.Discard, "", 0),
+			}
+			command := "template-isolation-boundary-" + string(relaxed)
+			args := []string{"--serve"}
+			cwdA, cwdB, cwdC := t.TempDir(), t.TempDir(), t.TempDir()
+			env := map[string]string{"SERVICE_CONFIG_PATH": "/cfg/same"}
+			effectiveEnv := mergeEnv(env)
+
+			isolatedA := daemonMaterializationSnapshot(false)
+			isolatedA.Classification = "isolated"
+			isolatedA.Cwd = cwdA
+			isolatedA.Env = env
+			d.updateTemplate(command, args, isolatedA)
+
+			relaxedB := isolatedA
+			relaxedB.Classification = relaxed
+			relaxedB.Cwd = cwdB
+			d.updateTemplate(command, args, relaxedB)
+
+			assertTemplate := func(cwd, want string) {
+				t.Helper()
+				match, ok := d.getCompatibleTemplate(command, args, cwd, effectiveEnv)
+				if want == "" {
+					if ok {
+						t.Fatalf("template for %q = %q, want no compatible template", cwd, match.snapshot.Classification)
+					}
+					return
+				}
+				if !ok {
+					t.Fatalf("template for %q missing, want classification %q", cwd, want)
+				}
+				if got := string(match.snapshot.Classification); got != want {
+					t.Fatalf("template for %q classification=%q, want %q", cwd, got, want)
+				}
+			}
+
+			assertTemplate(cwdA, "isolated")
+			assertTemplate(cwdB, string(relaxed))
+			assertTemplate(cwdC, string(relaxed))
+
+			isolatedB := relaxedB
+			isolatedB.Classification = "isolated"
+			d.updateTemplate(command, args, isolatedB)
+
+			assertTemplate(cwdA, "isolated")
+			assertTemplate(cwdB, "isolated")
+			assertTemplate(cwdC, "")
+		})
 	}
 }

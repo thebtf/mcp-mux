@@ -1280,6 +1280,17 @@ func TestMergeEnv(t *testing.T) {
 	})
 }
 
+func TestMergeEnvPreservesUnixCaseSensitiveKeys(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix environment keys are case-sensitive")
+	}
+	t.Setenv("CONFIG_PATH", "A")
+	got := mergeEnv(map[string]string{"config_path": "B"})
+	if got["CONFIG_PATH"] != "A" || got["config_path"] != "B" {
+		t.Fatalf("mergeEnv collapsed case-distinct Unix keys: CONFIG_PATH=%q config_path=%q", got["CONFIG_PATH"], got["config_path"])
+	}
+}
+
 func TestEnvTransient(t *testing.T) {
 	testCases := []struct {
 		name string
