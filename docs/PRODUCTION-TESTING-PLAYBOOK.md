@@ -521,6 +521,55 @@ Broken signals:
 - A v2 predecessor releases tree authority before final adoption, both daemon
   generations retain authority, or any descendant survives final tree cleanup.
 
+## Scenario 9: Demand-Driven Upstream Materialization (v0.28.0)
+
+Run this scenario for v0.28.0 and later releases that change template-backed
+owner discovery, demand-driven upstream creation, template compatibility, or
+template revision publication.
+
+Objective: prove template-backed MCP entries publish cached discovery without
+starting an upstream, then materialize exactly one compatible owner only when
+an uncached request demands it.
+
+Focused automated proof:
+
+```powershell
+Push-Location muxcore
+go test ./daemon -run 'Test(TemplateBackedIsolatedStormMaterializesOnlyDemandedOwner|TemplateBackedSharedStormConvergesOneOwnerOneGeneration|CodexEightEntryHandshakeBurstSameTransportWake|CompatibleTemplateCachedBurstThenUncachedWakeSameIPCSession|TemplateCompatibilityUsesExactEnvAndIsolatedCwd|TwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames|PersistentTemplateMaterializesEagerly)' -count=1
+Pop-Location
+```
+
+Customer-mode observed invariants:
+
+1. Start eight template-backed Codex-style entries with compatible isolated
+   contexts. Cached discovery completes with **8 owners, 0 upstream processes,
+   and 0 starts**.
+2. Send an uncached request through one existing open IPC transport. The
+   request returns successfully on that same transport, then topology reports
+   **8 owners, 1 upstream process, and 1 start**.
+3. Repeat the burst for a shared template. The storm converges to **1 owner and
+   0 processes** before demand, then produces exactly **1 generation** after
+   demand.
+4. Replay using an incompatible CWD or effective environment. It reuses zero
+   cached discovery and follows the bounded cold path; it must not receive
+   stale cached frames.
+5. Repeat with a persistent/eager template owner. It still starts eagerly,
+   rather than waiting for an uncached request.
+
+Broken signals:
+
+- Any template-backed discovery starts an upstream before an uncached request,
+  or eight isolated entries do not remain eight owners with zero starts.
+- The uncached request fails, uses a new IPC transport, creates more than one
+  upstream generation, or leaves counts other than 8 owners / 1 process / 1
+  start.
+- A shared storm has more than one owner before demand or more than one
+  generation after demand.
+- An incompatible CWD or effective environment receives cached frames, retries
+  without the bounded cold path, or sees stale frames after revision mismatch.
+- A persistent/eager template owner waits for demand instead of starting
+  eagerly.
+
 ## Verdict Template
 
 Create a run report under `.agent/reports/emulation-playbook-run-YYYYMMDD-HHMM.md`
@@ -537,7 +586,8 @@ with this table:
 | 6 | Isolated Short Idle Cleanup (v0.25.0) | Target isolated owner reaped within ~70s of zero sessions (60s idle + 10s sweep) |  | PASS/FAIL |
 | 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
 | 8 | Lifecycle Convergence and Tree Authority (v0.27.0+) | Dormant wake is exact-once; v1 skew aborts pre-detach; post-Hello fallback is single-shot; same-v2 handoff retains one full-tree authority |  | PASS/FAIL |
-| 9 | Critical muxcore consumer handoff | `CONSUMER_HANDOFF_PASS`, or `CONSUMER_HANDOFF_BLOCKED` with the full critical scope not called shipped |  | PASS/BLOCKED |
+| 9 | Demand-Driven Upstream Materialization (v0.28.0) | 8 owners / 0 processes before demand; same transport response; 8 / 1 after one wake; one authority |  | PASS/FAIL |
+| 10 | Critical muxcore consumer handoff | `CONSUMER_HANDOFF_PASS`, or `CONSUMER_HANDOFF_BLOCKED` with the full critical scope not called shipped |  | PASS/BLOCKED |
 
 Overall verdict:
 
