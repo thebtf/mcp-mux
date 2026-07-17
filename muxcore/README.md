@@ -12,36 +12,28 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-After the `muxcore/v0.27.2` tag is published and resolves through the Go proxy,
-upgrade with:
+Install the current release after its tag resolves through the Go proxy:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.2
+go get github.com/thebtf/mcp-mux/muxcore@v0.28.0
 ```
 
-Until that tag resolves, keep production consumers on v0.27.1; do not pin this
-branch or a pseudo-version. Use v0.27.2 as the consumer target after publication.
+v0.28.0 includes the v0.25.3 native SessionHandler hot-update contract
+(`RestartWithSuccessor` / `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon
+registry, the v0.26.4 occupied-control-pipe guard, the v0.26.5 owner fanout
+reduction, and the v0.26.6 auto-managed engine namespace. It preserves
+snapshot-restored `tools/list` cache during background refresh, keeps live
+downstream sessions attached across upstream process exit/update with explicit
+JSON-RPC errors for in-flight requests, enters degraded retry without closing
+the parent stdio transport, and safely cleans zero-session disposable owners.
+v0.27.0 adds opt-in shim idle/dormant controls, protocol-v2 tree-authority
+handoff, and full process-tree containment. v0.27.1 prevents permanent
+idle-gate outcomes from creating a control-plane retry herd, and v0.27.2 makes
+the first uncached request join a pending snapshot/template background start.
+v0.28.0 adds cache-only startup and demand-driven materialization for compatible
+templates.
 
-v0.27.2 includes the v0.25.3 native SessionHandler hot-update contract (`RestartWithSuccessor` /
-`ApplyUpdateAndRestart`), the v0.26.x opt-in daemon registry, the v0.26.4
-occupied-control-pipe guard, the v0.26.5 owner fanout reduction, and the
-v0.26.6 auto-managed engine namespace. It also preserves snapshot-restored
-`tools/list` cache during background refresh so new MCP host sessions can replay
-cached tool discovery while the replacement upstream refreshes. For pipe-backed
-owners, it also keeps live downstream sessions attached across upstream process
-exit/update by draining current in-flight requests with explicit JSON-RPC
-errors and automatically respawning the replacement upstream for the next
-request. Reconnect timeout now enters degraded retry instead of closing the
-parent stdio transport, and zero-session disposable owners are cleaned
-automatically after a short safety-gated delay. v0.27.0 adds opt-in shim
-idle/dormant controls, protocol-v2 tree-authority handoff, and full process-tree
-containment. v0.27.1 prevents permanent idle-gate outcomes from creating a
-control-plane retry herd and binds normal product gate checks to one exact
-owner. v0.27.2 makes a first uncached request join an already-pending
-snapshot/template background start through its MCP initialization handshake
-instead of creating a competing upstream generation for the same owner.
-
-### Unreleased - demand-driven upstream materialization
+### v0.28.0 - demand-driven upstream materialization
 
 **No consumer API change is required for ordinary `engine.New` users.** After
 one generation has published a compatible discovery template, muxcore can
@@ -96,8 +88,8 @@ This preserves one authoritative upstream process tree per owner and prevents
 duplicate source-checkout launches, locked entrypoint replacement failures, and
 respawn storms from this race. Consumers must not add product-local spawn locks,
 file-replacement retries, PID sweeps, stale-process kill loops, or parallel
-lifecycle mechanisms. Demand-driven template materialization is not part of
-v0.27.2; its unreleased consumer contract is documented above.
+lifecycle mechanisms. Demand-driven template materialization is part of
+v0.28.0; v0.27.2 remains the conservative ownership repair.
 
 ### v0.27.1 - idle-gate rolling-compatibility hotfix
 

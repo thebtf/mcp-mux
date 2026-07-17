@@ -490,11 +490,11 @@ Runtime idle/dormant proof:
 
 Planned-restart proof:
 
-- v1-to-v2: start a pre-v0.27 candidate, stage v0.27.0, and request the normal
+- v1-to-v2: start a pre-v0.27 candidate, stage v0.28.0, and request the normal
   safe restart with zero live sessions. Evidence must show protocol mismatch
-  before owner detach, one bounded `snapshot_fallback` respawn, and a usable
-  successor. In-flight work may receive explicit JSON-RPC errors by original
-  id; it must not be replayed.
+  before owner detach, the predecessor still serving, and no snapshot fallback
+  or successor spawn. In-flight work may receive explicit JSON-RPC errors by
+  original id; it must not be replayed.
 - v2-to-v2: restart between two v2 candidates with a subprocess tree. Evidence
   must show `snapshot_handoff`, a changed daemon generation, the same upstream
   PID/process tree, a complete accepted/aborted final partition, and no
