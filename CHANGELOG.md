@@ -12,9 +12,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ### Fixed
 
 - Fixed snapshot/template background startup racing the first uncached request
-  into a second upstream respawn for the same owner. The request path now waits
-  on the existing bounded background start before deciding whether a replacement
-  is needed, preserving one authoritative upstream process tree.
+  into a second upstream respawn for the same owner. The request path now joins
+  the existing bounded background start until the new generation either
+  completes its `initialize` / `notifications/initialized` handshake or
+  terminates. A successful generation cannot be overtaken by ordinary requests;
+  terminal failure follows the existing explicit error/respawn path while
+  preserving one authoritative upstream process tree.
+  Proactive discovery IDs and response claims are now owner/generation scoped,
+  so dead-generation entries are drained and stale or unclaimed responses are
+  dropped before they can change caches, pending state, or session routing.
 
 ## [0.27.1] - 2026-07-14
 

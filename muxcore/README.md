@@ -38,17 +38,25 @@ idle/dormant controls, protocol-v2 tree-authority handoff, and full process-tree
 containment. v0.27.1 prevents permanent idle-gate outcomes from creating a
 control-plane retry herd and binds normal product gate checks to one exact
 owner. v0.27.2 makes a first uncached request join an already-pending
-snapshot/template background start instead of creating a competing upstream
-generation for the same owner.
+snapshot/template background start through its MCP initialization handshake
+instead of creating a competing upstream generation for the same owner.
 
 ### v0.27.2 - template background-spawn ownership gate
 
 **No required consumer code changes for ordinary `engine.New` users.** When a
 snapshot/template owner already has `SpawnUpstreamBackground` in progress, the
-request-readiness path waits for that bounded start before deciding whether a
-request-triggered respawn is needed. A completed start with a writable upstream
-is reused; timeout, owner shutdown, or a completed start without a usable
-upstream follows the existing explicit error/respawn behavior.
+request-readiness path joins that bounded start. A successful generation keeps
+the gate pending through the upstream's `initialize` response and muxcore's
+`notifications/initialized` write before ordinary request dispatch can proceed.
+Exact-generation terminal failure releases the gate into the existing explicit
+error/respawn path. A completed start with a writable upstream is reused;
+timeout, owner shutdown, or a completed start without a usable upstream follows
+the existing explicit error/respawn behavior.
+
+Proactive discovery IDs and response ownership are scoped to one owner and one
+exact upstream generation. Dead-generation registry entries are drained, while
+stale or unclaimed responses are discarded before cache, pending-state,
+progress, or downstream-session side effects.
 
 This preserves one authoritative upstream process tree per owner and prevents
 duplicate source-checkout launches, locked entrypoint replacement failures, and

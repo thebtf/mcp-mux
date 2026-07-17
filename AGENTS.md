@@ -82,6 +82,14 @@ patch closes a process-authority race for snapshot/template owners:
 - when snapshot restoration has already started the template-cache background
   upstream, the first uncached request waits for that existing start instead of
   opening a competing request-respawn generation;
+- a successful pending generation releases the gate only after the upstream
+  answers `initialize` and muxcore writes `notifications/initialized`, so
+  ordinary requests cannot overtake the MCP lifecycle handshake; exact-
+  generation terminal failure releases the gate into the existing explicit
+  error/respawn path;
+- proactive requests and ordinary responses are bound to one exact upstream
+  generation; dead-generation registry entries are drained, and stale or
+  unclaimed responses cannot mutate caches, pending counts, or sessions;
 - the wait remains bounded by the existing upstream readiness timeout and owner
   shutdown, after which the request receives an explicit error rather than an
   unowned process tree;

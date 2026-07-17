@@ -14,10 +14,20 @@ could then install different processes into the same owner slot, leaving the
 losing upstream generation outside normal finalization.
 
 The request path now joins an already-pending template background start before
-deciding whether respawn is necessary. The wait uses the existing bounded
-upstream readiness timeout and owner shutdown signal. If the completed
-background start produced a writable upstream, the request uses it; otherwise
-the existing request-respawn path remains available.
+deciding whether respawn is necessary. A successful generation keeps the gate
+pending until the upstream has answered `initialize` and muxcore has written
+`notifications/initialized`, so the first uncached request cannot overtake the
+MCP lifecycle handshake. Exact-generation terminal failure also releases the
+gate into the existing explicit error/respawn path. The wait remains bounded by
+the existing upstream readiness timeout and owner shutdown signal. If the
+completed background start produced a writable upstream, the request uses it;
+otherwise request-triggered respawn remains available.
+
+Response ownership is now generation-bound as well. Proactive discovery IDs are
+unique per owner, their registry entries are tied to the exact upstream process
+and drained when that generation dies, and stale or unclaimed responses are
+dropped before they can change caches, pending counts, progress ownership, or
+downstream session routing.
 
 This is the conservative race repair. It does not change when template owners
 are eagerly materialized; demand-driven upstream materialization remains a
@@ -48,13 +58,14 @@ authority and make failures harder to attribute.
 
 ## Verification
 
-The release candidate includes the deterministic
-`TestSnapshotBackgroundSpawnBlocksRequestRespawn` regression. The deployed
-repair completed a `32h 18m` post-cutover Windows soak with zero actual
-runtime locked-entrypoint errors and zero request-triggered competing-respawn
-markers. The same daemon generation stayed live; unrelated network-failure
-respawns are classified separately in
-`.agent/reports/2026-07-17-v0.27.2-soak.md`.
+The release candidate includes deterministic regressions for the background-
+spawn/request-respawn gate, MCP initialization ordering, owner-unique proactive
+IDs, dead-generation proactive drain, stale and unclaimed ordinary responses,
+and the terminal proactive-registration race. The deployed repair completed a
+`32h 18m` post-cutover Windows soak with zero actual runtime locked-entrypoint
+errors and zero request-triggered competing-respawn markers. The same daemon
+generation stayed live; unrelated network-failure respawns are classified
+separately in `.agent/reports/2026-07-17-v0.27.2-soak.md`.
 
 Release closeout still requires the current root and muxcore suites, `go vet`,
 the repository critical suite, applicable native-consumer and lifecycle
