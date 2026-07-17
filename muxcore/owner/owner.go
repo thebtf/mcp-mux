@@ -196,6 +196,7 @@ type Owner struct {
 	shutdownOnce            sync.Once
 	teardownOnce            sync.Once
 	removalMu               sync.Mutex
+	handoffPrepared         bool // guarded by removalMu; rejects duplicate transfer preparation
 	closeListenerOnce       sync.Once
 	isAccepting             atomic.Bool
 	admissionFrozen         atomic.Bool
@@ -2989,7 +2990,7 @@ func (o *Owner) ExportSnapshotState() (OwnerSnapshot, []SessionSnapshot) {
 }
 
 func (o *Owner) applyMaterializationSnapshotLocked(snap *OwnerSnapshot) {
-	snap.Persistent = snap.Persistent || o.persistentPending
+	snap.Persistent = snap.Persistent || o.persistentPending || o.persistentRequired || o.materializationPolicy == MaterializationPersistent
 	if a := o.materializationAttempt; a != nil {
 		snap.Cwd = a.launch.Cwd
 		snap.Env = cloneSnapshotEnv(a.launch.Env)
@@ -3160,6 +3161,25 @@ func (o *Owner) cacheResponseState(method string, raw []byte) bool {
 	}
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
+	if method == "tools/list" && o.onCacheReady != nil {
+		o.mu.RLock()
+		initDone := o.initDone
+		o.mu.RUnlock()
+		if initDone {
+			staged := o.ExportSnapshot()
+			staged.CachedTools = base64Encode(cached)
+			if staged.ClassificationSource == "" {
+				mode, matched := classify.ClassifyTools(cached)
+				staged.Classification = mode
+				staged.ClassificationSource = "tools"
+				staged.ClassificationReason = matched
+			}
+			if !o.onCacheReady(o, staged) {
+				o.logger.Printf("cache publication rejected for live tools/list response")
+				return false
+			}
+		}
+	}
 
 	o.mu.Lock()
 	switch method {
@@ -3203,11 +3223,6 @@ func (o *Owner) cacheResponseState(method string, raw []byte) bool {
 		return false
 	}
 	o.classifyFromToolList(cached)
-	// Publish synchronously while a live response still owns its generation
-	// lease, so template publication cannot cross successor installation.
-	if o.onCacheReady != nil && o.initDone {
-		o.onCacheReady(o, o.ExportSnapshot())
-	}
 	if !o.listChangedAfterRefresh.Swap(false) {
 		return false
 	}

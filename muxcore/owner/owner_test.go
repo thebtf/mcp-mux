@@ -292,9 +292,9 @@ func TestSpawnUpstreamBackground_SessionHandlerOnly_NoSubprocess(t *testing.T) {
 	defer o.Shutdown()
 
 	o.SpawnUpstreamBackground()
-	if state := o.MaterializationState(); state != MaterializationReady {
-		t.Fatalf("materialization state = %s, want ready", state)
-	}
+	waitForCondition(t, time.Second, func() bool {
+		return o.MaterializationState() == MaterializationReady
+	}, "session-handler materialization did not reach ready state")
 	o.mu.RLock()
 	upstream := o.upstream
 	o.mu.RUnlock()

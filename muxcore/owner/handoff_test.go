@@ -64,6 +64,9 @@ func TestShutdownForHandoff_HappyPath(t *testing.T) {
 		t.Fatal("o.Done() closed before handoff settlement")
 	default:
 	}
+	if _, err := o.ShutdownForHandoff(); !errors.Is(err, ErrHandoffAlreadyPrepared) {
+		t.Fatalf("duplicate ShutdownForHandoff error = %v, want ErrHandoffAlreadyPrepared", err)
+	}
 	if err := payload.Commit(); err != nil {
 		t.Fatalf("payload.Commit: %v", err)
 	}

@@ -496,8 +496,14 @@ func finalizeFailedStart(p *Process, proc *procgroup.Process, pipes ...*os.File)
 		finalizeErr = errors.Join(finalizeErr, proc.Kill())
 	}
 	if finalizeErr == nil {
-		<-p.Done
-		p.markClosed()
+		timer := time.NewTimer(processTreeRetirementTimeout)
+		select {
+		case <-p.Done:
+			timer.Stop()
+			p.markClosed()
+		case <-timer.C:
+			finalizeErr = errors.New("upstream: failed-start retirement not yet proven")
+		}
 	}
 	for _, pipe := range pipes {
 		if pipe != nil {
@@ -769,7 +775,18 @@ func (p *Process) AbortDetach() error {
 		_ = p.stdin.Close()
 	}
 	err := p.finalizeOwnedTree()
-	if err == nil {
+	doneProven := p.proc == nil && p.pid == 0
+	if !doneProven {
+		timer := time.NewTimer(processTreeRetirementTimeout)
+		select {
+		case <-p.Done:
+			timer.Stop()
+			doneProven = true
+		case <-timer.C:
+			err = errors.Join(err, errors.New("upstream: aborted detach process did not exit"))
+		}
+	}
+	if err == nil && doneProven {
 		p.markClosed()
 	}
 	if p.stdout != nil {
@@ -777,13 +794,6 @@ func (p *Process) AbortDetach() error {
 	}
 	if p.stderr != nil {
 		_ = p.stderr.Close()
-	}
-	if p.proc != nil {
-		select {
-		case <-p.Done:
-		case <-time.After(5 * time.Second):
-			return errors.Join(err, errors.New("upstream: aborted detach process did not exit"))
-		}
 	}
 	return err
 }

@@ -194,9 +194,9 @@ func TestConcurrentUncachedDemandsShareOneMaterialization(t *testing.T) {
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("upstream starts = %d, want exactly 1", got)
 	}
-	if state := o.MaterializationState(); state != MaterializationReady {
-		t.Fatalf("materialization state = %s, want ready", state)
-	}
+	waitForCondition(t, time.Second, func() bool {
+		return o.MaterializationState() == MaterializationReady
+	}, "shared materialization did not reach ready state")
 }
 
 func TestCancellationRacingForwardingWritesRequestBeforeUpstreamCancel(t *testing.T) {
@@ -294,6 +294,72 @@ func TestCancellationRacingForwardingWritesRequestBeforeUpstreamCancel(t *testin
 		t.Fatalf("upstream order=%v, want request then cancellation", gotOrder)
 	}
 	waitForCondition(t, time.Second, func() bool { return o.Status()["pending_requests"] == int64(0) }, "forwarded request left pending residue")
+}
+
+func TestCancellationAfterForwardingDoesNotWaitForGeneration(t *testing.T) {
+	o := newMinimalOwner()
+	var upstream bytes.Buffer
+	o.upstreamWriter = &upstream
+	s := NewSession(strings.NewReader(""), io.Discard)
+	o.admissionMu.Lock()
+	o.addSessionLocked(s)
+	o.admissionMu.Unlock()
+	defer s.Close()
+
+	msg, err := jsonrpc.Parse([]byte(`{"jsonrpc":"2.0","id":41,"method":"custom/forwarded","params":{}}`))
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	key := string(remap.Remap(s.ID, msg.ID))
+	launch := o.launchContextForSession(s)
+	a := newMaterializationAttempt(1, MaterializationTriggerDemand)
+	a.launch = launch
+	o.materializationMu.Lock()
+	o.materializationAttempt = a
+	o.materializationState = MaterializationMaterializing
+	o.pendingDemands[key] = &localDemand{key: key, session: s, message: msg, state: localDemandWaiting, generation: a.generation}
+	o.materializationMu.Unlock()
+
+	writeEntered := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var writeOnce sync.Once
+	o.beforeQueuedDemandWrite = func() {
+		writeOnce.Do(func() { close(writeEntered) })
+		<-releaseWrite
+	}
+	forwardDone := make(chan struct{})
+	go func() {
+		o.forwardQueuedDemand(key, a.generation, launch)
+		close(forwardDone)
+	}()
+	select {
+	case <-writeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("queued demand did not reach forwarding boundary")
+	}
+
+	cancelResult := make(chan bool, 1)
+	go func() { cancelResult <- o.cancelLocalDemand(s, msg.ID) }()
+	close(releaseWrite)
+	select {
+	case local := <-cancelResult:
+		if local {
+			t.Fatal("forwarded request cancellation was consumed locally")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarded request cancellation waited for generation completion")
+	}
+	select {
+	case <-a.done:
+		t.Fatal("test generation completed before cancellation result")
+	default:
+	}
+	a.finish(nil)
+	select {
+	case <-forwardDone:
+	case <-time.After(time.Second):
+		t.Fatal("queued demand forwarding did not complete")
+	}
 }
 
 func TestUnauthorizedWaiterRejectedAfterMaterialization(t *testing.T) {
@@ -527,9 +593,9 @@ func TestTimedOutDemandNeverForwardsWhileLaterWaiterContinues(t *testing.T) {
 	if got := forwardedTwo.Load(); got != 1 {
 		t.Fatalf("later demand forwarded %d times, want 1", got)
 	}
-	if status := o.Status(); status["pending_demand_count"] != 0 {
-		t.Fatalf("pending demand residue: %#v", status)
-	}
+	waitForCondition(t, time.Second, func() bool {
+		return o.Status()["pending_demand_count"] == 0
+	}, "forwarded demand remained pending after response delivery")
 }
 
 func TestMaterializationDiagnosticsDoNotExposeRawEnvValues(t *testing.T) {
@@ -1012,6 +1078,139 @@ func TestRestartPinDefersLiveRecoveryUntilFinalRelease(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("deferred recovery started %d generations, want exactly 1", got)
+	}
+}
+
+func TestRestartAndHandoffRejectActiveFinalization(t *testing.T) {
+	newFinalizingOwner := func() *Owner {
+		o := newMinimalOwner()
+		proc := &upstream.Process{Done: make(chan struct{})}
+		o.mu.Lock()
+		o.upstream = proc
+		o.mu.Unlock()
+		o.materializationMu.Lock()
+		o.materializationState = MaterializationFinalizing
+		o.retiringProcess = proc
+		o.materializationMu.Unlock()
+		return o
+	}
+
+	t.Run("restart pin", func(t *testing.T) {
+		o := newFinalizingOwner()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if pin, err := o.AcquireRestartPin(ctx); err == nil || pin != nil || !errors.Is(err, errFinalizationUnproven) {
+			t.Fatalf("restart pin during finalization = pin=%v err=%v", pin, err)
+		}
+		if pins := o.restartPins.Load(); pins != 0 {
+			t.Fatalf("failed restart pin leaked %d pins", pins)
+		}
+	})
+
+	t.Run("handoff quiesce", func(t *testing.T) {
+		o := newFinalizingOwner()
+		if err := o.quiesceMaterializationForHandoff(); !errors.Is(err, errFinalizationUnproven) {
+			t.Fatalf("handoff quiesce during finalization = %v", err)
+		}
+	})
+}
+
+func TestMaterializationAdmissionRejectsUnretiredGeneration(t *testing.T) {
+	tests := []struct {
+		name     string
+		state    MaterializationState
+		dead     bool
+		retiring bool
+	}{
+		{name: "finalizing state", state: MaterializationFinalizing},
+		{name: "retiring process", state: MaterializationCacheOnly, retiring: true},
+		{name: "ready dead before retirement claim", state: MaterializationReady, dead: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := newMinimalOwner()
+			proc := &upstream.Process{Done: make(chan struct{})}
+			o.mu.Lock()
+			o.upstream = proc
+			o.mu.Unlock()
+			o.upstreamDead.Store(tt.dead)
+			o.materializationMu.Lock()
+			o.materializationState = tt.state
+			if tt.retiring {
+				o.retiringProcess = proc
+			}
+			a, start := o.startMaterializationLocked(MaterializationTriggerDemand)
+			state := o.materializationState
+			generation := o.materializationGeneration
+			o.materializationMu.Unlock()
+			if start || a.err == nil {
+				t.Fatalf("unretired generation admitted replacement: start=%v err=%v", start, a.err)
+			}
+			if state != tt.state || generation != 0 {
+				t.Fatalf("rejected admission mutated controller: state=%s generation=%d", state, generation)
+			}
+		})
+	}
+}
+
+func TestPostDiscoveryExitRetiresBeforeReadyPublication(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	proc := &upstream.Process{Done: done}
+	o := newMinimalOwner()
+	a := newMaterializationAttempt(1, MaterializationTriggerDemand)
+	a.process = proc
+	a.signals.signalDiscoveryReady()
+	o.mu.Lock()
+	o.upstream = proc
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationAttempt = a
+	o.materializationState = MaterializationMaterializing
+	o.materializationMu.Unlock()
+
+	o.monitorMaterializedProcessExit(proc)
+	if state := o.MaterializationState(); state != MaterializationCacheOnly {
+		t.Fatalf("post-discovery exit state = %s, want cache_only after retirement", state)
+	}
+	if current := o.currentUpstream(); current != nil {
+		t.Fatalf("post-discovery exit retained upstream %p", current)
+	}
+
+	o.finishMaterializationSuccess(a)
+	select {
+	case <-a.done:
+	default:
+		t.Fatal("failed post-discovery generation did not settle")
+	}
+	if a.err == nil || o.MaterializationState() == MaterializationReady {
+		t.Fatalf("dead post-discovery generation published ready: err=%v state=%s", a.err, o.MaterializationState())
+	}
+}
+
+func TestFinishMaterializationSuccessPreservesFinalizeBlocked(t *testing.T) {
+	o := newMinimalOwner()
+	proc := &upstream.Process{Done: make(chan struct{})}
+	blockErr := errors.New("synthetic authority remains")
+	a := newMaterializationAttempt(1, MaterializationTriggerDemand)
+	a.process = proc
+	o.mu.Lock()
+	o.upstream = proc
+	o.mu.Unlock()
+	o.upstreamDead.Store(true)
+	o.materializationMu.Lock()
+	o.materializationAttempt = a
+	o.materializationState = MaterializationFinalizeBlocked
+	o.materializationBlockedErr = blockErr
+	o.retiringProcess = proc
+	o.materializationMu.Unlock()
+
+	o.finishMaterializationSuccess(a)
+	if state := o.MaterializationState(); state != MaterializationFinalizeBlocked {
+		t.Fatalf("finish success overwrote blocked state with %s", state)
+	}
+	if !errors.Is(a.err, blockErr) || o.currentUpstream() != proc {
+		t.Fatalf("blocked authority was not retained: err=%v current=%p", a.err, o.currentUpstream())
 	}
 }
 
@@ -2239,6 +2438,16 @@ func TestResolvePersistentCannotDowngradeCommittedPersistence(t *testing.T) {
 	}
 }
 
+func TestExportSnapshotPreservesCommittedPersistentPolicy(t *testing.T) {
+	o := newMinimalOwner()
+	o.materializationPolicy = MaterializationPersistent
+
+	snapshot := o.ExportSnapshot()
+	if !snapshot.Persistent {
+		t.Fatal("committed persistent policy was not preserved in snapshot")
+	}
+}
+
 func TestMaterializationStatusReportsCacheOnlyAndLiveGeneration(t *testing.T) {
 	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
 		scanner := bufio.NewScanner(stdin)
@@ -2289,10 +2498,10 @@ func TestMaterializationStatusReportsCacheOnlyAndLiveGeneration(t *testing.T) {
 	defer s.close()
 	sendReq(t, s.write, 21, "custom/status", `{}`)
 	assertResponseID(t, readRespWithID(t, s.read, 21), 21)
-	status = o.Status()
-	if status["materialization_state"] != string(MaterializationReady) || status["upstream_live"] != true {
-		t.Fatalf("ready status = %#v", status)
-	}
+	waitForCondition(t, time.Second, func() bool {
+		status = o.Status()
+		return status["materialization_state"] == string(MaterializationReady) && status["upstream_live"] == true
+	}, "ready status was not published")
 	if generation, ok := status["materialization_generation"].(uint64); !ok || generation != 1 {
 		t.Fatalf("materialization generation = %#v, want uint64(1)", status["materialization_generation"])
 	}
@@ -2651,6 +2860,35 @@ func TestCacheResponseStateRejectsJSONRPCError(t *testing.T) {
 	}
 }
 
+func TestLiveCachePublicationRejectionDoesNotCommitLocalTools(t *testing.T) {
+	o := newMinimalOwner()
+	o.initResp = []byte(`{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}`)
+	o.initDone = true
+	var staged OwnerSnapshot
+	o.onCacheReady = func(got *Owner, snap OwnerSnapshot) bool {
+		if got != o {
+			t.Fatalf("cache callback owner = %p, want %p", got, o)
+		}
+		staged = snap
+		return false
+	}
+
+	raw := []byte(`{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"fresh"}]}}`)
+	o.cacheResponseState("tools/list", raw)
+	if o.getCachedResponse("tools/list") != nil {
+		t.Fatal("rejected live cache publication committed tools locally")
+	}
+	if staged.CachedTools == "" || staged.ClassificationSource != "tools" {
+		t.Fatalf("cache callback did not receive staged tools/classification: %+v", staged)
+	}
+	o.mu.RLock()
+	classificationSource := o.classificationSource
+	o.mu.RUnlock()
+	if classificationSource != "" {
+		t.Fatalf("rejected live cache publication committed classification source %q", classificationSource)
+	}
+}
+
 func TestBlockedMaterializationFinalizationReprovesAutomatically(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
@@ -2658,7 +2896,6 @@ func TestBlockedMaterializationFinalizationReprovesAutomatically(t *testing.T) {
 	o := newMinimalOwner()
 	o.initResp = []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
 	a := newMaterializationAttempt(1, MaterializationTriggerDemand)
-	a.process = proc
 	o.materializationAttempt = a
 	o.materializationState = MaterializationFinalizing
 	o.retiringProcess = proc
@@ -2671,7 +2908,7 @@ func TestBlockedMaterializationFinalizationReprovesAutomatically(t *testing.T) {
 		}
 		return errors.New("synthetic authority still live")
 	}
-	blockErr := o.blockMaterializationFinalization(a, errors.New("synthetic authority still live"))
+	blockErr := o.blockMaterializationFinalization(a, proc, errors.New("synthetic authority still live"))
 	o.finishMaterializationFailure(a, blockErr)
 	allowProof.Store(true)
 

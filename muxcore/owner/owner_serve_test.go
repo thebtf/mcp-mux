@@ -73,8 +73,13 @@ func TestOwnerServe_CacheOnlyOwnerIsHealthy(t *testing.T) {
 	}
 
 	o.Shutdown()
-	if err := <-errCh; !errors.Is(err, suture.ErrDoNotRestart) {
-		t.Fatalf("cache-only Serve returned %v after Shutdown, want ErrDoNotRestart", err)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, suture.ErrDoNotRestart) {
+			t.Fatalf("cache-only Serve returned %v after Shutdown, want ErrDoNotRestart", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cache-only Serve did not return after Shutdown")
 	}
 }
 

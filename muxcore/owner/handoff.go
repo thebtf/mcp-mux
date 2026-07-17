@@ -12,6 +12,10 @@ import (
 // ShutdownForHandoff) was already called on this Owner.
 var ErrAlreadyShutDown = errors.New("owner: already shut down")
 
+// ErrHandoffAlreadyPrepared is returned while an earlier prepared transfer
+// still awaits Commit or Abort settlement.
+var ErrHandoffAlreadyPrepared = errors.New("owner: handoff already prepared")
+
 // ErrNoUpstream is returned by ShutdownForHandoff if the owner has no upstream
 // process to detach (nil upstream — in-process handler or no spawn yet).
 var ErrNoUpstream = errors.New("owner: no upstream to hand off")
@@ -131,6 +135,14 @@ func (o *Owner) recordFailedHandoffTransition(proc *upstream.Process, err error,
 func (o *Owner) commitPreparedHandoff(proc *upstream.Process, pid int) error {
 	o.removalMu.Lock()
 	defer o.removalMu.Unlock()
+	if !o.handoffPrepared {
+		select {
+		case <-o.done:
+			return nil
+		default:
+			return ErrHandoffAlreadyPrepared
+		}
+	}
 	err := proc.CommitDetach()
 	if !proc.RetirementProven() {
 		o.recordFailedHandoffTransition(proc, err, false)
@@ -142,6 +154,7 @@ func (o *Owner) commitPreparedHandoff(proc *upstream.Process, pid int) error {
 		// not trigger cold fallback beside the accepted successor generation.
 		o.logger.Printf("owner handoff commit finalized with local release warning: %v", err)
 	}
+	o.handoffPrepared = false
 	o.recordFailedHandoffTransition(proc, nil, true)
 	o.completeShutdown(fmt.Sprintf("owner handed off (pid=%d)", pid))
 	return nil
@@ -150,9 +163,20 @@ func (o *Owner) commitPreparedHandoff(proc *upstream.Process, pid int) error {
 func (o *Owner) abortPreparedHandoff(proc *upstream.Process, pid int) error {
 	o.removalMu.Lock()
 	defer o.removalMu.Unlock()
+	if !o.handoffPrepared {
+		select {
+		case <-o.done:
+			return nil
+		default:
+			return ErrHandoffAlreadyPrepared
+		}
+	}
 	err := proc.AbortDetach()
 	proven := proc.RetirementProven()
 	o.recordFailedHandoffTransition(proc, err, proven)
+	if proven {
+		o.handoffPrepared = false
+	}
 	if proven {
 		o.completeShutdown(fmt.Sprintf("owner handoff aborted and finalized (pid=%d)", pid))
 	}
@@ -167,6 +191,7 @@ func (o *Owner) abortPreparedHandoff(proc *upstream.Process, pid int) error {
 //
 // Error cases:
 //   - ErrAlreadyShutDown — shutdown or a prior settled handoff completed.
+//   - ErrHandoffAlreadyPrepared — a prepared transfer still awaits settlement.
 //   - ErrNoUpstream — no subprocess exists; teardown completes immediately.
 //   - wrapped detach errors — cleanup is attempted and completion occurs only
 //     when process-tree retirement is proven.
@@ -177,6 +202,9 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 	case <-o.done:
 		return HandoffPayload{}, ErrAlreadyShutDown
 	default:
+	}
+	if o.handoffPrepared {
+		return HandoffPayload{}, ErrHandoffAlreadyPrepared
 	}
 
 	if err := o.quiesceMaterializationForHandoff(); err != nil {
@@ -220,6 +248,8 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 		o.logger.Printf("owner handoff failed: %v", retErr)
 		return HandoffPayload{}, retErr
 	}
+
+	o.handoffPrepared = true
 
 	payload := HandoffPayload{
 		ServerID:    o.serverID,

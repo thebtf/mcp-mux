@@ -122,8 +122,8 @@ func TestHandoffUnix_FinalAckDisconnectClosesTransferredFDsAndStartsOneFallback(
 		if entry.RestoreSource != "snapshot_fallback" {
 			t.Fatalf("restore_source=%q, want snapshot_fallback after final ACK failure; logs:\n%s", entry.RestoreSource, logs.String())
 		}
-		if !entry.Owner.CacheReady() {
-			t.Fatalf("fallback owner lost cached discovery state; logs:\n%s", logs.String())
+		if entry.Owner.CacheReady() {
+			t.Fatalf("fallback owner exposed stale cached discovery after final ACK failure; logs:\n%s", logs.String())
 		}
 		if state := entry.Owner.MaterializationState(); state == owner.MaterializationCacheOnly {
 			t.Fatalf("fallback materialization state=%s after predecessor barrier, want eager restore", state)

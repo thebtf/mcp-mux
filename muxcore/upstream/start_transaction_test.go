@@ -37,6 +37,14 @@ func TestStartPostAuthorityFailureFinalizesProcessTree(t *testing.T) {
 	injected := errors.New("injected post-authority failure")
 	var leaderPID int
 	var descendantPID int
+	t.Cleanup(func() {
+		if leaderPID > 0 && upstreamTestProcessAlive(leaderPID) {
+			killUpstreamTestProcess(leaderPID)
+		}
+		if descendantPID > 0 && upstreamTestProcessAlive(descendantPID) {
+			killUpstreamTestProcess(descendantPID)
+		}
+	})
 
 	previousHook := startPostAuthorityHook
 	startPostAuthorityHook = func(p *Process) error {

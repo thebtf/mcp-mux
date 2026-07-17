@@ -727,7 +727,9 @@ func TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration(t *
 		if err != nil {
 			t.Fatalf("successor dial: %v", err)
 		}
-		receipt, err := prepareHandoffReceive(context.Background(), conn, "materializing-token")
+		receiveCtx, cancelReceive := context.WithTimeout(context.Background(), 10*time.Second)
+		receipt, err := prepareHandoffReceive(receiveCtx, conn, "materializing-token")
+		cancelReceive()
 		if err != nil {
 			t.Fatalf("successor receive: %v", err)
 		}
@@ -856,6 +858,12 @@ func TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration(t *
 	case <-time.After(5 * time.Second):
 		t.Fatal("handoff did not complete after coherent materialization")
 	}
+	handoffSettled := false
+	t.Cleanup(func() {
+		if !handoffSettled {
+			_ = result.payload.Abort()
+		}
+	})
 	predecessorClosed = true
 	snapshot := predecessor.ExportSnapshot()
 	snapshot.ServerID = result.payload.ServerID
@@ -892,7 +900,8 @@ func TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration(t *
 		t.Fatal("successor did not connect to handoff pipe")
 	}
 	defer conn.Close()
-	_, handoffErr := performHandoff(context.Background(), conn, "materializing-token", []HandoffUpstream{{
+	handoffCtx, cancelHandoff := context.WithTimeout(context.Background(), 10*time.Second)
+	_, handoffErr := performHandoff(handoffCtx, conn, "materializing-token", []HandoffUpstream{{
 		ServerID:    result.payload.ServerID,
 		Command:     result.payload.Command,
 		PID:         result.payload.PID,
@@ -903,9 +912,11 @@ func TestHandoffIntegration_MaterializingOwnerTransfersSingleReadyGeneration(t *
 		commit:      result.payload.Commit,
 		abort:       result.payload.Abort,
 	}})
+	cancelHandoff()
 	if handoffErr != nil {
 		t.Fatalf("performHandoff: %v", handoffErr)
 	}
+	handoffSettled = true
 	if err := os.WriteFile(committedPath, nil, 0o600); err != nil {
 		t.Fatalf("write commit marker: %v", err)
 	}

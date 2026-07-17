@@ -125,7 +125,10 @@ type OwnerEntry struct {
 	snapshotUnpinned chan struct{}
 	// removalInProgress prevents restart serialization from pinning an owner
 	// after teardown has begun but before whole-tree finalization is proven.
+	// removalDone closes when that exact attempt settles so concurrent removers
+	// serialize instead of finalizing the same process authority twice.
 	removalInProgress bool
+	removalDone       chan struct{}
 	removalRetrying   bool
 }
 
@@ -2110,17 +2113,18 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 		err  error
 	}
 	connCh := make(chan connResult, 1)
-	go func() {
-		conn, err := listenHandoff(socketPath, handoffAcceptTimeout)
+	acceptTimeout := handoffAcceptTimeout
+	go func(timeout time.Duration) {
+		conn, err := listenHandoff(socketPath, timeout)
 		connCh <- connResult{conn, err}
-	}()
+	}(acceptTimeout)
 
 	// Spawn successor with handoff credentials and retain process authority until
 	// the protocol either commits or the failed successor is proven stopped.
 	successor, spawnErr := spawnHandoffSuccessorForRestart(tokenPath, socketPath, d.daemonFlag, successorExe)
 	if spawnErr != nil {
 		// Do NOT drain connCh here — the listener goroutine will self-terminate
-		// once handoffAcceptTimeout expires (buffered channel prevents leakage).
+		// once acceptTimeout expires (buffered channel prevents leakage).
 		return fmt.Errorf("spawn successor: %w", spawnErr)
 	}
 
@@ -2702,8 +2706,10 @@ func (d *Daemon) publishOwnerCache(expected *owner.Owner, snap mcpsnapshot.Owner
 		return false
 	}
 	snap.Persistent = d.persistent || snap.Persistent
-	entry.Persistent = snap.Persistent
 	key, revision, published := d.updateTemplateLocked(entry.Command, entry.Args, snap)
+	if published {
+		entry.Persistent = snap.Persistent
+	}
 	d.mu.Unlock()
 	if published {
 		d.logger.Printf("template cache updated for %s (key=%s revision=%d scope=%s)", entry.Command, key[:8], revision, snap.Classification)

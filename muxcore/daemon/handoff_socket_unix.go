@@ -3,6 +3,9 @@
 package daemon
 
 import (
+	"crypto/rand"
+	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
@@ -13,7 +16,11 @@ import (
 // The socket is created in baseDir (typically os.TempDir()) so it is accessible
 // to both old and new daemon processes running as the same user.
 func handoffSocketPath(baseDir string) string {
-	return filepath.Join(baseDir, "mcp-mux-handoff.sock")
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err == nil {
+		return filepath.Join(baseDir, fmt.Sprintf("mcp-mux-handoff-%x.sock", suffix))
+	}
+	return filepath.Join(baseDir, fmt.Sprintf("mcp-mux-handoff-%d-%d.sock", os.Getpid(), time.Now().UnixNano()))
 }
 
 // listenHandoff accepts one connection on the handoff Unix domain socket.

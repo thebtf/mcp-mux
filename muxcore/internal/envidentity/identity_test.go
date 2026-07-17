@@ -61,6 +61,23 @@ func TestCompatiblePreservesCredentialPresenceBoundary(t *testing.T) {
 	}
 }
 
+func TestSimpleCredentialNamesPartitionIdentity(t *testing.T) {
+	for _, key := range []string{"TOKEN", "KEY", "API_KEY", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS", "AUTH"} {
+		t.Run(key, func(t *testing.T) {
+			withCredential := map[string]string{key: "secret"}
+			if !IsCredentialKey(key) || !IsIdentityKey(key) {
+				t.Fatalf("simple credential key %q was not identity-relevant", key)
+			}
+			if Compatible(withCredential, nil) {
+				t.Fatalf("simple credential key %q did not partition owner compatibility", key)
+			}
+			if Build(withCredential).Fingerprint == Build(nil).Fingerprint {
+				t.Fatalf("simple credential key %q did not affect template identity", key)
+			}
+		})
+	}
+}
+
 func TestDigestCoversMixedSecurityRelevantKeysAndExcludesLaunchNoise(t *testing.T) {
 	base := map[string]string{
 		"GITHUB_TOKEN":        "token",

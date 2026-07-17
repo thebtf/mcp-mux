@@ -116,6 +116,12 @@ func writeField(h interface{ Write([]byte) (int, error) }, value string) {
 func IsCredentialKey(key string) bool {
 	upper := strings.ToUpper(key)
 	switch {
+	case upper == "TOKEN" || upper == "KEY" || upper == "API_KEY":
+		return true
+	case upper == "SECRET" || upper == "PASSWORD" || upper == "PASSWD":
+		return true
+	case upper == "CREDENTIAL" || upper == "CREDENTIALS" || upper == "AUTH":
+		return true
 	case strings.HasSuffix(upper, "_TOKEN"):
 		return true
 	case strings.HasSuffix(upper, "_KEY"):

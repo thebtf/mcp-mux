@@ -142,7 +142,7 @@ func registerGracefulRestartCleanup(t *testing.T, d *Daemon, afterFn func()) {
 		t.Fatal("graceful restart afterFn is nil")
 	}
 	t.Cleanup(func() {
-		afterFn()
+		go afterFn()
 		select {
 		case <-d.Done():
 		case <-time.After(5 * time.Second):

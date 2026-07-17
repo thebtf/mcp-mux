@@ -151,6 +151,14 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 			d.mu.Unlock()
 			return result, nil
 		}
+		if current.removalInProgress {
+			settled := current.removalDone
+			d.mu.Unlock()
+			if err := waitForOwnerRemovalAttempt(serverID, settled); err != nil {
+				return result, err
+			}
+			continue
+		}
 		if current.snapshotPins > 0 {
 			unpinned := current.snapshotUnpinned
 			d.mu.Unlock()
@@ -160,6 +168,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 			continue
 		}
 		current.removalInProgress = true
+		current.removalDone = make(chan struct{})
 		current.terminationHint = terminationHintForRemoval(reason)
 		entry = current
 		d.mu.Unlock()
@@ -169,9 +178,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 	exitCode, finalized, finalizationErr := d.finalizeOwnerWithRetry(entry.Owner, soft)
 	if !finalized {
 		d.mu.Lock()
-		if current := d.owners[serverID]; current == entry {
-			entry.removalInProgress = false
-		}
+		finishOwnerRemovalAttemptLocked(entry)
 		d.mu.Unlock()
 		if scheduleRetry {
 			d.scheduleOwnerFinalizationRetry(serverID, entry, reason, soft)
@@ -182,14 +189,50 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 	d.mu.Lock()
 	current, ok := d.owners[serverID]
 	if !ok || current != entry {
+		finishOwnerRemovalAttemptLocked(entry)
 		d.mu.Unlock()
 		return result, finalizationErr
 	}
+	if entry.snapshotPins > 0 {
+		finishOwnerRemovalAttemptLocked(entry)
+		d.mu.Unlock()
+		pinErr := fmt.Errorf("owner %s gained a snapshot pin during finalization", shortServerID(serverID))
+		if scheduleRetry {
+			d.scheduleOwnerFinalizationRetry(serverID, entry, reason, soft)
+		}
+		return result, errors.Join(finalizationErr, pinErr)
+	}
+	finishOwnerRemovalAttemptLocked(entry)
 	prepared := d.prepareOwnerRemovalLocked(serverID, entry, reason, soft)
 	prepared.exitCode = exitCode
 	prepared.finalizationErr = finalizationErr
 	d.mu.Unlock()
 	return prepared.result, errors.Join(finalizationErr, d.finishOwnerRemoval(prepared))
+}
+
+func finishOwnerRemovalAttemptLocked(entry *OwnerEntry) {
+	if entry == nil || !entry.removalInProgress {
+		return
+	}
+	entry.removalInProgress = false
+	if entry.removalDone != nil {
+		close(entry.removalDone)
+		entry.removalDone = nil
+	}
+}
+
+func waitForOwnerRemovalAttempt(serverID string, settled <-chan struct{}) error {
+	if settled == nil {
+		return fmt.Errorf("server %s removal attempt missing completion signal", serverID)
+	}
+	timer := time.NewTimer(snapshotPinWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-settled:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("server %s removal attempt did not settle within %s", serverID, snapshotPinWaitTimeout)
+	}
 }
 
 func (d *Daemon) finalizeOwnerWithRetry(ownerRef *owner.Owner, soft bool) (int, bool, error) {

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -188,6 +189,93 @@ func TestOwnerRemovalRetriesBeforeForgettingEntry(t *testing.T) {
 	}
 	if d.Entry(sid) != nil {
 		t.Fatal("owner entry survived proven finalization")
+	}
+}
+
+func TestConcurrentOwnerRemovalsSerializeAcrossSnapshotPin(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-concurrent-removal"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_concurrent"}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	registryPins, err := d.acquireSnapshotOwnerPins()
+	if err != nil {
+		t.Fatalf("acquireSnapshotOwnerPins: %v", err)
+	}
+
+	original := finalizeOwnerForRemoval
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || soft {
+			return 0, false, fmt.Errorf("unexpected finalizer owner=%p soft=%v", got, soft)
+		}
+		calls.Add(1)
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return 0, true, nil
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+
+	type removeResult struct {
+		result ownerRemovalResult
+		err    error
+	}
+	results := make(chan removeResult, 2)
+	for range 2 {
+		go func() {
+			result, removeErr := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonOperatorHard, false)
+			results <- removeResult{result: result, err: removeErr}
+		}()
+	}
+	select {
+	case <-entered:
+		t.Fatal("owner finalization started while snapshot pin was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	d.releaseSnapshotOwnerPins(registryPins)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("owner finalization did not start after snapshot pin release")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("concurrent removers started %d finalizers, want 1", got)
+	}
+	if pins, pinErr := d.acquireSnapshotOwnerPins(); pinErr == nil {
+		d.releaseSnapshotOwnerPins(pins)
+		t.Fatal("snapshot pinned owner while removal was in progress")
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	removed := 0
+	for range 2 {
+		select {
+		case got := <-results:
+			if got.err != nil {
+				t.Fatalf("concurrent remove error: %v", got.err)
+			}
+			if got.result.Removed {
+				removed++
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent remover did not settle")
+		}
+	}
+	if removed != 1 || calls.Load() != 1 {
+		t.Fatalf("removed=%d finalizer_calls=%d, want one serialized removal", removed, calls.Load())
 	}
 }
 

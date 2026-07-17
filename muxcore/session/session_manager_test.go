@@ -558,6 +558,9 @@ func TestRemovePendingForOwnerExceptSessionPreservesConcurrentReconnect(t *testi
 
 	enteredOwnerCheck := make(chan struct{})
 	releaseOwnerCheck := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOwner := func() { releaseOnce.Do(func() { close(releaseOwnerCheck) }) }
+	t.Cleanup(releaseOwner)
 	type reconnectResult struct {
 		token string
 		err   error
@@ -571,13 +574,22 @@ func TestRemovePendingForOwnerExceptSessionPreservesConcurrentReconnect(t *testi
 		})
 		result <- reconnectResult{token: token, err: err}
 	}()
-	<-enteredOwnerCheck
+	select {
+	case <-enteredOwnerCheck:
+	case <-time.After(time.Second):
+		t.Fatal("RegisterReconnect did not enter owner liveness check")
+	}
 
 	if removed := sm.RemovePendingForOwnerExceptSession(ownerKey, retained); removed != 1 {
 		t.Fatalf("RemovePendingForOwnerExceptSession() = %d, want fresh reservation only", removed)
 	}
-	close(releaseOwnerCheck)
-	got := <-result
+	releaseOwner()
+	var got reconnectResult
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("RegisterReconnect did not return after owner check release")
+	}
 	if got.err != nil {
 		t.Fatalf("RegisterReconnect() error = %v", got.err)
 	}

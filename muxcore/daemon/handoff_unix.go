@@ -339,15 +339,41 @@ func listenHandoffUnix(socketPath string, acceptTimeout time.Duration) (fdConn, 
 // dialHandoffUnix connects to a Unix domain socket previously bound by
 // listenHandoffUnix. Caller owns the returned conn's lifetime.
 func dialHandoffUnix(socketPath string, timeout time.Duration) (fdConn, error) {
-	d := net.Dialer{Timeout: timeout}
-	conn, err := d.Dial("unix", socketPath)
-	if err != nil {
-		return nil, fmt.Errorf("handoff dial: %w", err)
+	deadline := time.Now().Add(timeout)
+	for {
+		attemptTimeout := timeout
+		if timeout > 0 {
+			attemptTimeout = time.Until(deadline)
+			if attemptTimeout <= 0 {
+				return nil, fmt.Errorf("handoff dial: timeout waiting for %s", socketPath)
+			}
+		}
+
+		d := net.Dialer{Timeout: attemptTimeout}
+		conn, err := d.Dial("unix", socketPath)
+		if err == nil {
+			uc, ok := conn.(*net.UnixConn)
+			if !ok {
+				_ = conn.Close()
+				return nil, fmt.Errorf("handoff dial: not *net.UnixConn")
+			}
+			return newUnixFDConn(uc), nil
+		}
+		// attemptHandoff starts the blocking listener in a goroutine. Unix dial
+		// can observe the path before bind (ENOENT) or during rebinding
+		// (ECONNREFUSED), so wait within the caller's existing handoff budget.
+		if timeout <= 0 || (!errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ECONNREFUSED)) {
+			return nil, fmt.Errorf("handoff dial: %w", err)
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("handoff dial: %w", err)
+		}
+		delay := 5 * time.Millisecond
+		if remaining < delay {
+			delay = remaining
+		}
+		time.Sleep(delay)
 	}
-	uc, ok := conn.(*net.UnixConn)
-	if !ok {
-		_ = conn.Close()
-		return nil, fmt.Errorf("handoff dial: not *net.UnixConn")
-	}
-	return newUnixFDConn(uc), nil
 }

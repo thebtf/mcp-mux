@@ -7,6 +7,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // socketpairUnixConn creates a connected pair of *unixFDConn using the kernel
@@ -196,5 +197,47 @@ func TestRecvFDs_TripleRoundtrip(t *testing.T) {
 	// Clean up the duplicated FDs on the receiver side.
 	for _, f := range recv {
 		_ = syscall.Close(int(f))
+	}
+}
+
+func TestDialHandoffUnixWaitsForLateListener(t *testing.T) {
+	socketPath := shortSocketPath(t, "late-handoff.sock")
+	listenerResult := make(chan error, 1)
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		ln, err := net.Listen("unix", socketPath)
+		if err != nil {
+			listenerResult <- err
+			return
+		}
+		defer ln.Close()
+		if unixListener, ok := ln.(*net.UnixListener); ok {
+			_ = unixListener.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		}
+		conn, err := ln.Accept()
+		if err == nil {
+			err = conn.Close()
+		}
+		listenerResult <- err
+	}()
+
+	conn, dialErr := dialHandoffUnix(socketPath, 500*time.Millisecond)
+	if dialErr == nil {
+		dialErr = conn.Close()
+	}
+	listenerErr := <-listenerResult
+	if dialErr != nil {
+		t.Fatalf("dialHandoffUnix before late listener: %v", dialErr)
+	}
+	if listenerErr != nil {
+		t.Fatalf("late listener: %v", listenerErr)
+	}
+}
+
+func TestHandoffSocketPathIsUnique(t *testing.T) {
+	first := handoffSocketPath(os.TempDir())
+	second := handoffSocketPath(os.TempDir())
+	if first == second {
+		t.Fatalf("handoff socket path reused across attempts: %s", first)
 	}
 }

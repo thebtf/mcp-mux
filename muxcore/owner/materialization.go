@@ -207,15 +207,14 @@ const (
 )
 
 type localDemand struct {
-	key                 string
-	session             *Session
-	message             *jsonrpc.Message
-	timer               *time.Timer
-	state               localDemandState
-	generation          uint64
-	forwardDone         chan struct{}
-	materializationDone <-chan struct{}
-	upstreamForwarded   bool
+	key               string
+	session           *Session
+	message           *jsonrpc.Message
+	timer             *time.Timer
+	state             localDemandState
+	generation        uint64
+	forwardDone       chan struct{}
+	upstreamForwarded bool
 }
 
 type cacheStage struct {
@@ -258,7 +257,9 @@ func (o *Owner) startMaterializationLocked(trigger MaterializationTrigger) (*mat
 		return completedMaterializationAttempt(errors.New("owner shutting down")), false
 	default:
 	}
-	if o.materializationState == MaterializationFinalizeBlocked {
+	if o.materializationState == MaterializationFinalizing ||
+		o.materializationState == MaterializationFinalizeBlocked ||
+		o.retiringProcess != nil {
 		err := o.materializationBlockedErr
 		if err == nil {
 			err = errFinalizationUnproven
@@ -271,10 +272,18 @@ func (o *Owner) startMaterializationLocked(trigger MaterializationTrigger) (*mat
 	if o.materializationState == MaterializationReady && !o.upstreamDead.Load() {
 		return completedMaterializationAttempt(nil), false
 	}
+	if o.upstreamDead.Load() && o.currentUpstream() != nil {
+		return completedMaterializationAttempt(errFinalizationUnproven), false
+	}
 
 	o.materializationGeneration++
 	a := newMaterializationAttempt(o.materializationGeneration, trigger)
 	a.launch = o.electLaunchContextLocked()
+	for _, demand := range o.pendingDemands {
+		if demand.state == localDemandWaiting && demand.generation == 0 {
+			demand.generation = a.generation
+		}
+	}
 	o.materializationAttempt = a
 	o.materializationState = MaterializationMaterializing
 	o.materializationTrigger = trigger
@@ -669,7 +678,7 @@ func (o *Owner) retireMaterializationProcess(a *materializationAttempt, proc *up
 		if closeErr != nil {
 			finalizationErr = errors.Join(finalizationErr, closeErr)
 		}
-		return o.blockMaterializationFinalization(a, finalizationErr)
+		return o.blockMaterializationFinalization(a, proc, finalizationErr)
 	}
 
 	o.upstreamEventMu.Lock()
@@ -695,7 +704,7 @@ func (o *Owner) retireMaterializationProcess(a *materializationAttempt, proc *up
 	return nil
 }
 
-func (o *Owner) blockMaterializationFinalization(a *materializationAttempt, err error) error {
+func (o *Owner) blockMaterializationFinalization(a *materializationAttempt, proc *upstream.Process, err error) error {
 	o.upstreamEventMu.Lock()
 	o.materializationMu.Lock()
 	blocked := o.materializationAttempt == a
@@ -705,8 +714,8 @@ func (o *Owner) blockMaterializationFinalization(a *materializationAttempt, err 
 	}
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
-	if blocked && a.process != nil {
-		o.startRetiringProcessRetry(a.process, a.trigger)
+	if blocked && proc != nil {
+		o.startRetiringProcessRetry(proc, a.trigger)
 	}
 	return err
 }
@@ -722,6 +731,31 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 		order := append([]string(nil), o.pendingDemandOrder...)
 		o.pendingDemandOrder = nil
 		if len(order) == 0 && len(o.pendingDemands) == 0 {
+			state := o.materializationState
+			retiring := o.retiringProcess
+			readyErr := o.materializationBlockedErr
+			retryTrigger := o.materializationTrigger
+			o.mu.RLock()
+			current := o.upstream
+			o.mu.RUnlock()
+			live := state == MaterializationMaterializing && retiring == nil && current == a.process && !o.upstreamDead.Load()
+			if !live {
+				if readyErr == nil {
+					readyErr = errors.New("materialization generation lost process authority before ready")
+				}
+				if retryTrigger == "" {
+					retryTrigger = MaterializationTriggerUpstreamExit
+				}
+				o.materializationMu.Unlock()
+				if a.process != nil {
+					o.retireReadyProcess(a.process, retryTrigger)
+				}
+				o.finishMaterializationFailure(a, readyErr)
+				if o.shouldRetryMaterialization(retryTrigger) {
+					o.startMaterialization(retryTrigger)
+				}
+				return
+			}
 			o.materializationAttempt = nil
 			o.materializationState = MaterializationReady
 			o.materializationTrigger = a.trigger
@@ -747,7 +781,11 @@ func (o *Owner) finishMaterializationFailure(a *materializationAttempt, err erro
 	if o.materializationAttempt == a {
 		o.materializationAttempt = nil
 		if o.materializationState != MaterializationFinalizeBlocked {
-			o.materializationState = MaterializationCacheOnly
+			if o.retiringProcess != nil || o.materializationState == MaterializationFinalizing {
+				o.materializationState = MaterializationFinalizing
+			} else {
+				o.materializationState = MaterializationCacheOnly
+			}
 		}
 		o.cacheStage = nil
 	}
@@ -1228,6 +1266,10 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 	demand.timer = time.AfterFunc(materializationDemandTimeout, func() {
 		o.expireLocalDemand(key)
 	})
+	if o.materializationState == MaterializationFinalizing || o.retiringProcess != nil || o.upstreamDead.Load() && o.currentUpstream() != nil {
+		o.materializationMu.Unlock()
+		return true, nil
+	}
 	a, start := o.startMaterializationLocked(MaterializationTriggerDemand)
 	if a.generation == 0 {
 		delete(o.pendingDemands, key)
@@ -1266,7 +1308,6 @@ func (o *Owner) cancelLocalDemand(s *Session, requestID json.RawMessage) bool {
 	o.materializationMu.Lock()
 	if demand := o.pendingDemands[key]; demand != nil && demand.state == localDemandForwarding {
 		forwardDone := demand.forwardDone
-		materializationDone := demand.materializationDone
 		o.materializationMu.Unlock()
 		if forwardDone != nil {
 			select {
@@ -1275,17 +1316,7 @@ func (o *Owner) cancelLocalDemand(s *Session, requestID json.RawMessage) bool {
 				return true
 			}
 		}
-		if !demand.upstreamForwarded {
-			return true
-		}
-		if materializationDone != nil {
-			select {
-			case <-materializationDone:
-			case <-o.materializationStop:
-				return true
-			}
-		}
-		return false
+		return !demand.upstreamForwarded
 	}
 	demand, ok := o.transitionLocalDemandLocked(key, localDemandCancelled)
 	if ok && o.materializationAttempt != nil && !o.materializationAttempt.launchFrozen && demand.session.ID == o.materializationAttempt.launch.SessionID {
@@ -1394,9 +1425,6 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 
 	demand.state = localDemandForwarding
 	demand.forwardDone = make(chan struct{})
-	if a := o.materializationAttempt; a != nil && a.generation == generation {
-		demand.materializationDone = a.done
-	}
 	if demand.timer != nil {
 		demand.timer.Stop()
 	}
@@ -1628,12 +1656,21 @@ func (o *Owner) monitorMaterializedProcessExit(proc *upstream.Process) {
 	if a := o.materializationAttempt; a != nil && a.process == proc {
 		o.upstreamDead.Store(true)
 		signals := a.signals
+		discoveryCommitted := false
+		select {
+		case <-signals.discoveryReady:
+			discoveryCommitted = true
+		default:
+		}
 		o.mu.Unlock()
 		responses := o.claimInflightRequests()
 		o.materializationMu.Unlock()
 		o.upstreamEventMu.Unlock()
 		o.deliverInflightResponses(responses)
 		signals.signalFailure(fmt.Errorf("upstream exited before materialization completed: %v", proc.ExitErr))
+		if discoveryCommitted {
+			o.retireReadyProcess(proc, MaterializationTriggerUpstreamExit)
+		}
 		return
 	}
 	o.mu.Unlock()
@@ -1689,6 +1726,7 @@ func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger Material
 		proven = proofErr == nil
 	}
 	if !proven {
+		var demands []*localDemand
 		if proofErr == nil {
 			proofErr = errFinalizationUnproven
 		}
@@ -1700,9 +1738,11 @@ func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger Material
 		if o.retiringProcess == proc {
 			o.materializationState = MaterializationFinalizeBlocked
 			o.materializationBlockedErr = proofErr
+			demands = o.detachLocalDemandsForGenerationLocked(0)
 		}
 		o.materializationMu.Unlock()
 		o.upstreamEventMu.Unlock()
+		o.writeFailedLocalDemands(demands, proofErr)
 		return false
 	}
 	if closeErr != nil {
@@ -1901,9 +1941,10 @@ func (o *Owner) AcquireRestartPin(ctx context.Context) (*RestartPin, error) {
 
 	o.materializationMu.Lock()
 	state := o.materializationState
+	retiring := o.retiringProcess != nil
 	blockedErr := o.materializationBlockedErr
 	o.materializationMu.Unlock()
-	if state == MaterializationFinalizeBlocked {
+	if state == MaterializationFinalizing || state == MaterializationFinalizeBlocked || retiring {
 		if blockedErr == nil {
 			blockedErr = errFinalizationUnproven
 		}
@@ -1936,9 +1977,10 @@ func (o *Owner) quiesceMaterializationForHandoff() error {
 	o.stopMaterialization()
 	o.materializationMu.Lock()
 	state := o.materializationState
+	retiring := o.retiringProcess != nil
 	blockedErr := o.materializationBlockedErr
 	o.materializationMu.Unlock()
-	if state == MaterializationFinalizeBlocked {
+	if state == MaterializationFinalizing || state == MaterializationFinalizeBlocked || retiring {
 		if blockedErr == nil {
 			blockedErr = errFinalizationUnproven
 		}

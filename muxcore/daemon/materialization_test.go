@@ -34,12 +34,24 @@ func daemonMaterializationSnapshot(persistent bool) mcpsnapshot.OwnerSnapshot {
 	}
 }
 
+type testReadDeadlineConn struct {
+	net.Conn
+}
+
+func (c *testReadDeadlineConn) Read(p []byte) (int, error) {
+	if err := c.Conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
 func connectSpawnedOwner(t *testing.T, path, token string) (net.Conn, *bufio.Scanner) {
 	t.Helper()
-	conn, err := ipc.Dial(path)
+	rawConn, err := ipc.Dial(path)
 	if err != nil {
 		t.Fatalf("ipc.Dial: %v", err)
 	}
+	conn := &testReadDeadlineConn{Conn: rawConn}
 	if _, err := fmt.Fprintln(conn, token); err != nil {
 		_ = conn.Close()
 		t.Fatalf("write handshake token: %v", err)
@@ -82,6 +94,30 @@ func readDaemonResponseID(t *testing.T, scanner *bufio.Scanner, id string) []byt
 func writeDaemonResponse(w io.Writer, id json.RawMessage, result string) error {
 	_, err := fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`+"\n", id, result)
 	return err
+}
+
+func TestRejectedOwnerCachePublishDoesNotCommitPersistence(t *testing.T) {
+	d := testDaemon(t)
+	command := "rejected-owner-cache-publish"
+	d.updateTemplate(command, nil, daemonMaterializationSnapshot(false))
+	_, sid, _, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer d.Remove(sid) //nolint:errcheck
+
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatalf("spawned owner %q missing", sid)
+	}
+	rejected := daemonMaterializationSnapshot(true)
+	rejected.CachedTools = ""
+	if d.publishOwnerCache(entry.Owner, rejected) {
+		t.Fatal("invalid cache snapshot was published")
+	}
+	if entry.Persistent {
+		t.Fatal("rejected cache publication committed owner persistence")
+	}
 }
 
 func TestSpawnTemplateCacheHitStaysCacheOnlyAndServesTools(t *testing.T) {
@@ -603,8 +639,13 @@ func TestColdFastHandlerPublishesOnlyAfterExactOwnerRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
-	if err := <-promotionCheck; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-promotionCheck:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cold owner promotion check did not complete")
 	}
 	select {
 	case err := <-publishCheck:
