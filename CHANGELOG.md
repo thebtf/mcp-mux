@@ -34,7 +34,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Failed/rejected local demand clears request-scoped remap, pending, inflight,
   and progress residue instead of replaying later; session-token revocation is
   reserved for isolation eviction.
-INS.POST 39:
 - Official CI and release artifacts now use Go 1.25.12. Root and muxcore
   `govulncheck` report zero reachable vulnerabilities under that toolchain;
   this does not treat an imported-but-unreached advisory as reachable.
