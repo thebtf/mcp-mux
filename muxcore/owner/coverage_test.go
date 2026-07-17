@@ -1134,6 +1134,14 @@ func TestIsAccepting_NewOwner(t *testing.T) {
 	}
 }
 
+func TestIsAccepting_AdmissionFreezeKeepsListenerLive(t *testing.T) {
+	o := newMinimalOwner()
+	o.admissionFrozen.Store(true)
+	if !o.IsAccepting() {
+		t.Error("IsAccepting() = false during admission freeze, want live listener")
+	}
+}
+
 func TestIsAccepting_AfterCloseListener(t *testing.T) {
 	o := newMinimalOwner()
 	// closeListener requires a real listener; signal the channel directly instead.

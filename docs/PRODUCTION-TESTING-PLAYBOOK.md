@@ -516,8 +516,8 @@ Broken signals:
 - An already-sent in-flight request is replayed after reconnect instead of
   receiving one explicit error with its original id.
 - A persistent owner suspends or reaps.
-- A v1 peer detaches before version rejection, or fallback loops through more
-  than one cold respawn.
+- A v1 peer detaches, starts snapshot fallback, or shuts down the predecessor
+  instead of failing negotiation with the predecessor still serving.
 - A v2 predecessor releases tree authority before final adoption, both daemon
   generations retain authority, or any descendant survives final tree cleanup.
 
@@ -536,7 +536,7 @@ with this table:
 | 5b | Native Muxcore Consumer Hot Update | Consumer-owned update path preserves MCP session and reports new version |  | PASS/FAIL/SKIPPED |
 | 6 | Isolated Short Idle Cleanup (v0.25.0) | Target isolated owner reaped within ~70s of zero sessions (60s idle + 10s sweep) |  | PASS/FAIL |
 | 7 | Credential Boundary (v0.25.0) | 2 owners under different credential, 2 under presence asymmetry |  | PASS/FAIL |
-| 8 | Lifecycle Convergence and Tree Authority (v0.27.0) | Dormant wake is exact-once; v1 fallback is bounded; same-v2 handoff retains one full-tree authority |  | PASS/FAIL |
+| 8 | Lifecycle Convergence and Tree Authority (v0.27.0+) | Dormant wake is exact-once; v1 skew aborts pre-detach; post-Hello fallback is single-shot; same-v2 handoff retains one full-tree authority |  | PASS/FAIL |
 | 9 | Critical muxcore consumer handoff | `CONSUMER_HANDOFF_PASS`, or `CONSUMER_HANDOFF_BLOCKED` with the full critical scope not called shipped |  | PASS/BLOCKED |
 
 Overall verdict:

@@ -812,21 +812,48 @@ func TestHandleSpawnRejectsAfterShutdownBegins(t *testing.T) {
 
 func TestGracefulRestartSnapshotFailureReopensSpawn(t *testing.T) {
 	d := testDaemon(t)
+	command := "restart-snapshot-failure-owner"
+	d.updateTemplate(command, nil, daemonMaterializationSnapshot(false))
+	path, sid, token, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	entry := d.Entry(sid)
 
 	badTemp := filepath.Join(t.TempDir(), "temp-is-file")
-	if err := os.WriteFile(badTemp, []byte("not a directory"), 0600); err != nil {
+	if err := os.WriteFile(badTemp, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("WriteFile bad temp: %v", err)
 	}
 	t.Setenv("TMP", badTemp)
 	t.Setenv("TEMP", badTemp)
 	t.Setenv("TMPDIR", badTemp)
 
-	_, _, err := d.HandleGracefulRestart(0)
+	_, _, err = d.HandleGracefulRestart(0)
 	if err == nil {
 		t.Fatal("HandleGracefulRestart() error = nil, want snapshot failure")
 	}
 	if d.shuttingDown.Load() {
 		t.Fatal("shuttingDown stayed true after snapshot failure")
+	}
+	if got := entry.Owner.Status()["restart_pin_count"]; got != int64(0) {
+		t.Fatalf("owner restart pin count after snapshot failure = %v, want 0", got)
+	}
+	d.mu.RLock()
+	registryPins := entry.snapshotPins
+	d.mu.RUnlock()
+	if registryPins != 0 {
+		t.Fatalf("daemon snapshot pin count after snapshot failure = %d, want 0", registryPins)
+	}
+	if !entry.Owner.IsAccepting() {
+		t.Fatal("predecessor owner stopped accepting after snapshot failure")
+	}
+	conn, scanner := connectSpawnedOwner(t, path, token)
+	defer conn.Close()
+	if _, err := fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":99,"method":"tools/list","params":{}}`); err != nil {
+		t.Fatalf("write cached tools request: %v", err)
+	}
+	if response := readDaemonResponseID(t, scanner, "99"); !strings.Contains(string(response), "cached-tool") {
+		t.Fatalf("predecessor cached response after snapshot failure = %s", response)
 	}
 }
 
@@ -1453,10 +1480,10 @@ func TestCleanStaleSocketsNameScope(t *testing.T) {
 	// Seed files: one owned by "aimux-test", one owned by "mcp-mux".
 	aimuxSocket := filepath.Join(tmpDir, "aimux-test-abc12345.ctl.sock")
 	mcpMuxSocket := filepath.Join(tmpDir, "mcp-mux-stale-1.ctl.sock")
-	if err := os.WriteFile(aimuxSocket, []byte("placeholder"), 0600); err != nil {
+	if err := os.WriteFile(aimuxSocket, []byte("placeholder"), 0o600); err != nil {
 		t.Fatalf("seed aimux socket: %v", err)
 	}
-	if err := os.WriteFile(mcpMuxSocket, []byte("placeholder"), 0600); err != nil {
+	if err := os.WriteFile(mcpMuxSocket, []byte("placeholder"), 0o600); err != nil {
 		t.Fatalf("seed mcp-mux socket: %v", err)
 	}
 
@@ -1964,7 +1991,7 @@ func TestDaemonNew_HandoffMode_DefersControlBind(t *testing.T) {
 
 	// Set handoff env vars so daemon.New enters handoff mode.
 	tokenPath := filepath.Join(t.TempDir(), "handoff-token")
-	os.WriteFile(tokenPath, []byte("test-token"), 0600)
+	os.WriteFile(tokenPath, []byte("test-token"), 0o600)
 	socketPath := filepath.Join(t.TempDir(), "handoff.sock")
 	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", tokenPath)
 	t.Setenv("MCPMUX_HANDOFF_SOCKET", socketPath)

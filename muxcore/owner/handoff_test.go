@@ -16,8 +16,9 @@ import (
 
 // TestShutdownForHandoff_HappyPath verifies that ShutdownForHandoff:
 //   - returns a valid HandoffPayload with non-zero PID and FDs
-//   - closes o.Done() channel on success
-//   - makes a subsequent Shutdown() call a safe no-op (no panic, no block)
+//   - keeps o.Done open while the transfer is only prepared
+//   - closes o.Done only after Commit settles transferred authority
+//   - makes a subsequent Shutdown call a safe no-op
 func TestShutdownForHandoff_HappyPath(t *testing.T) {
 	ipcPath := testIPCPath(t)
 	cmd, args := mockServerArgs()
@@ -56,12 +57,20 @@ func TestShutdownForHandoff_HappyPath(t *testing.T) {
 		t.Errorf("payload.ServerID = %q, want %q", payload.ServerID, "test-handoff-happy")
 	}
 
-	// Done channel must be closed after a successful handoff.
+	// Preparation alone is not terminal: the predecessor retains the lease
+	// until the final adoption decision settles Commit or Abort.
 	select {
 	case <-o.Done():
-		// ok
+		t.Fatal("o.Done() closed before handoff settlement")
+	default:
+	}
+	if err := payload.Commit(); err != nil {
+		t.Fatalf("payload.Commit: %v", err)
+	}
+	select {
+	case <-o.Done():
 	case <-time.After(2 * time.Second):
-		t.Error("o.Done() not closed after ShutdownForHandoff")
+		t.Error("o.Done() not closed after handoff commit")
 	}
 
 	// Subsequent Shutdown() must be a safe no-op: no panic, no indefinite block.
@@ -137,7 +146,7 @@ func TestShutdownForHandoff_DetachFailureAbortsTreeAndCompletesOwner(t *testing.
 	if err != nil {
 		t.Fatalf("NewOwner: %v", err)
 	}
-	waitForCondition(t, 5*time.Second, o.CacheReady, "owner did not finish initial materialization")
+	waitForCondition(t, 5*time.Second, func() bool { return o.MaterializationState() == MaterializationReady }, "owner did not finish initial materialization")
 
 	o.mu.RLock()
 	proc := o.upstream

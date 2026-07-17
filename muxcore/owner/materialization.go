@@ -99,12 +99,13 @@ func newMaterializationSignals() *materializationSignals {
 }
 
 type materializationAttempt struct {
-	generation   uint64
-	trigger      MaterializationTrigger
-	launch       LaunchContext
-	cancel       chan struct{}
-	cancelOnce   sync.Once
-	launchFrozen bool
+	generation            uint64
+	trigger               MaterializationTrigger
+	launch                LaunchContext
+	launchFrozen          bool
+	launchRequiresSession bool
+	cancel                chan struct{}
+	cancelOnce            sync.Once
 
 	started     chan struct{}
 	startedOnce sync.Once
@@ -206,12 +207,15 @@ const (
 )
 
 type localDemand struct {
-	key        string
-	session    *Session
-	message    *jsonrpc.Message
-	timer      *time.Timer
-	state      localDemandState
-	generation uint64
+	key                 string
+	session             *Session
+	message             *jsonrpc.Message
+	timer               *time.Timer
+	state               localDemandState
+	generation          uint64
+	forwardDone         chan struct{}
+	materializationDone <-chan struct{}
+	upstreamForwarded   bool
 }
 
 type cacheStage struct {
@@ -275,18 +279,42 @@ func (o *Owner) startMaterializationLocked(trigger MaterializationTrigger) (*mat
 func (o *Owner) electLaunchContextLocked() LaunchContext {
 	for _, key := range o.pendingDemandOrder {
 		demand := o.pendingDemands[key]
-		if demand != nil && demand.state == localDemandWaiting && demand.session != nil {
+		if demand != nil && demand.state == localDemandWaiting && o.sessionEligibleForDemand(demand.session) {
 			return o.launchContextForSession(demand.session)
 		}
 	}
 	return o.launchContextForSession(nil)
 }
 
+func (o *Owner) launchSessionEligible(launch LaunchContext) bool {
+	if launch.SessionID == 0 {
+		return true
+	}
+	o.mu.RLock()
+	session := o.sessions[launch.SessionID]
+	o.mu.RUnlock()
+	return o.sessionEligibleForDemand(session)
+}
+
+func (o *Owner) oldestEligibleLaunchContext() (LaunchContext, bool) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	session := o.oldestEligibleSessionLocked()
+	if session == nil {
+		return LaunchContext{}, false
+	}
+	return o.launchContextForSessionLocked(session), true
+}
+
 func (o *Owner) launchContextForSession(session *Session) LaunchContext {
 	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.launchContextForSessionLocked(session)
+}
+
+func (o *Owner) launchContextForSessionLocked(session *Session) LaunchContext {
 	cwd := o.cwd
 	env := cloneLaunchEnv(o.env)
-	o.mu.RUnlock()
 	if session == nil {
 		return LaunchContext{Cwd: cwd, Env: env}
 	}
@@ -299,6 +327,24 @@ func (o *Owner) launchContextForSession(session *Session) LaunchContext {
 	return LaunchContext{SessionID: session.ID, Cwd: cwd, Env: env}
 }
 
+func (o *Owner) oldestEligibleSessionLocked() *Session {
+	var selected *Session
+	selectedID := 0
+	for id, session := range o.sessions {
+		if session == nil || session.IsClosed() {
+			continue
+		}
+		if o.authorizeSession != nil && !session.Meta().IsAuthorized() {
+			continue
+		}
+		if selected == nil || id < selectedID {
+			selected = session
+			selectedID = id
+		}
+	}
+	return selected
+}
+
 func cloneLaunchEnv(src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return nil
@@ -308,6 +354,19 @@ func cloneLaunchEnv(src map[string]string) map[string]string {
 		dst[key] = value
 	}
 	return dst
+}
+
+func launchContextsEqual(a, b LaunchContext) bool {
+	if serverid.CanonicalizePath(a.Cwd) != serverid.CanonicalizePath(b.Cwd) || len(a.Env) != len(b.Env) {
+		return false
+	}
+	for key, value := range a.Env {
+		other, ok := b.Env[key]
+		if !ok || other != value {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *Owner) launchContextCompatible(a, b LaunchContext) bool {
@@ -325,8 +384,9 @@ func (o *Owner) launchContextCompatible(a, b LaunchContext) bool {
 }
 
 var (
-	errMaterializationCancelled     = errors.New("upstream materialization cancelled for restart")
-	errMaterializationInitiatorGone = errors.New("materialization initiator disconnected before isolated classification commit")
+	errMaterializationCancelled        = errors.New("upstream materialization cancelled for restart")
+	errMaterializationInitiatorGone    = errors.New("materialization initiator disconnected before isolated classification commit")
+	errMaterializationContextReelected = errors.New("fresh isolated classification requires retained-session rematerialization")
 )
 
 func (o *Owner) runMaterialization(a *materializationAttempt) {
@@ -363,17 +423,32 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			return
 		}
 
+		o.launchContextMu.Lock()
 		o.materializationMu.Lock()
 		if !a.launchFrozen {
-			a.launch = o.electLaunchContextLocked()
+			if !o.launchSessionEligible(a.launch) {
+				if a.launchRequiresSession {
+					if replacement, ok := o.oldestEligibleLaunchContext(); ok {
+						a.launch = replacement
+					}
+				} else {
+					a.launch = o.electLaunchContextLocked()
+				}
+			}
 			a.launchFrozen = true
 		}
 		launch := LaunchContext{SessionID: a.launch.SessionID, Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
 		o.materializationMu.Unlock()
 
 		proc, err := o.spawnReplacementUpstream(launch)
+		o.launchContextMu.Unlock()
 		if err != nil {
 			o.logger.Printf("upstream materialization start failed generation=%d attempt=%d trigger=%s err=%v", a.generation, attemptNumber, a.trigger, err)
+			o.materializationMu.Lock()
+			if o.materializationAttempt == a {
+				a.launchFrozen = false
+			}
+			o.materializationMu.Unlock()
 			if a.cancelled() || !o.shouldRetryMaterialization(a.trigger) {
 				a.signalStarted(err)
 				o.finishMaterializationFailure(a, err)
@@ -446,7 +521,14 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			o.finishMaterializationFailure(a, readyErr)
 			return
 		}
-		if errors.Is(readyErr, errMaterializationInitiatorGone) || a.cancelled() || !o.shouldRetryMaterialization(a.trigger) {
+		o.materializationMu.Lock()
+		if o.materializationAttempt == a {
+			a.launchFrozen = false
+		}
+		o.materializationMu.Unlock()
+		initiatorGoneTerminal := errors.Is(readyErr, errMaterializationInitiatorGone) &&
+			a.trigger != MaterializationTriggerUpstreamExit && a.trigger != MaterializationTriggerWriteError
+		if initiatorGoneTerminal || a.cancelled() || !o.shouldRetryMaterialization(a.trigger) {
 			o.finishMaterializationFailure(a, readyErr)
 			return
 		}
@@ -598,12 +680,16 @@ func (o *Owner) retireMaterializationProcess(a *materializationAttempt, proc *up
 func (o *Owner) blockMaterializationFinalization(a *materializationAttempt, err error) error {
 	o.upstreamEventMu.Lock()
 	o.materializationMu.Lock()
-	if o.materializationAttempt == a {
+	blocked := o.materializationAttempt == a
+	if blocked {
 		o.materializationState = MaterializationFinalizeBlocked
 		o.materializationBlockedErr = err
 	}
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
+	if blocked && a.process != nil {
+		o.startRetiringProcessRetry(a.process, a.trigger)
+	}
 	return err
 }
 
@@ -779,11 +865,10 @@ func (o *Owner) stageMaterializationListChanged(proc *upstream.Process, method s
 }
 
 func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method string, raw []byte) bool {
-	cached := append([]byte(nil), raw...)
-	if method == "initialize" {
-		if injected, ok := listchanged.InjectInitializeCapability(cached); ok {
-			cached = injected
-		}
+	switch method {
+	case "initialize", "tools/list", "prompts/list", "resources/list", "resources/templates/list":
+	default:
+		return false
 	}
 
 	o.materializationMu.Lock()
@@ -793,6 +878,22 @@ func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method
 		o.materializationMu.Unlock()
 		return false
 	}
+	if !successfulJSONRPCResponse(raw) {
+		if method == "initialize" {
+			stage.signals.signalInit(false)
+		}
+		stage.signals.signalFailure(fmt.Errorf("%s did not return a successful JSON-RPC result", method))
+		o.materializationMu.Unlock()
+		return true
+	}
+
+	cached := append([]byte(nil), raw...)
+	if method == "initialize" {
+		if injected, ok := listchanged.InjectInitializeCapability(cached); ok {
+			cached = injected
+		}
+	}
+
 	persistentDetected := false
 	switch method {
 	case "initialize":
@@ -810,9 +911,6 @@ func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method
 		stage.resourceList = cached
 	case "resources/templates/list":
 		stage.resourceTemplateList = cached
-	default:
-		o.materializationMu.Unlock()
-		return false
 	}
 	readyToCommit := stage.initResp != nil && stage.toolList != nil
 	if method == "initialize" {
@@ -839,10 +937,32 @@ func (o *Owner) commitMaterializationCache(a *materializationAttempt) {
 	stage := o.cacheStage
 	freshMode, freshSource, freshReason := stagedClassification(stage.initResp, stage.toolList)
 	persistent := classify.ParsePersistent(stage.initResp)
+	// Persistence is monotonic safety state. A failed generation's declaration,
+	// a configured requirement, or a prior committed generation cannot be
+	// downgraded by a later initialize response that omits the capability.
+	effectivePersistent := persistent || o.persistentPending || o.persistentRequired || o.materializationPolicy == MaterializationPersistent
 
 	o.mu.Lock()
+	if freshMode == classify.ModeIsolated && a.launch.SessionID == 0 {
+		if retained := o.oldestEligibleSessionLocked(); retained != nil {
+			retainedLaunch := o.launchContextForSessionLocked(retained)
+			a.launchRequiresSession = true
+			if launchContextsEqual(a.launch, retainedLaunch) {
+				a.launch = retainedLaunch
+			} else {
+				a.launch = retainedLaunch
+				a.launchFrozen = false
+				o.mu.Unlock()
+				o.admissionMu.Unlock()
+				o.materializationMu.Unlock()
+				stage.signals.signalFailure(errMaterializationContextReelected)
+				return
+			}
+		}
+	}
 	if freshMode == classify.ModeIsolated && a.launch.SessionID != 0 {
-		if _, initiatorPresent := o.sessions[a.launch.SessionID]; !initiatorPresent {
+		initiator, initiatorPresent := o.sessions[a.launch.SessionID]
+		if !initiatorPresent || initiator.IsClosed() {
 			o.mu.Unlock()
 			o.admissionMu.Unlock()
 			o.materializationMu.Unlock()
@@ -851,7 +971,7 @@ func (o *Owner) commitMaterializationCache(a *materializationAttempt) {
 		}
 	}
 	hadCachedLists := o.toolList != nil || o.promptList != nil || o.resourceList != nil || o.resourceTemplateList != nil
-	stagedSnapshot := o.stagedSnapshotLocked(a, stage, freshMode, freshSource, freshReason, persistent)
+	stagedSnapshot := o.stagedSnapshotLocked(a, stage, freshMode, freshSource, freshReason, effectivePersistent)
 	liveMode, liveSource := freshMode, freshSource
 	liveReason := append([]string(nil), freshReason...)
 	if o.autoClassification == classify.ModeIsolated && freshMode != classify.ModeIsolated {
@@ -889,10 +1009,8 @@ func (o *Owner) commitMaterializationCache(a *materializationAttempt) {
 	o.mu.Unlock()
 
 	o.persistentPending = false
-	if persistent || o.persistentRequired {
+	if effectivePersistent {
 		o.materializationPolicy = MaterializationPersistent
-	} else if o.materializationPolicy == MaterializationPersistent {
-		o.materializationPolicy = MaterializationOnDemand
 	}
 
 	var rejected []*localDemand
@@ -943,7 +1061,7 @@ func (o *Owner) commitMaterializationCache(a *materializationAttempt) {
 		}
 	})
 	if o.onPersistentResolved != nil {
-		o.onPersistentResolved(o, persistent)
+		o.onPersistentResolved(o, effectivePersistent)
 	}
 	o.parseDrainTimeout(stage.initResp)
 	o.parseToolTimeout(stage.initResp)
@@ -1002,25 +1120,49 @@ func (o *Owner) isolatedEvicteesLocked(mode classify.SharingMode, keepID int) []
 	}
 	primaryCwd := serverid.CanonicalizePath(o.cwd)
 	o.cwdSet = map[string]bool{primaryCwd: true}
-	o.sessionMgr.RemovePendingForOwnerExcept(o.serverID, o.initialAdmissionToken)
-	if len(o.sessions) <= 1 {
-		return nil
-	}
-	if _, ok := o.sessions[keepID]; !ok {
+
+	var keep *Session
+	if candidate, ok := o.sessions[keepID]; ok {
+		keep = candidate
+	} else {
 		keepID = -1
-		for id := range o.sessions {
-			if keepID == -1 || id < keepID {
+		for id, session := range o.sessions {
+			if keep == nil || id < keepID {
 				keepID = id
+				keep = session
 			}
 		}
 	}
+	if keep == nil {
+		o.sessionMgr.RemovePendingForOwnerExcept(o.serverID, o.initialAdmissionToken)
+	} else {
+		o.sessionMgr.RemovePendingForOwnerExceptSession(o.serverID, keep)
+		o.sessionMgr.RemoveBoundForOwnerExceptSession(o.serverID, keep)
+	}
+	if len(o.sessions) <= 1 {
+		return nil
+	}
+
 	evictees := make([]*Session, 0, len(o.sessions)-1)
-	for id, s := range o.sessions {
+	for id, session := range o.sessions {
 		if id != keepID {
-			evictees = append(evictees, s)
+			evictees = append(evictees, session)
 		}
 	}
 	return evictees
+}
+
+func (o *Owner) sessionEligibleForDemand(s *Session) bool {
+	if s == nil || s.IsClosed() {
+		return false
+	}
+	if o.authorizeSession != nil && !s.Meta().IsAuthorized() {
+		return false
+	}
+	o.mu.RLock()
+	attached := o.sessions[s.ID] == s
+	o.mu.RUnlock()
+	return attached
 }
 
 func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, error) {
@@ -1033,6 +1175,10 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 	candidate := o.launchContextForSession(s)
 
 	o.materializationMu.Lock()
+	if !o.sessionEligibleForDemand(s) {
+		o.materializationMu.Unlock()
+		return true, o.writeDemandError(s, msg.ID, "request no longer admitted before upstream materialization")
+	}
 	if o.materializationState == MaterializationReady && !o.upstreamDead.Load() {
 		o.materializationMu.Unlock()
 		return false, nil
@@ -1100,6 +1246,29 @@ func (o *Owner) cancelLocalDemand(s *Session, requestID json.RawMessage) bool {
 		o.beforeLocalDemandCancel()
 	}
 	o.materializationMu.Lock()
+	if demand := o.pendingDemands[key]; demand != nil && demand.state == localDemandForwarding {
+		forwardDone := demand.forwardDone
+		materializationDone := demand.materializationDone
+		o.materializationMu.Unlock()
+		if forwardDone != nil {
+			select {
+			case <-forwardDone:
+			case <-o.materializationStop:
+				return true
+			}
+		}
+		if !demand.upstreamForwarded {
+			return true
+		}
+		if materializationDone != nil {
+			select {
+			case <-materializationDone:
+			case <-o.materializationStop:
+				return true
+			}
+		}
+		return false
+	}
 	demand, ok := o.transitionLocalDemandLocked(key, localDemandCancelled)
 	if ok && o.materializationAttempt != nil && !o.materializationAttempt.launchFrozen && demand.session.ID == o.materializationAttempt.launch.SessionID {
 		o.materializationAttempt.launch = o.electLaunchContextLocked()
@@ -1192,12 +1361,9 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 		return
 	}
 
-	o.mu.RLock()
-	attached := o.sessions[demand.session.ID] == demand.session
-	o.mu.RUnlock()
-	authorized := o.authorizeSession == nil || demand.session.Meta().IsAuthorized()
+	eligible := o.sessionEligibleForDemand(demand.session)
 	compatible := o.launchContextCompatible(launch, o.launchContextForSession(demand.session))
-	if !attached || !authorized || !compatible {
+	if !eligible || !compatible {
 		demand.state = localDemandRejected
 		delete(o.pendingDemands, key)
 		if demand.timer != nil {
@@ -1209,14 +1375,22 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	}
 
 	demand.state = localDemandForwarding
-	delete(o.pendingDemands, key)
+	demand.forwardDone = make(chan struct{})
+	if a := o.materializationAttempt; a != nil && a.generation == generation {
+		demand.materializationDone = a.done
+	}
 	if demand.timer != nil {
 		demand.timer.Stop()
 	}
-	if cached := o.getCachedResponse(demand.message.Method); cached != nil &&
-		(demand.message.Method != "initialize" || o.initFingerprintMatches(demand.message.Raw)) {
+	cached := o.getCachedResponse(demand.message.Method)
+	if demand.message.Method == "initialize" && !o.initFingerprintMatches(demand.message.Raw) {
+		cached = nil
+	}
+	o.materializationMu.Unlock()
+
+	if cached != nil {
 		err := o.replayFromCache(demand.session, demand.message, cached)
-		o.materializationMu.Unlock()
+		o.completeForwardingLocalDemand(key, demand, false)
 		if err != nil {
 			_ = o.writeDemandError(demand.session, demand.message.ID, err.Error())
 		}
@@ -1226,14 +1400,30 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	if o.beforeQueuedDemandWrite != nil {
 		o.beforeQueuedDemandWrite()
 	}
-	writeFailed, err := o.forwardRequestPrepared(demand.session, demand.message)
-	o.materializationMu.Unlock()
+	usedProc, writeFailed, err := o.forwardRequestPrepared(demand.session, demand.message)
+	o.completeForwardingLocalDemand(key, demand, err == nil && !writeFailed)
 	if err != nil {
 		o.logger.Printf("session %d: queued demand forwarding failed: %v", demand.session.ID, err)
 	}
 	if writeFailed {
-		o.startMaterialization(MaterializationTriggerWriteError)
+		if usedProc != nil {
+			o.retireReadyProcess(usedProc, MaterializationTriggerWriteError)
+		} else {
+			o.startMaterialization(MaterializationTriggerWriteError)
+		}
 	}
+}
+
+func (o *Owner) completeForwardingLocalDemand(key string, demand *localDemand, upstreamForwarded bool) {
+	o.materializationMu.Lock()
+	if current := o.pendingDemands[key]; current == demand && demand.state == localDemandForwarding {
+		demand.upstreamForwarded = upstreamForwarded
+		delete(o.pendingDemands, key)
+		if demand.forwardDone != nil {
+			close(demand.forwardDone)
+		}
+	}
+	o.materializationMu.Unlock()
 }
 
 func (o *Owner) transitionLocalDemandLocked(key string, terminal localDemandState) (*localDemand, bool) {
@@ -1258,20 +1448,24 @@ func (o *Owner) writeDemandError(s *Session, id json.RawMessage, message string)
 }
 
 func (o *Owner) forwardRequestNow(s *Session, msg *jsonrpc.Message) error {
-	writeFailed, err := o.forwardRequestPrepared(s, msg)
+	failedProc, writeFailed, err := o.forwardRequestPrepared(s, msg)
 	if writeFailed {
-		o.startMaterialization(MaterializationTriggerWriteError)
+		if failedProc != nil {
+			o.retireReadyProcess(failedProc, MaterializationTriggerWriteError)
+		} else {
+			o.startMaterialization(MaterializationTriggerWriteError)
+		}
 	}
 	return err
 }
 
-func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (bool, error) {
+func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
 	o.pendingRequests.Add(1)
 	newID := remap.Remap(s.ID, msg.ID)
 	remapped, err := jsonrpc.ReplaceID(msg.Raw, newID)
 	if err != nil {
 		o.decrementPending()
-		return false, fmt.Errorf("remap request: %w", err)
+		return nil, false, fmt.Errorf("remap request: %w", err)
 	}
 
 	o.inflightTracker.Store(string(newID), &InflightRequest{
@@ -1319,13 +1513,19 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (bool, 
 	if msg.Method == "tools/call" && o.toolTimeoutNs.Load() > 0 {
 		o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 	}
-	if err := o.writeUpstream(remapped); err != nil {
-		o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), err)
-		o.upstreamDead.Store(true)
-		o.drainInflightRequests()
-		return true, nil
+	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped)
+	if writeErr != nil {
+		o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), writeErr)
+		if _, loaded := o.inflightTracker.LoadAndDelete(string(newID)); loaded {
+			o.methodTags.Delete(string(newID))
+			o.sessionMgr.CompleteRequest(string(newID))
+			o.clearProgressTokensForRequest(string(newID))
+			o.decrementPending()
+		}
+		_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+		return usedProc, true, nil
 	}
-	return false, nil
+	return usedProc, false, nil
 }
 
 func (o *Owner) ensureUpstreamReadyForRequest() error {
@@ -1390,9 +1590,54 @@ func (o *Owner) monitorMaterializedProcessExit(proc *upstream.Process) {
 	o.upstreamEventMu.Lock()
 	o.materializationMu.Lock()
 	if o.retiringProcess == proc {
+		blocked := o.materializationState == MaterializationFinalizeBlocked
+		managedByAttempt := o.materializationAttempt != nil && o.materializationAttempt.process == proc
+		trigger := o.materializationTrigger
 		o.materializationMu.Unlock()
 		o.upstreamEventMu.Unlock()
-		o.handleRetiringProcessExit(proc)
+		if blocked && !managedByAttempt && !o.completeRetiringProcess(proc, trigger) {
+			o.startRetiringProcessRetry(proc, trigger)
+		}
+		return
+	}
+	o.mu.Lock()
+	if o.upstream != proc {
+		o.mu.Unlock()
+		o.materializationMu.Unlock()
+		o.upstreamEventMu.Unlock()
+		return
+	}
+	if a := o.materializationAttempt; a != nil && a.process == proc {
+		o.upstreamDead.Store(true)
+		signals := a.signals
+		o.mu.Unlock()
+		responses := o.claimInflightRequests()
+		o.materializationMu.Unlock()
+		o.upstreamEventMu.Unlock()
+		o.deliverInflightResponses(responses)
+		signals.signalFailure(fmt.Errorf("upstream exited before materialization completed: %v", proc.ExitErr))
+		return
+	}
+	o.mu.Unlock()
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+
+	o.retireReadyProcess(proc, MaterializationTriggerUpstreamExit)
+}
+
+// retireReadyProcess moves one exact installed generation through FINALIZING.
+// The generation remains authoritative until both process exit and process-tree
+// authority retirement are proven; only then may the controller materialize a
+// replacement generation.
+func (o *Owner) retireReadyProcess(proc *upstream.Process, trigger MaterializationTrigger) {
+	if proc == nil {
+		return
+	}
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	if o.retiringProcess == proc {
+		o.materializationMu.Unlock()
+		o.upstreamEventMu.Unlock()
 		return
 	}
 	o.mu.Lock()
@@ -1403,51 +1648,21 @@ func (o *Owner) monitorMaterializedProcessExit(proc *upstream.Process) {
 		return
 	}
 	o.upstreamDead.Store(true)
-	if a := o.materializationAttempt; a != nil && a.process == proc {
-		signals := a.signals
-		o.mu.Unlock()
-		responses := o.claimInflightRequests()
-		o.materializationMu.Unlock()
-		o.upstreamEventMu.Unlock()
-		o.deliverInflightResponses(responses)
-		signals.signalFailure(fmt.Errorf("upstream exited before materialization completed: %v", proc.ExitErr))
-		return
-	}
-	o.upstream = nil
 	o.mu.Unlock()
-	o.materializationState = MaterializationCacheOnly
+	o.retiringProcess = proc
+	o.materializationState = MaterializationFinalizing
+	o.materializationTrigger = trigger
 	responses := o.claimInflightRequests()
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)
 
-	if o.shouldRetryMaterialization(MaterializationTriggerUpstreamExit) {
-		o.startMaterialization(MaterializationTriggerUpstreamExit)
-		return
-	}
-	if !o.hasUsableCache() {
-		o.notifyUpstreamExit()
+	if !o.completeRetiringProcess(proc, trigger) {
+		o.startRetiringProcessRetry(proc, trigger)
 	}
 }
 
-func (o *Owner) handleRetiringProcessExit(proc *upstream.Process) bool {
-	o.upstreamEventMu.Lock()
-	o.materializationMu.Lock()
-	if o.retiringProcess != proc {
-		o.materializationMu.Unlock()
-		o.upstreamEventMu.Unlock()
-		return false
-	}
-	if o.materializationState != MaterializationFinalizeBlocked || !errors.Is(o.materializationBlockedErr, errFinalizationUnproven) {
-		o.materializationMu.Unlock()
-		o.upstreamEventMu.Unlock()
-		return true
-	}
-	o.materializationMu.Unlock()
-	o.upstreamEventMu.Unlock()
-
-	// Process finalization may block; generation writers already see this proc
-	// as retiring, so no lease is held across Close.
+func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger MaterializationTrigger) bool {
 	closeErr := proc.Close()
 	proofErr := error(nil)
 	proven := proc.RetirementProven()
@@ -1465,11 +1680,12 @@ func (o *Owner) handleRetiringProcessExit(proc *upstream.Process) bool {
 		o.upstreamEventMu.Lock()
 		o.materializationMu.Lock()
 		if o.retiringProcess == proc {
+			o.materializationState = MaterializationFinalizeBlocked
 			o.materializationBlockedErr = proofErr
 		}
 		o.materializationMu.Unlock()
 		o.upstreamEventMu.Unlock()
-		return true
+		return false
 	}
 	if closeErr != nil {
 		o.logger.Printf("retiring process finalized after warning: %v", closeErr)
@@ -1499,12 +1715,41 @@ func (o *Owner) handleRetiringProcessExit(proc *upstream.Process) bool {
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)
 	o.clearProactiveTracking()
-	if o.shouldRetryMaterialization(MaterializationTriggerUpstreamExit) {
-		o.startMaterialization(MaterializationTriggerUpstreamExit)
+	o.retirementRetryProcess.CompareAndSwap(proc, nil)
+	if o.shouldRetryMaterialization(trigger) {
+		o.startMaterialization(trigger)
 	} else if !o.hasUsableCache() {
 		o.notifyUpstreamExit()
 	}
 	return true
+}
+
+func (o *Owner) startRetiringProcessRetry(proc *upstream.Process, trigger MaterializationTrigger) {
+	if !o.retirementRetryProcess.CompareAndSwap(nil, proc) {
+		return
+	}
+	go func() {
+		defer o.retirementRetryProcess.CompareAndSwap(proc, nil)
+		wait := materializationRetryInitial
+		for {
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-o.materializationStop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			}
+			if o.completeRetiringProcess(proc, trigger) {
+				return
+			}
+			wait = nextMaterializationRetry(wait)
+		}
+	}()
 }
 
 // RestartPin freezes new materialization generations while restart state is
@@ -1728,10 +1973,8 @@ func (o *Owner) PersistentPending() bool {
 func (o *Owner) ResolvePersistent(persistent bool) {
 	o.materializationMu.Lock()
 	o.persistentPending = false
-	if persistent || o.persistentRequired {
+	if persistent || o.persistentRequired || o.materializationPolicy == MaterializationPersistent {
 		o.materializationPolicy = MaterializationPersistent
-	} else if o.materializationPolicy == MaterializationPersistent {
-		o.materializationPolicy = MaterializationOnDemand
 	}
 	o.materializationMu.Unlock()
 }

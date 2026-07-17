@@ -186,6 +186,11 @@ func (s *Session) Close() {
 	}
 }
 
+// IsClosed reports whether Close has completed for this session.
+func (s *Session) IsClosed() bool {
+	return s.closed.Load()
+}
+
 // SendNotification queues a notification for async delivery. Never blocks the
 // caller — if the buffer is full, the oldest notification is dropped to make room.
 // This prevents the upstream reader goroutine from deadlocking when a session's

@@ -19,6 +19,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/remap"
+	muxsession "github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
 
@@ -918,6 +919,399 @@ func TestLaterProcessExitClearsRecoverableFinalizationBlock(t *testing.T) {
 	}
 }
 
+func TestReadyGenerationRemainsAuthoritativeUntilRetirementProof(t *testing.T) {
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+
+	proc := upstream.NewProcessFromHandler(context.Background(), func(context.Context, io.Reader, io.Writer) error {
+		return errors.New("synthetic ready-generation exit")
+	})
+	select {
+	case <-proc.Done:
+	case <-time.After(time.Second):
+		t.Fatal("fixture process did not exit")
+	}
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	o.upstream = proc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+
+	var allowProof atomic.Bool
+	o.materializationFinalizationProbe = func(*upstream.Process) error {
+		if allowProof.Load() {
+			return nil
+		}
+		return errors.New("synthetic process-tree authority remains")
+	}
+	o.monitorMaterializedProcessExit(proc)
+	waitForCondition(t, time.Second, func() bool {
+		return o.MaterializationState() == MaterializationFinalizeBlocked
+	}, "ready generation did not enter finalize_blocked")
+	if got := o.currentUpstream(); got != proc {
+		t.Fatalf("authoritative process changed before retirement proof: got=%p want=%p", got, proc)
+	}
+	if attempt := o.startMaterialization(MaterializationTriggerUpstreamExit); attempt.err == nil {
+		t.Fatal("replacement materialization was accepted before retirement proof")
+	}
+
+	allowProof.Store(true)
+	waitForCondition(t, 2*time.Second, func() bool {
+		return o.MaterializationState() == MaterializationCacheOnly && o.currentUpstream() == nil && o.retirementRetryProcess.Load() == nil
+	}, "retirement retry did not release generation after proof")
+}
+
+func TestStaleWriteFailureDoesNotRetireReplacementGeneration(t *testing.T) {
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+
+	stale := upstream.NewProcessFromHandler(context.Background(), func(context.Context, io.Reader, io.Writer) error {
+		return nil
+	})
+	select {
+	case <-stale.Done:
+	case <-time.After(time.Second):
+		t.Fatal("stale process did not exit")
+	}
+	replacement := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	})
+
+	sessionOutput := &bytes.Buffer{}
+	s := NewSessionWithRawWriter(7001, sessionOutput)
+	defer s.Close()
+	o.mu.Lock()
+	o.sessions[s.ID] = s
+	o.mu.Unlock()
+	o.sessionMgr.RegisterSession(s, "")
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	o.upstream = stale
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+
+	writeCaptured := make(chan *upstream.Process, 1)
+	releaseWrite := make(chan struct{})
+	o.beforeCurrentUpstreamWrite = func(proc *upstream.Process) {
+		writeCaptured <- proc
+		<-releaseWrite
+	}
+	msg, err := jsonrpc.Parse([]byte(`{"jsonrpc":"2.0","id":73,"method":"custom/stale-write","params":{}}`))
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	forwardDone := make(chan error, 1)
+	go func() { forwardDone <- o.forwardRequestNow(s, msg) }()
+	select {
+	case got := <-writeCaptured:
+		if got != stale {
+			t.Fatalf("captured write process=%p, want stale=%p", got, stale)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write did not reach generation capture seam")
+	}
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	o.upstream = replacement
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+	close(releaseWrite)
+	select {
+	case err := <-forwardDone:
+		if err != nil {
+			t.Fatalf("forwardRequestNow: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale write did not return after release")
+	}
+
+	if got := o.currentUpstream(); got != replacement {
+		t.Fatalf("stale write failure replaced current process: got=%p want=%p", got, replacement)
+	}
+	if o.upstreamDead.Load() || o.MaterializationState() != MaterializationReady {
+		t.Fatalf("replacement generation was marked failed: %#v", o.Status())
+	}
+	if o.PendingRequests() != 0 {
+		t.Fatalf("failed stale write left pending requests: %d", o.PendingRequests())
+	}
+	if !strings.Contains(sessionOutput.String(), `"id":73`) || !strings.Contains(sessionOutput.String(), "upstream write failed") {
+		t.Fatalf("failed request did not receive its own error: %s", sessionOutput.String())
+	}
+}
+
+func TestClosedAttachedSessionCannotSeedMaterialization(t *testing.T) {
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+
+	s := NewSession(strings.NewReader(""), io.Discard)
+	s.Cwd = "/closed/waiter"
+	o.mu.Lock()
+	o.sessions[s.ID] = s
+	o.mu.Unlock()
+	s.Close()
+
+	o.materializationMu.Lock()
+	o.pendingDemands["closed"] = &localDemand{session: s, state: localDemandWaiting}
+	o.pendingDemandOrder = []string{"closed"}
+	launch := o.electLaunchContextLocked()
+	o.materializationMu.Unlock()
+	o.materializationMu.Lock()
+	delete(o.pendingDemands, "closed")
+	o.pendingDemandOrder = nil
+	o.materializationMu.Unlock()
+	if launch.SessionID == s.ID || launch.Cwd == s.Cwd {
+		t.Fatalf("closed attached session seeded launch context: %+v", launch)
+	}
+}
+
+func TestProactiveIsolatedRecoveryRematerializesInOldestAttachedContext(t *testing.T) {
+	firstInit := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	var starts atomic.Int32
+	defer firstOnce.Do(func() { close(releaseFirst) })
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		generation := starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if generation == 1 {
+					close(firstInit)
+					<-releaseFirst
+				}
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"isolated"}},"serverInfo":{"name":"recovery","version":"1"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		Cwd:                   "/project/departed",
+		Env:                   map[string]string{"CONFIG_PATH": "departed"},
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		ServerID:              "proactive-isolated-context",
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+
+	oldest := newControllerTestSession(o)
+	defer oldest.close()
+	oldest.session.Cwd = "/project/retained"
+	oldest.session.Env = map[string]string{"CONFIG_PATH": "retained"}
+	newer := newControllerTestSession(o)
+	defer newer.close()
+	newer.session.Cwd = "/project/newer"
+	newer.session.Env = map[string]string{"CONFIG_PATH": "newer"}
+
+	attempt := o.startMaterialization(MaterializationTriggerUpstreamExit)
+	select {
+	case <-firstInit:
+	case <-time.After(time.Second):
+		t.Fatal("proactive recovery did not reach its first initialize")
+	}
+	o.materializationMu.Lock()
+	firstLaunch := attempt.launch
+	o.materializationMu.Unlock()
+	if firstLaunch.SessionID != 0 || firstLaunch.Cwd != "/project/departed" {
+		t.Fatalf("initial proactive launch = %+v, want stored owner context", firstLaunch)
+	}
+	firstOnce.Do(func() { close(releaseFirst) })
+	waitForCondition(t, 3*time.Second, func() bool { return starts.Load() >= 2 }, "isolated verdict did not rematerialize")
+	o.materializationMu.Lock()
+	secondLaunch := attempt.launch
+	o.materializationMu.Unlock()
+	if secondLaunch.SessionID != oldest.session.ID || secondLaunch.Cwd != oldest.session.Cwd || secondLaunch.Env["CONFIG_PATH"] != "retained" {
+		t.Fatalf("second launch context = %+v, want oldest attached session", secondLaunch)
+	}
+	select {
+	case <-attempt.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rematerialized isolated recovery did not finish")
+	}
+	if attempt.err != nil {
+		t.Fatalf("rematerialized isolated recovery failed: %v", attempt.err)
+	}
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("upstream starts = %d, want owner-context probe plus retained-context generation", got)
+	}
+	snapshot := o.ExportSnapshot()
+	if snapshot.Cwd != oldest.session.Cwd || snapshot.Env["CONFIG_PATH"] != "retained" || snapshot.Classification != "isolated" {
+		t.Fatalf("committed recovery context = %+v", snapshot)
+	}
+	select {
+	case <-oldest.session.Done():
+		t.Fatal("retained oldest session was evicted")
+	default:
+	}
+	waitForCondition(t, time.Second, func() bool {
+		select {
+		case <-newer.session.Done():
+			return true
+		default:
+			return false
+		}
+	}, "newer session was not evicted after isolated rematerialization")
+}
+
+func TestProactiveIsolatedRecoveryReelectsWhenOldestLeavesBeforeRestart(t *testing.T) {
+	firstInit := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	var starts atomic.Int32
+	defer firstOnce.Do(func() { close(releaseFirst) })
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		generation := starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if generation == 1 {
+					close(firstInit)
+					<-releaseFirst
+				}
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"isolated"}},"serverInfo":{"name":"recovery","version":"1"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		Cwd:                   "/project/departed",
+		Env:                   map[string]string{"CONFIG_PATH": "departed"},
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		ServerID:              "proactive-isolated-reelection",
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+
+	oldest := newControllerTestSession(o)
+	oldest.session.Cwd = "/project/oldest"
+	oldest.session.Env = map[string]string{"CONFIG_PATH": "oldest"}
+	newer := newControllerTestSession(o)
+	defer newer.close()
+	newer.session.Cwd = "/project/newer"
+	newer.session.Env = map[string]string{"CONFIG_PATH": "newer"}
+
+	attempt := o.startMaterialization(MaterializationTriggerUpstreamExit)
+	select {
+	case <-firstInit:
+	case <-time.After(time.Second):
+		t.Fatal("proactive recovery did not reach its first initialize")
+	}
+	o.materializationMu.Lock()
+	firstSignals := attempt.signals
+	o.materializationMu.Unlock()
+	firstOnce.Do(func() { close(releaseFirst) })
+	select {
+	case <-firstSignals.failed:
+	case <-time.After(time.Second):
+		t.Fatal("first isolated verdict did not request retained-context rematerialization")
+	}
+	oldest.close()
+	waitForCondition(t, time.Second, func() bool {
+		return !o.sessionEligibleForDemand(oldest.session)
+	}, "oldest session remained eligible before replacement start")
+
+	waitForCondition(t, 3*time.Second, func() bool { return starts.Load() >= 2 }, "replacement generation did not start")
+	o.materializationMu.Lock()
+	secondLaunch := attempt.launch
+	o.materializationMu.Unlock()
+	if secondLaunch.SessionID != newer.session.ID || secondLaunch.Cwd != newer.session.Cwd || secondLaunch.Env["CONFIG_PATH"] != "newer" {
+		t.Fatalf("replacement launch context = %+v, want next-oldest attached session", secondLaunch)
+	}
+	select {
+	case <-attempt.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("re-elected isolated recovery did not finish")
+	}
+	if attempt.err != nil {
+		t.Fatalf("re-elected isolated recovery failed: %v", attempt.err)
+	}
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("upstream starts = %d, want owner-context probe plus one re-elected generation", got)
+	}
+	snapshot := o.ExportSnapshot()
+	if snapshot.Cwd != newer.session.Cwd || snapshot.Env["CONFIG_PATH"] != "newer" || snapshot.Classification != "isolated" {
+		t.Fatalf("committed re-elected recovery context = %+v", snapshot)
+	}
+	select {
+	case <-newer.session.Done():
+		t.Fatal("re-elected session was evicted")
+	default:
+	}
+}
+
 func TestFreshIsolatedClassificationRetainsInitiatingSession(t *testing.T) {
 	initSeen := make(chan struct{})
 	releaseInit := make(chan struct{})
@@ -965,6 +1359,7 @@ func TestFreshIsolatedClassificationRetainsInitiatingSession(t *testing.T) {
 		IPCPath:               testIPCPath(t),
 		MaterializationPolicy: MaterializationOnDemand,
 		Logger:                testLogger(t),
+		ServerID:              "fresh-isolated-reconnect",
 	}, controllerSnapshot())
 	if err != nil {
 		t.Fatalf("NewOwnerFromSnapshot: %v", err)
@@ -978,6 +1373,12 @@ func TestFreshIsolatedClassificationRetainsInitiatingSession(t *testing.T) {
 	defer high.close()
 	high.session.Cwd = "/project/high"
 	high.session.Env = map[string]string{"GITHUB_TOKEN": "same"}
+	for token, session := range map[string]*Session{"low-bound": low.session, "high-bound": high.session} {
+		o.SessionMgr().PreRegisterForOwner(token, o.ServerID(), session.Cwd, session.Env)
+		if !o.SessionMgr().Bind(token, o.ServerID(), session) {
+			t.Fatalf("Bind(%q) returned false", token)
+		}
+	}
 
 	sendReq(t, high.write, 9, "custom/high", `{}`)
 	select {
@@ -1013,6 +1414,12 @@ func TestFreshIsolatedClassificationRetainsInitiatingSession(t *testing.T) {
 	snapshot := o.ExportSnapshot()
 	if snapshot.Cwd != "/project/high" || snapshot.Classification != "isolated" {
 		t.Fatalf("committed initiating context/classification = %+v", snapshot)
+	}
+	if _, err := o.SessionMgr().RegisterReconnect("low-bound", func(string) bool { return true }); !errors.Is(err, muxsession.ErrUnknownToken) {
+		t.Fatalf("evicted reconnect error = %v, want ErrUnknownToken", err)
+	}
+	if _, err := o.SessionMgr().RegisterReconnect("high-bound", func(string) bool { return true }); err != nil {
+		t.Fatalf("retained reconnect authority was revoked: %v", err)
 	}
 }
 
@@ -1081,6 +1488,7 @@ func TestMaterializationIsolatedCommitRevokesTokenDuringAuthorization(t *testing
 	initiator := newControllerTestSession(o)
 	defer initiator.close()
 	initiator.session.Cwd = "/project/initiator"
+	initiator.session.SetMeta(muxcore.SessionMeta{AuthorizedAt: time.Now()})
 
 	const token = "deadbeef"
 	if !o.PreRegister(token, "/project/extra", map[string]string{"PROJECT": "extra"}) {
@@ -1540,7 +1948,11 @@ func TestPendingPersistenceRetriesAfterDiscoveryFailureWithoutSessions(t *testin
 			}
 			switch req.Method {
 			case "initialize":
-				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"persistent":true}},"serverInfo":{"name":"persistent-retry","version":"1"}}`); err != nil {
+				result := `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"persistent-retry","version":"1"}}`
+				if generation == 1 {
+					result = `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"persistent":true}},"serverInfo":{"name":"persistent-retry","version":"1"}}`
+				}
+				if err := writeControllerResponse(stdout, req.ID, result); err != nil {
 					return err
 				}
 			case "tools/list":
@@ -1583,7 +1995,26 @@ func TestPendingPersistenceRetriesAfterDiscoveryFailureWithoutSessions(t *testin
 		return starts.Load() >= 2 && o.MaterializationState() == MaterializationReady
 	}, "pending persistence did not retain one retry obligation")
 	if o.PersistentPending() {
-		t.Fatal("successful persistent commit did not promote the pending obligation")
+		t.Fatal("successful commit did not promote the pending obligation")
+	}
+	o.materializationMu.Lock()
+	policy := o.materializationPolicy
+	o.materializationMu.Unlock()
+	if policy != MaterializationPersistent {
+		t.Fatalf("second generation downgraded latched persistence: policy=%s", policy)
+	}
+}
+
+func TestResolvePersistentCannotDowngradeCommittedPersistence(t *testing.T) {
+	o := &Owner{materializationPolicy: MaterializationPersistent}
+
+	o.ResolvePersistent(false)
+
+	o.materializationMu.Lock()
+	policy := o.materializationPolicy
+	o.materializationMu.Unlock()
+	if policy != MaterializationPersistent {
+		t.Fatalf("later persistent=false resolution downgraded committed persistence: policy=%s", policy)
 	}
 }
 
@@ -1629,6 +2060,9 @@ func TestMaterializationStatusReportsCacheOnlyAndLiveGeneration(t *testing.T) {
 	status := o.Status()
 	if status["materialization_state"] != string(MaterializationCacheOnly) || status["cache_ready"] != true || status["upstream_live"] != false {
 		t.Fatalf("cache-only status = %#v", status)
+	}
+	if status["materialization_policy"] != "on_demand" {
+		t.Fatalf("materialization policy = %#v, want on_demand", status["materialization_policy"])
 	}
 	s := newControllerTestSession(o)
 	defer s.close()
@@ -1946,5 +2380,137 @@ func TestMaterializationListChangedSuccessBroadcastsFromColdCommit(t *testing.T)
 	}, "cold staged list_changed was not broadcast after commit")
 	if got := string(o.getCachedResponse("tools/list")); !strings.Contains(got, "fresh") {
 		t.Fatalf("successful staged cache not committed: %s", got)
+	}
+}
+
+func TestMaterializationDiscoveryErrorsFailWithoutStaging(t *testing.T) {
+	for _, method := range []string{"initialize", "tools/list"} {
+		t.Run(method, func(t *testing.T) {
+			o := newMinimalOwner()
+			proc := &upstream.Process{Done: make(chan struct{})}
+			a := newMaterializationAttempt(1, MaterializationTriggerDemand)
+			a.process = proc
+			a.signals = newMaterializationSignals()
+			o.materializationAttempt = a
+			o.cacheStage = &cacheStage{generation: a.generation, process: proc, signals: a.signals}
+
+			raw := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"discovery failed"}}`)
+			if !o.stageMaterializationCacheResponse(proc, method, raw) {
+				t.Fatal("materialization response was not claimed")
+			}
+			select {
+			case <-a.signals.failed:
+			default:
+				t.Fatal("JSON-RPC discovery error did not fail materialization")
+			}
+			if method == "initialize" {
+				select {
+				case <-a.signals.initReady:
+				default:
+					t.Fatal("initialize error did not settle the init usability gate")
+				}
+				if a.signals.initOK {
+					t.Fatal("initialize error marked the response usable")
+				}
+			}
+			if o.cacheStage.initResp != nil || o.cacheStage.toolList != nil {
+				t.Fatalf("discovery error entered staged cache: %#v", o.cacheStage)
+			}
+		})
+	}
+}
+
+func TestCacheResponseStateRejectsJSONRPCError(t *testing.T) {
+	o := newMinimalOwner()
+	raw := []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"not cacheable"}}`)
+	o.cacheResponseState("initialize", raw)
+	o.cacheResponseState("tools/list", raw)
+	if o.getCachedResponse("initialize") != nil || o.getCachedResponse("tools/list") != nil {
+		t.Fatal("JSON-RPC error response entered the reusable cache")
+	}
+}
+
+func TestBlockedMaterializationFinalizationReprovesAutomatically(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	proc := &upstream.Process{Done: done}
+	o := newMinimalOwner()
+	o.initResp = []byte(`{"jsonrpc":"2.0","id":1,"result":{}}`)
+	a := newMaterializationAttempt(1, MaterializationTriggerDemand)
+	a.process = proc
+	o.materializationAttempt = a
+	o.materializationState = MaterializationFinalizing
+	o.retiringProcess = proc
+	o.upstream = proc
+
+	var allowProof atomic.Bool
+	o.materializationFinalizationProbe = func(*upstream.Process) error {
+		if allowProof.Load() {
+			return nil
+		}
+		return errors.New("synthetic authority still live")
+	}
+	blockErr := o.blockMaterializationFinalization(a, errors.New("synthetic authority still live"))
+	o.finishMaterializationFailure(a, blockErr)
+	allowProof.Store(true)
+
+	waitForCondition(t, time.Second, func() bool {
+		return o.MaterializationState() == MaterializationCacheOnly && o.currentUpstream() == nil
+	}, "blocked materialization finalization was not automatically re-proven")
+}
+
+func TestBlockedQueuedWriteDoesNotHoldMaterializationMutex(t *testing.T) {
+	o := newMinimalOwner()
+	var upstream bytes.Buffer
+	o.upstreamWriter = &upstream
+	s := NewSession(strings.NewReader(""), io.Discard)
+	o.admissionMu.Lock()
+	o.addSessionLocked(s)
+	o.admissionMu.Unlock()
+	defer s.Close()
+
+	msg, err := jsonrpc.Parse([]byte(`{"jsonrpc":"2.0","id":41,"method":"custom/blocked","params":{}}`))
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	key := string(remap.Remap(s.ID, msg.ID))
+	o.pendingDemands[key] = &localDemand{key: key, session: s, message: msg, state: localDemandWaiting, generation: 1}
+	o.materializationState = MaterializationReady
+
+	writeEntered := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	o.beforeQueuedDemandWrite = func() {
+		close(writeEntered)
+		<-releaseWrite
+	}
+	forwardDone := make(chan struct{})
+	go func() {
+		o.forwardQueuedDemand(key, 1, o.launchContextForSession(s))
+		close(forwardDone)
+	}()
+	select {
+	case <-writeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("queued write did not reach the blocking boundary")
+	}
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		o.materializationMu.Lock()
+		o.materializationMu.Unlock()
+		close(lockAcquired)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(150 * time.Millisecond):
+		close(releaseWrite)
+		<-forwardDone
+		t.Fatal("blocked upstream write held materializationMu")
+	}
+	close(releaseWrite)
+	select {
+	case <-forwardDone:
+	case <-time.After(time.Second):
+		t.Fatal("queued write did not complete")
 	}
 }

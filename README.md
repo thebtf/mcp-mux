@@ -166,17 +166,34 @@ Cache entries are invalidated when the upstream sends the corresponding `*_chang
 For `initialize`, the cache is keyed on `protocolVersion`. A new client using a different protocol
 version bypasses the cache and goes to the upstream directly.
 
-## Proactive Init
+## Cache-Only Startup and Lazy Materialization
 
-When a new owner is created, mcp-mux sends a synthetic `initialize` request to the upstream
-immediately — before any CC session connects. This pre-populates the response cache so the first
-session gets an instant cached replay instead of waiting for the upstream to start.
+The first time mcp-mux sees a command and security context, it starts the
+upstream and performs a synthetic `initialize` plus `tools/list` to learn the
+server's sharing mode and publish a reusable discovery template.
 
-For slow-starting servers (serena via uvx ~3s, tavily via npx ~5s), this eliminates the CC
-"failed" status that occurred when the upstream couldn't respond within CC's startup timeout.
+After that owner is removed, a compatible session can start as a **cache-only
+owner**:
 
-The proactive init also sends `notifications/initialized` and `tools/list` to warm the full
-cache and trigger auto-classification.
+- cached `initialize`, `tools/list`, and any captured prompt/resource discovery
+  responses are replayed without starting the upstream process;
+- `notifications/initialized` is suppressed while no upstream exists;
+- the first uncached request starts exactly one upstream generation and forwards
+  the original request on the same open host transport after initialization;
+- `mcp-mux status` reports `materialization_state: "CACHE_ONLY"` with
+  `upstream_pid: 0` until demand arrives, then `READY` with the live PID.
+
+Template reuse is fail-closed. A missing, stale, or incompatible template takes
+one bounded cold/eager path instead of replaying cached frames from the wrong
+context. Compatibility uses an exact SHA-256 identity of the effective
+security-relevant environment; isolated templates also require the exact
+canonical working directory. Raw environment values are not stored in the
+identity or exposed in status. Persistent owners and callers that explicitly
+require eager startup continue to materialize without waiting for a request.
+
+For slow-starting servers (serena via uvx ~3s, tavily via npx ~5s), a compatible
+template lets later host startup complete from cache while deferring that cost
+until the server is actually used.
 
 ## Daemon Mode
 
@@ -470,25 +487,31 @@ Done   ──(transferred, aborted lists)──>
   every other prepared tree aborts and is eligible for snapshot respawn.
 - **30s accept + total timeout** on both sides.
 - **Version skew (FR-3):** negotiation happens before any owner detaches. A
-  mismatched `protocol_version`, including the first v1-to-v2 restart, takes
-  one bounded snapshot-backed shutdown+respawn path (FR-8).
+  mismatched `protocol_version`, token mismatch, listener timeout, or handoff
+  successor start failure aborts the restart, releases restart pins, and leaves
+  the predecessor serving.
 
 ### FR-8 degraded fallback
 
-If any of the following happens, the daemon automatically falls back to the
-bounded snapshot-backed shutdown-and-respawn path:
+Snapshot fallback is authorized only after exact version/token Hello and owner
+detach. On a later receipt or final-ack failure, the daemon:
 
-- Platform unsupported (socket bind failure on an exotic OS)
-- Successor spawn failure
-- Handoff socket accept timeout exceeded
-- Shared token mismatch (`ErrTokenMismatch`)
-- Protocol version mismatch (`ErrProtocolVersionMismatch`)
-- Any other `performHandoff` error
+1. proves the failed handoff successor has exited;
+2. aborts the prepared transfer, permanently closing the detached predecessor
+   owner and terminating its process tree;
+3. rewrites the pinned snapshot from the retained logical generation metadata;
+4. pre-starts exactly one clean snapshot successor; and
+5. only then returns the post-response predecessor shutdown callback.
 
-All paths log `handoff.fallback reason=…` — search `mcp-muxd-debug.log` for operator diagnostics.
-After fallback the successor daemon respawns upstreams from snapshot;
-`drainOrphanedInflight` returns JSON-RPC errors by original id to in-flight
-callers. It does not replay those requests.
+No-process/cache-only restarts likewise pre-start one snapshot successor before
+predecessor shutdown. A pre-detach failure logs `handoff.abort` and does not
+spawn fallback. A successful post-detach recovery logs `handoff.fallback`;
+failure to prove successor exit, rewrite the snapshot, or start the backup logs
+`handoff.fallback_blocked` and remains fail-closed.
+
+The snapshot successor eagerly restores upstreams; `drainOrphanedInflight`
+returns JSON-RPC errors by original id to in-flight callers. It does not replay
+those requests.
 
 ### Operator visibility
 

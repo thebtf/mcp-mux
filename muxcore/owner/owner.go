@@ -204,10 +204,13 @@ type Owner struct {
 	done                    chan struct{}
 
 	restartPins atomic.Int64
-	// Lock order is upstreamEventMu, materializationMu, admissionMu, then mu.
+	// Lock order is launchContextMu, upstreamEventMu, materializationMu,
+	// admissionMu, then mu. launchContextMu fences final session-context
+	// validation and upstream.Start against owner-side session detachment.
 	// Writers never hold upstreamEventMu across process Close/SoftClose; readers
 	// may hold it across bounded session I/O. admissionMu serializes token bind +
 	// session registration against coherent classification commits.
+	launchContextMu                  sync.Mutex
 	upstreamEventMu                  sync.RWMutex
 	materializationMu                sync.Mutex
 	admissionMu                      sync.Mutex
@@ -218,6 +221,7 @@ type Owner struct {
 	materializationAttempt           *materializationAttempt
 	retiringProcess                  *upstream.Process
 	materializationBlockedErr        error
+	retirementRetryProcess           atomic.Pointer[upstream.Process]
 	materializationStop              chan struct{}
 	pendingDemands                   map[string]*localDemand
 	pendingDemandOrder               []string
@@ -227,7 +231,8 @@ type Owner struct {
 	materializationFinalizationProbe func(*upstream.Process) error
 	beforeQueuedDemandWrite          func()
 	beforeLocalDemandCancel          func()
-	afterProactiveStore              func() // test-only registration race seam
+	afterProactiveStore              func()                  // test-only registration race seam
+	beforeCurrentUpstreamWrite       func(*upstream.Process) // test-only generation race seam
 	cacheStage                       *cacheStage
 }
 
@@ -501,6 +506,24 @@ func (o *Owner) hydrateSnapshotCache(snap OwnerSnapshot) {
 		if data, err := Base64Decode(snap.CachedResourceTemplates); err == nil {
 			o.resourceTemplateList = data
 		}
+	}
+	o.applyCachedRuntimeSettings()
+}
+
+// applyCachedRuntimeSettings restores server-declared runtime policy from the
+// cached initialize response before a restored or handoff-adopted owner becomes
+// visible. Cache hydration deliberately does not invoke persistence callbacks:
+// daemon registration is not complete during construction.
+func (o *Owner) applyCachedRuntimeSettings() {
+	if len(o.initResp) == 0 {
+		return
+	}
+	o.parseDrainTimeout(o.initResp)
+	o.parseToolTimeout(o.initResp)
+	o.parseIdleTimeout(o.initResp)
+	if sec := classify.ParseProgressInterval(o.initResp); sec > 0 {
+		o.progressIntervalNs.Store(int64(time.Duration(sec) * time.Second))
+		o.logger.Printf("x-mux capability: progressInterval=%ds", sec)
 	}
 }
 
@@ -1632,9 +1655,6 @@ func (o *Owner) clearProgressTokensForRequest(requestID string) {
 
 // sendRootsListChanged notifies the upstream that roots have changed.
 func (o *Owner) sendRootsListChanged() {
-	if o.upstream == nil {
-		return // snapshot owner — upstream not yet spawned
-	}
 	notification := `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`
 	if err := o.forwardNotificationIfReady([]byte(notification)); err != nil {
 		o.logger.Printf("failed to send roots/list_changed: %v", err)
@@ -1753,6 +1773,7 @@ func (n *ownerNotifier) Broadcast(notification []byte) {
 
 // removeSession removes a session from the owner.
 func (o *Owner) removeSession(s *Session) {
+	o.launchContextMu.Lock()
 	o.mu.Lock()
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
@@ -1769,6 +1790,7 @@ func (o *Owner) removeSession(s *Session) {
 		}
 	}
 	o.mu.Unlock()
+	o.launchContextMu.Unlock()
 	o.cancelLocalDemandsForSession(s.ID)
 	if remaining == 0 {
 		o.cancelDisposableMaterializationForZeroSessions()
@@ -2472,9 +2494,6 @@ func (o *Owner) IPCPath() string {
 // states produce "dial: connection refused" for shims even though the owner
 // entry is still registered in the daemon.
 func (o *Owner) IsAccepting() bool {
-	if o.admissionFrozen.Load() {
-		return false
-	}
 	// If the accept loop has explicitly set isAccepting true, trust it.
 	if o.isAccepting.Load() {
 		return true
@@ -2488,6 +2507,12 @@ func (o *Owner) IsAccepting() bool {
 	default:
 		return true
 	}
+}
+
+// AdmissionFrozen reports the short cache-commit barrier during which fresh
+// session reservations must wait instead of treating the live listener as dead.
+func (o *Owner) AdmissionFrozen() bool {
+	return o.admissionFrozen.Load()
 }
 
 // IsReachable returns true if the IPC listener is both marked-open
@@ -2745,6 +2770,9 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte) (*upstream.Process, error)
 	if up == nil {
 		return nil, errors.New("upstream writer unavailable")
 	}
+	if o.beforeCurrentUpstreamWrite != nil {
+		o.beforeCurrentUpstreamWrite(up)
+	}
 	return up, up.WriteLine(data)
 }
 
@@ -2885,7 +2913,7 @@ func (o *Owner) Status() map[string]any {
 		"cached_resources":           hasCachedResources,
 		"materialization_state":      string(matState),
 		"materialization_trigger":    string(matTrigger),
-		"materialization_policy":     string(matPolicy),
+		"materialization_policy":     matPolicy.String(),
 		"materialization_generation": matGeneration,
 		"pending_demand_count":       pendingDemandCount,
 		"persistent_pending":         persistentPending,
@@ -3109,10 +3137,27 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 	}
 }
 
+// successfulJSONRPCResponse reports whether a parsed response carries a result
+// and no error. Discovery error frames are routed to their caller but never
+// become reusable cache or template authority.
+func successfulJSONRPCResponse(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false
+	}
+	_, hasResult := fields["result"]
+	_, hasError := fields["error"]
+	return hasResult && !hasError
+}
+
 // cacheResponseState commits cache and classification state without downstream
 // session I/O. The caller may hold upstreamEventMu to linearize a live process
 // response against process-generation replacement.
 func (o *Owner) cacheResponseState(method string, raw []byte) bool {
+	if !successfulJSONRPCResponse(raw) {
+		o.logger.Printf("not caching unsuccessful %s response", method)
+		return false
+	}
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
 

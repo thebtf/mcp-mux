@@ -848,6 +848,99 @@ func TestMaterializationFreshSharedTemplateKeepsLiveOwnerIsolated(t *testing.T) 
 	}
 }
 
+func TestMaterializingOwnerAdmissionFreezeDoesNotTriggerReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode string
+	}{
+		{name: "exact-global", mode: "global"},
+		{name: "legacy-cwd-shared-scan", mode: "cwd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDaemon(t)
+			var starts atomic.Int32
+			d.handlerFunc = func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+				starts.Add(1)
+				scanner := bufio.NewScanner(stdin)
+				for scanner.Scan() {
+					var req struct {
+						ID     json.RawMessage `json:"id"`
+						Method string          `json:"method"`
+					}
+					if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+						return err
+					}
+					switch req.Method {
+					case "initialize":
+						if err := writeDaemonResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared"}},"serverInfo":{"name":"admission-freeze","version":"1"}}`); err != nil {
+							return err
+						}
+					case "tools/list":
+						if err := writeDaemonResponse(stdout, req.ID, `{"tools":[{"name":"probe"}]}`); err != nil {
+							return err
+						}
+					}
+				}
+				return scanner.Err()
+			}
+			publishEntered := make(chan struct{})
+			releasePublish := make(chan struct{})
+			var enteredOnce sync.Once
+			var releaseOnce sync.Once
+			t.Cleanup(func() { releaseOnce.Do(func() { close(releasePublish) }) })
+			d.beforeOwnerCachePublish = func(*owner.Owner) {
+				enteredOnce.Do(func() { close(publishEntered) })
+				<-releasePublish
+			}
+
+			command := "admission-freeze-" + tc.name
+			path, sid, _, err := d.Spawn(control.Request{Command: command, Mode: tc.mode, Cwd: t.TempDir()})
+			if err != nil {
+				t.Fatalf("Spawn first: %v", err)
+			}
+			select {
+			case <-publishEntered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("owner did not enter cache-commit admission freeze")
+			}
+			entry := d.Entry(sid)
+			type spawnResult struct {
+				path  string
+				sid   string
+				token string
+				err   error
+			}
+			resultCh := make(chan spawnResult, 1)
+			go func() {
+				path, sid, token, err := d.Spawn(control.Request{Command: command, Mode: tc.mode, Cwd: t.TempDir()})
+				resultCh <- spawnResult{path: path, sid: sid, token: token, err: err}
+			}()
+			time.Sleep(50 * time.Millisecond)
+			select {
+			case result := <-resultCh:
+				t.Fatalf("second Spawn bypassed cache-commit barrier: %+v", result)
+			default:
+			}
+			releaseOnce.Do(func() { close(releasePublish) })
+
+			select {
+			case result := <-resultCh:
+				if result.err != nil {
+					t.Fatalf("Spawn second: %v", result.err)
+				}
+				if result.path != path || result.sid != sid || result.token == "" {
+					t.Fatalf("second Spawn = (%q, %q, token=%v), want existing (%q, %q)", result.path, result.sid, result.token != "", path, sid)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("second Spawn did not resume after cache commit")
+			}
+			if d.Entry(sid) != entry || d.OwnerCount() != 1 || starts.Load() != 1 {
+				t.Fatalf("admission freeze replaced owner: same=%v owners=%d starts=%d", d.Entry(sid) == entry, d.OwnerCount(), starts.Load())
+			}
+		})
+	}
+}
+
 func TestLiveSessionsJoinSingleReplacementControllerDuringUnexpectedExit(t *testing.T) {
 	d := testDaemon(t)
 	var starts atomic.Int32
@@ -903,7 +996,13 @@ func TestLiveSessionsJoinSingleReplacementControllerDuringUnexpectedExit(t *test
 		t.Fatalf("second sid=%s, want shared sid %s", sid2, sid)
 	}
 	entry := d.Entry(sid)
-	waitForDaemonCondition(t, 2*time.Second, func() bool { return entry.Owner.MaterializationState() == owner.MaterializationReady }, "initial generation did not become ready")
+	readyDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(readyDeadline) && entry.Owner.MaterializationState() != owner.MaterializationReady {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entry.Owner.MaterializationState() != owner.MaterializationReady {
+		t.Fatalf("initial generation did not become ready: starts=%d status=%#v", starts.Load(), entry.Owner.Status())
+	}
 	conn1, scan1 := connectSpawnedOwner(t, path, token1)
 	defer conn1.Close()
 	conn2, scan2 := connectSpawnedOwner(t, path, token2)
@@ -947,9 +1046,22 @@ func TestLiveSessionsJoinSingleReplacementControllerDuringUnexpectedExit(t *test
 func TestPersistentZeroSessionCrashRacingReaperUsesOneReplacementController(t *testing.T) {
 	d := testDaemon(t)
 	var starts atomic.Int32
+	gen1Init := make(chan struct{})
+	releaseGen1Init := make(chan struct{})
 	crashFirst := make(chan struct{})
 	gen2Init := make(chan struct{})
 	releaseGen2 := make(chan struct{})
+	closeSignal := func(ch chan struct{}) {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	}
+	defer closeSignal(releaseGen1Init)
+	defer closeSignal(crashFirst)
+	defer closeSignal(releaseGen2)
+	var gen1Once sync.Once
 	var gen2Once sync.Once
 	d.handlerFunc = func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
 		generation := starts.Add(1)
@@ -964,7 +1076,10 @@ func TestPersistentZeroSessionCrashRacingReaperUsesOneReplacementController(t *t
 			}
 			switch req.Method {
 			case "initialize":
-				if generation == 2 {
+				if generation == 1 {
+					gen1Once.Do(func() { close(gen1Init) })
+					<-releaseGen1Init
+				} else if generation == 2 {
 					gen2Once.Do(func() { close(gen2Init) })
 					<-releaseGen2
 				}
@@ -990,13 +1105,20 @@ func TestPersistentZeroSessionCrashRacingReaperUsesOneReplacementController(t *t
 		t.Fatalf("Spawn: %v", err)
 	}
 	entry := d.Entry(sid)
+	select {
+	case <-gen1Init:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial persistent generation did not reach initialize")
+	}
 	conn, _ := connectSpawnedOwner(t, path, token)
+	waitForDaemonCondition(t, time.Second, func() bool { return entry.Owner.SessionCount() == 1 }, "persistent owner did not admit session before readiness")
+	closeSignal(releaseGen1Init)
 	waitForDaemonCondition(t, 2*time.Second, func() bool {
 		return entry.Owner.MaterializationState() == owner.MaterializationReady && entry.Owner.SessionCount() == 1
 	}, "persistent owner did not become ready")
 	_ = conn.Close()
 	waitForDaemonCondition(t, time.Second, func() bool { return entry.Owner.SessionCount() == 0 }, "persistent owner retained a session")
-	close(crashFirst)
+	closeSignal(crashFirst)
 	select {
 	case <-gen2Init:
 	case <-time.After(3 * time.Second):
@@ -1012,7 +1134,7 @@ func TestPersistentZeroSessionCrashRacingReaperUsesOneReplacementController(t *t
 	if starts.Load() != 2 {
 		t.Fatalf("competing persistent replacement generations=%d, want 2 total", starts.Load())
 	}
-	close(releaseGen2)
+	closeSignal(releaseGen2)
 	waitForDaemonCondition(t, 2*time.Second, func() bool { return entry.Owner.MaterializationState() == owner.MaterializationReady }, "persistent replacement did not become ready")
 	if d.Entry(sid) != entry || starts.Load() != 2 {
 		t.Fatalf("persistent recovery final same=%v starts=%d", d.Entry(sid) == entry, starts.Load())
@@ -1038,7 +1160,11 @@ func TestPendingPersistenceConcurrentReaperRetriesWithoutDemandAndDeniesSuspend(
 			}
 			switch req.Method {
 			case "initialize":
-				if err := writeDaemonResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared","persistent":true}},"serverInfo":{"name":"pending-persistent","version":"1"}}`); err != nil {
+				result := `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared"}},"serverInfo":{"name":"pending-persistent","version":"1"}}`
+				if generation == 1 {
+					result = `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared","persistent":true}},"serverInfo":{"name":"pending-persistent","version":"1"}}`
+				}
+				if err := writeDaemonResponse(stdout, req.ID, result); err != nil {
 					return err
 				}
 			case "tools/list":
@@ -1097,9 +1223,12 @@ func TestPendingPersistenceConcurrentReaperRetriesWithoutDemandAndDeniesSuspend(
 	if d.Entry(sid) != entry || starts.Load() != 2 {
 		t.Fatalf("pending persistence recovery same=%v starts=%d", d.Entry(sid) == entry, starts.Load())
 	}
+	if !entry.Persistent {
+		t.Fatal("successful retry downgraded the latched daemon persistence obligation")
+	}
 }
 
-func TestConcurrentCacheTemplateCommitAndSnapshotIsCoherentAndBounded(t *testing.T) {
+func TestRestartRacingSharedToIsolatedCommitCapturesMatchingGeneration(t *testing.T) {
 	_ = os.Remove(SnapshotPath())
 	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
 	d := testDaemon(t)
@@ -1122,7 +1251,7 @@ func TestConcurrentCacheTemplateCommitAndSnapshotIsCoherentAndBounded(t *testing
 			}
 			switch req.Method {
 			case "initialize":
-				if err := writeDaemonResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"shared"}},"serverInfo":{"name":"new-coherent","version":"2"}}`); err != nil {
+				if err := writeDaemonResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"isolated"}},"serverInfo":{"name":"new-coherent","version":"2"}}`); err != nil {
 					return err
 				}
 			case "tools/list":
@@ -1183,8 +1312,8 @@ func TestConcurrentCacheTemplateCommitAndSnapshotIsCoherentAndBounded(t *testing
 	if err != nil || !strings.Contains(string(tools), "new-coherent-tool") {
 		t.Fatalf("captured tools=%s err=%v, want wholly new cache", tools, err)
 	}
-	if captured.Classification != "shared" || captured.OwnerGeneration != entry.OwnerGeneration {
-		t.Fatalf("captured metadata classification=%q owner_generation=%q, want shared/%q", captured.Classification, captured.OwnerGeneration, entry.OwnerGeneration)
+	if captured.Classification != "isolated" || captured.OwnerGeneration != entry.OwnerGeneration {
+		t.Fatalf("captured metadata classification=%q owner_generation=%q, want isolated/%q", captured.Classification, captured.OwnerGeneration, entry.OwnerGeneration)
 	}
 	template, ok := d.getTemplate(command, nil)
 	if !ok || template.CachedInit != captured.CachedInit || template.CachedTools != captured.CachedTools || template.Classification != captured.Classification {

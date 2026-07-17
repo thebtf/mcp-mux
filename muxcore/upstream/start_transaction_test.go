@@ -45,7 +45,12 @@ func TestStartPostAuthorityFailureFinalizesProcessTree(t *testing.T) {
 		for time.Now().Before(deadline) {
 			data, err := os.ReadFile(pidFile)
 			if err == nil {
-				pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+				text := strings.TrimSpace(string(data))
+				if text == "" {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				pid, parseErr := strconv.Atoi(text)
 				if parseErr != nil {
 					return fmt.Errorf("parse descendant pid: %w", parseErr)
 				}

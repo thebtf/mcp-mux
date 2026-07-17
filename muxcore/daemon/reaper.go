@@ -244,15 +244,15 @@ func shouldEvict(s evictionSample, now time.Time, daemonDefault, isolatedIdleTim
 	if s.MaterializationBlocked {
 		return evictionDecision{}
 	}
+	if s.Persistent {
+		return evictionDecision{}
+	}
 	// Zombie: upstream dead + zero sessions = evict immediately once reconnect
 	// reservations have either rolled back or expired.
 	if s.UpstreamDead && s.Sessions == 0 && !s.CacheReady {
 		return evictionDecision{evict: true, reason: "zombie"}
 	}
 	if s.Sessions != 0 {
-		return evictionDecision{}
-	}
-	if s.Persistent {
 		return evictionDecision{}
 	}
 	if s.PendingRequests > 0 {

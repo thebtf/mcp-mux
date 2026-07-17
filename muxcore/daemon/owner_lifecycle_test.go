@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -307,6 +308,163 @@ func TestOwnerRemovalKeepsEntryWhenFinalizationUnproven(t *testing.T) {
 	d.mu.RUnlock()
 	if removalInProgress {
 		t.Fatal("blocked removal did not release retryable registry state")
+	}
+}
+
+func TestRestartFallbackWaitsForBlockedOwnerRetirementProof(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	d.sessionHandler = noopSessionHandler{}
+
+	blockerSID := "restart-blocker-owner"
+	blockerOwner := testReconnectOwner(t, blockerSID)
+	blocker := &OwnerEntry{
+		Owner:           blockerOwner,
+		ServerID:        blockerSID,
+		OwnerGeneration: "owner_gen_restart_blocker",
+	}
+	d.mu.Lock()
+	d.owners[blockerSID] = blocker
+	d.mu.Unlock()
+
+	fallbackSnapshot := daemonMaterializationSnapshot(false)
+	fallbackSnapshot.ServerID = blockerSID
+	fallbackSnapshot.Cwd = t.TempDir()
+	fallbackSnapshot.Mode = "global"
+	plan := d.makeSnapshotRestorePlan(fallbackSnapshot)
+	plan.blockedBy = blocker
+	d.mu.Lock()
+	d.restartStaging = []snapshotRestorePlan{plan}
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	proofStarted := make(chan struct{})
+	releaseProof := make(chan struct{})
+	var startedOnce sync.Once
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != blockerOwner || soft {
+			return original(got, soft)
+		}
+		startedOnce.Do(func() { close(proofStarted) })
+		<-releaseProof
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	removalDone := make(chan error, 1)
+	go func() {
+		_, removeErr := d.removeOwnerIfCurrent(blockerSID, blocker, ownerRemovalReasonIdle, false)
+		removalDone <- removeErr
+	}()
+	select {
+	case <-proofStarted:
+	case <-time.After(time.Second):
+		t.Fatal("blocked owner finalization did not start")
+	}
+
+	type activationResult struct {
+		activated int
+		err       error
+	}
+	activationDone := make(chan activationResult, 1)
+	go func() {
+		activated, activateErr := d.activateRestartStaging()
+		activationDone <- activationResult{activated: activated, err: activateErr}
+	}()
+	select {
+	case result := <-activationDone:
+		t.Fatalf("fallback activated before retirement proof: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if entry := d.Entry(fallbackSnapshot.ServerID); entry != blocker {
+		t.Fatalf("blocker registry identity changed before retirement proof: %#v", entry)
+	}
+
+	close(releaseProof)
+	select {
+	case removeErr := <-removalDone:
+		if removeErr != nil {
+			t.Fatalf("removeOwnerIfCurrent() error: %v", removeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked owner removal did not finish after retirement proof")
+	}
+	select {
+	case result := <-activationDone:
+		if result.err != nil || result.activated != 1 {
+			t.Fatalf("activateRestartStaging() = %+v, want one activated fallback", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback activation did not resume after retirement proof")
+	}
+	if entry := d.Entry(fallbackSnapshot.ServerID); entry == nil || entry == blocker || entry.Owner == nil {
+		t.Fatalf("fallback owner was not restored after retirement proof: %#v", entry)
+	}
+}
+
+func TestDaemonShutdownWaitsForOwnerRetirementBeforeSuccessorActivation(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "shutdown-retirement-barrier"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_shutdown_barrier"}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	var allowProof atomic.Bool
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=false", got, soft, o)
+		}
+		calls.Add(1)
+		if !allowProof.Load() {
+			return 0, false, errors.New("synthetic retirement proof pending")
+		}
+		return 0, true, nil
+	}
+	t.Cleanup(func() {
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+
+	activated := make(chan struct{})
+	go d.shutdown(func() { close(activated) })
+	waitForDaemonCondition(t, time.Second, func() bool {
+		return calls.Load() >= ownerFinalizationAttempts
+	}, "shutdown did not attempt owner finalization")
+	select {
+	case <-activated:
+		t.Fatal("successor activation ran before owner retirement proof")
+	default:
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("daemon completed before owner retirement proof")
+	default:
+	}
+	if d.Entry(sid) != entry {
+		t.Fatal("owner registry entry was forgotten before retirement proof")
+	}
+	if err := d.HandleRemove(sid); !errors.Is(err, ErrDaemonShuttingDown) {
+		t.Fatalf("HandleRemove during shutdown error=%v, want ErrDaemonShuttingDown", err)
+	}
+
+	allowProof.Store(true)
+	select {
+	case <-activated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("successor activation did not run after retirement proof")
+	}
+	select {
+	case <-d.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon did not complete after retirement proof")
+	}
+	if d.Entry(sid) != nil {
+		t.Fatal("owner registry entry survived proven shutdown finalization")
 	}
 }
 

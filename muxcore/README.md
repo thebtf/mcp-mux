@@ -41,6 +41,40 @@ owner. v0.27.2 makes a first uncached request join an already-pending
 snapshot/template background start through its MCP initialization handshake
 instead of creating a competing upstream generation for the same owner.
 
+### Unreleased - demand-driven upstream materialization
+
+**No consumer API change is required for ordinary `engine.New` users.** After
+one generation has published a compatible discovery template, muxcore can
+construct a cache-only owner that serves cached `initialize` and `tools/list`
+without spawning an upstream process. The first uncached request retains its
+original JSON-RPC ID and session, starts one generation, waits for the MCP
+initialization handshake, and is forwarded once on the same transport.
+
+Template authorization is intentionally stricter than live shared-owner
+compatibility: it compares a full SHA-256 identity of the effective
+security-relevant environment, and isolated templates also require the exact
+canonical CWD. Raw identity values remain only in the existing launch context.
+Missing, incompatible, or repeatedly racing templates take one bounded
+cold/eager path and never receive partial cached replay.
+
+Lifecycle integration is fail-closed. A failed installed process remains the
+authoritative generation through retirement until `Process.Done` and process
+group / Windows Job authority finalization are both proven. Reaper, operator
+removal, snapshot fallback, restart pins, and protocol-v2 handoff cannot admit a
+replacement while that proof is missing; status reports `FINALIZE_BLOCKED` and
+the exact generation is retried.
+
+Graceful restart keeps version/token negotiation strictly pre-detach: mismatch,
+accept timeout, or successor-start failure leaves the predecessor serving and
+does not spawn fallback. A later protocol failure must stop the failed handoff
+successor, abort the prepared generation, rewrite the pinned snapshot, and
+pre-start exactly one clean snapshot successor before predecessor shutdown.
+
+Staged snapshot activation is transactional. If any fallback owner cannot be
+constructed, muxcore rolls back partial registrations, rewrites the filtered
+recovery snapshot with the exact pinned launch environment, and fails startup
+before the successor control endpoint begins serving.
+
 ### v0.27.2 - template background-spawn ownership gate
 
 **No required consumer code changes for ordinary `engine.New` users.** When a
@@ -62,8 +96,8 @@ This preserves one authoritative upstream process tree per owner and prevents
 duplicate source-checkout launches, locked entrypoint replacement failures, and
 respawn storms from this race. Consumers must not add product-local spawn locks,
 file-replacement retries, PID sweeps, stale-process kill loops, or parallel
-lifecycle mechanisms. Demand-driven template materialization is a separate
-future architecture change; v0.27.2 is the conservative ownership repair.
+lifecycle mechanisms. Demand-driven template materialization is not part of
+v0.27.2; its unreleased consumer contract is documented above.
 
 ### v0.27.1 - idle-gate rolling-compatibility hotfix
 

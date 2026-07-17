@@ -249,6 +249,16 @@ func TestShouldEvict_IsolatedDisabledByZero(t *testing.T) {
 	}
 }
 
+func TestShouldEvict_PersistentDeadCachelessOwnerIsNotZombie(t *testing.T) {
+	s := baseSample()
+	s.Persistent = true
+	s.UpstreamDead = true
+	s.CacheReady = false
+	if decision := shouldEvict(s, time.Now(), 10*time.Minute, 60*time.Second); decision.evict {
+		t.Fatalf("persistent recovering owner was evicted as zombie: %+v", decision)
+	}
+}
+
 func TestShouldEvict_MaterializationBlocksZombieAndIdleRemoval(t *testing.T) {
 	s := baseSample()
 	s.UpstreamDead = true

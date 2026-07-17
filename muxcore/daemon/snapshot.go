@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -92,19 +93,45 @@ type snapshotOwnerPin struct {
 }
 
 type snapshotRestartLease struct {
-	once sync.Once
-	pins []*owner.RestartPin
+	daemon       *Daemon
+	snapshot     *DaemonSnapshot
+	registryOnce sync.Once
+	ownerOnce    sync.Once
+	registryPins []snapshotOwnerPin
+	ownerPins    []*owner.RestartPin
+}
+
+func (l *snapshotRestartLease) ReleaseRegistryPins() {
+	if l == nil || l.daemon == nil {
+		return
+	}
+	l.registryOnce.Do(func() { l.daemon.releaseSnapshotOwnerPins(l.registryPins) })
+}
+
+func (l *snapshotRestartLease) ReleaseOwnerPins() {
+	if l == nil {
+		return
+	}
+	l.ownerOnce.Do(func() {
+		for _, pin := range l.ownerPins {
+			pin.Release()
+		}
+	})
 }
 
 func (l *snapshotRestartLease) Release() {
 	if l == nil {
 		return
 	}
-	l.once.Do(func() {
-		for _, pin := range l.pins {
-			pin.Release()
-		}
-	})
+	l.ReleaseRegistryPins()
+	l.ReleaseOwnerPins()
+}
+
+func (l *snapshotRestartLease) RewriteSnapshot() (string, error) {
+	if l == nil || l.daemon == nil || l.snapshot == nil {
+		return "", errors.New("restart snapshot lease has no retained payload")
+	}
+	return mcpsnapshot.Serialize(l.snapshot, l.daemon.logger)
 }
 
 // SerializeSnapshot walks all owners, exports their state, and delegates
@@ -118,25 +145,22 @@ func (d *Daemon) SerializeSnapshot() (string, error) {
 }
 
 func (d *Daemon) serializeSnapshotPinned() (string, *snapshotRestartLease, error) {
-	pins, err := d.acquireSnapshotOwnerPins()
+	registryPins, err := d.acquireSnapshotOwnerPins()
 	if err != nil {
 		return "", nil, err
 	}
-	defer d.releaseSnapshotOwnerPins(pins)
+	lease := &snapshotRestartLease{daemon: d, registryPins: registryPins}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			lease.Release()
+		}
+	}()
 
 	barrierCtx, cancelBarrier := context.WithTimeout(context.Background(), restartMaterializationBarrierTimeout)
 	defer cancelBarrier()
-	ownerPins := make([]*owner.RestartPin, 0, len(pins))
-	keepOwnerPins := false
-	defer func() {
-		if keepOwnerPins {
-			return
-		}
-		for _, pin := range ownerPins {
-			pin.Release()
-		}
-	}()
-	for _, pin := range pins {
+	lease.ownerPins = make([]*owner.RestartPin, 0, len(registryPins))
+	for _, pin := range registryPins {
 		if d.beforeSnapshotOwnerExport != nil {
 			d.beforeSnapshotOwnerExport()
 		}
@@ -144,13 +168,13 @@ func (d *Daemon) serializeSnapshotPinned() (string, *snapshotRestartLease, error
 		if err != nil {
 			return "", nil, fmt.Errorf("serialize owner %s materialization: %w", pin.serverID, err)
 		}
-		ownerPins = append(ownerPins, ownerPin)
+		lease.ownerPins = append(lease.ownerPins, ownerPin)
 	}
 
-	owners := make([]mcpsnapshot.OwnerSnapshot, 0, len(pins))
+	owners := make([]mcpsnapshot.OwnerSnapshot, 0, len(registryPins))
 	sessions := make([]mcpsnapshot.SessionSnapshot, 0)
-	for i, pin := range pins {
-		snap, ownerSessions := ownerPins[i].Snapshot, ownerPins[i].Sessions
+	for i, pin := range registryPins {
+		snap, ownerSessions := lease.ownerPins[i].Snapshot, lease.ownerPins[i].Sessions
 		snap.ServerID = pin.serverID
 		snap.Mode = pin.mode
 		if snap.Env == nil {
@@ -177,13 +201,14 @@ func (d *Daemon) serializeSnapshotPinned() (string, *snapshotRestartLease, error
 		Owners:           owners,
 		Sessions:         sessions,
 	}
+	lease.snapshot = data
 
 	path, err := mcpsnapshot.Serialize(data, d.logger)
 	if err != nil {
 		return "", nil, err
 	}
-	keepOwnerPins = true
-	return path, &snapshotRestartLease{pins: ownerPins}, nil
+	releaseOnError = false
+	return path, lease, nil
 }
 
 func (d *Daemon) acquireSnapshotOwnerPins() ([]snapshotOwnerPin, error) {
@@ -245,6 +270,73 @@ func cloneSnapshotStringMap(src map[string]string) map[string]string {
 	return dst
 }
 
+func cloneOwnerSnapshotForRecovery(src mcpsnapshot.OwnerSnapshot) mcpsnapshot.OwnerSnapshot {
+	dst := src
+	dst.Args = append([]string(nil), src.Args...)
+	dst.Env = cloneSnapshotStringMap(src.Env)
+	dst.CwdSet = append([]string(nil), src.CwdSet...)
+	dst.ClassificationReason = append([]string(nil), src.ClassificationReason...)
+	dst.BoundTokens = append([]mcpsnapshot.BoundTokenSnapshot(nil), src.BoundTokens...)
+	for i := range dst.BoundTokens {
+		dst.BoundTokens[i].Env = cloneSnapshotStringMap(src.BoundTokens[i].Env)
+	}
+	return dst
+}
+
+func cloneSessionSnapshotForRecovery(src mcpsnapshot.SessionSnapshot) mcpsnapshot.SessionSnapshot {
+	dst := src
+	dst.Env = cloneSnapshotStringMap(src.Env)
+	return dst
+}
+
+func buildRestartRecoverySnapshot(base *DaemonSnapshot, plans []snapshotRestorePlan) *DaemonSnapshot {
+	if base == nil || len(plans) == 0 {
+		return nil
+	}
+	recovery := *base
+	recovery.Owners = make([]mcpsnapshot.OwnerSnapshot, 0, len(plans))
+	selected := make(map[string]struct{}, len(plans))
+	for _, plan := range plans {
+		sid := plan.snapshot.ServerID
+		if _, duplicate := selected[sid]; duplicate {
+			continue
+		}
+		selected[sid] = struct{}{}
+		recovery.Owners = append(recovery.Owners, cloneOwnerSnapshotForRecovery(plan.snapshot))
+	}
+	recovery.Sessions = make([]mcpsnapshot.SessionSnapshot, 0, len(base.Sessions))
+	for _, session := range base.Sessions {
+		if _, keep := selected[session.OwnerServerID]; keep {
+			recovery.Sessions = append(recovery.Sessions, cloneSessionSnapshotForRecovery(session))
+		}
+	}
+	return &recovery
+}
+
+func (d *Daemon) rewriteRestartRecoverySnapshot() (string, error) {
+	d.mu.RLock()
+	retained := d.restartRecoverySnapshot
+	if retained == nil {
+		d.mu.RUnlock()
+		return "", errors.New("restart recovery snapshot is unavailable")
+	}
+	recovery := *retained
+	recovery.Owners = make([]mcpsnapshot.OwnerSnapshot, len(retained.Owners))
+	for i, ownerSnap := range retained.Owners {
+		recovery.Owners[i] = cloneOwnerSnapshotForRecovery(ownerSnap)
+	}
+	recovery.Sessions = make([]mcpsnapshot.SessionSnapshot, len(retained.Sessions))
+	for i, session := range retained.Sessions {
+		recovery.Sessions[i] = cloneSessionSnapshotForRecovery(session)
+	}
+	d.mu.RUnlock()
+
+	recovery.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	recovery.DaemonGeneration = d.daemonGeneration
+	recovery.PredecessorPID = os.Getpid()
+	return mcpsnapshot.Serialize(&recovery, d.logger)
+}
+
 // DeserializeSnapshot reads and validates a snapshot from the well-known path.
 // Returns nil, nil if no snapshot exists (cold start). Deletes the file after
 // successful load or if stale. Logs warnings for corrupt/stale snapshots.
@@ -299,13 +391,14 @@ func (d *Daemon) tryHandoffReceive(ctx context.Context) *handoffReceipt {
 }
 
 type snapshotRestorePlan struct {
-	snapshot mcpsnapshot.OwnerSnapshot
-	cfg      owner.OwnerConfig
-	env      map[string]string
+	snapshot  mcpsnapshot.OwnerSnapshot
+	cfg       owner.OwnerConfig
+	env       map[string]string
+	blockedBy *OwnerEntry
 }
 
 func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) snapshotRestorePlan {
-	restoredEnv := mergeEnv(ownerSnap.Env)
+	restoredEnv := cloneSnapshotStringMap(ownerSnap.Env)
 	command := ownerSnap.Command
 	args := append([]string(nil), ownerSnap.Args...)
 	cfg := owner.OwnerConfig{
@@ -342,6 +435,16 @@ func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) sn
 
 func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffUpstream, restoreSource string, eager, publishTemplate bool) (*OwnerEntry, bool, error) {
 	snap := plan.snapshot
+	if isRestartRestoreMode() {
+		// Snapshot capture cannot exclude a late list_changed or discovery
+		// response from the predecessor. Preserve initialize for protocol and
+		// runtime policy, but force every secondary discovery list through the
+		// adopted live generation before replay or template publication.
+		snap.CachedTools = ""
+		snap.CachedPrompts = ""
+		snap.CachedResources = ""
+		snap.CachedResourceTemplates = ""
+	}
 	if isRestartRestoreMode() {
 		d.retireOldOwnerSockets(plan.cfg.IPCPath, plan.cfg.ControlPath)
 	}
@@ -429,26 +532,92 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 	return entry, reattached, nil
 }
 
-func (d *Daemon) activateRestartStaging() int {
-	d.mu.Lock()
+func (d *Daemon) activateRestartStaging() (int, error) {
+	d.mu.RLock()
 	plans := append([]snapshotRestorePlan(nil), d.restartStaging...)
-	d.restartStaging = nil
-	d.mu.Unlock()
+	d.mu.RUnlock()
+	if err := d.waitForRestartStagingBlockers(plans); err != nil {
+		return 0, err
+	}
 
-	restored := 0
+	type activatedOwner struct {
+		plan  snapshotRestorePlan
+		entry *OwnerEntry
+	}
+	activated := make([]activatedOwner, 0, len(plans))
 	for _, plan := range plans {
-		if _, _, err := d.restoreSnapshotPlan(plan, nil, "snapshot_fallback", true, true); err != nil {
-			d.logger.Printf("snapshot: staged restore failed for %s (%s): %v", shortServerID(plan.snapshot.ServerID), plan.snapshot.Command, err)
+		entry, _, err := d.restoreSnapshotPlan(plan, nil, "snapshot_fallback", false, true)
+		if err == nil {
+			activated = append(activated, activatedOwner{plan: plan, entry: entry})
 			continue
 		}
-		restored++
+
+		activationErr := fmt.Errorf("snapshot: staged restore failed for %s (%s): %w", shortServerID(plan.snapshot.ServerID), plan.snapshot.Command, err)
+		rollbackErrs := make([]error, 0, len(activated))
+		for i := len(activated) - 1; i >= 0; i-- {
+			item := activated[i]
+			result, removeErr := d.removeOwnerIfCurrent(item.plan.snapshot.ServerID, item.entry, ownerRemovalReasonRestoreFailed, false)
+			if removeErr != nil {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback staged owner %s: %w", shortServerID(item.plan.snapshot.ServerID), removeErr))
+			} else if !result.Removed {
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("rollback staged owner %s: owner remained registered", shortServerID(item.plan.snapshot.ServerID)))
+			}
+		}
+		if len(rollbackErrs) > 0 {
+			return 0, errors.Join(append([]error{activationErr}, rollbackErrs...)...)
+		}
+		return 0, activationErr
 	}
+
+	d.mu.Lock()
+	d.restartStaging = nil
+	d.restartRecoverySnapshot = nil
+	d.mu.Unlock()
+	// Construct and register the complete staged set before any fallback process
+	// starts. A later registration failure can then roll back inert owners without
+	// creating a transient extra process generation.
+	for _, item := range activated {
+		item.entry.Owner.SpawnUpstreamBackground()
+	}
+	restored := len(activated)
 	if restored > 0 {
 		d.restoredOwnerCount.Add(uint64(restored))
 		d.runRestoreHealthGate()
 	}
 	d.logger.Printf("snapshot: activated %d/%d staged owners after predecessor finalization", restored, len(plans))
-	return restored
+	return restored, nil
+}
+
+func (d *Daemon) waitForRestartStagingBlockers(plans []snapshotRestorePlan) error {
+	deadline := time.NewTimer(restartMaterializationBarrierTimeout)
+	defer deadline.Stop()
+	for _, plan := range plans {
+		if plan.blockedBy == nil {
+			continue
+		}
+		for {
+			d.mu.RLock()
+			current := d.owners[plan.snapshot.ServerID]
+			d.mu.RUnlock()
+			if current == nil {
+				break
+			}
+			if current != plan.blockedBy {
+				return fmt.Errorf("restart fallback owner %s was replaced before rollback finalization", shortServerID(plan.snapshot.ServerID))
+			}
+			timer := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-deadline.C:
+				timer.Stop()
+				return fmt.Errorf("restart fallback owner %s finalization remained unproven after %s", shortServerID(plan.snapshot.ServerID), restartMaterializationBarrierTimeout)
+			case <-d.done:
+				timer.Stop()
+				return errors.New("daemon stopped while waiting for restart rollback finalization")
+			}
+		}
+	}
+	return nil
 }
 
 // loadSnapshot checks for a snapshot file and restores owners from it.
@@ -528,6 +697,7 @@ func (d *Daemon) loadSnapshot() int {
 				}
 				if !result.Removed {
 					item.entry.Owner.Shutdown()
+					item.plan.blockedBy = item.entry
 				}
 				fallback = append(fallback, item.plan)
 			}
@@ -537,19 +707,23 @@ func (d *Daemon) loadSnapshot() int {
 			staged = fallback
 			restored = 0
 		} else {
-			for _, item := range adopted {
-				snapshot := item.plan.snapshot
-				if snapshot.CachedInit != "" && snapshot.CachedTools != "" {
-					d.updateTemplate(snapshot.Command, snapshot.Args, snapshot)
-				}
-			}
+			// Adopted owners intentionally begin with secondary discovery caches
+			// invalidated. Their first live tools/list response republishes a fresh
+			// template through publishOwnerCache.
 			d.logger.Printf("handoff.receive.ok upstreams=%d staged=%d", len(handoffAccepted), len(staged))
 		}
 	}
 
 	if restartMode {
+		recoveryPlans := append([]snapshotRestorePlan(nil), staged...)
+		if restored > 0 {
+			for _, item := range adopted {
+				recoveryPlans = append(recoveryPlans, item.plan)
+			}
+		}
 		d.mu.Lock()
 		d.restartStaging = append([]snapshotRestorePlan(nil), staged...)
+		d.restartRecoverySnapshot = buildRestartRecoverySnapshot(snap, recoveryPlans)
 		d.mu.Unlock()
 		if restored > 0 {
 			d.restoredOwnerCount.Add(uint64(restored))
@@ -582,8 +756,9 @@ func (d *Daemon) loadSnapshotMetadataOnly(reason string) int {
 	d.predecessorDaemonGeneration = snap.DaemonGeneration
 	d.mu.Unlock()
 
+	restoreCaches := !isRestartRestoreMode()
 	for _, ownerSnap := range snap.Owners {
-		if ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
+		if restoreCaches && ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
 			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
 		}
 		d.rehydrateRetryCounter(ownerSnap.ServerID, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)

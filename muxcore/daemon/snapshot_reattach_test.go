@@ -129,8 +129,47 @@ func TestLoadSnapshotMetadataOnlyConsumesWithoutRestoringOwners(t *testing.T) {
 	if d.predecessorDaemonGeneration != "daemon_previous" {
 		t.Fatalf("predecessorDaemonGeneration = %q, want daemon_previous", d.predecessorDaemonGeneration)
 	}
+	if _, ok := d.getTemplate("", nil); !ok {
+		t.Fatal("ordinary metadata-only load did not retain coherent template cache")
+	}
 	if !strings.Contains(logBuf.String(), "snapshot: deferred restore of 1 owners (test)") {
 		t.Fatalf("missing deferred restore log:\n%s", logBuf.String())
+	}
+}
+
+func TestRestartMetadataOnlyLoadSuppressesStaleTemplateCache(t *testing.T) {
+	os.Remove(SnapshotPath())
+	t.Cleanup(func() { os.Remove(SnapshotPath()) })
+	t.Setenv(snapshotRestartEnv, "1")
+
+	const command = "restart-metadata-cache"
+	snapshot := DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Owners: []mcpsnapshot.OwnerSnapshot{{
+			ServerID:       "restart-metadata-cache-owner",
+			Command:        command,
+			Cwd:            t.TempDir(),
+			Mode:           "global",
+			Classification: classify.ModeShared,
+			CachedInit:     "e30=",
+			CachedTools:    "e30=",
+		}},
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(SnapshotPath(), data, 0o644); err != nil {
+		t.Fatalf("WriteFile snapshot: %v", err)
+	}
+
+	d, _ := testDaemonWithLog(t)
+	if deferred := d.loadSnapshotMetadataOnly("restart-test"); deferred != 1 {
+		t.Fatalf("loadSnapshotMetadataOnly() = %d, want 1", deferred)
+	}
+	if _, ok := d.getTemplate(command, nil); ok {
+		t.Fatal("restart metadata-only load published stale template cache")
 	}
 }
 
@@ -368,6 +407,7 @@ func uniquePIDsFromFile(path string) []int {
 	}
 	return pids
 }
+
 func TestMixedReadyCacheOnlyRestartHandoffKeepsOneAuthorityPerOwner(t *testing.T) {
 	const roleEnv = "MCPMUX_TEST_MIXED_RESTART_HANDOFF_ROLE"
 	const pidPathEnv = "MCPMUX_TEST_MIXED_RESTART_HANDOFF_PIDS"
@@ -626,7 +666,11 @@ func TestLoadSnapshot_Reattach_HappyPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		wantActivated = 1
 	}
-	if activated := d.activateRestartStaging(); activated != wantActivated {
+	activated, err := d.activateRestartStaging()
+	if err != nil {
+		t.Fatalf("activateRestartStaging() error: %v; logs:\n%s", err, logBuf.String())
+	}
+	if activated != wantActivated {
 		t.Fatalf("activateRestartStaging()=%d, want %d; logs:\n%s", activated, wantActivated, logBuf.String())
 	}
 
@@ -716,7 +760,9 @@ func TestLoadSnapshot_Reattach_SocketUnreachable(t *testing.T) {
 	if restored != 1 {
 		t.Fatalf("loadSnapshot() restored %d owners (want 1); FR-8 fallback failed", restored)
 	}
-	d.activateRestartStaging()
+	if _, err := d.activateRestartStaging(); err != nil {
+		t.Fatalf("activateRestartStaging() error: %v", err)
+	}
 
 	// Structural log assertions replace the d.owners poll (which races with
 	// OnUpstreamExit on fast schedulers — see F80-4 and the happy-path fix
@@ -827,7 +873,11 @@ func TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn(t *testing.T) {
 	if entry := d.Entry(sid); entry != nil {
 		t.Fatalf("snapshot stage bound owner IPC before predecessor barrier: %#v", entry)
 	}
-	if activated := d.activateRestartStaging(); activated != 1 {
+	activated, err := d.activateRestartStaging()
+	if err != nil {
+		t.Fatalf("activateRestartStaging() error: %v", err)
+	}
+	if activated != 1 {
 		t.Fatalf("activateRestartStaging()=%d, want 1", activated)
 	}
 	waitForDaemonCondition(t, 2*time.Second, func() bool {
@@ -835,8 +885,11 @@ func TestLoadSnapshot_Reattach_LegacyV1FallsBackToFreshSpawn(t *testing.T) {
 		return err == nil
 	}, "snapshot fallback did not start one eager restore generation")
 	entry := d.Entry(sid)
-	if entry == nil || entry.Owner == nil || !entry.Owner.CacheReady() {
-		t.Fatalf("eager fallback owner missing cached discovery; logs:\n%s", logBuf.String())
+	if entry == nil || entry.Owner == nil {
+		t.Fatalf("eager fallback owner missing after activation; logs:\n%s", logBuf.String())
+	}
+	if entry.Owner.CacheReady() {
+		t.Fatalf("eager fallback owner exposed stale cached discovery; logs:\n%s", logBuf.String())
 	}
 	if state := entry.Owner.MaterializationState(); state == owner.MaterializationCacheOnly {
 		t.Fatalf("fallback state=%s after predecessor barrier, want eager materialization", state)
@@ -1091,7 +1144,9 @@ func TestLoadSnapshot_Reattach_PartialHandoff(t *testing.T) {
 	if restored != 2 {
 		t.Fatalf("loadSnapshot() restored %d owners, want 2", restored)
 	}
-	d.activateRestartStaging()
+	if _, err := d.activateRestartStaging(); err != nil {
+		t.Fatalf("activateRestartStaging() error: %v", err)
+	}
 
 	// After the modeled predecessor barrier, structural logs show which
 	// entries retained transferred authority and which started one fresh

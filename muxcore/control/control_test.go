@@ -864,6 +864,43 @@ func TestCloseIdempotent(t *testing.T) {
 	srv.Close() // second close must be a no-op, not a panic
 }
 
+func TestPausedServerDoesNotDispatchUntilStart(t *testing.T) {
+	path := testSocketPath(t)
+	srv, err := NewPausedServer(path, &mockHandler{}, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewPausedServer: %v", err)
+	}
+	defer srv.Close()
+
+	result := make(chan error, 1)
+	go func() {
+		resp, sendErr := SendWithTimeout(path, Request{Cmd: "status"}, 2*time.Second)
+		if sendErr == nil && !resp.OK {
+			sendErr = fmt.Errorf("status response not OK: %s", resp.Message)
+		}
+		result <- sendErr
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("paused server dispatched before Start: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	srv.Start()
+	srv.Start()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("status after Start: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("paused server did not dispatch after Start")
+	}
+	srv.Close()
+	srv.Close()
+	srv.Start()
+}
+
 func TestCloseRemovesSocketPath(t *testing.T) {
 	path := testSocketPath(t)
 	handler := &mockHandler{}

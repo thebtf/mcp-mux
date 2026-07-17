@@ -108,7 +108,11 @@ func TestHandoffUnix_FinalAckDisconnectClosesTransferredFDsAndStartsOneFallback(
 		if restored := d.loadSnapshot(); restored != 1 {
 			t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 		}
-		if activated := d.activateRestartStaging(); activated != 1 {
+		activated, err := d.activateRestartStaging()
+		if err != nil {
+			t.Fatalf("activateRestartStaging() error: %v; logs:\n%s", err, logs.String())
+		}
+		if activated != 1 {
 			t.Fatalf("activateRestartStaging()=%d, want 1; logs:\n%s", activated, logs.String())
 		}
 		entry := d.Entry("aabbccdd-final-ack-rollback-unix")

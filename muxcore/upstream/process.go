@@ -110,6 +110,7 @@ type detachState uint8
 
 const (
 	detachAttached detachState = iota
+	detachLegacy
 	detachPrepared
 	detachCommitted
 	detachAborted
@@ -520,11 +521,16 @@ func (p *Process) Close() error {
 		p.mu.Unlock()
 		return nil
 	}
-	if p.detach != detachAttached {
+	switch p.detach {
+	case detachLegacy, detachCommitted:
 		p.mu.Unlock()
 		return nil
+	case detachPrepared, detachAborted:
+		p.mu.Unlock()
+		return p.AbortDetach()
+	case detachAttached:
+		p.retiring = true
 	}
-	p.retiring = true
 	stdinWait := p.drainTimeout
 	p.mu.Unlock()
 
@@ -625,7 +631,7 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 	if err := prepareLegacyDetach(p, pid); err != nil {
 		return 0, 0, 0, err
 	}
-	p.detach = detachPrepared
+	p.detach = detachLegacy
 	if p.stdinFile != nil {
 		stdinFD = p.stdinFD
 	}
@@ -690,7 +696,7 @@ func (p *Process) CommitDetach() error {
 		return nil
 	case detachPrepared:
 		p.detach = detachCommitted
-	case detachAborted, detachAttached:
+	case detachAborted, detachAttached, detachLegacy:
 		p.mu.Unlock()
 		return ErrDetachNotPrepared
 	}
@@ -716,7 +722,7 @@ func (p *Process) AbortDetach() error {
 	case detachCommitted:
 		p.mu.Unlock()
 		return ErrDetachCommitted
-	case detachAttached:
+	case detachAttached, detachLegacy:
 		p.mu.Unlock()
 		return ErrDetachNotPrepared
 	case detachPrepared:

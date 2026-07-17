@@ -494,7 +494,11 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 		if restored := d.loadSnapshot(); restored != 1 {
 			t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 		}
-		if activated := d.activateRestartStaging(); activated != 1 {
+		activated, err := d.activateRestartStaging()
+		if err != nil {
+			t.Fatalf("activateRestartStaging() error: %v; logs:\n%s", err, logs.String())
+		}
+		if activated != 1 {
 			t.Fatalf("activateRestartStaging()=%d, want 1; logs:\n%s", activated, logs.String())
 		}
 		entry := d.Entry("aabbccdd-final-ack-rollback")
@@ -505,8 +509,8 @@ func TestLoadSnapshot_FinalAckWriteFailureRollsBackAdoptedOwner(t *testing.T) {
 			t.Fatalf("restore_source=%q, want snapshot_fallback after final ACK failure; logs:\n%s", entry.RestoreSource, logs.String())
 		}
 
-		if !entry.Owner.CacheReady() {
-			t.Fatalf("fallback owner lost cached discovery state; logs:\n%s", logs.String())
+		if entry.Owner.CacheReady() {
+			t.Fatalf("fallback owner exposed stale cached discovery after final ACK failure; logs:\n%s", logs.String())
 		}
 		if state := entry.Owner.MaterializationState(); state == owner.MaterializationCacheOnly {
 			t.Fatalf("fallback materialization state=%s after predecessor barrier, want eager restore", state)

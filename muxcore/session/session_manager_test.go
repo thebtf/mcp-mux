@@ -276,6 +276,45 @@ func TestRemoveBoundForOwner(t *testing.T) {
 	}
 }
 
+func TestRemoveBoundForOwnerExceptSessionRevokesOtherLineages(t *testing.T) {
+	sm := NewManager()
+	keep := &Session{ID: 41}
+	evict := &Session{ID: 42}
+	for token, session := range map[string]*Session{"keep": keep, "evict": evict} {
+		sm.RegisterSession(session, "")
+		sm.PreRegisterForOwner(token, "owner-a", "/project/"+token, nil)
+		if !sm.Bind(token, "owner-a", session) {
+			t.Fatalf("Bind(%q) returned false", token)
+		}
+	}
+	keepRefresh, err := sm.RegisterReconnect("keep", func(string) bool { return true })
+	if err != nil {
+		t.Fatalf("RegisterReconnect(keep): %v", err)
+	}
+	evictRefresh, err := sm.RegisterReconnect("evict", func(string) bool { return true })
+	if err != nil {
+		t.Fatalf("RegisterReconnect(evict): %v", err)
+	}
+	if sm.bound[keepRefresh].Session != keep || sm.bound[evictRefresh].Session != evict {
+		t.Fatal("refresh token did not retain its source session lineage")
+	}
+
+	sm.RemovePendingForOwner("owner-a")
+	if removed := sm.RemoveBoundForOwnerExceptSession("owner-a", keep); removed != 2 {
+		t.Fatalf("RemoveBoundForOwnerExceptSession() = %d, want 2", removed)
+	}
+	for _, token := range []string{"evict", evictRefresh} {
+		if _, err := sm.RegisterReconnect(token, func(string) bool { return true }); !errors.Is(err, ErrUnknownToken) {
+			t.Fatalf("RegisterReconnect(%q) error = %v, want ErrUnknownToken", token, err)
+		}
+	}
+	for _, token := range []string{"keep", keepRefresh} {
+		if _, err := sm.RegisterReconnect(token, func(string) bool { return true }); err != nil {
+			t.Fatalf("RegisterReconnect(%q) error = %v, want retained authority", token, err)
+		}
+	}
+}
+
 func TestRemovePendingForOwnerIgnoresEmptyOwnerKey(t *testing.T) {
 	sm := NewManager()
 	sm.PreRegister("legacy", "/project/legacy", nil)
@@ -503,6 +542,50 @@ func TestRegisterReconnect_NewTokenFresh(t *testing.T) {
 	}
 	if s2.Env["X"] != "1" {
 		t.Fatalf("session Env[X] = %q, want %q", s2.Env["X"], "1")
+	}
+}
+
+func TestRemovePendingForOwnerExceptSessionPreservesConcurrentReconnect(t *testing.T) {
+	const ownerKey = "owner-reconnect-race"
+	sm := NewManager()
+	retained := &Session{ID: 101}
+	sm.RegisterSession(retained, "")
+	sm.PreRegisterForOwner("previous", ownerKey, "/project/retained", nil)
+	if !sm.Bind("previous", ownerKey, retained) {
+		t.Fatal("Bind(previous) returned false")
+	}
+	sm.PreRegisterForOwner("fresh", ownerKey, "/project/fresh", nil)
+
+	enteredOwnerCheck := make(chan struct{})
+	releaseOwnerCheck := make(chan struct{})
+	type reconnectResult struct {
+		token string
+		err   error
+	}
+	result := make(chan reconnectResult, 1)
+	go func() {
+		token, err := sm.RegisterReconnect("previous", func(string) bool {
+			close(enteredOwnerCheck)
+			<-releaseOwnerCheck
+			return true
+		})
+		result <- reconnectResult{token: token, err: err}
+	}()
+	<-enteredOwnerCheck
+
+	if removed := sm.RemovePendingForOwnerExceptSession(ownerKey, retained); removed != 1 {
+		t.Fatalf("RemovePendingForOwnerExceptSession() = %d, want fresh reservation only", removed)
+	}
+	close(releaseOwnerCheck)
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("RegisterReconnect() error = %v", got.err)
+	}
+	if got.token == "" || !sm.IsPreRegistered(got.token) {
+		t.Fatalf("retained reconnect reservation %q was revoked", got.token)
+	}
+	if sm.IsPreRegistered("fresh") {
+		t.Fatal("fresh admission reservation survived isolated revocation")
 	}
 }
 

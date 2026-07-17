@@ -42,7 +42,24 @@ var errNoHandoffUpstreams = errors.New("no process-backed owners to hand off")
 
 const snapshotRestartEnv = "MCPMUX_SNAPSHOT_RESTART"
 
-var spawnSnapshotSuccessorForRestart = spawnSnapshotSuccessor
+var (
+	spawnSnapshotSuccessorForRestart = spawnSnapshotSuccessor
+	spawnHandoffSuccessorForRestart  = spawnSuccessor
+)
+
+type handoffSnapshotFallbackError struct {
+	err        error
+	backupSafe bool
+}
+
+func (e *handoffSnapshotFallbackError) Error() string { return e.err.Error() }
+func (e *handoffSnapshotFallbackError) Unwrap() error { return e.err }
+
+func handoffSnapshotFallback(err error) (*handoffSnapshotFallbackError, bool) {
+	var fallbackErr *handoffSnapshotFallbackError
+	ok := errors.As(err, &fallbackErr)
+	return fallbackErr, ok
+}
 
 // ErrUnknownToken indicates that the daemon does not recognize a reconnect
 // token presented through the refresh-token control-plane path.
@@ -192,6 +209,9 @@ type Daemon struct {
 	// owner IPC or start an upstream until control-socket takeover proves the
 	// predecessor has finalized its non-transferred process authority.
 	restartStaging []snapshotRestorePlan
+	// restartRecoverySnapshot retains exactly the owner/session subset that a
+	// successor must rewrite if staged activation cannot complete after takeover.
+	restartRecoverySnapshot *DaemonSnapshot
 	// supervisor manages owner lifecycle with exponential backoff on restart.
 	// Owners are added via supervisor.Add in Spawn() and removed via
 	// supervisor.Remove in daemon.Remove. Context-cancelled on Shutdown.
@@ -537,7 +557,21 @@ func New(cfg Config) (*Daemon, error) {
 		}
 		// The control endpoint can bind only after the predecessor has released
 		// it. This is the predecessor-finalized barrier for metadata-only owners.
-		d.activateRestartStaging()
+		if _, err := d.activateRestartStaging(); err != nil {
+			recoveryPath, recoveryErr := d.rewriteRestartRecoverySnapshot()
+			if recoveryErr != nil {
+				logger.Printf("snapshot: failed to preserve restart recovery after activation error: %v", recoveryErr)
+			} else if recoveryPath != "" {
+				logger.Printf("snapshot: preserved restart recovery at %s after activation error", recoveryPath)
+			}
+			d.shutdown(nil)
+			activationErr := fmt.Errorf("daemon: activate restart staging: %w", err)
+			if recoveryErr != nil {
+				return nil, errors.Join(activationErr, fmt.Errorf("preserve restart recovery: %w", recoveryErr))
+			}
+			return nil, activationErr
+		}
+		d.ctlSrv.Start()
 		if planned > 0 {
 			logger.Printf("startup: restored %d owners from snapshot (%s)", d.OwnerCount(), modeLabel)
 		}
@@ -1057,6 +1091,23 @@ func (d *Daemon) warnDeprecatedMode(cmd string, args []string, legacyMode string
 	)
 }
 
+func (d *Daemon) waitForOwnerAdmissionThaw(o *owner.Owner) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	timer := time.NewTimer(d.admissionBufferTimeout)
+	defer ticker.Stop()
+	defer timer.Stop()
+	for o.AdmissionFrozen() {
+		select {
+		case <-o.Done():
+			return ErrOwnerGone
+		case <-ticker.C:
+		case <-timer.C:
+			return fmt.Errorf("admission gate: timeout after %s waiting for owner %s cache commit", d.admissionBufferTimeout, shortServerID(o.ServerID()))
+		}
+	}
+	return nil
+}
+
 // Spawn creates or reuses an owner for the given command. If a compatible owner
 // already exists (same command+args+cwd, or globally shareable), it is reused —
 // stateless servers don't need per-project copies. Returns the IPC path, server
@@ -1214,6 +1265,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			}
 			d.mu.Lock()
 			// Re-check: creation may have succeeded or failed.
+			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.AdmissionFrozen() {
+				frozenOwner := e.Owner
+				d.mu.Unlock()
+				if waitErr := d.waitForOwnerAdmissionThaw(frozenOwner); waitErr != nil && !errors.Is(waitErr, ErrOwnerGone) {
+					return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, waitErr)
+				}
+				return "", "", "", errSpawnRetry
+			}
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.IsAccepting() {
 				// CR-002 AC8: re-validate env compatibility now that the owner is
 				// fully created and e.Env is populated. At the time deriveEnvBucketedSid
@@ -1270,6 +1329,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			d.mu.Unlock()
 			if retryEntry != nil && retryOwner != nil && retryOwner.IsClassifiedIsolated() {
 				*isolatedRetry = d.promoteIsolatedRetry(reqPtr, retryEntry)
+			}
+			return "", "", "", errSpawnRetry
+		}
+		if entry.Owner.AdmissionFrozen() {
+			frozenOwner := entry.Owner
+			d.mu.Unlock()
+			if waitErr := d.waitForOwnerAdmissionThaw(frozenOwner); waitErr != nil && !errors.Is(waitErr, ErrOwnerGone) {
+				return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, waitErr)
 			}
 			return "", "", "", errSpawnRetry
 		}
@@ -1706,11 +1773,17 @@ func (d *Daemon) HandleSpawnResponseFailure(serverID, token string) {
 
 // HandleRemove implements control.DaemonHandler.
 func (d *Daemon) HandleRemove(serverID string) error {
+	if d.shuttingDown.Load() {
+		return ErrDaemonShuttingDown
+	}
 	return d.Remove(serverID)
 }
 
 // HandleStopOwner implements the optional control.OwnerStopHandler extension.
 func (d *Daemon) HandleStopOwner(req control.Request) (string, error) {
+	if d.shuttingDown.Load() {
+		return "", ErrDaemonShuttingDown
+	}
 	serverID := req.ServerID
 	if serverID == "" {
 		serverID = req.Command
@@ -1811,7 +1884,7 @@ func waitBeforeSnapshotRestartControlBind(logger *log.Logger) {
 // that and completes the bind.
 func (d *Daemon) retryControlBind(socketPath string) error {
 	for i := range controlBindMaxAttempts {
-		ctlSrv, err := control.NewServer(socketPath, d, d.logger)
+		ctlSrv, err := control.NewPausedServer(socketPath, d, d.logger)
 		if err == nil {
 			d.ctlSrv = ctlSrv
 			if i > 0 {
@@ -1830,14 +1903,49 @@ func (d *Daemon) retryControlBind(socketPath string) error {
 		controlBindMaxAttempts, time.Duration(controlBindMaxAttempts)*controlBindRetryInterval)
 }
 
+type handoffSuccessor interface {
+	Done() <-chan struct{}
+	Stop() error
+}
+
+type execHandoffSuccessor struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+}
+
+func (s *execHandoffSuccessor) Done() <-chan struct{} { return s.done }
+
+func (s *execHandoffSuccessor) Stop() error {
+	if s == nil || s.cmd == nil || s.cmd.Process == nil {
+		return nil
+	}
+	select {
+	case <-s.done:
+		return nil
+	default:
+	}
+	killErr := s.cmd.Process.Kill()
+	if errors.Is(killErr, os.ErrProcessDone) {
+		killErr = nil
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return killErr
+	case <-timer.C:
+		return errors.Join(killErr, errors.New("handoff successor did not exit after termination"))
+	}
+}
+
 // spawnSuccessor forks the current binary as a detached background process,
 // injecting MCPMUX_HANDOFF_TOKEN_PATH and MCPMUX_HANDOFF_SOCKET so the successor
 // daemon can locate the handoff socket and authenticate (FR-11). The caller does
 // NOT wait for the process — it runs independently and will dial back.
-func spawnSuccessor(tokenPath, socketPath, daemonFlag, successorExe string) error {
+func spawnSuccessor(tokenPath, socketPath, daemonFlag, successorExe string) (handoffSuccessor, error) {
 	exe, err := successorExecutableFor(successorExe)
 	if err != nil {
-		return fmt.Errorf("handoff: resolve executable: %w", err)
+		return nil, fmt.Errorf("handoff: resolve executable: %w", err)
 	}
 	cmd := exec.Command(exe, daemonFlag)
 	cmd.Env = append(os.Environ(),
@@ -1851,12 +1959,14 @@ func spawnSuccessor(tokenPath, socketPath, daemonFlag, successorExe string) erro
 	// It mirrors engine.setDetached; importing engine from daemon would be a cycle.
 	setSuccessorDetached(cmd)
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("handoff: spawn successor: %w", err)
+		return nil, fmt.Errorf("handoff: spawn successor: %w", err)
 	}
-	if err := cmd.Process.Release(); err != nil {
-		return fmt.Errorf("handoff: release successor: %w", err)
-	}
-	return nil
+	successor := &execHandoffSuccessor{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		close(successor.done)
+	}()
+	return successor, nil
 }
 
 func spawnSnapshotSuccessor(successorExe, daemonFlag string) error {
@@ -1961,18 +2071,10 @@ func (d *Daemon) hasHandoffUpstreamOwners() bool {
 }
 
 // attemptHandoff runs the old-daemon side of the two-daemon handoff protocol.
-// Returns nil if the protocol completed (transferred or FR-7 per-upstream abort).
-// Returns non-nil on any protocol-level failure — the caller logs "handoff.fallback"
-// and falls back to the legacy kill-and-respawn path (FR-8).
-//
-// FR-8 fallback trigger set (all route through the returned error):
-//   - Token write failure (crypto/rand unavailable, disk full, permission denied)
-//   - Socket bind / accept failure (path collision, permission denied)
-//   - Accept timeout exceeded (successor never connected)
-//   - Successor spawn failure (os.Executable error, exec.Start error)
-//   - ErrTokenMismatch (successor presented wrong token — FR-11)
-//   - ErrProtocolVersionMismatch (binary skew — FR-6)
-//   - Any other performHandoff protocol error (conn drop, JSON decode failure)
+// Returns nil after a complete transfer. Failures after exact version/token
+// Hello return handoffSnapshotFallbackError only after the failed successor has
+// exited, making one fresh snapshot successor safe. Listener/spawn/accept and
+// all Hello failures are pre-detach aborts that preserve the predecessor.
 func (d *Daemon) attemptHandoff(successorExe string) error {
 	d.stats.attempted.Add(1)
 	startedAt := time.Now()
@@ -2008,19 +2110,20 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 		connCh <- connResult{conn, err}
 	}()
 
-	// Spawn successor with handoff credentials.
-	if spawnErr := spawnSuccessor(tokenPath, socketPath, d.daemonFlag, successorExe); spawnErr != nil {
+	// Spawn successor with handoff credentials and retain process authority until
+	// the protocol either commits or the failed successor is proven stopped.
+	successor, spawnErr := spawnHandoffSuccessorForRestart(tokenPath, socketPath, d.daemonFlag, successorExe)
+	if spawnErr != nil {
 		// Do NOT drain connCh here — the listener goroutine will self-terminate
-		// once handoffAcceptTimeout expires (buffered channel prevents goroutine
-		// leak; the accepted conn, if any arrives despite the spawn failure, is
-		// closed when connCh is garbage-collected after nobody reads it).
+		// once handoffAcceptTimeout expires (buffered channel prevents leakage).
 		return fmt.Errorf("spawn successor: %w", spawnErr)
 	}
 
 	// Wait for successor to connect (or timeout to expire).
 	cr := <-connCh
 	if cr.err != nil {
-		return fmt.Errorf("accept: %w", cr.err)
+		acceptErr := fmt.Errorf("accept: %w", cr.err)
+		return errors.Join(acceptErr, successor.Stop())
 	}
 	conn := cr.conn
 	defer conn.Close() //nolint:errcheck
@@ -2029,11 +2132,14 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 	stopDeadline := bindHandoffContext(ctx, conn)
 	defer stopDeadline()
 
-	// Version/token negotiation happens before detaching any owner. A v1 peer
-	// therefore falls back to one bounded cold respawn without losing authority.
+	// Version/token negotiation happens before detaching any owner. Every Hello
+	// failure therefore stops the uncommitted successor and preserves predecessor
+	// process/session authority without snapshot fallback.
 	if err := acceptHandoffHello(conn, token); err != nil {
-		return fmt.Errorf("protocol hello: %w", handoffContextError(ctx, err))
+		helloErr := fmt.Errorf("protocol hello: %w", handoffContextError(ctx, err))
+		return errors.Join(helloErr, successor.Stop())
 	}
+	d.markPlannedHandoff()
 
 	// Detach only after the successor proved it speaks the exact v2 schema.
 	// Each entry carries abort/commit operations retained until final adoption.
@@ -2041,7 +2147,11 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 
 	result, err := performHandoffAfterHello(ctx, conn, upstreams)
 	if err != nil {
-		return fmt.Errorf("protocol error: %w", err)
+		protocolErr := fmt.Errorf("protocol error: %w", err)
+		if stopErr := successor.Stop(); stopErr != nil {
+			return &handoffSnapshotFallbackError{err: errors.Join(protocolErr, fmt.Errorf("stop failed successor: %w", stopErr))}
+		}
+		return &handoffSnapshotFallbackError{err: protocolErr, backupSafe: true}
 	}
 
 	d.stats.transferred.Add(uint64(len(result.Transferred)))
@@ -2052,13 +2162,44 @@ func (d *Daemon) attemptHandoff(successorExe string) error {
 	return nil
 }
 
-// HandleGracefulRestart implements control.DaemonHandler.
-// Serializes a state snapshot (used as FR-8 fallback seed and successor
-// cold-start seed), then attempts FD-passing handoff to the successor daemon
-// (FR-1/FR-2/FR-3). Process-backed handoff failures emit the "handoff.fallback"
-// log line and fall through to legacy kill-and-respawn (FR-8). SessionHandler-
-// only configurations have no upstream FDs to hand off and use snapshot-only
-// restart as their healthy path.
+func (d *Daemon) markPlannedHandoff() {
+	d.mu.Lock()
+	for _, entry := range d.owners {
+		entry.terminationHint = HintPlannedHandoff
+	}
+	d.mu.Unlock()
+}
+
+func (d *Daemon) abortGracefulRestart(snapshotPath string, restartLease *snapshotRestartLease, restartErr error) (string, func(), error) {
+	restartLease.Release()
+	d.mu.Lock()
+	for _, entry := range d.owners {
+		if entry.terminationHint == HintPlannedHandoff {
+			entry.terminationHint = HintNone
+		}
+	}
+	d.mu.Unlock()
+	d.shuttingDown.Store(false)
+	if snapshotPath != "" {
+		if err := os.Remove(snapshotPath); err != nil && !os.IsNotExist(err) {
+			d.logger.Printf("graceful-restart: remove aborted snapshot %q: %v", snapshotPath, err)
+		}
+	}
+	d.logger.Printf("handoff.abort reason=%v predecessor_retained=true", restartErr)
+	return "", nil, restartErr
+}
+
+func (d *Daemon) blockPostDetachRestart(snapshotPath string, restartLease *snapshotRestartLease, restartErr error) (string, func(), error) {
+	restartLease.Release()
+	d.logger.Printf("handoff.fallback_blocked reason=%v predecessor_closed=true snapshot=%q", restartErr, snapshotPath)
+	return snapshotPath, nil, restartErr
+}
+
+// HandleGracefulRestart implements control.DaemonHandler. It snapshots and
+// pins the predecessor, proves a successor path, and only then returns the
+// post-response shutdown callback. Every pre-Hello failure aborts with the
+// predecessor intact. A post-Hello failure stops that successor, rewrites the
+// retained snapshot, and pre-starts exactly one clean fallback successor.
 func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), error) {
 	return d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{DrainTimeoutMs: drainTimeoutMs})
 }
@@ -2070,55 +2211,63 @@ func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOp
 		d.logger.Printf("graceful-restart: successor_exe=%q", successorExe)
 	}
 
-	// Serialize snapshot first — needed for FR-8 fallback and successor seed
-	// regardless of whether handoff succeeds. Owner restart pins remain held
-	// until the predecessor has shut down after the control response is flushed.
+	// Serialize snapshot first so any proven successor can restore the same
+	// metadata generation. Restart pins stay held until shutdown or abort.
 	snapshotPath, restartLease, err := d.serializeSnapshotPinned()
 	if err != nil {
 		d.shuttingDown.Store(false)
 		return "", nil, fmt.Errorf("snapshot: %w", err)
 	}
 
-	// Tag owners BEFORE attemptHandoff. collectHandoffUpstreams (inside
-	// attemptHandoff) detaches owners → supervisor fires termination events
-	// → event hook acquires d.mu. Tagging after attemptHandoff deadlocks
-	// because this goroutine also needs d.mu (#99).
-	d.mu.Lock()
-	for _, entry := range d.owners {
-		entry.terminationHint = HintPlannedHandoff
+	handoffErr := d.attemptHandoff(opts.SuccessorExe)
+	if errors.Is(handoffErr, errNoHandoffUpstreams) {
+		afterFn, spawnErr := d.prepareSnapshotRestart(opts.SuccessorExe, restartLease, "no_process_backed_owners")
+		if spawnErr != nil {
+			return d.abortGracefulRestart(snapshotPath, restartLease, spawnErr)
+		}
+		return snapshotPath, afterFn, nil
 	}
-	d.mu.Unlock()
-
-	// Attempt FD-passing handoff. Callers never see a handoff error — FR-8 is
-	// silent to the control-plane caller (it still gets a valid snapshot path).
-	if handoffErr := d.attemptHandoff(opts.SuccessorExe); handoffErr != nil {
-		if errors.Is(handoffErr, errNoHandoffUpstreams) {
-			return snapshotPath, d.afterSnapshotOnlyRestart(opts.SuccessorExe, restartLease), nil
+	if handoffErr != nil {
+		fallbackErr, ok := handoffSnapshotFallback(handoffErr)
+		if !ok {
+			return d.abortGracefulRestart(snapshotPath, restartLease, handoffErr)
+		}
+		if !fallbackErr.backupSafe {
+			return d.blockPostDetachRestart(snapshotPath, restartLease, handoffErr)
+		}
+		rewrittenPath, rewriteErr := restartLease.RewriteSnapshot()
+		if rewriteErr != nil {
+			return d.blockPostDetachRestart(snapshotPath, restartLease, fmt.Errorf("rewrite post-handoff snapshot: %w", rewriteErr))
+		}
+		afterFn, spawnErr := d.prepareSnapshotRestart(opts.SuccessorExe, restartLease, "post_handoff_failure")
+		if spawnErr != nil {
+			return d.blockPostDetachRestart(rewrittenPath, restartLease, spawnErr)
 		}
 		d.stats.fallback.Add(1)
-		d.logger.Printf("handoff.fallback reason=%v — using legacy shutdown+respawn", handoffErr)
+		d.logger.Printf("handoff.fallback reason=%v — clean successor pre-started from rewritten snapshot", handoffErr)
+		return rewrittenPath, afterFn, nil
 	}
 
-	return snapshotPath, func() {
-		go func() {
-			defer restartLease.Release()
-			d.Shutdown()
-		}()
-	}, nil
+	return snapshotPath, d.afterGracefulRestart(restartLease), nil
 }
 
-func (d *Daemon) afterSnapshotOnlyRestart(successorExe string, restartLease *snapshotRestartLease) func() {
+func (d *Daemon) prepareSnapshotRestart(successorExe string, restartLease *snapshotRestartLease, reason string) (func(), error) {
+	d.logger.Printf("snapshot_restart.spawn_successor reason=%s exe=%q flag=%q", reason, successorExe, d.daemonFlag)
+	if err := spawnSnapshotSuccessorForRestart(successorExe, d.daemonFlag); err != nil {
+		d.logger.Printf("snapshot_restart.successor_spawn_failed reason=%s err=%v", reason, err)
+		return nil, err
+	}
+	d.logger.Printf("snapshot_restart.successor_spawned reason=%s", reason)
+	d.markPlannedHandoff()
+	return d.afterGracefulRestart(restartLease), nil
+}
+
+func (d *Daemon) afterGracefulRestart(restartLease *snapshotRestartLease) func() {
 	return func() {
 		go func() {
-			defer restartLease.Release()
-			d.shutdown(func() {
-				d.logger.Printf("snapshot_restart.spawn_successor exe=%q flag=%q", successorExe, d.daemonFlag)
-				if err := spawnSnapshotSuccessorForRestart(successorExe, d.daemonFlag); err != nil {
-					d.logger.Printf("snapshot_restart.successor_spawn_failed reason=no_process_backed_owners err=%v", err)
-					return
-				}
-				d.logger.Printf("snapshot_restart.successor_spawned reason=no_process_backed_owners")
-			})
+			restartLease.ReleaseRegistryPins()
+			defer restartLease.ReleaseOwnerPins()
+			d.Shutdown()
 		}()
 	}
 }
@@ -2622,9 +2771,10 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 	for {
 		// Phase 1: scan live entries for a concrete match.
 		var (
-			match        *OwnerEntry
-			placeholder  chan struct{}
-			classifyWait <-chan struct{} // in-flight classification of a matching entry
+			match         *OwnerEntry
+			placeholder   chan struct{}
+			classifyWait  <-chan struct{} // in-flight classification of a matching entry
+			admissionWait *owner.Owner    // short cache-commit admission freeze
 		)
 		for _, entry := range d.owners {
 			if entry.Command != command {
@@ -2643,6 +2793,12 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 			}
 			// Skip owners with incompatible env — different API keys, tokens, etc.
 			if !envCompatible(entry.Env, mergedEnv) {
+				continue
+			}
+			if entry.Owner.AdmissionFrozen() {
+				if admissionWait == nil {
+					admissionWait = entry.Owner
+				}
 				continue
 			}
 			if !entry.Owner.IsAccepting() {
@@ -2682,6 +2838,12 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 			select {
 			case <-entry.Owner.Classified():
 				// Classification known — re-check IsAccepting (may have closed listener)
+				if entry.Owner.AdmissionFrozen() {
+					if admissionWait == nil {
+						admissionWait = entry.Owner
+					}
+					continue
+				}
 				if !entry.Owner.IsAccepting() {
 					continue
 				}
@@ -2697,10 +2859,10 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 			return match
 		}
 
-		// No concrete match. If a placeholder or in-flight classification was
-		// seen and we have wait budget, release the lock, wait for it (or
-		// time out), re-acquire, and rescan. Otherwise give up.
-		if placeholder == nil && classifyWait == nil {
+		// No concrete match. If creation, classification, or a cache-commit
+		// admission freeze is in flight, release the lock and wait once before
+		// rescanning. Otherwise give up.
+		if placeholder == nil && classifyWait == nil && admissionWait == nil {
 			return nil
 		}
 		if waitsDone >= maxWaits {
@@ -2709,21 +2871,24 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 		waitsDone++
 
 		d.mu.Unlock()
-		// Build a select that blocks on whichever signals we collected.
-		// Using nil channels in a select case blocks forever, so a single
-		// select with nil branches safely waits only on non-nil ones.
-		// Invariant: at least one of placeholder/classifyWait is non-nil (guard
-		// at line ~998 ensures this). Nil-channel cases in a select are never
-		// selected, so time.After is the fallback for the non-nil branch.
-		select {
-		case <-placeholder:
-			// Creation resolved (success or failure) — rescan.
-		case <-classifyWait:
-			// Classification resolved — rescan; owner may now be shareable.
-		case <-time.After(concurrentCreateWaitTimeout):
-			// Timed out. Re-acquire and return — caller will create new.
-			d.mu.Lock()
-			return nil
+		if admissionWait != nil {
+			if err := d.waitForOwnerAdmissionThaw(admissionWait); err != nil && !errors.Is(err, ErrOwnerGone) {
+				d.mu.Lock()
+				return nil
+			}
+		} else {
+			// Nil-channel cases in a select are disabled, so this waits for the
+			// concrete creation/classification signal that was observed above.
+			select {
+			case <-placeholder:
+				// Creation resolved (success or failure) — rescan.
+			case <-classifyWait:
+				// Classification resolved — rescan; owner may now be shareable.
+			case <-time.After(concurrentCreateWaitTimeout):
+				// Timed out. Re-acquire and return — caller will create new.
+				d.mu.Lock()
+				return nil
+			}
 		}
 		d.mu.Lock()
 		// Loop: fresh scan on the now-mutated map.
@@ -2920,8 +3085,47 @@ func (d *Daemon) shutdown(beforeDone func()) {
 				d.logger.Printf("supervisor did not exit within 2s, proceeding anyway")
 			}
 		}
+		// Finalize every concrete owner before releasing the control namespace.
+		// A successor may bind and activate only after all non-transferred process
+		// trees have proven retirement; blocked finalizers keep this predecessor
+		// alive and authoritative instead of allowing a competing generation.
+		type shutdownOwner struct {
+			serverID string
+			entry    *OwnerEntry
+		}
+		ownersShutDown := 0
+		for {
+			d.mu.Lock()
+			owners := make([]shutdownOwner, 0, len(d.owners))
+			for serverID, entry := range d.owners {
+				if entry == nil || entry.Owner == nil {
+					d.deleteOwnerEntryLocked(serverID)
+					continue
+				}
+				owners = append(owners, shutdownOwner{serverID: serverID, entry: entry})
+			}
+			d.mu.Unlock()
+			if len(owners) == 0 {
+				break
+			}
 
-		// Close control server
+			removedThisPass := 0
+			for _, item := range owners {
+				result, err := d.finalizeAndRemoveOwner(item.serverID, item.entry, ownerRemovalReasonOperatorHard, false, nil, false)
+				if result.Removed {
+					removedThisPass++
+					ownersShutDown++
+				}
+				if err != nil && !result.Removed {
+					d.logger.Printf("owner %s shutdown finalization blocked: %v", shortServerID(item.serverID), err)
+				}
+			}
+			if removedThisPass == 0 {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+
+		// Only now may a waiting successor acquire the fixed control namespace.
 		if d.ctlSrv != nil {
 			d.ctlSrv.Close()
 		}
@@ -2931,37 +3135,11 @@ func (d *Daemon) shutdown(beforeDone func()) {
 			}
 		}
 
-		// Finalize each owner before deleting its registry entry. Placeholders own
-		// no process authority and may be removed directly.
-		type shutdownOwner struct {
-			serverID string
-			entry    *OwnerEntry
-		}
-		d.mu.RLock()
-		owners := make([]shutdownOwner, 0, len(d.owners))
-		for serverID, entry := range d.owners {
-			owners = append(owners, shutdownOwner{serverID: serverID, entry: entry})
-		}
-		d.mu.RUnlock()
-		for _, item := range owners {
-			if item.entry == nil || item.entry.Owner == nil {
-				d.mu.Lock()
-				if d.owners[item.serverID] == item.entry {
-					d.deleteOwnerEntryLocked(item.serverID)
-				}
-				d.mu.Unlock()
-				continue
-			}
-			if _, err := d.finalizeAndRemoveOwner(item.serverID, item.entry, ownerRemovalReasonOperatorHard, false, nil, false); err != nil {
-				d.logger.Printf("owner %s shutdown finalization blocked: %v", shortServerID(item.serverID), err)
-			}
-		}
-
 		if beforeDone != nil {
 			beforeDone()
 		}
 
-		d.logger.Printf("daemon stopped (%d owners shut down)", len(owners))
+		d.logger.Printf("daemon stopped (%d owners shut down)", ownersShutDown)
 		close(d.done)
 	})
 }

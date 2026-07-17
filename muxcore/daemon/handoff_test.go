@@ -204,10 +204,10 @@ func TestRetireOldOwnerSocketsRemovesPathsAndCounts(t *testing.T) {
 func TestSuccessorExecutableUsesActiveEnginePointer(t *testing.T) {
 	dir := t.TempDir()
 	enginePath := filepath.Join(dir, "versions", "abc123", "mcp-mux-engine.exe")
-	if err := os.MkdirAll(filepath.Dir(enginePath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(enginePath), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(enginePath, []byte("engine"), 0755); err != nil {
+	if err := os.WriteFile(enginePath, []byte("engine"), 0o755); err != nil {
 		t.Fatalf("WriteFile engine: %v", err)
 	}
 	pointerPath := filepath.Join(dir, "active.txt")
@@ -215,7 +215,7 @@ func TestSuccessorExecutableUsesActiveEnginePointer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rel: %v", err)
 	}
-	if err := os.WriteFile(pointerPath, []byte(rel+"\n"), 0644); err != nil {
+	if err := os.WriteFile(pointerPath, []byte(rel+"\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile pointer: %v", err)
 	}
 
@@ -462,25 +462,35 @@ func TestPerformHandoffFinalAckFailureAbortsEveryPreparedTree(t *testing.T) {
 	}
 }
 
-func TestPerformHandoffVersionSkewRejectsBeforeLeaseSettlement(t *testing.T) {
-	var settled int
-	conn := &scriptedHandoffConn{
-		schema: handoffHandleSchema{count: 3},
-		reads: []scriptedHandoffRead{{
-			msg: HelloMsg{Type: MsgHello, ProtocolVersion: HandoffProtocolVersion - 1, Token: "secret"},
-		}},
+func TestPerformHandoffHelloRejectsBeforeLeaseSettlement(t *testing.T) {
+	tests := []struct {
+		name  string
+		hello HelloMsg
+		want  error
+	}{
+		{name: "version skew", hello: HelloMsg{Type: MsgHello, ProtocolVersion: HandoffProtocolVersion - 1, Token: "secret"}, want: ErrProtocolVersionMismatch},
+		{name: "token mismatch", hello: HelloMsg{Type: MsgHello, ProtocolVersion: HandoffProtocolVersion, Token: "wrong"}, want: ErrTokenMismatch},
 	}
-	upstreams := []HandoffUpstream{{
-		ServerID: "s1", PID: 1, StdinFD: 11, StdoutFD: 12, StderrFD: 13,
-		commit: func() error { settled++; return nil },
-		abort:  func() error { settled++; return nil },
-	}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var settled int
+			conn := &scriptedHandoffConn{
+				schema: handoffHandleSchema{count: 3},
+				reads:  []scriptedHandoffRead{{msg: tt.hello}},
+			}
+			upstreams := []HandoffUpstream{{
+				ServerID: "s1", PID: 1, StdinFD: 11, StdoutFD: 12, StderrFD: 13,
+				commit: func() error { settled++; return nil },
+				abort:  func() error { settled++; return nil },
+			}}
 
-	if _, err := performHandoff(context.Background(), conn, "secret", upstreams); !errors.Is(err, ErrProtocolVersionMismatch) {
-		t.Fatalf("performHandoff error=%v, want ErrProtocolVersionMismatch", err)
-	}
-	if settled != 0 {
-		t.Fatalf("lease settled %d times before Hello version acceptance", settled)
+			if _, err := performHandoff(context.Background(), conn, "secret", upstreams); !errors.Is(err, tt.want) {
+				t.Fatalf("performHandoff error=%v, want %v", err, tt.want)
+			}
+			if settled != 0 {
+				t.Fatalf("lease settled %d times before Hello acceptance", settled)
+			}
+		})
 	}
 }
 

@@ -128,23 +128,48 @@ func (o *Owner) recordFailedHandoffTransition(proc *upstream.Process, err error,
 	o.upstreamEventMu.Unlock()
 }
 
-// ShutdownForHandoff performs the same cleanup as Shutdown (closes listener,
-// sessions, control server) but instead of closing the upstream process it
-// detaches from it — returning the PID and file descriptors so the caller can
-// transfer ownership to a new daemon without restarting the upstream.
-//
-// After a successful ShutdownForHandoff the upstream process continues running
-// under a prepared lease. o.done is closed; the caller must later invoke the
-// payload's Commit or Abort operation exactly once (both are idempotent).
+func (o *Owner) commitPreparedHandoff(proc *upstream.Process, pid int) error {
+	o.removalMu.Lock()
+	defer o.removalMu.Unlock()
+	err := proc.CommitDetach()
+	if !proc.RetirementProven() {
+		o.recordFailedHandoffTransition(proc, err, false)
+		return errors.Join(errFinalizationUnproven, err)
+	}
+	if err != nil {
+		// The successor already owns duplicated stdio and tree authority once
+		// detach reaches committed. A local authority-handle close warning must
+		// not trigger cold fallback beside the accepted successor generation.
+		o.logger.Printf("owner handoff commit finalized with local release warning: %v", err)
+	}
+	o.recordFailedHandoffTransition(proc, nil, true)
+	o.completeShutdown(fmt.Sprintf("owner handed off (pid=%d)", pid))
+	return nil
+}
+
+func (o *Owner) abortPreparedHandoff(proc *upstream.Process, pid int) error {
+	o.removalMu.Lock()
+	defer o.removalMu.Unlock()
+	err := proc.AbortDetach()
+	proven := proc.RetirementProven()
+	o.recordFailedHandoffTransition(proc, err, proven)
+	if proven {
+		o.completeShutdown(fmt.Sprintf("owner handoff aborted and finalized (pid=%d)", pid))
+	}
+	return err
+}
+
+// ShutdownForHandoff performs the same admission and session teardown as
+// Shutdown, but prepares the upstream process for transactional transfer.
+// The returned payload retains the owner's removal lease logically: o.done
+// remains open until Commit proves transferred authority or Abort proves full
+// process-tree retirement. FinalizeForRemoval may retry a failed abort later.
 //
 // Error cases:
-//   - ErrAlreadyShutDown — Shutdown or ShutdownForHandoff was already called.
-//     o.done reflects how that earlier shutdown completed.
-//   - ErrNoUpstream — owner has no subprocess to hand off (nil upstream).
-//     The already-torn-down owner is completed and o.done is closed.
-//   - wrapped upstream.ErrAlreadyDetached / ErrDetachUnsupported — Detach failed.
-//     The upstream is aborted or closed, then o.done is closed. A failed handoff
-//     never leaves a torn-down owner or process tree in limbo.
+//   - ErrAlreadyShutDown — shutdown or a prior settled handoff completed.
+//   - ErrNoUpstream — no subprocess exists; teardown completes immediately.
+//   - wrapped detach errors — cleanup is attempted and completion occurs only
+//     when process-tree retirement is proven.
 func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 	o.removalMu.Lock()
 	defer o.removalMu.Unlock()
@@ -206,9 +231,12 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 		Command:     o.command,
 		Args:        o.args,
 		Cwd:         o.cwd,
-		abort:       up.AbortDetach,
-		commit:      up.CommitDetach,
+		abort: func() error {
+			return o.abortPreparedHandoff(up, pid)
+		},
+		commit: func() error {
+			return o.commitPreparedHandoff(up, pid)
+		},
 	}
-	o.completeShutdown(fmt.Sprintf("owner handed off (pid=%d)", pid))
 	return payload, nil
 }

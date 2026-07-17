@@ -17,6 +17,7 @@ import (
 // Regression test for #99 (response lost on Windows AF_UNIX).
 func TestGracefulRestart_ResponseDelivery(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	ctlPath := shortSocketPath(t, "gr-response.ctl.sock")
 	d, err := New(Config{
@@ -48,6 +49,9 @@ func TestGracefulRestart_ResponseDelivery(t *testing.T) {
 		t.Errorf("message = %q, want %q", resp.Message, "snapshot written, shutting down")
 	}
 	t.Logf("response received: ok=%v message=%q", resp.OK, resp.Message)
+	if *spawnedFallbacks != 1 {
+		t.Fatalf("snapshot fallback successor starts = %d, want 1", *spawnedFallbacks)
+	}
 
 	// Verify daemon shuts down within a reasonable time.
 	select {
@@ -68,6 +72,7 @@ func TestGracefulRestart_ResponseDelivery(t *testing.T) {
 // Shutdown has actual work to do (close owners, stop supervisor).
 func TestGracefulRestart_ResponseDelivery_WithOwner(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	ctlPath := shortSocketPath(t, "gr-owner.ctl.sock")
 	d, err := New(Config{
@@ -104,6 +109,9 @@ func TestGracefulRestart_ResponseDelivery_WithOwner(t *testing.T) {
 		t.Fatalf("response not OK: %s", resp.Message)
 	}
 	t.Logf("response received: ok=%v message=%q (with live owner)", resp.OK, resp.Message)
+	if *spawnedFallbacks != 1 {
+		t.Fatalf("snapshot fallback successor starts = %d, want 1", *spawnedFallbacks)
+	}
 
 	select {
 	case <-d.Done():
@@ -120,6 +128,7 @@ func TestGracefulRestart_ResponseDelivery_WithOwner(t *testing.T) {
 // pattern observed in aimux testing.
 func TestGracefulRestart_BackToBack(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	for i := 1; i <= 2; i++ {
 		ctlPath := shortSocketPath(t, "gr-b2b.ctl.sock")
@@ -147,6 +156,9 @@ func TestGracefulRestart_BackToBack(t *testing.T) {
 			t.Fatalf("Phase %d: response not OK: %s", i, resp.Message)
 		}
 		t.Logf("Phase %d: response received: ok=%v", i, resp.OK)
+		if *spawnedFallbacks != i {
+			t.Fatalf("Phase %d: snapshot fallback successor starts = %d, want %d", i, *spawnedFallbacks, i)
+		}
 
 		select {
 		case <-d.Done():
