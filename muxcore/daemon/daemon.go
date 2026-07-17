@@ -2943,15 +2943,8 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 		return merged
 	}
 
-	windowsKeys := make(map[string]string, len(shimEnv)+64)
 	set := func(key, value string) {
-		folded := strings.ToUpper(key)
-		if existing, ok := windowsKeys[folded]; ok {
-			merged[existing] = value
-			return
-		}
-		windowsKeys[folded] = key
-		merged[key] = value
+		merged[strings.ToUpper(key)] = value
 	}
 	for _, entry := range os.Environ() {
 		if i := strings.IndexByte(entry, '='); i > 0 {

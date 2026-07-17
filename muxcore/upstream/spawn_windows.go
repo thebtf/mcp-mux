@@ -97,6 +97,8 @@ func resumeProcessThreads(pid int) error {
 	return nil
 }
 
+var resumeSpawnedProcessThreads = resumeProcessThreads
+
 func afterSpawnWindows(p *Process, pid int) error {
 	handle, err := windows.OpenProcess(
 		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION,
@@ -115,14 +117,9 @@ func afterSpawnWindows(p *Process, pid int) error {
 	p.jobHandle = uintptr(job)
 	p.authorityMu.Unlock()
 
-	if err := resumeProcessThreads(pid); err != nil {
-		p.authorityMu.Lock()
-		if p.jobHandle == uintptr(job) {
-			p.jobHandle = 0
-		}
-		p.authorityMu.Unlock()
-		_ = windows.TerminateJobObject(job, 1)
-		_ = windows.CloseHandle(job)
+	if err := resumeSpawnedProcessThreads(pid); err != nil {
+		// Keep the installed Job reachable. Start's shared failed-start path
+		// must terminate, wait, and close the exact authority before retry.
 		return err
 	}
 	return nil

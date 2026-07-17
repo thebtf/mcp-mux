@@ -286,6 +286,8 @@ func (p *Process) SetDrainTimeout(d time.Duration) {
 // exists and verify Start does not return before the full tree is retired.
 var startPostAuthorityHook = func(*Process) error { return nil }
 
+var afterSpawnPlatform = afterSpawnWindows
+
 var finalizeFailedStartTree = func(p *Process) error { return p.finalizeOwnedTree() }
 
 func Start(command string, args []string, env map[string]string, cwd string, logger *log.Logger) (*Process, error) {
@@ -405,26 +407,27 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		p.authorityMu.Unlock()
 	}
 
-	if captureErr != nil {
-		// Should not happen — Spawn already propagates PreStart errors — but if
-		// it does, retire the process before returning the setup error.
-		finalizeErr := finalizeFailedStart(p, proc, stdoutR, stdoutW, stderrR, stderrW)
-		return nil, errors.Join(captureErr, finalizeErr)
-	}
-
-	// Upstream owns the single transferable tree authority. Procgroup tree
-	// management is disabled for this spawn to avoid a second Job/PGID owner.
-	if err := afterSpawnWindows(p, proc.PID()); err != nil {
-		finalizeErr := finalizeFailedStart(p, proc, stdoutR, stdoutW, stderrR, stderrW)
-		return nil, errors.Join(fmt.Errorf("upstream: tree authority: %w", err), finalizeErr)
-	}
-	if err := startPostAuthorityHook(p); err != nil {
-		finalizeErr := finalizeFailedStart(p, proc, stdoutR, stdoutW, stderrR, stderrW)
-		startErr := errors.Join(err, finalizeErr)
+	failAfterSpawn := func(startErr error) (*Process, error) {
+		startErr = errors.Join(startErr, finalizeFailedStart(p, proc, stdoutR, stdoutW, stderrR, stderrW))
 		if !p.RetirementProven() {
 			return p, startErr
 		}
 		return nil, startErr
+	}
+
+	if captureErr != nil {
+		// Should not happen — Spawn already propagates PreStart errors — but if
+		// it does, retire the process before returning the setup error.
+		return failAfterSpawn(captureErr)
+	}
+
+	// Upstream owns the single transferable tree authority. Procgroup tree
+	// management is disabled for this spawn to avoid a second Job/PGID owner.
+	if err := afterSpawnPlatform(p, proc.PID()); err != nil {
+		return failAfterSpawn(fmt.Errorf("upstream: tree authority: %w", err))
+	}
+	if err := startPostAuthorityHook(p); err != nil {
+		return failAfterSpawn(err)
 	}
 
 	// Close our copy of the write end — the child inherited its own copy via

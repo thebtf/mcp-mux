@@ -209,3 +209,60 @@ func TestStartPostAuthorityFailureRetainsUnprovenProcessAuthority(t *testing.T) 
 		t.Fatalf("descendant pid %d still alive after retry", descendantPID)
 	}
 }
+
+func TestStartPlatformSetupFailureRetainsUnprovenProcessAuthority(t *testing.T) {
+	if os.Getenv(startFailureRoleEnv) == "platform" {
+		select {}
+	}
+
+	setupErr := errors.New("injected platform setup failure")
+	retirementErr := errors.New("injected unproven retirement")
+	var captured *Process
+
+	previousPlatform := afterSpawnPlatform
+	previousFinalizer := finalizeFailedStartTree
+	afterSpawnPlatform = func(p *Process, _ int) error {
+		captured = p
+		return setupErr
+	}
+	finalizeFailedStartTree = func(*Process) error { return retirementErr }
+	t.Cleanup(func() {
+		afterSpawnPlatform = previousPlatform
+		finalizeFailedStartTree = previousFinalizer
+		if captured == nil || captured.RetirementProven() {
+			return
+		}
+		if err := captured.finalizeOwnedTree(); err != nil {
+			t.Errorf("finalize retained platform-failure authority: %v", err)
+			return
+		}
+		select {
+		case <-captured.Done:
+		case <-time.After(2 * time.Second):
+			t.Error("retained platform-failure process did not exit during cleanup")
+		}
+	})
+
+	env := make(map[string]string)
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	env[startFailureRoleEnv] = "platform"
+
+	proc, err := Start(os.Args[0], []string{"-test.run=^TestStartPlatformSetupFailureRetainsUnprovenProcessAuthority$"}, env, "", nil)
+	if proc == nil {
+		t.Fatal("Start() process = nil, want retained platform-failure authority")
+	}
+	if proc != captured {
+		t.Fatal("Start() did not return the installed platform-failure authority")
+	}
+	if !errors.Is(err, setupErr) || !errors.Is(err, retirementErr) {
+		t.Fatalf("Start() error = %v, want setup and retirement failures", err)
+	}
+	if proc.RetirementProven() {
+		t.Fatal("unfinalized platform-failure process reported proven retirement")
+	}
+}

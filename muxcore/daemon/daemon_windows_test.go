@@ -84,16 +84,16 @@ func TestDetachedDaemonControlHelper(t *testing.T) {
 		Logger:       log.New(os.Stderr, "[daemon-helper] ", log.LstdFlags),
 	})
 	if err != nil {
-		_ = os.WriteFile(resultPath, []byte("daemon: "+err.Error()), 0600)
+		_ = os.WriteFile(resultPath, []byte("daemon: "+err.Error()), 0o600)
 		os.Exit(0)
 	}
 	defer d.Shutdown()
-	if err := os.WriteFile(readyPath, []byte("ready"), 0600); err != nil {
-		_ = os.WriteFile(resultPath, []byte("ready: "+err.Error()), 0600)
+	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+		_ = os.WriteFile(resultPath, []byte("ready: "+err.Error()), 0o600)
 		os.Exit(0)
 	}
 	time.Sleep(500 * time.Millisecond)
-	_ = os.WriteFile(resultPath, []byte("ok"), 0600)
+	_ = os.WriteFile(resultPath, []byte("ok"), 0o600)
 	os.Exit(0)
 }
 
@@ -159,6 +159,38 @@ func TestWindowsEffectiveEnvUsesShimOverrideForIdentityTemplateAndLaunch(t *test
 	assertNormalized("owner snapshot env", launchSnapshot.Env)
 	if !reflect.DeepEqual(launchSnapshot.Env, effectiveEnv) {
 		t.Fatal("owner snapshot did not preserve the normalized launch env")
+	}
+}
+
+func TestWindowsMergeEnvCanonicalizesIdentityKeyCase(t *testing.T) {
+	const canonicalKey = "MCPMUX_TEST_CASE_VARIANT_CONFIG_PATH"
+	previous, present := os.LookupEnv(canonicalKey)
+	if err := os.Unsetenv(canonicalKey); err != nil {
+		t.Fatalf("unset %s: %v", canonicalKey, err)
+	}
+	t.Cleanup(func() {
+		if present {
+			if err := os.Setenv(canonicalKey, previous); err != nil {
+				t.Errorf("restore %s: %v", canonicalKey, err)
+			}
+			return
+		}
+		if err := os.Unsetenv(canonicalKey); err != nil {
+			t.Errorf("clear %s: %v", canonicalKey, err)
+		}
+	})
+
+	lowerKey := strings.ToLower(canonicalKey)
+	lower := mergeEnv(map[string]string{lowerKey: "A"})
+	upper := mergeEnv(map[string]string{canonicalKey: "B"})
+	if got := lower[canonicalKey]; got != "A" {
+		t.Fatalf("canonical lower-case merge value = %q, want A", got)
+	}
+	if _, ok := lower[lowerKey]; ok {
+		t.Fatalf("lower-case key %q survived Windows canonicalization", lowerKey)
+	}
+	if envCompatible(lower, upper) {
+		t.Fatal("case variants with conflicting config values remained compatible")
 	}
 }
 
