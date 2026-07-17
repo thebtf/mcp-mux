@@ -167,7 +167,7 @@ func completeStormTemplate(classification classify.SharingMode, cwd string, env 
 	snap := daemonMaterializationSnapshot(false)
 	snap.Classification = classification
 	snap.Cwd = cwd
-	snap.Env = env
+	snap.Env = mergeEnv(env)
 	snap.CachedPrompts = base64.StdEncoding.EncodeToString([]byte(`{"jsonrpc":"2.0","id":"cached-prompts","result":{"prompts":[{"name":"cached-prompt"}]}}`))
 	snap.CachedResources = base64.StdEncoding.EncodeToString([]byte(`{"jsonrpc":"2.0","id":"cached-resources","result":{"resources":[{"uri":"file:///cached"}]}}`))
 	snap.CachedResourceTemplates = base64.StdEncoding.EncodeToString([]byte(`{"jsonrpc":"2.0","id":"cached-resource-templates","result":{"resourceTemplates":[{"uriTemplate":"file:///{path}"}]}}`))

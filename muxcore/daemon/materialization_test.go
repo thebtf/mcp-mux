@@ -30,6 +30,7 @@ func daemonMaterializationSnapshot(persistent bool) mcpsnapshot.OwnerSnapshot {
 		Classification: "shared",
 		CachedInit:     base64.StdEncoding.EncodeToString([]byte(initResp)),
 		CachedTools:    base64.StdEncoding.EncodeToString([]byte(toolsResp)),
+		Env:            mergeEnv(nil),
 		Persistent:     persistent,
 	}
 }
@@ -165,7 +166,7 @@ func TestTemplateCacheRequiresCompatibleContext(t *testing.T) {
 		cwdA := t.TempDir()
 		snap := daemonMaterializationSnapshot(false)
 		snap.Cwd = cwdA
-		snap.Env = map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "same"}
+		snap.Env = mergeEnv(map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "same"})
 		d.updateTemplate(command, nil, snap)
 
 		_, sid, _, err := d.Spawn(control.Request{
@@ -187,7 +188,7 @@ func TestTemplateCacheRequiresCompatibleContext(t *testing.T) {
 		command := "definitely-not-a-real-env-mismatch-command"
 		snap := daemonMaterializationSnapshot(false)
 		snap.Cwd = t.TempDir()
-		snap.Env = map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "A"}
+		snap.Env = mergeEnv(map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "A"})
 		d.updateTemplate(command, nil, snap)
 
 		if _, _, _, err := d.Spawn(control.Request{
@@ -207,7 +208,7 @@ func TestTemplateCacheRequiresCompatibleContext(t *testing.T) {
 		snap := daemonMaterializationSnapshot(false)
 		snap.Classification = "isolated"
 		snap.Cwd = cwdA
-		snap.Env = map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "same"}
+		snap.Env = mergeEnv(map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "same"})
 		d.updateTemplate(command, nil, snap)
 
 		if _, _, _, err := d.Spawn(control.Request{
@@ -228,12 +229,12 @@ func TestTemplateRevisionRevalidatedBeforePromotion(t *testing.T) {
 	env := map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "same"}
 	oldSnap := daemonMaterializationSnapshot(false)
 	oldSnap.Cwd = cwd
-	oldSnap.Env = env
+	oldSnap.Env = mergeEnv(env)
 	d.updateTemplate(command, nil, oldSnap)
 
 	newSnap := daemonMaterializationSnapshot(false)
 	newSnap.Cwd = cwd
-	newSnap.Env = env
+	newSnap.Env = mergeEnv(env)
 	newTools := `{"jsonrpc":"2.0","id":"cached-tools","result":{"tools":[{"name":"new-template-tool"}]}}`
 	newSnap.CachedTools = base64.StdEncoding.EncodeToString([]byte(newTools))
 	var hookCalls atomic.Int32
@@ -271,7 +272,7 @@ func TestTemplateInvalidationPreventsStalePromotion(t *testing.T) {
 	env := map[string]string{"MCPMUX_TEMPLATE_TEST_TOKEN": "same"}
 	snap := daemonMaterializationSnapshot(false)
 	snap.Cwd = cwd
-	snap.Env = env
+	snap.Env = mergeEnv(env)
 	d.updateTemplate(command, nil, snap)
 
 	var hookCalls atomic.Int32
@@ -536,7 +537,7 @@ func TestSerializeSnapshotDuringMaterializationPreservesLiveSession(t *testing.T
 	t.Cleanup(func() { d.Shutdown() })
 	command := "snapshot-materialization-upstream"
 	template := daemonMaterializationSnapshot(false)
-	template.Env = map[string]string{"GITHUB_TOKEN": "snapshot-secret"}
+	template.Env = mergeEnv(map[string]string{"GITHUB_TOKEN": "snapshot-secret"})
 	d.updateTemplate(command, nil, template)
 	path, sid, token, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: t.TempDir(), Env: map[string]string{"GITHUB_TOKEN": "snapshot-secret"}})
 	if err != nil {
@@ -819,6 +820,7 @@ func TestMaterializationFreshSharedTemplateKeepsLiveOwnerIsolated(t *testing.T) 
 	const command = "t044-command"
 	args := []string{"--serve"}
 	env := map[string]string{"SERVICE_CONFIG_PATH": "/cfg/t044"}
+	effectiveEnv := mergeEnv(env)
 	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
 		scanner := bufio.NewScanner(stdin)
 		for scanner.Scan() {
@@ -847,12 +849,12 @@ func TestMaterializationFreshSharedTemplateKeepsLiveOwnerIsolated(t *testing.T) 
 	snap.Classification = "isolated"
 	snap.ClassificationSource = "capability"
 	snap.Cwd = "/project/live"
-	snap.Env = env
+	snap.Env = effectiveEnv
 	o, err := owner.NewOwnerFromSnapshot(owner.OwnerConfig{
 		Command:               command,
 		Args:                  args,
 		Cwd:                   snap.Cwd,
-		Env:                   env,
+		Env:                   effectiveEnv,
 		HandlerFunc:           handler,
 		IPCPath:               shortSocketPath(t, "t044-owner.sock"),
 		ServerID:              sid,
@@ -865,7 +867,7 @@ func TestMaterializationFreshSharedTemplateKeepsLiveOwnerIsolated(t *testing.T) 
 	}
 	defer o.Shutdown()
 	d.mu.Lock()
-	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid, Command: command, Args: args, Cwd: snap.Cwd, Env: env}
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid, Command: command, Args: args, Cwd: snap.Cwd, Env: effectiveEnv}
 	d.mu.Unlock()
 
 	if err := o.StartInitialMaterialization(); err != nil {
@@ -1778,7 +1780,7 @@ func TestRestartCaptureZeroSessionMaterializationBarrier(t *testing.T) {
 			command := "restart-capture-upstream"
 			template := daemonMaterializationSnapshot(false)
 			template.Cwd = "/cached/restart"
-			template.Env = map[string]string{"CACHED_SENTINEL": "old"}
+			template.Env = mergeEnv(map[string]string{"CACHED_SENTINEL": "old"})
 			d.updateTemplate(command, nil, template)
 			path, sid, token, err := d.Spawn(control.Request{Command: command, Mode: "global", Cwd: "/winner/restart", Env: map[string]string{"WINNER_SENTINEL": "winner"}})
 			if err != nil {

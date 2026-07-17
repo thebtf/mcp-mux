@@ -587,16 +587,19 @@ func (o *Owner) materializationStillNeeded(trigger MaterializationTrigger) bool 
 }
 
 func (o *Owner) shouldRetryMaterialization(trigger MaterializationTrigger) bool {
+	o.materializationMu.Lock()
+	retry := o.shouldRetryMaterializationLocked(trigger)
+	o.materializationMu.Unlock()
+	return retry
+}
+
+func (o *Owner) shouldRetryMaterializationLocked(trigger MaterializationTrigger) bool {
 	select {
 	case <-o.materializationStop:
 		return false
 	default:
 	}
-	o.materializationMu.Lock()
-	pending := len(o.pendingDemands)
-	persistenceObligation := o.materializationPolicy == MaterializationPersistent || o.persistentPending
-	o.materializationMu.Unlock()
-	if persistenceObligation || pending > 0 {
+	if o.materializationPolicy == MaterializationPersistent || o.persistentPending || len(o.pendingDemands) > 0 {
 		return true
 	}
 	return (trigger == MaterializationTriggerUpstreamExit || trigger == MaterializationTriggerWriteError) && o.SessionCount() > 0
@@ -1255,7 +1258,9 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 		o.materializationMu.Unlock()
 		return true, o.writeDemandError(s, msg.ID, "duplicate request id while upstream materializes")
 	}
-	if active := o.materializationAttempt; active != nil && !o.launchContextCompatible(active.launch, candidate) {
+	active := o.materializationAttempt
+	postAttemptRecovery := o.materializationState == MaterializationCacheOnly && active != nil
+	if active != nil && !postAttemptRecovery && !o.launchContextCompatible(active.launch, candidate) {
 		o.materializationMu.Unlock()
 		return true, o.writeDemandError(s, msg.ID, "request context incompatible with active upstream materialization")
 	}
@@ -1266,7 +1271,7 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 	demand.timer = time.AfterFunc(materializationDemandTimeout, func() {
 		o.expireLocalDemand(key)
 	})
-	if o.materializationState == MaterializationFinalizing || o.retiringProcess != nil || o.upstreamDead.Load() && o.currentUpstream() != nil {
+	if postAttemptRecovery || o.materializationState == MaterializationFinalizing || o.retiringProcess != nil || o.upstreamDead.Load() && o.currentUpstream() != nil {
 		o.materializationMu.Unlock()
 		return true, nil
 	}
@@ -1764,6 +1769,11 @@ func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger Material
 	o.mu.Unlock()
 	o.retiringProcess = nil
 	o.materializationBlockedErr = nil
+	retry := o.shouldRetryMaterializationLocked(trigger)
+	settlingAttempt := retry && o.materializationAttempt != nil
+	if settlingAttempt && o.restartResumeTrigger == "" {
+		o.restartResumeTrigger = trigger
+	}
 	o.materializationState = MaterializationCacheOnly
 	if o.cacheStage != nil && o.cacheStage.process == proc {
 		o.cacheStage = nil
@@ -1774,9 +1784,9 @@ func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger Material
 	o.deliverInflightResponses(responses)
 	o.clearProactiveTracking()
 	o.retirementRetryProcess.CompareAndSwap(proc, nil)
-	if o.shouldRetryMaterialization(trigger) {
+	if retry && !settlingAttempt {
 		o.startMaterialization(trigger)
-	} else if !o.hasUsableCache() {
+	} else if !retry && !o.hasUsableCache() {
 		o.notifyUpstreamExit()
 	}
 	return true

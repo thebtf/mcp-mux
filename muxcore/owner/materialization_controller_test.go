@@ -2917,6 +2917,201 @@ func TestBlockedMaterializationFinalizationReprovesAutomatically(t *testing.T) {
 	}, "blocked materialization finalization was not automatically re-proven")
 }
 
+func TestRetirementReproofBeforeAttemptFailureStillRestartsLiveOwner(t *testing.T) {
+	var starts atomic.Int32
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"reproof","version":"2"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+	session := newControllerTestSession(o)
+	defer session.close()
+
+	retired := upstream.NewProcessFromHandler(context.Background(), func(context.Context, io.Reader, io.Writer) error { return nil })
+	select {
+	case <-retired.Done:
+	case <-time.After(time.Second):
+		t.Fatal("retired fixture did not exit")
+	}
+	a := newMaterializationAttempt(1, MaterializationTriggerUpstreamExit)
+	a.process = retired
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	o.upstream = retired
+	o.upstreamDead.Store(true)
+	o.mu.Unlock()
+	o.materializationGeneration = 1
+	o.materializationAttempt = a
+	o.materializationState = MaterializationFinalizeBlocked
+	o.materializationBlockedErr = errors.New("synthetic authority remained")
+	o.retiringProcess = retired
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+	o.materializationFinalizationProbe = func(got *upstream.Process) error {
+		if got != retired {
+			return fmt.Errorf("reproof process = %p, want %p", got, retired)
+		}
+		return nil
+	}
+
+	if !o.completeRetiringProcess(retired, MaterializationTriggerUpstreamExit) {
+		t.Fatal("retirement reproof did not succeed")
+	}
+	o.finishMaterializationFailure(a, errors.New("replacement readiness failed"))
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return starts.Load() == 1 && o.MaterializationState() == MaterializationReady
+	}, "live owner did not restart after retirement reproof won the attempt-settlement race")
+}
+
+func TestRetirementReproofKeepsFreshDemandForPostAttemptRecovery(t *testing.T) {
+	var starts atomic.Int32
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"reproof-demand","version":"2"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			case "custom/recover":
+				if err := writeControllerResponse(stdout, req.ID, `{"replacement":true}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+	session := newControllerTestSession(o)
+	defer session.close()
+
+	retired := upstream.NewProcessFromHandler(context.Background(), func(context.Context, io.Reader, io.Writer) error { return nil })
+	select {
+	case <-retired.Done:
+	case <-time.After(time.Second):
+		t.Fatal("retired fixture did not exit")
+	}
+	a := newMaterializationAttempt(1, MaterializationTriggerUpstreamExit)
+	a.process = retired
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	o.upstream = retired
+	o.upstreamDead.Store(true)
+	o.mu.Unlock()
+	o.materializationGeneration = 1
+	o.materializationAttempt = a
+	o.materializationState = MaterializationFinalizeBlocked
+	o.materializationBlockedErr = errors.New("synthetic authority remained")
+	o.retiringProcess = retired
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+	o.materializationFinalizationProbe = func(got *upstream.Process) error {
+		if got != retired {
+			return fmt.Errorf("reproof process = %p, want %p", got, retired)
+		}
+		return nil
+	}
+
+	if !o.completeRetiringProcess(retired, MaterializationTriggerUpstreamExit) {
+		t.Fatal("retirement reproof did not succeed")
+	}
+	msg, err := jsonrpc.Parse([]byte(`{"jsonrpc":"2.0","id":72,"method":"custom/recover","params":{}}`))
+	if err != nil {
+		t.Fatalf("parse recovery demand: %v", err)
+	}
+	handled, err := o.enqueueLocalDemand(session.session, msg)
+	if err != nil {
+		t.Fatalf("enqueue recovery demand: %v", err)
+	}
+	if !handled {
+		t.Fatal("recovery demand bypassed materialization controller")
+	}
+	key := string(remap.Remap(session.session.ID, msg.ID))
+	o.materializationMu.Lock()
+	demand := o.pendingDemands[key]
+	trigger := o.restartResumeTrigger
+	o.materializationMu.Unlock()
+	if trigger != MaterializationTriggerUpstreamExit {
+		t.Fatalf("post-attempt trigger = %q, want %q", trigger, MaterializationTriggerUpstreamExit)
+	}
+	if demand == nil {
+		t.Fatal("recovery demand was not retained")
+	}
+	if demand.generation != 0 {
+		t.Fatalf("recovery demand generation = %d, want 0 until failed attempt settles", demand.generation)
+	}
+
+	o.finishMaterializationFailure(a, errors.New("replacement readiness failed"))
+	result := make(chan controllerResponseResult, 1)
+	go func() { result <- scanControllerResponseWithID(session.read, 72) }()
+	select {
+	case got := <-result:
+		if got.err != nil || !strings.Contains(string(got.response), `"replacement":true`) {
+			t.Fatalf("recovery response: response=%s err=%v", got.response, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recovery demand was not served by the successor generation")
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("successor starts = %d, want 1", got)
+	}
+}
+
 func TestBlockedQueuedWriteDoesNotHoldMaterializationMutex(t *testing.T) {
 	o := newMinimalOwner()
 	var upstream bytes.Buffer

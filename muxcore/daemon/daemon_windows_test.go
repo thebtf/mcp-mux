@@ -131,7 +131,7 @@ func TestWindowsEffectiveEnvUsesShimOverrideForIdentityTemplateAndLaunch(t *test
 	cwd := t.TempDir()
 	template := daemonMaterializationSnapshot(false)
 	template.Cwd = cwd
-	template.Env = shimEnv
+	template.Env = effectiveEnv
 	d.updateTemplate(command, nil, template)
 
 	match, ok := d.getCompatibleTemplate(command, nil, cwd, effectiveEnv)

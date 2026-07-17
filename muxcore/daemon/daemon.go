@@ -912,7 +912,9 @@ func (d *Daemon) updateTemplate(command string, args []string, snap mcpsnapshot.
 // Keeping owner-entry persistence and the matching template under the same
 // critical section prevents mixed-generation daemon state.
 func (d *Daemon) updateTemplateLocked(command string, args []string, snap mcpsnapshot.OwnerSnapshot) (string, uint64, bool) {
-	effectiveEnv := mergeEnv(snap.Env)
+	// OwnerSnapshot.Env is already the pinned daemon-normalized effective launch
+	// environment. Re-merging here would forge successor-only identity fields.
+	effectiveEnv := cloneSnapshotStringMap(snap.Env)
 	envIdentity := envidentity.Build(effectiveEnv)
 	scope, ok := templateScope(snap.Classification, snap.Cwd, envIdentity.Fingerprint)
 	if !ok || snap.CachedInit == "" || snap.CachedTools == "" {

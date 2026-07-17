@@ -3,6 +3,7 @@ package daemon
 import (
 	"io"
 	"log"
+	"os"
 	"testing"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
@@ -22,7 +23,7 @@ func TestTemplateCompatibilityUsesExactEnvAndIsolatedCwd(t *testing.T) {
 	snap := daemonMaterializationSnapshot(false)
 	snap.Classification = "shared"
 	snap.Cwd = "/project/a"
-	snap.Env = env
+	snap.Env = mergeEnv(env)
 	d.updateTemplate(command, args, snap)
 
 	compatible := mergeEnv(map[string]string{
@@ -81,7 +82,7 @@ func TestTemplateIsolationBoundarySurvivesRelaxedFamilyPublish(t *testing.T) {
 			isolatedA := daemonMaterializationSnapshot(false)
 			isolatedA.Classification = "isolated"
 			isolatedA.Cwd = cwdA
-			isolatedA.Env = env
+			isolatedA.Env = mergeEnv(env)
 			d.updateTemplate(command, args, isolatedA)
 
 			relaxedB := isolatedA
@@ -118,5 +119,44 @@ func TestTemplateIsolationBoundarySurvivesRelaxedFamilyPublish(t *testing.T) {
 			assertTemplate(cwdB, "isolated")
 			assertTemplate(cwdC, "")
 		})
+	}
+}
+
+func TestSnapshotTemplatePublicationDoesNotMergeSuccessorEnvironment(t *testing.T) {
+	const successorOnlyKey = "MCPMUX_RESTORE_CONFIG_PATH"
+	original, existed := os.LookupEnv(successorOnlyKey)
+	if err := os.Unsetenv(successorOnlyKey); err != nil {
+		t.Fatalf("unset %s: %v", successorOnlyKey, err)
+	}
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv(successorOnlyKey, original)
+		} else {
+			_ = os.Unsetenv(successorOnlyKey)
+		}
+	})
+
+	predecessorEnv := mergeEnv(nil)
+	if _, leaked := predecessorEnv[successorOnlyKey]; leaked {
+		t.Fatalf("predecessor fixture unexpectedly contains %s", successorOnlyKey)
+	}
+	if err := os.Setenv(successorOnlyKey, "successor-only"); err != nil {
+		t.Fatalf("set %s: %v", successorOnlyKey, err)
+	}
+
+	d := &Daemon{
+		templateCache: make(map[string]*templateFamily),
+		logger:        log.New(io.Discard, "", 0),
+	}
+	snap := daemonMaterializationSnapshot(false)
+	snap.Env = predecessorEnv
+	d.updateTemplate("snapshot-template-env", nil, snap)
+
+	if _, ok := d.getCompatibleTemplate("snapshot-template-env", nil, "/project", predecessorEnv); !ok {
+		t.Fatal("snapshot template lost its captured predecessor environment")
+	}
+	successorEnv := mergeEnv(nil)
+	if _, ok := d.getCompatibleTemplate("snapshot-template-env", nil, "/project", successorEnv); ok {
+		t.Fatal("snapshot template inherited successor-only environment identity")
 	}
 }
