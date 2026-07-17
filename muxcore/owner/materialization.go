@@ -246,6 +246,11 @@ func (o *Owner) startMaterializationLocked(trigger MaterializationTrigger) (*mat
 		return completedMaterializationAttempt(nil), false
 	}
 	if o.restartPins.Load() > 0 {
+		if o.restartResumeTrigger == "" &&
+			(trigger == MaterializationTriggerUpstreamExit || trigger == MaterializationTriggerWriteError) &&
+			o.SessionCount() > 0 {
+			o.restartResumeTrigger = trigger
+		}
 		return completedMaterializationAttempt(errors.New("restart snapshot in progress")), false
 	}
 	select {
@@ -444,6 +449,14 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 		o.launchContextMu.Unlock()
 		if err != nil {
 			o.logger.Printf("upstream materialization start failed generation=%d attempt=%d trigger=%s err=%v", a.generation, attemptNumber, a.trigger, err)
+			if proc != nil {
+				if retireErr := o.retireFailedMaterializationStart(a, proc); retireErr != nil {
+					err = errors.Join(err, retireErr)
+					a.signalStarted(err)
+					o.finishMaterializationFailure(a, err)
+					return
+				}
+			}
 			o.materializationMu.Lock()
 			if o.materializationAttempt == a {
 				a.launchFrozen = false
@@ -607,6 +620,11 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	return signals
+}
+
+func (o *Owner) retireFailedMaterializationStart(a *materializationAttempt, proc *upstream.Process) error {
+	o.installMaterializationProcess(a, proc)
+	return o.retireMaterializationProcess(a, proc)
 }
 
 func (o *Owner) retireMaterializationProcess(a *materializationAttempt, proc *upstream.Process) error {
@@ -1876,6 +1894,9 @@ func (o *Owner) AcquireRestartPin(ctx context.Context) (*RestartPin, error) {
 				return nil, errors.New("restart materialization cancellation: owner shutting down")
 			}
 		}
+	}
+	if a != nil && a.err == nil {
+		launch = nil
 	}
 
 	o.materializationMu.Lock()

@@ -832,6 +832,227 @@ func TestAcquireRestartPinCancelsMaterializationAndFreezesSnapshot(t *testing.T)
 	}
 }
 
+func TestAcquireRestartPinPreservesSettledReelectedLaunchContext(t *testing.T) {
+	firstInit := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstOnce sync.Once
+	var releaseOnce sync.Once
+	var starts atomic.Int32
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	defer release()
+
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		generation := starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if generation == 1 {
+					firstOnce.Do(func() { close(firstInit) })
+					<-releaseFirst
+				}
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"sharing":"isolated"}},"serverInfo":{"name":"restart-pin","version":"1"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		Cwd:                   "/project/pre-wait",
+		Env:                   map[string]string{"CONFIG_PATH": "pre-wait"},
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+	retained := newControllerTestSession(o)
+	defer retained.close()
+	retained.session.Cwd = "/project/reelected"
+	retained.session.Env = map[string]string{"CONFIG_PATH": "reelected"}
+
+	attempt := o.startMaterialization(MaterializationTriggerUpstreamExit)
+	select {
+	case <-firstInit:
+	case <-time.After(time.Second):
+		t.Fatal("materialization did not reach the pre-wait generation")
+	}
+
+	type pinResult struct {
+		pin *RestartPin
+		err error
+	}
+	resultCh := make(chan pinResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() {
+		pin, acquireErr := o.AcquireRestartPin(ctx)
+		resultCh <- pinResult{pin: pin, err: acquireErr}
+	}()
+	waitForCondition(t, time.Second, func() bool {
+		o.materializationMu.Lock()
+		defer o.materializationMu.Unlock()
+		return o.restartPins.Load() == 1 && attempt.launchFrozen && o.restartResumeTrigger == MaterializationTriggerUpstreamExit
+	}, "restart pin did not freeze the pre-wait launch")
+	release()
+
+	var result pinResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("AcquireRestartPin did not settle")
+	}
+	if result.err != nil {
+		t.Fatalf("AcquireRestartPin: %v", result.err)
+	}
+	defer result.pin.Release()
+	if attempt.err != nil {
+		t.Fatalf("re-elected materialization failed: %v", attempt.err)
+	}
+	if result.pin.Snapshot.Cwd != retained.session.Cwd || result.pin.Snapshot.Env["CONFIG_PATH"] != "reelected" {
+		t.Fatalf("restart snapshot context = %+v, want settled re-elected context", result.pin.Snapshot)
+	}
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("upstream starts = %d, want pre-wait plus one re-elected generation", got)
+	}
+	result.pin.Release()
+	time.Sleep(50 * time.Millisecond)
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("pin release started duplicate generation: got %d starts, want 2", got)
+	}
+}
+
+func TestRestartPinDefersLiveRecoveryUntilFinalRelease(t *testing.T) {
+	var starts atomic.Int32
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"restart-resume","version":"1"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, controllerSnapshot())
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	defer o.Shutdown()
+	s := newControllerTestSession(o)
+	defer s.close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	firstPin, err := o.AcquireRestartPin(ctx)
+	if err != nil {
+		t.Fatalf("first AcquireRestartPin: %v", err)
+	}
+	defer firstPin.Release()
+	finalPin, err := o.AcquireRestartPin(ctx)
+	if err != nil {
+		t.Fatalf("second AcquireRestartPin: %v", err)
+	}
+	defer finalPin.Release()
+
+	for _, trigger := range []MaterializationTrigger{MaterializationTriggerUpstreamExit, MaterializationTriggerWriteError} {
+		blocked := o.startMaterialization(trigger)
+		if blocked.err == nil || !strings.Contains(blocked.err.Error(), "restart snapshot in progress") {
+			t.Fatalf("%s start while pinned = %v, want restart barrier", trigger, blocked.err)
+		}
+	}
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("pinned recovery started %d generations, want 0", got)
+	}
+	firstPin.Release()
+	time.Sleep(50 * time.Millisecond)
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("non-final pin release started %d generations, want 0", got)
+	}
+	finalPin.Release()
+	waitForCondition(t, 2*time.Second, func() bool {
+		return starts.Load() == 1 && o.MaterializationState() == MaterializationReady
+	}, "final pin release did not restore live-session recovery")
+	time.Sleep(50 * time.Millisecond)
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("deferred recovery started %d generations, want exactly 1", got)
+	}
+}
+
+func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.T) {
+	o := newMinimalOwner()
+	defer close(o.materializationStop)
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	})
+	a := newMaterializationAttempt(1, MaterializationTriggerUpstreamExit)
+	o.materializationAttempt = a
+	o.materializationState = MaterializationMaterializing
+
+	var sawExactAuthority atomic.Bool
+	o.materializationFinalizationProbe = func(got *upstream.Process) error {
+		sawExactAuthority.Store(got == proc)
+		return errors.New("synthetic failed-start authority remains")
+	}
+	retireErr := o.retireFailedMaterializationStart(a, proc)
+	if retireErr == nil || !strings.Contains(retireErr.Error(), "authority remains") {
+		t.Fatalf("failed-start retirement = %v, want unproven authority", retireErr)
+	}
+	startErr := errors.New("synthetic start failed after authority install")
+	o.finishMaterializationFailure(a, errors.Join(startErr, retireErr))
+
+	if !sawExactAuthority.Load() {
+		t.Fatal("failed-start finalization did not receive the installed process authority")
+	}
+	if got := o.currentUpstream(); got != proc {
+		t.Fatalf("authoritative failed-start process = %p, want %p", got, proc)
+	}
+	if a.process != proc || o.retiringProcess != proc || o.MaterializationState() != MaterializationFinalizeBlocked {
+		t.Fatalf("failed-start authority was not retained: attempt=%p retiring=%p status=%#v", a.process, o.retiringProcess, o.Status())
+	}
+	blocked := o.startMaterialization(MaterializationTriggerUpstreamExit)
+	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "authority remains") {
+		t.Fatalf("replacement start while failed-start authority remained = %v", blocked.err)
+	}
+}
+
 func TestUnprovenFinalizationBlocksReplacementGeneration(t *testing.T) {
 	var starts atomic.Int32
 	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
