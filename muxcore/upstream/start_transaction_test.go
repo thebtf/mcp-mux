@@ -119,3 +119,93 @@ func TestRetirementProvenRequiresDoneAndTreeAuthority(t *testing.T) {
 		t.Fatal("committed authority transfer should be terminal for predecessor owner")
 	}
 }
+
+func TestStartPostAuthorityFailureRetainsUnprovenProcessAuthority(t *testing.T) {
+	pidFile := t.TempDir() + string(os.PathSeparator) + "descendant.pid"
+	setupErr := errors.New("injected post-authority failure")
+	retirementErr := errors.New("injected unproven retirement")
+	var captured *Process
+	var leaderPID int
+	var descendantPID int
+
+	previousStartHook := startPostAuthorityHook
+	previousFinalizer := finalizeFailedStartTree
+	startPostAuthorityHook = func(p *Process) error {
+		captured = p
+		leaderPID = p.PID()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(pidFile)
+			if err == nil {
+				text := strings.TrimSpace(string(data))
+				if text == "" {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				pid, parseErr := strconv.Atoi(text)
+				if parseErr != nil {
+					return fmt.Errorf("parse descendant pid: %w", parseErr)
+				}
+				descendantPID = pid
+				return setupErr
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("read descendant pid: %w", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return errors.New("descendant pid was not published")
+	}
+	finalizeFailedStartTree = func(*Process) error { return retirementErr }
+	t.Cleanup(func() {
+		startPostAuthorityHook = previousStartHook
+		finalizeFailedStartTree = previousFinalizer
+		if captured != nil && !captured.RetirementProven() {
+			_ = captured.finalizeOwnedTree()
+		}
+		if leaderPID > 0 && upstreamTestProcessAlive(leaderPID) {
+			killUpstreamTestProcess(leaderPID)
+		}
+		if descendantPID > 0 && upstreamTestProcessAlive(descendantPID) {
+			killUpstreamTestProcess(descendantPID)
+		}
+	})
+
+	env := make(map[string]string)
+	for _, item := range os.Environ() {
+		key, value, ok := strings.Cut(item, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	env[startFailureRoleEnv] = "leader"
+	env[startFailurePIDFileEnv] = pidFile
+
+	proc, err := Start(os.Args[0], []string{"-test.run=^TestStartPostAuthorityFailureFinalizesProcessTree$"}, env, "", nil)
+	if proc == nil {
+		t.Fatal("Start() process = nil, want retained unproven authority")
+	}
+	if proc != captured {
+		t.Fatal("Start() did not return the installed Process authority")
+	}
+	if !errors.Is(err, setupErr) || !errors.Is(err, retirementErr) {
+		t.Fatalf("Start() error = %v, want setup and retirement failures", err)
+	}
+	select {
+	case <-proc.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Process.Done did not report failed-start leader completion")
+	}
+	if proc.RetirementProven() {
+		t.Fatal("leader completion without tree finalization proved retirement")
+	}
+	if err := proc.Close(); err != nil {
+		t.Fatalf("Close() retry after failed start: %v", err)
+	}
+	if !proc.RetirementProven() {
+		t.Fatal("Close() retry did not prove failed-start retirement")
+	}
+	if upstreamTestProcessAlive(descendantPID) {
+		t.Fatalf("descendant pid %d still alive after retry", descendantPID)
+	}
+}

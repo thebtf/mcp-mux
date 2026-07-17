@@ -32,17 +32,26 @@ import (
 // and any error from the kill escalation. A non-nil error signals that a forced
 // kill occurred (either GracefulKill failed, kill succeeded after timeout, or the
 // handler did not exit within timeout).
-// Safe to call after Close() — returns (0, nil) if already closed or detached.
+// Safe to call after Close() — returns (0, nil) if already closed or authority was transferred.
 func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 	p.closeMu.Lock()
 	defer p.closeMu.Unlock()
 
 	p.mu.Lock()
-	if p.closed || p.detach != detachAttached {
+	if p.closed {
 		p.mu.Unlock()
 		return 0, nil
 	}
-	p.retiring = true
+	switch p.detach {
+	case detachLegacy, detachCommitted:
+		p.mu.Unlock()
+		return 0, nil
+	case detachPrepared, detachAborted:
+		p.mu.Unlock()
+		return 0, p.AbortDetach()
+	case detachAttached:
+		p.retiring = true
+	}
 	p.mu.Unlock()
 
 	if p.stdin != nil {
@@ -277,6 +286,8 @@ func (p *Process) SetDrainTimeout(d time.Duration) {
 // exists and verify Start does not return before the full tree is retired.
 var startPostAuthorityHook = func(*Process) error { return nil }
 
+var finalizeFailedStartTree = func(p *Process) error { return p.finalizeOwnedTree() }
+
 func Start(command string, args []string, env map[string]string, cwd string, logger *log.Logger) (*Process, error) {
 	var merged []string
 	if len(env) > 0 {
@@ -409,7 +420,11 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	}
 	if err := startPostAuthorityHook(p); err != nil {
 		finalizeErr := finalizeFailedStart(p, proc, stdoutR, stdoutW, stderrR, stderrW)
-		return nil, errors.Join(err, finalizeErr)
+		startErr := errors.Join(err, finalizeErr)
+		if !p.RetirementProven() {
+			return p, startErr
+		}
+		return nil, startErr
 	}
 
 	// Close our copy of the write end — the child inherited its own copy via
@@ -452,20 +467,34 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	return p, nil
 }
 
+func observeFailedStartLeader(p *Process, proc *procgroup.Process) {
+	if proc == nil {
+		close(p.Done)
+		return
+	}
+	go func() {
+		p.ExitErr = proc.Wait()
+		close(p.Done)
+	}()
+}
+
 func finalizeFailedStart(p *Process, proc *procgroup.Process, pipes ...*os.File) error {
+	p.mu.Lock()
+	p.retiring = true
+	p.mu.Unlock()
+	observeFailedStartLeader(p, proc)
+
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
 
-	finalizeErr := terminateProcessTree(p)
+	finalizeErr := finalizeFailedStartTree(p)
 	if finalizeErr != nil && proc != nil {
 		finalizeErr = errors.Join(finalizeErr, proc.Kill())
 	}
-	if proc != nil {
-		// procgroup.Done closes only after the leader and its platform-owned
-		// descendants are reaped. Blocking here is deliberate: a setup error is
-		// not allowed to escape while a child tree can still be alive.
-		<-proc.Done()
+	if finalizeErr == nil {
+		<-p.Done
+		p.markClosed()
 	}
 	for _, pipe := range pipes {
 		if pipe != nil {

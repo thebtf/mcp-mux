@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -73,5 +74,19 @@ func TestSoftClose_UpstreamIgnoresStdinClose_FallsBackToKill(t *testing.T) {
 		// good — process was killed
 	case <-time.After(10 * time.Second):
 		t.Fatal("process not done after SoftClose forced kill path")
+	}
+}
+
+func TestSoftCloseRetriesAbortedDetachFinalization(t *testing.T) {
+	for _, state := range []detachState{detachPrepared, detachAborted} {
+		t.Run(fmt.Sprint(state), func(t *testing.T) {
+			p := &Process{detach: state, Done: make(chan struct{})}
+			if _, err := p.SoftClose(time.Millisecond); err != nil {
+				t.Fatalf("SoftClose() after detach state %d: %v", state, err)
+			}
+			if !p.RetirementProven() {
+				t.Fatalf("SoftClose() did not prove retirement for detach state %d", state)
+			}
+		})
 	}
 }
