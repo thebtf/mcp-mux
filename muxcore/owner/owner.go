@@ -45,12 +45,6 @@ type (
 	SessionSnapshot = snapshot.SessionSnapshot
 )
 
-const (
-	upstreamRespawnWaitTimeout = 30 * time.Second
-	upstreamRespawnInitialWait = 100 * time.Millisecond
-	upstreamRespawnMaxWait     = 2 * time.Second
-)
-
 // Constructor aliases.
 var (
 	NewSession              = session.NewSession
@@ -99,6 +93,7 @@ type InflightRequest struct {
 	Tool      string    `json:"tool,omitempty"`
 	SessionID int       `json:"session"`
 	StartTime time.Time `json:"started_at"`
+	process   atomic.Pointer[upstream.Process]
 }
 
 // proactiveRequest is claimed exactly once by its response or bound upstream death.
@@ -134,11 +129,13 @@ type Owner struct {
 	serverID                    string    // server identity hash
 	listener                    net.Listener
 	logger                      *log.Logger
-	onZeroSessions              func(serverID string)
 
-	onUpstreamExit       func(serverID string)
-	onPersistentDetected func(serverID string)
-	onCacheReady         func(serverID string)
+	onZeroSessions       func(*Owner)
+	onUpstreamExit       func(*Owner)
+	onPersistentDetected func(*Owner)
+	onPersistentResolved func(*Owner, bool)
+	onCacheReady         func(*Owner, OwnerSnapshot) bool
+	onCacheInvalidated   func(*Owner)
 
 	// authorizeSession is the optional pre-dispatch session-admission gate
 	// forwarded from engine.Config / daemon.Config / OwnerConfig. nil = no
@@ -197,27 +194,50 @@ type Owner struct {
 	startTime               time.Time
 	controlServer           *control.Server
 
-	shutdownOnce      sync.Once
-	closeListenerOnce sync.Once
-	isAccepting       atomic.Bool
-	listenerDone      chan struct{} // closed when IPC listener is intentionally stopped
-	done              chan struct{}
+	shutdownOnce            sync.Once
+	teardownOnce            sync.Once
+	removalMu               sync.Mutex
+	handoffPrepared         bool // guarded by removalMu; rejects duplicate transfer preparation
+	handoffAbortRequested   bool // guarded by removalMu; permits only explicit abort retirement retries
+	closeListenerOnce       sync.Once
+	isAccepting             atomic.Bool
+	admissionFrozen         atomic.Bool
+	pendingAdmissionsPurged atomic.Int64
+	listenerDone            chan struct{} // closed when IPC listener is intentionally stopped
+	done                    chan struct{}
 
-	// backgroundSpawnCh is non-nil for owners created via NewOwnerFromSnapshot,
-	// where the upstream is started asynchronously via SpawnUpstreamBackground.
-	// It is closed (under mu) when background spawn finishes (success or failure),
-	// allowing Serve to block instead of treating nil upstream as dead.
-	backgroundSpawnCh         chan struct{}
-	beforeBackgroundSpawnWait func() // test-only synchronization seam; nil in production
-	afterProactiveStore       func() // test-only registration race seam
-
-	respawnMu sync.Mutex
-	respawn   *upstreamRespawn
-}
-
-type upstreamRespawn struct {
-	done chan struct{}
-	err  error
+	restartPins atomic.Int64
+	// Lock order is launchContextMu, upstreamEventMu, materializationMu,
+	// admissionMu, then mu. launchContextMu fences final session-context
+	// validation and upstream.Start against owner-side session detachment.
+	// Writers never hold upstreamEventMu across process Close/SoftClose; readers
+	// may hold it across bounded session I/O. admissionMu serializes token bind +
+	// session registration against coherent classification commits.
+	launchContextMu                  sync.Mutex
+	upstreamEventMu                  sync.RWMutex
+	materializationMu                sync.Mutex
+	admissionMu                      sync.Mutex
+	materializationPolicy            MaterializationPolicy
+	materializationState             MaterializationState
+	materializationTrigger           MaterializationTrigger
+	materializationGeneration        uint64
+	materializationAttempt           *materializationAttempt
+	retiringProcess                  *upstream.Process
+	materializationBlockedErr        error
+	retirementRetryProcess           atomic.Pointer[upstream.Process]
+	materializationStop              chan struct{}
+	pendingDemands                   map[string]*localDemand
+	pendingDemandOrder               []string
+	persistentPending                bool
+	persistentRequired               bool
+	restartResumeTrigger             MaterializationTrigger
+	materializationFinalizationProbe func(*upstream.Process) error
+	beforeQueuedDemandWrite          func()
+	afterQueuedDemandWrite           func() // test-only post-write/pre-ready cancellation seam
+	beforeLocalDemandCancel          func()
+	afterProactiveStore              func()                  // test-only registration race seam
+	beforeCurrentUpstreamWrite       func(*upstream.Process) // test-only generation race seam
+	cacheStage                       *cacheStage
 }
 
 // OwnerConfig holds parameters for creating an Owner.
@@ -240,28 +260,47 @@ type OwnerConfig struct {
 	// ServerID is the server identity hash. Used in callbacks to identify this owner.
 	ServerID string
 
-	// OnZeroSessions is called when the last session disconnects.
-	// If nil, the owner does not auto-shutdown on zero sessions (legacy behavior
-	// shuts down only on upstream exit or signal).
-	OnZeroSessions func(serverID string)
+	// OnZeroSessions is called with the exact owner whose last session left.
+	// If nil, the owner does not auto-shutdown on zero sessions.
+	OnZeroSessions func(*Owner)
 
-	// OnUpstreamExit is called when the upstream process exits.
-	// If nil, the owner auto-shuts down (legacy behavior).
-	OnUpstreamExit func(serverID string)
+	// OnUpstreamExit is called with the exact owner whose controller cannot
+	// recover the upstream. If nil, the owner auto-shuts down.
+	OnUpstreamExit func(*Owner)
 
-	// OnPersistentDetected is called when the upstream declares x-mux.persistent: true.
-	// Used by the daemon to mark the owner entry as persistent.
-	OnPersistentDetected func(serverID string)
+	// OnPersistentDetected latches a fresh generation's early persistent=true
+	// declaration before coherent discovery commit.
+	OnPersistentDetected func(*Owner)
 
-	// OnCacheReady is called when the owner has cached both init and tools/list responses.
-	// Used by the daemon to update the template cache for instant isolated server spawns.
-	OnCacheReady func(serverID string)
+	// OnCacheReady synchronously publishes one coherent cache/template snapshot.
+	// Returning false rejects a stale owner generation and aborts the commit.
+	OnCacheReady func(*Owner, OwnerSnapshot) bool
+
+	// OnCacheInvalidated removes only this exact owner's daemon template.
+	OnCacheInvalidated func(*Owner)
+
+	// OnPersistentResolved receives a coherent generation's exact persistence
+	// verdict for non-template consumers.
+	OnPersistentResolved func(*Owner, bool)
+
+	// MaterializationPolicy controls owners created without a live upstream.
+	// The zero value is eager, preserving existing direct consumer behavior.
+	MaterializationPolicy MaterializationPolicy
+	// DeferInitialMaterialization lets the daemon register the exact OwnerEntry
+	// before a fast upstream can publish its first cache generation.
+	DeferInitialMaterialization bool
 
 	// TokenHandshake enables reading the shim's handshake token from each new IPC
 	// connection before the MCP session begins. Only set true when the owner is
 	// managed by the global daemon — shims always send a token in that mode.
 	// Legacy and test connections do not send a token; leave this false (default).
 	TokenHandshake bool
+	// PersistentPending protects cache-only restored owners from eviction until
+	// live discovery resolves x-mux.persistent.
+	PersistentPending bool
+	// PersistentRequired is an external daemon policy that fresh discovery may
+	// not downgrade.
+	PersistentRequired bool
 
 	// HandlerFunc is an in-process MCP server implementation.
 	// When set, Owner runs the handler via io.Pipe instead of spawning a subprocess.
@@ -292,6 +331,10 @@ type OwnerConfig struct {
 	// successor adopts its result directly.
 	CachedClassification classify.SharingMode
 
+	// AdoptedSnapshot carries the predecessor's coherent cache into a live
+	// process-backed handoff. It is in-memory only and adds no persistence field.
+	AdoptedSnapshot *OwnerSnapshot
+
 	// AuthorizeSession, when non-nil, gates every accepted session BEFORE
 	// AddSession is called. acceptLoop invokes the callback with peer
 	// credentials + project context and acts on the returned SessionAuth:
@@ -319,10 +362,9 @@ type OwnerConfig struct {
 	Logger *log.Logger
 }
 
-// NewOwnerFromSnapshot creates an Owner with pre-populated caches from a snapshot.
-// Does NOT spawn the upstream process — caller must call SpawnUpstreamBackground()
-// after the owner is registered in the daemon. The owner serves cached responses
-// immediately (cache-first mode) while the upstream starts in the background.
+// NewOwnerFromSnapshot creates a cache-backed Owner without a live upstream.
+// The caller chooses eager, persistent, or demand-driven materialization via
+// OwnerConfig.MaterializationPolicy after registering the owner in the daemon.
 func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	logger := cfg.Logger
 	if logger == nil {
@@ -343,32 +385,31 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		cwdSet[cfg.Cwd] = true
 	}
 	o := &Owner{
-		proactiveNamespace:   nextProactiveNamespace(),
-		ipcPath:              cfg.IPCPath,
-		cwd:                  cfg.Cwd,
-		cwdSet:               cwdSet,
-		command:              cfg.Command,
-		args:                 cfg.Args,
-		env:                  cfg.Env,
-		handlerFunc:          cfg.HandlerFunc,
-		sessionHandler:       cfg.SessionHandler,
-		serverID:             cfg.ServerID,
-		listener:             ln,
-		logger:               logger,
-		onZeroSessions:       cfg.OnZeroSessions,
-		onUpstreamExit:       cfg.OnUpstreamExit,
-		onPersistentDetected: cfg.OnPersistentDetected,
-		onCacheReady:         cfg.OnCacheReady,
-		authorizeSession:     cfg.AuthorizeSession,
-		onFrameReceived:      cfg.OnFrameReceived,
-		sessions:             make(map[int]*Session),
-		cachedInitSessions:   make(map[int]bool),
-		sessionMgr:           NewSessionManager(),
-		tokenHandshake:       cfg.TokenHandshake,
-		// rejectionLogger is created lazily below, only when tokenHandshake is
-		// enabled — legacy/test owners with tokenHandshake=false never rate-limit
-		// anything, so the per-Owner ticker goroutine adds cost without value
-		// (measurable scheduler pressure on CI under -race with many owners).
+		proactiveNamespace:     nextProactiveNamespace(),
+		ipcPath:                cfg.IPCPath,
+		cwd:                    cfg.Cwd,
+		cwdSet:                 cwdSet,
+		command:                cfg.Command,
+		args:                   cfg.Args,
+		env:                    cfg.Env,
+		handlerFunc:            cfg.HandlerFunc,
+		sessionHandler:         cfg.SessionHandler,
+		upstreamWriter:         cfg.UpstreamWriter,
+		serverID:               cfg.ServerID,
+		listener:               ln,
+		logger:                 logger,
+		onZeroSessions:         cfg.OnZeroSessions,
+		onUpstreamExit:         cfg.OnUpstreamExit,
+		onPersistentDetected:   cfg.OnPersistentDetected,
+		onPersistentResolved:   cfg.OnPersistentResolved,
+		onCacheReady:           cfg.OnCacheReady,
+		onCacheInvalidated:     cfg.OnCacheInvalidated,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
+		sessions:               make(map[int]*Session),
+		cachedInitSessions:     make(map[int]bool),
+		sessionMgr:             NewSessionManager(),
+		tokenHandshake:         cfg.TokenHandshake,
 		autoClassification:     snap.Classification,
 		classificationSource:   snap.ClassificationSource,
 		classificationReason:   snap.ClassificationReason,
@@ -381,7 +422,15 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
-		backgroundSpawnCh:      make(chan struct{}),
+		materializationPolicy:  cfg.MaterializationPolicy,
+		materializationState:   MaterializationCacheOnly,
+		persistentRequired:     cfg.PersistentRequired,
+		materializationStop:    make(chan struct{}),
+		pendingDemands:         make(map[string]*localDemand),
+		persistentPending:      cfg.PersistentPending,
+	}
+	if cfg.UpstreamWriter != nil || (cfg.SessionHandler != nil && cfg.HandlerFunc == nil) {
+		o.materializationState = MaterializationReady
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
 
@@ -392,42 +441,14 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		imported := o.sessionMgr.ImportBoundHistory(boundTokenSnapshotsToSession(snap.BoundTokens))
 		logger.Printf("owner restored %d reconnect token history entries from snapshot", imported)
 	}
-
-	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
-	o.cacheHandlerInterfaces()
-
-	// Pre-populate caches from snapshot
-	if snap.CachedInit != "" {
-		if data, err := Base64Decode(snap.CachedInit); err == nil {
-			o.initResp = data
-			o.initDone = true
-		}
-	}
-	if snap.CachedTools != "" {
-		if data, err := Base64Decode(snap.CachedTools); err == nil {
-			o.toolList = data
-		}
-	}
-	if snap.CachedPrompts != "" {
-		if data, err := Base64Decode(snap.CachedPrompts); err == nil {
-			o.promptList = data
-		}
-	}
-	if snap.CachedResources != "" {
-		if data, err := Base64Decode(snap.CachedResources); err == nil {
-			o.resourceList = data
-		}
-	}
-	if snap.CachedResourceTemplates != "" {
-		if data, err := Base64Decode(snap.CachedResourceTemplates); err == nil {
-			o.resourceTemplateList = data
-		}
-	}
+	// Pre-populate one coherent cache generation from the snapshot.
+	o.hydrateSnapshotCache(snap)
 
 	// Close initReady and classified immediately — caches already populated
 	o.initReadyOnce.Do(func() { close(o.initReady) })
 	o.classifiedOnce.Do(func() { close(o.classified) })
 
+	o.cacheHandlerInterfaces()
 	// Wire notifier into sessionHandler if it supports NotifierAware.
 	if o.sessionHandler != nil {
 		if na, ok := o.sessionHandler.(muxcore.NotifierAware); ok {
@@ -457,93 +478,63 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	return o, nil
 }
 
+// hydrateSnapshotCache installs a previously committed cache generation before
+// any owner goroutine starts. Callers must provide exclusive construction-time
+// ownership of o.
+func (o *Owner) hydrateSnapshotCache(snap OwnerSnapshot) {
+	o.autoClassification = snap.Classification
+	o.classificationSource = snap.ClassificationSource
+	o.classificationReason = append([]string(nil), snap.ClassificationReason...)
+	if snap.CachedInit != "" {
+		if data, err := Base64Decode(snap.CachedInit); err == nil {
+			o.initResp = data
+			o.initDone = true
+		}
+	}
+	if snap.CachedTools != "" {
+		if data, err := Base64Decode(snap.CachedTools); err == nil {
+			o.toolList = data
+		}
+	}
+	if snap.CachedPrompts != "" {
+		if data, err := Base64Decode(snap.CachedPrompts); err == nil {
+			o.promptList = data
+		}
+	}
+	if snap.CachedResources != "" {
+		if data, err := Base64Decode(snap.CachedResources); err == nil {
+			o.resourceList = data
+		}
+	}
+	if snap.CachedResourceTemplates != "" {
+		if data, err := Base64Decode(snap.CachedResourceTemplates); err == nil {
+			o.resourceTemplateList = data
+		}
+	}
+	o.applyCachedRuntimeSettings()
+}
+
+// applyCachedRuntimeSettings restores server-declared runtime policy from the
+// cached initialize response before a restored or handoff-adopted owner becomes
+// visible. Cache hydration deliberately does not invoke persistence callbacks:
+// daemon registration is not complete during construction.
+func (o *Owner) applyCachedRuntimeSettings() {
+	if len(o.initResp) == 0 {
+		return
+	}
+	o.parseDrainTimeout(o.initResp)
+	o.parseToolTimeout(o.initResp)
+	o.parseIdleTimeout(o.initResp)
+	if sec := classify.ParseProgressInterval(o.initResp); sec > 0 {
+		o.progressIntervalNs.Store(int64(time.Duration(sec) * time.Second))
+		o.logger.Printf("x-mux capability: progressInterval=%ds", sec)
+	}
+}
+
 // SpawnUpstreamBackground starts the upstream process in a goroutine and runs
 // proactive init to refresh caches. Called after NewOwnerFromSnapshot when the
 // owner is registered in the daemon. If upstream fails, owner continues serving
 // stale cached responses.
-func (o *Owner) SpawnUpstreamBackground() {
-	go func() {
-		// Check if owner is already shutting down before spawning
-		select {
-		case <-o.done:
-			return
-		default:
-		}
-		if o.sessionHandler != nil && o.handlerFunc == nil {
-			o.logger.Printf("background SessionHandler-only spawn: no upstream process")
-			o.finishBackgroundSpawn()
-			return
-		}
-
-		var proc *upstream.Process
-		var err error
-		if o.handlerFunc != nil {
-			proc = upstream.NewProcessFromHandler(context.Background(), o.handlerFunc)
-			o.logger.Printf("background handler spawn: in-process (no subprocess)")
-		} else {
-			// CRITICAL: pass o.env (captured at owner creation), NOT nil.
-			// upstream.Start treats nil env as "inherit daemon os.Environ()",
-			// which loses MCP-config-specific vars like CCLSP_CONFIG_PATH that
-			// only exist in the spawning shim's env, not in the daemon's.
-			// Observed failure: cclsp respawn emits
-			//   "Error: configPath is required when CCLSP_CONFIG_PATH environment variable is not set"
-			// on background respawn (first spawn used ownerCfg.Env correctly;
-			// this path dropped it). Causes 3+ minute recovery loops while
-			// suture retries via FailureBackoff.
-			proc, err = upstream.Start(o.command, o.args, o.env, o.cwd, o.logger)
-		}
-		if err != nil {
-			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
-			o.finishBackgroundSpawn()
-			return
-		}
-
-		// Check again after spawn — owner may have shut down while process was starting
-		select {
-		case <-o.done:
-			proc.Close()
-			o.finishBackgroundSpawn()
-			return
-		default:
-		}
-
-		o.mu.Lock()
-		o.upstream = proc
-		// Keep public cached readiness intact while a separate generation-local
-		// proactive handshake proves this new process is lifecycle-ready.
-		hadCachedLists := o.toolList != nil || o.promptList != nil ||
-			o.resourceList != nil || o.resourceTemplateList != nil
-		if hadCachedLists {
-			// Keep snapshot list caches usable while the replacement upstream is
-			// warming. Clearing here creates a startup race: clients that already
-			// received cached initialize can miss cached tools/list and block on
-			// the live upstream until their MCP startup timeout expires. The first
-			// fresh tools/list response below will replace the tools cache, clear
-			// non-refreshed prompt/resource caches, and broadcast list_changed.
-			o.listChangedAfterRefresh.Store(true)
-		}
-		o.mu.Unlock()
-
-		// Start reading and monitoring before initialization so a failed generation
-		// always releases the pending background-spawn gate.
-		go o.readUpstream(proc)
-		go o.monitorUpstreamExit(proc)
-
-		// Keep backgroundSpawnCh pending until the new generation has answered
-		// initialize and notifications/initialized has been written. This prevents
-		// the first uncached request from overtaking the MCP lifecycle handshake.
-		o.sendProactiveInit(proc, o.finishBackgroundSpawn)
-	}()
-}
-
-func (o *Owner) finishBackgroundSpawn() {
-	o.mu.Lock()
-	if o.backgroundSpawnCh != nil {
-		close(o.backgroundSpawnCh)
-		o.backgroundSpawnCh = nil
-	}
-	o.mu.Unlock()
-}
 
 // NewOwner creates and starts a new Owner.
 // It spawns the upstream process and starts the IPC listener.
@@ -555,67 +546,37 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		logger = log.Default()
 	}
 
-	// Spawn upstream — either in-process handler, subprocess, injected writer, or neither (SessionHandler-only).
-	var proc *upstream.Process
-	if cfg.UpstreamWriter != nil {
-		// Writer-injection mode: skip subprocess spawn entirely.
-		// writeUpstream routes bytes directly into the caller's writer.
-		// Intended for tests that exercise pure JSON-building methods without
-		// the subprocess-timing flake class. No upstream process, no exit event.
-		logger.Printf("owner: writer-injection mode (no subprocess)")
-	} else if cfg.SessionHandler != nil && cfg.HandlerFunc == nil {
-		// SessionHandler-only: no upstream process needed.
-		// Requests dispatch directly via dispatchToSessionHandler.
-		logger.Printf("owner: SessionHandler-only mode (no upstream process)")
-	} else if cfg.HandlerFunc != nil {
-		proc = upstream.NewProcessFromHandler(context.Background(), cfg.HandlerFunc)
-		logger.Printf("owner: started in-process handler (no subprocess)")
-	} else {
-		var err error
-		proc, err = upstream.Start(cfg.Command, cfg.Args, cfg.Env, cfg.Cwd, logger)
-		if err != nil {
-			return nil, fmt.Errorf("owner: start upstream: %w", err)
-		}
-	}
-
-	// Start IPC listener
 	ln, err := ipc.Listen(cfg.IPCPath)
 	if err != nil {
-		if proc != nil {
-			proc.Close()
-		}
 		return nil, fmt.Errorf("owner: listen %s: %w", cfg.IPCPath, err)
 	}
 
 	o := &Owner{
-		upstream:             proc,
-		ipcPath:              cfg.IPCPath,
-		cwd:                  cfg.Cwd,
-		cwdSet:               map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
-		command:              cfg.Command,
-		args:                 cfg.Args,
-		env:                  cfg.Env,
-		handlerFunc:          cfg.HandlerFunc,
-		proactiveNamespace:   nextProactiveNamespace(),
-		sessionHandler:       cfg.SessionHandler,
-		upstreamWriter:       cfg.UpstreamWriter,
-		serverID:             cfg.ServerID,
-		listener:             ln,
-		logger:               logger,
-		onZeroSessions:       cfg.OnZeroSessions,
-		onUpstreamExit:       cfg.OnUpstreamExit,
-		onPersistentDetected: cfg.OnPersistentDetected,
-		onCacheReady:         cfg.OnCacheReady,
-		authorizeSession:     cfg.AuthorizeSession,
-		onFrameReceived:      cfg.OnFrameReceived,
-		sessions:             make(map[int]*Session),
-		cachedInitSessions:   make(map[int]bool),
-		sessionMgr:           NewSessionManager(),
-		tokenHandshake:       cfg.TokenHandshake,
-		// rejectionLogger is created lazily below, only when tokenHandshake is
-		// enabled — legacy/test owners with tokenHandshake=false never rate-limit
-		// anything, so the per-Owner ticker goroutine adds cost without value
-		// (measurable scheduler pressure on CI under -race with many owners).
+		proactiveNamespace:     nextProactiveNamespace(),
+		ipcPath:                cfg.IPCPath,
+		cwd:                    cfg.Cwd,
+		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
+		command:                cfg.Command,
+		args:                   cfg.Args,
+		env:                    cfg.Env,
+		handlerFunc:            cfg.HandlerFunc,
+		sessionHandler:         cfg.SessionHandler,
+		upstreamWriter:         cfg.UpstreamWriter,
+		serverID:               cfg.ServerID,
+		listener:               ln,
+		logger:                 logger,
+		onZeroSessions:         cfg.OnZeroSessions,
+		onUpstreamExit:         cfg.OnUpstreamExit,
+		onPersistentDetected:   cfg.OnPersistentDetected,
+		onPersistentResolved:   cfg.OnPersistentResolved,
+		onCacheReady:           cfg.OnCacheReady,
+		onCacheInvalidated:     cfg.OnCacheInvalidated,
+		authorizeSession:       cfg.AuthorizeSession,
+		onFrameReceived:        cfg.OnFrameReceived,
+		sessions:               make(map[int]*Session),
+		cachedInitSessions:     make(map[int]bool),
+		sessionMgr:             NewSessionManager(),
+		tokenHandshake:         cfg.TokenHandshake,
 		classified:             make(chan struct{}),
 		initReady:              make(chan struct{}),
 		progressOwners:         make(map[string]int),
@@ -625,58 +586,47 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		startTime:              time.Now(),
 		listenerDone:           make(chan struct{}),
 		done:                   make(chan struct{}),
+		materializationPolicy:  cfg.MaterializationPolicy,
+		materializationState:   MaterializationCacheOnly,
+		persistentRequired:     cfg.PersistentRequired,
+		materializationStop:    make(chan struct{}),
+		pendingDemands:         make(map[string]*localDemand),
+		persistentPending:      cfg.PersistentPending,
 	}
 	o.progressIntervalNs.Store(int64(5 * time.Second))
 
 	if o.tokenHandshake {
 		o.rejectionLogger = newRejectionLogger(logger)
 	}
-
-	// Cache optional *WithSessionMeta interface upgrades for hot-path dispatch.
 	o.cacheHandlerInterfaces()
-
-	// Wire notifier into sessionHandler if it supports NotifierAware.
 	if o.sessionHandler != nil {
 		if na, ok := o.sessionHandler.(muxcore.NotifierAware); ok {
 			na.SetNotifier(&ownerNotifier{owner: o})
 		}
 	}
-
-	// Start control plane if configured
 	if cfg.ControlPath != "" {
-		ctlSrv, err := control.NewServer(cfg.ControlPath, o, logger)
-		if err != nil {
-			logger.Printf("warning: control server failed to start: %v", err)
+		ctlSrv, ctlErr := control.NewServer(cfg.ControlPath, o, logger)
+		if ctlErr != nil {
+			logger.Printf("warning: control server failed to start: %v", ctlErr)
 		} else {
 			o.controlServer = ctlSrv
 			logger.Printf("control socket: %s", cfg.ControlPath)
 		}
 	}
 
-	// Start reading from upstream
-	if proc != nil {
-		go o.readUpstream(proc)
+	if cfg.UpstreamWriter != nil || (cfg.SessionHandler != nil && cfg.HandlerFunc == nil) {
+		o.materializationState = MaterializationReady
+	} else if !cfg.DeferInitialMaterialization {
+		a := o.startMaterialization(MaterializationTriggerEager)
+		<-a.started
+		if a.startedErr != nil {
+			o.Shutdown()
+			return nil, fmt.Errorf("owner: start upstream: %w", a.startedErr)
+		}
 	}
 
-	// Send proactive initialize to upstream so init response is cached
-	// before any session connects. Without this, Daemon.Spawn blocks on
-	// InitReady() but init requires a session to send the request — deadlock.
-	// SessionHandler-only owners have no upstream, so skip the proactive init.
-	if proc != nil {
-		go o.sendProactiveInit(proc, nil)
-	}
-
-	// Start accepting IPC connections
 	go o.acceptLoop()
-
-	// Start synthetic progress reporter
 	go o.runProgressReporter(doneContext(o.done))
-
-	// Monitor upstream exit (skip in SessionHandler-only mode — proc is nil)
-	if proc != nil {
-		go o.monitorUpstreamExit(proc)
-	}
-
 	return o, nil
 }
 
@@ -686,14 +636,28 @@ func (o *Owner) SessionMgr() *SessionManager {
 	return o.sessionMgr
 }
 
+// PendingAdmissionsPurged reports reservations revoked when admission closed.
+// Daemon removal accounting combines this with any final manager cleanup.
+func (o *Owner) PendingAdmissionsPurged() int {
+	return int(o.pendingAdmissionsPurged.Load())
+}
+
 // PreRegister atomically reserves a token for a fresh shim while this owner is
 // accepting fresh consumers. A classified-isolated owner keeps its listener
 // alive for exact-token reconnects, but generic fresh admission remains closed.
-// The owner lock always precedes the session-manager lock; accept-loop session
-// lookups release the session-manager lock before entering owner state.
+// admissionMu precedes the owner and session-manager locks so classification
+// commit can atomically freeze and revoke provisional fan-in.
 func (o *Owner) PreRegister(token, cwd string, env map[string]string) bool {
+	if o.admissionFrozen.Load() {
+		return false
+	}
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.admissionFrozen.Load() {
+		return false
+	}
 	select {
 	case <-o.listenerDone:
 		return false
@@ -712,19 +676,43 @@ func (o *Owner) PreRegister(token, cwd string, env map[string]string) bool {
 // installed; later fresh consumers must use PreRegister and are rejected once
 // isolation is known.
 func (o *Owner) PreRegisterInitial(token, cwd string, env map[string]string) bool {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	select {
-	case <-o.listenerDone:
-		return false
-	default:
+	deadline := time.Now().Add(materializationReadinessTimeout)
+	for {
+		o.admissionMu.Lock()
+		o.mu.Lock()
+		if o.admissionFrozen.Load() {
+			o.mu.Unlock()
+			o.admissionMu.Unlock()
+			if time.Now().After(deadline) {
+				return false
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		select {
+		case <-o.listenerDone:
+			o.mu.Unlock()
+			o.admissionMu.Unlock()
+			return false
+		default:
+		}
+		if o.initialAdmissionToken != "" && o.initialAdmissionToken != token {
+			o.mu.Unlock()
+			o.admissionMu.Unlock()
+			return false
+		}
+		o.initialAdmissionToken = token
+		o.sessionMgr.PreRegisterForOwner(token, o.serverID, cwd, env)
+		o.mu.Unlock()
+		o.admissionMu.Unlock()
+		return true
 	}
-	if o.initialAdmissionToken != "" && o.initialAdmissionToken != token {
-		return false
+}
+
+func (o *Owner) revokePendingAdmission(token string) {
+	if token != "" {
+		o.sessionMgr.RemovePendingForOwnerToken(o.ServerID(), token)
 	}
-	o.initialAdmissionToken = token
-	o.sessionMgr.PreRegisterForOwner(token, o.serverID, cwd, env)
-	return true
 }
 
 // readToken reads the handshake token sent by the shim immediately after connecting.
@@ -796,11 +784,23 @@ func extractToolName(raw []byte) string {
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
+	o.admissionMu.Lock()
+	o.addSessionLocked(s)
+	o.admissionMu.Unlock()
+	o.startRegisteredSession(s)
+}
+
+// addSessionLocked atomically publishes one admitted session. The caller holds
+// admissionMu so an isolated classification commit cannot split token Bind
+// from owner/session-manager registration.
+func (o *Owner) addSessionLocked(s *Session) {
 	o.mu.Lock()
 	o.sessions[s.ID] = s
 	o.mu.Unlock()
-
 	o.sessionMgr.RegisterSession(s, s.Cwd)
+}
+
+func (o *Owner) startRegisteredSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
 
@@ -817,7 +817,6 @@ func (o *Owner) AddSession(s *Session) {
 
 	// Notify upstream that roots may have changed (new client = new potential root)
 	o.sendRootsListChanged()
-
 	go o.readSession(s)
 }
 
@@ -919,7 +918,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		if !o.hasWritableUpstream() {
 			return nil // snapshot owner — upstream not yet spawned, drop notification
 		}
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
 
 	case msg.IsRequest():
 		// Replay from cache if available (avoids upstream round-trip).
@@ -942,106 +941,13 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			return o.dispatchToSessionHandler(s, msg)
 		}
 
-		// Fail fast if upstream is dead or not yet spawned (pipe-based mode only).
-		if !o.hasWritableUpstream() || o.upstreamDead.Load() {
-			if err := o.ensureUpstreamReadyForRequest(); err != nil {
-				errResp := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":%q}}`, string(msg.ID), err.Error())
-				return s.WriteRaw([]byte(errResp))
+		if !o.materializationReadyForRequests() {
+			queued, err := o.enqueueLocalDemand(s, msg)
+			if queued || err != nil {
+				return err
 			}
 		}
-
-		// Track pending requests
-		o.pendingRequests.Add(1)
-
-		// Remap ID and forward to upstream
-		newID := remap.Remap(s.ID, msg.ID)
-		remapped, err := jsonrpc.ReplaceID(msg.Raw, newID)
-		if err != nil {
-			o.decrementPending() // undo increment on error
-			return fmt.Errorf("remap request: %w", err)
-		}
-
-		// Track inflight request for observability (mux_list --verbose)
-		o.inflightTracker.Store(string(newID), &InflightRequest{
-			Method:    msg.Method,
-			Tool:      extractToolName(msg.Raw),
-			SessionID: s.ID,
-			StartTime: time.Now(),
-		})
-
-		// Tag cacheable methods for response interception
-		if msg.Method == "initialize" || msg.Method == "tools/list" ||
-			msg.Method == "prompts/list" || msg.Method == "resources/list" ||
-			msg.Method == "resources/templates/list" {
-			o.methodTags.Store(string(newID), msg.Method)
-		}
-
-		// Capture protocolVersion from the first initialize request for fingerprint matching
-		if msg.Method == "initialize" {
-			o.captureInitFingerprint(msg.Raw)
-		}
-
-		// Inject _meta.muxSessionId, _meta.muxCwd, and _meta.muxEnv when the upstream
-		// needs to distinguish between CC sessions. Two cases:
-		// 1. session-aware: upstream declared x-mux.sharing: session-aware
-		// 2. in-process handler: single handler serves all CC sessions, always needs session identity
-		o.mu.RLock()
-		needsMeta := o.autoClassification == classify.ModeSessionAware || o.handlerFunc != nil
-		o.mu.RUnlock()
-		if needsMeta {
-			injected, err := jsonrpc.InjectMeta(remapped, "muxSessionId", s.MuxSessionID)
-			if err != nil {
-				o.logger.Printf("session %d: failed to inject muxSessionId: %v", s.ID, err)
-			} else {
-				remapped = injected
-			}
-			// Inject per-session cwd so upstream knows the CC session's project directory
-			if s.Cwd != "" {
-				injected, err := jsonrpc.InjectMeta(remapped, "muxCwd", s.Cwd)
-				if err != nil {
-					o.logger.Printf("session %d: failed to inject muxCwd: %v", s.ID, err)
-				} else {
-					remapped = injected
-				}
-			}
-			// Inject per-session env diff so upstream can use project-scope credentials
-			if len(s.Env) > 0 {
-				injected, err := jsonrpc.InjectMeta(remapped, "muxEnv", s.Env)
-				if err != nil {
-					o.logger.Printf("session %d: failed to inject muxEnv: %v", s.ID, err)
-				} else {
-					remapped = injected
-				}
-			}
-		}
-
-		// Track progressToken ownership for targeted notification routing
-		o.trackProgressToken(s.ID, string(newID), msg.Raw)
-
-		// Record the active session so server→client requests can be routed back
-		o.sessionMgr.TrackRequest(string(newID), s.ID)
-
-		// Start tool-call watchdog if the upstream declared x-mux.toolTimeout.
-		// The watchdog synthesizes a timeout error response if the upstream
-		// doesn't respond within the declared window. Prevents eternal hangs
-		// when upstream deadlocks or crashes silently during a tool call.
-		if msg.Method == "tools/call" && o.toolTimeoutNs.Load() > 0 {
-			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
-		}
-
-		proc, writeErr := o.writeUpstreamFromCurrent(remapped)
-		if writeErr != nil {
-			o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), writeErr)
-			if proc != nil && o.markCurrentUpstreamDead(proc) {
-				o.initReadyOnce.Do(func() { close(o.initReady) })
-				_ = proc.Close()
-				if o.shouldRespawnUpstream() {
-					o.startUpstreamRespawn("write_error")
-				}
-			}
-			return nil
-		}
-		return nil
+		return o.forwardRequestNow(s, msg)
 
 	case msg.IsResponse():
 		// Client is responding to a server→client request (e.g., sampling/createMessage).
@@ -1236,6 +1142,7 @@ func (o *Owner) readUpstream(proc *upstream.Process) {
 			o.logger.Printf("upstream parse error: %v", err)
 			continue
 		}
+
 		if err := o.handleUpstreamMessageFrom(proc, msg); err != nil {
 			o.logger.Printf("upstream handle error: %v", err)
 		}
@@ -1245,28 +1152,20 @@ func (o *Owner) readUpstream(proc *upstream.Process) {
 func (o *Owner) monitorUpstreamExit(proc *upstream.Process) {
 	select {
 	case <-proc.Done:
-	case <-o.done:
+	case <-o.materializationStop:
 		return
 	}
 	if !o.isCurrentUpstream(proc) {
+		o.monitorMaterializedProcessExit(proc)
 		return
 	}
-
 	o.logger.Printf("upstream exited: %v", proc.ExitErr)
-	o.markCurrentUpstreamDead(proc)
-	// Signal init-ready so Daemon.Spawn or respawn waiters do not block forever
-	// on a crashed upstream generation.
 	o.initReadyOnce.Do(func() {
 		if o.initReady != nil {
 			close(o.initReady)
 		}
 	})
-
-	if o.shouldRespawnUpstream() {
-		o.startUpstreamRespawn("upstream_exit")
-		return
-	}
-	o.notifyUpstreamExit()
+	o.monitorMaterializedProcessExit(proc)
 }
 
 func (o *Owner) isCurrentUpstream(proc *upstream.Process) bool {
@@ -1276,40 +1175,12 @@ func (o *Owner) isCurrentUpstream(proc *upstream.Process) bool {
 	return current == proc
 }
 
-func (o *Owner) shouldRespawnUpstream() bool {
-	select {
-	case <-o.done:
-		return false
-	default:
-	}
-	if o.upstreamWriter != nil {
-		return false
-	}
-	if o.sessionHandler != nil && o.handlerFunc == nil {
-		return false
-	}
-	if o.handlerFunc == nil && o.command == "" {
-		return false
-	}
-	return o.SessionCount() > 0
-}
-
 func (o *Owner) notifyUpstreamExit() {
 	if o.onUpstreamExit != nil {
-		o.onUpstreamExit(o.serverID)
+		o.onUpstreamExit(o)
 		return
 	}
 	o.Shutdown()
-}
-
-func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
-	o.drainProactiveRequests(proc)
-	if !o.isCurrentUpstream(proc) {
-		return false
-	}
-	o.upstreamDead.Store(true)
-	o.drainInflightRequests()
-	return true
 }
 
 func (o *Owner) failProactiveGeneration(proc *upstream.Process) {
@@ -1317,144 +1188,27 @@ func (o *Owner) failProactiveGeneration(proc *upstream.Process) {
 	_ = proc.Close()
 }
 
-func (o *Owner) ensureUpstreamReadyForRequest() error {
+func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
+	o.drainProactiveRequests(proc)
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
 	o.mu.RLock()
-	backgroundSpawnCh := o.backgroundSpawnCh
-	beforeWait := o.beforeBackgroundSpawnWait
+	current := o.upstream == proc
 	o.mu.RUnlock()
-	if backgroundSpawnCh != nil {
-		if beforeWait != nil {
-			beforeWait()
-		}
-		timer := time.NewTimer(upstreamRespawnWaitTimeout)
-		defer timer.Stop()
-		select {
-		case <-backgroundSpawnCh:
-		case <-timer.C:
-			return fmt.Errorf("background upstream spawn still pending after %s", upstreamRespawnWaitTimeout)
-		case <-o.done:
-			return errors.New("owner shutting down")
-		}
+	if !current {
+		o.materializationMu.Unlock()
+		o.upstreamEventMu.Unlock()
+		return false
 	}
-	if o.hasWritableUpstream() && !o.upstreamDead.Load() {
-		return nil
-	}
-	if !o.shouldRespawnUpstream() {
-		return errors.New("upstream process exited")
-	}
-	state := o.startUpstreamRespawn("request")
-	timer := time.NewTimer(upstreamRespawnWaitTimeout)
-	defer timer.Stop()
-	select {
-	case <-state.done:
-		return state.err
-	case <-timer.C:
-		return fmt.Errorf("upstream respawn still pending after %s", upstreamRespawnWaitTimeout)
-	case <-o.done:
-		return errors.New("owner shutting down")
-	}
+	o.upstreamDead.Store(true)
+	responses := o.claimInflightRequests()
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+	o.deliverInflightResponses(responses)
+	return true
 }
 
-func (o *Owner) startUpstreamRespawn(reason string) *upstreamRespawn {
-	o.respawnMu.Lock()
-	if o.respawn != nil {
-		state := o.respawn
-		o.respawnMu.Unlock()
-		return state
-	}
-	state := &upstreamRespawn{done: make(chan struct{})}
-	o.respawn = state
-	o.respawnMu.Unlock()
-
-	go func() {
-		state.err = o.runUpstreamRespawn(reason)
-		close(state.done)
-		o.respawnMu.Lock()
-		if o.respawn == state {
-			o.respawn = nil
-		}
-		o.respawnMu.Unlock()
-	}()
-	return state
-}
-
-func (o *Owner) runUpstreamRespawn(reason string) error {
-	wait := upstreamRespawnInitialWait
-	for attempt := 1; ; attempt++ {
-		select {
-		case <-o.done:
-			return errors.New("owner shutting down")
-		default:
-		}
-		if o.SessionCount() == 0 {
-			return errors.New("no live sessions remain")
-		}
-
-		proc, err := o.spawnReplacementUpstream()
-		if err != nil {
-			o.logger.Printf("upstream respawn failed attempt=%d reason=%s err=%v", attempt, reason, err)
-			if !o.waitBeforeRespawnRetry(wait) {
-				return errors.New("owner shutting down")
-			}
-			if wait < upstreamRespawnMaxWait {
-				wait *= 2
-				if wait > upstreamRespawnMaxWait {
-					wait = upstreamRespawnMaxWait
-				}
-			}
-			continue
-		}
-
-		o.mu.Lock()
-		o.upstream = proc
-		o.initReady = make(chan struct{})
-		o.initReadyOnce = sync.Once{}
-		o.initDone = false
-		ready := o.initReady
-		if o.toolList != nil || o.promptList != nil ||
-			o.resourceList != nil || o.resourceTemplateList != nil {
-			o.listChangedAfterRefresh.Store(true)
-		}
-		o.mu.Unlock()
-		o.upstreamDead.Store(true)
-
-		o.logger.Printf("upstream respawn started attempt=%d reason=%s", attempt, reason)
-		go o.readUpstream(proc)
-		go o.monitorUpstreamExit(proc)
-		o.sendProactiveInit(proc, nil)
-
-		timer := time.NewTimer(upstreamRespawnWaitTimeout)
-		select {
-		case <-ready:
-			timer.Stop()
-			if o.InitSuccess() && o.isCurrentUpstream(proc) {
-				o.upstreamDead.Store(false)
-				o.logger.Printf("upstream respawn ready attempt=%d reason=%s", attempt, reason)
-				return nil
-			}
-			o.logger.Printf("upstream respawn attempt=%d exited before initialize completed", attempt)
-		case <-timer.C:
-			o.logger.Printf("upstream respawn attempt=%d readiness timeout after %s", attempt, upstreamRespawnWaitTimeout)
-			_ = proc.Close()
-		case <-o.done:
-			timer.Stop()
-			_ = proc.Close()
-			return errors.New("owner shutting down")
-		}
-
-		if !o.waitBeforeRespawnRetry(wait) {
-			return errors.New("owner shutting down")
-		}
-		if wait < upstreamRespawnMaxWait {
-			wait *= 2
-			if wait > upstreamRespawnMaxWait {
-				wait = upstreamRespawnMaxWait
-			}
-		}
-	}
-}
-
-func (o *Owner) spawnReplacementUpstream() (*upstream.Process, error) {
+func (o *Owner) spawnReplacementUpstream(launch LaunchContext) (*upstream.Process, error) {
 	if o.handlerFunc != nil {
 		o.logger.Printf("upstream respawn: in-process handler")
 		return upstream.NewProcessFromHandler(context.Background(), o.handlerFunc), nil
@@ -1462,18 +1216,7 @@ func (o *Owner) spawnReplacementUpstream() (*upstream.Process, error) {
 	if o.command == "" {
 		return nil, errors.New("upstream command is empty")
 	}
-	return upstream.Start(o.command, o.args, o.env, o.cwd, o.logger)
-}
-
-func (o *Owner) waitBeforeRespawnRetry(wait time.Duration) bool {
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return true
-	case <-o.done:
-		return false
-	}
+	return upstream.Start(o.command, o.args, launch.Env, launch.Cwd, o.logger)
 }
 
 // isProactiveID identifies only this Owner's proactive namespace. A response
@@ -1527,17 +1270,32 @@ func (o *Owner) decrementPending() {
 	}
 }
 
-// handleUpstreamMessage routes a test-injected upstream message without a process source.
+// handleUpstreamMessage routes a synthetic/test message without generation
+// staging. Live process readers call handleUpstreamMessageFrom.
 func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	return o.handleUpstreamMessageFrom(nil, msg)
 }
 
-// handleUpstreamMessageFrom routes a message from one exact upstream generation.
 func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.Message) error {
-	if proc != nil && !o.isCurrentUpstream(proc) {
+	if proc == nil {
+		return o.handleUpstreamMessageFromLocked(proc, msg)
+	}
+	o.upstreamEventMu.RLock()
+	defer o.upstreamEventMu.RUnlock()
+	if !o.acceptsProcessEvent(proc) {
+		o.logger.Printf("dropping stale upstream message pid=%d", proc.PID())
 		return nil
 	}
+	return o.handleUpstreamMessageFromLocked(proc, msg)
+}
+
+// handleUpstreamMessageFromLocked handles one live process event while its
+// caller holds upstreamEventMu for reading. Synthetic test messages pass nil.
+func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jsonrpc.Message) error {
 	if msg.IsNotification() {
+		if proc != nil && o.stageMaterializationListChanged(proc, msg.Method) {
+			return nil
+		}
 		// Route progress notifications to owning session instead of broadcast.
 		//
 		// If the token is NOT in progressOwners (e.g. the originating request
@@ -1598,6 +1356,12 @@ func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.M
 		return nil
 	}
 	if o.isProactiveID(msg.ID) {
+		if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
+			o.decrementPending()
+			o.sessionMgr.CompleteRequest(string(msg.ID))
+			o.clearProgressTokensForRequest(string(msg.ID))
+			o.cacheResponseFromLocked(proc, methodRaw.(string), msg.Raw)
+		}
 		return nil
 	}
 
@@ -1606,7 +1370,7 @@ func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.M
 	if _, timedOut := o.timedOutIDs.LoadAndDelete(string(msg.ID)); timedOut {
 		o.logger.Printf("dropping late response for timed-out request id=%s", string(msg.ID))
 		if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
-			o.cacheResponse(methodRaw.(string), msg.Raw)
+			o.cacheResponseFromLocked(proc, methodRaw.(string), msg.Raw)
 		}
 		o.clearProgressTokensForRequest(string(msg.ID))
 		return nil
@@ -1622,7 +1386,7 @@ func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.M
 	o.clearProgressTokensForRequest(string(msg.ID))
 
 	if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
-		o.cacheResponse(methodRaw.(string), msg.Raw)
+		o.cacheResponseFromLocked(proc, methodRaw.(string), msg.Raw)
 	}
 
 	// Deremap the ID to find the target session
@@ -1895,11 +1659,8 @@ func (o *Owner) clearProgressTokensForRequest(requestID string) {
 
 // sendRootsListChanged notifies the upstream that roots have changed.
 func (o *Owner) sendRootsListChanged() {
-	if o.upstream == nil {
-		return // snapshot owner — upstream not yet spawned
-	}
 	notification := `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`
-	if err := o.writeUpstream([]byte(notification)); err != nil {
+	if err := o.forwardNotificationIfReady([]byte(notification)); err != nil {
 		o.logger.Printf("failed to send roots/list_changed: %v", err)
 	}
 }
@@ -2016,6 +1777,7 @@ func (n *ownerNotifier) Broadcast(notification []byte) {
 
 // removeSession removes a session from the owner.
 func (o *Owner) removeSession(s *Session) {
+	o.launchContextMu.Lock()
 	o.mu.Lock()
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
@@ -2032,6 +1794,11 @@ func (o *Owner) removeSession(s *Session) {
 		}
 	}
 	o.mu.Unlock()
+	o.launchContextMu.Unlock()
+	o.cancelLocalDemandsForSession(s.ID)
+	if remaining == 0 {
+		o.cancelDisposableMaterializationForZeroSessions()
+	}
 	if len(removedTokens) > 0 {
 		o.progressTracker.Cleanup(removedTokens)
 	}
@@ -2050,7 +1817,7 @@ func (o *Owner) removeSession(s *Session) {
 		// Notify upstream that roots may have changed (client left)
 		o.sendRootsListChanged()
 	} else if o.onZeroSessions != nil {
-		o.onZeroSessions(o.serverID)
+		o.onZeroSessions(o)
 	}
 }
 
@@ -2097,10 +1864,14 @@ func (o *Owner) acceptLoop() {
 		}
 
 		var token string
+		var pendingCwd string
+		var pendingEnv map[string]string
 		var reader io.Reader = conn
 		if o.tokenHandshake {
 			token, reader = readToken(conn)
-			if token == "" || !o.sessionMgr.IsPreRegistered(token) {
+			var ok bool
+			pendingCwd, pendingEnv, ok = o.sessionMgr.LookupPendingForOwner(token, o.ServerID())
+			if token == "" || !ok {
 				peerPID := readPeerPID(conn)
 				o.rejectionLogger.Log(o.logger, peerPID)
 				conn.Close()
@@ -2110,26 +1881,15 @@ func (o *Owner) acceptLoop() {
 		// reader may be io.MultiReader if readToken prepended unconsumed bytes.
 		// conn is always the writer and closer.
 		s := NewSession(reader, conn)
+		// Authorization gets a side-effect-free snapshot of pending project
+		// context. Exact Bind is deferred until the admission commit below.
+		if token != "" {
+			s.Cwd = pendingCwd
+			s.Env = pendingEnv
+		}
 		// io.MultiReader doesn't implement io.Closer — set closer to conn explicitly
 		// so Close() can forcefully disconnect the IPC connection.
 		s.SetCloser(conn)
-		if token != "" {
-			// Bind consumes the token and sets s.Cwd from the pre-registered
-			// session data. It can return false if the token was swept by
-			// SweepExpiredPending (TTL) between IsPreRegistered and Bind.
-			// In that edge case, reject the connection instead of adding a
-			// session with no Cwd (which would produce invalid project routing).
-			if !o.sessionMgr.Bind(token, o.ServerID(), s) {
-				// Token was swept by SweepExpiredPending (TTL) or consumed by a
-				// concurrent shim between IsPreRegistered and Bind. Counted +
-				// logged by rejectionLogger.Log; do not emit a second direct
-				// Printf — that would bypass the 10/min/owner rate limit.
-				peerPID := readPeerPID(conn)
-				o.rejectionLogger.Log(o.logger, peerPID)
-				s.Close()
-				continue
-			}
-		}
 
 		// Populate cached SessionMeta with OS-level peer credentials before
 		// dispatch (FR-5/FR-6). Unconditional — token-handshake-disabled
@@ -2154,6 +1914,7 @@ func (o *Owner) acceptLoop() {
 			select {
 			case <-o.done:
 				o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+				o.revokePendingAdmission(token)
 				conn.Close()
 				s.Close()
 				continue
@@ -2177,6 +1938,7 @@ func (o *Owner) acceptLoop() {
 			select {
 			case <-o.done:
 				o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
+				o.revokePendingAdmission(token)
 				conn.Close()
 				s.Close()
 				continue
@@ -2203,6 +1965,7 @@ func (o *Owner) acceptLoop() {
 					o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
 				}
 				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
+				o.revokePendingAdmission(token)
 				conn.Close()
 				s.Close()
 				continue
@@ -2218,7 +1981,26 @@ func (o *Owner) acceptLoop() {
 			o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
 		}
 
-		o.AddSession(s)
+		o.admissionMu.Lock()
+		select {
+		case <-o.done:
+			o.admissionMu.Unlock()
+			o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
+			o.revokePendingAdmission(token)
+			s.Close()
+			continue
+		default:
+		}
+		if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
+			o.admissionMu.Unlock()
+			peerPID := readPeerPID(conn)
+			o.rejectionLogger.Log(o.logger, peerPID)
+			s.Close()
+			continue
+		}
+		o.addSessionLocked(s)
+		o.admissionMu.Unlock()
+		o.startRegisteredSession(s)
 	}
 }
 
@@ -2431,11 +2213,15 @@ func (o *Owner) resetCwdSetToPrimary() (string, int) {
 // Nil-safe: owners constructed for tests may not have a listener.
 func (o *Owner) closeListener() {
 	o.closeListenerOnce.Do(func() {
+		// Serialize teardown with token reservation and bind. Once listenerDone is
+		// closed, purge every unconsumed reservation before admission can resume.
+		o.admissionMu.Lock()
 		o.mu.Lock()
 		o.isAccepting.Store(false)
 		close(o.listenerDone)
-		o.sessionMgr.RemovePendingForOwner(o.serverID)
 		o.mu.Unlock()
+		o.pendingAdmissionsPurged.Add(int64(o.sessionMgr.RemovePendingForOwner(o.serverID)))
+		o.admissionMu.Unlock()
 		if o.listener != nil {
 			o.listener.Close()
 		}
@@ -2448,12 +2234,22 @@ func (o *Owner) closeListener() {
 // drainInflightRequests sends JSON-RPC error responses for all in-flight requests
 // when the upstream process dies. Without this, clients wait forever for responses
 // that will never come.
-func (o *Owner) drainInflightRequests() {
+type drainedInflightResponse struct {
+	session   *Session
+	sessionID int
+	payload   []byte
+}
+
+// claimInflightRequests atomically detaches generation-owned request state.
+// It performs no downstream session I/O, so callers may hold upstreamEventMu.
+func (o *Owner) claimInflightRequests() []drainedInflightResponse {
 	entries := o.sessionMgr.DrainInflight()
 	if len(entries) == 0 {
-		return
+		return nil
 	}
 	o.logger.Printf("upstream died: sending error responses for %d in-flight requests", len(entries))
+
+	responses := make([]drainedInflightResponse, 0, len(entries))
 	for _, entry := range entries {
 		if _, claimed := o.inflightTracker.LoadAndDelete(entry.RemappedID); !claimed {
 			continue
@@ -2469,22 +2265,26 @@ func (o *Owner) drainInflightRequests() {
 			continue
 		}
 		o.mu.RLock()
-		session, ok := o.sessions[result.SessionID]
+		s, ok := o.sessions[result.SessionID]
 		o.mu.RUnlock()
 		if ok {
-			errResp := fmt.Sprintf(
-				`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
-				string(result.OriginalID),
-			)
-			if writeErr := session.WriteRaw([]byte(errResp)); writeErr != nil {
-				o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
-			}
+			responses = append(responses, drainedInflightResponse{
+				session:   s,
+				sessionID: result.SessionID,
+				payload: []byte(fmt.Sprintf(
+					`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
+					string(result.OriginalID),
+				)),
+			})
 		}
+
 		o.methodTags.Delete(entry.RemappedID)
 		o.timedOutIDs.Delete(entry.RemappedID)
 		o.clearProgressTokensForRequest(entry.RemappedID)
 	}
+	return responses
 }
+
 func (o *Owner) drainProactiveRequests(proc *upstream.Process) {
 	o.proactiveRequests.Range(func(key, value any) bool {
 		request := value.(proactiveRequest)
@@ -2498,57 +2298,155 @@ func (o *Owner) drainProactiveRequests(proc *upstream.Process) {
 	})
 }
 
-// Shutdown stops the owner, closing all sessions and the upstream.
-// Cleanup completes before Done() is signaled, ensuring sockets are removed
-// before the process exits.
-func (o *Owner) Shutdown() {
-
-	o.shutdownOnce.Do(func() {
-		o.isAccepting.Store(false)
-		o.teardownExceptUpstream()
-
-		o.mu.Lock()
-		up := o.upstream
-		o.mu.Unlock()
-		if up != nil {
-			up.Close()
+func (o *Owner) deliverInflightResponses(responses []drainedInflightResponse) {
+	for _, response := range responses {
+		if err := response.session.WriteRaw(response.payload); err != nil {
+			o.logger.Printf("drainInflight: write error to session %d: %v", response.sessionID, err)
 		}
+	}
+}
 
-		o.logger.Printf("owner shut down")
+func (o *Owner) drainInflightRequests() {
+	o.deliverInflightResponses(o.claimInflightRequests())
+}
 
-		// Signal done AFTER cleanup, so main goroutine doesn't exit early
+// FinalizeForRemoval tears down admission and retries the owned process
+// generation's whole-tree finalizer. Done is closed only after authority
+// retirement is proven, so daemon state may safely be forgotten afterwards.
+func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool, error) {
+	o.removalMu.Lock()
+	defer o.removalMu.Unlock()
+	select {
+	case <-o.done:
+		return 0, true, nil
+	default:
+	}
+	abortPreparedHandoff := o.handoffPrepared && o.handoffAbortRequested
+	if o.handoffPrepared && !abortPreparedHandoff {
+		return 0, false, ErrHandoffAlreadyPrepared
+	}
+	if timeout <= 0 {
+		timeout = materializationFinalizeTimeout
+	}
+
+	o.stopMaterialization()
+	o.teardownExceptUpstream()
+
+	o.materializationMu.Lock()
+	attempt := o.materializationAttempt
+	if attempt != nil {
+		attempt.cancelMaterialization()
+	}
+	o.materializationMu.Unlock()
+	if attempt != nil {
+		timer := time.NewTimer(timeout)
+		select {
+		case <-attempt.done:
+			timer.Stop()
+		case <-timer.C:
+			return 0, false, fmt.Errorf("owner finalization: materialization did not settle after %s", timeout)
+		}
+	}
+
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	proc := o.retiringProcess
+	if proc == nil {
+		o.mu.RLock()
+		proc = o.upstream
+		o.mu.RUnlock()
+	}
+	if proc != nil {
+		o.retiringProcess = proc
+		o.materializationState = MaterializationFinalizing
+		o.upstreamDead.Store(true)
+	}
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+
+	exitCode := 0
+	var closeErr error
+	if proc != nil {
+		if abortPreparedHandoff {
+			closeErr = proc.AbortDetach()
+		} else if soft {
+			exitCode, closeErr = proc.SoftClose(timeout)
+		} else {
+			closeErr = proc.Close()
+		}
+	}
+	proofErr := error(nil)
+	proven := proc == nil || proc.RetirementProven()
+	if proc != nil && o.materializationFinalizationProbe != nil {
+		proofErr = o.materializationFinalizationProbe(proc)
+		proven = proofErr == nil
+	}
+	if !proven {
+		if proofErr == nil {
+			proofErr = errFinalizationUnproven
+		}
+		if closeErr != nil {
+			proofErr = errors.Join(proofErr, closeErr)
+		}
+		o.upstreamEventMu.Lock()
+		o.materializationMu.Lock()
+		o.materializationState = MaterializationFinalizeBlocked
+		o.materializationBlockedErr = proofErr
+		o.retiringProcess = proc
+		o.materializationMu.Unlock()
+		o.upstreamEventMu.Unlock()
+		return exitCode, false, proofErr
+	}
+
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	if o.upstream == proc {
+		o.upstream = nil
+	}
+	o.upstreamDead.Store(true)
+	o.mu.Unlock()
+	if o.retiringProcess == proc {
+		o.retiringProcess = nil
+	}
+	o.materializationBlockedErr = nil
+	o.materializationState = MaterializationCacheOnly
+	if o.cacheStage != nil && o.cacheStage.process == proc {
+		o.cacheStage = nil
+	}
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+	if abortPreparedHandoff {
+		o.handoffPrepared = false
+		o.handoffAbortRequested = false
+	}
+	o.completeShutdown("owner shut down")
+	return exitCode, true, closeErr
+}
+
+func (o *Owner) completeShutdown(message string) {
+	o.shutdownOnce.Do(func() {
+		o.logger.Printf("%s", message)
 		close(o.done)
 	})
 }
 
-// SoftShutdown performs the same cleanup as Shutdown (closes listener, sessions,
-// control server) but instead of calling upstream.Close() it calls
-// upstream.SoftClose(timeout) — giving the upstream a chance to exit cleanly
-// via stdin close before resorting to SIGTERM/SIGKILL.
-//
-// Returns the upstream exit code (0 = clean) and any kill-escalation error.
-// Used by the idle reaper (US3) to avoid SIGKILL on polite upstreams.
+// Shutdown finalizes the owner synchronously. A failed proof leaves Done open
+// so a later daemon removal attempt can retry without losing authority.
+func (o *Owner) Shutdown() {
+	if _, finalized, err := o.FinalizeForRemoval(false, materializationFinalizeTimeout); !finalized {
+		o.logger.Printf("owner shutdown blocked: %v", err)
+	}
+}
+
+// SoftShutdown gives the upstream a bounded graceful exit before forceful
+// whole-tree retirement. It still refuses terminal completion without proof.
 func (o *Owner) SoftShutdown(timeout time.Duration) (int, error) {
-	exitCode := 0
-	var exitErr error
-
-	o.shutdownOnce.Do(func() {
-		o.teardownExceptUpstream()
-
-		o.mu.Lock()
-		up := o.upstream
-		o.mu.Unlock()
-		if up != nil {
-			exitCode, exitErr = up.SoftClose(timeout)
-		}
-
-		o.logger.Printf("owner soft shut down (upstream exit code %d)", exitCode)
-
-		// Signal done AFTER cleanup.
-		close(o.done)
-	})
-
-	return exitCode, exitErr
+	exitCode, finalized, err := o.FinalizeForRemoval(true, timeout)
+	if !finalized && err == nil {
+		err = errFinalizationUnproven
+	}
+	return exitCode, err
 }
 
 // Done returns a channel closed when the owner has shut down.
@@ -2574,162 +2472,17 @@ func (o *Owner) String() string {
 	return fmt.Sprintf("owner[%s %s]", sid, o.command)
 }
 
-// closedChan is a pre-closed channel used by upstreamDeadCh when the owner
-// has no upstream process. Returning a closed channel lets Serve observe
-// upstream-missing as a failure (so suture can backoff/restart) instead of
-// blocking forever. Package-level to avoid per-call allocation.
-var closedChan = func() chan struct{} {
-	ch := make(chan struct{})
-	close(ch)
-	return ch
-}()
-
-// Serve implements the suture.Service interface, enabling owner lifecycle
-// management via supervisor trees with exponential backoff on restart.
-//
-// Serve blocks until one of:
-//   - ctx is cancelled (external shutdown → returns ctx.Err() after Shutdown)
-//   - owner.done is closed via Shutdown (clean exit → returns nil, no restart)
-//   - upstream dies fatally (returns error → suture restarts with backoff,
-//     unless classification is isolated or ErrDoNotRestart is returned)
-//
-// Isolated owners intentionally return suture.ErrDoNotRestart on upstream
-// death — they should not be auto-restarted because each CC session creates
-// its own dedicated isolated owner.
-//
-// Race ordering: upstream death is checked FIRST (non-blocking) before entering
-// the select. This handles the case where o.done closes concurrently with
-// upstream death (daemon's onUpstreamExit callback may Shutdown before Serve
-// observes the upstream Done channel). Without this check, Serve would
-// non-deterministically return nil instead of the expected error/ErrDoNotRestart,
-// making restart/backoff policies unreliable.
+// Serve is the stable owner lifecycle service. Process exit and replacement are
+// handled by the owner-local materialization controller; a cache-only owner is
+// therefore healthy and must not cause suture restart/backoff cycles.
 func (o *Owner) Serve(ctx context.Context) error {
-	// SessionHandler-only: no upstream process to monitor.
-	// Block until ctx is cancelled or Shutdown is called, then return cleanly.
-	if o.sessionHandler != nil && o.upstream == nil {
-		select {
-		case <-ctx.Done():
-			o.Shutdown()
-			return ctx.Err()
-		case <-o.done:
-			// Owner already shut down — tell suture not to restart and do not
-			// emit a clean-exit event that would trigger cleanupDeadOwner on a
-			// freshly-spawned replacement at the same server ID.
-			return suture.ErrDoNotRestart
-		}
-	}
-
-	for {
-		// Snapshot the current dead/pending channel under a single lock read.
-		// If backgroundSpawnCh is non-nil, upstreamDeadCh returns it (blocking Serve
-		// until the spawn goroutine finishes). If nil and upstream is also nil,
-		// upstreamDeadCh returns closedChan (immediate death). If upstream is set,
-		// upstreamDeadCh returns proc.Done.
-		deadCh := o.upstreamDeadCh()
-
-		// Non-blocking priority checks: done/ctx take precedence over upstream death.
-		// Without these, a shutdown owner with nil upstream (deadCh == closedChan)
-		// would return error → suture restart → immediate return → tight CPU spin.
-		select {
-		case <-o.done:
-			return suture.ErrDoNotRestart // owner already shut down — tell suture not to restart
-		default:
-		}
-		select {
-		case <-ctx.Done():
-			o.Shutdown()
-			return ctx.Err()
-		default:
-		}
-		select {
-		case <-deadCh:
-			// If this was backgroundSpawnCh (now closed and cleared), loop to
-			// re-evaluate — the upstream may now be set or definitively absent.
-			o.mu.RLock()
-			bgCh := o.backgroundSpawnCh
-			o.mu.RUnlock()
-			if bgCh == nil && deadCh != closedChan {
-				// backgroundSpawnCh just fired; upstream may be set now — loop.
-				continue
-			}
-			return o.upstreamDeathResult()
-		default:
-		}
-
-		select {
-		case <-ctx.Done():
-			// External cancellation (daemon shutdown, supervisor stop)
-			o.Shutdown()
-			return ctx.Err()
-		case <-o.done:
-			// Owner already shut down — tell suture not to restart, do not emit clean-exit event
-			return suture.ErrDoNotRestart
-		case <-deadCh:
-			// Same logic as the non-blocking check above.
-			o.mu.RLock()
-			bgCh := o.backgroundSpawnCh
-			o.mu.RUnlock()
-			if bgCh == nil && deadCh != closedChan {
-				// backgroundSpawnCh just fired; loop to re-evaluate.
-				continue
-			}
-			return o.upstreamDeathResult()
-		}
-	}
-}
-
-// upstreamDeathResult determines the Serve return value when upstream has died.
-// Checks classification: isolated owners return ErrDoNotRestart (no auto-restart),
-// others return an error to trigger supervisor backoff+restart.
-//
-// Special case (BUG-001 / FR-1): if the owner has NEVER had a live upstream
-// (up == nil and no background spawn pending), the "death" signal came from
-// closedChan — meaning background spawn failed before upstream was ever set.
-// Returning an error here would cause suture to restart Serve, which would
-// immediately re-observe the same nil state and return the same error — a
-// tight CPU spin bounded only by FailureThreshold. Return ErrDoNotRestart
-// for this case so the supervisor stops cycling. The owner is effectively
-// broken and will be cleaned up by the reaper on the next sweep.
-func (o *Owner) upstreamDeathResult() error {
-	o.mu.RLock()
-	mode := o.autoClassification
-	hasUpstream := o.upstream != nil
-	hasPendingSpawn := o.backgroundSpawnCh != nil
-	o.mu.RUnlock()
-	if !hasUpstream && !hasPendingSpawn {
-		// Owner never had a live upstream (failed background spawn, or no
-		// spawn ever attempted). No restart — otherwise suture spins.
+	select {
+	case <-ctx.Done():
+		o.Shutdown()
+		return ctx.Err()
+	case <-o.done:
 		return suture.ErrDoNotRestart
 	}
-	if mode == classify.ModeIsolated {
-		// Isolated servers should not be restarted by the supervisor.
-		// Each CC session spawns its own dedicated isolated owner.
-		return suture.ErrDoNotRestart
-	}
-	return fmt.Errorf("owner %s: upstream exited", o.serverID[:8])
-}
-
-// upstreamDeadCh returns a channel that closes when the upstream process dies.
-//
-// Three cases:
-//  1. Upstream is set: return proc.Done (normal path).
-//  2. Background spawn is pending (backgroundSpawnCh != nil): return backgroundSpawnCh.
-//     Serve blocks on it; when it closes Serve loops and re-checks the upstream.
-//  3. Upstream is nil and no spawn pending (spawn failed or never started): return
-//     closedChan so Serve observes it as failure and suture applies backoff/restart.
-func (o *Owner) upstreamDeadCh() <-chan struct{} {
-	o.mu.RLock()
-	up := o.upstream
-	bgCh := o.backgroundSpawnCh
-	o.mu.RUnlock()
-	if up != nil {
-		return up.Done
-	}
-	if bgCh != nil {
-		// Template owner: upstream is starting in background. Block Serve until done.
-		return bgCh
-	}
-	return closedChan
 }
 
 // ServerID returns the server identity hash for this owner.
@@ -2768,6 +2521,12 @@ func (o *Owner) IsAccepting() bool {
 	default:
 		return true
 	}
+}
+
+// AdmissionFrozen reports the short cache-commit barrier during which fresh
+// session reservations must wait instead of treating the live listener as dead.
+func (o *Owner) AdmissionFrozen() bool {
+	return o.admissionFrozen.Load()
 }
 
 // IsReachable returns true if the IPC listener is both marked-open
@@ -3001,13 +2760,14 @@ func (o *Owner) touchActivity() {
 // to the injected writer followed by a newline, mirroring upstream.WriteLine
 // semantics. Used by tests to capture output without a subprocess.
 func (o *Owner) writeUpstream(data []byte) error {
-	_, err := o.writeUpstreamFromCurrent(data)
+	_, err := o.writeUpstreamFromCurrent(data, nil)
 	return err
 }
 
 // writeUpstreamFromCurrent returns the exact process generation used for the
-// write so a failure cannot retire a replacement generation.
-func (o *Owner) writeUpstreamFromCurrent(data []byte) (*upstream.Process, error) {
+// write so a failure cannot retire a replacement generation. bind runs after
+// generation selection and before the write begins.
+func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Process)) (*upstream.Process, error) {
 	o.touchActivity()
 	o.mu.RLock()
 	writer := o.upstreamWriter
@@ -3025,7 +2785,21 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte) (*upstream.Process, error)
 	if up == nil {
 		return nil, errors.New("upstream writer unavailable")
 	}
+	if bind != nil {
+		bind(up)
+	}
+	if o.beforeCurrentUpstreamWrite != nil {
+		o.beforeCurrentUpstreamWrite(up)
+	}
 	return up, up.WriteLine(data)
+}
+
+func (o *Owner) writeUpstreamToProcess(proc *upstream.Process, data []byte) error {
+	if proc == nil {
+		return errors.New("upstream writer unavailable")
+	}
+	o.touchActivity()
+	return proc.WriteLine(data)
 }
 
 func (o *Owner) hasWritableUpstream() bool {
@@ -3139,29 +2913,40 @@ func (o *Owner) Status() map[string]any {
 		cwds = append(cwds, c)
 	}
 	primaryCwd := o.cwd
+	upstreamPresent := o.upstream != nil || o.upstreamWriter != nil || (o.sessionHandler != nil && o.handlerFunc == nil)
+	upstreamPID := 0
+	if o.upstream != nil {
+		upstreamPID = o.upstream.PID()
+	}
 	o.mu.RUnlock()
+	matState, matTrigger, matPolicy, matGeneration, pendingDemandCount, persistentPending, finalizationError := o.materializationStatus()
 
 	status := map[string]any{
-		"mux_version": Version,
-		"upstream_pid": func() int {
-			if o.upstream != nil {
-				return o.upstream.PID()
-			}
-			return 0
-		}(),
-		"ipc_path":         o.ipcPath,
-		"command":          o.command,
-		"args":             o.args,
-		"cwd":              primaryCwd,
-		"cwd_set":          cwds,
-		"sessions":         sessionIDs,
-		"session_count":    len(sessionIDs),
-		"pending_requests": o.pendingRequests.Load(),
-		"uptime_seconds":   time.Since(o.startTime).Seconds(),
-		"cached_init":      hasCachedInit,
-		"cached_tools":     hasCachedTools,
-		"cached_prompts":   hasCachedPrompts,
-		"cached_resources": hasCachedResources,
+		"mux_version":                Version,
+		"upstream_pid":               upstreamPID,
+		"ipc_path":                   o.ipcPath,
+		"command":                    o.command,
+		"args":                       o.args,
+		"cwd":                        primaryCwd,
+		"cwd_set":                    cwds,
+		"sessions":                   sessionIDs,
+		"session_count":              len(sessionIDs),
+		"pending_requests":           o.pendingRequests.Load(),
+		"uptime_seconds":             time.Since(o.startTime).Seconds(),
+		"cached_init":                hasCachedInit,
+		"cached_tools":               hasCachedTools,
+		"cached_prompts":             hasCachedPrompts,
+		"cached_resources":           hasCachedResources,
+		"materialization_state":      string(matState),
+		"materialization_trigger":    string(matTrigger),
+		"materialization_policy":     matPolicy.String(),
+		"materialization_generation": matGeneration,
+		"pending_demand_count":       pendingDemandCount,
+		"persistent_pending":         persistentPending,
+		"restart_pin_count":          o.restartPins.Load(),
+		"cache_ready":                hasCachedInit && hasCachedTools,
+		"upstream_live":              upstreamPresent && !o.upstreamDead.Load(),
+		"finalization_error":         finalizationError,
 	}
 
 	if classification != "" {
@@ -3203,19 +2988,54 @@ func (o *Owner) Status() map[string]any {
 // ExportSnapshot captures the owner's serializable state for graceful restart.
 // Thread-safe: acquires RLock. Cached responses are base64-encoded.
 func (o *Owner) ExportSnapshot() OwnerSnapshot {
+	o.materializationMu.Lock()
 	o.mu.RLock()
+	snap := o.exportSnapshotLocked()
+	o.applyMaterializationSnapshotLocked(&snap)
+	o.mu.RUnlock()
+	o.materializationMu.Unlock()
+	o.appendBoundTokenSnapshots(&snap)
+	return snap
+}
+
+// ExportSnapshotState captures owner metadata, discovery caches, and active
+// sessions under one owner read lock. Daemon restart serialization uses this
+// view so it cannot combine cache/classification facts from one instant with
+// a session set from another.
+func (o *Owner) ExportSnapshotState() (OwnerSnapshot, []SessionSnapshot) {
+	o.materializationMu.Lock()
+	o.mu.RLock()
+	snap := o.exportSnapshotLocked()
+	o.applyMaterializationSnapshotLocked(&snap)
+	sessions := o.exportSessionsLocked()
+	o.mu.RUnlock()
+	o.materializationMu.Unlock()
+	o.appendBoundTokenSnapshots(&snap)
+	return snap, sessions
+}
+
+func (o *Owner) applyMaterializationSnapshotLocked(snap *OwnerSnapshot) {
+	snap.Persistent = snap.Persistent || o.persistentPending || o.persistentRequired || o.materializationPolicy == MaterializationPersistent
+	if a := o.materializationAttempt; a != nil {
+		snap.Cwd = a.launch.Cwd
+		snap.Env = cloneSnapshotEnv(a.launch.Env)
+	}
+}
+
+func (o *Owner) exportSnapshotLocked() OwnerSnapshot {
 	cwds := make([]string, 0, len(o.cwdSet))
-	for c := range o.cwdSet {
-		cwds = append(cwds, c)
+	for cwd := range o.cwdSet {
+		cwds = append(cwds, cwd)
 	}
 	snap := OwnerSnapshot{
 		Command:              o.command,
-		Args:                 o.args,
+		Args:                 append([]string(nil), o.args...),
 		Cwd:                  o.cwd,
+		Env:                  cloneSnapshotEnv(o.env),
 		CwdSet:               cwds,
 		Classification:       o.autoClassification,
 		ClassificationSource: o.classificationSource,
-		ClassificationReason: o.classificationReason,
+		ClassificationReason: append([]string(nil), o.classificationReason...),
 	}
 	if o.initResp != nil {
 		snap.CachedInit = base64Encode(o.initResp)
@@ -3232,18 +3052,31 @@ func (o *Owner) ExportSnapshot() OwnerSnapshot {
 	if o.resourceTemplateList != nil {
 		snap.CachedResourceTemplates = base64Encode(o.resourceTemplateList)
 	}
-	o.mu.RUnlock()
+	return snap
+}
+
+func (o *Owner) appendBoundTokenSnapshots(snap *OwnerSnapshot) {
 	for _, hist := range o.sessionMgr.ExportBoundHistory() {
 		snap.BoundTokens = append(snap.BoundTokens, snapshot.BoundTokenSnapshot{
 			Token:    hist.Token,
 			OwnerKey: hist.OwnerKey,
 			Cwd:      hist.Cwd,
-			Env:      hist.Env,
+			Env:      cloneSnapshotEnv(hist.Env),
 			BoundAt:  hist.BoundAt,
 			LastUsed: hist.LastUsed,
 		})
 	}
-	return snap
+}
+
+func cloneSnapshotEnv(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func boundTokenSnapshotsToSession(entries []snapshot.BoundTokenSnapshot) []session.BoundHistorySnapshot {
@@ -3268,12 +3101,16 @@ func boundTokenSnapshotsToSession(entries []snapshot.BoundTokenSnapshot) []sessi
 func (o *Owner) ExportSessions() []SessionSnapshot {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+	return o.exportSessionsLocked()
+}
+
+func (o *Owner) exportSessionsLocked() []SessionSnapshot {
 	sessions := make([]SessionSnapshot, 0, len(o.sessions))
 	for _, s := range o.sessions {
 		sessions = append(sessions, SessionSnapshot{
 			MuxSessionID: s.MuxSessionID,
 			Cwd:          s.Cwd,
-			Env:          s.Env,
+			Env:          cloneSnapshotEnv(s.Env),
 		})
 	}
 	return sessions
@@ -3321,8 +3158,53 @@ func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte)
 
 // cacheResponse stores a raw JSON-RPC response for later replay.
 func (o *Owner) cacheResponse(method string, raw []byte) {
+	if o.cacheResponseState(method, raw) {
+		o.broadcastListChanged()
+	}
+}
+
+// successfulJSONRPCResponse reports whether a parsed response carries a result
+// and no error. Discovery error frames are routed to their caller but never
+// become reusable cache or template authority.
+func successfulJSONRPCResponse(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false
+	}
+	_, hasResult := fields["result"]
+	_, hasError := fields["error"]
+	return hasResult && !hasError
+}
+
+// cacheResponseState commits cache and classification state without downstream
+// session I/O. The caller may hold upstreamEventMu to linearize a live process
+// response against process-generation replacement.
+func (o *Owner) cacheResponseState(method string, raw []byte) bool {
+	if !successfulJSONRPCResponse(raw) {
+		o.logger.Printf("not caching unsuccessful %s response", method)
+		return false
+	}
 	cached := make([]byte, len(raw))
 	copy(cached, raw)
+	if method == "tools/list" && o.onCacheReady != nil {
+		o.mu.RLock()
+		initDone := o.initDone
+		o.mu.RUnlock()
+		if initDone {
+			staged := o.ExportSnapshot()
+			staged.CachedTools = base64Encode(cached)
+			if staged.ClassificationSource == "" {
+				mode, matched := classify.ClassifyTools(cached)
+				staged.Classification = mode
+				staged.ClassificationSource = "tools"
+				staged.ClassificationReason = matched
+			}
+			if !o.onCacheReady(o, staged) {
+				o.logger.Printf("cache publication rejected for live tools/list response")
+				return false
+			}
+		}
+	}
 
 	o.mu.Lock()
 	switch method {
@@ -3362,22 +3244,19 @@ func (o *Owner) cacheResponse(method string, raw []byte) {
 			o.logger.Printf("using x-mux.progressInterval: %ds", sec)
 		}
 	}
-	if method == "tools/list" {
-		o.classifyFromToolList(cached)
-		// Notify daemon that a complete template is available (init + tools cached).
-		// Daemon stores this as a template for instant future isolated spawns.
-		if o.onCacheReady != nil && o.initDone {
-			go o.onCacheReady(o.serverID)
-		}
-		if o.listChangedAfterRefresh.Swap(false) {
-			o.mu.Lock()
-			o.promptList = nil
-			o.resourceList = nil
-			o.resourceTemplateList = nil
-			o.mu.Unlock()
-			o.broadcastListChanged()
-		}
+	if method != "tools/list" {
+		return false
 	}
+	o.classifyFromToolList(cached)
+	if !o.listChangedAfterRefresh.Swap(false) {
+		return false
+	}
+	o.mu.Lock()
+	o.promptList = nil
+	o.resourceList = nil
+	o.resourceTemplateList = nil
+	o.mu.Unlock()
+	return true
 }
 
 // forwardCancelledNotification remaps the requestId in a notifications/cancelled
@@ -3387,22 +3266,25 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(msg.Raw, &obj); err != nil {
 		// Fallback: forward as-is
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
 	}
 
 	paramsRaw, hasParams := obj["params"]
 	if !hasParams {
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
 	}
 
 	var params map[string]json.RawMessage
 	if err := json.Unmarshal(paramsRaw, &params); err != nil {
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
 	}
 
 	requestIDRaw, hasRequestID := params["requestId"]
 	if !hasRequestID {
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
+	}
+	if o.cancelLocalDemand(s, requestIDRaw) {
+		return nil
 	}
 
 	// Remap the requestId to the upstream-facing ID
@@ -3411,20 +3293,27 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 
 	newParams, err := json.Marshal(params)
 	if err != nil {
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
 	}
 
 	obj["params"] = newParams
 	remapped, err := json.Marshal(obj)
 	if err != nil {
-		return o.writeUpstream(msg.Raw)
+		return o.forwardNotificationIfReady(msg.Raw)
 	}
 
 	// Clean up progress tokens for the cancelled request (FIX 1).
 	o.clearProgressTokensForRequest(string(remappedRequestID))
 
 	o.logger.Printf("session %d: forwarding notifications/cancelled with remapped requestId", s.ID)
-	return o.writeUpstream(remapped)
+	if tracked, ok := o.inflightTracker.Load(string(remappedRequestID)); ok {
+		if inflight, ok := tracked.(*InflightRequest); ok {
+			if proc := inflight.process.Load(); proc != nil {
+				return o.writeUpstreamToProcess(proc, remapped)
+			}
+		}
+	}
+	return o.forwardNotificationIfReady(remapped)
 }
 
 // invalidateCacheIfNeeded checks if a notification from upstream signals that a
@@ -3434,20 +3323,27 @@ func (o *Owner) invalidateCacheIfNeeded(data []byte) {
 	if err != nil || !msg.IsNotification() {
 		return
 	}
+	invalidated := false
 	o.mu.Lock()
 	switch msg.Method {
 	case "notifications/tools/list_changed":
 		o.toolList = nil
+		invalidated = true
 		o.logger.Printf("cache invalidated: tools/list")
 	case "notifications/prompts/list_changed":
 		o.promptList = nil
+		invalidated = true
 		o.logger.Printf("cache invalidated: prompts/list")
 	case "notifications/resources/list_changed":
 		o.resourceList = nil
 		o.resourceTemplateList = nil
+		invalidated = true
 		o.logger.Printf("cache invalidated: resources/list + templates")
 	}
 	o.mu.Unlock()
+	if invalidated && o.onCacheInvalidated != nil {
+		o.onCacheInvalidated(o)
+	}
 }
 
 // captureInitFingerprint extracts protocolVersion from an initialize request
@@ -3585,12 +3481,17 @@ func (o *Owner) classifyFromToolList(toolsJSON []byte) {
 // checkPersistent checks if the upstream declares x-mux.persistent: true
 // and notifies the daemon via callback.
 func (o *Owner) checkPersistent(initJSON []byte) {
-	if !classify.ParsePersistent(initJSON) {
+	o.ResolvePersistent(classify.ParsePersistent(initJSON))
+	persistent := classify.ParsePersistent(initJSON)
+	if persistent {
+		o.logger.Printf("x-mux capability: persistent=true")
+	}
+	if o.onPersistentResolved != nil {
+		o.onPersistentResolved(o, persistent)
 		return
 	}
-	o.logger.Printf("x-mux capability: persistent=true")
-	if o.onPersistentDetected != nil {
-		o.onPersistentDetected(o.serverID)
+	if persistent && o.onPersistentDetected != nil {
+		o.onPersistentDetected(o)
 	}
 }
 

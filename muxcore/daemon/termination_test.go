@@ -12,9 +12,9 @@ import (
 // but is not one of the known concrete event types. Used to test the default branch.
 type unknownEvent struct{}
 
-func (unknownEvent) String() string                  { return "unknown-event" }
-func (unknownEvent) Type() suture.EventType          { return suture.EventType(999) }
-func (unknownEvent) Map() map[string]interface{}     { return map[string]interface{}{} }
+func (unknownEvent) String() string              { return "unknown-event" }
+func (unknownEvent) Type() suture.EventType      { return suture.EventType(999) }
+func (unknownEvent) Map() map[string]interface{} { return map[string]interface{}{} }
 
 // Compile-time check: unknownEvent must implement suture.Event.
 var _ suture.Event = unknownEvent{}

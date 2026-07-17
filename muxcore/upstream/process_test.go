@@ -42,6 +42,29 @@ func TestBeginExitFinalizationSerializesDetachLease(t *testing.T) {
 	})
 }
 
+func TestCloseRetriesAbortedDetachFinalization(t *testing.T) {
+	p := &Process{detach: detachAborted, Done: make(chan struct{})}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close() after aborted detach: %v", err)
+	}
+	if !p.RetirementProven() {
+		t.Fatal("Close() did not prove retirement for aborted detach")
+	}
+}
+
+func TestCloseDoesNotFinalizeCommittedDetach(t *testing.T) {
+	p := &Process{detach: detachCommitted, Done: make(chan struct{})}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close() after committed detach: %v", err)
+	}
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
+		t.Fatal("Close() reclaimed authority after committed detach")
+	}
+}
+
 func TestStartAndClose(t *testing.T) {
 	// Use a simple process that exits immediately
 	var cmd string

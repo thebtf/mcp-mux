@@ -1,12 +1,16 @@
 package daemon
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 // setupTestHandoffTimeouts overrides the package-level handoff timeout
@@ -25,9 +29,131 @@ func setupTestHandoffTimeouts(t *testing.T) {
 	})
 }
 
+type fakeHandoffSuccessor struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newFakeHandoffSuccessor() *fakeHandoffSuccessor {
+	return &fakeHandoffSuccessor{done: make(chan struct{})}
+}
+
+func (s *fakeHandoffSuccessor) Done() <-chan struct{} { return s.done }
+func (s *fakeHandoffSuccessor) Stop() error {
+	s.once.Do(func() { close(s.done) })
+	return nil
+}
+
+func setupVersionSkewSuccessor(t *testing.T) {
+	t.Helper()
+	origSpawn := spawnHandoffSuccessorForRestart
+	spawnHandoffSuccessorForRestart = func(tokenPath, socketPath, _, _ string) (handoffSuccessor, error) {
+		token, err := readHandoffToken(tokenPath)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := dialHandoff(socketPath, time.Second)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(HelloMsg{
+			Type:            MsgHello,
+			ProtocolVersion: HandoffProtocolVersion - 1,
+			Token:           token,
+		}); err != nil {
+			return nil, err
+		}
+		return newFakeHandoffSuccessor(), nil
+	}
+	t.Cleanup(func() { spawnHandoffSuccessorForRestart = origSpawn })
+}
+
+func setupPostHelloFailureSuccessors(t *testing.T) *int {
+	t.Helper()
+	origHandoffSpawn := spawnHandoffSuccessorForRestart
+	origSnapshotSpawn := spawnSnapshotSuccessorForRestart
+	spawnedFallbacks := new(int)
+	spawnHandoffSuccessorForRestart = func(tokenPath, socketPath, _, _ string) (handoffSuccessor, error) {
+		token, err := readHandoffToken(tokenPath)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := dialHandoff(socketPath, time.Second)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(NewHelloMsgWithPID(token, os.Getpid())); err != nil {
+			return nil, err
+		}
+		return newFakeHandoffSuccessor(), nil
+	}
+	spawnSnapshotSuccessorForRestart = func(string, string) error {
+		*spawnedFallbacks++
+		return nil
+	}
+	t.Cleanup(func() {
+		spawnHandoffSuccessorForRestart = origHandoffSpawn
+		spawnSnapshotSuccessorForRestart = origSnapshotSpawn
+	})
+	return spawnedFallbacks
+}
+
+func TestRetryControlBindStaysPausedUntilRestartStagingActivation(t *testing.T) {
+	d := &Daemon{logger: testLogger(t)}
+	path := shortSocketPath(t, "paused-restart-control.ctl.sock")
+	if err := d.retryControlBind(path); err != nil {
+		t.Fatalf("retryControlBind: %v", err)
+	}
+	defer d.ctlSrv.Close()
+
+	result := make(chan error, 1)
+	go func() {
+		resp, err := control.SendWithTimeout(path, control.Request{Cmd: "ping"}, 2*time.Second)
+		if err == nil && !resp.OK {
+			err = os.ErrInvalid
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("restart control dispatched before staging activation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if _, err := d.activateRestartStaging(); err != nil {
+		t.Fatalf("activateRestartStaging() error: %v", err)
+	}
+	d.ctlSrv.Start()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("ping after staging activation: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("restart control did not dispatch after staging activation")
+	}
+}
+
+func registerGracefulRestartCleanup(t *testing.T, d *Daemon, afterFn func()) {
+	t.Helper()
+	if afterFn == nil {
+		t.Fatal("graceful restart afterFn is nil")
+	}
+	t.Cleanup(func() {
+		go afterFn()
+		select {
+		case <-d.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("daemon did not shut down after graceful restart afterFn")
+		}
+	})
+}
+
 func seedProcessBackedOwner(t *testing.T, d *Daemon) {
 	t.Helper()
-	_, _, _, err := d.Spawn(control.Request{
+	_, sid, _, err := d.Spawn(control.Request{
 		Cmd:     "spawn",
 		Command: "go",
 		Args:    []string{"run", "../../testdata/mock_server.go"},
@@ -37,40 +163,159 @@ func seedProcessBackedOwner(t *testing.T, d *Daemon) {
 	if err != nil {
 		t.Fatalf("Spawn() process-backed owner: %v", err)
 	}
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		entry := d.Entry(sid)
+		return entry != nil && entry.Owner != nil && entry.Owner.MaterializationState() == owner.MaterializationReady
+	}, "process-backed owner did not finish eager materialization")
 }
 
-// TestHandoffFallbackOnAcceptTimeout verifies that HandleGracefulRestart returns
-// a valid snapshot path and nil error even when no successor daemon connects
-// within the accept timeout — i.e. the FR-8 fallback path is transparent to
-// the control-plane caller.
-//
-// Failure mode simulated: listenHandoff accept times out because spawnSuccessor
-// forks a real binary with the configured DaemonFlag but the binary in the test
-// environment is the test binary itself, which does not implement the successor
-// handshake. The accept timeout (overridden to 50 ms) fires before any connection arrives.
-//
-// This test asserts:
-//  1. HandleGracefulRestart returns (snapshotPath, nil, nil) — not an error.
-//  2. snapshotPath is non-empty — snapshot serialization succeeded.
-//  3. The daemon continues to the Shutdown path (go d.Shutdown()) regardless.
-func TestHandoffFallbackOnAcceptTimeout(t *testing.T) {
+// TestHandoffAcceptTimeoutKeepsPredecessorServing verifies that a successor
+// which never reaches Hello cannot authorize predecessor teardown.
+func TestHandoffAcceptTimeoutKeepsPredecessorServing(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
 
-	d := testDaemon(t) // helper defined in daemon_test.go
+	d := testDaemon(t)
+	seedProcessBackedOwner(t, d)
+	d.mu.RLock()
+	var entry *OwnerEntry
+	for _, candidate := range d.owners {
+		entry = candidate
+		break
+	}
+	d.mu.RUnlock()
+
+	snapshotPath, afterFn, err := d.HandleGracefulRestart(0)
+	if err == nil || !strings.Contains(err.Error(), "accept") {
+		t.Fatalf("HandleGracefulRestart() error = %v, want accept failure", err)
+	}
+	if snapshotPath != "" || afterFn != nil {
+		t.Fatalf("aborted restart returned path=%q afterFn=%v", snapshotPath, afterFn != nil)
+	}
+	if d.shuttingDown.Load() {
+		t.Fatal("daemon remained in shutting-down state after aborted restart")
+	}
+	if entry == nil || entry.Owner == nil || !entry.Owner.IsAccepting() {
+		t.Fatal("accept failure stopped the predecessor owner")
+	}
+	if got := entry.Owner.Status()["restart_pin_count"]; got != int64(0) {
+		t.Fatalf("restart pin count = %v, want 0", got)
+	}
+	if entry.terminationHint != HintNone {
+		t.Fatalf("termination hint = %v, want none", entry.terminationHint)
+	}
+	if _, statErr := os.Stat(SnapshotPath()); !os.IsNotExist(statErr) {
+		t.Fatalf("aborted snapshot still exists: %v", statErr)
+	}
+}
+
+func TestProtocolVersionMismatchKeepsPredecessorServing(t *testing.T) {
+	setupTestHandoffTimeouts(t)
+	setupVersionSkewSuccessor(t)
+	origSnapshotSpawn := spawnSnapshotSuccessorForRestart
+	fallbackSpawns := 0
+	spawnSnapshotSuccessorForRestart = func(string, string) error {
+		fallbackSpawns++
+		return nil
+	}
+	t.Cleanup(func() { spawnSnapshotSuccessorForRestart = origSnapshotSpawn })
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+
+	d, logs := testDaemonWithLog(t)
+	seedProcessBackedOwner(t, d)
+	d.mu.RLock()
+	var entry *OwnerEntry
+	for _, candidate := range d.owners {
+		entry = candidate
+		break
+	}
+	d.mu.RUnlock()
+	beforeFallback := d.stats.fallback.Load()
+
+	snapshotPath, afterFn, err := d.HandleGracefulRestart(0)
+	if !errors.Is(err, ErrProtocolVersionMismatch) {
+		t.Fatalf("HandleGracefulRestart() error = %v, want ErrProtocolVersionMismatch", err)
+	}
+	if snapshotPath != "" || afterFn != nil {
+		t.Fatalf("version mismatch returned path=%q afterFn=%v", snapshotPath, afterFn != nil)
+	}
+	if fallbackSpawns != 0 || d.stats.fallback.Load() != beforeFallback {
+		t.Fatalf("version mismatch started fallback=%d or advanced counter", fallbackSpawns)
+	}
+	if d.shuttingDown.Load() || entry == nil || entry.Owner == nil || !entry.Owner.IsAccepting() {
+		t.Fatal("version mismatch did not preserve the predecessor")
+	}
+	if got := entry.Owner.Status()["restart_pin_count"]; got != int64(0) {
+		t.Fatalf("restart pin count = %v, want 0", got)
+	}
+	if entry.terminationHint != HintNone {
+		t.Fatalf("termination hint = %v, want none", entry.terminationHint)
+	}
+	if _, statErr := os.Stat(SnapshotPath()); !os.IsNotExist(statErr) {
+		t.Fatalf("aborted snapshot still exists: %v", statErr)
+	}
+	if !strings.Contains(logs.String(), "handoff.abort") || strings.Contains(logs.String(), "handoff.fallback") {
+		t.Fatalf("version mismatch logs did not record abort-only behavior:\n%s", logs.String())
+	}
+}
+
+func TestAttemptHandoffSuccessorStartFailureLeavesPredecessorServing(t *testing.T) {
+	setupTestHandoffTimeouts(t)
+	d := testDaemon(t)
 	seedProcessBackedOwner(t, d)
 
-	// HandleGracefulRestart MUST succeed (FR-8 fallback is transparent to caller).
-	snapshotPath, _, err := d.HandleGracefulRestart(0)
-	if err != nil {
-		t.Fatalf("HandleGracefulRestart() returned error %v; want nil (FR-8 fallback should be transparent)", err)
+	d.mu.RLock()
+	var entry *OwnerEntry
+	for _, candidate := range d.owners {
+		entry = candidate
+		break
 	}
-	if snapshotPath == "" {
-		t.Error("HandleGracefulRestart() returned empty snapshot path; want non-empty")
+	d.mu.RUnlock()
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("process-backed predecessor owner missing")
 	}
+	beforePID := entry.Owner.Status()["upstream_pid"]
+	missingSuccessor := filepath.Join(t.TempDir(), "missing-successor.exe")
+	if err := d.attemptHandoff(missingSuccessor); err == nil || !strings.Contains(err.Error(), "spawn successor") {
+		t.Fatalf("attemptHandoff error = %v, want successor start failure", err)
+	}
+	if d.Entry(entry.ServerID) != entry {
+		t.Fatal("successor start failure replaced or removed predecessor owner")
+	}
+	if !entry.Owner.IsAccepting() {
+		t.Fatal("successor start failure stopped predecessor listener")
+	}
+	if afterPID := entry.Owner.Status()["upstream_pid"]; afterPID != beforePID {
+		t.Fatalf("successor start failure changed predecessor pid from %v to %v", beforePID, afterPID)
+	}
+}
 
-	// Cleanup snapshot file produced by SerializeSnapshot.
-	if snapshotPath != "" {
-		os.Remove(snapshotPath)
+func TestGracefulRestartSuccessorStartFailureLeavesPredecessorServing(t *testing.T) {
+	d := testDaemon(t)
+	seedProcessBackedOwner(t, d)
+	d.mu.RLock()
+	var entry *OwnerEntry
+	for _, candidate := range d.owners {
+		entry = candidate
+		break
+	}
+	d.mu.RUnlock()
+
+	missingSuccessor := filepath.Join(t.TempDir(), "missing-successor.exe")
+	snapshotPath, afterFn, err := d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{SuccessorExe: missingSuccessor})
+	if err == nil || !strings.Contains(err.Error(), "spawn successor") {
+		t.Fatalf("HandleGracefulRestartWithOptions() error = %v, want successor start failure", err)
+	}
+	if snapshotPath != "" || afterFn != nil {
+		t.Fatalf("aborted restart returned path=%q afterFn=%v", snapshotPath, afterFn != nil)
+	}
+	if d.shuttingDown.Load() || entry == nil || entry.Owner == nil || !entry.Owner.IsAccepting() {
+		t.Fatal("successor start failure did not preserve the predecessor")
+	}
+	if got := entry.Owner.Status()["restart_pin_count"]; got != int64(0) {
+		t.Fatalf("restart pin count = %v, want 0", got)
 	}
 }
 
@@ -116,7 +361,7 @@ func TestAttemptHandoffSkipsSessionHandlerOnlyOwners(t *testing.T) {
 	}
 }
 
-func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorAfterShutdown(t *testing.T) {
+func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorBeforeShutdown(t *testing.T) {
 	origSpawn := spawnSnapshotSuccessorForRestart
 	spawned := make(chan struct{})
 	var gotExe, gotFlag string
@@ -143,40 +388,31 @@ func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorAfterShutdown(t
 		t.Fatalf("New(): %v", err)
 	}
 
-	_, sid, _, err := d.Spawn(control.Request{
-		Cmd:  "spawn",
-		Cwd:  t.TempDir(),
-		Mode: "global",
-	})
+	_, sid, _, err := d.Spawn(control.Request{Cmd: "spawn", Cwd: t.TempDir(), Mode: "global"})
 	if err != nil {
 		t.Fatalf("Spawn() SessionHandler owner: %v", err)
 	}
 	waitOwnerAccepting(t, d, sid)
 
 	beforeFallback := d.stats.fallback.Load()
-	snapshotPath, afterFn, err := d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{
-		SuccessorExe: "next-engine.exe",
-	})
+	snapshotPath, afterFn, err := d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{SuccessorExe: "next-engine.exe"})
 	if err != nil {
-		t.Fatalf("HandleGracefulRestartWithOptions() error = %v, want nil", err)
-	}
-	if snapshotPath == "" {
-		t.Fatal("snapshot path is empty")
+		t.Fatalf("HandleGracefulRestartWithOptions() error = %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(snapshotPath) })
-	if afterFn == nil {
-		t.Fatal("afterFn is nil; predecessor would not shut down after response")
-	}
 	select {
 	case <-spawned:
-		t.Fatal("snapshot successor spawned before restart response afterFn")
 	default:
+		t.Fatal("snapshot successor was not started before restart returned")
 	}
-	if !d.shuttingDown.Load() {
-		t.Fatal("daemon is not marked shuttingDown while restart response is pending")
+	if afterFn == nil || !d.shuttingDown.Load() {
+		t.Fatal("successful snapshot restart did not arm predecessor shutdown")
 	}
 	if got := d.stats.fallback.Load() - beforeFallback; got != 0 {
-		t.Fatalf("handoff fallback delta = %d, want 0 for SessionHandler-only snapshot restart", got)
+		t.Fatalf("handoff fallback delta = %d, want 0", got)
+	}
+	if gotExe != "next-engine.exe" || gotFlag != "--fixture-daemon" {
+		t.Fatalf("snapshot successor = (%q, %q), want (next-engine.exe, --fixture-daemon)", gotExe, gotFlag)
 	}
 
 	afterFn()
@@ -185,13 +421,49 @@ func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorAfterShutdown(t
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon did not shut down after snapshot restart afterFn")
 	}
-	select {
-	case <-spawned:
-	case <-time.After(5 * time.Second):
-		t.Fatal("snapshot successor did not spawn after daemon shutdown")
+}
+
+func TestGracefulRestartSessionHandlerSuccessorStartFailurePreservesPredecessor(t *testing.T) {
+	origSpawn := spawnSnapshotSuccessorForRestart
+	spawnSnapshotSuccessorForRestart = func(string, string) error { return os.ErrNotExist }
+	t.Cleanup(func() { spawnSnapshotSuccessorForRestart = origSpawn })
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+
+	ctlPath := shortSocketPath(t, "sessionhandler-snapshot-failure.ctl.sock")
+	d, err := New(Config{
+		Name:           "test-daemon",
+		ControlPath:    ctlPath,
+		SkipSnapshot:   true,
+		SessionHandler: noopSessionHandler{},
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("New(): %v", err)
 	}
-	if gotExe != "next-engine.exe" || gotFlag != "--fixture-daemon" {
-		t.Fatalf("snapshot successor = (%q, %q), want (next-engine.exe, --fixture-daemon)", gotExe, gotFlag)
+	t.Cleanup(func() { d.Shutdown() })
+	_, sid, _, err := d.Spawn(control.Request{Cmd: "spawn", Cwd: t.TempDir(), Mode: "global"})
+	if err != nil {
+		t.Fatalf("Spawn() SessionHandler owner: %v", err)
+	}
+	waitOwnerAccepting(t, d, sid)
+
+	snapshotPath, afterFn, err := d.HandleGracefulRestartWithOptions(control.GracefulRestartOptions{SuccessorExe: "missing.exe"})
+	if err == nil {
+		t.Fatal("snapshot successor start failure returned nil error")
+	}
+	if snapshotPath != "" || afterFn != nil || d.shuttingDown.Load() {
+		t.Fatalf("aborted snapshot restart path=%q afterFn=%v shuttingDown=%v", snapshotPath, afterFn != nil, d.shuttingDown.Load())
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil || !entry.Owner.IsAccepting() {
+		t.Fatal("snapshot successor start failure stopped predecessor owner")
+	}
+	if got := entry.Owner.Status()["restart_pin_count"]; got != int64(0) {
+		t.Fatalf("restart pin count = %v, want 0", got)
+	}
+	if _, statErr := os.Stat(SnapshotPath()); !os.IsNotExist(statErr) {
+		t.Fatalf("aborted snapshot still exists: %v", statErr)
 	}
 }
 
@@ -203,15 +475,20 @@ func TestGracefulRestartSessionHandlerOnlySpawnsSnapshotSuccessorAfterShutdown(t
 // log output into a thread-safe buffer and grep it after the call returns.
 func TestHandoffFallback_LogMarker(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	d, logBuf := testDaemonWithLog(t)
 	seedProcessBackedOwner(t, d)
 
-	snapshotPath, _, err := d.HandleGracefulRestart(0)
+	snapshotPath, afterFn, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(snapshotPath) })
+	registerGracefulRestartCleanup(t, d, afterFn)
+	if *spawnedFallbacks != 1 {
+		t.Fatalf("snapshot fallback successor starts = %d, want exactly 1", *spawnedFallbacks)
+	}
 
 	logs := logBuf.String()
 
@@ -236,15 +513,12 @@ func TestHandoffFallback_LogMarker(t *testing.T) {
 }
 
 // TestHandoffFallback_CounterIncrement verifies that the handoff_fallback
-// atomic counter advances by exactly 1 per fallback attempt, enabling the
-// verify-handoff.sh / .ps1 post-deploy scripts (T036) to distinguish
-// successful handoffs from FR-8 legacy-path falls.
-//
-// Mechanism mirrors TestHandoffFallbackOnAcceptTimeout (accept timeout),
-// but asserts the counter delta in HandleStatus output rather than log
-// content.
+// atomic counter advances by exactly 1 after an exact-Hello protocol failure,
+// enabling post-deploy scripts to distinguish live handoff from bounded
+// snapshot fallback.
 func TestHandoffFallback_CounterIncrement(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	d := testDaemon(t)
 	seedProcessBackedOwner(t, d)
@@ -253,11 +527,15 @@ func TestHandoffFallback_CounterIncrement(t *testing.T) {
 	before := d.stats.fallback.Load()
 	beforeAttempted := d.stats.attempted.Load()
 
-	snapshotPath, _, err := d.HandleGracefulRestart(0)
+	snapshotPath, afterFn, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(snapshotPath) })
+	registerGracefulRestartCleanup(t, d, afterFn)
+	if *spawnedFallbacks != 1 {
+		t.Fatalf("snapshot fallback successor starts = %d, want exactly 1", *spawnedFallbacks)
+	}
 
 	afterAttempted := d.stats.attempted.Load()
 	after := d.stats.fallback.Load()
@@ -269,13 +547,12 @@ func TestHandoffFallback_CounterIncrement(t *testing.T) {
 			afterAttempted-beforeAttempted)
 	}
 
-	// fallback MUST increase by exactly 1 on this failure path.
+	// fallback MUST increase by exactly 1 only after exact Hello and detach.
 	if after-before != 1 {
-		t.Errorf("handoff_fallback delta: got %d, want 1 (accept timeout should be a fallback, not a success)",
-			after-before)
+		t.Errorf("handoff_fallback delta: got %d, want 1 for post-Hello failure", after-before)
 	}
 
-	// transferred + aborted MUST remain zero — no handoff protocol ran.
+	// transferred + aborted remain zero because no owner transfer began.
 	if got := d.stats.transferred.Load(); got != 0 {
 		t.Errorf("handoff_transferred on fallback path: got %d, want 0", got)
 	}
@@ -288,6 +565,7 @@ func TestHandoffFallback_CounterIncrement(t *testing.T) {
 // HandleStatus output (the API verify-handoff.sh / .ps1 rely on).
 func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	d := testDaemon(t)
 	seedProcessBackedOwner(t, d)
@@ -304,11 +582,15 @@ func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
 		}
 	}
 
-	snapshotPath, _, err := d.HandleGracefulRestart(0)
+	snapshotPath, afterFn, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(snapshotPath) })
+	registerGracefulRestartCleanup(t, d, afterFn)
+	if *spawnedFallbacks != 1 {
+		t.Fatalf("snapshot fallback successor starts = %d, want exactly 1", *spawnedFallbacks)
+	}
 
 	after := d.HandleStatus()
 	hoff1, ok := after["handoff"].(map[string]any)
@@ -334,15 +616,20 @@ func TestHandoffFallback_StatusCountersExposed(t *testing.T) {
 // requests AND the cached init/tools templates.
 func TestHandoffFallback_SnapshotAlwaysWritten(t *testing.T) {
 	setupTestHandoffTimeouts(t)
+	spawnedFallbacks := setupPostHelloFailureSuccessors(t)
 
 	d := testDaemon(t)
 	seedProcessBackedOwner(t, d)
 
-	snapshotPath, _, err := d.HandleGracefulRestart(0)
+	snapshotPath, afterFn, err := d.HandleGracefulRestart(0)
 	if err != nil {
 		t.Fatalf("HandleGracefulRestart: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(snapshotPath) })
+	registerGracefulRestartCleanup(t, d, afterFn)
+	if *spawnedFallbacks != 1 {
+		t.Fatalf("snapshot fallback successor starts = %d, want exactly 1", *spawnedFallbacks)
+	}
 
 	info, statErr := os.Stat(snapshotPath)
 	if statErr != nil {

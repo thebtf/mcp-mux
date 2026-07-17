@@ -7,6 +7,45 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-17
+
+### Added
+
+- Added demand-driven upstream materialization for compatible template-backed
+  owners. Host `initialize` / `tools/list` startup can now complete from cache
+  with no upstream process, while the first uncached request materializes one
+  generation and succeeds on the same open transport.
+
+### Changed
+
+- Template reuse now requires an exact full SHA-256 identity of the effective
+  security-relevant environment, plus the exact canonical working directory
+  for isolated templates; a stricter per-CWD isolated entry shadows any later
+  relaxed template. Windows environment keys normalize case-insensitively
+  before shim override, fingerprinting, or launch. A first template revision
+  race performs one fresh lookup; a repeated mismatch takes one bounded
+  cold/eager bypass.
+- Process retirement, owner removal, snapshot fallback, and mixed handoff now
+  retain the installed generation until both process completion and process-tree
+  authority retirement are proven. Unproven finalization remains visible as
+  `FINALIZE_BLOCKED` and retries retirement proof for that same installed
+  generation without allowing a competing generation.
+- Restart restore invalidates secondary discovery caches before refresh.
+  Failed/rejected local demand clears request-scoped remap, pending, inflight,
+  and progress residue instead of replaying later; session-token revocation is
+  reserved for isolation eviction.
+- Official CI and release artifacts now use Go 1.25.12. Root and muxcore
+  `govulncheck` report zero reachable vulnerabilities under that toolchain;
+  this does not treat an imported-but-unreached advisory as reachable.
+- Graceful restart now treats listener/spawn/accept and exact-Hello negotiation
+  failures as pre-detach aborts that retain the predecessor. A post-detach
+  protocol failure must prove the failed successor exited, rewrite the pinned
+  snapshot, and pre-start exactly one clean snapshot successor before the
+  predecessor may shut down.
+- Staged snapshot activation is transactional: an owner-construction failure
+  rolls back partial registrations, preserves the exact pinned environment in a
+  filtered recovery snapshot, and fails before the new control endpoint serves.
+
 ## [0.27.2] - 2026-07-17
 
 ### Fixed
@@ -127,7 +166,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.27.2...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/thebtf/mcp-mux/compare/v0.27.2...v0.28.0
 [0.27.2]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/thebtf/mcp-mux/compare/v0.26.13...v0.27.0

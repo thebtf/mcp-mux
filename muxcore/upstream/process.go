@@ -32,14 +32,26 @@ import (
 // and any error from the kill escalation. A non-nil error signals that a forced
 // kill occurred (either GracefulKill failed, kill succeeded after timeout, or the
 // handler did not exit within timeout).
-// Safe to call after Close() — returns (0, nil) if already closed or detached.
+// Safe to call after Close() — returns (0, nil) if already closed or authority was transferred.
 func (p *Process) SoftClose(timeout time.Duration) (int, error) {
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
+
 	p.mu.Lock()
-	if p.closed || p.detach != detachAttached {
+	if p.closed {
 		p.mu.Unlock()
 		return 0, nil
 	}
-	p.closed = true
+	switch p.detach {
+	case detachLegacy, detachCommitted:
+		p.mu.Unlock()
+		return 0, nil
+	case detachPrepared, detachAborted:
+		p.mu.Unlock()
+		return 0, p.AbortDetach()
+	case detachAttached:
+		p.retiring = true
+	}
 	p.mu.Unlock()
 
 	if p.stdin != nil {
@@ -48,19 +60,23 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 
 	select {
 	case <-p.Done:
-		return softCloseExitCode(p.ExitErr), terminateProcessTree(p)
+		if err := p.finalizeOwnedTree(); err != nil {
+			return softCloseExitCode(p.ExitErr), err
+		}
+		p.markClosed()
+		return softCloseExitCode(p.ExitErr), nil
 	case <-time.After(timeout):
 	}
 
 	if p.proc != nil || p.pid > 0 {
-		killErr := terminateProcessTree(p)
+		if err := p.finalizeOwnedTree(); err != nil {
+			return -1, err
+		}
 		select {
 		case <-p.Done:
+			p.markClosed()
 		case <-time.After(5 * time.Second):
 			return -1, fmt.Errorf("upstream: process tree did not exit after termination")
-		}
-		if killErr != nil {
-			return softCloseExitCode(p.ExitErr), killErr
 		}
 		return softCloseExitCode(p.ExitErr), fmt.Errorf("upstream: forced kill after soft-close timeout")
 	}
@@ -103,10 +119,13 @@ type detachState uint8
 
 const (
 	detachAttached detachState = iota
+	detachLegacy
 	detachPrepared
 	detachCommitted
 	detachAborted
 )
+
+const processTreeRetirementTimeout = 10 * time.Second
 
 // lineBuffer is a mutex-protected deque of lines for buffering stdout.
 // A drain goroutine pushes lines; ReadLine pops them.
@@ -187,18 +206,22 @@ type Process struct {
 	// detach quiesces and joins both before exposing their OS handles.
 	stdoutDrain *streamReadControl
 	stderrDrain *streamReadControl
-	// authorityMu protects the one-shot PGID/Job authority. Finalization,
-	// detach commit, and leader-exit cleanup atomically take and retire it.
+	// authorityMu protects the transferable PGID/Job authority. Finalization
+	// retains it on failure so a later owner-removal attempt can retry.
 	authorityMu sync.Mutex
 	spawnPgid   int
 	jobHandle   uintptr
 
 	lineBuf *lineBuffer
 
-	mu           sync.Mutex
-	closed       bool
-	detach       detachState
-	drainTimeout time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
+	mu            sync.Mutex
+	closeMu       sync.Mutex
+	finalizeMu    sync.Mutex
+	closed        bool
+	retiring      bool
+	treeFinalized bool
+	detach        detachState
+	drainTimeout  time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
 
 	// Done is closed when the process exits.
 	Done chan struct{}
@@ -209,15 +232,35 @@ type Process struct {
 // beginExitFinalization atomically decides whether this Process still owns
 // leader-exit cleanup. A detach that reaches detachPrepared first owns the
 // tree lease; an exit finalizer that reaches this method first marks the
-// Process closed so a later detach cannot expose handles from a dying tree.
+// Process retiring so writes and later detach attempts are rejected while
+// finalization remains retryable until the full tree is proven retired.
 func (p *Process) beginExitFinalization() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.detach != detachAttached {
 		return false
 	}
-	p.closed = true
+	p.retiring = true
 	return true
+}
+
+func (p *Process) markClosed() {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+}
+
+func (p *Process) finalizeOwnedTree() error {
+	p.finalizeMu.Lock()
+	defer p.finalizeMu.Unlock()
+	if p.treeFinalized {
+		return nil
+	}
+	if err := terminateProcessTree(p); err != nil {
+		return err
+	}
+	p.treeFinalized = true
+	return nil
 }
 
 // SetDrainTimeout sets the graceful shutdown wait time after stdin close.
@@ -238,6 +281,15 @@ func (p *Process) SetDrainTimeout(d time.Duration) {
 // calling process. In daemon mode os.Stderr is typically discarded (daemon is detached
 // with cmd.Stderr=nil), so upstream crash diagnostics get lost — callers running under
 // a daemon MUST pass a logger to preserve stderr.
+// startPostAuthorityHook is a narrow regression-test seam. Production leaves
+// it as a no-op; tests use it to force a failure after process-tree authority
+// exists and verify Start does not return before the full tree is retired.
+var startPostAuthorityHook = func(*Process) error { return nil }
+
+var afterSpawnPlatform = afterSpawnWindows
+
+var finalizeFailedStartTree = func(p *Process) error { return p.finalizeOwnedTree() }
+
 func Start(command string, args []string, env map[string]string, cwd string, logger *log.Logger) (*Process, error) {
 	var merged []string
 	if len(env) > 0 {
@@ -343,17 +395,39 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		_ = stderrW.Close()
 		return nil, fmt.Errorf("upstream: spawn %s: %w", command, err)
 	}
-	if captureErr != nil {
-		// Should not happen — Spawn already propagates PreStart errors — but be safe.
-		if p.stdin != nil {
-			_ = p.stdin.Close()
+
+	p.proc = proc
+	p.pid = proc.PID()
+	// On Unix, Setpgid=true guarantees PGID == PID after spawn. We read
+	// proc.PID() to stay within the procgroup abstraction. The Windows build
+	// ignores spawnPgid and installs Job authority in afterSpawnWindows.
+	if pid := proc.PID(); pid != 0 {
+		p.authorityMu.Lock()
+		p.spawnPgid = pid
+		p.authorityMu.Unlock()
+	}
+
+	failAfterSpawn := func(startErr error) (*Process, error) {
+		startErr = errors.Join(startErr, finalizeFailedStart(p, proc, stdoutR, stdoutW, stderrR, stderrW))
+		if !p.RetirementProven() {
+			return p, startErr
 		}
-		_ = stdoutR.Close()
-		_ = stdoutW.Close()
-		_ = stderrR.Close()
-		_ = stderrW.Close()
-		_ = proc.Kill()
-		return nil, captureErr
+		return nil, startErr
+	}
+
+	if captureErr != nil {
+		// Should not happen — Spawn already propagates PreStart errors — but if
+		// it does, retire the process before returning the setup error.
+		return failAfterSpawn(captureErr)
+	}
+
+	// Upstream owns the single transferable tree authority. Procgroup tree
+	// management is disabled for this spawn to avoid a second Job/PGID owner.
+	if err := afterSpawnPlatform(p, proc.PID()); err != nil {
+		return failAfterSpawn(fmt.Errorf("upstream: tree authority: %w", err))
+	}
+	if err := startPostAuthorityHook(p); err != nil {
+		return failAfterSpawn(err)
 	}
 
 	// Close our copy of the write end — the child inherited its own copy via
@@ -363,28 +437,6 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 
-	// Upstream owns the single transferable tree authority. Procgroup tree
-	// management is disabled for this spawn to avoid a second Job/PGID owner.
-	if err := afterSpawnWindows(p, proc.PID()); err != nil {
-		_ = proc.Kill()
-		if p.stdin != nil {
-			_ = p.stdin.Close()
-		}
-		_ = stdoutR.Close()
-		_ = stderrR.Close()
-		return nil, fmt.Errorf("upstream: tree authority: %w", err)
-	}
-
-	p.proc = proc
-	p.pid = proc.PID()
-	// On Unix, Setpgid=true guarantees PGID == PID after spawn.
-	// We read proc.PID() to stay within the procgroup abstraction.
-	// spawnPgid is zero for handler-based processes.
-	if pid := proc.PID(); pid != 0 {
-		p.authorityMu.Lock()
-		p.spawnPgid = pid
-		p.authorityMu.Unlock()
-	}
 	p.lineBuf = newLineBuffer()
 
 	// Both readers publish cancellable read authority. Transactional handoff
@@ -399,27 +451,73 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 	go func() {
 		<-proc.Done()
 		attached := p.beginExitFinalization()
+		var finalizeErr error
 		if attached {
 			if p.stdin != nil {
 				_ = p.stdin.Close()
 			}
-			_ = terminateProcessTree(p)
+			finalizeErr = p.finalizeOwnedTree()
 		}
 		<-stdoutDrained
 		<-stderrDrained
-		p.ExitErr = proc.Wait()
+		p.ExitErr = errors.Join(proc.Wait(), finalizeErr)
+		if finalizeErr == nil {
+			p.markClosed()
+		}
 		close(p.Done)
 	}()
 
 	return p, nil
 }
 
+func observeFailedStartLeader(p *Process, proc *procgroup.Process) {
+	if proc == nil {
+		close(p.Done)
+		return
+	}
+	go func() {
+		p.ExitErr = proc.Wait()
+		close(p.Done)
+	}()
+}
+
+func finalizeFailedStart(p *Process, proc *procgroup.Process, pipes ...*os.File) error {
+	p.mu.Lock()
+	p.retiring = true
+	p.mu.Unlock()
+	observeFailedStartLeader(p, proc)
+
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
+
+	finalizeErr := finalizeFailedStartTree(p)
+	if finalizeErr != nil && proc != nil {
+		finalizeErr = errors.Join(finalizeErr, proc.Kill())
+	}
+	if finalizeErr == nil {
+		timer := time.NewTimer(processTreeRetirementTimeout)
+		select {
+		case <-p.Done:
+			timer.Stop()
+			p.markClosed()
+		case <-timer.C:
+			finalizeErr = errors.New("upstream: failed-start retirement not yet proven")
+		}
+	}
+	for _, pipe := range pipes {
+		if pipe != nil {
+			_ = pipe.Close()
+		}
+	}
+	return finalizeErr
+}
+
 // WriteLine sends a line of data to the upstream process stdin, followed by newline.
 func (p *Process) WriteLine(data []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if p.closed {
+	if p.closed || p.retiring {
 		return fmt.Errorf("upstream: process closed")
 	}
 
@@ -453,16 +551,24 @@ func (p *Process) ReadLine() ([]byte, error) {
 //  3. If still alive: proc.GracefulKill() — SIGTERM→wait→SIGKILL on Unix,
 //     CTRL_BREAK_EVENT→wait→TerminateJobObject on Windows. Kills the whole tree.
 func (p *Process) Close() error {
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
+
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return nil
 	}
-	if p.detach != detachAttached {
+	switch p.detach {
+	case detachLegacy, detachCommitted:
 		p.mu.Unlock()
 		return nil
+	case detachPrepared, detachAborted:
+		p.mu.Unlock()
+		return p.AbortDetach()
+	case detachAttached:
+		p.retiring = true
 	}
-	p.closed = true
 	stdinWait := p.drainTimeout
 	p.mu.Unlock()
 
@@ -475,18 +581,64 @@ func (p *Process) Close() error {
 
 	select {
 	case <-p.Done:
-		return terminateProcessTree(p)
+		if err := p.finalizeOwnedTree(); err != nil {
+			return err
+		}
+		p.markClosed()
+		return nil
 	case <-time.After(stdinWait):
 	}
-	if p.proc != nil || p.pid > 0 {
-		return terminateProcessTree(p)
+	if err := p.finalizeOwnedTree(); err != nil {
+		return err
 	}
-	return nil
+	if p.proc == nil && p.pid <= 0 {
+		p.markClosed()
+		return nil
+	}
+	select {
+	case <-p.Done:
+		p.markClosed()
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("upstream: process tree finalization not yet proven")
+	}
 }
 
 // PID returns the process ID of the upstream process.
 func (p *Process) PID() int {
 	return p.pid
+}
+
+// RetirementProven reports whether this Process no longer owns a live process
+// tree authority. Attached OS processes require both Process.Done and retired
+// process-group/Job authority. A committed detach is also terminal for this
+// owner because authority has transferred to the successor.
+func (p *Process) RetirementProven() bool {
+	p.mu.Lock()
+	detach := p.detach
+	closed := p.closed
+	hasOSProcess := p.proc != nil || p.pid > 0
+	p.mu.Unlock()
+
+	if detach == detachCommitted {
+		return true
+	}
+	if !hasOSProcess {
+		return closed
+	}
+
+	p.finalizeMu.Lock()
+	finalized := p.treeFinalized
+	p.finalizeMu.Unlock()
+	if !finalized {
+		return false
+	}
+	select {
+	case <-p.Done:
+		return true
+	default:
+		return false
+	}
 }
 
 // Detach releases ownership of the upstream process without terminating it.
@@ -504,7 +656,7 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.closed {
+	if p.closed || p.retiring {
 		return 0, 0, 0, ErrAlreadyClosed
 	}
 	if p.detach != detachAttached {
@@ -517,7 +669,7 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 	if err := prepareLegacyDetach(p, pid); err != nil {
 		return 0, 0, 0, err
 	}
-	p.detach = detachPrepared
+	p.detach = detachLegacy
 	if p.stdinFile != nil {
 		stdinFD = p.stdinFD
 	}
@@ -531,7 +683,7 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 // authority until the successor receives a duplicated handle.
 func (p *Process) DetachWithAuthority() (pid int, stdinFD, stdoutFD, stderrFD, authorityFD uintptr, err error) {
 	p.mu.Lock()
-	if p.closed {
+	if p.closed || p.retiring {
 		p.mu.Unlock()
 		return 0, 0, 0, 0, 0, ErrAlreadyClosed
 	}
@@ -582,7 +734,7 @@ func (p *Process) CommitDetach() error {
 		return nil
 	case detachPrepared:
 		p.detach = detachCommitted
-	case detachAborted, detachAttached:
+	case detachAborted, detachAttached, detachLegacy:
 		p.mu.Unlock()
 		return ErrDetachNotPrepared
 	}
@@ -605,37 +757,43 @@ func (p *Process) CommitDetach() error {
 func (p *Process) AbortDetach() error {
 	p.mu.Lock()
 	switch p.detach {
-	case detachAborted:
-		p.mu.Unlock()
-		return nil
 	case detachCommitted:
 		p.mu.Unlock()
 		return ErrDetachCommitted
-	case detachAttached:
+	case detachAttached, detachLegacy:
 		p.mu.Unlock()
 		return ErrDetachNotPrepared
 	case detachPrepared:
 		p.detach = detachAborted
-		p.closed = true
+		p.retiring = true
+	case detachAborted:
+		p.retiring = true
 	}
 	p.mu.Unlock()
 
 	if p.stdin != nil {
 		_ = p.stdin.Close()
 	}
-	err := terminateProcessTree(p)
+	err := p.finalizeOwnedTree()
+	doneProven := p.proc == nil && p.pid == 0
+	if !doneProven {
+		timer := time.NewTimer(processTreeRetirementTimeout)
+		select {
+		case <-p.Done:
+			timer.Stop()
+			doneProven = true
+		case <-timer.C:
+			err = errors.Join(err, errors.New("upstream: aborted detach process did not exit"))
+		}
+	}
+	if err == nil && doneProven {
+		p.markClosed()
+	}
 	if p.stdout != nil {
 		_ = p.stdout.Close()
 	}
 	if p.stderr != nil {
 		_ = p.stderr.Close()
-	}
-	if p.proc != nil {
-		select {
-		case <-p.Done:
-		case <-time.After(5 * time.Second):
-			return fmt.Errorf("upstream: abort detach timed out waiting for tree exit")
-		}
 	}
 	return err
 }

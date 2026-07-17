@@ -152,20 +152,35 @@ flowchart TD
 
 Для `initialize` кеш индексируется по `protocolVersion`. Клиент с другой версией протокола обходит кеш и обращается к upstream напрямую.
 
-## Проактивная инициализация
+## Cache-only запуск и отложенная материализация
 
-При создании нового owner mcp-mux сразу отправляет upstream синтетический
-запрос `initialize` — ещё до подключения первой сессии CC. Ответ заранее
-попадает в кеш, поэтому первая сессия получает его немедленно и не ждёт запуска
-upstream.
+При первом запуске команды в новом security context mcp-mux создаёт upstream
+и отправляет синтетические `initialize`, `notifications/initialized` и
+`tools/list`. Так owner определяет sharing mode и публикует совместимый шаблон
+discovery-кеша.
+
+После удаления этого owner следующая совместимая сессия может создать
+**cache-only owner** без процесса upstream:
+
+- кешированные `initialize`, `tools/list` и сохранённые prompt/resource-ответы
+  возвращаются без запуска процесса;
+- `notifications/initialized` подавляется, пока upstream отсутствует;
+- первый запрос без кешированного ответа запускает ровно одно поколение
+  upstream и передаётся с исходным JSON-RPC id по тому же открытому transport;
+- `mcp-mux status` показывает `materialization_state: "CACHE_ONLY"` и
+  `upstream_pid: 0`, а после первого спроса — `READY` и pid процесса.
+
+Повторное использование шаблона работает в fail-closed режиме. Отсутствующий,
+устаревший или несовместимый шаблон ведёт к одному ограниченному cold/eager
+запуску без воспроизведения чужого кеша. Совместимость требует точного
+SHA-256 identity эффективного security-relevant environment; для isolated
+шаблонов также нужен точный canonical working directory. Исходные значения
+environment не сохраняются в identity и не выводятся в status. Persistent owner
+и явно eager-сценарии по-прежнему запускаются без ожидания запроса.
 
 Для медленно запускающихся серверов (Serena через uvx — около 3 секунд, Tavily
-через npx — около 5 секунд) это предотвращает ложный статус «failed», который
-возникал, если upstream не успевал ответить в пределах стартового таймаута CC.
-
-После `initialize` mcp-mux также отправляет `notifications/initialized` и
-`tools/list`, чтобы прогреть весь кеш и выполнить автоматическую
-классификацию.
+через npx — около 5 секунд) cache-only шаблон ускоряет host startup, а стоимость
+запуска переносится на момент реального обращения к серверу.
 
 ## Daemon-режим
 
@@ -451,26 +466,32 @@ Done   ──(transferred, aborted lists)──>
   восстановлены из snapshot.
 - **Таймаут accept и общий таймаут — 30 секунд** с обеих сторон.
 - **Расхождение версий (FR-3):** согласование завершается до отсоединения
-  owner. Несовпадение `protocol_version`, включая первый переход v1 → v2,
-  запускает один ограниченный snapshot-backed shutdown-and-respawn (FR-8).
+  owner. Несовпадение `protocol_version` или токена, таймаут accept и ошибка
+  запуска handoff-successor отменяют рестарт: daemon освобождает restart pin,
+  не запускает fallback и оставляет predecessor в рабочем состоянии.
 
 ### Деградация по FR-8
 
-При неподдерживаемой платформе, ошибке запуска successor, таймауте accept,
-несоответствии токена (`ErrTokenMismatch`), несовпадении версии протокола
-(`ErrProtocolVersionMismatch`) или другой ошибке `performHandoff` daemon
-выполняет ограниченный snapshot-backed shutdown-and-respawn. Successor
-перезапускает upstream из snapshot; `drainOrphanedInflight` возвращает
-незавершённым запросам JSON-RPC ошибки с исходным id и не воспроизводит их.
+Snapshot fallback разрешён только после точного Hello и отсоединения owner.
+При последующей ошибке receipt или final ACK daemon подтверждает остановку
+неудачного successor, завершает подготовленное дерево, повторно записывает
+удержанный snapshot и заранее запускает ровно один чистый snapshot-successor.
+Только после этого control-ответ разрешает выключить predecessor.
 
-Все пути логируют `handoff.fallback reason=…` — ищите в `mcp-muxd-debug.log` для диагностики.
+Рестарт без process-backed owner также заранее запускает один
+snapshot-successor. Ошибка до отсоединения логируется как `handoff.abort`;
+успешное восстановление после отсоединения — как `handoff.fallback`. Если
+нельзя подтвердить остановку successor, записать snapshot или запустить backup,
+daemon логирует `handoff.fallback_blocked` и остаётся в fail-closed состоянии.
+`drainOrphanedInflight` возвращает незавершённым запросам JSON-RPC-ошибки
+с исходным id и не воспроизводит их.
 
 ### Видимость для оператора
 
 Новые счётчики в `mux_list` / `HandleStatus`: `handoff_attempted`, `handoff_transferred`,
 `handoff_aborted`, `handoff_fallback`. Структурированные маркеры логов: `handoff.start`,
-`handoff.upstream.transferred`, `handoff.complete`, `handoff.fallback`,
-`handoff.receive.{start,complete,fail}`.
+`handoff.abort`, `handoff.upstream.transferred`, `handoff.complete`, `handoff.fallback`,
+`handoff.fallback_blocked`, `handoff.receive.{start,complete,fail}`.
 
 ### Миграция на v0.27.0
 

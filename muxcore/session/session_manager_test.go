@@ -105,6 +105,26 @@ func TestPreRegisterClonesMutableEnv(t *testing.T) {
 	}
 }
 
+func TestLookupPendingForOwnerIsExactAndSideEffectFree(t *testing.T) {
+	sm := NewManager()
+	sm.PreRegisterForOwner("pending", "owner-a", "/project/a", map[string]string{"TOKEN": "original"})
+	if _, _, ok := sm.LookupPendingForOwner("pending", "owner-b"); ok {
+		t.Fatal("lookup accepted wrong owner")
+	}
+	cwd, env, ok := sm.LookupPendingForOwner("pending", "owner-a")
+	if !ok || cwd != "/project/a" || env["TOKEN"] != "original" {
+		t.Fatalf("lookup = (%q, %v, %v), want exact pending context", cwd, env, ok)
+	}
+	env["TOKEN"] = "mutated"
+	_, again, ok := sm.LookupPendingForOwner("pending", "owner-a")
+	if !ok || again["TOKEN"] != "original" {
+		t.Fatal("lookup leaked mutable environment or consumed token")
+	}
+	if !sm.Bind("pending", "owner-a", &Session{ID: 2002}) {
+		t.Fatal("side-effect-free lookup consumed pending token")
+	}
+}
+
 func TestNilSessionContextDoesNotRefreshUnrelatedHistory(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -253,6 +273,45 @@ func TestRemoveBoundForOwner(t *testing.T) {
 	}
 	if _, err := sm.RegisterReconnect("tok-b", func(string) bool { return true }); err != nil {
 		t.Fatalf("RegisterReconnect(tok-b) error = %v, want retained owner-b history", err)
+	}
+}
+
+func TestRemoveBoundForOwnerExceptSessionRevokesOtherLineages(t *testing.T) {
+	sm := NewManager()
+	keep := &Session{ID: 41}
+	evict := &Session{ID: 42}
+	for token, session := range map[string]*Session{"keep": keep, "evict": evict} {
+		sm.RegisterSession(session, "")
+		sm.PreRegisterForOwner(token, "owner-a", "/project/"+token, nil)
+		if !sm.Bind(token, "owner-a", session) {
+			t.Fatalf("Bind(%q) returned false", token)
+		}
+	}
+	keepRefresh, err := sm.RegisterReconnect("keep", func(string) bool { return true })
+	if err != nil {
+		t.Fatalf("RegisterReconnect(keep): %v", err)
+	}
+	evictRefresh, err := sm.RegisterReconnect("evict", func(string) bool { return true })
+	if err != nil {
+		t.Fatalf("RegisterReconnect(evict): %v", err)
+	}
+	if sm.bound[keepRefresh].Session != keep || sm.bound[evictRefresh].Session != evict {
+		t.Fatal("refresh token did not retain its source session lineage")
+	}
+
+	sm.RemovePendingForOwner("owner-a")
+	if removed := sm.RemoveBoundForOwnerExceptSession("owner-a", keep); removed != 2 {
+		t.Fatalf("RemoveBoundForOwnerExceptSession() = %d, want 2", removed)
+	}
+	for _, token := range []string{"evict", evictRefresh} {
+		if _, err := sm.RegisterReconnect(token, func(string) bool { return true }); !errors.Is(err, ErrUnknownToken) {
+			t.Fatalf("RegisterReconnect(%q) error = %v, want ErrUnknownToken", token, err)
+		}
+	}
+	for _, token := range []string{"keep", keepRefresh} {
+		if _, err := sm.RegisterReconnect(token, func(string) bool { return true }); err != nil {
+			t.Fatalf("RegisterReconnect(%q) error = %v, want retained authority", token, err)
+		}
 	}
 }
 
@@ -483,6 +542,62 @@ func TestRegisterReconnect_NewTokenFresh(t *testing.T) {
 	}
 	if s2.Env["X"] != "1" {
 		t.Fatalf("session Env[X] = %q, want %q", s2.Env["X"], "1")
+	}
+}
+
+func TestRemovePendingForOwnerExceptSessionPreservesConcurrentReconnect(t *testing.T) {
+	const ownerKey = "owner-reconnect-race"
+	sm := NewManager()
+	retained := &Session{ID: 101}
+	sm.RegisterSession(retained, "")
+	sm.PreRegisterForOwner("previous", ownerKey, "/project/retained", nil)
+	if !sm.Bind("previous", ownerKey, retained) {
+		t.Fatal("Bind(previous) returned false")
+	}
+	sm.PreRegisterForOwner("fresh", ownerKey, "/project/fresh", nil)
+
+	enteredOwnerCheck := make(chan struct{})
+	releaseOwnerCheck := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOwner := func() { releaseOnce.Do(func() { close(releaseOwnerCheck) }) }
+	t.Cleanup(releaseOwner)
+	type reconnectResult struct {
+		token string
+		err   error
+	}
+	result := make(chan reconnectResult, 1)
+	go func() {
+		token, err := sm.RegisterReconnect("previous", func(string) bool {
+			close(enteredOwnerCheck)
+			<-releaseOwnerCheck
+			return true
+		})
+		result <- reconnectResult{token: token, err: err}
+	}()
+	select {
+	case <-enteredOwnerCheck:
+	case <-time.After(time.Second):
+		t.Fatal("RegisterReconnect did not enter owner liveness check")
+	}
+
+	if removed := sm.RemovePendingForOwnerExceptSession(ownerKey, retained); removed != 1 {
+		t.Fatalf("RemovePendingForOwnerExceptSession() = %d, want fresh reservation only", removed)
+	}
+	releaseOwner()
+	var got reconnectResult
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("RegisterReconnect did not return after owner check release")
+	}
+	if got.err != nil {
+		t.Fatalf("RegisterReconnect() error = %v", got.err)
+	}
+	if got.token == "" || !sm.IsPreRegistered(got.token) {
+		t.Fatalf("retained reconnect reservation %q was revoked", got.token)
+	}
+	if sm.IsPreRegistered("fresh") {
+		t.Fatal("fresh admission reservation survived isolated revocation")
 	}
 }
 

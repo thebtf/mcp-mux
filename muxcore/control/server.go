@@ -21,10 +21,11 @@ type Server struct {
 	handler    CommandHandler
 	logger     *log.Logger
 
-	mu     sync.Mutex
-	closed bool
-	done   chan struct{}
-	wg     sync.WaitGroup
+	mu      sync.Mutex
+	started bool
+	closed  bool
+	done    chan struct{}
+	wg      sync.WaitGroup
 }
 
 var (
@@ -34,22 +35,40 @@ var (
 
 // NewServer creates and starts a control server at the given socket path.
 func NewServer(socketPath string, handler CommandHandler, logger *log.Logger) (*Server, error) {
+	s, err := NewPausedServer(socketPath, handler, logger)
+	if err != nil {
+		return nil, err
+	}
+	s.Start()
+	return s, nil
+}
+
+// NewPausedServer binds the control socket without accepting connections.
+// Call Start after the handler's restart state is ready to serve.
+func NewPausedServer(socketPath string, handler CommandHandler, logger *log.Logger) (*Server, error) {
 	ln, err := ipc.Listen(socketPath)
 	if err != nil {
 		return nil, fmt.Errorf("control: listen %s: %w", socketPath, err)
 	}
-
-	s := &Server{
+	return &Server{
 		listener:   ln,
 		socketPath: socketPath,
 		handler:    handler,
 		logger:     logger,
 		done:       make(chan struct{}),
+	}, nil
+}
+
+// Start begins accepting connections. Repeated calls and calls after Close are no-ops.
+func (s *Server) Start() {
+	s.mu.Lock()
+	if s.started || s.closed {
+		s.mu.Unlock()
+		return
 	}
-
+	s.started = true
+	s.mu.Unlock()
 	go s.acceptLoop()
-
-	return s, nil
 }
 
 func (s *Server) acceptLoop() {
@@ -309,8 +328,10 @@ func (s *Server) writeResponse(conn net.Conn, resp Response) error {
 	return io.ErrShortWrite
 }
 
-var errUnknownToken = errors.New("unknown token")
-var errOwnerGone = errors.New("owner gone")
+var (
+	errUnknownToken = errors.New("unknown token")
+	errOwnerGone    = errors.New("owner gone")
+)
 
 func matchesControlError(err error, target error) bool {
 	return errors.Is(err, target) || err.Error() == target.Error()

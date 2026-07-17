@@ -3,14 +3,19 @@
 package daemon
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Microsoft/go-winio"
+	"golang.org/x/sys/windows"
 )
 
 func randomPipeName(t *testing.T) string {
@@ -77,6 +82,119 @@ func TestHandoffPipe_ListenDialRoundtrip(t *testing.T) {
 		t.Errorf("unexpected resp: %v", resp)
 	}
 	wg.Wait()
+}
+
+// TestHandoffPipe_DialBeforeDelayedBind proves the client can start before the
+// successor has bound its pipe. The first real dial must observe FILE_NOT_FOUND;
+// only then does the test bind the listener and permit the retry.
+func TestHandoffPipe_DialBeforeDelayedBind(t *testing.T) {
+	name := randomPipeName(t)
+	firstAttempt := make(chan error, 1)
+	allowRetry := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRetry := func() {
+		releaseOnce.Do(func() { close(allowRetry) })
+	}
+	defer releaseRetry()
+
+	attempts := 0
+	dial := func(ctx context.Context, path string) (net.Conn, error) {
+		conn, err := winio.DialPipeContext(ctx, path)
+		attempts++
+		if attempts == 1 {
+			firstAttempt <- err
+			<-allowRetry
+		}
+		return conn, err
+	}
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	dialDone := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialHandoffPipeWith(name, 2*time.Second, dial)
+		dialDone <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case err := <-firstAttempt:
+		if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			t.Fatalf("first dial error = %v, want ERROR_FILE_NOT_FOUND", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first dial attempt did not complete")
+	}
+
+	ln, err := listenHandoffPipe(name)
+	if err != nil {
+		t.Fatalf("listenHandoffPipe: %v", err)
+	}
+	defer ln.Close()
+	acceptDone := make(chan dialResult, 1)
+	go func() {
+		conn, err := ln.Accept()
+		acceptDone <- dialResult{conn: conn, err: err}
+	}()
+	releaseRetry()
+
+	var client dialResult
+	select {
+	case client = <-dialDone:
+		if client.err != nil {
+			t.Fatalf("dial after delayed bind: %v", client.err)
+		}
+		defer client.conn.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("dial did not complete after delayed bind")
+	}
+	select {
+	case server := <-acceptDone:
+		if server.err != nil {
+			t.Fatalf("accept after delayed bind: %v", server.err)
+		}
+		server.conn.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("accept did not complete after delayed bind")
+	}
+	if attempts < 2 {
+		t.Fatalf("dial attempts = %d, want at least 2", attempts)
+	}
+}
+
+func TestHandoffPipe_DialRetriesPipeBusy(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+
+	attempts := 0
+	conn, err := dialHandoffPipeWith(randomPipeName(t), time.Second, func(context.Context, string) (net.Conn, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, windows.ERROR_PIPE_BUSY
+		}
+		return client, nil
+	})
+	if err != nil {
+		t.Fatalf("dial after ERROR_PIPE_BUSY: %v", err)
+	}
+	defer conn.Close()
+	if attempts != 2 {
+		t.Fatalf("dial attempts = %d, want 2", attempts)
+	}
+}
+
+func TestHandoffPipe_DialPermanentErrorFailsFast(t *testing.T) {
+	attempts := 0
+	_, err := dialHandoffPipeWith(randomPipeName(t), 100*time.Millisecond, func(context.Context, string) (net.Conn, error) {
+		attempts++
+		return nil, windows.ERROR_ACCESS_DENIED
+	})
+	if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		t.Fatalf("dial error = %v, want ERROR_ACCESS_DENIED", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("dial attempts = %d, want 1", attempts)
+	}
 }
 
 // TestHandoffPipe_DialMissingListener verifies that dial fails cleanly when

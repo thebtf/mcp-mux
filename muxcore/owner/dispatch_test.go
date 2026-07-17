@@ -900,6 +900,36 @@ func TestDispatch_WithSessionMetaPreferredOverLegacy(t *testing.T) {
 	}
 }
 
+func TestNewOwnerFromSnapshotPrefersSessionHandlerWithSessionMeta(t *testing.T) {
+	h := &mockSessionHandlerBoth{}
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		IPCPath:        testIPCPath(t),
+		ServerID:       "snapshot-meta-dispatch",
+		SessionHandler: h,
+	}, OwnerSnapshot{})
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	t.Cleanup(o.Shutdown)
+
+	sess, buf := newTestSession("/snapshot-meta")
+	defer sess.Close()
+	sess.SetMeta(muxcore.SessionMeta{TenantID: "snapshot-tenant", AuthorizedAt: time.Now()})
+	msg := parseMessage([]byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`))
+	if err := o.dispatchToSessionHandler(sess, msg); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if line := waitForWrite(t, buf, 2*time.Second); !strings.Contains(line, "meta-handled") {
+		t.Fatalf("response = %q, want meta handler", line)
+	}
+	if got := len(h.capturedMeta()); got != 1 {
+		t.Fatalf("WithSessionMeta calls = %d, want 1", got)
+	}
+	if got := len(h.captured()); got != 0 {
+		t.Fatalf("legacy calls = %d, want 0", got)
+	}
+}
+
 // TestDispatch_LegacyHandlerByteIdentical_v23 (T015) — legacy-only handler
 // (HandleRequest only) must be dispatched unchanged. SessionMeta is cached
 // regardless but never reaches the handler. Backward-compat regression for

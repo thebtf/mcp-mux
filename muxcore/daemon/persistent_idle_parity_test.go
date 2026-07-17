@@ -240,35 +240,36 @@ func TestPersistentIdleParityPersistsThroughSnapshotRestore(t *testing.T) {
 	}
 }
 
-func TestPersistentIdleParityPersistentRespawnGetsNewGeneration(t *testing.T) {
+func TestPersistentIdleParityReaperDoesNotReplaceOwnerGeneration(t *testing.T) {
 	d, r := testLifecycleDaemon(t, false)
 
-	_, sid, _ := spawnLifecycleOwner(t, d, "persistent-respawn")
+	_, sid, _ := spawnLifecycleOwner(t, d, "persistent-no-replacement")
 	d.SetPersistent(sid, true)
 	before := d.Entry(sid)
 	if before == nil || before.Owner == nil {
 		t.Fatal("persistent owner missing before shutdown")
 	}
 	beforeGeneration := before.OwnerGeneration
-	before.Owner.Shutdown()
+	beforeOwner := before.Owner
+	beforeOwner.Shutdown()
 	select {
-	case <-before.Owner.Done():
+	case <-beforeOwner.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("owner did not shut down")
 	}
 
-	if affected := r.sweep(); affected != 1 {
-		t.Fatalf("persistent dead-owner sweep affected %d owners, want 1", affected)
+	if affected := r.sweep(); affected != 0 {
+		t.Fatalf("persistent dead-owner sweep affected %d owners, want 0", affected)
 	}
 	after := d.Entry(sid)
-	if after == nil || after.Owner == nil {
-		t.Fatal("persistent owner missing after respawn")
+	if after != before || after.Owner != beforeOwner {
+		t.Fatal("reaper replaced persistent owner generation")
 	}
 	if !after.Persistent {
-		t.Fatal("persistent flag lost after respawn")
+		t.Fatal("persistent flag lost")
 	}
-	if after.OwnerGeneration == "" || after.OwnerGeneration == beforeGeneration {
-		t.Fatalf("respawned owner generation = %q, want fresh non-empty generation distinct from %q", after.OwnerGeneration, beforeGeneration)
+	if after.OwnerGeneration != beforeGeneration {
+		t.Fatalf("owner generation = %q, want unchanged %q", after.OwnerGeneration, beforeGeneration)
 	}
 
 	status := d.HandleStatus()
@@ -276,10 +277,7 @@ func TestPersistentIdleParityPersistentRespawnGetsNewGeneration(t *testing.T) {
 	if len(servers) != 1 {
 		t.Fatalf("status servers = %d, want 1", len(servers))
 	}
-	if got := servers[0]["owner_generation"]; got != after.OwnerGeneration {
-		t.Fatalf("status owner_generation = %#v, want %q", got, after.OwnerGeneration)
-	}
-	if got := servers[0]["owner_generation"]; got == beforeGeneration {
-		t.Fatalf("status still reports stale owner_generation %q", beforeGeneration)
+	if got := servers[0]["owner_generation"]; got != beforeGeneration {
+		t.Fatalf("status owner_generation = %#v, want %q", got, beforeGeneration)
 	}
 }

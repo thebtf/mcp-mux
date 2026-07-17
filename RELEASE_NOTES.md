@@ -1,91 +1,95 @@
-# mcp-mux v0.27.2
+# mcp-mux v0.28.0
 
 **Release date:** 2026-07-17
 
-**Type:** Non-breaking patch release
+**Type:** Backward-compatible feature release
 
 ## Summary
 
-v0.27.2 fixes a process-authority race for snapshot/template owners. A restored
-owner can begin materializing its cached upstream in the background while its
-first uncached request arrives. Before this patch, the request path could start
-a second respawn before the background start published readiness. Both paths
-could then install different processes into the same owner slot, leaving the
-losing upstream generation outside normal finalization.
+v0.28.0 adds demand-driven upstream materialization for compatible
+template-backed owners. After an upstream has published a compatible discovery
+template, a later owner can answer cached `initialize`, `tools/list`, and
+captured discovery requests without starting an upstream process. The first
+uncached request materializes exactly one upstream generation, completes the
+MCP initialization handshake, and forwards the original JSON-RPC request on the
+same open transport.
 
-The request path now joins an already-pending template background start before
-deciding whether respawn is necessary. A successful generation keeps the gate
-pending until the upstream has answered `initialize` and muxcore has written
-`notifications/initialized`, so the first uncached request cannot overtake the
-MCP lifecycle handshake. Exact-generation terminal failure also releases the
-gate into the existing explicit error/respawn path. The wait remains bounded by
-the existing upstream readiness timeout and owner shutdown signal. If the
-completed background start produced a writable upstream, the request uses it;
-otherwise request-triggered respawn remains available.
+Template reuse is fail-closed: authorization requires the full SHA-256 identity
+of the effective security-relevant environment and, for isolated templates, the
+exact canonical working directory. A stricter per-CWD isolated entry shadows a
+later relaxed template, and Windows environment keys normalize case-insensitively
+before shim override, fingerprinting, or launch. Missing, incompatible, or
+repeatedly racing templates take one bounded cold/eager path rather than replaying
+discovery from the wrong context.
 
-Response ownership is now generation-bound as well. Proactive discovery IDs are
-unique per owner, their registry entries are tied to the exact upstream process
-and drained when that generation dies, and stale or unclaimed responses are
-dropped before they can change caches, pending counts, progress ownership, or
-downstream session routing.
+## Lifecycle and restart safety
 
-This is the conservative race repair. It does not change when template owners
-are eagerly materialized; demand-driven upstream materialization remains a
-separate architecture change and release track.
+An installed generation remains authoritative during retirement until both
+`Process.Done` and process-group or Windows Job authority retirement are proven.
+If that proof is unavailable, muxcore reports `FINALIZE_BLOCKED` and retries
+retirement proof for that same installed generation; it does not admit a
+competing replacement.
 
-## What changes for users
-
-- Snapshot/template background startup and first-request recovery no longer
-  create competing upstream generations for one owner.
-- Windows source-checkout upstreams no longer receive duplicate concurrent
-  launches from this race, avoiding locked entrypoint replacement failures and
-  the associated crash/respawn storm.
-- Timeout and shutdown remain explicit request errors. The fix does not add
-  unbounded waits or replay already-sent requests.
-- Ordinary `engine.New` and direct muxcore consumers require no source changes.
+Graceful-restart negotiation remains pre-detach: listener, spawn, accept,
+version, or token failures leave the predecessor serving. A later receipt or
+final-ack failure must prove the failed successor exited, finalize the detached
+generation, rewrite the pinned snapshot, and pre-start exactly one clean
+snapshot successor before predecessor shutdown.
 
 ## Upgrade
 
+Upgrade muxcore consumers to the released tag:
+
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.2
+go get github.com/thebtf/mcp-mux/muxcore@v0.28.0
 ```
 
-Consumers should remove or quarantine any workaround added specifically for
-duplicate background/request starts. Do not add product-local spawn locks,
-file-replacement retries, PID sweeps, stale-process kill loops, or parallel
-lifecycle mechanisms; they compete with muxcore's Job Object/process-group
-authority and make failures harder to attribute.
+For the product binary, use the documented versioned-engine upgrade path:
+
+```powershell
+.\mcp-mux.exe upgrade --restart
+```
+
+Ordinary `engine.New` consumers require no source changes. Do not add
+consumer-local spawn locks, retry loops, PID sweeps, stale-process kill loops,
+or parallel lifecycle mechanisms; they undermine muxcore's single
+process-tree-authority contract.
+
+## Compatibility and rollback
+
+v0.28.0 is backward compatible for ordinary `engine.New` consumers. Persistent
+owners and callers that explicitly require eager startup continue to
+materialize without waiting for a request.
+
+To roll back, pin `muxcore/v0.27.2` or restore the previous product binary.
+That removes cache-only startup and demand-driven materialization; it does not
+change the v0.27.2 template background-spawn ownership fix. Do not compensate
+with consumer-local process cleanup or retry mechanisms; diagnose the rollback
+reason and upgrade again when resolved.
 
 ## Verification
 
-The release candidate includes deterministic regressions for the background-
-spawn/request-respawn gate, MCP initialization ordering, owner-unique proactive
-IDs, dead-generation proactive drain, stale and unclaimed ordinary responses,
-and the terminal proactive-registration race. The deployed repair completed a
-`32h 18m` post-cutover Windows soak with zero actual runtime locked-entrypoint
-errors and zero request-triggered competing-respawn markers. The same daemon
-generation stayed live; unrelated network-failure respawns are classified
-separately in `.agent/reports/2026-07-17-v0.27.2-soak.md`.
+Release verification covers cache-only discovery replay, first-demand
+materialization on the original transport, exact environment and isolated-CWD
+template authorization, bounded revision mismatch handling, failure cleanup,
+and process-tree retirement. It also covers pre-detach restart aborts,
+post-detach single-successor fallback, and transactional snapshot activation.
 
-Release closeout still requires the current root and muxcore suites, `go vet`,
-the repository critical suite, applicable native-consumer and lifecycle
-playbook evidence, independent review, remote tag parity, published artifact
-verification, and public muxcore module resolution.
+Official CI and release artifacts use Go 1.25.12. Under that toolchain, root
+and muxcore `govulncheck` report zero reachable vulnerabilities; this result
+does not classify an imported-but-unreached advisory as reachable.
 
-## Consumer handoff closeout
+Before release closeout, run the current root and muxcore suites, `go vet`, the
+repository critical suite, applicable native-consumer and lifecycle-playbook
+evidence, independent review, published artifact/tag parity checks, and public
+muxcore module resolution.
 
-This release affects every muxcore consumer that can restore snapshot/template
-owners and accept requests while background startup is pending. After
-`muxcore/v0.27.2` resolves, release closeout must update and re-read the Aimux
-and Engram adoption issues with the tagged version, the single-authority
-invariant, forbidden local workarounds, customer-mode smoke expectations,
-rollback notes, and provider evidence. If that cannot be completed, record
-`CONSUMER_HANDOFF_BLOCKED` and do not call the full critical muxcore scope
-shipped.
+## Consumer handoff
 
-## Rollback
-
-Consumers can pin `muxcore/v0.27.1` or restore the previous product binary. That
-rollback reintroduces the snapshot/template background-start race. Do not mask
-it with consumer-local retry or process cleanup loops; prefer upgrading again
-to v0.27.2 after diagnosing the rollback reason.
+This release affects muxcore consumers that restore owners, use discovery
+caches, or manage daemon restart. After `muxcore/v0.28.0` resolves, update and
+re-read the Aimux and Engram adoption issues with the tagged version, cache-only
+startup behavior, single-authority invariant, forbidden local workarounds,
+customer-mode smoke expectations, rollback notes, and provider evidence. If
+that cannot be completed, record `CONSUMER_HANDOFF_BLOCKED` and do not call the
+full critical muxcore scope shipped.

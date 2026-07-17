@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -96,6 +97,8 @@ func resumeProcessThreads(pid int) error {
 	return nil
 }
 
+var resumeSpawnedProcessThreads = resumeProcessThreads
+
 func afterSpawnWindows(p *Process, pid int) error {
 	handle, err := windows.OpenProcess(
 		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION,
@@ -114,14 +117,9 @@ func afterSpawnWindows(p *Process, pid int) error {
 	p.jobHandle = uintptr(job)
 	p.authorityMu.Unlock()
 
-	if err := resumeProcessThreads(pid); err != nil {
-		p.authorityMu.Lock()
-		if p.jobHandle == uintptr(job) {
-			p.jobHandle = 0
-		}
-		p.authorityMu.Unlock()
-		_ = windows.TerminateJobObject(job, 1)
-		_ = windows.CloseHandle(job)
+	if err := resumeSpawnedProcessThreads(pid); err != nil {
+		// Keep the installed Job reachable. Start's shared failed-start path
+		// must terminate, wait, and close the exact authority before retry.
 		return err
 	}
 	return nil
@@ -136,18 +134,30 @@ func (p *Process) takeJobAuthority() windows.Handle {
 }
 
 func terminateProcessTree(p *Process) error {
-	job := p.takeJobAuthority()
+	p.authorityMu.Lock()
+	defer p.authorityMu.Unlock()
+	job := windows.Handle(p.jobHandle)
 	if job == 0 {
 		if p.proc == nil {
 			return nil
 		}
 		return p.proc.Kill()
 	}
-	err := windows.TerminateJobObject(job, 1)
-	_ = windows.CloseHandle(job)
-	if err != nil {
+	if err := windows.TerminateJobObject(job, 1); err != nil {
 		return fmt.Errorf("TerminateJobObject: %w", err)
 	}
+	waitMillis := uint32(processTreeRetirementTimeout / time.Millisecond)
+	status, err := windows.WaitForSingleObject(job, waitMillis)
+	if err != nil {
+		return fmt.Errorf("WaitForSingleObject(job): %w", err)
+	}
+	if status != windows.WAIT_OBJECT_0 {
+		return fmt.Errorf("job retirement not proven after %s (wait status=%d)", processTreeRetirementTimeout, status)
+	}
+	if err := windows.CloseHandle(job); err != nil {
+		return fmt.Errorf("CloseHandle(job): %w", err)
+	}
+	p.jobHandle = 0
 	return nil
 }
 

@@ -66,13 +66,38 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.27.x)
+## muxcore Library API (v0.28.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.2
+go get github.com/thebtf/mcp-mux/muxcore@v0.28.0
 ```
+
+### v0.28.0 - demand-driven upstream materialization
+
+**No required consumer code changes for ordinary `engine.New` users.** After a
+compatible discovery template exists, muxcore can create a cache-only owner
+that serves cached `initialize` and `tools/list` without an upstream process.
+The first uncached request starts exactly one generation, completes MCP
+initialization, and forwards the original request once on the same transport.
+
+Template authorization uses the full SHA-256 identity of the effective
+security-relevant environment; isolated templates also require the exact
+canonical working directory. Missing, incompatible, or repeatedly racing
+templates take one bounded cold/eager path and never replay partial or
+cross-context discovery.
+
+An installed generation remains authoritative through retirement until both
+`Process.Done` and process-group or Windows Job authority retirement are
+proven. `FINALIZE_BLOCKED` prevents an overlapping replacement while the exact
+generation is retried. Restart negotiation failures before detach leave the
+predecessor serving; post-detach failure proves successor exit and pre-starts
+one clean snapshot successor before predecessor shutdown.
+
+Consumer impact: update to v0.28.0. Persistent owners and explicitly eager
+callers retain eager startup. Do not add consumer-local spawn locks, retry
+loops, PID sweeps, stale-process kill loops, or parallel lifecycle mechanisms.
 
 ### v0.27.2 - template background-spawn ownership gate
 

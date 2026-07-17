@@ -108,3 +108,41 @@ func TestNewOwnerFromHandoff_NoSpawn(t *testing.T) {
 		t.Errorf("o.upstream.PID() = %d, want 0 (handler process = no subprocess spawned)", pid)
 	}
 }
+
+func TestNewOwnerFromHandoff_ReappliesCachedRuntimeSettings(t *testing.T) {
+	hctx, hcancel := context.WithCancel(context.Background())
+	proc := upstream.NewProcessFromHandler(hctx, func(ctx context.Context, _ io.Reader, _ io.Writer) error {
+		<-ctx.Done()
+		return nil
+	})
+	initResponse := []byte(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"x-mux":{"drainTimeout":7,"toolTimeout":8,"idleTimeout":9,"progressInterval":10}},"serverInfo":{"name":"runtime-settings","version":"1"}}}`)
+	snap := OwnerSnapshot{
+		Classification: "shared",
+		CachedInit:     base64Encode(initResponse),
+	}
+	payload := HandoffPayload{ServerID: "test-runtime-settings", Command: "mock-handler"}
+	o, err := newOwnerWithProcess(OwnerConfig{
+		IPCPath:         testIPCPath(t),
+		ServerID:        payload.ServerID,
+		AdoptedSnapshot: &snap,
+		Logger:          testLogger(t),
+	}, payload, proc)
+	if err != nil {
+		t.Fatalf("newOwnerWithProcess: %v", err)
+	}
+	defer o.Shutdown()
+	defer hcancel()
+
+	if got := o.DrainTimeout(); got != 7*time.Second {
+		t.Fatalf("DrainTimeout()=%s, want 7s", got)
+	}
+	if got := time.Duration(o.toolTimeoutNs.Load()); got != 8*time.Second {
+		t.Fatalf("tool timeout=%s, want 8s", got)
+	}
+	if got := o.IdleTimeout(); got != 9*time.Second {
+		t.Fatalf("IdleTimeout()=%s, want 9s", got)
+	}
+	if got := o.loadProgressInterval(); got != 10*time.Second {
+		t.Fatalf("progress interval=%s, want 10s", got)
+	}
+}

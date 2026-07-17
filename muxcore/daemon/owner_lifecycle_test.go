@@ -2,10 +2,15 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
@@ -136,6 +141,418 @@ func TestStopOwnerResultMessageTreatsPostRemovalErrorAsWarning(t *testing.T) {
 	_, err = stopOwnerResultMessage("stopped", ownerRemovalResult{Removed: false}, errors.New("server not found"))
 	if err == nil {
 		t.Fatal("expected pre-removal error to remain an error")
+	}
+}
+
+func TestOwnerRemovalRetriesBeforeForgettingEntry(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-finalization-retry"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_retry"}
+	o.SessionMgr().PreRegisterForOwner("pending-finalization", sid, "/owned", nil)
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() {
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=false", got, soft, o)
+		}
+		d.mu.RLock()
+		current := d.owners[sid]
+		d.mu.RUnlock()
+		if current != entry {
+			t.Fatal("owner entry was forgotten before finalization proof")
+		}
+		if !o.SessionMgr().IsPreRegistered("pending-finalization") {
+			t.Fatal("owner tokens were removed before finalization proof")
+		}
+		if calls.Add(1) == 1 {
+			return 0, false, errors.New("retirement not yet proven")
+		}
+		return 0, true, nil
+	}
+
+	result, err := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonOperatorHard, false)
+	if err != nil {
+		t.Fatalf("removeOwnerIfCurrent() error: %v", err)
+	}
+	if !result.Removed || calls.Load() != 2 {
+		t.Fatalf("result=%+v finalizer_calls=%d, want removed after second proof", result, calls.Load())
+	}
+	if d.Entry(sid) != nil {
+		t.Fatal("owner entry survived proven finalization")
+	}
+}
+
+func TestConcurrentOwnerRemovalsSerializeAcrossSnapshotPin(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-concurrent-removal"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_concurrent"}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	registryPins, err := d.acquireSnapshotOwnerPins()
+	if err != nil {
+		t.Fatalf("acquireSnapshotOwnerPins: %v", err)
+	}
+
+	original := finalizeOwnerForRemoval
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || soft {
+			return 0, false, fmt.Errorf("unexpected finalizer owner=%p soft=%v", got, soft)
+		}
+		calls.Add(1)
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return 0, true, nil
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+
+	type removeResult struct {
+		result ownerRemovalResult
+		err    error
+	}
+	results := make(chan removeResult, 2)
+	for range 2 {
+		go func() {
+			result, removeErr := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonOperatorHard, false)
+			results <- removeResult{result: result, err: removeErr}
+		}()
+	}
+	select {
+	case <-entered:
+		t.Fatal("owner finalization started while snapshot pin was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	d.releaseSnapshotOwnerPins(registryPins)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("owner finalization did not start after snapshot pin release")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("concurrent removers started %d finalizers, want 1", got)
+	}
+	if pins, pinErr := d.acquireSnapshotOwnerPins(); pinErr == nil {
+		d.releaseSnapshotOwnerPins(pins)
+		t.Fatal("snapshot pinned owner while removal was in progress")
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	removed := 0
+	for range 2 {
+		select {
+		case got := <-results:
+			if got.err != nil {
+				t.Fatalf("concurrent remove error: %v", got.err)
+			}
+			if got.result.Removed {
+				removed++
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent remover did not settle")
+		}
+	}
+	if removed != 1 || calls.Load() != 1 {
+		t.Fatalf("removed=%d finalizer_calls=%d, want one serialized removal", removed, calls.Load())
+	}
+}
+
+func TestReaperFinalizationRetryRetainsLivePIDAndOwnerState(t *testing.T) {
+	d := testDaemon(t)
+	generationFile := t.TempDir() + string(os.PathSeparator) + "reaper-generation.txt"
+	command, args, env := daemonRespawnHelperCommand(generationFile)
+	path, sid, token, err := d.Spawn(control.Request{Cmd: "spawn", Command: command, Args: args, Env: env, Mode: "global"})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("spawned owner missing")
+	}
+	conn, _ := connectSpawnedOwner(t, path, token)
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return entry.Owner.SessionCount() == 1 && entry.Owner.MaterializationState() == owner.MaterializationReady
+	}, "owner did not become ready while session was retained")
+	_ = conn.Close()
+	waitForDaemonCondition(t, 3*time.Second, func() bool {
+		return entry.Owner.SessionCount() == 0 && entry.Owner.SessionMgr().PendingCount() == 0
+	}, "owner did not become idle after session close")
+	pid, _ := entry.Owner.Status()["upstream_pid"].(int)
+	if !daemonTestProcessAlive(pid) {
+		t.Fatalf("upstream pid %d is not live before reaper retry", pid)
+	}
+	if ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(token); !ok || ownerKey != sid {
+		t.Fatalf("reconnect history before reaper=(%q,%v), want owner %q", ownerKey, ok, sid)
+	}
+
+	d.mu.Lock()
+	entry.LastSession = time.Now().Add(-time.Second)
+	entry.IdleTimeout = time.Millisecond
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		call := calls.Add(1)
+		if got != entry.Owner || !soft {
+			t.Fatalf("finalizer call %d got owner=%p soft=%v, want owner=%p soft=true", call, got, soft, entry.Owner)
+		}
+		if call <= ownerFinalizationAttempts {
+			if current := d.Entry(sid); current != entry {
+				t.Fatalf("call %d forgot owner before process retirement proof", call)
+			}
+			if !daemonTestProcessAlive(pid) {
+				t.Fatalf("call %d lost live pid %d before retryable finalization", call, pid)
+			}
+			if ownerKey, _, _, ok := entry.Owner.SessionMgr().LookupHistory(token); !ok || ownerKey != sid {
+				t.Fatalf("call %d removed owner history before proof: owner=%q ok=%v", call, ownerKey, ok)
+			}
+			return 0, false, errors.New("synthetic whole-tree proof pending")
+		}
+		return original(got, soft)
+	}
+
+	if affected := (&Reaper{daemon: d, logger: d.logger}).sweep(); affected != 0 {
+		t.Fatalf("first reaper sweep affected=%d, want retained owner while finalization is retryable", affected)
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("synchronous finalizer calls=%d, want %d", got, ownerFinalizationAttempts)
+	}
+	if current := d.Entry(sid); current != entry {
+		t.Fatal("reaper forgot owner after unproven finalization")
+	}
+	if !daemonTestProcessAlive(pid) {
+		t.Fatalf("upstream pid %d died before scheduled finalization retry", pid)
+	}
+
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		return d.Entry(sid) == nil && !daemonTestProcessAlive(pid)
+	}, "scheduled finalization retry did not retire process and remove owner")
+	if calls.Load() < ownerFinalizationAttempts+1 {
+		t.Fatalf("finalizer calls=%d, want scheduled retry after %d synchronous attempts", calls.Load(), ownerFinalizationAttempts)
+	}
+	if _, _, _, ok := entry.Owner.SessionMgr().LookupHistory(token); ok {
+		t.Fatal("owner history survived proven final removal")
+	}
+}
+
+func TestOwnerRemovalKeepsEntryWhenFinalizationUnproven(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "owner-finalization-blocked"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_blocked"}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() {
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(*owner.Owner, bool) (int, bool, error) {
+		calls.Add(1)
+		return 0, false, errors.New("retirement unproven")
+	}
+
+	result, err := d.finalizeAndRemoveOwner(sid, entry, ownerRemovalReasonOperatorHard, false, nil, false)
+	if err == nil || result.Removed {
+		t.Fatalf("result=%+v err=%v, want blocked removal", result, err)
+	}
+	if calls.Load() != ownerFinalizationAttempts {
+		t.Fatalf("finalizer calls=%d, want %d", calls.Load(), ownerFinalizationAttempts)
+	}
+	if d.Entry(sid) != entry {
+		t.Fatal("owner entry was forgotten without finalization proof")
+	}
+	d.mu.RLock()
+	removalInProgress := entry.removalInProgress
+	d.mu.RUnlock()
+	if removalInProgress {
+		t.Fatal("blocked removal did not release retryable registry state")
+	}
+}
+
+func TestRestartFallbackWaitsForBlockedOwnerRetirementProof(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	d.sessionHandler = noopSessionHandler{}
+
+	blockerSID := "restart-blocker-owner"
+	blockerOwner := testReconnectOwner(t, blockerSID)
+	blocker := &OwnerEntry{
+		Owner:           blockerOwner,
+		ServerID:        blockerSID,
+		OwnerGeneration: "owner_gen_restart_blocker",
+	}
+	d.mu.Lock()
+	d.owners[blockerSID] = blocker
+	d.mu.Unlock()
+
+	fallbackSnapshot := daemonMaterializationSnapshot(false)
+	fallbackSnapshot.ServerID = blockerSID
+	fallbackSnapshot.Cwd = t.TempDir()
+	fallbackSnapshot.Mode = "global"
+	plan := d.makeSnapshotRestorePlan(fallbackSnapshot)
+	plan.blockedBy = blocker
+	d.mu.Lock()
+	d.restartStaging = []snapshotRestorePlan{plan}
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	proofStarted := make(chan struct{})
+	releaseProof := make(chan struct{})
+	var startedOnce sync.Once
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != blockerOwner || soft {
+			return original(got, soft)
+		}
+		startedOnce.Do(func() { close(proofStarted) })
+		<-releaseProof
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	removalDone := make(chan error, 1)
+	go func() {
+		_, removeErr := d.removeOwnerIfCurrent(blockerSID, blocker, ownerRemovalReasonIdle, false)
+		removalDone <- removeErr
+	}()
+	select {
+	case <-proofStarted:
+	case <-time.After(time.Second):
+		t.Fatal("blocked owner finalization did not start")
+	}
+
+	type activationResult struct {
+		activated int
+		err       error
+	}
+	activationDone := make(chan activationResult, 1)
+	go func() {
+		activated, activateErr := d.activateRestartStaging()
+		activationDone <- activationResult{activated: activated, err: activateErr}
+	}()
+	select {
+	case result := <-activationDone:
+		t.Fatalf("fallback activated before retirement proof: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if entry := d.Entry(fallbackSnapshot.ServerID); entry != blocker {
+		t.Fatalf("blocker registry identity changed before retirement proof: %#v", entry)
+	}
+
+	close(releaseProof)
+	select {
+	case removeErr := <-removalDone:
+		if removeErr != nil {
+			t.Fatalf("removeOwnerIfCurrent() error: %v", removeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked owner removal did not finish after retirement proof")
+	}
+	select {
+	case result := <-activationDone:
+		if result.err != nil || result.activated != 1 {
+			t.Fatalf("activateRestartStaging() = %+v, want one activated fallback", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fallback activation did not resume after retirement proof")
+	}
+	if entry := d.Entry(fallbackSnapshot.ServerID); entry == nil || entry == blocker || entry.Owner == nil {
+		t.Fatalf("fallback owner was not restored after retirement proof: %#v", entry)
+	}
+}
+
+func TestDaemonShutdownWaitsForOwnerRetirementBeforeSuccessorActivation(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "shutdown-retirement-barrier"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{Owner: o, ServerID: sid, OwnerGeneration: "owner_gen_shutdown_barrier"}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	var allowProof atomic.Bool
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=false", got, soft, o)
+		}
+		calls.Add(1)
+		if !allowProof.Load() {
+			return 0, false, errors.New("synthetic retirement proof pending")
+		}
+		return 0, true, nil
+	}
+	t.Cleanup(func() {
+		finalizeOwnerForRemoval = original
+		o.Shutdown()
+	})
+
+	activated := make(chan struct{})
+	go d.shutdown(func() { close(activated) })
+	waitForDaemonCondition(t, time.Second, func() bool {
+		return calls.Load() >= ownerFinalizationAttempts
+	}, "shutdown did not attempt owner finalization")
+	select {
+	case <-activated:
+		t.Fatal("successor activation ran before owner retirement proof")
+	default:
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("daemon completed before owner retirement proof")
+	default:
+	}
+	if d.Entry(sid) != entry {
+		t.Fatal("owner registry entry was forgotten before retirement proof")
+	}
+	if err := d.HandleRemove(sid); !errors.Is(err, ErrDaemonShuttingDown) {
+		t.Fatalf("HandleRemove during shutdown error=%v, want ErrDaemonShuttingDown", err)
+	}
+
+	allowProof.Store(true)
+	select {
+	case <-activated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("successor activation did not run after retirement proof")
+	}
+	select {
+	case <-d.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon did not complete after retirement proof")
+	}
+	if d.Entry(sid) != nil {
+		t.Fatal("owner registry entry survived proven shutdown finalization")
 	}
 }
 

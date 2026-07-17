@@ -1,7 +1,13 @@
 package owner
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,8 +16,9 @@ import (
 
 // TestShutdownForHandoff_HappyPath verifies that ShutdownForHandoff:
 //   - returns a valid HandoffPayload with non-zero PID and FDs
-//   - closes o.Done() channel on success
-//   - makes a subsequent Shutdown() call a safe no-op (no panic, no block)
+//   - keeps o.Done open while the transfer is only prepared
+//   - closes o.Done only after Commit settles transferred authority
+//   - makes a subsequent Shutdown call a safe no-op
 func TestShutdownForHandoff_HappyPath(t *testing.T) {
 	ipcPath := testIPCPath(t)
 	cmd, args := mockServerArgs()
@@ -50,12 +57,33 @@ func TestShutdownForHandoff_HappyPath(t *testing.T) {
 		t.Errorf("payload.ServerID = %q, want %q", payload.ServerID, "test-handoff-happy")
 	}
 
-	// Done channel must be closed after a successful handoff.
+	// Preparation alone is not terminal: the predecessor retains the lease
+	// until the final adoption decision settles Commit or Abort.
 	select {
 	case <-o.Done():
-		// ok
+		t.Fatal("o.Done() closed before handoff settlement")
+	default:
+	}
+	if _, err := o.ShutdownForHandoff(); !errors.Is(err, ErrHandoffAlreadyPrepared) {
+		t.Fatalf("duplicate ShutdownForHandoff error = %v, want ErrHandoffAlreadyPrepared", err)
+	}
+	if _, finalized, err := o.FinalizeForRemoval(false, 100*time.Millisecond); finalized || !errors.Is(err, ErrHandoffAlreadyPrepared) {
+		t.Fatalf("FinalizeForRemoval during prepared handoff = finalized=%v err=%v, want false/ErrHandoffAlreadyPrepared", finalized, err)
+	}
+	o.Shutdown()
+	select {
+	case <-o.Done():
+		t.Fatal("ordinary shutdown finalized a prepared handoff before Commit")
+	default:
+	}
+
+	if err := payload.Commit(); err != nil {
+		t.Fatalf("payload.Commit: %v", err)
+	}
+	select {
+	case <-o.Done():
 	case <-time.After(2 * time.Second):
-		t.Error("o.Done() not closed after ShutdownForHandoff")
+		t.Error("o.Done() not closed after handoff commit")
 	}
 
 	// Subsequent Shutdown() must be a safe no-op: no panic, no indefinite block.
@@ -69,6 +97,79 @@ func TestShutdownForHandoff_HappyPath(t *testing.T) {
 		// ok — Shutdown returned immediately because shutdownOnce already fired
 	case <-time.After(2 * time.Second):
 		t.Error("Shutdown() after ShutdownForHandoff blocked or panicked")
+	}
+}
+
+func TestShutdownForHandoff_ExplicitAbortRetriesUnprovenRetirement(t *testing.T) {
+	cmd, args := mockServerArgs()
+	o, err := NewOwner(OwnerConfig{
+		Command:  cmd,
+		Args:     args,
+		IPCPath:  testIPCPath(t),
+		ServerID: "test-handoff-abort-retry",
+		Logger:   testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner: %v", err)
+	}
+	waitForCondition(t, 5*time.Second, func() bool { return o.MaterializationState() == MaterializationReady }, "owner did not finish initial materialization")
+	proc := o.currentUpstream()
+	if proc == nil {
+		t.Fatal("expected subprocess upstream")
+	}
+
+	payload, err := o.ShutdownForHandoff()
+	if err != nil {
+		t.Fatalf("ShutdownForHandoff: %v", err)
+	}
+	allowProof := false
+	defer func() {
+		allowProof = true
+		_ = payload.Abort()
+	}()
+	proofErr := errors.New("synthetic aborted-detach retirement remains unproven")
+	wrongProcessErr := errors.New("retirement probe received the wrong process")
+	proofCalls := 0
+	o.materializationFinalizationProbe = func(got *upstream.Process) error {
+		proofCalls++
+		if got != proc {
+			return wrongProcessErr
+		}
+		if !allowProof {
+			return proofErr
+		}
+		return nil
+	}
+
+	if err := payload.Abort(); !errors.Is(err, proofErr) {
+		t.Fatalf("first payload.Abort error = %v, want retirement proof failure", err)
+	}
+	select {
+	case <-o.Done():
+		t.Fatal("owner completed after unproven explicit abort")
+	default:
+	}
+	if state := o.MaterializationState(); state != MaterializationFinalizeBlocked {
+		t.Fatalf("state after unproven abort = %s, want %s", state, MaterializationFinalizeBlocked)
+	}
+	if err := payload.Commit(); !errors.Is(err, upstream.ErrDetachNotPrepared) {
+		t.Fatalf("payload.Commit after explicit abort = %v, want ErrDetachNotPrepared", err)
+	}
+	if _, finalized, err := o.FinalizeForRemoval(false, 100*time.Millisecond); finalized || !errors.Is(err, proofErr) {
+		t.Fatalf("FinalizeForRemoval retry before proof = finalized=%v err=%v, want false/proof failure", finalized, err)
+	}
+
+	allowProof = true
+	if err := payload.Abort(); err != nil {
+		t.Fatalf("payload.Abort retry after proof: %v", err)
+	}
+	select {
+	case <-o.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner did not complete after explicit abort retirement retry")
+	}
+	if proofCalls != 3 {
+		t.Fatalf("retirement proof calls = %d, want 3 (abort, finalizer retry, abort retry)", proofCalls)
 	}
 }
 
@@ -131,6 +232,7 @@ func TestShutdownForHandoff_DetachFailureAbortsTreeAndCompletesOwner(t *testing.
 	if err != nil {
 		t.Fatalf("NewOwner: %v", err)
 	}
+	waitForCondition(t, 5*time.Second, func() bool { return o.MaterializationState() == MaterializationReady }, "owner did not finish initial materialization")
 
 	o.mu.RLock()
 	proc := o.upstream
@@ -155,5 +257,108 @@ func TestShutdownForHandoff_DetachFailureAbortsTreeAndCompletesOwner(t *testing.
 	case <-proc.Done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("upstream tree survived detach failure cleanup")
+	}
+}
+
+func TestShutdownForHandoffWaitsForMaterializationQuiescence(t *testing.T) {
+	toolsSeen := make(chan struct{})
+	releaseTools := make(chan struct{})
+	var toolsOnce sync.Once
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			switch req.Method {
+			case "initialize":
+				if err := writeControllerResponse(stdout, req.ID, `{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"handoff","version":"1"}}`); err != nil {
+					return err
+				}
+			case "tools/list":
+				toolsOnce.Do(func() { close(toolsSeen) })
+				<-releaseTools
+				if err := writeControllerResponse(stdout, req.ID, `{"tools":[]}`); err != nil {
+					return err
+				}
+			}
+		}
+		return scanner.Err()
+	}
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		HandlerFunc:           handler,
+		IPCPath:               testIPCPath(t),
+		MaterializationPolicy: MaterializationOnDemand,
+		Logger:                testLogger(t),
+	}, OwnerSnapshot{})
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot: %v", err)
+	}
+	o.SpawnUpstreamBackground()
+	select {
+	case <-toolsSeen:
+	case <-time.After(time.Second):
+		t.Fatal("materialization did not reach discovery")
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, handoffErr := o.ShutdownForHandoff()
+		errCh <- handoffErr
+	}()
+	select {
+	case err := <-errCh:
+		t.Fatalf("handoff returned before materialization quiesced: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseTools)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, upstream.ErrDetachUnsupported) {
+			t.Fatalf("ShutdownForHandoff error=%v, want ErrDetachUnsupported", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handoff did not continue after materialization quiesced")
+	}
+	select {
+	case <-o.Done():
+	case <-time.After(time.Second):
+		t.Fatal("handoff failure left owner incomplete")
+	}
+}
+
+func TestHandoffAdoptsCacheWithoutProactiveInitialize(t *testing.T) {
+	received := make(chan string, 1)
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			received <- scanner.Text()
+		}
+		return scanner.Err()
+	})
+	snap := controllerSnapshot()
+	snap.Classification = "session-aware"
+	o, err := newOwnerWithProcess(OwnerConfig{
+		IPCPath:              testIPCPath(t),
+		ServerID:             "handoff-cache-adoption",
+		CachedClassification: snap.Classification,
+		AdoptedSnapshot:      &snap,
+		Logger:               testLogger(t),
+	}, HandoffPayload{ServerID: "handoff-cache-adoption", Command: "adopted"}, proc)
+	if err != nil {
+		t.Fatalf("newOwnerWithProcess: %v", err)
+	}
+	defer o.Shutdown()
+	if !o.CacheReady() || !strings.Contains(string(o.getCachedResponse("tools/list")), "old-tool") {
+		t.Fatalf("handoff did not adopt coherent cache: %#v", o.Status())
+	}
+	select {
+	case line := <-received:
+		t.Fatalf("handoff sent duplicate proactive request: %s", line)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

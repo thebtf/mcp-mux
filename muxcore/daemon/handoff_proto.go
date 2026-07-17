@@ -6,14 +6,13 @@ import (
 )
 
 // HandoffProtocolVersion is the current version of the handoff control protocol.
-// The protocol_version field is mandatory in every message; a successor daemon
-// that receives an unknown version must reject the handoff and fall back to
-// the legacy shutdown-and-respawn path (FR-6, FR-8).
+// The protocol_version field is mandatory in every message. Unknown versions
+// are rejected during Hello before any owner detach or session quiesce, so the
+// predecessor releases its restart pins and remains serving.
 // Version 2 adds an explicit optional tree-authority handle to FdTransferMsg
 // and moves the commit boundary to HandoffAckMsg.Accepted/Aborted. Version 1
-// peers are intentionally rejected during Hello: an old predecessor cannot
-// transfer the Windows Job handle, so the safe migration is one bounded
-// shutdown-and-respawn rather than an authority-less live handoff.
+// peers cannot transfer the Windows Job handle and therefore cannot authorize
+// an authority-less live handoff.
 const HandoffProtocolVersion = 2
 
 // MsgType identifies the kind of handoff control message.

@@ -248,14 +248,26 @@ func TestZeroSessionCleanupReconnectReservationClosesWakeRace(t *testing.T) {
 		t.Fatalf("wake conn.Close() error = %v", err)
 	}
 	waitOwnerSessionCount(t, entry, 0)
+	waitForDaemonCondition(t, time.Second, func() bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return !entry.LastSession.Equal(zeroAt)
+	}, "wake disconnect did not publish zero-session timestamp")
 
 	d.mu.Lock()
 	zeroAt = time.Now().Add(-time.Second)
 	entry.LastSession = zeroAt
 	d.mu.Unlock()
-	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond); err != nil {
-		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() after bind error = %v", err)
-	} else if !removed {
-		t.Fatal("zero-session cleanup did not remove owner after reservation was consumed")
+	var cleanupErr error
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		_, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond)
+		if err != nil {
+			cleanupErr = err
+			return true
+		}
+		return removed
+	}, "zero-session cleanup remained blocked after reservation was consumed")
+	if cleanupErr != nil {
+		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() after bind error = %v", cleanupErr)
 	}
 }

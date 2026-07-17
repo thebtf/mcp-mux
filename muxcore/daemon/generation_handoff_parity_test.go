@@ -87,6 +87,13 @@ func TestGenerationHandoffParityStatusRejectsFreshSpawnEvidence(t *testing.T) {
 	if restored := d.loadSnapshot(); restored != 1 {
 		t.Fatalf("loadSnapshot() restored %d owners, want 1", restored)
 	}
+	activated, err := d.activateRestartStaging()
+	if err != nil {
+		t.Fatalf("activateRestartStaging() error: %v", err)
+	}
+	if activated != 1 {
+		t.Fatalf("activateRestartStaging() activated %d owners, want 1", activated)
+	}
 
 	status := d.HandleStatus()
 	handoff, ok := status["handoff"].(map[string]any)

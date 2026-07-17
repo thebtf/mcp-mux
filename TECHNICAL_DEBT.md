@@ -29,7 +29,21 @@ All items from the 2026-04-08 debt batch have been resolved:
 
 ## Open items
 
-(none)
+The following v0.28.0 follow-ups are non-blocking and out of scope for the
+current release:
+
+- **Cancellation provenance fallback** — unknown or expired cancellation may
+  currently target the current generation after inflight provenance is gone;
+  consider dropping the fallback or retaining a short-lived generation
+  tombstone.
+- **Extremal retry coverage** — add a test with two prior general spawn retries,
+  followed by two template mismatches and the cold fifth attempt.
+- **Windows DACL isolation** — evaluate a logon-SID DACL instead of an
+  account-SID DACL only if terminal-session isolation becomes a requirement.
+- **Detached listener test flake** —
+  `TestDetachedProcessListenerAcceptsParentDial` failed once in the full Windows
+  muxcore suite with empty helper output but passed 10 focused repetitions;
+  investigate separately.
 
 
 <!--
