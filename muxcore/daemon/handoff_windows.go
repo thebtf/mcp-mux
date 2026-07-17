@@ -75,17 +75,35 @@ func listenHandoffPipe(name string) (net.Listener, error) {
 	return ln, nil
 }
 
+const handoffPipeDialRetryDelay = 10 * time.Millisecond
+
 // dialHandoffPipe connects to a named pipe created by listenHandoffPipe.
 // `name` must match the listener. `timeout` is applied to the dial attempt.
 func dialHandoffPipe(name string, timeout time.Duration) (net.Conn, error) {
+	return dialHandoffPipeWith(name, timeout, winio.DialPipeContext)
+}
+
+func dialHandoffPipeWith(name string, timeout time.Duration, dial func(context.Context, string) (net.Conn, error)) (net.Conn, error) {
 	path := handoffPipePrefix + name
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	conn, err := winio.DialPipeContext(ctx, path)
-	if err != nil {
-		return nil, fmt.Errorf("handoff: dial named pipe %s: %w", path, err)
+	for {
+		conn, err := dial(ctx, path)
+		if err == nil {
+			return conn, nil
+		}
+		if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(err, windows.ERROR_PIPE_BUSY) {
+			return nil, fmt.Errorf("handoff: dial named pipe %s: %w", path, err)
+		}
+
+		timer := time.NewTimer(handoffPipeDialRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("handoff: dial named pipe %s: %w", path, ctx.Err())
+		case <-timer.C:
+		}
 	}
-	return conn, nil
 }
 
 // msgHandleBatch is the MsgType for windowsHandleBatch wire messages.

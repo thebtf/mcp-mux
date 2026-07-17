@@ -39,6 +39,10 @@ import (
 // FR-6 retry pattern that replaced the old recursive d.Spawn(req) calls.
 var errSpawnRetry = errors.New("spawn: retry requested")
 
+// errTemplateRevisionMismatch requests the bounded fresh-template retry path
+// without consuming Spawn's general retry budget.
+var errTemplateRevisionMismatch = errors.New("spawn: template revision mismatch")
+
 var errNoHandoffUpstreams = errors.New("no process-backed owners to hand off")
 
 const snapshotRestartEnv = "MCPMUX_SNAPSHOT_RESTART"
@@ -74,10 +78,12 @@ var ErrOwnerGone = errors.New("owner gone")
 // spawns because shutdown or graceful restart has already begun.
 var ErrDaemonShuttingDown = errors.New("daemon shutting down")
 
-// maxSpawnRetries bounds the retry budget in Spawn. Three iterations handle the
-// realistic cases (stuck placeholder cleanup + one isolated-mode promotion);
-// exhaustion is treated as a hard failure and returned to the caller.
-const maxSpawnRetries = 3
+// maxSpawnRetries bounds general retry requests in Spawn. Template revision
+// mismatches have their own budget so the required cold bypass remains reachable.
+const (
+	maxSpawnRetries               = 3
+	maxTemplateRevisionMismatches = 2
+)
 
 const defaultZeroSessionCleanupDelay = 30 * time.Second
 
@@ -1131,19 +1137,28 @@ func (d *Daemon) waitForOwnerAdmissionThaw(o *owner.Owner) error {
 // ("owner not accepting but has active sessions — retry in isolated mode")
 // called d.Spawn(req) recursively. Two audit agents (code-reviewer H2,
 // bug-hunter BUG-005) flagged the stack-depth risk and the comment-vs-code
-// divergence. spawnOnce now returns errSpawnRetry on those paths; Spawn loops
-// up to maxSpawnRetries times and surfaces an error on exhaustion.
+// divergence. General retries remain bounded by maxSpawnRetries. Template
+// revision mismatches are separately bounded so two mismatches still reach one
+// cold/template-bypass attempt even after an earlier general retry.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	var isolatedRetry int64
 	templateMismatches := 0
 	templateBypass := false
-	for attempt := 0; attempt < maxSpawnRetries; attempt++ {
+	generalRetries := 0
+	for range maxSpawnRetries + maxTemplateRevisionMismatches {
 		ipcPath, sid, token, err := d.spawnOnce(&req, &isolatedRetry, &templateMismatches, &templateBypass)
-		if !errors.Is(err, errSpawnRetry) {
+		switch {
+		case errors.Is(err, errTemplateRevisionMismatch):
+			continue
+		case !errors.Is(err, errSpawnRetry):
 			return ipcPath, sid, token, err
 		}
+		generalRetries++
+		if generalRetries >= maxSpawnRetries {
+			return "", "", "", fmt.Errorf("spawn %s: exhausted retry budget after %d attempts", req.Command, maxSpawnRetries)
+		}
 	}
-	return "", "", "", fmt.Errorf("spawn %s: exhausted retry budget after %d attempts", req.Command, maxSpawnRetries)
+	return "", "", "", fmt.Errorf("spawn %s: exhausted bounded retry loop after %d general retries and %d template revision mismatches", req.Command, generalRetries, templateMismatches)
 }
 
 func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) int64 {
@@ -1665,10 +1680,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		o.Shutdown()
 		if staleTemplate {
 			*templateMismatches++
-			if *templateMismatches >= 2 {
+			if *templateMismatches >= maxTemplateRevisionMismatches {
 				*templateBypass = true
 			}
 			d.logger.Printf("template revision changed before promotion for %s (revision=%d mismatches=%d bypass=%v)", req.Command, selectedTemplate.revision, *templateMismatches, *templateBypass)
+			return "", "", "", errTemplateRevisionMismatch
 		}
 		return "", "", "", errSpawnRetry
 	}

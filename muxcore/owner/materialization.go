@@ -1453,6 +1453,9 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	}
 	usedProc, writeFailed, err := o.forwardRequestPrepared(demand.session, demand.message)
 	o.completeForwardingLocalDemand(key, demand, err == nil && !writeFailed)
+	if o.afterQueuedDemandWrite != nil {
+		o.afterQueuedDemandWrite()
+	}
 	if err != nil {
 		o.logger.Printf("session %d: queued demand forwarding failed: %v", demand.session.ID, err)
 	}
@@ -1519,12 +1522,13 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 		return nil, false, fmt.Errorf("remap request: %w", err)
 	}
 
-	o.inflightTracker.Store(string(newID), &InflightRequest{
+	inflight := &InflightRequest{
 		Method:    msg.Method,
 		Tool:      extractToolName(msg.Raw),
 		SessionID: s.ID,
 		StartTime: time.Now(),
-	})
+	}
+	o.inflightTracker.Store(string(newID), inflight)
 	if msg.Method == "initialize" || msg.Method == "tools/list" ||
 		msg.Method == "prompts/list" || msg.Method == "resources/list" ||
 		msg.Method == "resources/templates/list" {
@@ -1564,7 +1568,7 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 	if msg.Method == "tools/call" && o.toolTimeoutNs.Load() > 0 {
 		o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 	}
-	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped)
+	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped, inflight.process.Store)
 	if writeErr != nil {
 		o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), writeErr)
 		if _, loaded := o.inflightTracker.LoadAndDelete(string(newID)); loaded {

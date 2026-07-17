@@ -93,6 +93,7 @@ type InflightRequest struct {
 	Tool      string    `json:"tool,omitempty"`
 	SessionID int       `json:"session"`
 	StartTime time.Time `json:"started_at"`
+	process   atomic.Pointer[upstream.Process]
 }
 
 // proactiveRequest is claimed exactly once by its response or bound upstream death.
@@ -197,6 +198,7 @@ type Owner struct {
 	teardownOnce            sync.Once
 	removalMu               sync.Mutex
 	handoffPrepared         bool // guarded by removalMu; rejects duplicate transfer preparation
+	handoffAbortRequested   bool // guarded by removalMu; permits only explicit abort retirement retries
 	closeListenerOnce       sync.Once
 	isAccepting             atomic.Bool
 	admissionFrozen         atomic.Bool
@@ -231,6 +233,7 @@ type Owner struct {
 	restartResumeTrigger             MaterializationTrigger
 	materializationFinalizationProbe func(*upstream.Process) error
 	beforeQueuedDemandWrite          func()
+	afterQueuedDemandWrite           func() // test-only post-write/pre-ready cancellation seam
 	beforeLocalDemandCancel          func()
 	afterProactiveStore              func()                  // test-only registration race seam
 	beforeCurrentUpstreamWrite       func(*upstream.Process) // test-only generation race seam
@@ -2318,6 +2321,10 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		return 0, true, nil
 	default:
 	}
+	abortPreparedHandoff := o.handoffPrepared && o.handoffAbortRequested
+	if o.handoffPrepared && !abortPreparedHandoff {
+		return 0, false, ErrHandoffAlreadyPrepared
+	}
 	if timeout <= 0 {
 		timeout = materializationFinalizeTimeout
 	}
@@ -2360,7 +2367,9 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	exitCode := 0
 	var closeErr error
 	if proc != nil {
-		if soft {
+		if abortPreparedHandoff {
+			closeErr = proc.AbortDetach()
+		} else if soft {
 			exitCode, closeErr = proc.SoftClose(timeout)
 		} else {
 			closeErr = proc.Close()
@@ -2407,6 +2416,10 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	}
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
+	if abortPreparedHandoff {
+		o.handoffPrepared = false
+		o.handoffAbortRequested = false
+	}
 	o.completeShutdown("owner shut down")
 	return exitCode, true, closeErr
 }
@@ -2747,13 +2760,14 @@ func (o *Owner) touchActivity() {
 // to the injected writer followed by a newline, mirroring upstream.WriteLine
 // semantics. Used by tests to capture output without a subprocess.
 func (o *Owner) writeUpstream(data []byte) error {
-	_, err := o.writeUpstreamFromCurrent(data)
+	_, err := o.writeUpstreamFromCurrent(data, nil)
 	return err
 }
 
 // writeUpstreamFromCurrent returns the exact process generation used for the
-// write so a failure cannot retire a replacement generation.
-func (o *Owner) writeUpstreamFromCurrent(data []byte) (*upstream.Process, error) {
+// write so a failure cannot retire a replacement generation. bind runs after
+// generation selection and before the write begins.
+func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Process)) (*upstream.Process, error) {
 	o.touchActivity()
 	o.mu.RLock()
 	writer := o.upstreamWriter
@@ -2771,10 +2785,21 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte) (*upstream.Process, error)
 	if up == nil {
 		return nil, errors.New("upstream writer unavailable")
 	}
+	if bind != nil {
+		bind(up)
+	}
 	if o.beforeCurrentUpstreamWrite != nil {
 		o.beforeCurrentUpstreamWrite(up)
 	}
 	return up, up.WriteLine(data)
+}
+
+func (o *Owner) writeUpstreamToProcess(proc *upstream.Process, data []byte) error {
+	if proc == nil {
+		return errors.New("upstream writer unavailable")
+	}
+	o.touchActivity()
+	return proc.WriteLine(data)
 }
 
 func (o *Owner) hasWritableUpstream() bool {
@@ -3281,6 +3306,13 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 	o.clearProgressTokensForRequest(string(remappedRequestID))
 
 	o.logger.Printf("session %d: forwarding notifications/cancelled with remapped requestId", s.ID)
+	if tracked, ok := o.inflightTracker.Load(string(remappedRequestID)); ok {
+		if inflight, ok := tracked.(*InflightRequest); ok {
+			if proc := inflight.process.Load(); proc != nil {
+				return o.writeUpstreamToProcess(proc, remapped)
+			}
+		}
+	}
 	return o.forwardNotificationIfReady(remapped)
 }
 

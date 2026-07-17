@@ -324,8 +324,8 @@ func TestListChangedInvalidatesDaemonTemplate(t *testing.T) {
 	}
 
 	d, err := New(Config{
-		Name:             "materialization-invalidation-test",
-		ControlPath:      shortSocketPath(t, "materialization-invalidation.ctl"),
+		Name:             "mi",
+		ControlPath:      shortSocketPath(t, "mi.ctl"),
 		SkipSnapshot:     true,
 		HandlerFunc:      handler,
 		OwnerIdleTimeout: time.Minute,
@@ -1364,7 +1364,7 @@ func TestRestartRacingSharedToIsolatedCommitCapturesMatchingGeneration(t *testin
 	}
 }
 
-func TestTwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames(t *testing.T) {
+func TestGeneralRetryBeforeTwoTemplateRevisionMismatchesStillColdBypasses(t *testing.T) {
 	d := testDaemon(t)
 	var starts atomic.Int32
 	initSeen := make(chan struct{})
@@ -1408,12 +1408,24 @@ func TestTwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames(t *tes
 		return snapshot
 	}
 	d.updateTemplate(command, nil, makeSnapshot("stale-one"))
+	sid := serverid.GenerateContextKey(serverid.ModeGlobal, command, nil, nil, cwd)
 	var hookCalls atomic.Int32
 	d.beforeTemplatePromotion = func() {
 		switch hookCalls.Add(1) {
 		case 1:
-			d.updateTemplate(command, nil, makeSnapshot("stale-two"))
+			d.mu.Lock()
+			entry := d.owners[sid]
+			removed := entry != nil && entry.Owner == nil && entry.creating != nil
+			if removed {
+				d.deleteOwnerEntryLocked(sid)
+			}
+			d.mu.Unlock()
+			if !removed {
+				t.Errorf("general retry hook found owner entry=%#v, want creating placeholder", entry)
+			}
 		case 2:
+			d.updateTemplate(command, nil, makeSnapshot("stale-two"))
+		case 3:
 			d.updateTemplate(command, nil, makeSnapshot("stale-three"))
 		default:
 			t.Error("template promotion hook called after bounded bypass")
@@ -1437,7 +1449,7 @@ func TestTwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames(t *tes
 			t.Fatalf("Spawn: %v", result.err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("second template mismatch livelocked instead of taking cold bypass")
+		t.Fatal("general retry plus two template mismatches exhausted the shared budget before cold bypass")
 	}
 	select {
 	case <-initSeen:
@@ -1449,7 +1461,7 @@ func TestTwoTemplateRevisionMismatchesThenOneColdBypassWithoutStaleFrames(t *tes
 	if preCommit.CachedInit != "" || preCommit.CachedTools != "" {
 		t.Fatalf("cold bypass admitted stale cached frames: %+v", preCommit)
 	}
-	if hookCalls.Load() != 2 || starts.Load() != 1 || d.OwnerCount() != 1 {
+	if hookCalls.Load() != 3 || starts.Load() != 1 || d.OwnerCount() != 1 {
 		t.Fatalf("bounded bypass hook_calls=%d starts=%d owners=%d", hookCalls.Load(), starts.Load(), d.OwnerCount())
 	}
 	conn, scanner := connectSpawnedOwner(t, result.path, result.token)

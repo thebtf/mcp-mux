@@ -143,6 +143,9 @@ func (o *Owner) commitPreparedHandoff(proc *upstream.Process, pid int) error {
 			return ErrHandoffAlreadyPrepared
 		}
 	}
+	if o.handoffAbortRequested {
+		return upstream.ErrDetachNotPrepared
+	}
 	err := proc.CommitDetach()
 	if !proc.RetirementProven() {
 		o.recordFailedHandoffTransition(proc, err, false)
@@ -155,6 +158,7 @@ func (o *Owner) commitPreparedHandoff(proc *upstream.Process, pid int) error {
 		o.logger.Printf("owner handoff commit finalized with local release warning: %v", err)
 	}
 	o.handoffPrepared = false
+	o.handoffAbortRequested = false
 	o.recordFailedHandoffTransition(proc, nil, true)
 	o.completeShutdown(fmt.Sprintf("owner handed off (pid=%d)", pid))
 	return nil
@@ -171,13 +175,24 @@ func (o *Owner) abortPreparedHandoff(proc *upstream.Process, pid int) error {
 			return ErrHandoffAlreadyPrepared
 		}
 	}
+	o.handoffAbortRequested = true
 	err := proc.AbortDetach()
+	proofErr := error(nil)
 	proven := proc.RetirementProven()
+	if o.materializationFinalizationProbe != nil {
+		proofErr = o.materializationFinalizationProbe(proc)
+		proven = proofErr == nil
+	}
+	if !proven {
+		if proofErr == nil {
+			proofErr = errFinalizationUnproven
+		}
+		err = errors.Join(err, proofErr)
+	}
 	o.recordFailedHandoffTransition(proc, err, proven)
 	if proven {
 		o.handoffPrepared = false
-	}
-	if proven {
+		o.handoffAbortRequested = false
 		o.completeShutdown(fmt.Sprintf("owner handoff aborted and finalized (pid=%d)", pid))
 	}
 	return err
@@ -250,6 +265,7 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 	}
 
 	o.handoffPrepared = true
+	o.handoffAbortRequested = false
 
 	payload := HandoffPayload{
 		ServerID:    o.serverID,

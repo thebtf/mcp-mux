@@ -31,6 +31,7 @@ func TestGracefulRestart_ResponseDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
+	t.Cleanup(d.Shutdown)
 	seedProcessBackedOwner(t, d)
 
 	// Send graceful-restart via the real control client — same code path
@@ -86,6 +87,7 @@ func TestGracefulRestart_ResponseDelivery_WithOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
+	t.Cleanup(d.Shutdown)
 
 	// Spawn a mock owner so Shutdown has real work.
 	_, _, _, err = d.Spawn(control.Request{
@@ -143,6 +145,7 @@ func TestGracefulRestart_BackToBack(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Phase %d: New(): %v", i, err)
 		}
+		t.Cleanup(d.Shutdown)
 		seedProcessBackedOwner(t, d)
 
 		resp, err := control.SendWithTimeout(ctlPath, control.Request{

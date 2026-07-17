@@ -202,7 +202,9 @@ func TestConcurrentUncachedDemandsShareOneMaterialization(t *testing.T) {
 func TestCancellationRacingForwardingWritesRequestBeforeUpstreamCancel(t *testing.T) {
 	var orderMu sync.Mutex
 	var order []string
+	var orderRequestID json.RawMessage
 	cancelSeen := make(chan struct{})
+	releaseResponse := make(chan struct{})
 	var cancelOnce sync.Once
 	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
 		scanner := bufio.NewScanner(stdin)
@@ -227,14 +229,16 @@ func TestCancellationRacingForwardingWritesRequestBeforeUpstreamCancel(t *testin
 				orderMu.Lock()
 				order = append(order, req.Method)
 				orderMu.Unlock()
-				if err := writeControllerResponse(stdout, req.ID, `{"ok":true}`); err != nil {
-					return err
-				}
+				orderRequestID = append(orderRequestID[:0], req.ID...)
 			case "notifications/cancelled":
 				orderMu.Lock()
 				order = append(order, req.Method)
 				orderMu.Unlock()
 				cancelOnce.Do(func() { close(cancelSeen) })
+				<-releaseResponse
+				if err := writeControllerResponse(stdout, orderRequestID, `{"ok":true}`); err != nil {
+					return err
+				}
 			}
 		}
 		return scanner.Err()
@@ -252,16 +256,49 @@ func TestCancellationRacingForwardingWritesRequestBeforeUpstreamCancel(t *testin
 	defer o.Shutdown()
 	s := newControllerTestSession(o)
 	defer s.close()
+
+	replacementFrames := make(chan string, 1)
+	replacement := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			replacementFrames <- scanner.Text()
+		}
+		return scanner.Err()
+	})
+	defer func() { _ = replacement.Close() }()
+
 	writeEntered := make(chan struct{})
 	releaseWrite := make(chan struct{})
+	requestWritten := make(chan struct{})
+	replacementInstalled := make(chan struct{})
+	releaseReady := make(chan struct{})
+	defer func() {
+		for _, ch := range []chan struct{}{releaseWrite, replacementInstalled, releaseResponse, releaseReady} {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+		}
+	}()
 	cancelAttempted := make(chan struct{})
+	acceptingProcess := make(chan *upstream.Process, 1)
 	var writeOnce sync.Once
 	var attemptedOnce sync.Once
 	o.beforeQueuedDemandWrite = func() {
 		writeOnce.Do(func() { close(writeEntered) })
 		<-releaseWrite
 	}
-	o.beforeLocalDemandCancel = func() { attemptedOnce.Do(func() { close(cancelAttempted) }) }
+	o.beforeLocalDemandCancel = func() {
+		attemptedOnce.Do(func() { close(cancelAttempted) })
+		<-replacementInstalled
+	}
+	o.afterQueuedDemandWrite = func() {
+		acceptingProcess <- o.currentUpstream()
+		close(requestWritten)
+		<-replacementInstalled
+		<-releaseReady
+	}
 
 	sendReq(t, s.write, 41, "custom/order", `{}`)
 	select {
@@ -278,14 +315,65 @@ func TestCancellationRacingForwardingWritesRequestBeforeUpstreamCancel(t *testin
 		t.Fatal("cancellation did not race the forwarding boundary")
 	}
 	close(releaseWrite)
+	select {
+	case <-requestWritten:
+	case <-time.After(time.Second):
+		t.Fatal("queued request write did not reach the pre-ready boundary")
+	}
+	accepting := <-acceptingProcess
+	if accepting == nil {
+		t.Fatal("queued request did not bind an accepting process generation")
+	}
+	o.materializationMu.Lock()
+	state := o.materializationState
+	attempt := o.materializationAttempt
+	o.materializationMu.Unlock()
+	if state != MaterializationMaterializing {
+		t.Fatalf("state after queued write = %s, want %s before READY", state, MaterializationMaterializing)
+	}
+	if attempt == nil {
+		t.Fatal("queued write completed without an active materialization attempt")
+	}
+	if attempt.process != accepting {
+		t.Fatalf("accepting process = %p, active attempt process = %p", accepting, attempt.process)
+	}
+	o.mu.Lock()
+	if o.upstream != accepting {
+		current := o.upstream
+		o.mu.Unlock()
+		t.Fatalf("current process before replacement = %p, want accepting %p", current, accepting)
+	}
+	o.upstream = replacement
+	o.mu.Unlock()
+	close(replacementInstalled)
+
+	select {
+	case <-cancelSeen:
+	case line := <-replacementFrames:
+		t.Fatalf("cancellation reached replacement generation: %s", line)
+	case <-time.After(time.Second):
+		t.Fatal("remapped cancellation did not reach the accepting upstream before READY")
+	}
+	select {
+	case line := <-replacementFrames:
+		t.Fatalf("replacement generation received queued cancellation: %s", line)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	o.mu.Lock()
+	if o.upstream != replacement {
+		current := o.upstream
+		o.mu.Unlock()
+		t.Fatalf("current process during cancellation = %p, want replacement %p", current, replacement)
+	}
+	o.upstream = accepting
+	o.mu.Unlock()
+	close(releaseResponse)
+	close(releaseReady)
+
 	result := scanControllerResponseWithID(s.read, 41)
 	if result.err != nil || !strings.Contains(string(result.response), `"ok":true`) {
 		t.Fatalf("forwarded request result: response=%s err=%v", result.response, result.err)
-	}
-	select {
-	case <-cancelSeen:
-	case <-time.After(time.Second):
-		t.Fatal("remapped cancellation did not reach upstream")
 	}
 	orderMu.Lock()
 	gotOrder := append([]string(nil), order...)

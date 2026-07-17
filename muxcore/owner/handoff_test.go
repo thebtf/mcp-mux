@@ -67,6 +67,16 @@ func TestShutdownForHandoff_HappyPath(t *testing.T) {
 	if _, err := o.ShutdownForHandoff(); !errors.Is(err, ErrHandoffAlreadyPrepared) {
 		t.Fatalf("duplicate ShutdownForHandoff error = %v, want ErrHandoffAlreadyPrepared", err)
 	}
+	if _, finalized, err := o.FinalizeForRemoval(false, 100*time.Millisecond); finalized || !errors.Is(err, ErrHandoffAlreadyPrepared) {
+		t.Fatalf("FinalizeForRemoval during prepared handoff = finalized=%v err=%v, want false/ErrHandoffAlreadyPrepared", finalized, err)
+	}
+	o.Shutdown()
+	select {
+	case <-o.Done():
+		t.Fatal("ordinary shutdown finalized a prepared handoff before Commit")
+	default:
+	}
+
 	if err := payload.Commit(); err != nil {
 		t.Fatalf("payload.Commit: %v", err)
 	}
@@ -87,6 +97,79 @@ func TestShutdownForHandoff_HappyPath(t *testing.T) {
 		// ok — Shutdown returned immediately because shutdownOnce already fired
 	case <-time.After(2 * time.Second):
 		t.Error("Shutdown() after ShutdownForHandoff blocked or panicked")
+	}
+}
+
+func TestShutdownForHandoff_ExplicitAbortRetriesUnprovenRetirement(t *testing.T) {
+	cmd, args := mockServerArgs()
+	o, err := NewOwner(OwnerConfig{
+		Command:  cmd,
+		Args:     args,
+		IPCPath:  testIPCPath(t),
+		ServerID: "test-handoff-abort-retry",
+		Logger:   testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner: %v", err)
+	}
+	waitForCondition(t, 5*time.Second, func() bool { return o.MaterializationState() == MaterializationReady }, "owner did not finish initial materialization")
+	proc := o.currentUpstream()
+	if proc == nil {
+		t.Fatal("expected subprocess upstream")
+	}
+
+	payload, err := o.ShutdownForHandoff()
+	if err != nil {
+		t.Fatalf("ShutdownForHandoff: %v", err)
+	}
+	allowProof := false
+	defer func() {
+		allowProof = true
+		_ = payload.Abort()
+	}()
+	proofErr := errors.New("synthetic aborted-detach retirement remains unproven")
+	wrongProcessErr := errors.New("retirement probe received the wrong process")
+	proofCalls := 0
+	o.materializationFinalizationProbe = func(got *upstream.Process) error {
+		proofCalls++
+		if got != proc {
+			return wrongProcessErr
+		}
+		if !allowProof {
+			return proofErr
+		}
+		return nil
+	}
+
+	if err := payload.Abort(); !errors.Is(err, proofErr) {
+		t.Fatalf("first payload.Abort error = %v, want retirement proof failure", err)
+	}
+	select {
+	case <-o.Done():
+		t.Fatal("owner completed after unproven explicit abort")
+	default:
+	}
+	if state := o.MaterializationState(); state != MaterializationFinalizeBlocked {
+		t.Fatalf("state after unproven abort = %s, want %s", state, MaterializationFinalizeBlocked)
+	}
+	if err := payload.Commit(); !errors.Is(err, upstream.ErrDetachNotPrepared) {
+		t.Fatalf("payload.Commit after explicit abort = %v, want ErrDetachNotPrepared", err)
+	}
+	if _, finalized, err := o.FinalizeForRemoval(false, 100*time.Millisecond); finalized || !errors.Is(err, proofErr) {
+		t.Fatalf("FinalizeForRemoval retry before proof = finalized=%v err=%v, want false/proof failure", finalized, err)
+	}
+
+	allowProof = true
+	if err := payload.Abort(); err != nil {
+		t.Fatalf("payload.Abort retry after proof: %v", err)
+	}
+	select {
+	case <-o.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner did not complete after explicit abort retirement retry")
+	}
+	if proofCalls != 3 {
+		t.Fatalf("retirement proof calls = %d, want 3 (abort, finalizer retry, abort retry)", proofCalls)
 	}
 }
 
