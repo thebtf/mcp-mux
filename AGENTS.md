@@ -71,8 +71,37 @@ do not call the full critical muxcore scope shipped.
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.2
 ```
+
+### v0.27.2 - template background-spawn ownership gate
+
+**No required consumer code changes for ordinary `engine.New` users.** This
+patch closes a process-authority race for snapshot/template owners:
+
+- when snapshot restoration has already started the template-cache background
+  upstream, the first uncached request waits for that existing start instead of
+  opening a competing request-respawn generation;
+- a successful pending generation releases the gate only after the upstream
+  answers `initialize` and muxcore writes `notifications/initialized`, so
+  ordinary requests cannot overtake the MCP lifecycle handshake; exact-
+  generation terminal failure releases the gate into the existing explicit
+  error/respawn path;
+- proactive requests and ordinary responses are bound to one exact upstream
+  generation; dead-generation registry entries are drained, and stale or
+  unclaimed responses cannot mutate caches, pending counts, or sessions;
+- the wait remains bounded by the existing upstream readiness timeout and owner
+  shutdown, after which the request receives an explicit error rather than an
+  unowned process tree;
+- ordinary request-triggered respawn remains available when no background start
+  is pending or the completed background start did not produce a writable
+  upstream.
+
+Consumer impact: update to v0.27.2. The fix prevents duplicate direct upstream
+roots, locked source-checkout entrypoints, and respawn storms caused by two
+startup paths writing the same owner process slot. Do not add product-local
+spawn locks, file-replacement retries, PID sweeps, stale-process kill loops, or
+parallel lifecycle mechanisms; muxcore retains single process-tree authority.
 
 ### v0.27.1 - idle-gate rolling-compatibility hotfix
 

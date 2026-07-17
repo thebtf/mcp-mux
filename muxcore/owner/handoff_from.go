@@ -63,6 +63,7 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	}
 
 	o := &Owner{
+		proactiveNamespace:     nextProactiveNamespace(),
 		upstream:               proc,
 		ipcPath:                cfg.IPCPath,
 		cwd:                    cwd,
@@ -131,7 +132,7 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 
 	// Start goroutines — identical set to NewOwner.
 	go o.readUpstream(proc)
-	go o.sendProactiveInit()
+	go o.sendProactiveInit(proc, nil)
 	go o.acceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 

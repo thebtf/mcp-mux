@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,10 @@ func initVersion() string {
 	return rev + dirty
 }
 
+func nextProactiveNamespace() string {
+	return fmt.Sprintf("mux-init-%d-%d", os.Getpid(), proactiveOwnerSequence.Add(1))
+}
+
 // InflightRequest holds metadata about a request currently being processed by upstream.
 // Used for observability: mux_list --verbose shows what's pending and for how long.
 type InflightRequest struct {
@@ -95,6 +100,16 @@ type InflightRequest struct {
 	SessionID int       `json:"session"`
 	StartTime time.Time `json:"started_at"`
 }
+
+// proactiveRequest is claimed exactly once by its response or bound upstream death.
+type proactiveRequest struct {
+	method       string
+	initResponse chan struct{}
+	upstream     *upstream.Process
+	upstreamDone <-chan struct{}
+}
+
+var proactiveOwnerSequence atomic.Uint64
 
 // Owner is the multiplexer core. It manages a single upstream process and
 // routes requests from multiple downstream sessions through it.
@@ -119,8 +134,8 @@ type Owner struct {
 	serverID                    string    // server identity hash
 	listener                    net.Listener
 	logger                      *log.Logger
+	onZeroSessions              func(serverID string)
 
-	onZeroSessions       func(serverID string)
 	onUpstreamExit       func(serverID string)
 	onPersistentDetected func(serverID string)
 	onCacheReady         func(serverID string)
@@ -162,12 +177,14 @@ type Owner struct {
 	progressTokenRequestID map[string]string   // progressToken → remapped request ID that registered it
 	requestToTokens        map[string][]string // remapped request ID → list of progress tokens
 
-	progressTracker *progress.Tracker // dedup state for synthetic progress emission
-
-	upstreamDead            atomic.Bool // set when upstream exits; prevents sending to dead pipe
-	methodTags              sync.Map    // remapped request ID (string) -> method name
-	inflightTracker         sync.Map    // remapped request ID (string) -> *InflightRequest
-	timedOutIDs             sync.Map    // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
+	progressTracker         *progress.Tracker // dedup state for synthetic progress emission
+	upstreamDead            atomic.Bool       // set when upstream exits; prevents sending to dead pipe
+	methodTags              sync.Map          // remapped request ID (string) -> method name
+	proactiveNamespace      string            // unique across Owner construction and live handoff
+	proactiveInitSeq        atomic.Uint64     // per-owner proactive handshake sequence
+	proactiveRequests       sync.Map          // proactive response ID -> proactiveRequest
+	inflightTracker         sync.Map          // remapped request ID (string) -> *InflightRequest
+	timedOutIDs             sync.Map          // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests         atomic.Int64
 	drainTimeout            time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs           atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
@@ -190,7 +207,9 @@ type Owner struct {
 	// where the upstream is started asynchronously via SpawnUpstreamBackground.
 	// It is closed (under mu) when background spawn finishes (success or failure),
 	// allowing Serve to block instead of treating nil upstream as dead.
-	backgroundSpawnCh chan struct{}
+	backgroundSpawnCh         chan struct{}
+	beforeBackgroundSpawnWait func() // test-only synchronization seam; nil in production
+	afterProactiveStore       func() // test-only registration race seam
 
 	respawnMu sync.Mutex
 	respawn   *upstreamRespawn
@@ -323,8 +342,8 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	if cfg.Cwd != "" {
 		cwdSet[cfg.Cwd] = true
 	}
-
 	o := &Owner{
+		proactiveNamespace:   nextProactiveNamespace(),
 		ipcPath:              cfg.IPCPath,
 		cwd:                  cfg.Cwd,
 		cwdSet:               cwdSet,
@@ -452,12 +471,7 @@ func (o *Owner) SpawnUpstreamBackground() {
 		}
 		if o.sessionHandler != nil && o.handlerFunc == nil {
 			o.logger.Printf("background SessionHandler-only spawn: no upstream process")
-			o.mu.Lock()
-			if o.backgroundSpawnCh != nil {
-				close(o.backgroundSpawnCh)
-				o.backgroundSpawnCh = nil
-			}
-			o.mu.Unlock()
+			o.finishBackgroundSpawn()
 			return
 		}
 
@@ -480,13 +494,7 @@ func (o *Owner) SpawnUpstreamBackground() {
 		}
 		if err != nil {
 			o.logger.Printf("background upstream spawn failed: %v (serving stale cache)", err)
-			// Unblock Serve — spawn is done (failed), nil upstream will be observed via upstreamDeadCh.
-			o.mu.Lock()
-			if o.backgroundSpawnCh != nil {
-				close(o.backgroundSpawnCh)
-				o.backgroundSpawnCh = nil
-			}
-			o.mu.Unlock()
+			o.finishBackgroundSpawn()
 			return
 		}
 
@@ -494,24 +502,15 @@ func (o *Owner) SpawnUpstreamBackground() {
 		select {
 		case <-o.done:
 			proc.Close()
-			// Still unblock Serve so it can observe o.done and exit cleanly.
-			o.mu.Lock()
-			if o.backgroundSpawnCh != nil {
-				close(o.backgroundSpawnCh)
-				o.backgroundSpawnCh = nil
-			}
-			o.mu.Unlock()
+			o.finishBackgroundSpawn()
 			return
 		default:
 		}
 
 		o.mu.Lock()
 		o.upstream = proc
-		// Unblock Serve — upstream is now set; upstreamDeadCh will return proc.Done.
-		if o.backgroundSpawnCh != nil {
-			close(o.backgroundSpawnCh)
-			o.backgroundSpawnCh = nil
-		}
+		// Keep public cached readiness intact while a separate generation-local
+		// proactive handshake proves this new process is lifecycle-ready.
 		hadCachedLists := o.toolList != nil || o.promptList != nil ||
 			o.resourceList != nil || o.resourceTemplateList != nil
 		if hadCachedLists {
@@ -525,15 +524,25 @@ func (o *Owner) SpawnUpstreamBackground() {
 		}
 		o.mu.Unlock()
 
-		// Start reading upstream responses
+		// Start reading and monitoring before initialization so a failed generation
+		// always releases the pending background-spawn gate.
 		go o.readUpstream(proc)
-
-		// Send proactive init to refresh caches from new upstream
-		go o.sendProactiveInit()
-
-		// Monitor upstream exit.
 		go o.monitorUpstreamExit(proc)
+
+		// Keep backgroundSpawnCh pending until the new generation has answered
+		// initialize and notifications/initialized has been written. This prevents
+		// the first uncached request from overtaking the MCP lifecycle handshake.
+		o.sendProactiveInit(proc, o.finishBackgroundSpawn)
 	}()
+}
+
+func (o *Owner) finishBackgroundSpawn() {
+	o.mu.Lock()
+	if o.backgroundSpawnCh != nil {
+		close(o.backgroundSpawnCh)
+		o.backgroundSpawnCh = nil
+	}
+	o.mu.Unlock()
 }
 
 // NewOwner creates and starts a new Owner.
@@ -587,6 +596,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		args:                 cfg.Args,
 		env:                  cfg.Env,
 		handlerFunc:          cfg.HandlerFunc,
+		proactiveNamespace:   nextProactiveNamespace(),
 		sessionHandler:       cfg.SessionHandler,
 		upstreamWriter:       cfg.UpstreamWriter,
 		serverID:             cfg.ServerID,
@@ -653,7 +663,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	// InitReady() but init requires a session to send the request — deadlock.
 	// SessionHandler-only owners have no upstream, so skip the proactive init.
 	if proc != nil {
-		go o.sendProactiveInit()
+		go o.sendProactiveInit(proc, nil)
 	}
 
 	// Start accepting IPC connections
@@ -1019,12 +1029,15 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 		}
 
-		if err := o.writeUpstream(remapped); err != nil {
-			o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), err)
-			o.upstreamDead.Store(true)
-			o.drainInflightRequests()
-			if o.shouldRespawnUpstream() {
-				o.startUpstreamRespawn("write_error")
+		proc, writeErr := o.writeUpstreamFromCurrent(remapped)
+		if writeErr != nil {
+			o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), writeErr)
+			if proc != nil && o.markCurrentUpstreamDead(proc) {
+				o.initReadyOnce.Do(func() { close(o.initReady) })
+				_ = proc.Close()
+				if o.shouldRespawnUpstream() {
+					o.startUpstreamRespawn("write_error")
+				}
 			}
 			return nil
 		}
@@ -1137,53 +1150,66 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 // which closes initReady. Subsequent sessions get instant cached replay.
 //
 // Also sends notifications/initialized and tools/list to pre-populate caches.
-func (o *Owner) sendProactiveInit() {
-	initReq := `{"jsonrpc":"2.0","id":"mux-init-0","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"mcp-mux","version":"1.0.0"}}}`
-	o.mu.RLock()
-	initReady := o.initReady
-	o.mu.RUnlock()
-
-	// Tag the request so handleUpstreamMessage caches the response.
-	// Key must match string(msg.ID) which includes JSON quotes: "\"mux-init-0\"".
-	o.methodTags.Store(`"mux-init-0"`, "initialize")
-	o.pendingRequests.Add(1)
-
-	if err := o.writeUpstream([]byte(initReq)); err != nil {
-		o.logger.Printf("proactive init: write failed: %v", err)
+func (o *Owner) sendProactiveInit(proc *upstream.Process, afterInitialized func()) {
+	sequence := o.proactiveInitSeq.Add(1)
+	initID := fmt.Sprintf("%s-%d-0", o.proactiveNamespace, sequence)
+	initKey := strconv.Quote(initID)
+	initResponse := make(chan struct{})
+	if !o.registerProactive(initKey, proactiveRequest{method: "initialize", initResponse: initResponse, upstream: proc, upstreamDone: proc.Done}) {
+		o.markCurrentUpstreamDead(proc)
+		if afterInitialized != nil {
+			afterInitialized()
+		}
 		return
 	}
-	// Do NOT capture fingerprint from proactive init — let the first real
-	// session's initialize capture it. Our synthetic protocolVersion may
-	// differ from what CC actually sends, causing fingerprint mismatches.
+	initReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"mcp-mux","version":"1.0.0"}}}`, initKey)
+
+	complete := func() {}
+	if afterInitialized != nil {
+		complete = sync.OnceFunc(afterInitialized)
+	}
+	if err := proc.WriteLine([]byte(initReq)); err != nil {
+		if _, claimed := o.claimProactive(initKey); claimed {
+			o.decrementPending()
+		}
+		o.failProactiveGeneration(proc)
+		o.logger.Printf("proactive init: write failed: %v", err)
+		complete()
+		return
+	}
 	o.logger.Printf("proactive init: sent initialize request")
 
-	// After init response is cached (signaled by initReady), send the
-	// followup notifications/initialized + tools/list to pre-populate caches.
-	go func(initReady <-chan struct{}) {
+	go func() {
+		defer complete()
 		select {
-		case <-initReady:
+		case <-initResponse:
+		case <-proc.Done:
+			o.markCurrentUpstreamDead(proc)
+			return
 		case <-o.done:
 			return
 		}
-		if !o.InitSuccess() {
-			return
-		}
 
-		// Send notifications/initialized (required by MCP after initialize)
-		notif := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-		if err := o.writeUpstream([]byte(notif)); err != nil {
+		if err := proc.WriteLine([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)); err != nil {
+			o.failProactiveGeneration(proc)
 			o.logger.Printf("proactive init: notifications/initialized failed: %v", err)
 			return
 		}
-
-		// Request tools/list to pre-populate tool cache + trigger classification
-		toolsReq := `{"jsonrpc":"2.0","id":"mux-init-1","method":"tools/list","params":{}}`
-		o.methodTags.Store(`"mux-init-1"`, "tools/list")
-		o.pendingRequests.Add(1)
-		if err := o.writeUpstream([]byte(toolsReq)); err != nil {
+		complete()
+		toolsID := fmt.Sprintf("%s-%d-1", o.proactiveNamespace, sequence)
+		toolsKey := strconv.Quote(toolsID)
+		if !o.registerProactive(toolsKey, proactiveRequest{method: "tools/list", upstream: proc, upstreamDone: proc.Done}) {
+			return
+		}
+		toolsReq := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"tools/list","params":{}}`, toolsKey)
+		if err := proc.WriteLine([]byte(toolsReq)); err != nil {
+			if _, claimed := o.claimProactive(toolsKey); claimed {
+				o.decrementPending()
+			}
+			o.failProactiveGeneration(proc)
 			o.logger.Printf("proactive init: tools/list failed: %v", err)
 		}
-	}(initReady)
+	}()
 }
 
 // readUpstream reads responses from one upstream generation and routes them to
@@ -1204,16 +1230,13 @@ func (o *Owner) readUpstream(proc *upstream.Process) {
 			return
 		}
 
-		// Any line from upstream counts as activity for reaper idle tracking.
 		o.touchActivity()
-
 		msg, err := jsonrpc.Parse(line)
 		if err != nil {
 			o.logger.Printf("upstream parse error: %v", err)
 			continue
 		}
-
-		if err := o.handleUpstreamMessage(msg); err != nil {
+		if err := o.handleUpstreamMessageFrom(proc, msg); err != nil {
 			o.logger.Printf("upstream handle error: %v", err)
 		}
 	}
@@ -1280,6 +1303,7 @@ func (o *Owner) notifyUpstreamExit() {
 }
 
 func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
+	o.drainProactiveRequests(proc)
 	if !o.isCurrentUpstream(proc) {
 		return false
 	}
@@ -1288,7 +1312,30 @@ func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
 	return true
 }
 
+func (o *Owner) failProactiveGeneration(proc *upstream.Process) {
+	o.markCurrentUpstreamDead(proc)
+	_ = proc.Close()
+}
+
 func (o *Owner) ensureUpstreamReadyForRequest() error {
+	o.mu.RLock()
+	backgroundSpawnCh := o.backgroundSpawnCh
+	beforeWait := o.beforeBackgroundSpawnWait
+	o.mu.RUnlock()
+	if backgroundSpawnCh != nil {
+		if beforeWait != nil {
+			beforeWait()
+		}
+		timer := time.NewTimer(upstreamRespawnWaitTimeout)
+		defer timer.Stop()
+		select {
+		case <-backgroundSpawnCh:
+		case <-timer.C:
+			return fmt.Errorf("background upstream spawn still pending after %s", upstreamRespawnWaitTimeout)
+		case <-o.done:
+			return errors.New("owner shutting down")
+		}
+	}
 	if o.hasWritableUpstream() && !o.upstreamDead.Load() {
 		return nil
 	}
@@ -1374,7 +1421,7 @@ func (o *Owner) runUpstreamRespawn(reason string) error {
 		o.logger.Printf("upstream respawn started attempt=%d reason=%s", attempt, reason)
 		go o.readUpstream(proc)
 		go o.monitorUpstreamExit(proc)
-		o.sendProactiveInit()
+		o.sendProactiveInit(proc, nil)
 
 		timer := time.NewTimer(upstreamRespawnWaitTimeout)
 		select {
@@ -1429,13 +1476,36 @@ func (o *Owner) waitBeforeRespawnRetry(wait time.Duration) bool {
 	}
 }
 
-// isProactiveID reports whether a response ID was generated by the owner's
-// own sendProactiveInit handshake ("mux-init-0", "mux-init-1"). Those IDs are
-// intentionally unprefixed (no session scope) because they are sent before
-// any session connects. They must NOT be run through remap.Deremap.
-func isProactiveID(id json.RawMessage) bool {
-	s := string(id)
-	return s == `"mux-init-0"` || s == `"mux-init-1"`
+// isProactiveID identifies only this Owner's proactive namespace. A response
+// for another Owner, including a predecessor from live handoff, is never ours.
+func (o *Owner) isProactiveID(id json.RawMessage) bool {
+	value, err := strconv.Unquote(string(id))
+	return err == nil && o.proactiveNamespace != "" && strings.HasPrefix(value, o.proactiveNamespace+"-")
+}
+
+func (o *Owner) registerProactive(id string, request proactiveRequest) bool {
+	o.pendingRequests.Add(1)
+	o.proactiveRequests.Store(id, request)
+	if o.afterProactiveStore != nil {
+		o.afterProactiveStore()
+	}
+	select {
+	case <-request.upstreamDone:
+		if _, claimed := o.claimProactive(id); claimed {
+			o.decrementPending()
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func (o *Owner) claimProactive(id string) (proactiveRequest, bool) {
+	request, ok := o.proactiveRequests.LoadAndDelete(id)
+	if !ok {
+		return proactiveRequest{}, false
+	}
+	return request.(proactiveRequest), true
 }
 
 // decrementPending atomically decrements pendingRequests, clamping at zero.
@@ -1457,9 +1527,16 @@ func (o *Owner) decrementPending() {
 	}
 }
 
-// handleUpstreamMessage routes a message from the upstream to the correct session.
-// It also intercepts server→client requests like roots/list.
+// handleUpstreamMessage routes a test-injected upstream message without a process source.
 func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
+	return o.handleUpstreamMessageFrom(nil, msg)
+}
+
+// handleUpstreamMessageFrom routes a message from one exact upstream generation.
+func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.Message) error {
+	if proc != nil && !o.isCurrentUpstream(proc) {
+		return nil
+	}
 	if msg.IsNotification() {
 		// Route progress notifications to owning session instead of broadcast.
 		//
@@ -1499,62 +1576,53 @@ func (o *Owner) handleUpstreamMessage(msg *jsonrpc.Message) error {
 	}
 
 	if msg.IsRequest() {
-		// Server→client request (e.g., roots/list, sampling/createMessage)
 		return o.handleUpstreamRequest(msg)
 	}
-
 	if !msg.IsResponse() {
 		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
+	}
+	if request, claimed := o.claimProactive(string(msg.ID)); claimed {
+		o.decrementPending()
+		if request.upstream != proc || !o.isCurrentUpstream(request.upstream) {
+			return nil
+		}
+		select {
+		case <-request.upstreamDone:
+			return nil
+		default:
+		}
+		o.cacheResponse(request.method, msg.Raw)
+		if request.initResponse != nil {
+			close(request.initResponse)
+		}
+		return nil
+	}
+	if o.isProactiveID(msg.ID) {
+		return nil
 	}
 
 	// If the watchdog already claimed this request as timed-out, drop the
 	// late upstream response to prevent duplicate delivery to the session.
-	// Note: we keep methodTags caching (upstream response is still useful
-	// for future cached replays), just skip the session delivery path.
 	if _, timedOut := o.timedOutIDs.LoadAndDelete(string(msg.ID)); timedOut {
 		o.logger.Printf("dropping late response for timed-out request id=%s", string(msg.ID))
-		// Still cache if tagged — the response body is valid even if late
 		if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
 			o.cacheResponse(methodRaw.(string), msg.Raw)
 		}
-		// Clean up progress tokens for the (watchdog-timed-out) request (FIX 1).
 		o.clearProgressTokensForRequest(string(msg.ID))
 		return nil
 	}
 
-	// Atomically claim the inflight entry. If the watchdog claimed it first,
-	// the timedOutIDs check above would have caught it — but we double-check
-	// via LoadAndDelete here to handle any concurrent claim race safely.
-	//
-	// decrementPending is conditional: only decrement if we successfully claimed
-	// the inflight entry, OR if this is a proactive ID (mux-init-0/1) which is
-	// never stored in inflightTracker but always has a corresponding Add(1).
-	// If !claimed and not proactive, the watchdog already claimed and decremented
-	// — calling decrementPending here would cause a double-decrement that drives
-	// pendingRequests below the true in-flight count, causing HandleShutdown to
-	// drain too early and tear down while real requests are still outstanding.
-	_, claimed := o.inflightTracker.LoadAndDelete(string(msg.ID))
-	if claimed || isProactiveID(msg.ID) {
-		o.decrementPending()
+	// Ordinary responses must win their inflight claim before they can affect
+	// pending state, caches, progress ownership, or a downstream session.
+	if _, claimed := o.inflightTracker.LoadAndDelete(string(msg.ID)); !claimed {
+		return nil
 	}
+	o.decrementPending()
 	o.sessionMgr.CompleteRequest(string(msg.ID))
-
-	// Clean up any progress tokens registered for this request (FIX 1).
 	o.clearProgressTokensForRequest(string(msg.ID))
 
-	// Cache response if this was a tagged cacheable request
 	if methodRaw, ok := o.methodTags.LoadAndDelete(string(msg.ID)); ok {
 		o.cacheResponse(methodRaw.(string), msg.Raw)
-	}
-
-	// Proactive init responses (mux-init-0, mux-init-1) have no session
-	// prefix by design — they are sent by the owner itself before any
-	// session connects, to warm caches. The response caching above has
-	// already consumed them; there is nothing to route. Return cleanly
-	// rather than propagating a deremap error that fills the log with
-	// "missing session prefix in mux-init-N" noise for every spawn.
-	if isProactiveID(msg.ID) {
-		return nil
 	}
 
 	// Deremap the ID to find the target session
@@ -2386,8 +2454,11 @@ func (o *Owner) drainInflightRequests() {
 		return
 	}
 	o.logger.Printf("upstream died: sending error responses for %d in-flight requests", len(entries))
-
 	for _, entry := range entries {
+		if _, claimed := o.inflightTracker.LoadAndDelete(entry.RemappedID); !claimed {
+			continue
+		}
+		o.decrementPending()
 		remappedID := json.RawMessage(entry.RemappedID)
 		if !json.Valid(remappedID) {
 			remappedID = json.RawMessage(strconv.Quote(entry.RemappedID))
@@ -2409,25 +2480,29 @@ func (o *Owner) drainInflightRequests() {
 				o.logger.Printf("drainInflight: write error to session %d: %v", result.SessionID, writeErr)
 			}
 		}
-		// Use LoadAndDelete to atomically claim the inflightTracker entry.
-		// If the watchdog already claimed it (LoadAndDelete returns false), skip
-		// the decrement — the watchdog already decremented. Without this guard a
-		// concurrent watchdog timeout during upstream teardown causes a
-		// double-decrement that drives pendingRequests below the real in-flight
-		// count, making HandleShutdown drain too early.
-		if _, claimed := o.inflightTracker.LoadAndDelete(entry.RemappedID); claimed {
-			o.decrementPending()
-		}
 		o.methodTags.Delete(entry.RemappedID)
 		o.timedOutIDs.Delete(entry.RemappedID)
 		o.clearProgressTokensForRequest(entry.RemappedID)
 	}
+}
+func (o *Owner) drainProactiveRequests(proc *upstream.Process) {
+	o.proactiveRequests.Range(func(key, value any) bool {
+		request := value.(proactiveRequest)
+		if request.upstream != proc {
+			return true
+		}
+		if _, claimed := o.claimProactive(key.(string)); claimed {
+			o.decrementPending()
+		}
+		return true
+	})
 }
 
 // Shutdown stops the owner, closing all sessions and the upstream.
 // Cleanup completes before Done() is signaled, ensuring sockets are removed
 // before the process exits.
 func (o *Owner) Shutdown() {
+
 	o.shutdownOnce.Do(func() {
 		o.isAccepting.Store(false)
 		o.teardownExceptUpstream()
@@ -2738,6 +2813,8 @@ func (o *Owner) IsReachable() bool {
 // exited. Used by Daemon.Spawn to block until the server is ready, preventing CC
 // from timing out on slow-starting upstreams.
 func (o *Owner) InitReady() <-chan struct{} {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	return o.initReady
 }
 
@@ -2924,6 +3001,13 @@ func (o *Owner) touchActivity() {
 // to the injected writer followed by a newline, mirroring upstream.WriteLine
 // semantics. Used by tests to capture output without a subprocess.
 func (o *Owner) writeUpstream(data []byte) error {
+	_, err := o.writeUpstreamFromCurrent(data)
+	return err
+}
+
+// writeUpstreamFromCurrent returns the exact process generation used for the
+// write so a failure cannot retire a replacement generation.
+func (o *Owner) writeUpstreamFromCurrent(data []byte) (*upstream.Process, error) {
 	o.touchActivity()
 	o.mu.RLock()
 	writer := o.upstreamWriter
@@ -2931,17 +3015,17 @@ func (o *Owner) writeUpstream(data []byte) error {
 	o.mu.RUnlock()
 	if writer != nil {
 		if _, err := writer.Write(data); err != nil {
-			return fmt.Errorf("upstream writer: write: %w", err)
+			return nil, fmt.Errorf("upstream writer: write: %w", err)
 		}
 		if _, err := writer.Write([]byte("\n")); err != nil {
-			return fmt.Errorf("upstream writer: write newline: %w", err)
+			return nil, fmt.Errorf("upstream writer: write newline: %w", err)
 		}
-		return nil
+		return nil, nil
 	}
 	if up == nil {
-		return errors.New("upstream writer unavailable")
+		return nil, errors.New("upstream writer unavailable")
 	}
-	return up.WriteLine(data)
+	return up, up.WriteLine(data)
 }
 
 func (o *Owner) hasWritableUpstream() bool {

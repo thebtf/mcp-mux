@@ -2,13 +2,16 @@ package owner
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestOwnerRespawnsUpstreamForLiveSession(t *testing.T) {
@@ -57,6 +60,162 @@ func TestOwnerRespawnsUpstreamForLiveSession(t *testing.T) {
 	replacementGeneration := respawnGeneration(t, resp)
 	if replacementGeneration <= initialGeneration {
 		t.Fatalf("post-respawn ping response = %s, want generation > %d from same session", resp, initialGeneration)
+	}
+}
+
+func TestSnapshotBackgroundSpawnBlocksRequestRespawn(t *testing.T) {
+	var starts atomic.Int32
+	requestWaiting := make(chan struct{})
+	initializeReceived := make(chan struct{})
+	allowInitializeResponse := make(chan struct{})
+	initializedReceived := make(chan error, 1)
+	release := make(chan struct{})
+	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+		starts.Add(1)
+		scanner := bufio.NewScanner(stdin)
+		if !scanner.Scan() {
+			return scanner.Err()
+		}
+		var req struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			return err
+		}
+		close(initializeReceived)
+		<-allowInitializeResponse
+		if _, err := fmt.Fprintf(stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"background-gate","version":"1"}}}`+"\n", req.ID); err != nil {
+			return err
+		}
+
+		if !scanner.Scan() {
+			err := scanner.Err()
+			if err == nil {
+				err = io.ErrUnexpectedEOF
+			}
+			initializedReceived <- err
+			return err
+		}
+		var notification struct {
+			Method string `json:"method"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &notification); err != nil {
+			initializedReceived <- err
+			return err
+		}
+		if notification.Method != "notifications/initialized" {
+			err := fmt.Errorf("first post-initialize message method = %q, want notifications/initialized", notification.Method)
+			initializedReceived <- err
+			return err
+		}
+		initializedReceived <- nil
+		<-release
+		return nil
+	}
+
+	o, err := NewOwnerFromSnapshot(OwnerConfig{
+		HandlerFunc: handler,
+		IPCPath:     testIPCPath(t),
+		Logger:      testLogger(t),
+	}, OwnerSnapshot{})
+	if err != nil {
+		t.Fatalf("NewOwnerFromSnapshot() error: %v", err)
+	}
+	o.mu.Lock()
+	o.beforeBackgroundSpawnWait = func() {
+		close(requestWaiting)
+	}
+	spawnDone := o.backgroundSpawnCh
+	o.mu.Unlock()
+	if spawnDone == nil {
+		t.Fatal("snapshot owner has no pending background-spawn channel")
+	}
+
+	clientR, serverW := io.Pipe()
+	serverR, clientW := io.Pipe()
+	session := NewSession(serverR, serverW)
+	o.AddSession(session)
+
+	respawnLocked := true
+	initializeReleased := false
+	o.respawnMu.Lock()
+	t.Cleanup(func() {
+		if respawnLocked {
+			o.respawnMu.Unlock()
+		}
+		if !initializeReleased {
+			close(allowInitializeResponse)
+		}
+		o.removeSession(session)
+		session.Close()
+		_ = clientR.Close()
+		_ = clientW.Close()
+		close(release)
+		o.Shutdown()
+	})
+
+	ready := make(chan error, 1)
+	go func() {
+		ready <- o.ensureUpstreamReadyForRequest()
+	}()
+
+	select {
+	case <-requestWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("request path did not enter the pending background-spawn wait")
+	}
+	o.SpawnUpstreamBackground()
+	waitForCondition(t, time.Second, func() bool {
+		return starts.Load() == 1
+	}, "background upstream did not start")
+	select {
+	case <-initializeReceived:
+	case <-time.After(time.Second):
+		t.Fatal("background upstream did not receive initialize")
+	}
+
+	select {
+	case <-spawnDone:
+		t.Fatal("background-spawn gate closed before the new upstream answered initialize")
+	default:
+	}
+	select {
+	case err := <-ready:
+		t.Fatalf("request readiness returned before initialize completed: %v", err)
+	default:
+	}
+
+	close(allowInitializeResponse)
+	initializeReleased = true
+	select {
+	case err := <-initializedReceived:
+		if err != nil {
+			t.Fatalf("proactive initialization error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background upstream did not receive notifications/initialized")
+	}
+	select {
+	case <-spawnDone:
+	case <-time.After(time.Second):
+		t.Fatal("background-spawn gate did not close after notifications/initialized")
+	}
+
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("ensureUpstreamReadyForRequest() error: %v", err)
+		}
+	case <-time.After(time.Second):
+		o.respawnMu.Unlock()
+		respawnLocked = false
+		t.Fatal("request path started a competing respawn instead of waiting for the pending background spawn")
+	}
+
+	o.respawnMu.Unlock()
+	respawnLocked = false
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("upstream starts = %d, want 1", got)
 	}
 }
 

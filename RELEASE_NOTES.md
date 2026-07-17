@@ -1,99 +1,91 @@
-# mcp-mux v0.27.1
+# mcp-mux v0.27.2
 
-**Release date:** 2026-07-14
+**Release date:** 2026-07-17
 
 **Type:** Non-breaking patch release
 
 ## Summary
 
-Persistent daemon/owner state and downstream transport lifetime are now
-separate. Persistent products such as Aimux and Engram retain their transport
-by default because MCP permits background notifications. They may opt into
-`AllowPersistentIdleSuspend` only after proving no-background-events or a
-buffer/replay policy; that opt-in still requires muxcore's exact-owner daemon
-gate. Ordinary `engine.New` users remain source-compatible and receive that
-gate automatically when they enable `IdleSuspendDelay`.
+v0.27.2 fixes a process-authority race for snapshot/template owners. A restored
+owner can begin materializing its cached upstream in the background while its
+first uncached request arrives. Before this patch, the request path could start
+a second respawn before the background start published readiness. Both paths
+could then install different processes into the same owner slot, leaving the
+losing upstream generation outside normal finalization.
 
-The installed stable launcher and active versioned engine are distinct binaries
-and may differ byte-for-byte. Private dormant frames require protocol-v2
-target-bound attestation over a one-shot current-user-only local IPC endpoint.
-The engine verifies that the endpoint server PID is its direct parent and keeps
-the proof bytes separate from host stdio. Provider-derived version-store layout,
-active-engine pointer, and direct-parent executable path checks remain
-mandatory; custom, copied, or environment-forwarded engine paths fail closed.
-A verified engine can update the stable launcher only for future invocations
-through the existing two-rename swap. An already-running v0.27.0-or-older
-launcher lacks the v2 attestation server and needs one explicit host/session
-restart (or exact scoped maintenance cleanup). A silent host has no MCP
-completion signal, so full dormant exit is the explicit
-`MCPMUX_LAUNCHER_DORMANT_LEASE` opt-in, not a default promise.
+The request path now joins an already-pending template background start before
+deciding whether respawn is necessary. A successful generation keeps the gate
+pending until the upstream has answered `initialize` and muxcore has written
+`notifications/initialized`, so the first uncached request cannot overtake the
+MCP lifecycle handshake. Exact-generation terminal failure also releases the
+gate into the existing explicit error/respawn path. The wait remains bounded by
+the existing upstream readiness timeout and owner shutdown signal. If the
+completed background start produced a writable upstream, the request uses it;
+otherwise request-triggered respawn remains available.
 
-v0.27.1 fixes a control-plane retry herd introduced by the v0.27.0 idle-shim
-lifecycle. During rolling coexistence, a new shim could ask a v0.26.13 daemon
-whether it was safe to suspend. The old daemon correctly replied
-`unknown command: can_suspend`, but the shim treated that permanent response as
-transient and opened another named-pipe control connection every five seconds.
-Hundreds of retained Desktop/CLI-worker transports could therefore consume
-multiple daemon CPU cores even though their upstream owners were idle.
+Response ownership is now generation-bound as well. Proactive discovery IDs are
+unique per owner, their registry entries are tied to the exact upstream process
+and drained when that generation dies, and stale or unclaimed responses are
+dropped before they can change caches, pending counts, progress ownership, or
+downstream session routing.
+
+This is the conservative race repair. It does not change when template owners
+are eagerly materialized; demand-driven upstream materialization remains a
+separate architecture change and release track.
 
 ## What changes for users
 
-- Unsupported, unknown-token, owner-gone, persistent-owner, malformed, and
-  other non-transient gate outcomes are one-shot and fail closed. The shim keeps
-  its existing daemon IPC session connected and stops polling.
-- Actual transport failure and daemon shutdown remain recoverable. Retries use
-  capped, per-token jittered exponential backoff instead of a synchronized fixed
-  cadence.
-- Busy, pending-request, and active-progress denials remain recheckable because
-  those conditions can clear safely.
-- Product shims include the spawn-returned owner ID in the gate request. The
-  daemon checks that owner's token history directly instead of scanning every
-  owner. A forged owner ID or a stale token after same-ID owner recreation is
-  rejected.
-
-The lifecycle behavior shipped in v0.27.0 remains unchanged: disposable shims
-can become dormant, exact-owner wake remains available, persistent owners retain
-transport by default, and full subprocess trees are finalized when their owner
-is removed.
+- Snapshot/template background startup and first-request recovery no longer
+  create competing upstream generations for one owner.
+- Windows source-checkout upstreams no longer receive duplicate concurrent
+  launches from this race, avoiding locked entrypoint replacement failures and
+  the associated crash/respawn storm.
+- Timeout and shutdown remain explicit request errors. The fix does not add
+  unbounded waits or replay already-sent requests.
+- Ordinary `engine.New` and direct muxcore consumers require no source changes.
 
 ## Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.27.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.27.2
 ```
 
-Ordinary `engine.New` consumers need no source changes. Existing v0.27.0 shim
-engines must enter the v0.27.1 binary generation before the retry fix applies.
-The active engine can bootstrap the stable launcher for future invocations, but
-an already-running v0.27.0-or-older launcher cannot acquire the target-bound v2
-attestation server in memory; restart that host/session before expecting
-launcher dormancy. Do not add product-local retry loops, token indexes, PID-only
-cleanup, or stale process sweeps.
-
-## Serena dashboard
-
-Serena dashboard policy is independent of mux process lifecycle:
-
-- `--open-web-dashboard false` or
-  `web_dashboard_open_on_launch: false` prevents automatic browser opening but
-  leaves the dashboard available.
-- `web_dashboard: false` disables the dashboard service.
+Consumers should remove or quarantine any workaround added specifically for
+duplicate background/request starts. Do not add product-local spawn locks,
+file-replacement retries, PID sweeps, stale-process kill loops, or parallel
+lifecycle mechanisms; they compete with muxcore's Job Object/process-group
+authority and make failures harder to attribute.
 
 ## Verification
 
-Before release, the final candidate SHA must pass root and muxcore full suites,
-`go vet`, focused Windows races, Linux races, cross-platform builds, and the
-Windows lifecycle smoke. Earlier Windows artifacts are useful regression
-evidence only; they do not certify a later repaired SHA.
+The release candidate includes deterministic regressions for the background-
+spawn/request-respawn gate, MCP initialization ordering, owner-unique proactive
+IDs, dead-generation proactive drain, stale and unclaimed ordinary responses,
+and the terminal proactive-registration race. The deployed repair completed a
+`32h 18m` post-cutover Windows soak with zero actual runtime locked-entrypoint
+errors and zero request-triggered competing-respawn markers. The same daemon
+generation stayed live; unrelated network-failure respawns are classified
+separately in `.agent/reports/2026-07-17-v0.27.2-soak.md`.
 
-GitHub issue [#138](https://github.com/thebtf/mcp-mux/issues/138) tracks the
-regression and release proof.
+Release closeout still requires the current root and muxcore suites, `go vet`,
+the repository critical suite, applicable native-consumer and lifecycle
+playbook evidence, independent review, remote tag parity, published artifact
+verification, and public muxcore module resolution.
 
 ## Consumer handoff closeout
 
-This release affects every muxcore consumer that adopted v0.27.0 lifecycle
-behavior. The final release closeout must update and re-read the existing aimux
-and engram adoption issues with `muxcore/v0.27.1`, compatibility notes, and
-customer-mode verification. If that cannot be completed, record
+This release affects every muxcore consumer that can restore snapshot/template
+owners and accept requests while background startup is pending. After
+`muxcore/v0.27.2` resolves, release closeout must update and re-read the Aimux
+and Engram adoption issues with the tagged version, the single-authority
+invariant, forbidden local workarounds, customer-mode smoke expectations,
+rollback notes, and provider evidence. If that cannot be completed, record
 `CONSUMER_HANDOFF_BLOCKED` and do not call the full critical muxcore scope
 shipped.
+
+## Rollback
+
+Consumers can pin `muxcore/v0.27.1` or restore the previous product binary. That
+rollback reintroduces the snapshot/template background-start race. Do not mask
+it with consumer-local retry or process cleanup loops; prefer upgrading again
+to v0.27.2 after diagnosing the rollback reason.

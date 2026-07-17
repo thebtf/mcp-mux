@@ -8,11 +8,13 @@ import (
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
 
 // testLogger returns a logger that writes to test output.
@@ -941,10 +943,44 @@ func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
 	}
 
 	handlerStarted := make(chan struct{})
+	initializeReceived := make(chan struct{})
+	allowInitializeResponse := make(chan struct{})
+	initializeReleased := false
+	defer func() {
+		if !initializeReleased {
+			close(allowInitializeResponse)
+		}
+	}()
 	handlerFunc := func(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
 		_ = ctx
-		_ = stdout
 		close(handlerStarted)
+		scanner := bufio.NewScanner(stdin)
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		for scanner.Scan() {
+			if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+				return err
+			}
+			if req.Method == "initialize" {
+				break
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+		if req.Method != "initialize" {
+			return io.ErrUnexpectedEOF
+		}
+		close(initializeReceived)
+		<-allowInitializeResponse
+		if _, err := fmt.Fprintf(stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"snap-server","version":"0.1.0"}}}`+"\n", req.ID); err != nil {
+			return err
+		}
+		if !scanner.Scan() {
+			return scanner.Err()
+		}
 		_, _ = io.Copy(io.Discard, stdin)
 		return nil
 	}
@@ -968,15 +1004,44 @@ func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
 	}
 	owner.SpawnUpstreamBackground()
 	select {
-	case <-bgCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("background spawn did not finish")
-	}
-	select {
 	case <-handlerStarted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("background handler did not start")
 	}
+	select {
+	case <-initializeReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background handler did not receive proactive initialize")
+	}
+	select {
+	case <-bgCh:
+		t.Fatal("background spawn became publicly ready before proactive initialization")
+	default:
+	}
+
+	// A late initialize response from a dead predecessor must not release this
+	// generation's lifecycle gate or overwrite its public snapshot cache.
+	staleDone := make(chan struct{})
+	close(staleDone)
+	staleID := strconv.Quote(owner.proactiveNamespace + "-stale-0")
+	owner.registerProactive(staleID, proactiveRequest{method: "initialize", upstreamDone: staleDone})
+	if err := owner.handleUpstreamMessage(parseMessage([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"stale-server"}}}`, staleID)))); err != nil {
+		t.Fatalf("handle stale proactive initialize response: %v", err)
+	}
+	if cached := owner.getCachedResponse("initialize"); !strings.Contains(string(cached), "snap-server") {
+		t.Fatalf("stale generation response replaced public cached initialize: %s", cached)
+	}
+	select {
+	case <-bgCh:
+		t.Fatal("stale generation response released the current background spawn")
+	default:
+	}
+
+	// Session admission emits roots/listChanged synchronously. Discard that
+	// unrelated notification while this test deliberately holds initialize.
+	owner.mu.Lock()
+	owner.upstreamWriter = io.Discard
+	owner.mu.Unlock()
 
 	conn, err := ipc.Dial(ipcPath)
 	if err != nil {
@@ -1015,6 +1080,20 @@ func TestSnapshotOwnerServesCachedToolsDuringBackgroundRefresh(t *testing.T) {
 	initLine := readLineWithin(500 * time.Millisecond)
 	if !strings.Contains(initLine, `"id":42`) || !strings.Contains(initLine, "snap-server") {
 		t.Fatalf("unexpected cached initialize response: %s", initLine)
+	}
+
+	owner.mu.Lock()
+	owner.upstreamWriter = nil
+	owner.mu.Unlock()
+
+	// The snapshot's cached initialize remains public readiness while the new
+	// generation-local lifecycle handshake is intentionally still pending.
+	close(allowInitializeResponse)
+	initializeReleased = true
+	select {
+	case <-bgCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background spawn did not finish after proactive initialization")
 	}
 
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n")); err != nil {
@@ -1096,5 +1175,207 @@ func TestNewOwnerFromSnapshot_ClassificationPreserved(t *testing.T) {
 	}
 	if status["classification_source"] != "capability" {
 		t.Errorf("classification_source = %v, want capability", status["classification_source"])
+	}
+}
+
+func TestProactiveRegistryDrainsDeadGenerationAndSwallowsStaleResponses(t *testing.T) {
+	o := newMinimalOwner()
+	o.proactiveNamespace = nextProactiveNamespace()
+	o.initReady = make(chan struct{})
+	o.classified = make(chan struct{})
+
+	deadDone := make(chan struct{})
+	close(deadDone)
+	currentDone := make(chan struct{})
+	staleID := strconv.Quote(o.proactiveNamespace + "-old-0")
+	currentID := strconv.Quote(o.proactiveNamespace + "-new-0")
+	currentInit := make(chan struct{})
+	o.registerProactive(staleID, proactiveRequest{method: "initialize", upstreamDone: deadDone})
+	o.drainProactiveRequests(nil)
+	o.drainProactiveRequests(nil)
+	if got := o.PendingRequests(); got != 0 {
+		t.Fatalf("pending after repeated dead-generation drain = %d, want 0", got)
+	}
+	o.registerProactive(currentID, proactiveRequest{method: "initialize", initResponse: currentInit, upstreamDone: currentDone})
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after current-generation registration = %d, want 1", got)
+	}
+	closedDone := make(chan struct{})
+	close(closedDone)
+	if o.registerProactive(strconv.Quote(o.proactiveNamespace+"-closed-0"), proactiveRequest{method: "tools/list", upstreamDone: closedDone}) {
+		t.Fatal("registerProactive accepted an already-dead generation")
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after rejected registration = %d, want 1", got)
+	}
+
+	oldProc := &upstream.Process{}
+	currentProc := &upstream.Process{}
+	o.mu.Lock()
+	o.upstream = currentProc
+	o.mu.Unlock()
+	oldID := strconv.Quote(o.proactiveNamespace + "-old-live-0")
+	oldWait := make(chan struct{})
+	o.registerProactive(oldID, proactiveRequest{method: "initialize", initResponse: oldWait, upstream: oldProc, upstreamDone: currentDone})
+	oldResponse := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"old-live"}}}`, oldID))
+	if err := o.handleUpstreamMessageFrom(oldProc, parseMessage(oldResponse)); err != nil {
+		t.Fatalf("handle stale live-generation response: %v", err)
+	}
+	select {
+	case <-oldWait:
+		t.Fatal("stale live-generation response released its init waiter")
+	default:
+	}
+	if cached := o.getCachedResponse("initialize"); cached != nil {
+		t.Fatalf("stale live-generation response populated cache: %s", cached)
+	}
+	o.drainProactiveRequests(oldProc)
+	o.mu.Lock()
+	o.upstream = nil
+	o.mu.Unlock()
+
+	staleInit := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"serverInfo":{"name":"stale"}}}`, staleID))
+	if err := o.handleUpstreamMessage(parseMessage(staleInit)); err != nil {
+		t.Fatalf("handle stale initialize response: %v", err)
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after stale initialize response = %d, want 1", got)
+	}
+	if cached := o.getCachedResponse("initialize"); cached != nil {
+		t.Fatalf("stale initialize response populated cache: %s", cached)
+	}
+	select {
+	case <-currentInit:
+		t.Fatal("stale initialize response released newer init waiter")
+	default:
+	}
+
+	toolsID := strconv.Quote(o.proactiveNamespace + "-new-1")
+	o.registerProactive(toolsID, proactiveRequest{method: "tools/list", upstreamDone: currentDone})
+	freshTools := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"fresh"}]}}`, toolsID))
+	if err := o.handleUpstreamMessage(parseMessage(freshTools)); err != nil {
+		t.Fatalf("handle fresh tools response: %v", err)
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after fresh tools response = %d, want 1", got)
+	}
+	staleTools := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"stale"}]}}`, toolsID))
+	if err := o.handleUpstreamMessage(parseMessage(staleTools)); err != nil {
+		t.Fatalf("handle duplicate tools response: %v", err)
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after duplicate tools response = %d, want 1", got)
+	}
+	if cached := o.getCachedResponse("tools/list"); !strings.Contains(string(cached), "fresh") || strings.Contains(string(cached), "stale") {
+		t.Fatalf("duplicate tools response changed cache: %s", cached)
+	}
+
+	close(currentDone)
+	o.drainProactiveRequests(nil)
+	if got := o.PendingRequests(); got != 0 {
+		t.Fatalf("pending after current-generation drain = %d, want 0", got)
+	}
+}
+
+func TestOwnerInstancesUseDistinctFirstProactiveIDs(t *testing.T) {
+	ids := make(chan string, 2)
+	newOwner := func() *Owner {
+		o, err := NewOwner(OwnerConfig{
+			IPCPath: testIPCPath(t),
+			Logger:  testLogger(t),
+			HandlerFunc: func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+				var request struct {
+					ID json.RawMessage `json:"id"`
+				}
+				if err := json.NewDecoder(stdin).Decode(&request); err != nil {
+					return err
+				}
+				ids <- string(request.ID)
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewOwner: %v", err)
+		}
+		return o
+	}
+
+	o1 := newOwner()
+	defer o1.Shutdown()
+	o2 := newOwner()
+	defer o2.Shutdown()
+	first := make([]string, 0, 2)
+	for len(first) < 2 {
+		select {
+		case id := <-ids:
+			first = append(first, id)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for proactive initialize IDs")
+		}
+	}
+	if first[0] == first[1] {
+		t.Fatalf("first proactive IDs collided: %s", first[0])
+	}
+}
+
+func TestOrdinaryResponsesRequireCurrentSourceAndInflightClaim(t *testing.T) {
+	o := newMinimalOwner()
+	current := &upstream.Process{}
+	stale := &upstream.Process{}
+	o.upstream = current
+	o.toolList = []byte(`{"result":{"tools":[{"name":"cached"}]}}`)
+
+	staleID := strconv.Quote("ordinary-stale")
+	o.inflightTracker.Store(staleID, &InflightRequest{Method: "tools/list"})
+	o.methodTags.Store(staleID, "tools/list")
+	o.pendingRequests.Add(1)
+	staleResponse := parseMessage([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"stale"}]}}`, staleID)))
+	if err := o.handleUpstreamMessageFrom(stale, staleResponse); err != nil {
+		t.Fatalf("handle stale-source response: %v", err)
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after stale-source response = %d, want 1", got)
+	}
+	if _, ok := o.inflightTracker.Load(staleID); !ok {
+		t.Fatal("stale-source response claimed current inflight request")
+	}
+	if cached := o.getCachedResponse("tools/list"); !strings.Contains(string(cached), "cached") || strings.Contains(string(cached), "stale") {
+		t.Fatalf("stale-source response changed cache: %s", cached)
+	}
+
+	unclaimedID := strconv.Quote("ordinary-unclaimed")
+	o.methodTags.Store(unclaimedID, "tools/list")
+	unclaimedResponse := parseMessage([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"unclaimed"}]}}`, unclaimedID)))
+	if err := o.handleUpstreamMessageFrom(current, unclaimedResponse); err != nil {
+		t.Fatalf("handle unclaimed current-source response: %v", err)
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("pending after unclaimed response = %d, want 1", got)
+	}
+	if _, ok := o.methodTags.Load(unclaimedID); !ok {
+		t.Fatal("unclaimed response consumed method tag")
+	}
+	if cached := o.getCachedResponse("tools/list"); !strings.Contains(string(cached), "cached") || strings.Contains(string(cached), "unclaimed") {
+		t.Fatalf("unclaimed response changed cache: %s", cached)
+	}
+}
+
+func TestRegisterProactiveDrainedAfterStoreDoesNotLeakPending(t *testing.T) {
+	o := newMinimalOwner()
+	done := make(chan struct{})
+	id := strconv.Quote("proactive-registration-race")
+	o.afterProactiveStore = func() {
+		close(done)
+		o.drainProactiveRequests(nil)
+	}
+
+	if o.registerProactive(id, proactiveRequest{method: "tools/list", upstreamDone: done}) {
+		t.Fatal("registerProactive accepted a generation drained in its published-entry window")
+	}
+	if got := o.PendingRequests(); got != 0 {
+		t.Fatalf("pending after published-entry drain = %d, want 0", got)
+	}
+	if _, found := o.proactiveRequests.Load(id); found {
+		t.Fatal("published-entry drain left a proactive registry record")
 	}
 }
