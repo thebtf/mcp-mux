@@ -124,6 +124,13 @@ func waitProcessGroupGone(pgid int, leaderDone <-chan struct{}) error {
 	}
 }
 
+func processGroupRetirementError(waitErr, termErr, killErr error) error {
+	if waitErr == nil {
+		return nil
+	}
+	return errors.Join(termErr, killErr, waitErr)
+}
+
 func (p *Process) waitGroupAuthority(wait <-chan struct{}) error {
 	if wait == nil {
 		return nil
@@ -164,7 +171,7 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 	}
 	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
 	waitErr := waitProcessGroupGone(pgid, p.leaderDone)
-	authorityErr := p.finishGroupAuthority(errors.Join(termErr, killErr, waitErr))
+	authorityErr := p.finishGroupAuthority(processGroupRetirementError(waitErr, termErr, killErr))
 	<-p.done
 	return authorityErr
 }
@@ -192,7 +199,7 @@ func (p *Process) killPlatform() error {
 	}
 	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
 	waitErr := waitProcessGroupGone(pgid, p.leaderDone)
-	authorityErr := p.finishGroupAuthority(errors.Join(killErr, waitErr))
+	authorityErr := p.finishGroupAuthority(processGroupRetirementError(waitErr, nil, killErr))
 	if p.Alive() {
 		<-p.done
 	}
@@ -216,7 +223,7 @@ func (p *Process) cleanupPlatform() error {
 	if owner {
 		killErr := signalProcessGroup(pgid, syscall.SIGKILL)
 		waitErr := waitProcessGroupGone(pgid, p.leaderDone)
-		return p.finishGroupAuthority(errors.Join(killErr, waitErr))
+		return p.finishGroupAuthority(processGroupRetirementError(waitErr, nil, killErr))
 	}
 	return p.waitGroupAuthority(wait)
 }
@@ -229,7 +236,7 @@ func (p *Process) reapPlatform() error {
 	if owner {
 		killErr := signalProcessGroup(pgid, syscall.SIGKILL)
 		waitErr := waitProcessGroupGone(pgid, p.leaderDone)
-		return p.finishGroupAuthority(errors.Join(killErr, waitErr))
+		return p.finishGroupAuthority(processGroupRetirementError(waitErr, nil, killErr))
 	}
 	return p.waitGroupAuthority(wait)
 }
