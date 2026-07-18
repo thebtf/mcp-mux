@@ -360,6 +360,109 @@ func TestReaperFinalizationRetryRetainsLivePIDAndOwnerState(t *testing.T) {
 	}
 }
 
+func TestReaperFinalizationRetryContinuesAfterEntryMetadataChanges(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "reaper-retry-retirement"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{
+		Owner:       o,
+		ServerID:    sid,
+		LastSession: time.Now().Add(-time.Second),
+		IdleTimeout: time.Millisecond,
+	}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || !soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=true", got, soft, o)
+		}
+		if calls.Add(1) <= ownerFinalizationAttempts {
+			return 0, false, errors.New("synthetic whole-tree proof pending")
+		}
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	if affected := (&Reaper{daemon: d, logger: d.logger}).sweep(); affected != 0 {
+		t.Fatalf("first reaper sweep affected=%d, want retryable owner retained", affected)
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("synchronous finalizer calls=%d, want %d", got, ownerFinalizationAttempts)
+	}
+	d.mu.Lock()
+	entry.Persistent = true
+	entry.LastSession = time.Now()
+	entry.IdleTimeout = time.Hour
+	retrying := entry.removalRetrying
+	d.mu.Unlock()
+	if !retrying {
+		t.Fatal("reaper did not schedule finalization retry")
+	}
+
+	waitForDaemonCondition(t, time.Second, func() bool { return d.Entry(sid) == nil }, "scheduled retry stopped after teardown metadata changed")
+	if got := calls.Load(); got < ownerFinalizationAttempts+1 {
+		t.Fatalf("finalizer calls=%d, want retry after teardown began", got)
+	}
+}
+
+func TestZeroSessionFinalizationRetryContinuesAfterPersistenceChange(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "zero-session-retry-retirement"
+	o := testReconnectOwner(t, sid)
+	zeroAt := time.Now().Add(-time.Second)
+	entry := &OwnerEntry{
+		Owner:       o,
+		ServerID:    sid,
+		LastSession: zeroAt,
+		IdleTimeout: time.Millisecond,
+	}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || !soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=true", got, soft, o)
+		}
+		if calls.Add(1) <= ownerFinalizationAttempts {
+			return 0, false, errors.New("synthetic zero-session retirement pending")
+		}
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond); err == nil {
+		t.Fatal("zero-session removal unexpectedly proved finalization")
+	} else if removed {
+		t.Fatal("zero-session removal forgot owner before retry")
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("synchronous finalizer calls=%d, want %d", got, ownerFinalizationAttempts)
+	}
+	d.mu.Lock()
+	entry.Persistent = true
+	retrying := entry.removalRetrying
+	d.mu.Unlock()
+	if !retrying {
+		t.Fatal("zero-session removal did not schedule finalization retry")
+	}
+
+	waitForDaemonCondition(t, time.Second, func() bool { return d.Entry(sid) == nil }, "zero-session retry stopped after teardown persistence changed")
+	if got := calls.Load(); got < ownerFinalizationAttempts+1 {
+		t.Fatalf("finalizer calls=%d, want retry after zero-session teardown began", got)
+	}
+}
+
 func TestOwnerRemovalKeepsEntryWhenFinalizationUnproven(t *testing.T) {
 	d := testDaemon(t)
 	d.supervisor = nil

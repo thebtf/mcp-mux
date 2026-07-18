@@ -121,7 +121,7 @@ func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *Owne
 		soft = false
 	}
 	removed, err := d.finalizeAndRemoveOwner(serverID, entry, reason, soft, func(current *OwnerEntry) bool {
-		return current.LastSession.Equal(zeroAt)
+		return current.Owner == ownerRef && !current.Persistent && current.LastSession.Equal(zeroAt)
 	}, true)
 	return removed, removed.Removed, err
 }
@@ -278,6 +278,8 @@ func (d *Daemon) scheduleOwnerFinalizationRetry(serverID string, entry *OwnerEnt
 				timer.Stop()
 				return
 			}
+			// FinalizeForRemoval has already torn down admission. Keep retiring
+			// that exact generation even if reusable-entry metadata changes.
 			result, err := d.finalizeAndRemoveOwner(serverID, entry, reason, soft, nil, false)
 			if result.Removed || err == nil {
 				return

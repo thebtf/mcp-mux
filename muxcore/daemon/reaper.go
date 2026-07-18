@@ -36,6 +36,24 @@ type Reaper struct {
 	stopped  chan struct{}
 }
 
+type reaperOwnerView struct {
+	sid         string
+	entry       *OwnerEntry
+	owner       *owner.Owner
+	persistent  bool
+	idleTimeout time.Duration
+	lastSession time.Time
+}
+
+func (v reaperOwnerView) matches(current *OwnerEntry) bool {
+	return current != nil &&
+		current == v.entry &&
+		current.Owner == v.owner &&
+		current.Persistent == v.persistent &&
+		current.IdleTimeout == v.idleTimeout &&
+		current.LastSession.Equal(v.lastSession)
+}
+
 // NewReaper creates and starts a reaper goroutine.
 func NewReaper(d *Daemon, interval time.Duration) *Reaper {
 	if interval == 0 {
@@ -100,11 +118,16 @@ func (r *Reaper) sweep() int {
 	affected := 0
 
 	r.daemon.mu.RLock()
-	entries := make([]*OwnerEntry, 0, len(r.daemon.owners))
-	sids := make([]string, 0, len(r.daemon.owners))
-	for sid, e := range r.daemon.owners {
-		entries = append(entries, e)
-		sids = append(sids, sid)
+	entries := make([]reaperOwnerView, 0, len(r.daemon.owners))
+	for sid, entry := range r.daemon.owners {
+		entries = append(entries, reaperOwnerView{
+			sid:         sid,
+			entry:       entry,
+			owner:       entry.Owner,
+			persistent:  entry.Persistent,
+			idleTimeout: entry.IdleTimeout,
+			lastSession: entry.LastSession,
+		})
 	}
 	r.daemon.mu.RUnlock()
 
@@ -113,12 +136,12 @@ func (r *Reaper) sweep() int {
 	// reconnect history ages past its 30-minute refresh window.
 	totalPendingSwept := 0
 	totalBoundSwept := 0
-	for _, entry := range entries {
-		if entry.Owner == nil {
+	for _, view := range entries {
+		if view.owner == nil {
 			continue
 		}
-		totalPendingSwept += entry.Owner.SessionMgr().SweepExpiredPending()
-		totalBoundSwept += entry.Owner.SessionMgr().SweepExpiredBound()
+		totalPendingSwept += view.owner.SessionMgr().SweepExpiredPending()
+		totalBoundSwept += view.owner.SessionMgr().SweepExpiredBound()
 	}
 	if totalPendingSwept > 0 {
 		r.logger.Printf("reaper: swept %d expired pending tokens", totalPendingSwept)
@@ -127,11 +150,13 @@ func (r *Reaper) sweep() int {
 		r.logger.Printf("reaper: swept %d expired bound tokens", totalBoundSwept)
 	}
 
-	for i, entry := range entries {
-		sid := sids[i]
+	for _, view := range entries {
+		sid := view.sid
+		entry := view.entry
+		ownerRef := view.owner
 
 		// Skip placeholders — owner is still being created by Spawn.
-		if entry.Owner == nil {
+		if ownerRef == nil {
 			continue
 		}
 
@@ -139,40 +164,42 @@ func (r *Reaper) sweep() int {
 		// inside the owner-local controller; explicit teardown is completed by
 		// the removal path that owns it.
 		select {
-		case <-entry.Owner.Done():
+		case <-ownerRef.Done():
 			continue
 		default:
 		}
 
 		sample := evictionSample{
-			Sessions:               entry.Owner.SessionCount(),
-			PendingSessions:        entry.Owner.SessionMgr().PendingCount(),
-			Persistent:             entry.Persistent,
-			PendingRequests:        entry.Owner.PendingRequests(),
-			ActiveProgressTokens:   entry.Owner.ActiveProgressTokens(),
-			HasBusyWork:            entry.Owner.HasActiveBusyWork(),
-			UpstreamDead:           entry.Owner.UpstreamDead(),
-			CacheReady:             entry.Owner.CacheReady(),
-			MaterializationBlocked: entry.Owner.MaterializationBlocksEviction(),
-			IdleTimeout:            entry.IdleTimeout,
-			OwnerIdleOverride:      entry.Owner.IdleTimeout(),
-			LastSession:            entry.LastSession,
-			LastActivity:           entry.Owner.LastActivity(),
-			IsolatedClassified:     entry.Owner.IsClassifiedIsolated(),
+			Sessions:               ownerRef.SessionCount(),
+			PendingSessions:        ownerRef.SessionMgr().PendingCount(),
+			Persistent:             view.persistent,
+			PendingRequests:        ownerRef.PendingRequests(),
+			ActiveProgressTokens:   ownerRef.ActiveProgressTokens(),
+			HasBusyWork:            ownerRef.HasActiveBusyWork(),
+			UpstreamDead:           ownerRef.UpstreamDead(),
+			CacheReady:             ownerRef.CacheReady(),
+			MaterializationBlocked: ownerRef.MaterializationBlocksEviction(),
+			IdleTimeout:            view.idleTimeout,
+			OwnerIdleOverride:      ownerRef.IdleTimeout(),
+			LastSession:            view.lastSession,
+			LastActivity:           ownerRef.LastActivity(),
+			IsolatedClassified:     ownerRef.IsClassifiedIsolated(),
 		}
 		decision := shouldEvict(sample, now, r.daemon.ownerIdleTimeout, r.daemon.isolatedIdleTimeout)
 		if decision.evict {
-			var result ownerRemovalResult
+			reason := ownerRemovalReasonIdle
+			soft := true
 			if decision.reason == "zombie" {
+				reason = ownerRemovalReasonZombie
+				soft = false
 				r.logger.Printf("reaper: owner %s upstream dead with 0 sessions, removing", sid[:8])
-				result, _ = r.daemon.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonZombie, false)
 			} else {
 				r.logger.Printf(
 					"reaper: owner %s %s for %.0fs (timeout %.0fs), soft-removing",
 					sid[:8], decision.reason, decision.elapsed.Seconds(), decision.idleTimeout.Seconds(),
 				)
-				result, _ = r.daemon.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonIdle, true)
 			}
+			result, _ := r.daemon.finalizeAndRemoveOwner(sid, entry, reason, soft, view.matches, true)
 			if result.Removed {
 				affected++
 			}
