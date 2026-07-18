@@ -56,7 +56,7 @@ func newDormantSupervisorHarnessWithLease(t *testing.T, mode string, replyDelay,
 	h.codeCh = codeCh
 
 	go func() {
-		codeCh <- runLauncherStdioSupervisor(launcherSupervisorConfig{
+		codeCh <- runTestLauncherStdioSupervisor(launcherSupervisorConfig{
 			LauncherPath:      launcherPath,
 			InitialEnginePath: enginePath,
 			Args:              []string{"fixture-mcp"},

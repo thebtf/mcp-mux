@@ -100,7 +100,7 @@ func TestLauncherSupervisorRespawnsChildWithoutClosingTransport(t *testing.T) {
 
 	codeCh := make(chan int, 1)
 	go func() {
-		codeCh <- runLauncherStdioSupervisor(launcherSupervisorConfig{
+		codeCh <- runTestLauncherStdioSupervisor(launcherSupervisorConfig{
 			LauncherPath:        launcherPath,
 			InitialEnginePath:   enginePath,
 			Args:                []string{"fixture-mcp"},
@@ -265,7 +265,7 @@ func TestLauncherSupervisorRetriesInitializeWithoutClosingTransport(t *testing.T
 
 	codeCh := make(chan int, 1)
 	go func() {
-		codeCh <- runLauncherStdioSupervisor(launcherSupervisorConfig{
+		codeCh <- runTestLauncherStdioSupervisor(launcherSupervisorConfig{
 			LauncherPath:      launcherPath,
 			InitialEnginePath: enginePath,
 			Args:              []string{"fixture-mcp"},
@@ -337,7 +337,7 @@ func TestLauncherSupervisorRestartsChildWhenActiveEnginePointerChanges(t *testin
 
 	codeCh := make(chan int, 1)
 	go func() {
-		codeCh <- runLauncherStdioSupervisor(launcherSupervisorConfig{
+		codeCh <- runTestLauncherStdioSupervisor(launcherSupervisorConfig{
 			LauncherPath:        launcherPath,
 			InitialEnginePath:   enginePath1,
 			Args:                []string{"serve"},
@@ -421,7 +421,7 @@ func TestLauncherSupervisorEightHostsSwitchEngineOnSamePipes(t *testing.T) {
 		codeCh := make(chan int, 1)
 		starts := &atomic.Int32{}
 		go func() {
-			codeCh <- runLauncherStdioSupervisor(launcherSupervisorConfig{
+			codeCh <- runTestLauncherStdioSupervisor(launcherSupervisorConfig{
 				LauncherPath:        launcherPath,
 				InitialEnginePath:   enginePath1,
 				Args:                []string{"serve"},

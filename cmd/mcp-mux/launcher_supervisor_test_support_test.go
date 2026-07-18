@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 
 	"github.com/thebtf/mcp-mux/muxcore/supervisor"
@@ -36,6 +37,16 @@ func startSupervisedChildCommand(ctx context.Context, cmd *exec.Cmd) (*superviso
 		Dir:    cmd.Dir,
 		Stderr: cmd.Stderr,
 	})
+}
+
+func runTestLauncherStdioSupervisor(cfg launcherSupervisorConfig) int {
+	if err := runLauncherStdioSupervisorErr(cfg); err != nil {
+		if cfg.Stderr != nil {
+			fmt.Fprintln(cfg.Stderr, err)
+		}
+		return 1
+	}
+	return 0
 }
 
 type verifiedTestAdmission struct{}
