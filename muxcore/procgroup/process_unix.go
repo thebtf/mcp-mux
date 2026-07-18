@@ -31,6 +31,9 @@ func configurePlatform(cmd *exec.Cmd, p *Process) error {
 	if p.disableTree {
 		return nil
 	}
+	if err := prepareProcessTreeAuthority(); err != nil {
+		return err
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	p.platform.finalized = make(chan struct{})
 	return nil
@@ -118,23 +121,6 @@ func waitProcessGroupGone(pgid int, leaderDone <-chan struct{}) error {
 			return fmt.Errorf("process group %d remained alive after %s", pgid, processTreeWaitTimeout)
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func drainWaitableGroupChildren(pgid int) error {
-	for {
-		var status syscall.WaitStatus
-		pid, err := syscall.Wait4(-pgid, &status, syscall.WNOHANG, nil)
-		switch {
-		case errors.Is(err, syscall.EINTR):
-			continue
-		case errors.Is(err, syscall.ECHILD):
-			return nil
-		case err != nil:
-			return err
-		case pid == 0:
-			return nil
-		}
 	}
 }
 
