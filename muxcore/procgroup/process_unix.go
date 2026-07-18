@@ -114,10 +114,13 @@ func waitProcessGroupGone(pgid int, leaderDone <-chan struct{}) error {
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
-		if err != nil {
+		if err != nil && !processGroupProbePending(err) {
 			return fmt.Errorf("probe process group %d: %w", pgid, err)
 		}
 		if !time.Now().Before(deadline) {
+			if err != nil {
+				return fmt.Errorf("process group %d remained unretired after %s: %w", pgid, processTreeWaitTimeout, err)
+			}
 			return fmt.Errorf("process group %d remained alive after %s", pgid, processTreeWaitTimeout)
 		}
 		time.Sleep(10 * time.Millisecond)

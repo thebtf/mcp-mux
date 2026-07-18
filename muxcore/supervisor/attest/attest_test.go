@@ -78,6 +78,11 @@ func TestParentAcceptsChildThatConnectsBeforeBind(t *testing.T) {
 	if err := <-result; err != nil {
 		t.Fatalf("pre-bind connection failed: %v", err)
 	}
+	select {
+	case <-parent.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-bind parent receipt did not finish")
+	}
 	if !parent.Verified() {
 		t.Fatal("pre-bind connection did not produce receipt")
 	}
@@ -129,6 +134,11 @@ func TestParentRejectsMalformedExchangeThenAcceptsValidChild(t *testing.T) {
 		DirectParentPID: os.Getpid(),
 	}); err != nil {
 		t.Fatalf("valid child after malformed peer: %v", err)
+	}
+	select {
+	case <-parent.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("valid-child parent receipt did not finish")
 	}
 	if !parent.Verified() {
 		t.Fatal("valid child after malformed peer did not verify")
