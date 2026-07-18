@@ -26,6 +26,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 )
 
 var runResilientClient = owner.RunResilientClient
@@ -202,6 +203,9 @@ type Config struct {
 	// supervisor; otherwise leave it zero.
 	IdleSuspendDelay time.Duration
 	IdleDormantGrace time.Duration
+	// LifecycleProtocol enables the private launcher-child lifecycle wire for
+	// consumers that own a compatible supervisor. Its zero value is disabled.
+	LifecycleProtocol supervisor.Protocol
 	// AllowPersistentIdleSuspend is an explicit assertion that this product has
 	// no unbuffered server-to-client background traffic for the suspended shim.
 	// Persistent owners retain their downstream transports by default.
@@ -552,6 +556,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 			return canSuspendViaDaemon(ctlPath, currentToken, serverID)
 		},
 		IdleDormantGrace:           e.cfg.IdleDormantGrace,
+		LifecycleProtocol:          e.cfg.LifecycleProtocol,
 		AllowPersistentIdleSuspend: e.cfg.AllowPersistentIdleSuspend,
 		EnginePrefix:               e.cfg.Name,
 		Logger:                     e.logger,

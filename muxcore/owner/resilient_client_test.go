@@ -1076,6 +1076,24 @@ func TestResilientClient_DrainOrphanedInflight_FailAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestReconnectPropagatesExitSentinel(t *testing.T) {
+	rc := &resilientClient{
+		cfg: ResilientClientConfig{
+			Stdout:           io.Discard,
+			ReconnectTimeout: time.Second,
+			Reconnect: func() (string, string, error) {
+				return "", "", ErrReconnectExit
+			},
+		},
+		msgFromCC:  make(chan []byte, 1),
+		stdoutDead: make(chan struct{}),
+		log:        resilientTestLogger(t),
+	}
+	if _, err := rc.reconnect(&sync.Mutex{}, make(chan error)); !errors.Is(err, ErrReconnectExit) {
+		t.Fatalf("reconnect error = %v, want ErrReconnectExit", err)
+	}
+}
+
 // failAfterNWriter succeeds `passes` times, then every subsequent Write
 // returns `err`. Used to test mid-iteration failure handling.
 type failAfterNWriter struct {

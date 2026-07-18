@@ -14,12 +14,25 @@ import (
 
 func writeTestFile(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("MkdirAll(%s): %v", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0755); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("WriteFile(%s): %v", path, err)
 	}
+}
+
+func writeContentAddressedTestEngine(t *testing.T, launcherPath, content string) string {
+	t.Helper()
+	pending := filepath.Join(t.TempDir(), engineFileName())
+	writeTestFile(t, pending, content)
+	hash, err := fileHash(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enginePath := filepath.Join(versionStoreDir(launcherPath), hash[:12], engineFileName())
+	writeTestFile(t, enginePath, content)
+	return enginePath
 }
 
 func TestInstallVersionedEngineKeepsLauncherStableByDefault(t *testing.T) {
@@ -120,6 +133,51 @@ func TestWriteActiveEngineStoresRelativePointer(t *testing.T) {
 	resolved, ok := resolveActiveEngine(launcherPath)
 	if !ok || !samePath(resolved, enginePath) {
 		t.Fatalf("resolved active engine = %q ok=%v, want %q", resolved, ok, enginePath)
+	}
+}
+
+func TestResolveActiveEngineRejectsPointerOutsideVersionStore(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, launcherFileName())
+	outside := filepath.Join(dir, "outside", engineFileName())
+	writeTestFile(t, outside, "outside engine")
+	if err := os.MkdirAll(versionStoreDir(launcherPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(activeEngineFile(launcherPath), []byte(outside+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, ok := resolveActiveEngine(launcherPath); ok || resolved != "" {
+		t.Fatalf("outside active engine resolved as %q", resolved)
+	}
+}
+
+func TestResolveActiveEngineRejectsTraversalOutsideVersionStore(t *testing.T) {
+	dir := t.TempDir()
+	launcherPath := filepath.Join(dir, launcherFileName())
+	outside := filepath.Join(dir, "outside", engineFileName())
+	writeTestFile(t, outside, "outside engine")
+	if err := os.MkdirAll(versionStoreDir(launcherPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	traversal := filepath.Join("..", "outside", engineFileName())
+	if err := os.WriteFile(activeEngineFile(launcherPath), []byte(traversal+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if resolved, ok := resolveActiveEngine(launcherPath); ok || resolved != "" {
+		t.Fatalf("traversal active engine resolved as %q", resolved)
+	}
+}
+
+func TestInstalledEngineAuthorizationRejectsModifiedContent(t *testing.T) {
+	launcherPath := filepath.Join(t.TempDir(), launcherFileName())
+	enginePath := writeContentAddressedTestEngine(t, launcherPath, "authorized engine")
+	if !authorizeInstalledEnginePath(launcherPath, enginePath) {
+		t.Fatal("content-addressed engine was not authorized")
+	}
+	writeTestFile(t, enginePath, "modified engine")
+	if authorizeInstalledEnginePath(launcherPath, enginePath) {
+		t.Fatal("modified content retained authorization")
 	}
 }
 

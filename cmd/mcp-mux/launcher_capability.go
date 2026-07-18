@@ -1,27 +1,19 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"context"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/thebtf/mcp-mux/muxcore/ipc"
-	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor/attest"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
 
 const (
-	launcherProtocolVersion     = "2"
-	launcherAttestationRequest  = "mcp-mux launcher attestation v2\n"
-	launcherAttestationResponse = "mcp-mux launcher capable v2\n"
 	launcherAttestationLifetime = 5 * time.Second
 	launcherAttestationIO       = 2 * time.Second
 )
@@ -53,7 +45,7 @@ func launcherLifecycleCapable() bool {
 
 func launcherAttestationAdvertisement() (string, int, bool) {
 	parts := strings.Split(strings.TrimSpace(os.Getenv(envLauncherProtocol)), ":")
-	if len(parts) != 2 || parts[0] != launcherProtocolVersion {
+	if len(parts) != 2 || parts[0] != attest.VersionV2 {
 		return "", 0, false
 	}
 	launcherPID, err := strconv.Atoi(parts[1])
@@ -69,64 +61,26 @@ func launcherAttestationCapable() bool {
 	return ok && launcherAttestationProbe(attestationPath, launcherPID)
 }
 
-func startLauncherAttestation() (string, func(), error) {
-	var randomID [8]byte
-	if _, err := rand.Read(randomID[:]); err != nil {
-		return "", nil, fmt.Errorf("launcher attestation randomness: %w", err)
-	}
-	path := serverid.IPCPath("", "mcp-l", hex.EncodeToString(randomID[:]))
-	listener, err := ipc.Listen(path)
-	if err != nil {
-		return "", nil, fmt.Errorf("launcher attestation listen: %w", err)
-	}
-	var closeOnce sync.Once
-	closeEndpoint := func() {
-		closeOnce.Do(func() {
-			_ = listener.Close()
-			ipc.Cleanup(path)
-		})
-	}
-	go serveLauncherAttestation(listener, closeEndpoint)
-	return path, closeEndpoint, nil
-}
-
-func serveLauncherAttestation(listener net.Listener, closeEndpoint func()) {
-	timer := time.AfterFunc(launcherAttestationLifetime, closeEndpoint)
-	defer timer.Stop()
-	defer closeEndpoint()
-
-	conn, err := listener.Accept()
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(launcherAttestationIO))
-	request := make([]byte, len(launcherAttestationRequest))
-	if _, err := io.ReadFull(conn, request); err != nil || string(request) != launcherAttestationRequest {
-		return
-	}
-	_, _ = io.WriteString(conn, launcherAttestationResponse)
+func startLauncherAttestation() (*attest.Parent, error) {
+	return attest.StartParent(context.Background(), attest.ParentConfig{
+		Lifetime:  launcherAttestationLifetime,
+		IOTimeout: launcherAttestationIO,
+	})
 }
 
 func verifyLauncherAttestation(path string, launcherPID int) bool {
-	conn, err := ipc.DialTimeout(path, launcherAttestationIO)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	serverPID, err := launcherAttestationServerPID(conn)
-	if err != nil || serverPID != launcherPID {
-		return false
-	}
-	_ = conn.SetDeadline(time.Now().Add(launcherAttestationIO))
-	if _, err := io.WriteString(conn, launcherAttestationRequest); err != nil {
-		return false
-	}
-	response := make([]byte, len(launcherAttestationResponse))
-	if _, err := io.ReadFull(conn, response); err != nil {
-		return false
-	}
-	return string(response) == launcherAttestationResponse
+	ctx, cancel := context.WithTimeout(context.Background(), launcherAttestationIO)
+	defer cancel()
+	err := attest.VerifyParent(ctx, attest.VerifyConfig{
+		Advertisement: attest.Advertisement{
+			Version:   attest.VersionV2,
+			ParentPID: launcherPID,
+			Endpoint:  path,
+		},
+		DirectParentPID: launcherPID,
+		IOTimeout:       launcherAttestationIO,
+	})
+	return err == nil
 }
 
 // launcherBootstrapEligible is deliberately stricter than an env check. It

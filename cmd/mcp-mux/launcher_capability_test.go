@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/supervisor/attest"
 )
 
 func launcherCapabilityTestLayout(t *testing.T, launcherContents, engineContents string) (string, string, string) {
@@ -310,22 +313,26 @@ func TestLauncherAttestationSuccessRemovesUnixEndpoint(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows named pipes do not leave filesystem socket paths")
 	}
-	path, cancel, err := startLauncherAttestation()
+	parent, err := startLauncherAttestation()
 	if err != nil {
 		t.Fatalf("startLauncherAttestation: %v", err)
 	}
-	t.Cleanup(cancel)
-	if !verifyLauncherAttestation(path, os.Getpid()) {
+	t.Cleanup(func() { _ = parent.Close() })
+	if err := parent.BindChildPID(os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+	advertisement := parent.Advertisement()
+	if !verifyLauncherAttestation(advertisement.Endpoint, advertisement.ParentPID) {
 		t.Fatal("launcher attestation failed")
 	}
 	deadline := time.Now().Add(time.Second)
 	for {
-		_, err := os.Stat(path)
+		_, err := os.Stat(advertisement.Endpoint)
 		if os.IsNotExist(err) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("attestation socket path still exists after successful exchange: %s (stat error: %v)", path, err)
+			t.Fatalf("attestation socket path still exists after successful exchange: %s (stat error: %v)", advertisement.Endpoint, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -334,10 +341,15 @@ func TestLauncherAttestationSuccessRemovesUnixEndpoint(t *testing.T) {
 func TestLauncherCommandStartFailureCancelsAttestation(t *testing.T) {
 	originalStart := launcherAttestationStart
 	t.Cleanup(func() { launcherAttestationStart = originalStart })
-	starts, cancels := 0, 0
-	launcherAttestationStart = func() (string, func(), error) {
+	starts := 0
+	var parents []*attest.Parent
+	launcherAttestationStart = func() (*attest.Parent, error) {
 		starts++
-		return "test-attestation", func() { cancels++ }, nil
+		parent, err := originalStart()
+		if parent != nil {
+			parents = append(parents, parent)
+		}
+		return parent, err
 	}
 
 	missing := filepath.Join(t.TempDir(), "missing-engine")
@@ -345,27 +357,45 @@ func TestLauncherCommandStartFailureCancelsAttestation(t *testing.T) {
 	if err := startLauncherEnvCommand(cmd); err == nil {
 		t.Fatal("missing engine unexpectedly started")
 	}
-	if starts != 1 || cancels != 1 {
-		t.Fatalf("attestation lifecycle = %d starts, %d cancels; want 1, 1", starts, cancels)
+	if starts != 1 || len(parents) != 1 {
+		t.Fatalf("attestation starts = %d parents=%d; want 1, 1", starts, len(parents))
+	}
+	select {
+	case <-parents[0].Done():
+	case <-time.After(time.Second):
+		t.Fatal("failed command left attestation open")
 	}
 }
 
-func TestSupervisedStartFailuresCancelEachAttestation(t *testing.T) {
+func TestSupervisedStartFailureCancelsActiveAttestationOnly(t *testing.T) {
 	originalStart := launcherAttestationStart
 	t.Cleanup(func() { launcherAttestationStart = originalStart })
-	starts, cancels := 0, 0
-	launcherAttestationStart = func() (string, func(), error) {
+	starts := 0
+	var parents []*attest.Parent
+	launcherAttestationStart = func() (*attest.Parent, error) {
 		starts++
-		return "test-attestation", func() { cancels++ }, nil
+		parent, err := originalStart()
+		if parent != nil {
+			parents = append(parents, parent)
+		}
+		return parent, err
 	}
 
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "missing-launcher")
-	enginePath := filepath.Join(dir, "missing-engine")
-	if _, err := startDefaultSupervisedEngineChild(launcherPath, enginePath, nil, io.Discard); err == nil {
-		t.Fatal("missing active and fallback engines unexpectedly started")
+	enginePath := writeContentAddressedTestEngine(t, launcherPath, "not an executable")
+	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+		t.Fatal(err)
 	}
-	if starts != 2 || cancels != 2 {
-		t.Fatalf("attestation lifecycle = %d starts, %d cancels; want 2, 2", starts, cancels)
+	if _, err := startDefaultSupervisedEngineChild(context.Background(), launcherPath, enginePath, nil, io.Discard); err == nil {
+		t.Fatal("invalid active and missing fallback engines unexpectedly started")
+	}
+	if starts != 1 || len(parents) != 1 {
+		t.Fatalf("attestation starts = %d parents=%d; want active engine only", starts, len(parents))
+	}
+	select {
+	case <-parents[0].Done():
+	case <-time.After(time.Second):
+		t.Fatal("failed supervised active start left attestation open")
 	}
 }

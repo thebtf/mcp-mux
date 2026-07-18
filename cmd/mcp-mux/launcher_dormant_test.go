@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 )
 
 type dormantSupervisorHarness struct {
@@ -66,7 +68,7 @@ func newDormantSupervisorHarnessWithLease(t *testing.T, mode string, replyDelay,
 				defer h.mu.Unlock()
 				return h.activePath, true
 			},
-			StartChild: func(_, selectedEngine string, _ []string, childStderr io.Writer) (*supervisedEngineChild, error) {
+			StartChild: func(ctx context.Context, _, selectedEngine string, _ []string, childStderr io.Writer) (supervisor.StartResult, error) {
 				h.mu.Lock()
 				h.startPaths = append(h.startPaths, selectedEngine)
 				h.mu.Unlock()
@@ -80,7 +82,12 @@ func newDormantSupervisorHarnessWithLease(t *testing.T, mode string, replyDelay,
 					"MCP_MUX_TEST_SUPERVISOR_DORMANT_REPLY_DELAY="+replyDelay.String(),
 				)
 				cmd.Stderr = childStderr
-				return startSupervisedChildCommand(cmd)
+				child, err := startSupervisedChildCommand(ctx, cmd)
+				return supervisor.StartResult{
+					Child:     child,
+					Actual:    supervisor.EngineRef{ID: canonicalLauncherEnginePath(selectedEngine)},
+					Admission: verifiedTestAdmission{},
+				}, err
 			},
 			RespawnDelay:       20 * time.Millisecond,
 			ReplayTimeout:      2 * time.Second,
@@ -323,17 +330,15 @@ func TestLauncherSupervisorAckWrongExitRestarts(t *testing.T) {
 	h.closeAndWait(t)
 }
 
-func TestLauncherSupervisorDrainsMoreThanChannelCapacityAfterAck(t *testing.T) {
+func TestLauncherSupervisorForwardsOnlyFirstPostAckFrame(t *testing.T) {
 	h := newDormantSupervisorHarness(t, "post-ack-many", 0)
 	h.initialize(t)
-	for i := 0; i < 32; i++ {
-		line := readTestLine(t, h.lines)
-		want := fmt.Sprintf("test/post-ack-%d", i)
-		if !strings.Contains(line, want) {
-			t.Fatalf("post-ACK line %d = %s, want %s", i, line, want)
-		}
+	line := readTestLine(t, h.lines)
+	if !strings.Contains(line, "test/post-ack-0") {
+		t.Fatalf("first post-ACK line = %s", line)
 	}
 	waitSupervisorGeneration(t, h.generationFile, 2)
+	assertNoTestLine(t, h.lines, 100*time.Millisecond)
 	writeTestLine(t, h.stdinW, `{"jsonrpc":"2.0","id":2,"method":"tools/call"}`)
 	_ = readTestLineContaining(t, h.lines, `"id":2`)
 	h.closeAndWait(t)
@@ -353,51 +358,6 @@ func TestLauncherSupervisorFlushesBufferedFramesFIFO(t *testing.T) {
 		}
 	}
 	h.closeAndWait(t)
-}
-
-func TestReplayLauncherSupervisorHandshakeWaitsForMatchingID(t *testing.T) {
-	childStdinR, childStdinW := io.Pipe()
-	childStdoutR, childStdoutW := io.Pipe()
-	child := &supervisedEngineChild{
-		stdin:  childStdinW,
-		stdout: bufio.NewReader(childStdoutR),
-	}
-	initialized := make(chan struct{})
-	go func() {
-		scanner := bufio.NewScanner(childStdinR)
-		if !scanner.Scan() {
-			return
-		}
-		_, _ = fmt.Fprintln(childStdoutW, `{"jsonrpc":"2.0","method":"notifications/test"}`)
-		_, _ = fmt.Fprintln(childStdoutW, `{"jsonrpc":"2.0","id":2,"result":{"wrong":true}}`)
-		_, _ = fmt.Fprintln(childStdoutW, `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`)
-		if scanner.Scan() && strings.Contains(scanner.Text(), "notifications/initialized") {
-			close(initialized)
-		}
-	}()
-
-	response, preserved, err := replayLauncherSupervisorHandshake(
-		child,
-		[]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`),
-		[]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`),
-		time.Second,
-	)
-	if err != nil {
-		t.Fatalf("replay handshake: %v", err)
-	}
-	if !strings.Contains(string(response), `"id":1`) {
-		t.Fatalf("matching response = %s", response)
-	}
-	if len(preserved) != 2 || !strings.Contains(string(preserved[0]), "notifications/test") || !strings.Contains(string(preserved[1]), `"id":2`) {
-		t.Fatalf("preserved prefix = %q", preserved)
-	}
-	select {
-	case <-initialized:
-	case <-time.After(time.Second):
-		t.Fatal("initialized notification was not replayed")
-	}
-	_ = childStdinW.Close()
-	_ = childStdoutW.Close()
 }
 
 func waitSupervisorEvent(t *testing.T, path, want string) string {

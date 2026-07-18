@@ -125,7 +125,7 @@ direct resilient-client controls are additive:
 | --- | --- |
 | `owner.ResilientClientConfig.IdleSuspendDelay` | Parks daemon IPC after safe host inactivity. Zero disables and preserves the prior always-connected behavior. |
 | `owner.ResilientClientConfig.IdleSuspendGate` | Optional final safety check before parking. A nil gate relies on local checks; errors and denials keep IPC connected. |
-| `owner.ResilientClientConfig.IdleDormantGrace` | Positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. Zero or negative keeps the suspended shim process alive. |
+| `owner.ResilientClientConfig.IdleDormantGrace` | With an enabled `LifecycleProtocol`, positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. With a disabled protocol the shim remains suspended until host demand; zero or negative also keeps the shim alive. |
 | `owner.ResilientClientConfig.AllowPersistentIdleSuspend` | False by default. Set true only when this shim has no unbuffered server-to-client background traffic, or the consumer owns buffering/replay. Persistent owners otherwise retain their downstream transport. |
 
 The `mcp-mux` product wires 10-minute idle and 30-second dormant defaults from
@@ -453,6 +453,102 @@ Rules:
 
 Use it for cheap admission decisions such as local rate limiting. Do not put
 network calls, database writes, or heavy policy evaluation in this hook.
+
+## Stable Stdio Supervisor (NVMD-145, unreleased)
+
+`muxcore/supervisor` is the public boundary for products whose MCP host keeps
+one stdio transport open while the product replaces a child engine executable.
+This API is currently unreleased on the feature branch. Do not issue a consumer
+upgrade target until the release workflow assigns and verifies an exact muxcore
+tag.
+
+Minimal ordinary-supervision shape:
+
+```go
+err := supervisor.Run(ctx, supervisor.Config{
+    HostIn:  os.Stdin,
+    HostOut: os.Stdout,
+    Resolve: func(context.Context) (supervisor.EngineRef, error) {
+        path, err := resolveActiveEngine()
+        return supervisor.EngineRef{ID: path}, err
+    },
+    Start: func(ctx context.Context, requested supervisor.EngineRef) (supervisor.StartResult, error) {
+        child, err := supervisor.StartCommand(ctx, supervisor.Command{
+            Path:   requested.ID,
+            Args:   []string{"serve"},
+            Env:    os.Environ(),
+            Stderr: os.Stderr,
+        })
+        return supervisor.StartResult{Child: child, Actual: requested}, err
+    },
+})
+```
+
+The supervisor guarantees:
+
+- one serialized writer to host stdout and at most one live child process-tree
+  authority;
+- strict bounded newline-delimited JSON-RPC/MCP validation in both directions;
+- count-and-byte bounded first-delivery FIFO while a child starts, replays,
+  finalizes, quiesces, or is dormant;
+- replay of only the cached `initialize` / `notifications/initialized`
+  handshake, while lifecycle-permitted client/server pings remain correlated
+  and server logging prelude preserves order;
+- explicit original-ID errors for delivered requests lost on a generation
+  change;
+- generation-safe request, cancellation, progress-token, and MCP task
+  correlation;
+- full Unix process-group or Windows Job Object retirement before a successor
+  starts when `StartCommand` is used;
+- optional tools/prompts/resources list-change notifications after replacement,
+  gated by the initialize capability contract already visible to the host.
+
+When `Start` reports a fallback whose `Actual` identity differs from the
+`requested` identity, reconciliation compares later `Resolve` results with the
+requested identity. A healthy fallback is not recycled merely because its
+actual executable differs; a product that wants a replacement must resolve a
+different `EngineRef` through its own recovery policy.
+
+After an authorized dormant ACK, at most one ordinary child frame is forwarded
+before dormancy is invalidated; later ordinary frames from that generation are
+suppressed until bounded finalization replaces it. A reader-observed host frame
+at or before the dormant-lease deadline wins the timer race, while a rejected or
+otherwise non-waking frame cannot permanently disarm lease expiry.
+
+`StartTimeout` bounds one `Resolve` + `Start` attempt; timeout is terminal rather
+than permitting overlapping child authorities, and `StartFunc` must honor its
+context and roll back partial authority. If rollback cannot be proven and no
+partial `StartResult` is available for `Run` to finalize, return
+`supervisor.ErrStartRollbackUnproven`; the supervisor terminates instead of
+retrying into a second authority. `ReplayTimeout` bounds both the first
+`initialize` response and replacement handshake replay. `DormantExitTimeout`
+bounds the ACK/NACK response to `commit-dormant` and is then re-armed for the
+post-ACK exit/output-drain proof. Built-in lifecycle logs contain only
+generation, state, finite reason, and fallback status; opaque engine identities
+are exposed only to an explicitly configured `Observe` callback.
+
+The product still owns executable authorization, active-version layout,
+command/args/cwd/environment construction, preferred-versus-fallback policy,
+update/bootstrap policy, and operator exit behavior. `supervisor` does not infer
+those facts from paths or MCP protocol negotiation.
+
+Products with a shared daemon must keep it outside each replaceable command child's process-tree authority. The `mcp-mux` stable launcher prepares its daemon before starting a supervised child; on Windows that leaves the daemon outside the child's KillOnJobClose Job. A marked child never starts the shared daemon itself and exits through `owner.ErrReconnectExit` if the daemon disappears, allowing the stable launcher to prepare it and restart the child on the same host transport.
+
+Private dormant control is disabled unless the exact child generation has a
+verified `supervisor/attest.Parent` receipt. Start the parent endpoint before
+the child, pass its generic `Advertisement` using product-owned env or argv,
+start the child, then call `BindChildPID` with the returned PID. The child calls
+`attest.VerifyParent` with its OS direct-parent PID. The package verifies client
+and server peer PIDs on Windows, Linux, and Darwin; unsupported platforms fail
+closed while ordinary supervision remains available. Product path/layout
+authorization remains a separate check after generic attestation.
+
+Rolling compatibility is deliberately fail-closed: a new supervisor runs an
+old engine as ordinary MCP; an old launcher runs a new engine without private
+dormancy; and a pre-attestation engine that emits a colliding private method is
+suppressed rather than committed or restarted in a loop. Do not copy the v2
+method strings, exit code, parser, replay loop, or attestation into a consumer.
+Use `supervisor.ProtocolV2()`, `supervisor.Run`, and `supervisor/attest`.
 
 ## Upgrade and Restart Contract
 

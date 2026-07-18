@@ -18,6 +18,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 )
 
 // noopHandler is a Handler that does nothing and returns immediately.
@@ -526,6 +527,7 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		BaseDir:                    baseDir,
 		IdleSuspendDelay:           7 * time.Second,
 		IdleDormantGrace:           11 * time.Second,
+		LifecycleProtocol:          supervisor.ProtocolV2(),
 		Persistent:                 true,
 		AllowPersistentIdleSuspend: true,
 	})
@@ -552,6 +554,9 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 		}
 		if cfg.IdleSuspendDelay != 7*time.Second || cfg.IdleDormantGrace != 11*time.Second || !cfg.AllowPersistentIdleSuspend {
 			t.Fatalf("lifecycle config not forwarded: %+v", cfg)
+		}
+		if !cfg.LifecycleProtocol.Enabled() {
+			t.Fatal("LifecycleProtocol was not forwarded")
 		}
 		if cfg.IdleSuspendGate == nil {
 			t.Fatal("IdleSuspendGate is nil; engine.New must bind the daemon exact-owner gate")
@@ -709,6 +714,9 @@ func TestRunClientReconnectWaitsForSuccessorBeforeSelfStart(t *testing.T) {
 
 	stopErr := errors.New("stop after refresh")
 	runResilientClient = func(cfg owner.ResilientClientConfig) error {
+		if cfg.LifecycleProtocol.Enabled() {
+			t.Fatal("zero-value LifecycleProtocol unexpectedly enabled private control")
+		}
 		srv.Close()
 
 		successorReady := make(chan struct{})

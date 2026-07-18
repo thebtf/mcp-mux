@@ -1,0 +1,106 @@
+package supervisor
+
+import (
+	"fmt"
+	"testing"
+)
+
+func mustParseCorrelationFrame(t *testing.T, raw string) *parsedFrame {
+	t.Helper()
+	frame, err := parseFrame([]byte(raw), 4096)
+	if err != nil || frame.utilityErr != nil {
+		t.Fatalf("parse correlation frame: parse=%v utility=%v raw=%s", err, frame.utilityErr, raw)
+	}
+	return frame
+}
+
+func TestCorrelationTombstonesPreventImmediateReuseAndStayBounded(t *testing.T) {
+	registry := newDirectionRegistry()
+	request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"same","method":"tools/list"}`)
+	record := registry.register(request, 1)
+	registry.cancel(record)
+	if err := registry.canRegister(request); err == nil {
+		t.Fatal("immediate request ID reuse bypassed tombstone")
+	}
+
+	progressRole := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"other","method":"tools/call","params":{"_meta":{"progressToken":"same"}}}`)
+	if err := registry.canRegister(progressRole); err != nil {
+		t.Fatalf("request-ID tombstone crossed into progress-token role: %v", err)
+	}
+
+	tokenRequest := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"source","method":"tools/call","params":{"_meta":{"progressToken":"role"}}}`)
+	tokenRecord := registry.register(tokenRequest, 1)
+	registry.cancel(tokenRecord)
+	requestRole := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"role","method":"tools/list"}`)
+	if err := registry.canRegister(requestRole); err != nil {
+		t.Fatalf("progress-token tombstone crossed into request-ID role: %v", err)
+	}
+
+	for index := 0; index < tombstoneLimit+32; index++ {
+		frame := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"bounded-%d","method":"tools/list"}`, index))
+		registry.cancel(registry.register(frame, 1))
+	}
+	if got := len(registry.tombstones.values); got != tombstoneLimit {
+		t.Fatalf("tombstones = %d, want bounded %d", got, tombstoneLimit)
+	}
+	latest := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"bounded-%d","method":"tools/list"}`, tombstoneLimit+31))
+	if err := registry.canRegister(latest); err == nil {
+		t.Fatal("latest bounded tombstone was lost")
+	}
+	registry.clearTransitionTombstones()
+	if err := registry.canRegister(latest); err != nil {
+		t.Fatalf("transition clear did not release tombstone: %v", err)
+	}
+}
+
+func TestCorrelationActiveRequestsStayBounded(t *testing.T) {
+	registry := newDirectionRegistry()
+	for index := 0; index < activeCorrelationLimit; index++ {
+		frame := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"active-%d","method":"tools/list"}`, index))
+		if err := registry.canRegister(frame); err != nil {
+			t.Fatalf("register active request %d: %v", index, err)
+		}
+		registry.register(frame, 1)
+	}
+	overflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"overflow","method":"tools/list"}`)
+	if err := registry.canRegister(overflow); err == nil {
+		t.Fatal("active correlation limit accepted another request")
+	}
+}
+
+func TestTaskCompletionRejectsDuplicateLiveTaskID(t *testing.T) {
+	registry := newDirectionRegistry()
+	first := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"task":{}}}`)
+	firstRecord := registry.register(first, 1)
+	firstResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":1,"result":{"task":{"taskId":"task-1","status":"working"}}}`)
+	if err := registry.canComplete(firstRecord, firstResponse); err != nil {
+		t.Fatal(err)
+	}
+	registry.complete(firstRecord, firstResponse)
+
+	second := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"task":{}}}`)
+	secondRecord := registry.register(second, 1)
+	duplicate := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":2,"result":{"task":{"taskId":"task-1","status":"input_required"}}}`)
+	if err := registry.canComplete(secondRecord, duplicate); err == nil {
+		t.Fatal("duplicate live task ID was accepted")
+	}
+	terminal := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":2,"result":{"task":{"taskId":"task-1","status":"completed"}}}`)
+	if err := registry.canComplete(secondRecord, terminal); err != nil {
+		t.Fatalf("terminal task result should not bind a duplicate live task: %v", err)
+	}
+	missing := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":2,"result":{"content":[]}}`)
+	if err := registry.canComplete(secondRecord, missing); err == nil {
+		t.Fatal("task-augmented request accepted a result without task metadata")
+	}
+	malformed, parseErr := parseFrame([]byte(`{"jsonrpc":"2.0","id":2,"result":{"task":{"taskId":"task-2","status":"unknown"}}}`), 4096)
+	if parseErr != nil || malformed.utilityErr == nil {
+		t.Fatalf("malformed task result parse=%v utility=%v", parseErr, malformed.utilityErr)
+	}
+	if err := registry.canComplete(secondRecord, malformed); err == nil {
+		t.Fatal("task-augmented request accepted malformed task metadata")
+	}
+	errorResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"rejected"}}`)
+	if err := registry.canComplete(secondRecord, errorResponse); err != nil {
+		t.Fatalf("task-augmented error response rejected: %v", err)
+	}
+}

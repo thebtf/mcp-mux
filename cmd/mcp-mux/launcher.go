@@ -16,6 +16,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor/attest"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
 
@@ -27,7 +28,10 @@ const (
 	envLauncherProtocol    = "MCPMUX_LAUNCHER_PROTOCOL"
 	envLauncherAttestation = "MCPMUX_LAUNCHER_ATTESTATION"
 	envLauncherTrace       = "MCPMUX_LAUNCHER_TRACE"
+	envLauncherOwnsDaemon  = "MCPMUX_LAUNCHER_OWNS_DAEMON"
 )
+
+var errLauncherManagedDaemonUnavailable = errors.New("mcp-mux: launcher-managed daemon unavailable")
 
 func maybeRunLauncher() (bool, int) {
 	if os.Getenv(envEngineMode) == "1" || os.Getenv(envDisableLauncher) == "1" {
@@ -69,6 +73,7 @@ func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int
 			LauncherPath:      launcherPath,
 			InitialEnginePath: enginePath,
 			Args:              args,
+			PrepareStart:      prepareSupervisedEngineStart,
 			Stdin:             os.Stdin,
 			Stdout:            os.Stdout,
 			Stderr:            os.Stderr,
@@ -119,25 +124,31 @@ func launcherTracef(format string, args ...any) {
 }
 
 func startEngineOrStableLauncher(launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*exec.Cmd, bool, error) {
-	cmd := newLauncherEnvCommand(launcherPath, enginePath, args)
-	configure(cmd)
-	if err := startLauncherEnvCommand(cmd); err == nil {
-		return cmd, false, nil
-	} else if fallbackToCaller {
-		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
+	var cmd *exec.Cmd
+	var startErr error
+	if samePath(enginePath, launcherPath) || authorizeInstalledEnginePath(launcherPath, enginePath) {
+		cmd = newLauncherEnvCommand(launcherPath, enginePath, args)
+		configure(cmd)
+		startErr = startLauncherEnvCommand(cmd)
+		if startErr == nil {
+			return cmd, false, nil
+		}
+	} else {
+		startErr = errors.New("active engine path is not authorized")
+	}
+	if fallbackToCaller {
+		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, startErr)
 		fmt.Fprintln(os.Stderr, "mcp-mux launcher: falling back to stable launcher binary")
 		return nil, true, nil
-	} else {
-		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
-		fmt.Fprintln(os.Stderr, "mcp-mux launcher: starting daemon via stable launcher binary")
-		startErr := err
-		cmd = newLauncherEnvCommand(launcherPath, launcherPath, args)
-		configure(cmd)
-		if err := startLauncherEnvCommand(cmd); err != nil {
-			return nil, false, fmt.Errorf("start active engine %s: %v; start stable launcher fallback %s: %w", enginePath, startErr, launcherPath, err)
-		}
-		return cmd, false, nil
 	}
+	fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, startErr)
+	fmt.Fprintln(os.Stderr, "mcp-mux launcher: starting daemon via stable launcher binary")
+	cmd = newLauncherEnvCommand(launcherPath, launcherPath, args)
+	configure(cmd)
+	if err := startLauncherEnvCommand(cmd); err != nil {
+		return nil, false, fmt.Errorf("start active engine %s: %v; start stable launcher fallback %s: %w", enginePath, startErr, launcherPath, err)
+	}
+	return cmd, false, nil
 }
 
 func newLauncherEnvCommand(launcherPath, executablePath string, args []string) *exec.Cmd {
@@ -147,32 +158,41 @@ func newLauncherEnvCommand(launcherPath, executablePath string, args []string) *
 }
 
 func startLauncherEnvCommand(cmd *exec.Cmd) error {
-	cancelAttestation := prepareLauncherAttestation(cmd)
+	admission, err := prepareLauncherAttestation(cmd)
+	if err != nil {
+		launcherTracef("attestation unavailable")
+		admission = nil
+	}
 	if err := cmd.Start(); err != nil {
-		cancelAttestation()
+		if admission != nil {
+			_ = admission.Close()
+		}
 		return err
+	}
+	if admission != nil {
+		if err := admission.BindChildPID(cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			_ = admission.Close()
+			return fmt.Errorf("bind launcher attestation child: %w", err)
+		}
 	}
 	return nil
 }
 
-func prepareLauncherAttestation(cmd *exec.Cmd) func() {
+func prepareLauncherAttestation(cmd *exec.Cmd) (*attest.Parent, error) {
 	if !hasEnvKey(cmd.Env, envLauncherExe) {
-		return noopLauncherAttestation
+		return nil, nil
 	}
-	attestationPath, cancelAttestation, err := launcherAttestationStart()
+	admission, err := launcherAttestationStart()
 	if err != nil {
-		launcherTracef("attestation unavailable: %v", err)
-		return noopLauncherAttestation
+		return nil, err
 	}
-	if cancelAttestation == nil {
-		cancelAttestation = noopLauncherAttestation
-	}
-	cmd.Env = setEnv(cmd.Env, envLauncherProtocol, launcherProtocolVersion+":"+strconv.Itoa(os.Getpid()))
-	cmd.Env = setEnv(cmd.Env, envLauncherAttestation, attestationPath)
-	return cancelAttestation
+	advertisement := admission.Advertisement()
+	cmd.Env = setEnv(cmd.Env, envLauncherProtocol, advertisement.Version+":"+strconv.Itoa(advertisement.ParentPID))
+	cmd.Env = setEnv(cmd.Env, envLauncherAttestation, advertisement.Endpoint)
+	return admission, nil
 }
-
-func noopLauncherAttestation() {}
 
 func hasEnvKey(env []string, key string) bool {
 	prefix := key + "="
@@ -191,6 +211,7 @@ func launcherEnv(launcherPath string) []string {
 	env = setEnv(env, envActiveEngineFile, activeEngineFile(launcherPath))
 	env = setEnv(env, envLauncherProtocol, "")
 	env = setEnv(env, envLauncherAttestation, "")
+	env = setEnv(env, envLauncherOwnsDaemon, "")
 	return env
 }
 
@@ -527,7 +548,62 @@ var (
 )
 
 func resolveActiveEngine(launcherPath string) (string, bool) {
-	return resolveActiveEnginePointer(activeEngineFile(launcherPath))
+	candidate, ok := resolveActiveEnginePointer(activeEngineFile(launcherPath))
+	if !ok {
+		return "", false
+	}
+	return resolveInstalledEnginePath(launcherPath, candidate)
+}
+
+func resolveInstalledEnginePath(launcherPath, candidate string) (string, bool) {
+	storePath, err := filepath.Abs(versionStoreDir(launcherPath))
+	if err != nil {
+		return "", false
+	}
+	candidatePath, err := filepath.Abs(candidate)
+	if err != nil || !isVersionStoreEnginePath(storePath, candidatePath) {
+		return "", false
+	}
+	resolvedStore, err := filepath.EvalSymlinks(storePath)
+	if err != nil || !samePath(resolvedStore, storePath) {
+		return "", false
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidatePath)
+	if err != nil || !samePath(resolvedCandidate, candidatePath) || !isVersionStoreEnginePath(resolvedStore, resolvedCandidate) {
+		return "", false
+	}
+	info, err := os.Stat(resolvedCandidate)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	return resolvedCandidate, true
+}
+
+func authorizeInstalledEnginePath(launcherPath, candidate string) bool {
+	resolved, ok := resolveInstalledEnginePath(launcherPath, candidate)
+	if !ok || !samePath(resolved, candidate) {
+		return false
+	}
+	versionID := filepath.Base(filepath.Dir(resolved))
+	if len(versionID) != 12 {
+		return false
+	}
+	for _, char := range versionID {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	hash, err := fileHash(resolved)
+	return err == nil && strings.HasPrefix(hash, versionID)
+}
+
+func isVersionStoreEnginePath(storePath, candidatePath string) bool {
+	relative, err := filepath.Rel(storePath, candidatePath)
+	if err != nil || relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return false
+	}
+	versionDir := filepath.Dir(relative)
+	return filepath.Base(relative) == engineFileName() && versionDir != "." && filepath.Dir(versionDir) == "."
 }
 
 func resolveActiveEnginePointer(pointerPath string) (string, bool) {

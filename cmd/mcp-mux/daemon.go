@@ -135,8 +135,15 @@ func ensureDaemon(logger *log.Logger) error {
 }
 
 func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
+	return ensureDaemonWithinWithStarter(logger, budget, daemonStarter)
+}
+
+func ensureDaemonWithinWithStarter(logger *log.Logger, budget time.Duration, starter func() error) error {
 	if budget <= 0 {
 		return fmt.Errorf("daemon did not start within reconnect budget")
+	}
+	if starter == nil {
+		return fmt.Errorf("daemon starter is nil")
 	}
 	deadline := time.Now().Add(budget)
 	ctlPath := serverid.DaemonControlPath("", engineName)
@@ -156,6 +163,9 @@ func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
 		if waitErr := waitForDaemon(ctlPath, remainingBudget(deadline, 10*time.Second)); waitErr != nil {
 			logger.Printf("ensure_daemon substep=wait_for_occupied_control status=error duration=%v err=%q",
 				time.Since(waitStart), waitErr.Error())
+			if os.Getenv(envLauncherOwnsDaemon) == "1" {
+				return fmt.Errorf("%w: %v", errLauncherManagedDaemonUnavailable, waitErr)
+			}
 			return fmt.Errorf("daemon control endpoint occupied but unresponsive: %w", waitErr)
 		}
 		logger.Printf("ensure_daemon substep=wait_for_occupied_control status=ok duration=%v",
@@ -164,11 +174,15 @@ func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
 	}
 	logger.Printf("ensure_daemon substep=fast_ping status=miss duration=%v",
 		time.Since(pingStart))
+	if os.Getenv(envLauncherOwnsDaemon) == "1" {
+		logger.Printf("ensure_daemon substep=parent_owned status=restart_required")
+		return errLauncherManagedDaemonUnavailable
+	}
 
 	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
 	// Lock file is NOT deleted — it persists for coordination across shims.
 	lockPath := serverid.DaemonLockPath("", engineName)
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
 	}
@@ -219,7 +233,7 @@ func ensureDaemonWithin(logger *log.Logger, budget time.Duration) error {
 
 	// Start daemon as detached process
 	spawnStart := time.Now()
-	if err := daemonStarter(); err != nil {
+	if err := starter(); err != nil {
 		logger.Printf("ensure_daemon substep=spawn_process status=error duration=%v err=%q",
 			time.Since(spawnStart), err.Error())
 		return fmt.Errorf("start daemon: %w", err)

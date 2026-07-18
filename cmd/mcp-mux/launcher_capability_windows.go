@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -50,16 +49,4 @@ func windowsProcessExecutable(pid uint32) (string, error) {
 		size *= 2
 		buf = make([]uint16, size)
 	}
-}
-
-func launcherAttestationServerPID(conn net.Conn) (int, error) {
-	handleConn, ok := conn.(interface{ Fd() uintptr })
-	if !ok {
-		return 0, fmt.Errorf("launcher attestation connection exposes no Windows handle")
-	}
-	var peerPID uint32
-	if err := windows.GetNamedPipeServerProcessId(windows.Handle(handleConn.Fd()), &peerPID); err != nil {
-		return 0, err
-	}
-	return int(peerPID), nil
 }

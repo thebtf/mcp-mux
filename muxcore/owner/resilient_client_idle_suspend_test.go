@@ -15,7 +15,26 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 )
+
+var testLifecycleProtocol = supervisor.ProtocolV2()
+
+var (
+	resilientDormantReadyMethod  = testLifecycleMethod(supervisor.ControlDormantReady)
+	resilientDormantCommitMethod = testLifecycleMethod(supervisor.ControlCommitDormant)
+	resilientDormantAckMethod    = testLifecycleMethod(supervisor.ControlDormantAck)
+)
+
+func testLifecycleMethod(control supervisor.Control) string {
+	var envelope struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(testLifecycleProtocol.Frame(control), &envelope); err != nil {
+		panic(err)
+	}
+	return envelope.Method
+}
 
 func TestResilientClient_IdleSuspendsAndReconnectsOnDemand(t *testing.T) {
 	path := newTestIPCPath(t)
@@ -373,13 +392,14 @@ func TestResilientClient_IdleDormantHandshake(t *testing.T) {
 	ccStdinR, ccStdinW := io.Pipe()
 	ccStdoutR, ccStdoutW := io.Pipe()
 	cfg := ResilientClientConfig{
-		ProbeGracePeriod: time.Nanosecond,
-		Stdin:            ccStdinR,
-		Stdout:           ccStdoutW,
-		InitialIPCPath:   path,
-		IdleSuspendDelay: 50 * time.Millisecond,
-		IdleDormantGrace: 50 * time.Millisecond,
-		Logger:           resilientTestLogger(t),
+		ProbeGracePeriod:  time.Nanosecond,
+		Stdin:             ccStdinR,
+		Stdout:            ccStdoutW,
+		InitialIPCPath:    path,
+		IdleSuspendDelay:  50 * time.Millisecond,
+		IdleDormantGrace:  50 * time.Millisecond,
+		LifecycleProtocol: testLifecycleProtocol,
+		Logger:            resilientTestLogger(t),
 	}
 
 	errCh := make(chan error, 1)
@@ -411,6 +431,42 @@ func TestResilientClient_IdleDormantHandshake(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("resilient client did not complete dormant handshake")
+	}
+}
+
+func TestResilientClient_DisabledLifecycleIgnoresDormantGrace(t *testing.T) {
+	rc := &resilientClient{
+		cfg:        ResilientClientConfig{IdleDormantGrace: 20 * time.Millisecond},
+		msgFromCC:  make(chan []byte, 1),
+		stdoutDead: make(chan struct{}),
+	}
+	type result struct {
+		demand  []byte
+		expired bool
+		err     error
+	}
+	resultCh := make(chan result, 1)
+	stdinDone := make(chan error)
+	go func() {
+		demand, expired, err := rc.waitForSuspendedDemand(stdinDone, nil)
+		resultCh <- result{demand: demand, expired: expired, err: err}
+	}()
+
+	select {
+	case got := <-resultCh:
+		t.Fatalf("disabled lifecycle returned before demand: %+v", got)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	want := []byte(`{"jsonrpc":"2.0","id":7,"method":"ping"}`)
+	rc.msgFromCC <- want
+	select {
+	case got := <-resultCh:
+		if got.err != nil || got.expired || !bytes.Equal(got.demand, want) {
+			t.Fatalf("waitForSuspendedDemand = (%s, %v, %v)", got.demand, got.expired, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("disabled lifecycle did not wake for host demand")
 	}
 }
 
@@ -560,7 +616,7 @@ func TestResilientClient_SuspendBarrierDefersNewHostFrame(t *testing.T) {
 func TestResilientClient_DemandBeforeCommitDropsPrivateCommit(t *testing.T) {
 	var host bytes.Buffer
 	rc := &resilientClient{
-		cfg:        ResilientClientConfig{Stdout: &host},
+		cfg:        ResilientClientConfig{Stdout: &host, LifecycleProtocol: testLifecycleProtocol},
 		msgFromCC:  make(chan []byte, 2),
 		stdoutDead: make(chan struct{}),
 		log:        resilientTestLogger(t),
@@ -609,7 +665,7 @@ func TestResilientClient_InjectRaceDormantCommit(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		host := &dormantReadyWriter{ready: make(chan struct{})}
 		rc := &resilientClient{
-			cfg:        ResilientClientConfig{Stdout: host},
+			cfg:        ResilientClientConfig{Stdout: host, LifecycleProtocol: testLifecycleProtocol},
 			msgFromCC:  make(chan []byte, 4),
 			stdoutDead: make(chan struct{}),
 			log:        resilientTestLogger(t),
@@ -685,7 +741,7 @@ func TestResilientClient_InjectRaceDormantCommit(t *testing.T) {
 func TestResilientClient_QueuedInjectsKeepFIFOAcrossDormantNack(t *testing.T) {
 	var host bytes.Buffer
 	rc := &resilientClient{
-		cfg:        ResilientClientConfig{Stdout: &host},
+		cfg:        ResilientClientConfig{Stdout: &host, LifecycleProtocol: testLifecycleProtocol},
 		msgFromCC:  make(chan []byte, 3),
 		stdoutDead: make(chan struct{}),
 		log:        resilientTestLogger(t),

@@ -1,6 +1,7 @@
 package procgroup
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -83,6 +84,60 @@ func TestConcurrentFinalizerWaitsForPublishedDone(t *testing.T) {
 				t.Fatal("finalizer did not return after Done")
 			}
 		})
+	}
+}
+
+func TestConcurrentFinalizerReturnsPublishedAuthorityError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*Process) error
+	}{
+		{name: "kill", call: func(p *Process) error { return p.killPlatform() }},
+		{name: "graceful", call: func(p *Process) error { return p.gracefulKillPlatform(time.Millisecond) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			finalizeErr := errors.New("authority retirement failed")
+			p := &Process{done: make(chan struct{})}
+			p.platform.state = authorityFinalizing
+			p.platform.finalized = make(chan struct{})
+			p.platform.finalizeErr = finalizeErr
+
+			returned := make(chan error, 1)
+			go func() { returned <- tc.call(p) }()
+			close(p.platform.finalized)
+			close(p.done)
+
+			select {
+			case err := <-returned:
+				if !errors.Is(err, finalizeErr) {
+					t.Fatalf("finalizer error = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("finalizer did not return published authority error")
+			}
+		})
+	}
+}
+
+func TestCleanupPlatformReturnsPublishedAuthorityError(t *testing.T) {
+	finalizeErr := errors.New("cleanup retirement failed")
+	finalized := make(chan struct{})
+	close(finalized)
+	p := &Process{}
+	p.platform.state = authorityFinalized
+	p.platform.finalized = finalized
+	p.platform.finalizeErr = finalizeErr
+	if err := p.cleanupPlatform(); !errors.Is(err, finalizeErr) {
+		t.Fatalf("cleanup error = %v", err)
+	}
+}
+
+func TestPostStartFailureMarksUnprovenRollback(t *testing.T) {
+	setupErr := errors.New("platform setup failed")
+	rollbackErr := errors.New("rollback failed")
+	err := postStartFailure(setupErr, rollbackErr)
+	if !errors.Is(err, setupErr) || !errors.Is(err, rollbackErr) || !errors.Is(err, ErrTreeRetirementUnproven) {
+		t.Fatalf("post-start failure = %v", err)
 	}
 }
 

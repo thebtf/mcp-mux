@@ -10,6 +10,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 )
 
 const (
@@ -54,7 +55,7 @@ func resilientClientExitCode(err error) int {
 	case err == nil:
 		return 0
 	case errors.Is(err, owner.ErrIdleDormant):
-		return launcherDormantExitCode
+		return supervisor.ProtocolV2().DormantExitCode()
 	default:
 		return 1
 	}

@@ -42,6 +42,24 @@ current release:
   `TestDetachedProcessListenerAcceptsParentDial` failed once in the full Windows
   muxcore suite with empty helper output but passed 10 focused repetitions;
   investigate separately.
+- **Invalid `DisableTree` + `StartSuspended` option pair** — on Windows this
+  combination can leave the child suspended because no procgroup Job authority
+  performs the resume. Reject the pair explicitly if `StartSuspended` becomes a
+  public option outside the supervisor's tree-managed command path.
+- **Hostile Unix process-group escape** — NFR-4 deliberately selects portable
+  Unix process groups. A deliberately hostile descendant can call
+  `setsid`/`setpgid` and leave that authority; stronger containment needs a new
+  cross-platform contract (for example Linux cgroup v2 plus an explicit Darwin
+  policy), not descendant polling presented as proof.
+- **Signed engine provenance** — parent-side authorization now requires the
+  exact active pointer, installed version-store layout, no symlink escape, and
+  content matching the 12-hex version directory. Authenticating a malicious
+  same-user replacement that creates its own matching hash requires signed
+  release provenance and a separate trust-root design.
+- **Trust-boundary error minimization** — public `ControlOf` and attestation
+  errors may still include caller-supplied method or endpoint detail if a
+  consumer logs returned errors verbatim. Consider fixed public
+  classifications with private debug wrapping.
 
 
 <!--
