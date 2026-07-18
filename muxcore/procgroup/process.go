@@ -1,7 +1,7 @@
 // Package procgroup manages child processes with full process-tree lifecycle control.
-// On Unix, the process runs in its own process group (Setpgid). On Windows, it is
-// placed in a Job Object with KillOnJobClose so the entire tree is reaped when the
-// handle is released.
+// On Unix, the process runs in its own process group (Setpgid). On Windows, it
+// is placed in a Job Object that defaults to KillOnJobClose so the entire tree
+// is reaped when the owning process exits.
 package procgroup
 
 import (
@@ -182,6 +182,21 @@ func (p *Process) PID() int {
 // Done returns a channel that is closed when the process exits.
 func (p *Process) Done() <-chan struct{} {
 	return p.done
+}
+
+// AllowSurviveParentExit disables only the platform policy that would kill
+// this process tree when the spawning process exits. Explicit Kill and Wait
+// authority remains available until the caller commits the detached start.
+// On Unix, parent exit does not implicitly terminate a process group, so this
+// operation is a no-op.
+func (p *Process) AllowSurviveParentExit() error {
+	if p == nil {
+		return errors.New("procgroup: nil process")
+	}
+	if p.disableTree {
+		return errors.New("procgroup: tree management is disabled")
+	}
+	return p.allowSurviveParentExitPlatform()
 }
 
 // GracefulKill sends a graceful signal, waits up to timeout, then force-kills.

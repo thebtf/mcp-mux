@@ -54,6 +54,67 @@ func TestParentSpawnedDaemonStaysOutsideManagedJob(t *testing.T) {
 	}
 }
 
+func TestAllowSurviveParentExitPreservesExplicitJobAuthority(t *testing.T) {
+	managed, err := Spawn(longRunningCmd())
+	if err != nil {
+		t.Fatalf("Spawn managed child: %v", err)
+	}
+	t.Cleanup(func() {
+		if managed.Alive() {
+			_ = managed.Kill()
+		}
+	})
+
+	managed.platform.mu.Lock()
+	job := managed.platform.job
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	queryErr := windows.QueryInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	)
+	if queryErr == nil {
+		info.BasicLimitInformation.LimitFlags |= windows.JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+		_, queryErr = windows.SetInformationJobObject(
+			job,
+			windows.JobObjectExtendedLimitInformation,
+			uintptr(unsafe.Pointer(&info)),
+			uint32(unsafe.Sizeof(info)),
+		)
+	}
+	managed.platform.mu.Unlock()
+	if queryErr != nil {
+		t.Fatalf("prepare Job limits: %v", queryErr)
+	}
+
+	if err := managed.AllowSurviveParentExit(); err != nil {
+		t.Fatalf("AllowSurviveParentExit: %v", err)
+	}
+	managed.platform.mu.Lock()
+	queryErr = windows.QueryInformationJobObject(
+		managed.platform.job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	)
+	managed.platform.mu.Unlock()
+	if queryErr != nil {
+		t.Fatalf("query released Job limits: %v", queryErr)
+	}
+	if info.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0 {
+		t.Fatal("KillOnJobClose remained set after parent-exit release")
+	}
+	if info.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION == 0 {
+		t.Fatal("AllowSurviveParentExit replaced unrelated Job limits")
+	}
+	if err := managed.Kill(); err != nil {
+		t.Fatalf("explicit tree Kill after parent-exit release: %v", err)
+	}
+}
+
 func processInSpecificJob(pid int, job windows.Handle) (bool, error) {
 	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {

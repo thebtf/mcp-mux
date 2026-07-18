@@ -126,10 +126,10 @@ func launcherTracef(format string, args ...any) {
 }
 
 func startEngineOrStableLauncher(launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*procgroup.Process, bool, error) {
-	return startEngineOrStableLauncherContext(context.Background(), launcherPath, enginePath, args, fallbackToCaller, configure)
+	return startEngineOrStableLauncherContext(context.Background(), launcherPath, enginePath, args, fallbackToCaller, false, configure)
 }
 
-func startEngineOrStableLauncherContext(ctx context.Context, launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*procgroup.Process, bool, error) {
+func startEngineOrStableLauncherContext(ctx context.Context, launcherPath, enginePath string, args []string, fallbackToCaller, allowSurviveParentExit bool, configure func(*exec.Cmd)) (*procgroup.Process, bool, error) {
 	if err := context.Cause(ctx); err != nil {
 		return nil, false, err
 	}
@@ -138,7 +138,7 @@ func startEngineOrStableLauncherContext(ctx context.Context, launcherPath, engin
 	if samePath(enginePath, launcherPath) || authorizeInstalledEnginePath(launcherPath, enginePath) {
 		cmd := newLauncherEnvCommand(launcherPath, enginePath, args)
 		configure(cmd)
-		process, startErr = startLauncherEnvProcess(ctx, cmd)
+		process, startErr = startLauncherEnvProcessWithParentExit(ctx, cmd, allowSurviveParentExit)
 		if startErr == nil {
 			return process, false, nil
 		}
@@ -160,7 +160,7 @@ func startEngineOrStableLauncherContext(ctx context.Context, launcherPath, engin
 	fmt.Fprintln(os.Stderr, "mcp-mux launcher: starting daemon via stable launcher binary")
 	cmd := newLauncherEnvCommand(launcherPath, launcherPath, args)
 	configure(cmd)
-	process, err := startLauncherEnvProcess(ctx, cmd)
+	process, err := startLauncherEnvProcessWithParentExit(ctx, cmd, allowSurviveParentExit)
 	if err != nil {
 		return nil, false, fmt.Errorf("start active engine %s: %v; start stable launcher fallback %s: %w", enginePath, startErr, launcherPath, err)
 	}
@@ -174,6 +174,10 @@ func newLauncherEnvCommand(launcherPath, executablePath string, args []string) *
 }
 
 func startLauncherEnvProcess(ctx context.Context, cmd *exec.Cmd) (*procgroup.Process, error) {
+	return startLauncherEnvProcessWithParentExit(ctx, cmd, false)
+}
+
+func startLauncherEnvProcessWithParentExit(ctx context.Context, cmd *exec.Cmd, allowSurviveParentExit bool) (*procgroup.Process, error) {
 	if err := context.Cause(ctx); err != nil {
 		return nil, err
 	}
@@ -217,6 +221,14 @@ func startLauncherEnvProcess(ctx context.Context, cmd *exec.Cmd) (*procgroup.Pro
 	if admission != nil {
 		if err := launcherAttestationBind(admission, process.PID()); err != nil {
 			return nil, rollbackLauncherProcess(process, admission, fmt.Errorf("bind launcher attestation child: %w", err))
+		}
+	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, rollbackLauncherProcess(process, admission, err)
+	}
+	if allowSurviveParentExit {
+		if err := process.AllowSurviveParentExit(); err != nil {
+			return nil, rollbackLauncherProcess(process, admission, fmt.Errorf("allow launcher child to survive parent exit: %w", err))
 		}
 	}
 	if err := context.Cause(ctx); err != nil {
@@ -592,7 +604,7 @@ func startDaemonProcessFrom(launcherPath, enginePath string) error {
 }
 
 func startDaemonProcessFromContext(ctx context.Context, launcherPath, enginePath string) error {
-	_, _, err := startEngineOrStableLauncherContext(ctx, launcherPath, enginePath, []string{"daemon"}, false, func(cmd *exec.Cmd) {
+	_, _, err := startEngineOrStableLauncherContext(ctx, launcherPath, enginePath, []string{"daemon"}, false, true, func(cmd *exec.Cmd) {
 		cmd.Stdout = nil
 		cmd.Stderr = nil
 		cmd.Stdin = nil

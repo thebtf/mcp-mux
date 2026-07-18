@@ -86,6 +86,38 @@ func (p *Process) postStart() error {
 	return nil
 }
 
+func (p *Process) allowSurviveParentExitPlatform() error {
+	p.platform.mu.Lock()
+	defer p.platform.mu.Unlock()
+	if p.platform.state != authorityActive || p.platform.job == 0 {
+		return errors.New("procgroup: process Job authority is not active")
+	}
+
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	if err := windows.QueryInformationJobObject(
+		p.platform.job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	); err != nil {
+		return fmt.Errorf("QueryInformationJobObject: %w", err)
+	}
+	if info.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 {
+		return nil
+	}
+	info.BasicLimitInformation.LimitFlags &^= windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		p.platform.job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		return fmt.Errorf("SetInformationJobObject: %w", err)
+	}
+	return nil
+}
+
 func resumeProcessThreads(pid int) error {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {

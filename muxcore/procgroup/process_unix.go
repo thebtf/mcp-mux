@@ -49,6 +49,10 @@ func (p *Process) postStart() error {
 	return nil
 }
 
+func (p *Process) allowSurviveParentExitPlatform() error {
+	return nil
+}
+
 func (p *Process) takeGroupAuthority() (int, <-chan struct{}, bool) {
 	p.platform.mu.Lock()
 	defer p.platform.mu.Unlock()
