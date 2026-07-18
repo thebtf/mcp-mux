@@ -68,6 +68,73 @@ func TestCorrelationActiveRequestsStayBounded(t *testing.T) {
 	}
 }
 
+func TestSuccessfulReplayPreservesOnlyRetiredChildRequestFence(t *testing.T) {
+	childInput := new(bufferWriteCloser)
+	runner := &runner{
+		state:             StateReplaying,
+		current:           &generation{id: 2, stdin: childInput},
+		child:             newDirectionRegistry(),
+		host:              newDirectionRegistry(),
+		initializeRequest: []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}`),
+		initialized:       []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`),
+	}
+
+	completed := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"completed","method":"tools/list"}`)
+	completedRecord := runner.child.register(completed, 1)
+	completedResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"completed","result":{"tools":[]}}`)
+	runner.child.complete(completedRecord, completedResponse)
+
+	retired := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"retired","method":"tools/list","params":{"_meta":{"progressToken":"retired-token"}}}`)
+	runner.child.register(retired, 1)
+	runner.child.retireGeneration(1)
+	tokenReuse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"token-reuse","method":"tools/list","params":{"_meta":{"progressToken":"retired-token"}}}`)
+
+	hostRetired := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"host-retired","method":"tools/list"}`)
+	runner.host.register(hostRetired, 1)
+	runner.host.retireGeneration(1)
+
+	replay := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"replacement","version":"1"}}}`)
+	runner.completeReplay(replay)
+
+	if err := runner.child.canRegister(completed); err != nil {
+		t.Fatalf("completed child request ID remained fenced after replay: %v", err)
+	}
+	if err := runner.child.canRegister(retired); err == nil {
+		t.Fatal("successful replay released a retired child request ID")
+	}
+	if err := runner.child.canRegister(tokenReuse); err == nil {
+		t.Fatal("successful replay released a retired child progress token")
+	}
+	if err := runner.host.canRegister(hostRetired); err != nil {
+		t.Fatalf("successful replay retained a retired host request ID: %v", err)
+	}
+
+	before := childInput.String()
+	lateHostResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"retired","result":{"tools":[]}}`)
+	runner.state = StateStarting
+	runner.current = nil
+	runner.handleHostEvent(hostFrameEvent{frame: lateHostResponse})
+	if got := childInput.String(); got != before {
+		t.Fatalf("late host response reached replacement child: %s", got)
+	}
+	if err := runner.child.canRegister(retired); err == nil {
+		t.Fatal("late host response released the retired ID before the next replay")
+	}
+	if err := runner.child.canRegister(tokenReuse); err == nil {
+		t.Fatal("late host response released the retired token before the next replay")
+	}
+
+	runner.state = StateReplaying
+	runner.current = &generation{id: 3, stdin: childInput}
+	runner.completeReplay(replay)
+	if err := runner.child.canRegister(retired); err != nil {
+		t.Fatalf("consumed retired response did not release the ID at the next replay: %v", err)
+	}
+	if err := runner.child.canRegister(tokenReuse); err != nil {
+		t.Fatalf("consumed retired response did not release the token at the next replay: %v", err)
+	}
+}
+
 func TestTaskCompletionRejectsDuplicateLiveTaskID(t *testing.T) {
 	registry := newDirectionRegistry()
 	first := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"task":{}}}`)

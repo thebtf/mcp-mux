@@ -1,6 +1,10 @@
 package supervisor
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"reflect"
+)
 
 func (runner *runner) beginReplay() {
 	if runner.current == nil || runner.initializeRequest == nil || runner.initializeID == nil {
@@ -40,7 +44,7 @@ func (runner *runner) handleReplayFrame(frame *parsedFrame) {
 			return
 		}
 		if runner.initializeResponse != nil {
-			if frame.kind != frameResult || !sameInitializeProtocolVersion(runner.initializeResponse, frame) {
+			if frame.kind != frameResult || !sameInitializeContract(runner.initializeResponse, frame) {
 				runner.replaceCurrent(ReasonProtocolFailure)
 				return
 			}
@@ -131,6 +135,7 @@ func (runner *runner) completeReplay(response *parsedFrame) {
 
 	runner.replayResponse = nil
 	runner.host.clearTransitionTombstones()
+	runner.host.clearRetiredCorrelations()
 	runner.child.clearTransitionTombstones()
 	runner.setState(StateActive, ReasonInitial)
 	runner.flushPending()
@@ -167,34 +172,108 @@ func (runner *runner) flushPending() {
 	}
 }
 
-func sameInitializeProtocolVersion(original []byte, replacement *parsedFrame) bool {
+func sameInitializeContract(original []byte, replacement *parsedFrame) bool {
 	originalFrame, err := parseFrame(original, 0)
 	if err != nil {
 		return false
 	}
-	originalVersion, err := initializeProtocolVersion(originalFrame)
+	originalVersion, originalCapabilities, err := initializeContract(originalFrame)
 	if err != nil {
 		return false
 	}
-	replacementVersion, err := initializeProtocolVersion(replacement)
-	return err == nil && replacementVersion == originalVersion
+	replacementVersion, replacementCapabilities, err := initializeContract(replacement)
+	return err == nil && replacementVersion == originalVersion && reflect.DeepEqual(replacementCapabilities, originalCapabilities)
 }
 
-func initializeProtocolVersion(frame *parsedFrame) (string, error) {
+func initializeContract(frame *parsedFrame) (string, map[string]any, error) {
 	if frame == nil || frame.kind != frameResult {
-		return "", fmt.Errorf("initialize response is not a result")
+		return "", nil, fmt.Errorf("initialize response is not a result")
 	}
 	result, err := decodeObject(frame.result)
 	if err != nil {
-		return "", fmt.Errorf("initialize result: %w", err)
+		return "", nil, fmt.Errorf("initialize result: %w", err)
 	}
 	raw, ok := result["protocolVersion"]
 	if !ok {
-		return "", fmt.Errorf("initialize result is missing protocolVersion")
+		return "", nil, fmt.Errorf("initialize result is missing protocolVersion")
 	}
 	version, err := parseString(raw, "protocolVersion")
 	if err != nil || version == "" {
-		return "", fmt.Errorf("initialize protocolVersion must be a non-empty string")
+		return "", nil, fmt.Errorf("initialize protocolVersion must be a non-empty string")
 	}
-	return version, nil
+	capabilitiesRaw, ok := result["capabilities"]
+	if !ok {
+		return "", nil, fmt.Errorf("initialize result is missing capabilities")
+	}
+	capabilities, err := decodeSemanticJSONObject(capabilitiesRaw)
+	if err != nil {
+		return "", nil, fmt.Errorf("initialize capabilities must be an object: %w", err)
+	}
+	return version, capabilities, nil
+}
+
+type semanticJSONNumber string
+
+func decodeSemanticJSONObject(raw []byte) (map[string]any, error) {
+	fields, err := decodeObject(raw)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]any, len(fields))
+	for key, valueRaw := range fields {
+		value, err := decodeSemanticJSON(valueRaw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		result[key] = value
+	}
+	return result, nil
+}
+
+func decodeSemanticJSON(raw []byte) (any, error) {
+	raw = trimJSONWhitespace(raw)
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty JSON value")
+	}
+	switch raw[0] {
+	case '{':
+		return decodeSemanticJSONObject(raw)
+	case '[':
+		var elements []json.RawMessage
+		if err := json.Unmarshal(raw, &elements); err != nil {
+			return nil, err
+		}
+		values := make([]any, len(elements))
+		for index, element := range elements {
+			value, err := decodeSemanticJSON(element)
+			if err != nil {
+				return nil, fmt.Errorf("element %d: %w", index, err)
+			}
+			values[index] = value
+		}
+		return values, nil
+	case '"':
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	case 't', 'f':
+		var value bool
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	case 'n':
+		if string(raw) != "null" {
+			return nil, fmt.Errorf("invalid null value")
+		}
+		return nil, nil
+	default:
+		number, err := canonicalJSONNumber(string(raw))
+		if err != nil {
+			return nil, err
+		}
+		return semanticJSONNumber(number), nil
+	}
 }

@@ -32,6 +32,9 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	if runner.handleHostLifecycle(item) {
 		return
 	}
+	if isResponse(frame) && frame.id != nil && runner.child.consumeRetiredResponse(frame.id.key) {
+		return
+	}
 
 	switch {
 	case isResponse(frame):
@@ -480,7 +483,7 @@ func (runner *runner) handleChildCancellation(frame *parsedFrame) {
 		runner.terminate(ReasonHostOutputFailure, err)
 		return
 	}
-	runner.child.cancel(record)
+	runner.child.retireRequest(record)
 }
 
 func (runner *runner) handleChildProgress(frame *parsedFrame) {

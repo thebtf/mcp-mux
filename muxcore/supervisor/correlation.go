@@ -99,17 +99,21 @@ func (set *tombstoneSet) clear() {
 }
 
 type directionRegistry struct {
-	requests   map[scalarKey]*requestRecord
-	tokens     map[scalarKey]*tokenRecord
-	tasks      map[string]*taskRecord
-	tombstones tombstoneSet
+	requests        map[scalarKey]*requestRecord
+	tokens          map[scalarKey]*tokenRecord
+	tasks           map[string]*taskRecord
+	tombstones      tombstoneSet
+	retiredRequests map[scalarKey]*requestRecord
+	retiredTokens   map[scalarKey]struct{}
 }
 
 func newDirectionRegistry() directionRegistry {
 	return directionRegistry{
-		requests: make(map[scalarKey]*requestRecord),
-		tokens:   make(map[scalarKey]*tokenRecord),
-		tasks:    make(map[string]*taskRecord),
+		requests:        make(map[scalarKey]*requestRecord),
+		tokens:          make(map[scalarKey]*tokenRecord),
+		tasks:           make(map[string]*taskRecord),
+		retiredRequests: make(map[scalarKey]*requestRecord),
+		retiredTokens:   make(map[scalarKey]struct{}),
 	}
 }
 
@@ -120,6 +124,12 @@ func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
 	if len(registry.requests)+len(registry.tasks) >= activeCorrelationLimit {
 		return fmt.Errorf("active correlation limit reached")
 	}
+	if len(registry.retiredRequests) >= tombstoneLimit || len(registry.retiredTokens) >= tombstoneLimit {
+		return fmt.Errorf("retired correlation limit reached")
+	}
+	if _, exists := registry.retiredRequests[frame.id.key]; exists {
+		return fmt.Errorf("request id belongs to a retired generation")
+	}
 	if registry.tombstones.contains(tombstoneRequest, frame.id.key) {
 		return fmt.Errorf("request id is tombstoned")
 	}
@@ -127,6 +137,9 @@ func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
 		return fmt.Errorf("duplicate active request id")
 	}
 	if frame.progressToken != nil {
+		if _, exists := registry.retiredTokens[frame.progressToken.key]; exists {
+			return fmt.Errorf("progress token belongs to a retired generation")
+		}
 		if registry.tombstones.contains(tombstoneToken, frame.progressToken.key) {
 			return fmt.Errorf("progress token is tombstoned")
 		}
@@ -224,6 +237,15 @@ func (registry *directionRegistry) cancel(record *requestRecord) {
 	registry.removeToken(record)
 }
 
+func (registry *directionRegistry) retireRequest(record *requestRecord) {
+	delete(registry.requests, record.id.key)
+	registry.retiredRequests[record.id.key] = record
+	if record.progressToken != nil {
+		delete(registry.tokens, record.progressToken.key)
+		registry.retiredTokens[record.progressToken.key] = struct{}{}
+	}
+}
+
 func (registry *directionRegistry) removeToken(record *requestRecord) {
 	if record.progressToken == nil {
 		return
@@ -272,13 +294,11 @@ func (registry *directionRegistry) acceptProgress(meta *progressMeta, generation
 
 func (registry *directionRegistry) retireGeneration(generation uint64) []*requestRecord {
 	lost := make([]*requestRecord, 0)
-	for key, record := range registry.requests {
+	for _, record := range registry.requests {
 		if record.generation != generation {
 			continue
 		}
-		delete(registry.requests, key)
-		registry.tombstones.add(tombstoneRequest, key)
-		registry.removeToken(record)
+		registry.retireRequest(record)
 		if !record.initialize {
 			lost = append(lost, record)
 		}
@@ -290,7 +310,7 @@ func (registry *directionRegistry) retireGeneration(generation uint64) []*reques
 		delete(registry.tasks, id)
 		if task.progressToken != nil {
 			delete(registry.tokens, *task.progressToken)
-			registry.tombstones.add(tombstoneToken, *task.progressToken)
+			registry.retiredTokens[*task.progressToken] = struct{}{}
 		}
 	}
 	sort.Slice(lost, func(i, j int) bool {
@@ -302,8 +322,27 @@ func (registry *directionRegistry) retireGeneration(generation uint64) []*reques
 	return lost
 }
 
+func (registry *directionRegistry) consumeRetiredResponse(key scalarKey) bool {
+	record := registry.retiredRequests[key]
+	if record == nil {
+		return false
+	}
+	delete(registry.retiredRequests, key)
+	registry.tombstones.add(tombstoneRequest, key)
+	if record.progressToken != nil {
+		delete(registry.retiredTokens, record.progressToken.key)
+		registry.tombstones.add(tombstoneToken, record.progressToken.key)
+	}
+	return true
+}
+
 func (registry *directionRegistry) clearTransitionTombstones() {
 	registry.tombstones.clear()
+}
+
+func (registry *directionRegistry) clearRetiredCorrelations() {
+	clear(registry.retiredRequests)
+	clear(registry.retiredTokens)
 }
 
 func localErrorFrame(id json.RawMessage, code int, message string) []byte {
