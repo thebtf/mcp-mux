@@ -561,22 +561,41 @@ func resolveInstalledEnginePath(launcherPath, candidate string) (string, bool) {
 		return "", false
 	}
 	candidatePath, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", false
+	}
+	relative, err := filepath.Rel(storePath, candidatePath)
 	if err != nil || !isVersionStoreEnginePath(storePath, candidatePath) {
 		return "", false
 	}
+
+	storeInfo, err := os.Lstat(storePath)
+	if err != nil || storeInfo.Mode()&os.ModeSymlink != 0 || !storeInfo.IsDir() {
+		return "", false
+	}
+	versionPath := filepath.Join(storePath, filepath.Dir(relative))
+	versionInfo, err := os.Lstat(versionPath)
+	if err != nil || versionInfo.Mode()&os.ModeSymlink != 0 || !versionInfo.IsDir() {
+		return "", false
+	}
+	engineInfo, err := os.Lstat(candidatePath)
+	if err != nil || engineInfo.Mode()&os.ModeSymlink != 0 || !engineInfo.Mode().IsRegular() {
+		return "", false
+	}
+
 	resolvedStore, err := filepath.EvalSymlinks(storePath)
-	if err != nil || !samePath(resolvedStore, storePath) {
+	if err != nil {
 		return "", false
 	}
 	resolvedCandidate, err := filepath.EvalSymlinks(candidatePath)
-	if err != nil || !samePath(resolvedCandidate, candidatePath) || !isVersionStoreEnginePath(resolvedStore, resolvedCandidate) {
+	if err != nil {
 		return "", false
 	}
-	info, err := os.Stat(resolvedCandidate)
-	if err != nil || !info.Mode().IsRegular() {
+	expectedCandidate := filepath.Join(resolvedStore, relative)
+	if !samePath(resolvedCandidate, expectedCandidate) || !isVersionStoreEnginePath(resolvedStore, resolvedCandidate) {
 		return "", false
 	}
-	return resolvedCandidate, true
+	return candidatePath, true
 }
 
 func authorizeInstalledEnginePath(launcherPath, candidate string) bool {

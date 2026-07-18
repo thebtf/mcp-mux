@@ -12,6 +12,8 @@ func TestConcurrentTreeFinalizationIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
+	waited := make(chan error, 1)
+	go func() { waited <- p.Wait() }()
 
 	const callers = 24
 	var wg sync.WaitGroup
@@ -39,6 +41,14 @@ func TestConcurrentTreeFinalizationIsIdempotent(t *testing.T) {
 	case <-p.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("Done did not close after concurrent finalization")
+	}
+	select {
+	case err := <-waited:
+		if errors.Is(err, ErrTreeRetirementUnproven) {
+			t.Fatalf("concurrent Wait observed unproven retirement: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Wait did not return after finalization")
 	}
 
 	for i := 0; i < callers; i++ {

@@ -87,23 +87,54 @@ func signalProcessGroup(pgid int, signal syscall.Signal) error {
 	return err
 }
 
-func waitProcessGroupGone(pgid int) error {
+func waitProcessGroupGone(pgid int, leaderDone <-chan struct{}) error {
 	if pgid <= 0 {
 		return nil
 	}
 	deadline := time.Now().Add(processTreeWaitTimeout)
+	if leaderDone != nil {
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-leaderDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			return fmt.Errorf("process group %d leader remained unreaped after %s", pgid, processTreeWaitTimeout)
+		}
+	}
 	for {
+		if err := drainWaitableGroupChildren(pgid); err != nil {
+			return fmt.Errorf("reap adopted process group %d children: %w", pgid, err)
+		}
 		err := syscall.Kill(-pgid, 0)
 		if errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
-		if err != nil && !errors.Is(err, syscall.EPERM) {
-			return err
+		if err != nil {
+			return fmt.Errorf("probe process group %d: %w", pgid, err)
 		}
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("process group %d remained alive after %s", pgid, processTreeWaitTimeout)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func drainWaitableGroupChildren(pgid int) error {
+	for {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(-pgid, &status, syscall.WNOHANG, nil)
+		switch {
+		case errors.Is(err, syscall.EINTR):
+			continue
+		case errors.Is(err, syscall.ECHILD):
+			return nil
+		case err != nil:
+			return err
+		case pid == 0:
+			return nil
+		}
 	}
 }
 
@@ -146,7 +177,7 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 	case <-time.After(timeout):
 	}
 	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
-	waitErr := waitProcessGroupGone(pgid)
+	waitErr := waitProcessGroupGone(pgid, p.leaderDone)
 	authorityErr := p.finishGroupAuthority(errors.Join(termErr, killErr, waitErr))
 	<-p.done
 	return authorityErr
@@ -173,10 +204,9 @@ func (p *Process) killPlatform() error {
 		<-p.done
 		return authorityErr
 	}
-	authorityErr := p.finishGroupAuthority(errors.Join(
-		signalProcessGroup(pgid, syscall.SIGKILL),
-		waitProcessGroupGone(pgid),
-	))
+	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+	waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+	authorityErr := p.finishGroupAuthority(errors.Join(killErr, waitErr))
 	if p.Alive() {
 		<-p.done
 	}
@@ -198,10 +228,9 @@ func (p *Process) cleanupPlatform() error {
 	p.platform.mu.Unlock()
 	pgid, wait, owner := p.takeGroupAuthority()
 	if owner {
-		return p.finishGroupAuthority(errors.Join(
-			signalProcessGroup(pgid, syscall.SIGKILL),
-			waitProcessGroupGone(pgid),
-		))
+		killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+		waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+		return p.finishGroupAuthority(errors.Join(killErr, waitErr))
 	}
 	return p.waitGroupAuthority(wait)
 }
@@ -212,10 +241,9 @@ func (p *Process) reapPlatform() error {
 	}
 	pgid, wait, owner := p.takeGroupAuthority()
 	if owner {
-		return p.finishGroupAuthority(errors.Join(
-			signalProcessGroup(pgid, syscall.SIGKILL),
-			waitProcessGroupGone(pgid),
-		))
+		killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+		waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+		return p.finishGroupAuthority(errors.Join(killErr, waitErr))
 	}
 	return p.waitGroupAuthority(wait)
 }

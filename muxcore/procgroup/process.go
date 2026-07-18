@@ -116,6 +116,7 @@ func Spawn(opts Options) (*Process, error) {
 		if errors.Is(waitErr, os.ErrProcessDone) {
 			waitErr = nil
 		}
+		close(p.leaderDone)
 		cleanupErr := p.cleanupPlatform()
 		return nil, postStartFailure(err, errors.Join(killErr, waitErr, cleanupErr))
 	}

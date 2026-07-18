@@ -102,6 +102,29 @@ func newFaultChild() *faultChild {
 
 func (child *faultChild) Stdin() io.WriteCloser { return child.writer }
 
+type trackedReadCloser struct {
+	closed bool
+}
+
+func (*trackedReadCloser) Read([]byte) (int, error) { return 0, io.EOF }
+func (reader *trackedReadCloser) Close() error {
+	reader.closed = true
+	return nil
+}
+
+func TestJoinPumpClosesStdoutAfterNormalCompletion(t *testing.T) {
+	pumpDone := make(chan struct{})
+	close(pumpDone)
+	stdout := &trackedReadCloser{}
+	runner := &runner{cfg: Config{OutputDrainTimeout: time.Second, runtimeClock: realClock{}}}
+	if err := runner.joinPump(&generation{stdout: stdout, pumpDone: pumpDone}); err != nil {
+		t.Fatal(err)
+	}
+	if !stdout.closed {
+		t.Fatal("normally completed stdout pump left its read handle open")
+	}
+}
+
 func (child *testChild) crash(err error) { child.finish(1, err) }
 func (child *testChild) dormantExit()    { child.finish(ProtocolV2().DormantExitCode(), nil) }
 func (child *testChild) finish(code int, err error) {
@@ -1820,7 +1843,7 @@ func TestDormantLeaseExpiresAfterNonWakingPreDeadlineFrame(t *testing.T) {
 	}
 }
 
-func TestSafeToCommitDormantRequiresNoLiveOrUnreadWork(t *testing.T) {
+func TestSafeToCommitDormantRequiresNoLiveOrPendingWork(t *testing.T) {
 	newRunner := func() *runner {
 		return &runner{
 			current: &generation{id: 1},
@@ -1863,7 +1886,168 @@ func TestSafeToCommitDormantRequiresNoLiveOrUnreadWork(t *testing.T) {
 
 	withUnreadBoundary := newRunner()
 	observed := withUnreadBoundary.hostBoundary.record(time.Now())
-	if withUnreadBoundary.safeToCommitDormant(observed) {
-		t.Fatal("reader-observed unprocessed host demand crossed dormant gate")
+	if !withUnreadBoundary.safeToCommitDormant(observed) {
+		t.Fatal("an unread boundary sequence alone vetoed dormant commit")
 	}
+}
+
+func TestUnreadPreAckRequestReplaysToExactlyOneSuccessor(t *testing.T) {
+	first := newTestChild()
+	second := newTestChild()
+	firstInput := streamLines(first.inputReader)
+	secondInput := streamLines(second.inputReader)
+	firstAdmission := newTestAdmission(true)
+	secondAdmission := newTestAdmission(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	initialize := []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+	initializeFrame, err := parseFrame(initialize, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initializeID := *initializeFrame.id
+	initialized := []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	initializeResponse := []byte(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"first","version":"1"}}}`)
+
+	starts := 0
+	protocolFailures := 0
+	runner := &runner{
+		ctx:    ctx,
+		cancel: cancel,
+		cfg: Config{
+			HostOut: io.Discard,
+			Resolve: func(context.Context) (EngineRef, error) {
+				return EngineRef{ID: "engine"}, nil
+			},
+			Start: func(context.Context, EngineRef) (StartResult, error) {
+				starts++
+				return StartResult{Child: second, Actual: EngineRef{ID: "engine"}, Admission: secondAdmission}, nil
+			},
+			Observe: func(event Event) {
+				if event.Reason == ReasonProtocolFailure {
+					protocolFailures++
+				}
+			},
+			StartTimeout:        time.Second,
+			ReplayTimeout:       time.Second,
+			GracefulStopTimeout: time.Second,
+			OutputDrainTimeout:  time.Second,
+			DormantExitTimeout:  time.Second,
+			MaxFrameBytes:       4096,
+			PendingFrameLimit:   8,
+			PendingByteLimit:    8192,
+			runtimeClock:        realClock{},
+		},
+		events:             make(chan any, 8),
+		state:              StateActive,
+		generation:         1,
+		host:               newDirectionRegistry(),
+		child:              newDirectionRegistry(),
+		initializeRequest:  initialize,
+		initializeID:       &initializeID,
+		initializeResponse: initializeResponse,
+		initialized:        initialized,
+		current: &generation{
+			id:        1,
+			requested: EngineRef{ID: "engine"},
+			actual:    EngineRef{ID: "engine"},
+			child:     first,
+			stdin:     first.stdinWriter,
+			stdout:    first.stdoutReader,
+			admission: firstAdmission,
+			cancel:    func() {},
+			pumpDone:  make(chan struct{}),
+			reapDone:  make(chan struct{}),
+			exitDone:  make(chan struct{}),
+		},
+	}
+
+	request, err := parseFrame([]byte(`{"jsonrpc":"2.0","id":"already-read","method":"tools/list"}`), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arrived := time.Now()
+	sequence := runner.hostBoundary.record(arrived)
+	ready, err := parseFrame(ProtocolV2().Frame(ControlDormantReady), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.handleChildControl(ready)
+	if runner.state != StateQuiescing {
+		t.Fatalf("state after ready = %s, want quiescing", runner.state)
+	}
+	if runner.dormantTransitionStart != sequence {
+		t.Fatalf("dormant transition start = %d, want unread boundary %d", runner.dormantTransitionStart, sequence)
+	}
+	if got := nextLine(t, firstInput); got != string(ProtocolV2().Frame(ControlCommitDormant)) {
+		t.Fatalf("commit frame = %s", got)
+	}
+
+	runner.handleHostEvent(hostFrameEvent{sequence: sequence, arrived: arrived, frame: request})
+	if runner.state != StateQuiescing || runner.pending.len() != 1 {
+		t.Fatalf("pre-ACK request state=%s pending=%d", runner.state, runner.pending.len())
+	}
+	ack, err := parseFrame(ProtocolV2().Frame(ControlDormantAck), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.handleChildControl(ack)
+	if runner.state != StateAwaitingDormantExit {
+		t.Fatalf("state after ACK = %s", runner.state)
+	}
+
+	runner.current.mu.Lock()
+	runner.current.exit = Exit{Code: ProtocolV2().DormantExitCode()}
+	runner.current.outputEOF = true
+	runner.current.mu.Unlock()
+	close(runner.current.exitDone)
+	close(runner.current.pumpDone)
+	close(runner.current.reapDone)
+	runner.maybeCompleteDormancy()
+
+	select {
+	case event := <-runner.events:
+		runner.handleEvent(event)
+	case <-time.After(3 * time.Second):
+		t.Fatal("successor start attempt did not complete")
+	}
+	if got := nextLine(t, secondInput); !strings.Contains(got, `"method":"initialize"`) {
+		t.Fatalf("replay initialize = %s", got)
+	}
+	replayResponse, err := parseFrame([]byte(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"second","version":"1"}}}`), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.handleChildFrame(replayResponse)
+	if got := nextLine(t, secondInput); !strings.Contains(got, "notifications/initialized") {
+		t.Fatalf("replay initialized = %s", got)
+	}
+	if got := nextLine(t, secondInput); !strings.Contains(got, `"id":"already-read"`) {
+		t.Fatalf("replayed request = %s", got)
+	}
+	if starts != 1 || protocolFailures != 0 || runner.terminal {
+		t.Fatalf("starts=%d protocolFailures=%d terminal=%v reason=%s", starts, protocolFailures, runner.terminal, runner.terminalReason)
+	}
+	assertNoLine(t, secondInput, 100*time.Millisecond)
+
+	runner.stopAllTimers()
+	if runner.current != nil {
+		runner.current.cancel()
+		_ = runner.current.stdin.Close()
+		_ = runner.current.stdout.Close()
+	}
+	second.finish(0, nil)
+	select {
+	case <-runner.current.pumpDone:
+	case <-time.After(time.Second):
+		t.Fatal("successor pump did not stop")
+	}
+	select {
+	case <-runner.current.reapDone:
+	case <-time.After(time.Second):
+		t.Fatal("successor reaper did not stop")
+	}
+	cancel()
+	runner.background.Wait()
 }

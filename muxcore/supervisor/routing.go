@@ -553,11 +553,8 @@ func (runner *runner) handleChildControl(frame *parsedFrame) {
 	}
 }
 
-func (runner *runner) safeToCommitDormant(observedSequence uint64) bool {
-	if runner.current == nil || runner.pending.len() != 0 || observedSequence != runner.lastHostSequence {
-		return false
-	}
-	return registryIdle(&runner.host) && registryIdle(&runner.child)
+func (runner *runner) safeToCommitDormant(_ uint64) bool {
+	return runner.current != nil && runner.pending.len() == 0 && registryIdle(&runner.host) && registryIdle(&runner.child)
 }
 
 func registryIdle(registry *directionRegistry) bool {

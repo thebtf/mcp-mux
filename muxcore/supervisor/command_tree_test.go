@@ -33,6 +33,7 @@ func TestCommandTreeHelper(t *testing.T) {
 }
 
 func TestCommandChildStopRetiresDescendantTree(t *testing.T) {
+	prepareCommandTreeTest(t)
 	child, err := StartCommand(context.Background(), Command{
 		Path:   os.Args[0],
 		Args:   []string{"-test.run=TestCommandTreeHelper"},

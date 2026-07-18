@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -255,7 +256,10 @@ func VerifyParent(ctx context.Context, config VerifyConfig) error {
 	}
 	ioTimeout := boundedTimeout(ctx, config.IOTimeout)
 	if ioTimeout <= 0 {
-		return context.Cause(ctx)
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
+		return context.DeadlineExceeded
 	}
 	conn, err := ipc.DialTimeout(advertisement.Endpoint, ioTimeout)
 	if err != nil {
@@ -311,28 +315,25 @@ const attestBasenameOverhead = 27
 // minHexLen is the minimum random hex string length (8 bytes → 2^64 unique values).
 const minHexLen = 16
 
-// randomEndpoint returns a unique attestation socket path rooted in os.TempDir()
-// that fits within the Darwin Unix socket path ceiling.
+// randomEndpoint returns a unique attestation endpoint rooted in os.TempDir().
 func randomEndpoint() (string, error) {
 	return randomEndpointIn(os.TempDir())
 }
 
-// randomEndpointIn returns a unique attestation socket path rooted in dir that
-// fits within the Darwin Unix socket path ceiling (unixPathMax-1 usable bytes).
-// It uses the maximum hex length that fits, down to minHexLen. An error is
-// returned only when dir itself is so long that even minHexLen chars would not
-// fit; in practice this cannot happen with any real OS temp directory.
 func randomEndpointIn(dir string) (string, error) {
-	// usable = unixPathMax - 1 (null terminator byte reserved by the kernel).
-	usable := unixPathMax - 1
-	// path length = len(dir) + 1 (separator) + attestBasenameOverhead + hexLen
-	hexLen := usable - len(dir) - 1 - attestBasenameOverhead
-	if hexLen < minHexLen {
-		return "", fmt.Errorf("attest: temp dir too long (%d bytes) to generate a bindable endpoint", len(dir))
+	if dir == "" {
+		dir = os.TempDir()
 	}
-	// Round down to an even number so we read whole bytes from rand.
-	hexLen = hexLen &^ 1
-	randBytes := hexLen / 2
+	randBytes := 16
+	if runtime.GOOS != "windows" {
+		// Darwin has the tightest supported sockaddr storage: 104 bytes including NUL.
+		usable := unixPathMax - 1
+		hexLen := usable - len(dir) - 1 - attestBasenameOverhead
+		if hexLen < minHexLen {
+			return "", fmt.Errorf("attest: temp dir too long (%d bytes) to generate a bindable endpoint", len(dir))
+		}
+		randBytes = (hexLen &^ 1) / 2
+	}
 	random := make([]byte, randBytes)
 	if _, err := rand.Read(random); err != nil {
 		return "", fmt.Errorf("attest: random endpoint: %w", err)

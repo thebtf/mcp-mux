@@ -100,10 +100,15 @@ func (runner *runner) joinPump(generation *generation) error {
 	select {
 	case <-generation.pumpDone:
 		timer.Stop()
+		if generation.stdout != nil {
+			_ = generation.stdout.Close()
+		}
 		return nil
 	case <-timer.C():
 	}
-	_ = generation.stdout.Close()
+	if generation.stdout != nil {
+		_ = generation.stdout.Close()
+	}
 
 	timer = runner.cfg.runtimeClock.NewTimer(runner.cfg.GracefulStopTimeout)
 	defer timer.Stop()
