@@ -27,10 +27,48 @@ All items from the 2026-04-08 debt batch have been resolved:
 
 (none)
 
+## PR #145 review stopline
+
+The final review exposed the following unresolved NVMD-145 contract gaps after
+the bounded correction wave. They are recorded rather than expanded in-place;
+**PR #145 must not merge or release until each item is fixed or independently
+disproved against the accepted specification.**
+
+- **Start preparation cancellation** — daemon preparation receives the attempt
+  context but its product callback ignores it, so timeout/cancellation can leave
+  late daemon-start side effects after the generation attempt has ended.
+- **Bind-failure tree rollback** — the non-supervisor launcher path uses
+  `cmd.Process.Kill/Wait` after `BindChildPID` failure instead of full Unix
+  process-group / Windows Job authority.
+- **Atomic parent receipt** — a successful attestation response can race
+  `Parent.Close` before `Verified` is committed, leaving child success and
+  parent admission state inconsistent.
+- **Strict frame compliance** — reject invalid UTF-8 and non-JSON whitespace,
+  enforce MCP object-shaped `params`/`result`, and distinguish JSON-RPC parse
+  error `-32700` from structurally invalid request `-32600`.
+- **Task capability and terminal lifetime** — task augmentation must follow the
+  negotiated `tasks` capability, and terminal `tasks/get`/`tasks/cancel` results
+  must retire task/progress correlation without relying on optional status
+  notifications.
+- **Replay protocol continuity** — a hidden replacement initialize response
+  must not silently change the MCP `protocolVersion` already negotiated with
+  the host.
+- **Unclosed child wait** — supervisor cancellation/finalization needs a bounded
+  way to release its reaper goroutine when a custom `Child.Wait` never closes,
+  without treating cancellation as terminal process proof.
+- **Acceptance evidence gaps** — Windows descendant-retirement tests must fail
+  on unexpected `OpenProcess` errors, and the new/new compatibility fixture must
+  assert successful attestation rather than infer it from engine version.
+
 ## Open items
 
 The following v0.28.0 follow-ups are non-blocking and out of scope for the
 current release:
+
+- **Dormant rejection synchronization** — the current owner and control-plane
+  safety gates should make READY-with-live-work unreachable; either prove that
+  invariant end to end or define an explicit bounded rejection response so a
+  misbehaving child cannot wait indefinitely.
 
 - **Cancellation provenance fallback** — unknown or expired cancellation may
   currently target the current generation after inflight provenance is gone;
