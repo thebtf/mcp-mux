@@ -299,10 +299,43 @@ func boundedTimeout(ctx context.Context, configured time.Duration) time.Duration
 	return configured
 }
 
+// unixPathMax is the Darwin RawSockaddrUnix.Path length (104 bytes), which is
+// the tightest sun_path ceiling across supported platforms. Paths of this length
+// or longer fail bind(2) with EINVAL on Darwin; Linux allows up to 108.
+const unixPathMax = 104
+
+// attestBasename is the fixed portion of the socket basename: "mcp-supervisor-attest-<hex>.sock".
+// Fixed overhead = len("mcp-supervisor-attest-") + len(".sock") = 27.
+const attestBasenameOverhead = 27
+
+// minHexLen is the minimum random hex string length (8 bytes → 2^64 unique values).
+const minHexLen = 16
+
+// randomEndpoint returns a unique attestation socket path rooted in os.TempDir()
+// that fits within the Darwin Unix socket path ceiling.
 func randomEndpoint() (string, error) {
-	var random [16]byte
-	if _, err := rand.Read(random[:]); err != nil {
+	return randomEndpointIn(os.TempDir())
+}
+
+// randomEndpointIn returns a unique attestation socket path rooted in dir that
+// fits within the Darwin Unix socket path ceiling (unixPathMax-1 usable bytes).
+// It uses the maximum hex length that fits, down to minHexLen. An error is
+// returned only when dir itself is so long that even minHexLen chars would not
+// fit; in practice this cannot happen with any real OS temp directory.
+func randomEndpointIn(dir string) (string, error) {
+	// usable = unixPathMax - 1 (null terminator byte reserved by the kernel).
+	usable := unixPathMax - 1
+	// path length = len(dir) + 1 (separator) + attestBasenameOverhead + hexLen
+	hexLen := usable - len(dir) - 1 - attestBasenameOverhead
+	if hexLen < minHexLen {
+		return "", fmt.Errorf("attest: temp dir too long (%d bytes) to generate a bindable endpoint", len(dir))
+	}
+	// Round down to an even number so we read whole bytes from rand.
+	hexLen = hexLen &^ 1
+	randBytes := hexLen / 2
+	random := make([]byte, randBytes)
+	if _, err := rand.Read(random); err != nil {
 		return "", fmt.Errorf("attest: random endpoint: %w", err)
 	}
-	return serverid.IPCPath("", "mcp-supervisor-attest", hex.EncodeToString(random[:])), nil
+	return serverid.IPCPath(dir, "mcp-supervisor-attest", hex.EncodeToString(random)), nil
 }

@@ -220,3 +220,53 @@ func TestBindChildPIDAfterCloseIsRejected(t *testing.T) {
 		t.Fatal("closed parent accepted a child PID")
 	}
 }
+
+// TestRandomEndpointFitsDarwinPathCeiling is the regression guard for
+// https://github.com/thebtf/mcp-mux/pull/145 CI run 29645121822.
+//
+// Root cause: the macOS GitHub Actions runner uses
+//   /var/folders/8j/sfr9qqcj73j4p6nhwcfpr0th0000gn/T
+// as os.TempDir() (48 bytes). The pre-fix randomEndpoint combined that with
+// "mcp-supervisor-attest-<32hex>.sock" producing a 108-byte path, exceeding
+// Darwin's RawSockaddrUnix.Path ceiling of 104 bytes and causing
+// bind(2) to fail with EINVAL.
+//
+// The test models the exact CI temp-dir length and verifies that
+// randomEndpointIn produces a path ≤ unixPathMax-1 (103 usable bytes).
+func TestRandomEndpointFitsDarwinPathCeiling(t *testing.T) {
+	// Reproduce the exact 48-byte macOS CI temp directory from run 29645121822.
+	darwinRunnerTempDir := "/var/folders/8j/sfr9qqcj73j4p6nhwcfpr0th0000gn/T"
+	if len(darwinRunnerTempDir) != 48 {
+		t.Fatalf("test setup: expected 48-byte dir, got %d", len(darwinRunnerTempDir))
+	}
+
+	endpoint, err := randomEndpointIn(darwinRunnerTempDir)
+	if err != nil {
+		t.Fatalf("randomEndpointIn failed for Darwin runner temp dir: %v", err)
+	}
+
+	const usable = unixPathMax - 1 // 103 bytes; the kernel reserves one byte for the null terminator
+	if got := len(endpoint); got >= unixPathMax {
+		t.Errorf("endpoint length %d >= unixPathMax %d (would fail bind on Darwin): %q",
+			got, unixPathMax, endpoint)
+	} else {
+		t.Logf("endpoint length %d / %d usable: %q", got, usable, endpoint)
+	}
+}
+
+// TestRandomEndpointPreFixWouldExceedDarwinCeiling confirms that the pre-fix
+// construction (32 hex chars from a 16-byte random value) produces a path that
+// exceeds the Darwin ceiling when rooted in the CI runner temp directory,
+// encoding the exact defect that caused CI run 29645121822 to fail.
+func TestRandomEndpointPreFixWouldExceedDarwinCeiling(t *testing.T) {
+	darwinRunnerTempDir := "/var/folders/8j/sfr9qqcj73j4p6nhwcfpr0th0000gn/T"
+	// Pre-fix basename: "mcp-supervisor-attest-" (22) + 32 hex chars + ".sock" (5) = 59 bytes.
+	// Full pre-fix path: 48 (dir) + 1 (sep) + 59 = 108 bytes.
+	preFix32HexChars := "00000000000000000000000000000000" // 32 chars, representative of hex.EncodeToString([16]byte)
+	prePath := darwinRunnerTempDir + "/" + "mcp-supervisor-attest-" + preFix32HexChars + ".sock"
+	if got := len(prePath); got < unixPathMax {
+		t.Errorf("pre-fix path length %d < unixPathMax %d; test assumption wrong — re-check the CI path", got, unixPathMax)
+	} else {
+		t.Logf("confirmed: pre-fix path length %d >= unixPathMax %d (would cause EINVAL on Darwin)", got, unixPathMax)
+	}
+}
