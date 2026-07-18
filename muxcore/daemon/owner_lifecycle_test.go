@@ -416,6 +416,65 @@ func TestReaperFinalizationRetryPreservesEligibilityGate(t *testing.T) {
 	}
 }
 
+func TestZeroSessionFinalizationRetryRejectsNewPersistence(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "zero-session-retry-persistent"
+	o := testReconnectOwner(t, sid)
+	zeroAt := time.Now().Add(-time.Second)
+	entry := &OwnerEntry{
+		Owner:       o,
+		ServerID:    sid,
+		LastSession: zeroAt,
+		IdleTimeout: time.Millisecond,
+	}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || !soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=true", got, soft, o)
+		}
+		if calls.Add(1) <= ownerFinalizationAttempts {
+			return 0, false, errors.New("synthetic zero-session retirement pending")
+		}
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond); err == nil {
+		t.Fatal("zero-session removal unexpectedly proved finalization")
+	} else if removed {
+		t.Fatal("zero-session removal forgot owner before retry")
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("synchronous finalizer calls=%d, want %d", got, ownerFinalizationAttempts)
+	}
+	d.mu.Lock()
+	entry.Persistent = true
+	retrying := entry.removalRetrying
+	d.mu.Unlock()
+	if !retrying {
+		t.Fatal("zero-session removal did not schedule finalization retry")
+	}
+
+	waitForDaemonCondition(t, time.Second, func() bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return !entry.removalRetrying
+	}, "zero-session retry did not settle after persistence changed")
+	if current := d.Entry(sid); current != entry || !current.Persistent {
+		t.Fatal("zero-session retry removed or unpinned persistent owner")
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("finalizer calls=%d after persistence changed, want %d", got, ownerFinalizationAttempts)
+	}
+}
+
 func TestOwnerRemovalKeepsEntryWhenFinalizationUnproven(t *testing.T) {
 	d := testDaemon(t)
 	d.supervisor = nil

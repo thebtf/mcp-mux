@@ -121,7 +121,7 @@ func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *Owne
 		soft = false
 	}
 	removed, err := d.finalizeAndRemoveOwner(serverID, entry, reason, soft, func(current *OwnerEntry) bool {
-		return current.LastSession.Equal(zeroAt)
+		return current.Owner == ownerRef && !current.Persistent && current.LastSession.Equal(zeroAt)
 	}, true)
 	return removed, removed.Removed, err
 }
@@ -255,6 +255,12 @@ func (d *Daemon) finalizeOwnerWithRetry(ownerRef *owner.Owner, soft bool) (int, 
 }
 
 func (d *Daemon) scheduleOwnerFinalizationRetry(serverID string, entry *OwnerEntry, reason ownerRemovalReason, soft bool, eligible func(*OwnerEntry) bool) {
+	if reason == ownerRemovalReasonIdle || reason == ownerRemovalReasonZombie {
+		previousEligible := eligible
+		eligible = func(current *OwnerEntry) bool {
+			return current != nil && !current.Persistent && (previousEligible == nil || previousEligible(current))
+		}
+	}
 	d.mu.Lock()
 	if d.owners[serverID] != entry || entry.removalRetrying {
 		d.mu.Unlock()
