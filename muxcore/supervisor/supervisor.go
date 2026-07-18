@@ -187,7 +187,9 @@ func (reason Reason) String() string {
 
 // Config defines one stable host transport and its replaceable child policy.
 type Config struct {
-	HostIn  io.Reader
+	// HostIn is owned by Run for this invocation. Close must unblock any
+	// pending Read; Run closes the stream during shutdown, so it is not reusable.
+	HostIn  io.ReadCloser
 	HostOut io.Writer
 	Logger  *log.Logger
 

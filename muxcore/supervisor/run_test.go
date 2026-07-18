@@ -112,6 +112,35 @@ func (reader *trackedReadCloser) Close() error {
 	return nil
 }
 
+type blockingHostReadCloser struct {
+	readStarted chan struct{}
+	readDone    chan struct{}
+	closed      chan struct{}
+	startOnce   sync.Once
+	doneOnce    sync.Once
+	closeOnce   sync.Once
+}
+
+func newBlockingHostReadCloser() *blockingHostReadCloser {
+	return &blockingHostReadCloser{
+		readStarted: make(chan struct{}),
+		readDone:    make(chan struct{}),
+		closed:      make(chan struct{}),
+	}
+}
+
+func (reader *blockingHostReadCloser) Read([]byte) (int, error) {
+	reader.startOnce.Do(func() { close(reader.readStarted) })
+	<-reader.closed
+	reader.doneOnce.Do(func() { close(reader.readDone) })
+	return 0, io.ErrClosedPipe
+}
+
+func (reader *blockingHostReadCloser) Close() error {
+	reader.closeOnce.Do(func() { close(reader.closed) })
+	return nil
+}
+
 func TestJoinPumpClosesStdoutAfterNormalCompletion(t *testing.T) {
 	pumpDone := make(chan struct{})
 	close(pumpDone)
@@ -1311,10 +1340,60 @@ func TestRunHostEOFCancelsBlockedResolve(t *testing.T) {
 	}
 }
 
+func TestRunCallerCancellationClosesHostInputBeforeReturn(t *testing.T) {
+	hostInput := newBlockingHostReadCloser()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			HostIn:  hostInput,
+			HostOut: io.Discard,
+			Resolve: func(ctx context.Context) (EngineRef, error) {
+				<-ctx.Done()
+				return EngineRef{}, ctx.Err()
+			},
+			Start: func(context.Context, EngineRef) (StartResult, error) {
+				return StartResult{}, errors.New("unexpected start")
+			},
+			GracefulStopTimeout: time.Second,
+		})
+	}()
+
+	select {
+	case <-hostInput.readStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("host reader did not block")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run error = %v, want context cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not stop after caller cancellation")
+	}
+	select {
+	case <-hostInput.closed:
+	default:
+		t.Fatal("Run returned without closing host input")
+	}
+	select {
+	case <-hostInput.readDone:
+	default:
+		t.Fatal("Run returned before the blocked host read exited")
+	}
+}
+
 type discardWriteCloser struct{}
 
 func (discardWriteCloser) Write(buffer []byte) (int, error) { return len(buffer), nil }
 func (discardWriteCloser) Close() error                     { return nil }
+
+type bufferWriteCloser struct{ bytes.Buffer }
+
+func (*bufferWriteCloser) Close() error { return nil }
 
 type noProofChild struct {
 	wait chan Exit
@@ -1838,6 +1917,47 @@ func TestAwaitingDormantExitForwardsOnlyFirstOrdinaryFrame(t *testing.T) {
 	}
 }
 
+func TestAwaitingDormantExitCorrelatesFirstChildRequest(t *testing.T) {
+	request, err := parseFrame([]byte(`{"jsonrpc":"2.0","id":"post-ack","method":"roots/list"}`), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := parseFrame([]byte(`{"jsonrpc":"2.0","id":"post-ack","result":{}}`), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hostOutput bytes.Buffer
+	childInput := new(bufferWriteCloser)
+	runner := &runner{
+		cfg:               Config{HostOut: &hostOutput},
+		state:             StateAwaitingDormantExit,
+		current:           &generation{id: 1, stdin: childInput},
+		host:              newDirectionRegistry(),
+		child:             newDirectionRegistry(),
+		initializeRequest: []byte(`{}`),
+		initialized:       []byte(`{}`),
+	}
+
+	runner.handleChildFrame(request)
+	if !strings.Contains(hostOutput.String(), `"id":"post-ack"`) {
+		t.Fatalf("post-ACK request was not forwarded: %s", hostOutput.String())
+	}
+	if runner.child.requests[request.id.key] == nil {
+		t.Fatal("post-ACK request was exposed without correlation")
+	}
+	if !runner.dormancyInvalid {
+		t.Fatal("post-ACK request did not invalidate dormancy")
+	}
+
+	runner.handleHostEvent(hostFrameEvent{sequence: 1, arrived: time.Now(), frame: response})
+	if !strings.Contains(childInput.String(), `"id":"post-ack"`) {
+		t.Fatalf("host response did not reach post-ACK child request: %s", childInput.String())
+	}
+	if runner.child.requests[request.id.key] != nil {
+		t.Fatal("post-ACK request correlation was not completed")
+	}
+}
+
 func TestDormantLeaseExpiresAfterNonWakingPreDeadlineFrame(t *testing.T) {
 	frame, err := parseFrame(ProtocolV2().Frame(ControlDormantReady), 1024)
 	if err != nil {
@@ -1868,6 +1988,39 @@ func TestDormantLeaseExpiresAfterNonWakingPreDeadlineFrame(t *testing.T) {
 	runner.handleHostEvent(hostFrameEvent{sequence: sequence, arrived: arrived, frame: frame})
 	if !runner.terminal {
 		t.Fatal("non-waking frame permanently disarmed dormant lease expiry")
+	}
+}
+
+func TestDormantLeaseUsesMonotonicProcessedHostSequence(t *testing.T) {
+	frame, err := parseFrame(ProtocolV2().Frame(ControlDormantReady), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deadline := time.Now().Add(-time.Millisecond)
+	arrived := deadline.Add(-time.Millisecond)
+	runner := &runner{
+		ctx:                  ctx,
+		cancel:               cancel,
+		cfg:                  Config{DormantLease: time.Second, runtimeClock: realClock{}},
+		state:                StateDormant,
+		host:                 newDirectionRegistry(),
+		child:                newDirectionRegistry(),
+		dormantLeaseDeadline: deadline,
+		dormantLeaseTimer:    realClock{}.NewTimer(time.Hour),
+	}
+	first := runner.hostBoundary.record(arrived)
+	second := runner.hostBoundary.record(arrived)
+
+	runner.handleHostEvent(hostFrameEvent{sequence: second, arrived: arrived, frame: frame})
+	runner.handleHostEvent(hostFrameEvent{sequence: first, arrived: arrived, frame: frame})
+	if runner.lastHostSequence != second {
+		t.Fatalf("processed host sequence regressed to %d, want %d", runner.lastHostSequence, second)
+	}
+	runner.handleDormantLease(deadline)
+	if !runner.terminal {
+		t.Fatal("replayed older frame permanently disarmed dormant lease expiry")
 	}
 }
 

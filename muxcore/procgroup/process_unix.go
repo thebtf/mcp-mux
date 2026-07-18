@@ -31,9 +31,6 @@ func configurePlatform(cmd *exec.Cmd, p *Process) error {
 	if p.disableTree {
 		return nil
 	}
-	if err := prepareProcessTreeAuthority(); err != nil {
-		return err
-	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	p.platform.finalized = make(chan struct{})
 	return nil
@@ -111,9 +108,6 @@ func waitProcessGroupGone(pgid int, leaderDone <-chan struct{}) error {
 		}
 	}
 	for {
-		if err := drainWaitableGroupChildren(pgid); err != nil {
-			return fmt.Errorf("reap adopted process group %d children: %w", pgid, err)
-		}
 		err := syscall.Kill(-pgid, 0)
 		if errors.Is(err, syscall.ESRCH) {
 			return nil

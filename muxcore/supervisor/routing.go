@@ -9,7 +9,9 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	if runner.terminal {
 		return
 	}
-	runner.lastHostSequence = event.sequence
+	if event.sequence > runner.lastHostSequence {
+		runner.lastHostSequence = event.sequence
+	}
 	defer runner.resumeDormantLeaseAfterHost()
 	if event.err != nil {
 		code, message := invalidFrameResponse(event.err)
@@ -33,7 +35,7 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 
 	switch {
 	case isResponse(frame):
-		if runner.state == StateActive || runner.state == StateReplaying {
+		if runner.state == StateActive || runner.state == StateReplaying || runner.state == StateAwaitingDormantExit {
 			runner.handleHostResponse(frame)
 		} else if runner.state == StateQuiescing {
 			runner.enqueueHost(item, true)
@@ -355,6 +357,13 @@ func (runner *runner) handleChildFrame(frame *parsedFrame) {
 	}
 	if runner.state == StateAwaitingDormantExit {
 		if runner.dormancyInvalid {
+			return
+		}
+		if frame.kind == frameRequest {
+			runner.handleChildRequest(frame)
+			if runner.state == StateAwaitingDormantExit {
+				runner.dormancyInvalid = true
+			}
 			return
 		}
 		if err := runner.writeHost(frame.raw); err != nil {

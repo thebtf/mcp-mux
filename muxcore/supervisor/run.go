@@ -432,9 +432,7 @@ func (runner *runner) shutdown() error {
 	runner.stopAllTimers()
 	runner.setState(StateStopping, runner.terminalReason)
 
-	if closer, ok := runner.cfg.HostIn.(io.Closer); ok {
-		_ = closer.Close()
-	}
+	_ = runner.cfg.HostIn.Close()
 	hostTimer := runner.cfg.runtimeClock.NewTimer(runner.cfg.GracefulStopTimeout)
 	select {
 	case <-runner.hostDone:

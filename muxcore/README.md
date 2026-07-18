@@ -484,6 +484,10 @@ err := supervisor.Run(ctx, supervisor.Config{
 })
 ```
 
+`HostIn` transfers ownership of an `io.ReadCloser` to `Run` for the invocation.
+Its `Close` method must unblock any pending `Read`; the supervisor closes it on
+every shutdown path, so callers must not reuse the stream after `Run` returns.
+
 The supervisor guarantees:
 
 - one serialized writer to host stdout and at most one live child process-tree
@@ -511,7 +515,9 @@ different `EngineRef` through its own recovery policy.
 
 After an authorized dormant ACK, at most one ordinary child frame is forwarded
 before dormancy is invalidated; later ordinary frames from that generation are
-suppressed until bounded finalization replaces it. A reader-observed host frame
+suppressed until bounded finalization replaces it. If the forwarded frame is a
+request, its response remains correlated to the same generation until
+completion or retirement. A reader-observed host frame
 at or before the dormant-lease deadline wins the timer race, while a rejected or
 otherwise non-waking frame cannot permanently disarm lease expiry.
 

@@ -101,9 +101,6 @@ current release:
 - **Installed-engine TOCTOU** — authorization verifies canonical path nodes and
   content before exec, but does not pin an immutable file/directory handle
   across validation and launch; closing this requires a new execution contract.
-- **Process-wide Linux subreaper** — exact-PGID finalization can adopt unrelated
-  orphan descendants in a native consumer process without a general reaper;
-  isolate or coordinate subreaper ownership before broad native reuse.
 - **Signed engine provenance** — parent-side authorization now requires the
   exact active pointer, installed version-store layout, no symlink escape, and
   content matching the 12-hex version directory. Authenticating a malicious

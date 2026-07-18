@@ -28,7 +28,7 @@ func TestConfigDefaultsAndValidation(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := (Config{
-		HostIn:  bytes.NewReader(nil),
+		HostIn:  io.NopCloser(bytes.NewReader(nil)),
 		HostOut: new(bytes.Buffer),
 		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
 		Start:   func(context.Context, EngineRef) (StartResult, error) { return StartResult{}, nil },

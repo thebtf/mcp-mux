@@ -28,7 +28,7 @@ type launcherSupervisorConfig struct {
 	LauncherPath        string
 	InitialEnginePath   string
 	Args                []string
-	Stdin               io.Reader
+	Stdin               io.ReadCloser
 	Stdout              io.Writer
 	Stderr              io.Writer
 	ResolveActiveEngine func(string) (string, bool)

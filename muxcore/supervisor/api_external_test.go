@@ -26,7 +26,7 @@ func (externalAdmission) Verified() bool { return true }
 func (externalAdmission) Close() error   { return nil }
 
 func TestPublicContractCompilesExternally(t *testing.T) {
-	input := bytes.NewBufferString("")
+	input := io.NopCloser(bytes.NewBufferString(""))
 	output := new(bytes.Buffer)
 	exits := make(chan supervisor.Exit, 1)
 
