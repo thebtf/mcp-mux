@@ -37,7 +37,7 @@ func main() {
 		err = fmt.Errorf("unknown launcher mode %q", *mode)
 	}
 	if *attestationFile != "" {
-		if writeErr := os.WriteFile(*attestationFile, []byte(strconv.FormatBool(verified)), 0o600); writeErr != nil && err == nil {
+		if writeErr := writeAttestationResult(*attestationFile, verified); writeErr != nil && err == nil {
 			err = writeErr
 		}
 	}
@@ -74,6 +74,9 @@ func runNew(engine, engineMode, pidFile string) (bool, error) {
 			return supervisor.EngineRef{ID: engine}, nil
 		},
 		Start: func(ctx context.Context, requested supervisor.EngineRef) (supervisor.StartResult, error) {
+			parentMu.Lock()
+			lastParent = nil
+			parentMu.Unlock()
 			parent, err := attest.StartParent(context.Background(), attest.ParentConfig{Lifetime: 2 * time.Second, IOTimeout: time.Second})
 			if err != nil {
 				return supervisor.StartResult{}, err
@@ -119,6 +122,22 @@ func runNew(engine, engineMode, pidFile string) (bool, error) {
 	verified := lastParent != nil && lastParent.Verified()
 	parentMu.Unlock()
 	return verified, err
+}
+
+func writeAttestationResult(path string, verified bool) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := io.WriteString(file, strconv.FormatBool(verified)); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func recordPID(path string, pid int) error {

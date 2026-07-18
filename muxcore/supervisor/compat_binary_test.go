@@ -31,6 +31,14 @@ func TestRealBinaryRollingCompatibilityMatrix(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "children.txt")
 			attestationFile := filepath.Join(t.TempDir(), "attestation.txt")
+			if runtime.GOOS != "windows" {
+				if err := os.WriteFile(attestationFile, []byte("stale"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(attestationFile, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
 			command := exec.Command(launcher,
 				"--mode", testCase.launcherMode,
 				"--engine", engine,
@@ -102,6 +110,15 @@ func TestRealBinaryRollingCompatibilityMatrix(t *testing.T) {
 			wantAttestation := testCase.launcherMode == "new" && testCase.engineMode == "new"
 			if got := strings.TrimSpace(string(attestation)) == "true"; got != wantAttestation {
 				t.Fatalf("private attestation = %t, want %t; raw=%q stderr=%s", got, wantAttestation, attestation, stderr.String())
+			}
+			if runtime.GOOS != "windows" {
+				info, err := os.Stat(attestationFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got != 0o600 {
+					t.Fatalf("attestation file mode = %o, want 600", got)
+				}
 			}
 			data, err := os.ReadFile(pidFile)
 			if err != nil {
