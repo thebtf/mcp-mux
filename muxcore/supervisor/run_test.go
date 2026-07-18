@@ -815,7 +815,7 @@ func TestRunCancellationProgressAndTaskLifetime(t *testing.T) {
 	})
 	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
 	_ = nextLine(t, childInput)
-	if err := child.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"engine","version":"1"}}}`); err != nil {
+	if err := child.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"tools":{"call":{}}}}},"serverInfo":{"name":"engine","version":"1"}}}`); err != nil {
 		t.Fatal(err)
 	}
 	_ = nextLine(t, harness.hostOutput)
@@ -857,7 +857,7 @@ func TestRunCancellationProgressAndTaskLifetime(t *testing.T) {
 	if got := nextLine(t, childInput); !strings.Contains(got, `"method":"tasks/get"`) {
 		t.Fatalf("task get = %s", got)
 	}
-	if err := child.write(`{"jsonrpc":"2.0","id":"get-task","result":{"task":{"taskId":"task-1","status":"working"}}}`); err != nil {
+	if err := child.write(`{"jsonrpc":"2.0","id":"get-task","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`); err != nil {
 		t.Fatal(err)
 	}
 	_ = nextLine(t, harness.hostOutput)
@@ -884,7 +884,7 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 			return StartResult{Child: child, Actual: EngineRef{ID: "engine"}}, nil
 		},
 	})
-	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"sampling":{"createMessage":{}}}}},"clientInfo":{"name":"test","version":"1"}}}`)
 	_ = nextLine(t, childInput)
 	if err := child.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"engine","version":"1"}}}`); err != nil {
 		t.Fatal(err)
@@ -915,7 +915,7 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"method":"tasks/get"`) {
 		t.Fatalf("child task request = %s", got)
 	}
-	harness.send(t, `{"jsonrpc":"2.0","id":8,"result":{"task":{"taskId":"child-task","status":"working"}}}`)
+	harness.send(t, `{"jsonrpc":"2.0","id":8,"result":{"taskId":"child-task","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
 	_ = nextLine(t, childInput)
 	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"child-task","status":"completed"}}`)
 	if got := nextLine(t, childInput); !strings.Contains(got, `"status":"completed"`) {
@@ -1004,6 +1004,34 @@ func TestRunPendingCancellationAndQueueOverflow(t *testing.T) {
 		t.Fatalf("retained request = %s", got)
 	}
 	assertNoLine(t, secondInput, 100*time.Millisecond)
+	harness.closeAndWait(t)
+}
+
+func TestRunClassifiesMalformedAndStructurallyInvalidFrames(t *testing.T) {
+	child := newTestChild()
+	childInput := streamLines(child.inputReader)
+	harness := startHarness(t, Config{
+		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
+		Start: func(context.Context, EngineRef) (StartResult, error) {
+			return StartResult{Child: child, Actual: EngineRef{ID: "engine"}}, nil
+		},
+	})
+
+	harness.send(t, `{"jsonrpc":"2.0","id":`)
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"code":-32700`) || !strings.Contains(got, `"message":"parse error"`) {
+		t.Fatalf("malformed JSON response = %s", got)
+	}
+	assertNoLine(t, childInput, 100*time.Millisecond)
+
+	harness.send(t, `[]`)
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"code":-32600`) || !strings.Contains(got, `"message":"invalid JSON-RPC frame"`) {
+		t.Fatalf("invalid request response = %s", got)
+	}
+	assertNoLine(t, childInput, 100*time.Millisecond)
+
+	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`)
+	assertNoLine(t, harness.hostOutput, 100*time.Millisecond)
+	assertNoLine(t, childInput, 100*time.Millisecond)
 	harness.closeAndWait(t)
 }
 

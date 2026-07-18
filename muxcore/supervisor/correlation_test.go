@@ -104,3 +104,108 @@ func TestTaskCompletionRejectsDuplicateLiveTaskID(t *testing.T) {
 		t.Fatalf("task-augmented error response rejected: %v", err)
 	}
 }
+
+func TestTaskRequestSupportedUsesReceiverCapabilities(t *testing.T) {
+	serverInitialize := []byte(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"tools":{"call":{}}}}},"serverInfo":{"name":"server","version":"1"}}}`)
+	if !taskRequestSupported(serverInitialize, true, "tools/call") {
+		t.Fatal("server tools/call task capability was not recognized")
+	}
+	for _, method := range []string{"tools/list", "sampling/createMessage", "unknown/call"} {
+		if taskRequestSupported(serverInitialize, true, method) {
+			t.Fatalf("server capability unexpectedly authorized %s", method)
+		}
+	}
+
+	clientInitialize := []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"sampling":{"createMessage":{}},"elicitation":{"create":{}}}}},"clientInfo":{"name":"client","version":"1"}}}`)
+	for _, method := range []string{"sampling/createMessage", "elicitation/create"} {
+		if !taskRequestSupported(clientInitialize, false, method) {
+			t.Fatalf("client capability did not authorize %s", method)
+		}
+	}
+	if taskRequestSupported(clientInitialize, false, "tools/call") || taskRequestSupported(nil, false, "sampling/createMessage") {
+		t.Fatal("absent client request capability authorized task augmentation")
+	}
+}
+
+func TestTaskOperationResponsesRetireWithoutStatusNotification(t *testing.T) {
+	seed := func(t *testing.T) *directionRegistry {
+		t.Helper()
+		registry := newDirectionRegistry()
+		request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","method":"tools/call","params":{"_meta":{"progressToken":"progress"},"task":{}}}`)
+		record := registry.register(request, 1)
+		response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","result":{"task":{"taskId":"task-1","status":"working"}}}`)
+		if err := registry.canComplete(record, response); err != nil {
+			t.Fatal(err)
+		}
+		registry.complete(record, response)
+		if registry.tasks["task-1"] == nil || len(registry.tokens) != 1 {
+			t.Fatalf("seed task state = tasks:%d tokens:%d", len(registry.tasks), len(registry.tokens))
+		}
+		return &registry
+	}
+
+	t.Run("non-terminal get remains live", func(t *testing.T) {
+		registry := seed(t)
+		operation := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+		record := registry.register(operation, 1)
+		response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"input_required","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+		if err := registry.canComplete(record, response); err != nil {
+			t.Fatal(err)
+		}
+		registry.complete(record, response)
+		if task := registry.tasks["task-1"]; task == nil || task.status != "input_required" || len(registry.tokens) != 1 {
+			t.Fatalf("non-terminal state = task:%#v tokens:%d", task, len(registry.tokens))
+		}
+	})
+
+	for _, method := range []string{"tasks/get", "tasks/cancel", "tasks/result"} {
+		t.Run(method+" error remains live", func(t *testing.T) {
+			registry := seed(t)
+			operation := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"operation","method":%q,"params":{"taskId":"task-1"}}`, method))
+			record := registry.register(operation, 1)
+			response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"operation","error":{"code":-32000,"message":"not ready"}}`)
+			if err := registry.canComplete(record, response); err != nil {
+				t.Fatal(err)
+			}
+			registry.complete(record, response)
+			if task := registry.tasks["task-1"]; task == nil || len(registry.tokens) != 1 {
+				t.Fatalf("operation error retired live task: task=%#v tokens=%d", task, len(registry.tokens))
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		method   string
+		response string
+	}{
+		{name: "terminal get", method: "tasks/get", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "cancel", method: "tasks/cancel", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "result", method: "tasks/result", response: `{"jsonrpc":"2.0","id":"operation","result":{"content":[]}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			registry := seed(t)
+			operation := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"operation","method":%q,"params":{"taskId":"task-1"}}`, testCase.method))
+			record := registry.register(operation, 1)
+			response := mustParseCorrelationFrame(t, testCase.response)
+			if err := registry.canComplete(record, response); err != nil {
+				t.Fatal(err)
+			}
+			registry.complete(record, response)
+			if len(registry.tasks) != 0 || len(registry.tokens) != 0 {
+				t.Fatalf("terminal operation retained state: tasks=%d tokens=%d", len(registry.tasks), len(registry.tokens))
+			}
+		})
+	}
+}
+
+func TestTaskOperationResponseRejectsMismatchedTaskID(t *testing.T) {
+	registry := newDirectionRegistry()
+	registry.tasks["task-1"] = &taskRecord{id: "task-1", generation: 1}
+	operation := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+	record := registry.register(operation, 1)
+	response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"other","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(record, response); err == nil {
+		t.Fatal("tasks/get accepted a mismatched taskId")
+	}
+}

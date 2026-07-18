@@ -14,7 +14,6 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
@@ -32,6 +31,10 @@ const (
 	defaultLifetime  = 5 * time.Second
 	defaultIOTimeout = 2 * time.Second
 )
+
+var writeAttestationResponse = func(writer io.Writer) (int, error) {
+	return io.WriteString(writer, attestationResponse)
+}
 
 // Advertisement is the non-secret location and parent claim passed to a
 // prospective child. Peer process credentials, not these values alone, decide
@@ -61,7 +64,7 @@ type Parent struct {
 	closed      bool
 	bound       chan struct{}
 
-	verified  atomic.Bool
+	verified  bool
 	closeOnce sync.Once
 	closeErr  error
 	closing   chan struct{}
@@ -142,7 +145,12 @@ func (parent *Parent) BindChildPID(pid int) error {
 
 // Verified reports whether the bound child completed the exact exchange.
 func (parent *Parent) Verified() bool {
-	return parent != nil && parent.verified.Load()
+	if parent == nil {
+		return false
+	}
+	parent.bindMu.Lock()
+	defer parent.bindMu.Unlock()
+	return parent.verified
 }
 
 // Done closes when the endpoint expires, verifies, or is closed.
@@ -187,20 +195,10 @@ func (parent *Parent) serve() {
 		}
 		verified := parent.verifyConnection(conn)
 		_ = conn.Close()
-		if verified && parent.markVerified() {
+		if verified {
 			return
 		}
 	}
-}
-
-func (parent *Parent) markVerified() bool {
-	parent.bindMu.Lock()
-	defer parent.bindMu.Unlock()
-	if parent.closed || !time.Now().Before(parent.expiresAt) {
-		return false
-	}
-	parent.verified.Store(true)
-	return true
 }
 
 func (parent *Parent) verifyConnection(conn net.Conn) bool {
@@ -227,10 +225,18 @@ func (parent *Parent) verifyConnection(conn net.Conn) bool {
 	if _, err := io.ReadFull(conn, request); err != nil || string(request) != attestationRequest {
 		return false
 	}
-	if _, err := io.WriteString(conn, attestationResponse); err != nil {
+	parent.bindMu.Lock()
+	defer parent.bindMu.Unlock()
+	if parent.closed || !time.Now().Before(parent.expiresAt) {
 		return false
 	}
-	return time.Now().Before(parent.expiresAt)
+	parent.verified = true
+	written, _ := writeAttestationResponse(conn)
+	if written != len(attestationResponse) {
+		parent.verified = false
+		return false
+	}
+	return true
 }
 
 // VerifyConfig configures child-side verification.

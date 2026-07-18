@@ -12,7 +12,8 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	runner.lastHostSequence = event.sequence
 	defer runner.resumeDormantLeaseAfterHost()
 	if event.err != nil {
-		if err := runner.writeHost(localErrorFrame(nil, codeInvalidRequest, "invalid JSON-RPC frame")); err != nil {
+		code, message := invalidFrameResponse(event.err)
+		if err := runner.writeHost(localErrorFrame(nil, code, message)); err != nil {
 			runner.terminate(ReasonHostOutputFailure, err)
 		}
 		return
@@ -56,6 +57,13 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	default:
 		runner.enqueueHost(item, false)
 	}
+}
+
+func invalidFrameResponse(err error) (int, string) {
+	if errors.Is(err, ErrMalformedJSON) {
+		return -32700, "parse error"
+	}
+	return codeInvalidRequest, "invalid JSON-RPC frame"
 }
 
 func isInitializationPing(frame *parsedFrame) bool {
@@ -189,6 +197,9 @@ func (runner *runner) enqueueHost(item *pendingFrame, sameGenerationOnly bool) {
 }
 
 func (runner *runner) validateHostRequest(frame *parsedFrame) error {
+	if frame.taskAugmented && !taskRequestSupported(runner.initializeResponse, true, frame.method) {
+		frame.taskAugmented = false
+	}
 	if frame.utilityErr != nil {
 		return fmt.Errorf("invalid request metadata")
 	}
@@ -422,6 +433,9 @@ func (runner *runner) handleChildRequest(frame *parsedFrame) {
 	if runner.current == nil || (runner.initialized == nil && (runner.initializeRequest == nil || !isInitializationPing(frame))) {
 		runner.replaceCurrent(ReasonProtocolFailure)
 		return
+	}
+	if frame.taskAugmented && !taskRequestSupported(runner.initializeRequest, false, frame.method) {
+		frame.taskAugmented = false
 	}
 	if frame.utilityErr != nil {
 		runner.rejectChildRequest(frame, codeInvalidParams, "invalid request metadata")

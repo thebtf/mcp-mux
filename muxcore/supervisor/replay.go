@@ -1,5 +1,7 @@
 package supervisor
 
+import "fmt"
+
 func (runner *runner) beginReplay() {
 	if runner.current == nil || runner.initializeRequest == nil || runner.initializeID == nil {
 		runner.replaceCurrent(ReasonProtocolFailure)
@@ -37,9 +39,11 @@ func (runner *runner) handleReplayFrame(frame *parsedFrame) {
 			runner.replaceCurrent(ReasonProtocolFailure)
 			return
 		}
-		if runner.initializeResponse != nil && frame.kind != frameResult {
-			runner.replaceCurrent(ReasonProtocolFailure)
-			return
+		if runner.initializeResponse != nil {
+			if frame.kind != frameResult || !sameInitializeProtocolVersion(runner.initializeResponse, frame) {
+				runner.replaceCurrent(ReasonProtocolFailure)
+				return
+			}
 		}
 		runner.replayResponse = append([]byte(nil), frame.raw...)
 		runner.completeReplay(frame)
@@ -161,4 +165,36 @@ func (runner *runner) flushPending() {
 			frame:    item.frame,
 		})
 	}
+}
+
+func sameInitializeProtocolVersion(original []byte, replacement *parsedFrame) bool {
+	originalFrame, err := parseFrame(original, 0)
+	if err != nil {
+		return false
+	}
+	originalVersion, err := initializeProtocolVersion(originalFrame)
+	if err != nil {
+		return false
+	}
+	replacementVersion, err := initializeProtocolVersion(replacement)
+	return err == nil && replacementVersion == originalVersion
+}
+
+func initializeProtocolVersion(frame *parsedFrame) (string, error) {
+	if frame == nil || frame.kind != frameResult {
+		return "", fmt.Errorf("initialize response is not a result")
+	}
+	result, err := decodeObject(frame.result)
+	if err != nil {
+		return "", fmt.Errorf("initialize result: %w", err)
+	}
+	raw, ok := result["protocolVersion"]
+	if !ok {
+		return "", fmt.Errorf("initialize result is missing protocolVersion")
+	}
+	version, err := parseString(raw, "protocolVersion")
+	if err != nil || version == "" {
+		return "", fmt.Errorf("initialize protocolVersion must be a non-empty string")
+	}
+	return version, nil
 }

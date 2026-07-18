@@ -3,6 +3,7 @@ package supervisor
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -66,6 +67,70 @@ func TestParseFrameRejectsInvalidJSONRPC(t *testing.T) {
 	}
 	if _, err := parseFrame([]byte(`{"jsonrpc":"2.0","method":"long"}`), 8); !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("oversize error = %v", err)
+	}
+}
+
+func TestParseFrameRejectsNonJSONWhitespaceAndInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	frame, err := parseFrame([]byte("\t\r\n {\"jsonrpc\":\"2.0\",\"method\":\"ping\"} \r\n"), 1024)
+	if err != nil || frame.kind != frameNotification {
+		t.Fatalf("JSON whitespace frame = %#v, %v", frame, err)
+	}
+
+	for name, raw := range map[string][]byte{
+		"vertical-tab wrapper": []byte("\v{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\v"),
+		"form-feed wrapper":    []byte("\f{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\f"),
+		"non-JSON whitespace":  append([]byte{0xc2, 0xa0}, []byte(`{"jsonrpc":"2.0","method":"ping"}`)...),
+		"invalid UTF-8 in ID":  []byte("{\"jsonrpc\":\"2.0\",\"id\":\"a\xffb\",\"method\":\"ping\"}"),
+		"malformed JSON":       []byte(`{"jsonrpc":"2.0","method":`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseFrame(raw, 1024); !errors.Is(err, ErrMalformedJSON) {
+				t.Fatalf("parse error = %v, want ErrMalformedJSON", err)
+			}
+		})
+	}
+	if _, err := parseFrame([]byte(`[]`), 1024); err == nil || errors.Is(err, ErrMalformedJSON) {
+		t.Fatalf("well-formed non-object error = %v, want invalid request classification", err)
+	}
+}
+
+func TestParseFrameRequiresMCPObjectParamsAndResults(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":[]}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":null}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"x"}`,
+		`{"jsonrpc":"2.0","id":1,"result":[]}`,
+		`{"jsonrpc":"2.0","id":1,"result":null}`,
+		`{"jsonrpc":"2.0","id":1,"result":true}`,
+	} {
+		if _, err := parseFrame([]byte(raw), 1024); err == nil || errors.Is(err, ErrMalformedJSON) {
+			t.Errorf("parseFrame(%s) error = %v, want structural rejection", raw, err)
+		}
+	}
+
+	for _, raw := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{}}`,
+	} {
+		if _, err := parseFrame([]byte(raw), 1024); err != nil {
+			t.Errorf("parseFrame(%s) error = %v", raw, err)
+		}
+	}
+}
+
+func TestInvalidFrameResponseUsesJSONRPCErrorClasses(t *testing.T) {
+	t.Parallel()
+
+	if code, message := invalidFrameResponse(fmt.Errorf("wrapped: %w", ErrMalformedJSON)); code != -32700 || message != "parse error" {
+		t.Fatalf("malformed response = (%d, %q)", code, message)
+	}
+	if code, message := invalidFrameResponse(errors.New("invalid envelope")); code != codeInvalidRequest || message != "invalid JSON-RPC frame" {
+		t.Fatalf("invalid request response = (%d, %q)", code, message)
 	}
 }
 

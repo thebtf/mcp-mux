@@ -30,7 +30,7 @@ func TestPrepareSupervisedEngineStartOwnsDaemonInLauncher(t *testing.T) {
 	}
 	oldEnsure := launcherSupervisorEnsureDaemon
 	called := false
-	launcherSupervisorEnsureDaemon = func(_ *log.Logger, gotLauncher, gotEngine string) error {
+	launcherSupervisorEnsureDaemon = func(_ context.Context, _ *log.Logger, gotLauncher, gotEngine string) error {
 		called = true
 		if gotLauncher != launcherPath || gotEngine != enginePath {
 			t.Fatalf("daemon preparation paths = (%q, %q), want (%q, %q)", gotLauncher, gotEngine, launcherPath, enginePath)
@@ -60,6 +60,53 @@ func TestPrepareSupervisedEngineStartOwnsDaemonInLauncher(t *testing.T) {
 	}
 }
 
+func TestPrepareSupervisedEngineStartCancelsDaemonPreparation(t *testing.T) {
+	t.Setenv("MCP_MUX_NO_DAEMON", "")
+	launcherPath := filepath.Join(t.TempDir(), "mcp-mux.exe")
+	enginePath := writeContentAddressedTestEngine(t, launcherPath, "active engine")
+	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+		t.Fatal(err)
+	}
+
+	oldEnsure := launcherSupervisorEnsureDaemon
+	entered := make(chan struct{})
+	lateSideEffect := make(chan struct{}, 1)
+	launcherSupervisorEnsureDaemon = func(ctx context.Context, _ *log.Logger, _, _ string) error {
+		close(entered)
+		timer := time.NewTimer(100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-timer.C:
+			lateSideEffect <- struct{}{}
+			return nil
+		}
+	}
+	t.Cleanup(func() { launcherSupervisorEnsureDaemon = oldEnsure })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- prepareSupervisedEngineStart(ctx, launcherPath, enginePath, []string{"fixture-mcp"}, io.Discard)
+	}()
+	<-entered
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("prepare cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("daemon preparation ignored cancellation")
+	}
+	select {
+	case <-lateSideEffect:
+		t.Fatal("daemon preparation produced a late side effect after cancellation")
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
 func TestPrepareSupervisedEngineStartRejectsNonActiveEngineBeforeDaemon(t *testing.T) {
 	t.Setenv("MCP_MUX_NO_DAEMON", "")
 	launcherPath := filepath.Join(t.TempDir(), "mcp-mux.exe")
@@ -71,7 +118,7 @@ func TestPrepareSupervisedEngineStartRejectsNonActiveEngineBeforeDaemon(t *testi
 
 	oldEnsure := launcherSupervisorEnsureDaemon
 	called := false
-	launcherSupervisorEnsureDaemon = func(*log.Logger, string, string) error {
+	launcherSupervisorEnsureDaemon = func(context.Context, *log.Logger, string, string) error {
 		called = true
 		return nil
 	}

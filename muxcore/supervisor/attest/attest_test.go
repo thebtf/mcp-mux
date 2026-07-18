@@ -248,3 +248,55 @@ func TestBindChildPIDAfterCloseIsRejected(t *testing.T) {
 		t.Fatal("closed parent accepted a child PID")
 	}
 }
+
+func TestSuccessfulResponseCommitsReceiptBeforeClose(t *testing.T) {
+	parent, err := StartParent(context.Background(), ParentConfig{Lifetime: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	if err := parent.BindChildPID(os.Getpid()); err != nil {
+		t.Fatal(err)
+	}
+
+	originalWrite := writeAttestationResponse
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	writeAttestationResponse = func(conn io.Writer) (int, error) {
+		close(writeStarted)
+		<-releaseWrite
+		return io.WriteString(conn, attestationResponse)
+	}
+	t.Cleanup(func() { writeAttestationResponse = originalWrite })
+
+	verified := make(chan error, 1)
+	go func() {
+		verified <- VerifyParent(context.Background(), VerifyConfig{
+			Advertisement:   parent.Advertisement(),
+			DirectParentPID: os.Getpid(),
+		})
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("parent never reached the attestation response")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- parent.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close passed the in-flight receipt commit: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseWrite)
+	if err := <-verified; err != nil {
+		t.Fatalf("child did not observe attestation success: %v", err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if !parent.Verified() {
+		t.Fatal("child observed success before parent receipt was committed")
+	}
+}

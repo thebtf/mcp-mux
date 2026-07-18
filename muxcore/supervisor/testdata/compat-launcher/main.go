@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/supervisor"
@@ -19,19 +20,26 @@ func main() {
 	engine := flag.String("engine", "", "engine fixture path")
 	engineMode := flag.String("engine-mode", "", "engine fixture mode")
 	pidFile := flag.String("pid-file", "", "child PID ledger")
+	attestationFile := flag.String("attestation-file", "", "attestation result")
 	flag.Parse()
 	if *engine == "" || *pidFile == "" {
 		fmt.Fprintln(os.Stderr, "engine and pid-file are required")
 		os.Exit(2)
 	}
 	var err error
+	verified := false
 	switch *mode {
 	case "old":
 		err = runOld(*engine, *engineMode, *pidFile)
 	case "new":
-		err = runNew(*engine, *engineMode, *pidFile)
+		verified, err = runNew(*engine, *engineMode, *pidFile)
 	default:
 		err = fmt.Errorf("unknown launcher mode %q", *mode)
+	}
+	if *attestationFile != "" {
+		if writeErr := os.WriteFile(*attestationFile, []byte(strconv.FormatBool(verified)), 0o600); writeErr != nil && err == nil {
+			err = writeErr
+		}
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -56,18 +64,23 @@ func runOld(engine, engineMode, pidFile string) error {
 	return cmd.Wait()
 }
 
-func runNew(engine, engineMode, pidFile string) error {
-	return supervisor.Run(context.Background(), supervisor.Config{
+func runNew(engine, engineMode, pidFile string) (bool, error) {
+	var parentMu sync.Mutex
+	var lastParent *attest.Parent
+	err := supervisor.Run(context.Background(), supervisor.Config{
 		HostIn:  os.Stdin,
 		HostOut: os.Stdout,
 		Resolve: func(context.Context) (supervisor.EngineRef, error) {
 			return supervisor.EngineRef{ID: engine}, nil
 		},
 		Start: func(ctx context.Context, requested supervisor.EngineRef) (supervisor.StartResult, error) {
-			parent, err := attest.StartParent(ctx, attest.ParentConfig{Lifetime: 2 * time.Second, IOTimeout: time.Second})
+			parent, err := attest.StartParent(context.Background(), attest.ParentConfig{Lifetime: 2 * time.Second, IOTimeout: time.Second})
 			if err != nil {
 				return supervisor.StartResult{}, err
 			}
+			parentMu.Lock()
+			lastParent = parent
+			parentMu.Unlock()
 			advertisement := parent.Advertisement()
 			env := append(os.Environ(),
 				"MCP_MUX_COMPAT_ENGINE_MODE="+engineMode,
@@ -102,6 +115,10 @@ func runNew(engine, engineMode, pidFile string) error {
 		OutputDrainTimeout:  2 * time.Second,
 		DormantExitTimeout:  2 * time.Second,
 	})
+	parentMu.Lock()
+	verified := lastParent != nil && lastParent.Verified()
+	parentMu.Unlock()
+	return verified, err
 }
 
 func recordPID(path string, pid int) error {

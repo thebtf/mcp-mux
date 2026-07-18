@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -270,6 +271,113 @@ func TestLauncherAttestationHelper(t *testing.T) {
 	}
 }
 
+const (
+	launcherRollbackHelperMode = "MCPMUX_LAUNCHER_ROLLBACK_TEST_MODE"
+	launcherRollbackHelperAddr = "MCPMUX_LAUNCHER_ROLLBACK_TEST_ADDR"
+)
+
+func TestLauncherRollbackTreeHelper(t *testing.T) {
+	switch os.Getenv(launcherRollbackHelperMode) {
+	case "parent":
+		cmd := exec.Command(os.Args[0], "-test.run=^TestLauncherRollbackTreeHelper$")
+		cmd.Env = setEnv(os.Environ(), launcherRollbackHelperMode, "descendant")
+		cmd.Env = setEnv(cmd.Env, launcherRollbackHelperAddr, os.Getenv(launcherRollbackHelperAddr))
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, "start descendant:", err)
+			os.Exit(30)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	case "descendant":
+		conn, err := net.DialTimeout("tcp", os.Getenv(launcherRollbackHelperAddr), time.Second)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "dial rollback probe:", err)
+			os.Exit(31)
+		}
+		defer conn.Close()
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+}
+
+func TestLauncherBindFailureRetiresDescendantTree(t *testing.T) {
+	requireLauncherAttestationPlatform(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		accepted <- acceptResult{conn: conn, err: acceptErr}
+	}()
+
+	originalStart := launcherAttestationStart
+	originalBind := launcherAttestationBind
+	launcherAttestationStart = func() (*attest.Parent, error) {
+		parent, startErr := originalStart()
+		if startErr != nil {
+			return nil, startErr
+		}
+		if bindErr := parent.BindChildPID(os.Getpid()); bindErr != nil {
+			_ = parent.Close()
+			return nil, bindErr
+		}
+		return parent, nil
+	}
+	var descendant net.Conn
+	launcherAttestationBind = func(parent *attest.Parent, pid int) error {
+		select {
+		case result := <-accepted:
+			if result.err != nil {
+				return result.err
+			}
+			descendant = result.conn
+		case <-time.After(3 * time.Second):
+			return errors.New("descendant did not start before attestation bind")
+		}
+		return parent.BindChildPID(pid)
+	}
+	t.Cleanup(func() {
+		launcherAttestationStart = originalStart
+		launcherAttestationBind = originalBind
+		if descendant != nil {
+			_ = descendant.Close()
+		}
+	})
+
+	cmd := newLauncherEnvCommand(os.Args[0], os.Args[0], []string{"-test.run=^TestLauncherRollbackTreeHelper$"})
+	cmd.Env = setEnv(cmd.Env, launcherRollbackHelperMode, "parent")
+	cmd.Env = setEnv(cmd.Env, launcherRollbackHelperAddr, listener.Addr().String())
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_, startErr := startLauncherEnvProcess(context.Background(), cmd)
+	if startErr == nil {
+		t.Fatal("pre-bound attestation unexpectedly accepted the child")
+	}
+	if descendant == nil {
+		t.Fatalf("bind failure occurred before the descendant was observed: %v; stderr=%s", startErr, stderr.String())
+	}
+	if err := descendant.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	_, readErr := descendant.Read(one[:])
+	if readErr == nil {
+		t.Fatal("descendant connection remained readable after rollback")
+	}
+	if netErr, ok := readErr.(net.Error); ok && netErr.Timeout() {
+		t.Fatal("descendant survived attestation bind rollback")
+	}
+}
+
 func requireLauncherAttestationPlatform(t *testing.T) {
 	t.Helper()
 	switch runtime.GOOS {
@@ -295,10 +403,11 @@ func TestLauncherAttestationBindsServerToDirectParent(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			cmd.Stdout = &stdout
 			cmd.Stderr = &stderr
-			if err := startLauncherEnvCommand(cmd); err != nil {
+			process, err := startLauncherEnvProcess(context.Background(), cmd)
+			if err != nil {
 				t.Fatalf("helper start failed: %v; stderr=%s", err, stderr.String())
 			}
-			if err := cmd.Wait(); err != nil {
+			if err := process.Wait(); err != nil {
 				t.Fatalf("helper failed: %v; stderr=%s", err, stderr.String())
 			}
 			if got := stdout.String(); got != tc.want {
@@ -354,7 +463,7 @@ func TestLauncherCommandStartFailureCancelsAttestation(t *testing.T) {
 
 	missing := filepath.Join(t.TempDir(), "missing-engine")
 	cmd := newLauncherEnvCommand(filepath.Join(t.TempDir(), "missing-launcher"), missing, nil)
-	if err := startLauncherEnvCommand(cmd); err == nil {
+	if _, err := startLauncherEnvProcess(context.Background(), cmd); err == nil {
 		t.Fatal("missing engine unexpectedly started")
 	}
 	if starts != 1 || len(parents) != 1 {

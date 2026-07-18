@@ -39,10 +39,12 @@ type generation struct {
 	stdout    io.ReadCloser
 	admission ControlAdmission
 
-	cancel   context.CancelFunc
-	pumpDone chan struct{}
-	reapDone chan struct{}
-	exitDone chan struct{}
+	cancel       context.CancelFunc
+	cancelPump   context.CancelFunc
+	cancelReaper context.CancelFunc
+	pumpDone     chan struct{}
+	reapDone     chan struct{}
+	exitDone     chan struct{}
 
 	mu        sync.Mutex
 	exit      Exit
@@ -83,24 +85,30 @@ func newGeneration(
 		admission = nil
 	}
 
-	generationCtx, cancel := context.WithCancel(ctx)
+	pumpCtx, cancelPump := context.WithCancel(ctx)
+	reapCtx, cancelReaper := context.WithCancel(context.Background())
 	generation := &generation{
-		id:        id,
-		requested: requested,
-		actual:    result.Actual,
-		fallback:  result.Fallback,
-		child:     result.Child,
-		stdin:     stdin,
-		stdout:    stdout,
-		admission: admission,
-		cancel:    cancel,
-		pumpDone:  make(chan struct{}),
-		reapDone:  make(chan struct{}),
-		exitDone:  make(chan struct{}),
+		id:           id,
+		requested:    requested,
+		actual:       result.Actual,
+		fallback:     result.Fallback,
+		child:        result.Child,
+		stdin:        stdin,
+		stdout:       stdout,
+		admission:    admission,
+		cancelPump:   cancelPump,
+		cancelReaper: cancelReaper,
+		cancel: func() {
+			cancelPump()
+			cancelReaper()
+		},
+		pumpDone: make(chan struct{}),
+		reapDone: make(chan struct{}),
+		exitDone: make(chan struct{}),
 	}
 
-	go generation.pump(generationCtx, maxFrameBytes, events)
-	go generation.reap(generationCtx, wait, events)
+	go generation.pump(pumpCtx, maxFrameBytes, events)
+	go generation.reap(reapCtx, wait, events)
 	return generation, nil
 }
 
@@ -145,7 +153,13 @@ func (generation *generation) pump(ctx context.Context, maxFrameBytes int, event
 
 func (generation *generation) reap(ctx context.Context, wait <-chan Exit, events chan<- any) {
 	defer close(generation.reapDone)
-	exit, ok := <-wait
+	var exit Exit
+	var ok bool
+	select {
+	case exit, ok = <-wait:
+	case <-ctx.Done():
+		return
+	}
 	if !ok {
 		select {
 		case events <- childProofEvent{
@@ -163,6 +177,22 @@ func (generation *generation) reap(ctx context.Context, wait <-chan Exit, events
 	select {
 	case events <- childExitEvent{generation: generation.id, exit: exit}:
 	case <-ctx.Done():
+	}
+}
+
+func (generation *generation) cancelPumpOnly() {
+	if generation.cancelPump != nil {
+		generation.cancelPump()
+		return
+	}
+	if generation.cancel != nil {
+		generation.cancel()
+	}
+}
+
+func (generation *generation) cancelReaperOnly() {
+	if generation.cancelReaper != nil {
+		generation.cancelReaper()
 	}
 }
 

@@ -9,10 +9,16 @@ import (
 	"io"
 	"math/big"
 	"strings"
+	"unicode/utf8"
 )
 
-// ErrFrameTooLarge reports a line that exceeded the configured frame limit.
-var ErrFrameTooLarge = errors.New("supervisor: frame too large")
+var (
+	// ErrFrameTooLarge reports a line that exceeded the configured frame limit.
+	ErrFrameTooLarge = errors.New("supervisor: frame too large")
+	// ErrMalformedJSON distinguishes JSON syntax/encoding failures from a
+	// well-formed but structurally invalid JSON-RPC request.
+	ErrMalformedJSON = errors.New("supervisor: malformed JSON")
+)
 
 type frameKind uint8
 
@@ -62,12 +68,18 @@ func parseFrame(raw []byte, maxBytes int) (*parsedFrame, error) {
 	if maxBytes > 0 && len(raw) > maxBytes {
 		return nil, ErrFrameTooLarge
 	}
-	if bytes.ContainsAny(raw, "\r\n") {
+	trimmed := trimJSONWhitespace(raw)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("%w: empty frame", ErrMalformedJSON)
+	}
+	if !utf8.Valid(trimmed) {
+		return nil, fmt.Errorf("%w: invalid UTF-8", ErrMalformedJSON)
+	}
+	if bytes.ContainsAny(trimmed, "\r\n") {
 		return nil, fmt.Errorf("supervisor: frame contains a line break")
 	}
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("supervisor: empty frame")
+	if !json.Valid(trimmed) {
+		return nil, fmt.Errorf("%w: invalid JSON text", ErrMalformedJSON)
 	}
 
 	fields, err := decodeObject(trimmed)
@@ -88,8 +100,11 @@ func parseFrame(raw []byte, maxBytes int) (*parsedFrame, error) {
 	errorRaw, hasError := fields["error"]
 	paramsRaw, hasParams := fields["params"]
 
-	if hasParams && !isStructured(paramsRaw) {
-		return nil, fmt.Errorf("supervisor: params must be an object or array")
+	if hasParams && !isJSONObject(paramsRaw) {
+		return nil, fmt.Errorf("supervisor: params must be an object")
+	}
+	if hasResult && !isJSONObject(resultRaw) {
+		return nil, fmt.Errorf("supervisor: result must be an object")
 	}
 	if hasResult && hasError {
 		return nil, fmt.Errorf("supervisor: response contains both result and error")
@@ -364,9 +379,25 @@ func canonicalNumberIsInteger(value string) bool {
 	return exponent.Sign() >= 0
 }
 
-func isStructured(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
+func isJSONObject(raw json.RawMessage) bool {
+	trimmed := trimJSONWhitespace(raw)
+	return len(trimmed) > 0 && trimmed[0] == '{'
+}
+
+func trimJSONWhitespace(raw []byte) []byte {
+	start := 0
+	for start < len(raw) && isJSONWhitespace(raw[start]) {
+		start++
+	}
+	end := len(raw)
+	for end > start && isJSONWhitespace(raw[end-1]) {
+		end--
+	}
+	return raw[start:end]
+}
+
+func isJSONWhitespace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
 }
 
 func decodeObject(raw []byte) (map[string]json.RawMessage, error) {

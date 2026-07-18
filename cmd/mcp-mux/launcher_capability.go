@@ -23,7 +23,10 @@ var (
 	launcherParentExecutable  = directParentExecutable
 	launcherActivePointer     = resolveActiveEnginePointer
 	launcherAttestationStart  = startLauncherAttestation
-	launcherAttestationProbe  = verifyLauncherAttestation
+	launcherAttestationBind   = func(parent *attest.Parent, pid int) error {
+		return parent.BindChildPID(pid)
+	}
+	launcherAttestationProbe = verifyLauncherAttestation
 )
 
 // launcherLifecycleCapable proves that a current engine was directly launched

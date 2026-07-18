@@ -50,7 +50,8 @@ func (runner *runner) finalizeCurrent() error {
 	if generation == nil {
 		return nil
 	}
-	generation.cancel()
+	generation.cancelPumpOnly()
+	defer generation.cancelReaperOnly()
 
 	exit, exited := generation.exitResult()
 	if !exited {
@@ -79,6 +80,7 @@ func (runner *runner) finalizeCurrent() error {
 		return fmt.Errorf("supervisor: child finalization lacks terminal proof of process-tree retirement: %w", exit.Err)
 	}
 
+	generation.cancelReaperOnly()
 	if err := runner.joinPump(generation); err != nil {
 		return err
 	}

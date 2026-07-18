@@ -22,10 +22,12 @@ const lostRequestMessage = "mcp-mux engine restarted, request lost during launch
 
 type requestRecord struct {
 	id            scalarValue
+	method        string
 	initialize    bool
 	generation    uint64
 	progressToken *scalarValue
 	taskAugmented bool
+	taskID        string
 }
 
 type tokenRecord struct {
@@ -138,10 +140,12 @@ func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
 func (registry *directionRegistry) register(frame *parsedFrame, generation uint64) *requestRecord {
 	record := &requestRecord{
 		id:            *frame.id,
+		method:        frame.method,
 		initialize:    frame.method == "initialize",
 		generation:    generation,
 		progressToken: frame.progressToken,
 		taskAugmented: frame.taskAugmented,
+		taskID:        frame.taskID,
 	}
 	registry.requests[record.id.key] = record
 	if record.progressToken != nil {
@@ -154,6 +158,9 @@ func (registry *directionRegistry) register(frame *parsedFrame, generation uint6
 }
 
 func (registry *directionRegistry) canComplete(record *requestRecord, response *parsedFrame) error {
+	if _, handled, err := taskOperationResponse(record, response); handled {
+		return err
+	}
 	if !record.taskAugmented || response.kind == frameError {
 		return nil
 	}
@@ -176,6 +183,20 @@ func (registry *directionRegistry) canComplete(record *requestRecord, response *
 func (registry *directionRegistry) complete(record *requestRecord, response *parsedFrame) {
 	delete(registry.requests, record.id.key)
 	registry.tombstones.add(tombstoneRequest, record.id.key)
+
+	if meta, handled, _ := taskOperationResponse(record, response); handled {
+		if meta != nil {
+			if meta.status == "working" || meta.status == "input_required" {
+				if task := registry.tasks[meta.id]; task != nil && task.generation == record.generation {
+					task.status = meta.status
+				}
+			} else {
+				registry.retireTask(meta.id, record.generation)
+			}
+		}
+		registry.removeToken(record)
+		return
+	}
 
 	if record.taskAugmented && response.kind == frameResult && response.taskResult != nil {
 		meta := response.taskResult
@@ -220,7 +241,15 @@ func (registry *directionRegistry) updateTask(meta *taskMeta, generation uint64)
 	if meta.status == "working" || meta.status == "input_required" {
 		return true
 	}
-	delete(registry.tasks, meta.id)
+	return registry.retireTask(meta.id, generation)
+}
+
+func (registry *directionRegistry) retireTask(taskID string, generation uint64) bool {
+	task := registry.tasks[taskID]
+	if task == nil || task.generation != generation {
+		return false
+	}
+	delete(registry.tasks, taskID)
 	if task.progressToken != nil {
 		delete(registry.tokens, *task.progressToken)
 		registry.tombstones.add(tombstoneToken, *task.progressToken)
@@ -354,6 +383,107 @@ func compareAlignedDigits(left, right string) int {
 		}
 	}
 	return 0
+}
+
+func taskOperationResponse(record *requestRecord, response *parsedFrame) (*taskMeta, bool, error) {
+	if record == nil || record.taskID == "" {
+		return nil, false, nil
+	}
+	switch record.method {
+	case "tasks/get", "tasks/cancel":
+		if response.kind == frameError {
+			return nil, true, nil
+		}
+		if response.kind != frameResult {
+			return nil, true, fmt.Errorf("task operation requires a response")
+		}
+		meta, err := parseTaskMeta(response.result)
+		if err != nil {
+			return nil, true, fmt.Errorf("task operation result: %w", err)
+		}
+		if meta.id != record.taskID {
+			return nil, true, fmt.Errorf("task operation result taskId mismatch")
+		}
+		if record.method == "tasks/cancel" && meta.status != "cancelled" {
+			return nil, true, fmt.Errorf("tasks/cancel result must be cancelled")
+		}
+		return meta, true, nil
+	case "tasks/result":
+		if response.kind == frameError {
+			return nil, true, nil
+		}
+		if response.kind != frameResult {
+			return nil, true, fmt.Errorf("task result requires a response")
+		}
+		return &taskMeta{id: record.taskID, status: "completed"}, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func taskRequestSupported(initialize []byte, response bool, method string) bool {
+	frame, err := parseFrame(initialize, 0)
+	if err != nil {
+		return false
+	}
+	var root json.RawMessage
+	if response {
+		if frame.kind != frameResult {
+			return false
+		}
+		root = frame.result
+	} else {
+		if frame.kind != frameRequest || frame.method != "initialize" {
+			return false
+		}
+		root = frame.params
+	}
+	fields, err := decodeObject(root)
+	if err != nil {
+		return false
+	}
+	capabilitiesRaw, ok := fields["capabilities"]
+	if !ok {
+		return false
+	}
+	capabilities, err := decodeObject(capabilitiesRaw)
+	if err != nil {
+		return false
+	}
+	tasksRaw, ok := capabilities["tasks"]
+	if !ok {
+		return false
+	}
+	tasks, err := decodeObject(tasksRaw)
+	if err != nil {
+		return false
+	}
+	requestsRaw, ok := tasks["requests"]
+	if !ok {
+		return false
+	}
+	requests, err := decodeObject(requestsRaw)
+	if err != nil {
+		return false
+	}
+	categoryName, requestName, ok := strings.Cut(method, "/")
+	if !ok || categoryName == "" || requestName == "" || strings.Contains(requestName, "/") {
+		return false
+	}
+	categoryRaw, ok := requests[categoryName]
+	if !ok {
+		return false
+	}
+	category, err := decodeObject(categoryRaw)
+	if err != nil {
+		return false
+	}
+	capabilityRaw, ok := category[requestName]
+	if !ok {
+		return false
+	}
+	_, err = decodeObject(capabilityRaw)
+	return err == nil
 }
 
 func supportsListChanged(initializeResponse []byte, kind ListChangedKind) bool {

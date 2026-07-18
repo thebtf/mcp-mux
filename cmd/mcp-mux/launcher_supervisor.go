@@ -50,9 +50,9 @@ const (
 	defaultLauncherEnginePoll    = 5 * time.Second
 )
 
-var launcherSupervisorEnsureDaemon = func(logger *log.Logger, launcherPath, enginePath string) error {
-	return ensureDaemonWithinWithStarter(logger, 15*time.Second, func() error {
-		return startDaemonProcessFrom(launcherPath, enginePath)
+var launcherSupervisorEnsureDaemon = func(ctx context.Context, logger *log.Logger, launcherPath, enginePath string) error {
+	return ensureDaemonWithinWithStarter(ctx, logger, 15*time.Second, func(startCtx context.Context) error {
+		return startDaemonProcessFromContext(startCtx, launcherPath, enginePath)
 	})
 }
 
@@ -177,7 +177,7 @@ func prepareSupervisedEngineStart(ctx context.Context, launcherPath, enginePath 
 		stderr = io.Discard
 	}
 	logger := log.New(stderr, "[mcp-mux:launcher] ", log.LstdFlags|log.Lmicroseconds)
-	if err := launcherSupervisorEnsureDaemon(logger, launcherPath, enginePath); err != nil {
+	if err := launcherSupervisorEnsureDaemon(ctx, logger, launcherPath, enginePath); err != nil {
 		return err
 	}
 	return ctx.Err()

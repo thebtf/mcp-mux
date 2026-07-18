@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,7 +16,9 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/procgroup"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 	"github.com/thebtf/mcp-mux/muxcore/supervisor/attest"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
@@ -81,7 +84,7 @@ func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int
 		})
 	}
 
-	cmd, fallbackToCaller, err := startEngineOrStableLauncher(launcherPath, enginePath, args, true, func(cmd *exec.Cmd) {
+	process, fallbackToCaller, err := startEngineOrStableLauncher(launcherPath, enginePath, args, true, func(cmd *exec.Cmd) {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -93,10 +96,9 @@ func runEngineProcess(launcherPath, enginePath string, args []string) (bool, int
 		fmt.Fprintf(os.Stderr, "mcp-mux launcher: %v\n", err)
 		return true, 1
 	}
-	if err := cmd.Wait(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return true, exitErr.ExitCode()
+	if err := process.Wait(); err != nil {
+		if code := process.ExitCode(); code >= 0 {
+			return true, code
 		}
 		fmt.Fprintf(os.Stderr, "mcp-mux launcher: active engine %s exited with wait error: %v\n", enginePath, err)
 		return true, 1
@@ -123,18 +125,31 @@ func launcherTracef(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "mcp-mux launcher trace: "+format+"\n", args...)
 }
 
-func startEngineOrStableLauncher(launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*exec.Cmd, bool, error) {
-	var cmd *exec.Cmd
+func startEngineOrStableLauncher(launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*procgroup.Process, bool, error) {
+	return startEngineOrStableLauncherContext(context.Background(), launcherPath, enginePath, args, fallbackToCaller, configure)
+}
+
+func startEngineOrStableLauncherContext(ctx context.Context, launcherPath, enginePath string, args []string, fallbackToCaller bool, configure func(*exec.Cmd)) (*procgroup.Process, bool, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, false, err
+	}
+	var process *procgroup.Process
 	var startErr error
 	if samePath(enginePath, launcherPath) || authorizeInstalledEnginePath(launcherPath, enginePath) {
-		cmd = newLauncherEnvCommand(launcherPath, enginePath, args)
+		cmd := newLauncherEnvCommand(launcherPath, enginePath, args)
 		configure(cmd)
-		startErr = startLauncherEnvCommand(cmd)
+		process, startErr = startLauncherEnvProcess(ctx, cmd)
 		if startErr == nil {
-			return cmd, false, nil
+			return process, false, nil
+		}
+		if errors.Is(startErr, supervisor.ErrStartRollbackUnproven) {
+			return nil, false, startErr
 		}
 	} else {
 		startErr = errors.New("active engine path is not authorized")
+	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, false, err
 	}
 	if fallbackToCaller {
 		fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, startErr)
@@ -143,12 +158,13 @@ func startEngineOrStableLauncher(launcherPath, enginePath string, args []string,
 	}
 	fmt.Fprintf(os.Stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, startErr)
 	fmt.Fprintln(os.Stderr, "mcp-mux launcher: starting daemon via stable launcher binary")
-	cmd = newLauncherEnvCommand(launcherPath, launcherPath, args)
+	cmd := newLauncherEnvCommand(launcherPath, launcherPath, args)
 	configure(cmd)
-	if err := startLauncherEnvCommand(cmd); err != nil {
+	process, err := startLauncherEnvProcess(ctx, cmd)
+	if err != nil {
 		return nil, false, fmt.Errorf("start active engine %s: %v; start stable launcher fallback %s: %w", enginePath, startErr, launcherPath, err)
 	}
-	return cmd, false, nil
+	return process, false, nil
 }
 
 func newLauncherEnvCommand(launcherPath, executablePath string, args []string) *exec.Cmd {
@@ -157,27 +173,76 @@ func newLauncherEnvCommand(launcherPath, executablePath string, args []string) *
 	return cmd
 }
 
-func startLauncherEnvCommand(cmd *exec.Cmd) error {
+func startLauncherEnvProcess(ctx context.Context, cmd *exec.Cmd) (*procgroup.Process, error) {
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
+	}
 	admission, err := prepareLauncherAttestation(cmd)
 	if err != nil {
 		launcherTracef("attestation unavailable")
 		admission = nil
 	}
-	if err := cmd.Start(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		if admission != nil {
 			_ = admission.Close()
 		}
-		return err
+		return nil, err
+	}
+	args := []string(nil)
+	if len(cmd.Args) > 1 {
+		args = append(args, cmd.Args[1:]...)
+	}
+	process, err := procgroup.Spawn(procgroup.Options{
+		Command: cmd.Path,
+		Args:    args,
+		Dir:     cmd.Dir,
+		Env:     append([]string(nil), cmd.Env...),
+		Stdin:   cmd.Stdin,
+		Stdout:  cmd.Stdout,
+		Stderr:  cmd.Stderr,
+	})
+	if err != nil {
+		var closeErr error
+		if admission != nil {
+			closeErr = admission.Close()
+		}
+		if errors.Is(err, procgroup.ErrTreeRetirementUnproven) || closeErr != nil {
+			return nil, errors.Join(supervisor.ErrStartRollbackUnproven, err, closeErr)
+		}
+		return nil, err
+	}
+	if err := context.Cause(ctx); err != nil {
+		return nil, rollbackLauncherProcess(process, admission, err)
 	}
 	if admission != nil {
-		if err := admission.BindChildPID(cmd.Process.Pid); err != nil {
-			_ = cmd.Process.Kill()
-			_, _ = cmd.Process.Wait()
-			_ = admission.Close()
-			return fmt.Errorf("bind launcher attestation child: %w", err)
+		if err := launcherAttestationBind(admission, process.PID()); err != nil {
+			return nil, rollbackLauncherProcess(process, admission, fmt.Errorf("bind launcher attestation child: %w", err))
 		}
 	}
-	return nil
+	if err := context.Cause(ctx); err != nil {
+		return nil, rollbackLauncherProcess(process, admission, err)
+	}
+	return process, nil
+}
+
+func rollbackLauncherProcess(process *procgroup.Process, admission *attest.Parent, cause error) error {
+	var proofErr error
+	if process != nil {
+		if err := process.Kill(); err != nil {
+			proofErr = errors.Join(proofErr, err)
+		}
+		if err := process.Wait(); errors.Is(err, procgroup.ErrTreeRetirementUnproven) {
+			proofErr = errors.Join(proofErr, err)
+		}
+	}
+	var closeErr error
+	if admission != nil {
+		closeErr = admission.Close()
+	}
+	if proofErr != nil || closeErr != nil {
+		return errors.Join(supervisor.ErrStartRollbackUnproven, cause, proofErr, closeErr)
+	}
+	return cause
 }
 
 func prepareLauncherAttestation(cmd *exec.Cmd) (*attest.Parent, error) {
@@ -523,19 +588,16 @@ func startDaemonAndWait(launcherPath, enginePath, ctlPath string) error {
 }
 
 func startDaemonProcessFrom(launcherPath, enginePath string) error {
-	cmd, _, err := startEngineOrStableLauncher(launcherPath, enginePath, []string{"daemon"}, false, func(cmd *exec.Cmd) {
+	return startDaemonProcessFromContext(context.Background(), launcherPath, enginePath)
+}
+
+func startDaemonProcessFromContext(ctx context.Context, launcherPath, enginePath string) error {
+	_, _, err := startEngineOrStableLauncherContext(ctx, launcherPath, enginePath, []string{"daemon"}, false, func(cmd *exec.Cmd) {
 		cmd.Stdout = nil
 		cmd.Stderr = nil
 		cmd.Stdin = nil
-		setSysProcAttr(cmd)
 	})
-	if err != nil {
-		return fmt.Errorf("start daemon process: %w", err)
-	}
-	if err := cmd.Process.Release(); err != nil {
-		return fmt.Errorf("release daemon process: %w", err)
-	}
-	return nil
+	return err
 }
 
 var (

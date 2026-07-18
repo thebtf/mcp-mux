@@ -30,11 +30,13 @@ func TestRealBinaryRollingCompatibilityMatrix(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			pidFile := filepath.Join(t.TempDir(), "children.txt")
+			attestationFile := filepath.Join(t.TempDir(), "attestation.txt")
 			command := exec.Command(launcher,
 				"--mode", testCase.launcherMode,
 				"--engine", engine,
 				"--engine-mode", testCase.engineMode,
 				"--pid-file", pidFile,
+				"--attestation-file", attestationFile,
 			)
 			stdin, err := command.StdinPipe()
 			if err != nil {
@@ -93,6 +95,14 @@ func TestRealBinaryRollingCompatibilityMatrix(t *testing.T) {
 				t.Fatalf("launcher termination exceeded bound stderr=%s", stderr.String())
 			}
 
+			attestation, err := os.ReadFile(attestationFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantAttestation := testCase.launcherMode == "new" && testCase.engineMode == "new"
+			if got := strings.TrimSpace(string(attestation)) == "true"; got != wantAttestation {
+				t.Fatalf("private attestation = %t, want %t; raw=%q stderr=%s", got, wantAttestation, attestation, stderr.String())
+			}
 			data, err := os.ReadFile(pidFile)
 			if err != nil {
 				t.Fatal(err)

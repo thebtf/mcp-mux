@@ -43,3 +43,30 @@ func TestGenerationCancelJoinsBlockedPumpAndReaperSenders(t *testing.T) {
 		t.Fatal("generation cancellation did not join stdout pump")
 	}
 }
+
+func TestGenerationCancelJoinsNonClosingWait(t *testing.T) {
+	child := newTestChild()
+	child.wait = make(chan Exit)
+	events := make(chan any)
+	generation, err := newGeneration(
+		context.Background(),
+		1,
+		EngineRef{ID: "engine"},
+		StartResult{Child: child, Actual: EngineRef{ID: "engine"}},
+		1024,
+		events,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = child.outputWriter.Close()
+	generation.cancel()
+	select {
+	case <-generation.reapDone:
+	case <-time.After(time.Second):
+		t.Fatal("generation cancellation leaked a reaper blocked on Child.Wait")
+	}
+	if _, exited := generation.exitResult(); exited {
+		t.Fatal("reaper cancellation was treated as terminal process proof")
+	}
+}
