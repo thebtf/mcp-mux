@@ -38,8 +38,6 @@ current release:
   tombstone.
 - **Extremal retry coverage** — add a test with two prior general spawn retries,
   followed by two template mismatches and the cold fifth attempt.
-- **Windows DACL isolation** — evaluate a logon-SID DACL instead of an
-  account-SID DACL only if terminal-session isolation becomes a requirement.
 - **Detached listener test flake** —
   `TestDetachedProcessListenerAcceptsParentDial` failed once in the full Windows
   muxcore suite with empty helper output but passed 10 focused repetitions;
