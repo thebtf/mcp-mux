@@ -181,7 +181,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 		finishOwnerRemovalAttemptLocked(entry)
 		d.mu.Unlock()
 		if scheduleRetry {
-			d.scheduleOwnerFinalizationRetry(serverID, entry, reason, soft, eligible)
+			d.scheduleOwnerFinalizationRetry(serverID, entry, reason, soft)
 		}
 		return result, finalizationErr
 	}
@@ -198,7 +198,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 		d.mu.Unlock()
 		pinErr := fmt.Errorf("owner %s gained a snapshot pin during finalization", shortServerID(serverID))
 		if scheduleRetry {
-			d.scheduleOwnerFinalizationRetry(serverID, entry, reason, soft, eligible)
+			d.scheduleOwnerFinalizationRetry(serverID, entry, reason, soft)
 		}
 		return result, errors.Join(finalizationErr, pinErr)
 	}
@@ -254,13 +254,7 @@ func (d *Daemon) finalizeOwnerWithRetry(ownerRef *owner.Owner, soft bool) (int, 
 	return exitCode, false, fmt.Errorf("owner finalization unproven after %d attempts: %w", ownerFinalizationAttempts, lastErr)
 }
 
-func (d *Daemon) scheduleOwnerFinalizationRetry(serverID string, entry *OwnerEntry, reason ownerRemovalReason, soft bool, eligible func(*OwnerEntry) bool) {
-	if reason == ownerRemovalReasonIdle || reason == ownerRemovalReasonZombie {
-		previousEligible := eligible
-		eligible = func(current *OwnerEntry) bool {
-			return current != nil && !current.Persistent && (previousEligible == nil || previousEligible(current))
-		}
-	}
+func (d *Daemon) scheduleOwnerFinalizationRetry(serverID string, entry *OwnerEntry, reason ownerRemovalReason, soft bool) {
 	d.mu.Lock()
 	if d.owners[serverID] != entry || entry.removalRetrying {
 		d.mu.Unlock()
@@ -284,7 +278,9 @@ func (d *Daemon) scheduleOwnerFinalizationRetry(serverID string, entry *OwnerEnt
 				timer.Stop()
 				return
 			}
-			result, err := d.finalizeAndRemoveOwner(serverID, entry, reason, soft, eligible, false)
+			// FinalizeForRemoval has already torn down admission. Keep retiring
+			// that exact generation even if reusable-entry metadata changes.
+			result, err := d.finalizeAndRemoveOwner(serverID, entry, reason, soft, nil, false)
 			if result.Removed || err == nil {
 				return
 			}

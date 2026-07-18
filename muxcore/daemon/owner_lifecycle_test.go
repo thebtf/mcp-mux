@@ -360,10 +360,10 @@ func TestReaperFinalizationRetryRetainsLivePIDAndOwnerState(t *testing.T) {
 	}
 }
 
-func TestReaperFinalizationRetryPreservesEligibilityGate(t *testing.T) {
+func TestReaperFinalizationRetryContinuesAfterEntryMetadataChanges(t *testing.T) {
 	d := testDaemon(t)
 	d.supervisor = nil
-	sid := "reaper-retry-eligibility"
+	sid := "reaper-retry-retirement"
 	o := testReconnectOwner(t, sid)
 	entry := &OwnerEntry{
 		Owner:       o,
@@ -397,29 +397,24 @@ func TestReaperFinalizationRetryPreservesEligibilityGate(t *testing.T) {
 	}
 	d.mu.Lock()
 	entry.Persistent = true
+	entry.LastSession = time.Now()
+	entry.IdleTimeout = time.Hour
 	retrying := entry.removalRetrying
 	d.mu.Unlock()
 	if !retrying {
 		t.Fatal("reaper did not schedule finalization retry")
 	}
 
-	waitForDaemonCondition(t, time.Second, func() bool {
-		d.mu.RLock()
-		defer d.mu.RUnlock()
-		return !entry.removalRetrying
-	}, "scheduled retry did not settle after eligibility changed")
-	if current := d.Entry(sid); current != entry {
-		t.Fatal("scheduled retry removed owner after it became persistent")
-	}
-	if got := calls.Load(); got != ownerFinalizationAttempts {
-		t.Fatalf("finalizer calls=%d after eligibility changed, want %d", got, ownerFinalizationAttempts)
+	waitForDaemonCondition(t, time.Second, func() bool { return d.Entry(sid) == nil }, "scheduled retry stopped after teardown metadata changed")
+	if got := calls.Load(); got < ownerFinalizationAttempts+1 {
+		t.Fatalf("finalizer calls=%d, want retry after teardown began", got)
 	}
 }
 
-func TestZeroSessionFinalizationRetryRejectsNewPersistence(t *testing.T) {
+func TestZeroSessionFinalizationRetryContinuesAfterPersistenceChange(t *testing.T) {
 	d := testDaemon(t)
 	d.supervisor = nil
-	sid := "zero-session-retry-persistent"
+	sid := "zero-session-retry-retirement"
 	o := testReconnectOwner(t, sid)
 	zeroAt := time.Now().Add(-time.Second)
 	entry := &OwnerEntry{
@@ -462,16 +457,9 @@ func TestZeroSessionFinalizationRetryRejectsNewPersistence(t *testing.T) {
 		t.Fatal("zero-session removal did not schedule finalization retry")
 	}
 
-	waitForDaemonCondition(t, time.Second, func() bool {
-		d.mu.RLock()
-		defer d.mu.RUnlock()
-		return !entry.removalRetrying
-	}, "zero-session retry did not settle after persistence changed")
-	if current := d.Entry(sid); current != entry || !current.Persistent {
-		t.Fatal("zero-session retry removed or unpinned persistent owner")
-	}
-	if got := calls.Load(); got != ownerFinalizationAttempts {
-		t.Fatalf("finalizer calls=%d after persistence changed, want %d", got, ownerFinalizationAttempts)
+	waitForDaemonCondition(t, time.Second, func() bool { return d.Entry(sid) == nil }, "zero-session retry stopped after teardown persistence changed")
+	if got := calls.Load(); got < ownerFinalizationAttempts+1 {
+		t.Fatalf("finalizer calls=%d, want retry after zero-session teardown began", got)
 	}
 }
 
