@@ -353,6 +353,8 @@ func TestLauncherBindFailureRetiresDescendantTree(t *testing.T) {
 		}
 	})
 
+	// The helper creates its descendant before attestation bind. On Windows the
+	// launcher must therefore start suspended and install Job authority first.
 	cmd := newLauncherEnvCommand(os.Args[0], os.Args[0], []string{"-test.run=^TestLauncherRollbackTreeHelper$"})
 	cmd.Env = setEnv(cmd.Env, launcherRollbackHelperMode, "parent")
 	cmd.Env = setEnv(cmd.Env, launcherRollbackHelperAddr, listener.Addr().String())

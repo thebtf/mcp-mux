@@ -197,13 +197,14 @@ func startLauncherEnvProcessWithParentExit(ctx context.Context, cmd *exec.Cmd, a
 		args = append(args, cmd.Args[1:]...)
 	}
 	process, err := procgroup.Spawn(procgroup.Options{
-		Command: cmd.Path,
-		Args:    args,
-		Dir:     cmd.Dir,
-		Env:     append([]string(nil), cmd.Env...),
-		Stdin:   cmd.Stdin,
-		Stdout:  cmd.Stdout,
-		Stderr:  cmd.Stderr,
+		Command:        cmd.Path,
+		Args:           args,
+		Dir:            cmd.Dir,
+		Env:            append([]string(nil), cmd.Env...),
+		Stdin:          cmd.Stdin,
+		Stdout:         cmd.Stdout,
+		Stderr:         cmd.Stderr,
+		StartSuspended: true,
 	})
 	if err != nil {
 		var closeErr error
