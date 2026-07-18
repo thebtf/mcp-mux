@@ -51,6 +51,21 @@ current release:
   `setsid`/`setpgid` and leave that authority; stronger containment needs a new
   cross-platform contract (for example Linux cgroup v2 plus an explicit Darwin
   policy), not descendant polling presented as proof.
+- **Same-requested-identity fallback recovery** — a healthy stable-launcher
+  fallback remains pinned while the resolved requested identity is unchanged;
+  add a bounded retry policy before attempting in-place desired-engine recovery.
+- **Long Unix attestation paths** — oversized `TMPDIR` values fail closed today;
+  a shorter alternate root needs an explicit ownership and permission policy.
+- **Attestation cancellation after dial** — child verification bounds dial and
+  exchange separately but does not interrupt an established connection when
+  the caller context is cancelled; preserve the hard I/O bound while wiring
+  cancellation through the connection.
+- **Installed-engine TOCTOU** — authorization verifies canonical path nodes and
+  content before exec, but does not pin an immutable file/directory handle
+  across validation and launch; closing this requires a new execution contract.
+- **Process-wide Linux subreaper** — exact-PGID finalization can adopt unrelated
+  orphan descendants in a native consumer process without a general reaper;
+  isolate or coordinate subreaper ownership before broad native reuse.
 - **Signed engine provenance** — parent-side authorization now requires the
   exact active pointer, installed version-store layout, no symlink escape, and
   content matching the 12-hex version directory. Authenticating a malicious

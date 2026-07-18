@@ -215,10 +215,16 @@ func TestDefaultSupervisorDoesNotFallbackAfterUnprovenRollback(t *testing.T) {
 	original := launcherSupervisorCommandStart
 	defer func() { launcherSupervisorCommandStart = original }()
 
+	admission, admissionErr := attest.StartParent(context.Background(), attest.ParentConfig{})
+	if admissionErr != nil {
+		t.Fatal(admissionErr)
+	}
+	defer admission.Close()
+
 	calls := 0
 	launcherSupervisorCommandStart = func(context.Context, string, string, []string, io.Writer) (*supervisor.CommandChild, *attest.Parent, error) {
 		calls++
-		return nil, nil, supervisor.ErrStartRollbackUnproven
+		return nil, admission, supervisor.ErrStartRollbackUnproven
 	}
 
 	result, err := startDefaultSupervisedEngineChild(
@@ -235,7 +241,12 @@ func TestDefaultSupervisorDoesNotFallbackAfterUnprovenRollback(t *testing.T) {
 		t.Fatalf("start calls = %d, fallback started before rollback proof", calls)
 	}
 	if result.Child != nil || result.Admission != nil {
-		t.Fatalf("unexpected partial authority = %#v", result)
+		t.Fatalf("non-process admission masked unproven rollback = %#v", result)
+	}
+	select {
+	case <-admission.Done():
+	case <-time.After(time.Second):
+		t.Fatal("unproven rollback left admission open")
 	}
 }
 

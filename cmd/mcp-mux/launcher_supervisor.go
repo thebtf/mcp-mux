@@ -236,6 +236,12 @@ func startDefaultSupervisedEngineChild(
 	if err == nil {
 		return launcherSupervisorStartResult(child, admission, enginePath, false), nil
 	}
+	if errors.Is(err, supervisor.ErrStartRollbackUnproven) && child == nil {
+		if admission != nil {
+			err = errors.Join(err, admission.Close())
+		}
+		return supervisor.StartResult{}, err
+	}
 	if errors.Is(err, supervisor.ErrStartRollbackUnproven) || child != nil || admission != nil {
 		return launcherSupervisorStartResult(child, admission, enginePath, false), err
 	}
@@ -245,6 +251,12 @@ func startDefaultSupervisedEngineChild(
 	}
 	fallbackChild, fallbackAdmission, fallbackErr := launcherSupervisorCommandStart(ctx, launcherPath, launcherPath, args, stderr)
 	if fallbackErr != nil {
+		if errors.Is(fallbackErr, supervisor.ErrStartRollbackUnproven) && fallbackChild == nil {
+			if fallbackAdmission != nil {
+				fallbackErr = errors.Join(fallbackErr, fallbackAdmission.Close())
+			}
+			return supervisor.StartResult{}, fallbackErr
+		}
 		if errors.Is(fallbackErr, supervisor.ErrStartRollbackUnproven) || fallbackChild != nil || fallbackAdmission != nil {
 			return launcherSupervisorStartResult(fallbackChild, fallbackAdmission, launcherPath, true), fallbackErr
 		}
