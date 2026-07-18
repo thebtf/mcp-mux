@@ -360,6 +360,62 @@ func TestReaperFinalizationRetryRetainsLivePIDAndOwnerState(t *testing.T) {
 	}
 }
 
+func TestReaperFinalizationRetryPreservesEligibilityGate(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+	sid := "reaper-retry-eligibility"
+	o := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{
+		Owner:       o,
+		ServerID:    sid,
+		LastSession: time.Now().Add(-time.Second),
+		IdleTimeout: time.Millisecond,
+	}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	var calls atomic.Int32
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != o || !soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=true", got, soft, o)
+		}
+		if calls.Add(1) <= ownerFinalizationAttempts {
+			return 0, false, errors.New("synthetic whole-tree proof pending")
+		}
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	if affected := (&Reaper{daemon: d, logger: d.logger}).sweep(); affected != 0 {
+		t.Fatalf("first reaper sweep affected=%d, want retryable owner retained", affected)
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("synchronous finalizer calls=%d, want %d", got, ownerFinalizationAttempts)
+	}
+	d.mu.Lock()
+	entry.Persistent = true
+	retrying := entry.removalRetrying
+	d.mu.Unlock()
+	if !retrying {
+		t.Fatal("reaper did not schedule finalization retry")
+	}
+
+	waitForDaemonCondition(t, time.Second, func() bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return !entry.removalRetrying
+	}, "scheduled retry did not settle after eligibility changed")
+	if current := d.Entry(sid); current != entry {
+		t.Fatal("scheduled retry removed owner after it became persistent")
+	}
+	if got := calls.Load(); got != ownerFinalizationAttempts {
+		t.Fatalf("finalizer calls=%d after eligibility changed, want %d", got, ownerFinalizationAttempts)
+	}
+}
+
 func TestOwnerRemovalKeepsEntryWhenFinalizationUnproven(t *testing.T) {
 	d := testDaemon(t)
 	d.supervisor = nil
