@@ -32,8 +32,25 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	if runner.handleHostLifecycle(item) {
 		return
 	}
-	if isResponse(frame) && frame.id != nil && runner.child.consumeRetiredResponse(frame.id.key) {
-		return
+	if isResponse(frame) && frame.id != nil {
+		handled, err := runner.child.consumeRetiredResponse(frame)
+		if err != nil {
+			runner.replaceCurrent(ReasonProtocolFailure)
+			return
+		}
+		if handled {
+			return
+		}
+	}
+	if frame.method == "notifications/tasks/status" && frame.taskStatus != nil {
+		handled, err := runner.child.consumeRetiredTaskStatus(frame.taskStatus)
+		if err != nil {
+			runner.replaceCurrent(ReasonProtocolFailure)
+			return
+		}
+		if handled {
+			return
+		}
 	}
 
 	switch {

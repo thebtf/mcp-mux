@@ -631,7 +631,7 @@ func TestRunCrashFinalizesThenReplaysOnlyInitialization(t *testing.T) {
 	if err := third.write(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"prelude"}}`); err != nil {
 		t.Fatal(err)
 	}
-	if err := third.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"third","version":"1"}}}`); err != nil {
+	if err := third.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"third","version":"1"}}}`); err != nil {
 		t.Fatal(err)
 	}
 	if got := nextLine(t, thirdInput); !strings.Contains(got, "notifications/initialized") {
@@ -657,23 +657,43 @@ func TestRunCrashFinalizesThenReplaysOnlyInitialization(t *testing.T) {
 	harness.closeAndWait(t)
 }
 
-func TestRunReplacementNotificationDoesNotExceedHostCapability(t *testing.T) {
+func TestRunCapabilityDriftFailsClosedWithoutUnauthorizedReplacementNotification(t *testing.T) {
 	first := newTestChild()
 	second := newTestChild()
+	third := newTestChild()
 	firstInput := streamLines(first.inputReader)
 	secondInput := streamLines(second.inputReader)
-	starts := 0
+	thirdInput := streamLines(third.inputReader)
+	protocolFailure := make(chan struct{}, 1)
+	var startMu sync.Mutex
+	startCount := 0
 	harness := startHarness(t, Config{
 		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
 		Start: func(context.Context, EngineRef) (StartResult, error) {
-			starts++
-			if starts == 1 {
+			startMu.Lock()
+			defer startMu.Unlock()
+			startCount++
+			switch startCount {
+			case 1:
 				return StartResult{Child: first, Actual: EngineRef{ID: "engine"}}, nil
+			case 2:
+				return StartResult{Child: second, Actual: EngineRef{ID: "engine"}}, nil
+			case 3:
+				return StartResult{Child: third, Actual: EngineRef{ID: "engine"}}, nil
+			default:
+				return StartResult{}, errors.New("unexpected extra start")
 			}
-			return StartResult{Child: second, Actual: EngineRef{ID: "engine"}}, nil
 		},
 		ReplacementNotifications: []ListChangedKind{ListChangedTools},
 		RetryDelay:               10 * time.Millisecond,
+		Observe: func(event Event) {
+			if event.State == StateFinalizing && event.Reason == ReasonProtocolFailure {
+				select {
+				case protocolFailure <- struct{}{}:
+				default:
+				}
+			}
+		},
 	})
 
 	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
@@ -686,12 +706,43 @@ func TestRunReplacementNotificationDoesNotExceedHostCapability(t *testing.T) {
 	_ = nextLine(t, firstInput)
 	first.crash(errors.New("boom"))
 
-	_ = nextLine(t, secondInput)
+	if got := nextLine(t, secondInput); !strings.Contains(got, `"method":"initialize"`) {
+		t.Fatalf("second replay initialize = %s", got)
+	}
 	if err := second.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"second","version":"1"}}}`); err != nil {
 		t.Fatal(err)
 	}
-	_ = nextLine(t, secondInput)
+	select {
+	case <-protocolFailure:
+	case <-time.After(3 * time.Second):
+		t.Fatal("capability drift did not finalize with ReasonProtocolFailure")
+	}
+	select {
+	case <-second.stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("capability-drift generation was not finalized")
+	}
+	if got := nextLine(t, thirdInput); !strings.Contains(got, `"method":"initialize"`) {
+		t.Fatalf("third replay initialize = %s", got)
+	}
+	if err := third.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"third","version":"1"}}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, thirdInput); !strings.Contains(got, "notifications/initialized") {
+		t.Fatalf("third initialized notification = %s", got)
+	}
 	assertNoLine(t, harness.hostOutput, 100*time.Millisecond)
+
+	harness.send(t, `{"jsonrpc":"2.0","id":"tools","method":"tools/list"}`)
+	if got := nextLine(t, thirdInput); !strings.Contains(got, `"id":"tools"`) {
+		t.Fatalf("post-replay request = %s", got)
+	}
+	if err := third.write(`{"jsonrpc":"2.0","id":"tools","result":{"tools":[]}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"tools"`) {
+		t.Fatalf("post-replay response = %s", got)
+	}
 	harness.closeAndWait(t)
 }
 
@@ -965,6 +1016,105 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 	}
 	harness.send(t, `{"jsonrpc":"2.0","id":"cancel-child","result":{"roots":[]}}`)
 	assertNoLine(t, childInput, 100*time.Millisecond)
+	harness.closeAndWait(t)
+}
+
+func TestRunLateRetiredTaskResultCollisionFailsClosed(t *testing.T) {
+	first := newTestChild()
+	second := newTestChild()
+	third := newTestChild()
+	firstInput := streamLines(first.inputReader)
+	secondInput := streamLines(second.inputReader)
+	thirdInput := streamLines(third.inputReader)
+	protocolFailure := make(chan struct{}, 1)
+	var startMu sync.Mutex
+	startCount := 0
+	harness := startHarness(t, Config{
+		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
+		Start: func(context.Context, EngineRef) (StartResult, error) {
+			startMu.Lock()
+			defer startMu.Unlock()
+			startCount++
+			switch startCount {
+			case 1:
+				return StartResult{Child: first, Actual: EngineRef{ID: "engine"}}, nil
+			case 2:
+				return StartResult{Child: second, Actual: EngineRef{ID: "engine"}}, nil
+			case 3:
+				return StartResult{Child: third, Actual: EngineRef{ID: "engine"}}, nil
+			default:
+				return StartResult{}, errors.New("unexpected extra start")
+			}
+		},
+		RetryDelay: 10 * time.Millisecond,
+		Observe: func(event Event) {
+			if event.State == StateFinalizing && event.Reason == ReasonProtocolFailure {
+				select {
+				case protocolFailure <- struct{}{}:
+				default:
+				}
+			}
+		},
+	})
+
+	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"sampling":{"createMessage":{}}}}},"clientInfo":{"name":"test","version":"1"}}}`)
+	_ = nextLine(t, firstInput)
+	if err := first.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"first","version":"1"}}}`); err != nil {
+		t.Fatal(err)
+	}
+	_ = nextLine(t, harness.hostOutput)
+	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	_ = nextLine(t, firstInput)
+
+	if err := first.write(`{"jsonrpc":"2.0","id":"old","method":"sampling/createMessage","params":{"_meta":{"progressToken":"old-token"},"task":{},"messages":[]}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"old"`) {
+		t.Fatalf("old child request = %s", got)
+	}
+	first.crash(errors.New("boom"))
+
+	if got := nextLine(t, secondInput); !strings.Contains(got, `"method":"initialize"`) {
+		t.Fatalf("second replay initialize = %s", got)
+	}
+	if err := second.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"second","version":"1"}}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, secondInput); !strings.Contains(got, "notifications/initialized") {
+		t.Fatalf("second initialized notification = %s", got)
+	}
+
+	if err := second.write(`{"jsonrpc":"2.0","id":"new","method":"sampling/createMessage","params":{"_meta":{"progressToken":"new-token"},"task":{},"messages":[]}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"new"`) {
+		t.Fatalf("new child request = %s", got)
+	}
+	harness.send(t, `{"jsonrpc":"2.0","id":"new","result":{"task":{"taskId":"collision","status":"working"}}}`)
+	if got := nextLine(t, secondInput); !strings.Contains(got, `"taskId":"collision"`) {
+		t.Fatalf("new task response = %s", got)
+	}
+
+	harness.send(t, `{"jsonrpc":"2.0","id":"old","result":{"task":{"taskId":"collision","status":"working"}}}`)
+	select {
+	case <-protocolFailure:
+	case <-time.After(3 * time.Second):
+		t.Fatal("late task ID collision did not finalize with ReasonProtocolFailure")
+	}
+	select {
+	case <-second.stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("late task ID collision did not finalize the replacement generation")
+	}
+	if got := nextLine(t, thirdInput); !strings.Contains(got, `"method":"initialize"`) {
+		t.Fatalf("third replay initialize = %s", got)
+	}
+	if err := third.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"third","version":"1"}}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, thirdInput); !strings.Contains(got, "notifications/initialized") {
+		t.Fatalf("third initialized notification = %s", got)
+	}
 	harness.closeAndWait(t)
 }
 

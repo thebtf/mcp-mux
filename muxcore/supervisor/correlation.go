@@ -56,11 +56,16 @@ type tombstoneRole uint8
 const (
 	tombstoneRequest tombstoneRole = iota + 1
 	tombstoneToken
+	tombstoneTask
 )
 
 type tombstoneKey struct {
 	role tombstoneRole
 	key  scalarKey
+}
+
+func taskTombstoneKey(id string) scalarKey {
+	return scalarKey{kind: scalarString, value: id}
 }
 
 type tombstoneSet struct {
@@ -99,12 +104,14 @@ func (set *tombstoneSet) clear() {
 }
 
 type directionRegistry struct {
-	requests        map[scalarKey]*requestRecord
-	tokens          map[scalarKey]*tokenRecord
-	tasks           map[string]*taskRecord
-	tombstones      tombstoneSet
-	retiredRequests map[scalarKey]*requestRecord
-	retiredTokens   map[scalarKey]struct{}
+	requests          map[scalarKey]*requestRecord
+	tokens            map[scalarKey]*tokenRecord
+	tasks             map[string]*taskRecord
+	tombstones        tombstoneSet
+	retiredTombstones tombstoneSet
+	retiredRequests   map[scalarKey]*requestRecord
+	retiredTokens     map[scalarKey]struct{}
+	retiredTasks      map[string]*taskRecord
 }
 
 func newDirectionRegistry() directionRegistry {
@@ -114,6 +121,7 @@ func newDirectionRegistry() directionRegistry {
 		tasks:           make(map[string]*taskRecord),
 		retiredRequests: make(map[scalarKey]*requestRecord),
 		retiredTokens:   make(map[scalarKey]struct{}),
+		retiredTasks:    make(map[string]*taskRecord),
 	}
 }
 
@@ -121,30 +129,30 @@ func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
 	if frame.id == nil {
 		return fmt.Errorf("request id is missing")
 	}
-	if len(registry.requests)+len(registry.tasks) >= activeCorrelationLimit {
-		return fmt.Errorf("active correlation limit reached")
-	}
-	if len(registry.retiredRequests) >= tombstoneLimit || len(registry.retiredTokens) >= tombstoneLimit {
-		return fmt.Errorf("retired correlation limit reached")
-	}
 	if _, exists := registry.retiredRequests[frame.id.key]; exists {
 		return fmt.Errorf("request id belongs to a retired generation")
 	}
-	if registry.tombstones.contains(tombstoneRequest, frame.id.key) {
+	if registry.tombstones.contains(tombstoneRequest, frame.id.key) || registry.retiredTombstones.contains(tombstoneRequest, frame.id.key) {
 		return fmt.Errorf("request id is tombstoned")
 	}
 	if _, exists := registry.requests[frame.id.key]; exists {
 		return fmt.Errorf("duplicate active request id")
 	}
+	if len(registry.requests)+len(registry.retiredRequests) >= activeCorrelationLimit {
+		return fmt.Errorf("request correlation limit reached")
+	}
 	if frame.progressToken != nil {
 		if _, exists := registry.retiredTokens[frame.progressToken.key]; exists {
 			return fmt.Errorf("progress token belongs to a retired generation")
 		}
-		if registry.tombstones.contains(tombstoneToken, frame.progressToken.key) {
+		if registry.tombstones.contains(tombstoneToken, frame.progressToken.key) || registry.retiredTombstones.contains(tombstoneToken, frame.progressToken.key) {
 			return fmt.Errorf("progress token is tombstoned")
 		}
 		if _, exists := registry.tokens[frame.progressToken.key]; exists {
 			return fmt.Errorf("duplicate active progress token")
+		}
+		if len(registry.tokens)+len(registry.retiredTokens) >= activeCorrelationLimit {
+			return fmt.Errorf("progress token correlation limit reached")
 		}
 	}
 	return nil
@@ -170,6 +178,22 @@ func (registry *directionRegistry) register(frame *parsedFrame, generation uint6
 	return record
 }
 
+func (registry *directionRegistry) canBindTask(taskID string) error {
+	if _, exists := registry.tasks[taskID]; exists {
+		return fmt.Errorf("taskId belongs to an active task")
+	}
+	if _, exists := registry.retiredTasks[taskID]; exists {
+		return fmt.Errorf("taskId belongs to a retired generation")
+	}
+	if registry.tombstones.contains(tombstoneTask, taskTombstoneKey(taskID)) || registry.retiredTombstones.contains(tombstoneTask, taskTombstoneKey(taskID)) {
+		return fmt.Errorf("taskId is tombstoned")
+	}
+	if len(registry.tasks)+len(registry.retiredTasks) >= activeCorrelationLimit {
+		return fmt.Errorf("task correlation limit reached")
+	}
+	return nil
+}
+
 func (registry *directionRegistry) canComplete(record *requestRecord, response *parsedFrame) error {
 	if _, handled, err := taskOperationResponse(record, response); handled {
 		return err
@@ -184,13 +208,10 @@ func (registry *directionRegistry) canComplete(record *requestRecord, response *
 		return fmt.Errorf("task-augmented request requires CreateTaskResult")
 	}
 	meta := response.taskResult
-	if meta.status != "working" && meta.status != "input_required" {
-		return nil
+	if meta.status != "working" {
+		return fmt.Errorf("CreateTaskResult status must be working")
 	}
-	if existing := registry.tasks[meta.id]; existing != nil && existing.requestID != record.id.key {
-		return fmt.Errorf("duplicate active taskId")
-	}
-	return nil
+	return registry.canBindTask(meta.id)
 }
 
 func (registry *directionRegistry) complete(record *requestRecord, response *parsedFrame) {
@@ -213,7 +234,7 @@ func (registry *directionRegistry) complete(record *requestRecord, response *par
 
 	if record.taskAugmented && response.kind == frameResult && response.taskResult != nil {
 		meta := response.taskResult
-		if meta.status == "working" || meta.status == "input_required" {
+		if meta.status == "working" {
 			task := &taskRecord{
 				id:         meta.id,
 				requestID:  record.id.key,
@@ -272,6 +293,7 @@ func (registry *directionRegistry) retireTask(taskID string, generation uint64) 
 		return false
 	}
 	delete(registry.tasks, taskID)
+	registry.tombstones.add(tombstoneTask, taskTombstoneKey(taskID))
 	if task.progressToken != nil {
 		delete(registry.tokens, *task.progressToken)
 		registry.tombstones.add(tombstoneToken, *task.progressToken)
@@ -308,6 +330,10 @@ func (registry *directionRegistry) retireGeneration(generation uint64) []*reques
 			continue
 		}
 		delete(registry.tasks, id)
+		registry.retiredTasks[id] = task
+		if task.requestID.kind != 0 {
+			registry.retiredTombstones.add(tombstoneRequest, task.requestID)
+		}
 		if task.progressToken != nil {
 			delete(registry.tokens, *task.progressToken)
 			registry.retiredTokens[*task.progressToken] = struct{}{}
@@ -322,18 +348,92 @@ func (registry *directionRegistry) retireGeneration(generation uint64) []*reques
 	return lost
 }
 
-func (registry *directionRegistry) consumeRetiredResponse(key scalarKey) bool {
-	record := registry.retiredRequests[key]
-	if record == nil {
-		return false
+func (registry *directionRegistry) consumeRetiredResponse(response *parsedFrame) (bool, error) {
+	if response == nil || response.id == nil {
+		return false, nil
 	}
-	delete(registry.retiredRequests, key)
-	registry.tombstones.add(tombstoneRequest, key)
+	record := registry.retiredRequests[response.id.key]
+	if record == nil {
+		return false, nil
+	}
+	if !record.taskAugmented || response.kind == frameError {
+		registry.releaseRetiredRequest(record)
+		return true, nil
+	}
+	if response.utilityErr != nil {
+		return true, fmt.Errorf("retired CreateTaskResult: %w", response.utilityErr)
+	}
+	if response.kind != frameResult || response.taskResult == nil {
+		return true, fmt.Errorf("retired task-augmented request requires CreateTaskResult")
+	}
+	meta := response.taskResult
+	if meta.status != "working" {
+		return true, fmt.Errorf("retired CreateTaskResult status must be working")
+	}
+	if err := registry.canBindTask(meta.id); err != nil {
+		return true, fmt.Errorf("retired CreateTaskResult: %w", err)
+	}
+	task := &taskRecord{
+		id:         meta.id,
+		requestID:  record.id.key,
+		generation: record.generation,
+		status:     meta.status,
+	}
+	if record.progressToken != nil {
+		tokenKey := record.progressToken.key
+		task.progressToken = &tokenKey
+	}
+	delete(registry.retiredRequests, record.id.key)
+	registry.retiredTombstones.add(tombstoneRequest, record.id.key)
+	registry.retiredTasks[meta.id] = task
+	return true, nil
+}
+
+func (registry *directionRegistry) releaseRetiredRequest(record *requestRecord) {
+	delete(registry.retiredRequests, record.id.key)
+	tombstones := &registry.tombstones
+	if record.taskAugmented {
+		tombstones = &registry.retiredTombstones
+	}
+	tombstones.add(tombstoneRequest, record.id.key)
 	if record.progressToken != nil {
 		delete(registry.retiredTokens, record.progressToken.key)
-		registry.tombstones.add(tombstoneToken, record.progressToken.key)
+		tombstones.add(tombstoneToken, record.progressToken.key)
 	}
-	return true
+}
+
+func (registry *directionRegistry) consumeRetiredTaskStatus(meta *taskMeta) (bool, error) {
+	if meta == nil {
+		return false, nil
+	}
+	taskKey := taskTombstoneKey(meta.id)
+	task := registry.retiredTasks[meta.id]
+	if task == nil {
+		if !registry.retiredTombstones.contains(tombstoneTask, taskKey) {
+			return false, nil
+		}
+		if _, exists := registry.tasks[meta.id]; exists {
+			return true, fmt.Errorf("taskId belongs to an active task and a retired tombstone")
+		}
+		return true, nil
+	}
+	if _, exists := registry.tasks[meta.id]; exists {
+		return true, fmt.Errorf("taskId belongs to active and retired generations")
+	}
+	if registry.tombstones.contains(tombstoneTask, taskKey) || registry.retiredTombstones.contains(tombstoneTask, taskKey) {
+		return true, fmt.Errorf("retired taskId is also tombstoned")
+	}
+	task.status = meta.status
+	if meta.status == "working" || meta.status == "input_required" {
+		return true, nil
+	}
+	delete(registry.retiredTasks, meta.id)
+	registry.retiredTombstones.add(tombstoneTask, taskKey)
+	if task.progressToken != nil {
+		delete(registry.retiredTokens, *task.progressToken)
+		registry.retiredTombstones.add(tombstoneToken, *task.progressToken)
+	}
+	return true, nil
 }
 
 func (registry *directionRegistry) clearTransitionTombstones() {
@@ -343,6 +443,8 @@ func (registry *directionRegistry) clearTransitionTombstones() {
 func (registry *directionRegistry) clearRetiredCorrelations() {
 	clear(registry.retiredRequests)
 	clear(registry.retiredTokens)
+	clear(registry.retiredTasks)
+	registry.retiredTombstones.clear()
 }
 
 func localErrorFrame(id json.RawMessage, code int, message string) []byte {
