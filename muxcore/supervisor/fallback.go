@@ -30,6 +30,9 @@ func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start
 		return result, nil
 	}
 	if retained, retainedErr, terminal := retainFailedStart(result, err); terminal {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			retainedErr = errors.Join(retainedErr, ctxErr)
+		}
 		return retained, retainedErr
 	}
 	if err := ctx.Err(); err != nil {
@@ -45,6 +48,9 @@ func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start
 		return result, nil
 	}
 	if retained, retainedErr, terminal := retainFailedStart(result, err); terminal {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			retainedErr = errors.Join(retainedErr, ctxErr)
+		}
 		return retained, retainedErr
 	}
 	if err := ctx.Err(); err != nil {

@@ -100,6 +100,51 @@ func TestStartWithFallbackPreservesCancellationFromFallbackAttempt(t *testing.T)
 	}
 }
 
+func TestStartWithFallbackPreservesCancellationWithRetainedAuthority(t *testing.T) {
+	requested := EngineRef{ID: "secret-requested-engine"}
+	fallback := EngineRef{ID: "secret-fallback-engine"}
+	tests := []struct {
+		name         string
+		cancelOn     EngineRef
+		wantCalls    int
+		wantFallback bool
+	}{
+		{name: "requested", cancelOn: requested, wantCalls: 1},
+		{name: "fallback", cancelOn: fallback, wantCalls: 2, wantFallback: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			admission := new(fallbackTestAdmission)
+			calls := 0
+
+			result, err := StartWithFallback(ctx, requested, fallback, func(_ context.Context, ref EngineRef) (StartResult, error) {
+				calls++
+				if ref != test.cancelOn {
+					return StartResult{}, errors.New("clean start failure")
+				}
+				cancel()
+				return StartResult{Admission: admission}, errors.New("retained failure exposed " + ref.ID)
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("StartWithFallback() error = %v, want context cancellation", err)
+			}
+			if strings.Contains(err.Error(), requested.ID) || strings.Contains(err.Error(), fallback.ID) {
+				t.Fatalf("StartWithFallback() error leaked engine identity: %v", err)
+			}
+			if calls != test.wantCalls {
+				t.Fatalf("start calls = %d, want %d", calls, test.wantCalls)
+			}
+			if result.Admission != admission || result.Fallback != test.wantFallback {
+				t.Fatalf("result = %#v, want retained admission fallback=%v", result, test.wantFallback)
+			}
+			if admission.closed != 0 {
+				t.Fatalf("admission Close calls = %d, want supervisor finalization", admission.closed)
+			}
+		})
+	}
+}
+
 func TestStartWithFallbackReturnsAdmissionWithoutRetryForUnprovenRollback(t *testing.T) {
 	const requestedID = "secret-requested-engine"
 	const fallbackID = "secret-fallback-engine"
