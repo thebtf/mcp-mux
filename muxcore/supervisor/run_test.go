@@ -889,10 +889,19 @@ func TestUnverifiedDormantControlIsSuppressed(t *testing.T) {
 func TestRunCancellationProgressAndTaskLifetime(t *testing.T) {
 	child := newTestChild()
 	childInput := streamLines(child.inputReader)
+	terminalProtocolFailure := make(chan struct{}, 1)
 	harness := startHarness(t, Config{
 		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
 		Start: func(context.Context, EngineRef) (StartResult, error) {
 			return StartResult{Child: child, Actual: EngineRef{ID: "engine"}}, nil
+		},
+		Observe: func(event Event) {
+			if event.State == StateTerminal && event.Reason == ReasonProtocolFailure {
+				select {
+				case terminalProtocolFailure <- struct{}{}:
+				default:
+				}
+			}
 		},
 	})
 	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
@@ -970,17 +979,42 @@ func TestRunCancellationProgressAndTaskLifetime(t *testing.T) {
 	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"task-result"`) || !strings.Contains(got, `"result"`) {
 		t.Fatalf("task result = %s", got)
 	}
-
-	harness.closeAndWait(t)
+	if err := child.write(`{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"task-1","status":"failed"}}`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-harness.done:
+		if err == nil {
+			t.Fatal("conflicting finalized status terminated Run without an error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("conflicting finalized status did not terminate Run")
+	}
+	select {
+	case <-terminalProtocolFailure:
+	case <-time.After(time.Second):
+		t.Fatal("conflicting finalized status was not terminal protocol failure")
+	}
+	assertNoLine(t, harness.hostOutput, 100*time.Millisecond)
+	_ = harness.hostInput.Close()
 }
 
 func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 	child := newTestChild()
 	childInput := streamLines(child.inputReader)
+	terminalProtocolFailure := make(chan struct{}, 1)
 	harness := startHarness(t, Config{
 		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
 		Start: func(context.Context, EngineRef) (StartResult, error) {
 			return StartResult{Child: child, Actual: EngineRef{ID: "engine"}}, nil
+		},
+		Observe: func(event Event) {
+			if event.State == StateTerminal && event.Reason == ReasonProtocolFailure {
+				select {
+				case terminalProtocolFailure <- struct{}{}:
+				default:
+				}
+			}
 		},
 	})
 	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"sampling":{"createMessage":{}}}}},"clientInfo":{"name":"test","version":"1"}}}`)
@@ -1041,6 +1075,12 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 		t.Fatalf("child terminal task cancel = %s", got)
 	}
 	assertNoLine(t, harness.hostOutput, 100*time.Millisecond)
+	if err := child.write(`{"jsonrpc":"2.0","id":12,"method":"tasks/get","params":{"taskId":"child-task"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":12`) || !strings.Contains(got, `"method":"tasks/get"`) {
+		t.Fatalf("child late task request = %s", got)
+	}
 	if err := child.write(`{"jsonrpc":"2.0","id":11,"method":"tasks/result","params":{"taskId":"child-task"}}`); err != nil {
 		t.Fatal(err)
 	}
@@ -1052,22 +1092,29 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 		t.Fatalf("child task result = %s", got)
 	}
 
-	if err := child.write(`{"jsonrpc":"2.0","id":"cancel-child","method":"roots/list"}`); err != nil {
-		t.Fatal(err)
+	harness.send(t, `{"jsonrpc":"2.0","id":12,"result":{"taskId":"child-task","status":"failed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if got := nextLine(t, childInput); !strings.Contains(got, `"id":12`) || !strings.Contains(got, `"code":-32602`) || strings.Contains(got, `"status":"failed"`) {
+		t.Fatalf("finalized task mismatch was raw-forwarded: %s", got)
 	}
-	_ = nextLine(t, harness.hostOutput)
-	if err := child.write(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-child"}}`); err != nil {
-		t.Fatal(err)
+	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"child-task","status":"cancelled"}}`)
+	select {
+	case err := <-harness.done:
+		if err == nil {
+			t.Fatal("conflicting finalized host status terminated Run without an error")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("conflicting finalized host status did not terminate Run")
 	}
-	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, "notifications/cancelled") {
-		t.Fatalf("child cancellation = %s", got)
+	select {
+	case <-terminalProtocolFailure:
+	case <-time.After(time.Second):
+		t.Fatal("conflicting finalized host status was not terminal protocol failure")
 	}
-	harness.send(t, `{"jsonrpc":"2.0","id":"cancel-child","result":{"roots":[]}}`)
 	assertNoLine(t, childInput, 100*time.Millisecond)
-	harness.closeAndWait(t)
+	_ = harness.hostInput.Close()
 }
 
-func TestRunHostTaskNonterminalAfterTerminalIsNotForwarded(t *testing.T) {
+func TestRunHostTaskTerminalMismatchAfterResultIsNotForwarded(t *testing.T) {
 	first := newTestChild()
 	second := newTestChild()
 	firstInput := streamLines(first.inputReader)
@@ -1118,16 +1165,26 @@ func TestRunHostTaskNonterminalAfterTerminalIsNotForwarded(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = nextLine(t, harness.hostOutput)
-	if err := first.write(`{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`); err != nil {
+	harness.send(t, `{"jsonrpc":"2.0","id":"result","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	if got := nextLine(t, firstInput); !strings.Contains(got, `"method":"tasks/result"`) {
+		t.Fatalf("task result request = %s", got)
+	}
+	if err := first.write(`{"jsonrpc":"2.0","id":"result","result":{"content":[]}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"result"`) || !strings.Contains(got, `"result"`) {
+		t.Fatalf("task result = %s", got)
+	}
+	if err := first.write(`{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"failed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-protocolFailure:
 	case <-time.After(3 * time.Second):
-		t.Fatal("nonterminal response after terminal status did not fail the child")
+		t.Fatal("terminal response mismatch after tasks/result did not fail the child")
 	}
-	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"get"`) || !strings.Contains(got, `"error"`) || strings.Contains(got, `"status":"working"`) {
-		t.Fatalf("nonterminal task response was raw-forwarded: %s", got)
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"get"`) || !strings.Contains(got, `"error"`) || strings.Contains(got, `"status":"failed"`) {
+		t.Fatalf("terminal task mismatch was raw-forwarded: %s", got)
 	}
 	select {
 	case <-first.stopped:

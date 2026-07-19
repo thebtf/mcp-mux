@@ -680,6 +680,69 @@ func TestTerminalTaskStatusIsImmutable(t *testing.T) {
 	}
 }
 
+func TestFinalizedTaskStatusRemainsImmutable(t *testing.T) {
+	registry := newDirectionRegistry()
+	registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
+	lateGet := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"late-get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+	lateGetRecord := registry.register(lateGet, 1)
+	result := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	resultRecord := registry.register(result, 1)
+	resultResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result","result":{"content":[]}}`)
+	if err := registry.canComplete(resultRecord, resultResponse); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.complete(resultRecord, resultResponse); err != nil {
+		t.Fatal(err)
+	}
+	if status := registry.finalizedTaskStatuses["task-1"]; status != "completed" {
+		t.Fatalf("finalized task status = %q", status)
+	}
+
+	failed := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"late-get","result":{"taskId":"task-1","status":"failed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(lateGetRecord, failed); err == nil {
+		t.Fatal("late tasks/get changed finalized terminal status")
+	}
+	completed := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"late-get","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(lateGetRecord, completed); err != nil {
+		t.Fatalf("matching late tasks/get status rejected: %v", err)
+	}
+	if handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "cancelled"}, 1); err == nil || !handled {
+		t.Fatalf("late status mutation: handled=%v err=%v", handled, err)
+	}
+	if handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "completed"}, 1); err != nil || !handled {
+		t.Fatalf("matching finalized status: handled=%v err=%v", handled, err)
+	}
+	if handled, err := registry.consumeRetiredTaskStatus(&taskMeta{id: "task-1", status: "failed"}); err == nil || !handled {
+		t.Fatalf("retired status mutation: handled=%v err=%v", handled, err)
+	}
+
+	resultAgain := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result-again","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	resultAgainRecord := registry.register(resultAgain, 1)
+	resultAgainResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result-again","result":{"content":[]}}`)
+	if err := registry.canComplete(resultAgainRecord, resultAgainResponse); err != nil {
+		t.Fatalf("tasks/result after finalization rejected: %v", err)
+	}
+	if err := registry.complete(resultAgainRecord, resultAgainResponse); err != nil {
+		t.Fatal(err)
+	}
+
+	invalidated := newDirectionRegistry()
+	invalidated.terminalTasks["task-2"] = &taskRecord{id: "task-2", generation: 2, status: "failed"}
+	if _, err := invalidated.retireGenerationChecked(2); err != nil {
+		t.Fatal(err)
+	}
+	if status := invalidated.finalizedTaskStatuses["task-2"]; status != "failed" {
+		t.Fatalf("invalidated terminal status = %q", status)
+	}
+	if handled, err := invalidated.updateTask(&taskMeta{id: "task-2", status: "cancelled"}, 2); err == nil || !handled {
+		t.Fatalf("invalidated status mutation: handled=%v err=%v", handled, err)
+	}
+	invalidated.clearRetiredCorrelations()
+	if len(invalidated.finalizedTaskStatuses) != 0 {
+		t.Fatal("finalized status survived retired correlation clear")
+	}
+}
+
 func TestTaskOperationResponseRejectsMismatchedTaskID(t *testing.T) {
 	registry := newDirectionRegistry()
 	registry.tasks["task-1"] = &taskRecord{id: "task-1", generation: 1}
@@ -1214,6 +1277,7 @@ func TestHostRetiredTaskStatusIsConsumedBeforeCurrentGeneration(t *testing.T) {
 		host:              newDirectionRegistry(),
 		initializeRequest: []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}`),
 		initialized:       []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`),
+		cancel:            func() {},
 	}
 	seedRetiredTaskRequest(t, &runner.child, "late-status", "late-status-token")
 	response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"late-status","result":{"task":{"taskId":"retired-task","status":"working"}}}`)
@@ -1240,6 +1304,9 @@ func TestHostRetiredTaskStatusIsConsumedBeforeCurrentGeneration(t *testing.T) {
 	}
 	duplicate := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"retired-task","status":"failed"}}`)
 	runner.handleHostEvent(hostFrameEvent{frame: duplicate})
+	if !runner.terminal || runner.terminalReason != ReasonProtocolFailure {
+		t.Fatalf("conflicting finalized retired status did not fail closed: terminal=%v reason=%s", runner.terminal, runner.terminalReason)
+	}
 	if got := childInput.String(); got != "" {
 		t.Fatalf("tombstoned retired status reached replacement child: %s", got)
 	}

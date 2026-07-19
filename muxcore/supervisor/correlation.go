@@ -185,26 +185,28 @@ func (fence *persistentFence) clear() {
 }
 
 type directionRegistry struct {
-	requests         map[scalarKey]*requestRecord
-	tokens           map[scalarKey]*tokenRecord
-	tasks            map[string]*taskRecord
-	terminalTasks    map[string]*taskRecord
-	tombstones       tombstoneSet
-	persistentFences persistentFence
-	retiredRequests  map[scalarKey]*requestRecord
-	retiredTokens    map[scalarKey]struct{}
-	retiredTasks     map[string]*taskRecord
+	requests              map[scalarKey]*requestRecord
+	tokens                map[scalarKey]*tokenRecord
+	tasks                 map[string]*taskRecord
+	terminalTasks         map[string]*taskRecord
+	tombstones            tombstoneSet
+	persistentFences      persistentFence
+	retiredRequests       map[scalarKey]*requestRecord
+	retiredTokens         map[scalarKey]struct{}
+	retiredTasks          map[string]*taskRecord
+	finalizedTaskStatuses map[string]string
 }
 
 func newDirectionRegistry() directionRegistry {
 	return directionRegistry{
-		requests:        make(map[scalarKey]*requestRecord),
-		tokens:          make(map[scalarKey]*tokenRecord),
-		tasks:           make(map[string]*taskRecord),
-		terminalTasks:   make(map[string]*taskRecord),
-		retiredRequests: make(map[scalarKey]*requestRecord),
-		retiredTokens:   make(map[scalarKey]struct{}),
-		retiredTasks:    make(map[string]*taskRecord),
+		requests:              make(map[scalarKey]*requestRecord),
+		tokens:                make(map[scalarKey]*tokenRecord),
+		tasks:                 make(map[string]*taskRecord),
+		terminalTasks:         make(map[string]*taskRecord),
+		retiredRequests:       make(map[scalarKey]*requestRecord),
+		retiredTokens:         make(map[scalarKey]struct{}),
+		retiredTasks:          make(map[string]*taskRecord),
+		finalizedTaskStatuses: make(map[string]string),
 	}
 }
 
@@ -331,6 +333,16 @@ func (registry *directionRegistry) currentTaskForOperation(record *requestRecord
 	return nil, 0, fmt.Errorf("unknown taskId")
 }
 
+func (registry *directionRegistry) validateFinalizedTaskStatus(taskID, status string) error {
+	if status == "working" || status == "input_required" {
+		return fmt.Errorf("nonterminal task status follows finalized task")
+	}
+	if known, exists := registry.finalizedTaskStatuses[taskID]; exists && known != status {
+		return fmt.Errorf("terminal task status changed from %s to %s", known, status)
+	}
+	return nil
+}
+
 func (registry *directionRegistry) canComplete(record *requestRecord, response *parsedFrame) error {
 	if meta, handled, err := taskOperationResponse(record, response); handled {
 		if err != nil {
@@ -358,6 +370,8 @@ func (registry *directionRegistry) canComplete(record *requestRecord, response *
 			if task.status != meta.status {
 				return fmt.Errorf("terminal task status changed from %s to %s", task.status, meta.status)
 			}
+		case currentTaskFinalized:
+			return registry.validateFinalizedTaskStatus(record.taskID, meta.status)
 		}
 		return nil
 	}
@@ -508,9 +522,10 @@ func (registry *directionRegistry) updateTask(meta *taskMeta, generation uint64)
 		return true, nil
 	}
 	if registry.persistentFences.contains(tombstoneTask, taskTombstoneKey(meta.id)) {
-		if meta.status == "working" || meta.status == "input_required" {
-			return true, fmt.Errorf("nonterminal task status follows finalized task")
+		if err := registry.validateFinalizedTaskStatus(meta.id, meta.status); err != nil {
+			return true, err
 		}
+		registry.finalizedTaskStatuses[meta.id] = meta.status
 		return true, nil
 	}
 	return false, nil
@@ -544,6 +559,9 @@ func (registry *directionRegistry) finalizeTask(taskID string, generation uint64
 	}
 	if err := registry.persistentFences.addMany(entries...); err != nil {
 		return true, err
+	}
+	if terminal != nil {
+		registry.finalizedTaskStatuses[taskID] = terminal.status
 	}
 	delete(registry.tasks, taskID)
 	delete(registry.terminalTasks, taskID)
@@ -648,6 +666,7 @@ func (registry *directionRegistry) retireGenerationChecked(generation uint64) ([
 	}
 	for id, task := range registry.terminalTasks {
 		if task.generation == generation {
+			registry.finalizedTaskStatuses[id] = task.status
 			delete(registry.terminalTasks, id)
 		}
 	}
@@ -703,12 +722,22 @@ func (registry *directionRegistry) consumeRetiredResponse(response *parsedFrame)
 			return true, nil
 		}
 		if terminalFenced {
+			if record.method != "tasks/result" {
+				if err := registry.validateFinalizedTaskStatus(record.taskID, operationMeta.status); err != nil {
+					return true, err
+				}
+				registry.finalizedTaskStatuses[record.taskID] = operationMeta.status
+			}
 			if err := registry.releaseRetiredRequest(record); err != nil {
 				return true, err
 			}
 			return true, nil
 		}
-		if err := registry.releaseRetiredTaskOperation(record, task); err != nil {
+		finalizedStatus := ""
+		if record.method != "tasks/result" {
+			finalizedStatus = operationMeta.status
+		}
+		if err := registry.releaseRetiredTaskOperation(record, task, finalizedStatus); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -795,7 +824,7 @@ func (registry *directionRegistry) retiredTaskForOperation(record *requestRecord
 	return retired, false, nil
 }
 
-func (registry *directionRegistry) releaseRetiredTaskOperation(record *requestRecord, task *taskRecord) error {
+func (registry *directionRegistry) releaseRetiredTaskOperation(record *requestRecord, task *taskRecord, finalizedStatus string) error {
 	entries := []tombstoneKey{
 		{role: tombstoneRequest, key: record.id.key},
 		{role: tombstoneTask, key: taskTombstoneKey(task.id)},
@@ -808,6 +837,9 @@ func (registry *directionRegistry) releaseRetiredTaskOperation(record *requestRe
 	}
 	if err := registry.persistentFences.addMany(entries...); err != nil {
 		return err
+	}
+	if finalizedStatus != "" {
+		registry.finalizedTaskStatuses[task.id] = finalizedStatus
 	}
 	delete(registry.retiredRequests, record.id.key)
 	if record.progressToken != nil {
@@ -836,6 +868,10 @@ func (registry *directionRegistry) consumeRetiredTaskStatus(meta *taskMeta) (boo
 		if _, exists := registry.terminalTasks[meta.id]; exists {
 			return true, fmt.Errorf("taskId belongs to a terminal task and a persistent fence")
 		}
+		if err := registry.validateFinalizedTaskStatus(meta.id, meta.status); err != nil {
+			return true, err
+		}
+		registry.finalizedTaskStatuses[meta.id] = meta.status
 		return true, nil
 	}
 	if _, exists := registry.tasks[meta.id]; exists {
@@ -858,6 +894,7 @@ func (registry *directionRegistry) consumeRetiredTaskStatus(meta *taskMeta) (boo
 	if err := registry.persistentFences.addMany(entries...); err != nil {
 		return true, err
 	}
+	registry.finalizedTaskStatuses[meta.id] = meta.status
 	delete(registry.retiredTasks, meta.id)
 	if task.progressToken != nil {
 		delete(registry.retiredTokens, *task.progressToken)
@@ -873,6 +910,7 @@ func (registry *directionRegistry) clearRetiredCorrelations() {
 	clear(registry.retiredRequests)
 	clear(registry.retiredTokens)
 	clear(registry.retiredTasks)
+	clear(registry.finalizedTaskStatuses)
 	registry.persistentFences.clear()
 }
 
