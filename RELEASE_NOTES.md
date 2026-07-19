@@ -116,5 +116,5 @@ update and re-read the Aimux and Engram adoption issues with the released tag,
 public API boundary, single-authority and replay invariants, forbidden private-
 protocol copies, required customer-mode smoke evidence, rollback notes, and
 provider commit/test/module-resolution proof. If that cannot be completed,
-record `CONSUMER_HANDOFF_BLOCKED` and do not call the full critical muxcore scope
+record `CONSUMER_HANDOFF_BLOCKED` and do not claim the full critical muxcore scope
 shipped.
