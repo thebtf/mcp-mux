@@ -2688,13 +2688,9 @@ func (d *Daemon) setOwnerPersistent(expected *owner.Owner, persistent bool) bool
 		return false
 	}
 	serverID := expected.ServerID()
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	ok = ok && entry != nil && entry.Owner == expected
-	if ok {
+	ok := d.mutateCurrentOwnerEntry(expected, func(entry *OwnerEntry) {
 		entry.Persistent = persistent
-	}
-	d.mu.Unlock()
+	})
 	if ok {
 		d.logger.Printf("owner %s persistent=%v", shortServerID(serverID), persistent)
 	}
@@ -2716,21 +2712,21 @@ func (d *Daemon) publishOwnerCache(expected *owner.Owner, snap mcpsnapshot.Owner
 	if d.beforeOwnerCachePublish != nil {
 		d.beforeOwnerCachePublish(expected)
 	}
-	serverID := expected.ServerID()
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	if !ok || entry == nil || entry.Owner != expected {
-		d.mu.Unlock()
+	snap.Persistent = d.persistent || snap.Persistent
+	var command, key string
+	var revision uint64
+	var published bool
+	if !d.mutateCurrentOwnerEntry(expected, func(entry *OwnerEntry) {
+		command = entry.Command
+		key, revision, published = d.updateTemplateLocked(entry.Command, entry.Args, snap)
+		if published {
+			entry.Persistent = snap.Persistent
+		}
+	}) {
 		return false
 	}
-	snap.Persistent = d.persistent || snap.Persistent
-	key, revision, published := d.updateTemplateLocked(entry.Command, entry.Args, snap)
 	if published {
-		entry.Persistent = snap.Persistent
-	}
-	d.mu.Unlock()
-	if published {
-		d.logger.Printf("template cache updated for %s (key=%s revision=%d scope=%s)", entry.Command, key[:8], revision, snap.Classification)
+		d.logger.Printf("template cache updated for %s (key=%s revision=%d scope=%s)", command, key[:8], revision, snap.Classification)
 	}
 	return published
 }
@@ -2739,16 +2735,14 @@ func (d *Daemon) invalidateOwnerTemplate(expected *owner.Owner) {
 	if expected == nil {
 		return
 	}
-	serverID := expected.ServerID()
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	if !ok || entry == nil || entry.Owner != expected {
-		d.mu.Unlock()
+	var command, key string
+	var existed bool
+	if !d.mutateCurrentOwnerEntry(expected, func(entry *OwnerEntry) {
+		command = entry.Command
+		key, existed = d.invalidateTemplateLocked(entry.Command, entry.Args)
+	}) {
 		return
 	}
-	command := entry.Command
-	key, existed := d.invalidateTemplateLocked(command, entry.Args)
-	d.mu.Unlock()
 	if existed {
 		d.logger.Printf("template cache invalidated for %s (key=%s)", command, key[:8])
 	}
@@ -3229,14 +3223,11 @@ func (d *Daemon) onZeroSessions(expected *owner.Owner) {
 		delay = override
 	}
 	zeroAt := time.Now()
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	ok = ok && entry != nil && entry.Owner == expected
-	if ok {
+	var entry *OwnerEntry
+	if !d.mutateCurrentOwnerEntry(expected, func(current *OwnerEntry) {
+		entry = current
 		entry.LastSession = zeroAt
-	}
-	d.mu.Unlock()
-	if !ok {
+	}) {
 		return
 	}
 	d.logger.Printf("owner %s: zero sessions (cleanup delay %s)", shortServerID(serverID), delay)
@@ -3277,16 +3268,16 @@ func (d *Daemon) onUpstreamExit(expected *owner.Owner) {
 		return
 	}
 	serverID := expected.ServerID()
-	d.mu.Lock()
-	entry, ok := d.owners[serverID]
-	if !ok || entry == nil || entry.Owner != expected {
-		d.mu.Unlock()
+	var entry *OwnerEntry
+	var persistent bool
+	if !d.mutateCurrentOwnerEntry(expected, func(current *OwnerEntry) {
+		entry = current
+		cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
+		d.recordCrash(cmdKey)
+		persistent = entry.Persistent
+	}) {
 		return
 	}
-	cmdKey := entry.Command + " " + strings.Join(entry.Args, " ")
-	d.recordCrash(cmdKey)
-	persistent := entry.Persistent
-	d.mu.Unlock()
 	if persistent {
 		d.logger.Printf("owner %s: upstream exited; owner-local persistent recovery remains authoritative", shortServerID(serverID))
 		return

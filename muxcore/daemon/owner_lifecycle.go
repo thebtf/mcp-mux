@@ -59,6 +59,25 @@ func newOwnerRemovalStats() ownerRemovalStats {
 	return ownerRemovalStats{ByReason: make(map[ownerRemovalReason]uint64)}
 }
 
+// mutateCurrentOwnerEntry is the daemon-owned exact-generation registry seam.
+// It applies mutate only while expected is still the current owner generation
+// registered for its server ID. mutate runs with d.mu held and must not call
+// code that reacquires d.mu.
+func (d *Daemon) mutateCurrentOwnerEntry(expected *owner.Owner, mutate func(*OwnerEntry)) bool {
+	if expected == nil {
+		return false
+	}
+	serverID := expected.ServerID()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	entry, ok := d.owners[serverID]
+	if !ok || entry == nil || entry.Owner != expected {
+		return false
+	}
+	mutate(entry)
+	return true
+}
+
 func (s ownerRemovalStats) statusMap() map[string]any {
 	byReason := make(map[string]uint64, len(s.ByReason))
 	for reason, count := range s.ByReason {
