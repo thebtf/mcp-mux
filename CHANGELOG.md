@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-07-19
+
 ### Added
 
 - Added `supervisor.StartWithFallback` for provider-generic requested/fallback
@@ -236,7 +238,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.29.1...HEAD
+[0.29.1]: https://github.com/thebtf/mcp-mux/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/thebtf/mcp-mux/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/thebtf/mcp-mux/compare/v0.27.2...v0.28.0
 [0.27.2]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...v0.27.2

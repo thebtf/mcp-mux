@@ -71,8 +71,27 @@ do not call the full critical muxcore scope shipped.
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
 ```
+
+### v0.29.1 - fallback start policy and exact-generation registry mutation
+
+**No required consumer code changes for ordinary `engine.New` users.**
+`supervisor.StartWithFallback` tries a distinct fallback only after the
+requested start fails cleanly with neither child nor admission authority. A
+failed attempt that retains child or admission authority returns it for
+`supervisor.Run` finalization rather than starting another generation.
+`ErrStartRollbackUnproven` remains fail-closed because admission cleanup is not
+process-tree retirement proof. Cancellation is preserved and never causes an
+additional fallback attempt.
+
+Owner-originated persistence, template-cache, zero-session, and upstream-exit
+callbacks mutate the daemon registry only through its exact-current-generation
+transaction; stale owner generations are no-ops, and process-generation
+authority stays in `muxcore/owner`.
+
+Rollback: pin `muxcore/v0.29.0` or restore the prior product binary; do not
+force a mixed-version live handoff.
 
 ### v0.29.0 - public stable-stdio supervisor
 

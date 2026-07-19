@@ -15,16 +15,33 @@ consumers; muxcore is a runtime layer and downstream behavior changes matter.
 Install the current release after its tag resolves through the Go proxy:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
 ```
 
-v0.29.0 includes the v0.28.0 demand-driven materialization and fail-closed
-process-retirement contracts described below, plus the earlier native update,
-registry, namespace, reconnect, idle/dormant, and protocol-v2 handoff behavior.
-It adds the public `muxcore/supervisor` and `muxcore/supervisor/attest`
-packages for products that need one stable MCP host transport around
-replaceable child engines. Ordinary `engine.New` users require no source
-change.
+v0.29.1 includes the v0.29.0 stable-stdio supervisor, v0.28.0 demand-driven
+materialization, and fail-closed process-retirement contracts described below,
+plus the earlier native update, registry, namespace, reconnect, idle/dormant,
+and protocol-v2 handoff behavior. It adds the public
+`supervisor.StartWithFallback` policy helper and exact-generation daemon
+registry mutation. Ordinary `engine.New` users require no source change.
+
+### v0.29.1 - fallback start policy and exact-generation registry mutation
+
+**No required consumer code changes for ordinary `engine.New` users.**
+`supervisor.StartWithFallback` tries a distinct fallback only after a requested
+start fails cleanly with neither child nor admission authority. Failed attempts
+that retain authority return it to `supervisor.Run` for finalization instead of
+starting a second generation. `ErrStartRollbackUnproven` remains fail-closed,
+because admission cleanup alone is not process-tree retirement proof;
+cancellation is preserved and never starts an additional fallback attempt.
+
+Owner-originated persistence, template-cache, zero-session, and upstream-exit
+callbacks mutate the daemon registry only through its exact-current-generation
+transaction. Stale owner generations are no-ops, while process-generation
+authority stays in `muxcore/owner`.
+
+Current rollback: pin `muxcore/v0.29.0` or restore the prior product binary;
+do not force a mixed-version live handoff.
 
 ### v0.29.0 - public stable-stdio supervisor
 
@@ -457,15 +474,15 @@ Rules:
 Use it for cheap admission decisions such as local rate limiting. Do not put
 network calls, database writes, or heavy policy evaluation in this hook.
 
-## Stable Stdio Supervisor (v0.29.0)
+## Stable Stdio Supervisor (v0.29.x)
 
 `muxcore/supervisor` is the public boundary for products whose MCP host keeps
 one stdio transport open while the product replaces a child engine executable.
-Introduced in `muxcore/v0.29.0`. After the tag resolves through the Go proxy,
-pin it with:
+Introduced in `muxcore/v0.29.0`. After the current tag resolves through the Go
+proxy, pin `muxcore/v0.29.1` with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
 ```
 
 Minimal ordinary-supervision shape:
@@ -489,6 +506,13 @@ err := supervisor.Run(ctx, supervisor.Config{
     },
 })
 ```
+
+For requested/fallback engine policy, make `Config.Start` call
+`supervisor.StartWithFallback(ctx, requested, fallback, start)`, where `start`
+returns each attempt's `StartResult`. The fallback runs only after a clean
+requested failure with no child or admission authority; retained authority is
+returned to `Run` for finalization. A rollback-unproven result is fail-closed,
+and cancellation is returned without starting a later fallback attempt.
 
 `HostIn` transfers ownership of an `io.ReadCloser` to `Run` for the invocation.
 Its `Close` method must unblock any pending `Read`; the supervisor closes it on
@@ -560,9 +584,12 @@ old engine as ordinary MCP; an old launcher runs a new engine without private
 dormancy; and a pre-attestation engine that emits a colliding private method is
 suppressed rather than committed or restarted in a loop. Do not copy the v2
 method strings, exit code, parser, replay loop, or attestation into a consumer.
-Use `supervisor.ProtocolV2()`, `supervisor.Run`, and `supervisor/attest`.
+Use the public APIs `supervisor.ProtocolV2()`, `supervisor.Run`,
+`supervisor.StartCommand`, `supervisor.StartWithFallback`, and
+`supervisor/attest`.
 
-To roll back, pin `muxcore/v0.28.0` or restore the prior product binary. Do not
+To roll back the current v0.29.1 patch, pin `muxcore/v0.29.0` or restore the
+prior product binary. Do not
 force a mixed-version live supervisor handoff or forward an old attestation
 advertisement. Old/new combinations run as ordinary MCP without private
 dormancy and should restart through the product's bounded replacement path.
