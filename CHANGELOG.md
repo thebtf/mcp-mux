@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Added `supervisor.StartWithFallback` for provider-generic requested/fallback
+  start policy. It retries only after a clean start failure with no child or
+  admission authority, returns partial or rollback-unproven authority for the
+  supervisor to finalize, and keeps product engine identities out of errors.
+
+### Changed
+
+- Owner-originated persistence, template-cache, zero-session, and upstream-exit
+  callbacks now mutate daemon registry state through one exact-generation
+  transaction. Stale owner generations remain no-ops, while process-generation
+  authority stays in `muxcore/owner`.
+
 ## [0.29.0] - 2026-07-19
 
 ### Added
