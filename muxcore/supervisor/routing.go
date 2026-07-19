@@ -218,8 +218,8 @@ func (runner *runner) writeLifecycleNotification(raw []byte) {
 func (runner *runner) enqueueHost(item *pendingFrame, sameGenerationOnly bool) {
 	frame := item.frame
 	if frame.kind == frameRequest {
-		if err := runner.validateHostRequest(frame); err != nil {
-			runner.rejectHostRequest(frame, codeInvalidRequest, err.Error())
+		if code, err := runner.validateHostRequest(frame); err != nil {
+			runner.rejectHostRequest(frame, code, err.Error())
 			return
 		}
 	}
@@ -238,36 +238,36 @@ func (runner *runner) enqueueHost(item *pendingFrame, sameGenerationOnly bool) {
 	}
 }
 
-func (runner *runner) validateHostRequest(frame *parsedFrame) error {
+func (runner *runner) validateHostRequest(frame *parsedFrame) (int, error) {
 	if frame.taskAugmented && !taskRequestSupported(runner.initializeResponse, true, frame.method) {
 		frame.taskAugmented = false
 	}
 	if frame.utilityErr != nil {
-		return fmt.Errorf("invalid request metadata")
+		return codeInvalidRequest, fmt.Errorf("invalid request metadata")
 	}
 	if frame.taskOperation != "" {
 		if runner.current == nil {
-			return fmt.Errorf("unknown taskId")
+			return codeInvalidParams, fmt.Errorf("unknown taskId")
 		}
 		if err := validateTaskOperation(&runner.host, frame, runner.current.id); err != nil {
-			return err
+			return codeInvalidParams, err
 		}
 	}
 	if err := runner.host.canRegister(frame); err != nil {
-		return err
+		return codeInvalidRequest, err
 	}
 	if runner.initializeID != nil &&
 		(runner.initializeAwaiting || runner.state == StateReplaying) &&
 		frame.id.key == runner.initializeID.key {
-		return fmt.Errorf("duplicate active request id")
+		return codeInvalidRequest, fmt.Errorf("duplicate active request id")
 	}
 	if runner.pending.containsRequest(frame.id.key) {
-		return fmt.Errorf("duplicate pending request id")
+		return codeInvalidRequest, fmt.Errorf("duplicate pending request id")
 	}
 	if frame.progressToken != nil && runner.pending.containsProgressToken(frame.progressToken.key) {
-		return fmt.Errorf("duplicate pending progress token")
+		return codeInvalidRequest, fmt.Errorf("duplicate pending progress token")
 	}
-	return nil
+	return codeInvalidRequest, nil
 }
 
 func (runner *runner) deliverHostFirst(item *pendingFrame) {
@@ -278,11 +278,7 @@ func (runner *runner) deliverHostFirst(item *pendingFrame) {
 		return
 	}
 	if frame.kind == frameRequest {
-		if err := runner.validateHostRequest(frame); err != nil {
-			code := codeInvalidRequest
-			if errors.Is(err, errTerminalTaskCancel) {
-				code = codeInvalidParams
-			}
+		if code, err := runner.validateHostRequest(frame); err != nil {
 			runner.rejectHostRequest(frame, code, err.Error())
 			return
 		}

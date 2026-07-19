@@ -243,7 +243,7 @@ func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
 	if len(registry.requests)+len(registry.retiredRequests) >= retainedCorrelationLimit {
 		return fmt.Errorf("request correlation retention limit reached")
 	}
-	if frame.taskAugmented && len(registry.tasks)+len(registry.retiredTasks) >= retainedCorrelationLimit {
+	if frame.taskAugmented && len(registry.tasks)+len(registry.terminalTasks)+len(registry.retiredTasks) >= retainedCorrelationLimit {
 		return fmt.Errorf("task correlation retention limit reached")
 	}
 	if frame.progressToken != nil {
@@ -297,7 +297,7 @@ func (registry *directionRegistry) canBindTask(taskID string) error {
 	if registry.tombstones.contains(tombstoneTask, taskKey) || registry.persistentFences.contains(tombstoneTask, taskKey) {
 		return fmt.Errorf("taskId is tombstoned")
 	}
-	if len(registry.tasks)+len(registry.retiredTasks) >= retainedCorrelationLimit {
+	if len(registry.tasks)+len(registry.terminalTasks)+len(registry.retiredTasks) >= retainedCorrelationLimit {
 		return fmt.Errorf("task correlation retention limit reached")
 	}
 	return nil
@@ -336,12 +336,28 @@ func (registry *directionRegistry) canComplete(record *requestRecord, response *
 		if err != nil {
 			return err
 		}
-		_, state, stateErr := registry.currentTaskForOperation(record)
+		task, state, stateErr := registry.currentTaskForOperation(record)
 		if stateErr != nil {
 			return stateErr
 		}
-		if meta != nil && (meta.status == "working" || meta.status == "input_required") && state != currentTaskActive {
+		if meta == nil {
+			return nil
+		}
+		if (meta.status == "working" || meta.status == "input_required") && state != currentTaskActive {
 			return fmt.Errorf("nonterminal task operation response follows terminal task status")
+		}
+		if record.method == "tasks/result" || meta.status == "working" || meta.status == "input_required" {
+			return nil
+		}
+		switch state {
+		case currentTaskActive:
+			if len(registry.terminalTasks) >= terminalTaskLimit {
+				return fmt.Errorf("terminal task retention limit reached")
+			}
+		case currentTaskTerminal:
+			if task.status != meta.status {
+				return fmt.Errorf("terminal task status changed from %s to %s", task.status, meta.status)
+			}
 		}
 		return nil
 	}
@@ -486,7 +502,9 @@ func (registry *directionRegistry) updateTask(meta *taskMeta, generation uint64)
 		if meta.status == "working" || meta.status == "input_required" {
 			return true, fmt.Errorf("nonterminal task status follows terminal task status")
 		}
-		terminal.status = meta.status
+		if terminal.status != meta.status {
+			return true, fmt.Errorf("terminal task status changed from %s to %s", terminal.status, meta.status)
+		}
 		return true, nil
 	}
 	if registry.persistentFences.contains(tombstoneTask, taskTombstoneKey(meta.id)) {
@@ -555,7 +573,7 @@ func (registry *directionRegistry) retireGenerationChecked(generation uint64) ([
 	if len(registry.tokens)+len(registry.retiredTokens) > retainedCorrelationLimit {
 		return nil, fmt.Errorf("progress token correlation retention limit exceeded")
 	}
-	if len(registry.tasks)+len(registry.retiredTasks) > retainedCorrelationLimit {
+	if len(registry.tasks)+len(registry.terminalTasks)+len(registry.retiredTasks) > retainedCorrelationLimit {
 		return nil, fmt.Errorf("task correlation retention limit exceeded")
 	}
 	if len(registry.terminalTasks) > terminalTaskLimit {

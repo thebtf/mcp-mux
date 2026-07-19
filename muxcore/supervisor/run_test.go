@@ -1146,6 +1146,57 @@ func TestRunHostTaskNonterminalAfterTerminalIsNotForwarded(t *testing.T) {
 	harness.closeAndWait(t)
 }
 
+func TestHostTaskOperationValidationUsesInvalidParamsInImmediateAndQueuedPaths(t *testing.T) {
+	for _, mode := range []struct {
+		name  string
+		state State
+	}{
+		{name: "immediate", state: StateActive},
+		{name: "queued", state: StateQuiescing},
+	} {
+		for _, testCase := range []struct {
+			name         string
+			raw          string
+			expectedCode string
+			setup        func(*directionRegistry)
+		}{
+			{name: "unknown task", raw: `{"jsonrpc":"2.0","id":"unknown","method":"tasks/get","params":{"taskId":"missing"}}`, expectedCode: `"code":-32602`},
+			{name: "terminal cancel", raw: `{"jsonrpc":"2.0","id":"cancel","method":"tasks/cancel","params":{"taskId":"task-1"}}`, expectedCode: `"code":-32602`, setup: func(registry *directionRegistry) {
+				registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
+			}},
+			{name: "capacity", raw: `{"jsonrpc":"2.0","id":"overflow","method":"tools/list"}`, expectedCode: `"code":-32600`, setup: func(registry *directionRegistry) {
+				for index := range activeCorrelationLimit {
+					key := scalarKey{kind: scalarString, value: strings.Repeat("x", index+1)}
+					registry.requests[key] = &requestRecord{}
+				}
+			}},
+		} {
+			t.Run(mode.name+"/"+testCase.name, func(t *testing.T) {
+				hostOutput := &bufferWriteCloser{}
+				childInput := &bufferWriteCloser{}
+				runner := &runner{
+					cfg:     Config{HostOut: hostOutput},
+					state:   mode.state,
+					current: &generation{id: 1, stdin: childInput},
+					host:    newDirectionRegistry(),
+					child:   newDirectionRegistry(),
+				}
+				if testCase.setup != nil {
+					testCase.setup(&runner.host)
+				}
+				frame := mustParseCorrelationFrame(t, testCase.raw)
+				runner.deliverHostFirst(&pendingFrame{frame: frame})
+				if got := hostOutput.String(); !strings.Contains(got, testCase.expectedCode) {
+					t.Fatalf("host response = %s, want %s", got, testCase.expectedCode)
+				}
+				if childInput.Len() != 0 || runner.pending.len() != 0 {
+					t.Fatalf("rejected request reached delivery path: child=%q pending=%d", childInput.String(), runner.pending.len())
+				}
+			})
+		}
+	}
+}
+
 func TestRunLateRetiredTaskResultCollisionTerminatesSession(t *testing.T) {
 	first := newTestChild()
 	second := newTestChild()

@@ -338,7 +338,7 @@ func TestTaskRequestSupportedUsesReceiverCapabilities(t *testing.T) {
 	}
 }
 
-func TestTaskOperationResponsesRetireWithoutStatusNotification(t *testing.T) {
+func TestTaskOperationResponsesRetainOrFinalizeWithoutStatusNotification(t *testing.T) {
 	seed := func(t *testing.T) *directionRegistry {
 		t.Helper()
 		registry := newDirectionRegistry()
@@ -386,13 +386,14 @@ func TestTaskOperationResponsesRetireWithoutStatusNotification(t *testing.T) {
 	}
 
 	for _, testCase := range []struct {
-		name     string
-		method   string
-		response string
+		name           string
+		method         string
+		response       string
+		terminalStatus string
 	}{
-		{name: "terminal get", method: "tasks/get", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
-		{name: "cancel", method: "tasks/cancel", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
-		{name: "result", method: "tasks/result", response: `{"jsonrpc":"2.0","id":"operation","result":{"content":[]}}`},
+		{name: "terminal get retained", method: "tasks/get", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`, terminalStatus: "completed"},
+		{name: "cancel retained", method: "tasks/cancel", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`, terminalStatus: "cancelled"},
+		{name: "result finalized", method: "tasks/result", response: `{"jsonrpc":"2.0","id":"operation","result":{"content":[]}}`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			registry := seed(t)
@@ -402,9 +403,22 @@ func TestTaskOperationResponsesRetireWithoutStatusNotification(t *testing.T) {
 			if err := registry.canComplete(record, response); err != nil {
 				t.Fatal(err)
 			}
-			registry.complete(record, response)
+			if err := registry.complete(record, response); err != nil {
+				t.Fatal(err)
+			}
 			if len(registry.tasks) != 0 || len(registry.tokens) != 0 {
-				t.Fatalf("terminal operation retained state: tasks=%d tokens=%d", len(registry.tasks), len(registry.tokens))
+				t.Fatalf("terminal operation retained active state: tasks=%d tokens=%d", len(registry.tasks), len(registry.tokens))
+			}
+			terminal := registry.terminalTasks["task-1"]
+			if testCase.terminalStatus != "" {
+				if terminal == nil || terminal.status != testCase.terminalStatus {
+					t.Fatalf("terminal operation did not retain terminal task: %#v", terminal)
+				}
+				if registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) {
+					t.Fatal("routable terminal task was prematurely fenced")
+				}
+			} else if terminal != nil || !registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) {
+				t.Fatalf("tasks/result did not finalize task: terminal=%#v", terminal)
 			}
 		})
 	}
@@ -566,6 +580,29 @@ func TestTerminalTaskRetentionAndGenerationInvalidation(t *testing.T) {
 		}
 	})
 
+	t.Run("combined task retention cap", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		for index := range terminalTaskLimit {
+			id := fmt.Sprintf("terminal-%d", index)
+			registry.terminalTasks[id] = &taskRecord{id: id, generation: 1, status: "completed"}
+		}
+		for index := range activeCorrelationLimit {
+			id := fmt.Sprintf("retired-%d", index)
+			registry.retiredTasks[id] = &taskRecord{id: id, generation: 1, status: "working"}
+		}
+		request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","method":"tools/call","params":{"task":{}}}`)
+		if err := registry.canRegister(request); err == nil {
+			t.Fatal("combined terminal and retired task cap accepted task-augmented request")
+		}
+		if err := registry.canBindTask("new-task"); err == nil {
+			t.Fatal("combined terminal and retired task cap accepted task binding")
+		}
+		registry.tasks["overflow"] = &taskRecord{id: "overflow", generation: 2, status: "working"}
+		if _, err := registry.retireGenerationChecked(2); err == nil {
+			t.Fatal("generation retirement ignored combined task retention overflow")
+		}
+	})
+
 	t.Run("generation invalidation", func(t *testing.T) {
 		registry := newDirectionRegistry()
 		registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
@@ -599,6 +636,47 @@ func TestActiveTaskOperationResponseAfterTerminalStatus(t *testing.T) {
 	working := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
 	if err := registry.canComplete(record, working); err == nil {
 		t.Fatal("nonterminal response after terminal status was accepted")
+	}
+}
+
+func TestTerminalTaskStatusIsImmutable(t *testing.T) {
+	registry := newDirectionRegistry()
+	registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
+	if handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "cancelled"}, 1); err == nil || !handled {
+		t.Fatalf("terminal status mutation: handled=%v err=%v", handled, err)
+	}
+	if status := registry.terminalTasks["task-1"].status; status != "completed" {
+		t.Fatalf("terminal status mutated to %q", status)
+	}
+
+	get := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+	getRecord := registry.register(get, 1)
+	mismatch := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(getRecord, mismatch); err == nil {
+		t.Fatal("terminal operation response changed immutable status")
+	}
+
+	result := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	resultRecord := registry.register(result, 1)
+	resultResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result","result":{"content":[]}}`)
+	if err := registry.canComplete(resultRecord, resultResponse); err != nil {
+		t.Fatalf("tasks/result synthetic terminal status was compared: %v", err)
+	}
+
+	full := newDirectionRegistry()
+	for index := range terminalTaskLimit {
+		id := fmt.Sprintf("terminal-%d", index)
+		full.terminalTasks[id] = &taskRecord{id: id, generation: 1, status: "completed"}
+	}
+	full.tasks["active"] = &taskRecord{id: "active", generation: 1, status: "working"}
+	operation := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"active-get","method":"tasks/get","params":{"taskId":"active"}}`)
+	record := full.register(operation, 1)
+	terminal := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"active-get","result":{"taskId":"active","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := full.canComplete(record, terminal); err == nil {
+		t.Fatal("active terminal response ignored terminal retention preflight")
+	}
+	if full.tasks["active"] == nil || full.terminalTasks["active"] != nil {
+		t.Fatal("terminal retention preflight mutated task state")
 	}
 }
 
