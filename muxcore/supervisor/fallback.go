@@ -32,6 +32,9 @@ func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start
 	if retained, retainedErr, terminal := retainFailedStart(result, err); terminal {
 		return retained, retainedErr
 	}
+	if err := ctx.Err(); err != nil {
+		return StartResult{}, err
+	}
 	if requested == fallback {
 		return StartResult{}, errNoDistinctFallback
 	}

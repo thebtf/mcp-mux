@@ -42,6 +42,35 @@ func TestStartWithFallbackUsesFallbackAfterCleanFailure(t *testing.T) {
 	}
 }
 
+func TestStartWithFallbackDoesNotStartFallbackAfterContextCancellation(t *testing.T) {
+	const requestedID = "secret-requested-engine"
+	requested := EngineRef{ID: requestedID}
+	fallback := EngineRef{ID: "fallback-engine"}
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+
+	result, err := StartWithFallback(ctx, requested, fallback, func(_ context.Context, ref EngineRef) (StartResult, error) {
+		calls++
+		if ref == requested {
+			cancel()
+			return StartResult{}, errors.New("requested failure exposed " + requestedID)
+		}
+		return StartResult{Actual: ref}, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StartWithFallback() error = %v, want context cancellation", err)
+	}
+	if strings.Contains(err.Error(), requestedID) {
+		t.Fatalf("StartWithFallback() error leaked requested identity: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("start calls = %d, want requested attempt only", calls)
+	}
+	if startResultHasAuthority(result) {
+		t.Fatalf("result = %#v, want no authority", result)
+	}
+}
+
 func TestStartWithFallbackReturnsAdmissionWithoutRetryForUnprovenRollback(t *testing.T) {
 	const requestedID = "secret-requested-engine"
 	const fallbackID = "secret-fallback-engine"
