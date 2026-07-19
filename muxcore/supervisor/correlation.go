@@ -508,7 +508,7 @@ func (registry *directionRegistry) consumeRetiredResponse(response *parsedFrame)
 		if err != nil {
 			return true, err
 		}
-		task, taskErr := registry.retiredTaskForOperation(record)
+		task, terminalFenced, taskErr := registry.retiredTaskForOperation(record)
 		if taskErr != nil {
 			return true, taskErr
 		}
@@ -519,10 +519,19 @@ func (registry *directionRegistry) consumeRetiredResponse(response *parsedFrame)
 			return true, nil
 		}
 		if operationMeta.status == "working" || operationMeta.status == "input_required" {
+			if terminalFenced {
+				return true, fmt.Errorf("nonterminal task operation response follows terminal task status")
+			}
 			if err := registry.releaseRetiredRequest(record); err != nil {
 				return true, err
 			}
 			task.status = operationMeta.status
+			return true, nil
+		}
+		if terminalFenced {
+			if err := registry.releaseRetiredRequest(record); err != nil {
+				return true, err
+			}
 			return true, nil
 		}
 		if err := registry.releaseRetiredTaskOperation(record, task); err != nil {
@@ -590,22 +599,25 @@ func (registry *directionRegistry) releaseRetiredRequest(record *requestRecord) 
 	return nil
 }
 
-func (registry *directionRegistry) retiredTaskForOperation(record *requestRecord) (*taskRecord, error) {
+func (registry *directionRegistry) retiredTaskForOperation(record *requestRecord) (*taskRecord, bool, error) {
 	taskKey := taskTombstoneKey(record.taskID)
 	retired := registry.retiredTasks[record.taskID]
 	_, active := registry.tasks[record.taskID]
 	fenced := registry.persistentFences.contains(tombstoneTask, taskKey)
 	transitioned := registry.tombstones.contains(tombstoneTask, taskKey)
 	if retired == nil {
-		if active || fenced || transitioned {
-			return nil, fmt.Errorf("retired task operation collides with current or terminal taskId")
+		if active || transitioned {
+			return nil, false, fmt.Errorf("retired task operation collides with current taskId state")
 		}
-		return nil, fmt.Errorf("retired task operation references unknown taskId")
+		if fenced {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("retired task operation references unknown taskId")
 	}
 	if active || fenced || transitioned {
-		return nil, fmt.Errorf("retired task operation has ambiguous taskId state")
+		return nil, false, fmt.Errorf("retired task operation has ambiguous taskId state")
 	}
-	return retired, nil
+	return retired, false, nil
 }
 
 func (registry *directionRegistry) releaseRetiredTaskOperation(record *requestRecord, task *taskRecord) error {

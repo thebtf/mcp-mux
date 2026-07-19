@@ -505,6 +505,57 @@ func TestRetiredTaskOperationLateResponses(t *testing.T) {
 	}
 }
 
+func TestRetiredTaskOperationResponseAfterTerminalStatus(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		method         string
+		terminalStatus string
+		response       string
+	}{
+		{name: "terminal get", method: "tasks/get", terminalStatus: "completed", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "cancel", method: "tasks/cancel", terminalStatus: "cancelled", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "result", method: "tasks/result", terminalStatus: "completed", response: `{"jsonrpc":"2.0","id":"operation","result":{"content":[]}}`},
+		{name: "error", method: "tasks/get", terminalStatus: "completed", response: `{"jsonrpc":"2.0","id":"operation","error":{"code":-32000,"message":"already complete"}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			registry := seedRetiredTaskOperation(t, testCase.method)
+			terminal := &taskMeta{id: "task-1", status: testCase.terminalStatus}
+			if handled, err := registry.consumeRetiredTaskStatus(terminal); err != nil || !handled {
+				t.Fatalf("consume terminal status: handled=%v err=%v", handled, err)
+			}
+			response := mustParseCorrelationFrame(t, testCase.response)
+			handled, err := registry.consumeRetiredResponse(response)
+			if err != nil || !handled {
+				t.Fatalf("consume response after terminal status: handled=%v err=%v", handled, err)
+			}
+			tokenKey := scalarKey{kind: scalarString, value: "task-token"}
+			if registry.retiredRequests[response.id.key] != nil {
+				t.Fatal("response after terminal status retained operation request")
+			}
+			if !registry.persistentFences.contains(tombstoneRequest, response.id.key) ||
+				!registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) ||
+				!registry.persistentFences.contains(tombstoneToken, tokenKey) {
+				t.Fatal("response after terminal status lost request/task/token fences")
+			}
+		})
+	}
+
+	t.Run("nonterminal result remains fatal", func(t *testing.T) {
+		registry := seedRetiredTaskOperation(t, "tasks/get")
+		if handled, err := registry.consumeRetiredTaskStatus(&taskMeta{id: "task-1", status: "completed"}); err != nil || !handled {
+			t.Fatalf("consume terminal status: handled=%v err=%v", handled, err)
+		}
+		response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+		handled, err := registry.consumeRetiredResponse(response)
+		if err == nil || !handled {
+			t.Fatalf("nonterminal response after terminal status: handled=%v err=%v", handled, err)
+		}
+		if registry.retiredRequests[response.id.key] == nil {
+			t.Fatal("nonterminal response after terminal status released operation request")
+		}
+	})
+}
+
 func TestRetiredLateWorkingResultPreservesTaskAndToken(t *testing.T) {
 	registry := newDirectionRegistry()
 	request := seedRetiredTaskRequest(t, &registry, "retired-request", "retired-token")
