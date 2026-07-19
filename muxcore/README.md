@@ -15,23 +15,26 @@ consumers; muxcore is a runtime layer and downstream behavior changes matter.
 Install the current release after its tag resolves through the Go proxy:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.28.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
 ```
 
-v0.28.0 includes the v0.25.3 native SessionHandler hot-update contract
-(`RestartWithSuccessor` / `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon
-registry, the v0.26.4 occupied-control-pipe guard, the v0.26.5 owner fanout
-reduction, and the v0.26.6 auto-managed engine namespace. It preserves
-snapshot-restored `tools/list` cache during background refresh, keeps live
-downstream sessions attached across upstream process exit/update with explicit
-JSON-RPC errors for in-flight requests, enters degraded retry without closing
-the parent stdio transport, and safely cleans zero-session disposable owners.
-v0.27.0 adds opt-in shim idle/dormant controls, protocol-v2 tree-authority
-handoff, and full process-tree containment. v0.27.1 prevents permanent
-idle-gate outcomes from creating a control-plane retry herd, and v0.27.2 makes
-the first uncached request join a pending snapshot/template background start.
-v0.28.0 adds cache-only startup and demand-driven materialization for compatible
-templates.
+v0.29.0 includes the v0.28.0 demand-driven materialization and fail-closed
+process-retirement contracts described below, plus the earlier native update,
+registry, namespace, reconnect, idle/dormant, and protocol-v2 handoff behavior.
+It adds the public `muxcore/supervisor` and `muxcore/supervisor/attest`
+packages for products that need one stable MCP host transport around
+replaceable child engines. Ordinary `engine.New` users require no source
+change.
+
+### v0.29.0 - public stable-stdio supervisor
+
+`muxcore/supervisor` owns a stable host stdio transport, strict MCP framing,
+bounded pending FIFO, initialization-only replay, generation-safe correlation,
+serialized host output, and complete command-child retirement when paired with
+`supervisor.StartCommand`. `muxcore/supervisor/attest` adds optional one-shot
+direct-parent and exact-child-PID proof for private lifecycle control. Products
+retain executable authorization, version selection, fallback, update, daemon,
+and operator policy.
 
 ### v0.28.0 - demand-driven upstream materialization
 
@@ -454,13 +457,16 @@ Rules:
 Use it for cheap admission decisions such as local rate limiting. Do not put
 network calls, database writes, or heavy policy evaluation in this hook.
 
-## Stable Stdio Supervisor (NVMD-145, unreleased)
+## Stable Stdio Supervisor (v0.29.0)
 
 `muxcore/supervisor` is the public boundary for products whose MCP host keeps
 one stdio transport open while the product replaces a child engine executable.
-This API is currently unreleased on the feature branch. Do not issue a consumer
-upgrade target until the release workflow assigns and verifies an exact muxcore
-tag.
+Introduced in `muxcore/v0.29.0`. After the tag resolves through the Go proxy,
+pin it with:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
+```
 
 Minimal ordinary-supervision shape:
 
@@ -555,6 +561,11 @@ dormancy; and a pre-attestation engine that emits a colliding private method is
 suppressed rather than committed or restarted in a loop. Do not copy the v2
 method strings, exit code, parser, replay loop, or attestation into a consumer.
 Use `supervisor.ProtocolV2()`, `supervisor.Run`, and `supervisor/attest`.
+
+To roll back, pin `muxcore/v0.28.0` or restore the prior product binary. Do not
+force a mixed-version live supervisor handoff or forward an old attestation
+advertisement. Old/new combinations run as ordinary MCP without private
+dormancy and should restart through the product's bounded replacement path.
 
 ## Upgrade and Restart Contract
 

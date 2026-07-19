@@ -7,6 +7,60 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-19
+
+### Added
+
+- Added the public `muxcore/supervisor` package for products that keep one MCP
+  host stdio transport attached while replacing child engine generations. The
+  supervisor provides bounded startup/replay/dormancy buffering, strict MCP
+  validation, generation-safe request/cancellation/progress/Tasks correlation,
+  original-ID errors for delivered requests lost during replacement, and
+  capability-gated discovery list-change notifications.
+- Added `supervisor.StartCommand`, which gives the supervisor complete Unix
+  process-group or Windows Job Object retirement authority for a command child.
+- Added the public `muxcore/supervisor/attest` package for one-shot local
+  direct-parent and exact-child-PID attestation on Windows, Linux, and Darwin.
+  Unsupported platforms fail closed for private lifecycle control while
+  ordinary supervision remains available.
+
+### Changed
+
+- The stable `mcp-mux` launcher now delegates generic host transport, protocol,
+  replay, correlation, and child-tree lifecycle mechanics to
+  `muxcore/supervisor`. The product adapter retains active-engine authorization,
+  version-store and fallback selection, bootstrap/update policy, shared-daemon
+  ownership, and operator exit behavior.
+- Launcher-only dormancy, wake-on-demand, and installed active-engine switches
+  now preserve the original host stdio transport. Only the cached
+  `initialize` / `notifications/initialized` handshake is replayed; arbitrary
+  requests are never replayed.
+- Rolling old/new combinations remain ordinary MCP sessions without private
+  dormancy unless the exact child generation completes protocol-v2 bilateral
+  attestation. Product-private method strings, exit codes, parsers, and adapter
+  policy are not consumer APIs.
+
+### Fixed
+
+- Stale child generations can no longer forward or mutate request,
+  cancellation, progress-token, or MCP task state after replacement.
+  Finalized task status remains immutable when delayed `tasks/get`,
+  `tasks/result`, cancel, or status traffic arrives, and retained correlation
+  state stays bounded.
+- A successor is not started until the previous command child's complete
+  process-tree authority is retired. Start rollback that cannot prove authority
+  cleanup fails closed instead of admitting an overlapping generation.
+
+### Compatibility
+
+- Ordinary `engine.New` consumers require no source changes. Products that need
+  a stable host transport around replaceable engines should adopt
+  `supervisor.Run`, `supervisor.StartCommand`, `supervisor.ProtocolV2`, and
+  `supervisor/attest` rather than copying the `mcp-mux` product adapter.
+- Roll back by pinning `muxcore/v0.28.0` or restoring the previous product
+  binary. Do not force a mixed-version live supervisor handoff; use the
+  product's bounded replacement path.
+
 ## [0.28.0] - 2026-07-17
 
 ### Added
@@ -166,7 +220,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/thebtf/mcp-mux/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/thebtf/mcp-mux/compare/v0.27.2...v0.28.0
 [0.27.2]: https://github.com/thebtf/mcp-mux/compare/v0.27.1...v0.27.2
 [0.27.1]: https://github.com/thebtf/mcp-mux/compare/v0.27.0...v0.27.1

@@ -29,7 +29,7 @@ All items from the 2026-04-08 debt batch have been resolved:
 
 ## Open items
 
-The following v0.28.0 follow-ups are non-blocking and out of scope for the
+The following v0.29.0 follow-ups are non-blocking and out of scope for the
 current release:
 
 - **Dormant rejection synchronization** — the current owner and control-plane

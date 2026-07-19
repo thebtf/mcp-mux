@@ -66,13 +66,45 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.28.x)
+## muxcore Library API (v0.29.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.28.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
 ```
+
+### v0.29.0 - public stable-stdio supervisor
+
+**No required consumer code changes for ordinary `engine.New` users.** This
+release adds `muxcore/supervisor` for products whose MCP host keeps one stdio
+transport open while a replaceable child engine starts, parks, wakes, crashes,
+or switches version. `supervisor.Run` owns strict MCP framing, bounded pending
+FIFO, initialization-only replay, serialized host output, generation-safe
+request/cancellation/progress/Tasks correlation, and explicit original-ID
+errors for delivered requests lost during replacement.
+
+Use `supervisor.StartCommand` when the supervisor must own full Unix process-
+group or Windows Job Object retirement before a successor starts. Private
+dormant control requires a verified generation-bound
+`supervisor/attest.Parent` receipt: the parent endpoint is created before
+spawn, bound to the exact returned child PID, and independently verified by the
+child against its OS direct parent. Windows, Linux, and Darwin are supported;
+other platforms fail closed for private control while ordinary supervision
+continues.
+
+Consumer impact: update to v0.29.0 only when adopting the new stable-transport
+boundary or its attestation seam. Product code still owns executable and layout
+authorization, active-version and fallback policy, command/environment
+construction, update/bootstrap policy, shared-daemon placement, and operator
+exit behavior. Do not copy the `mcp-mux` private protocol methods, exit code,
+parser, replay loop, or launcher adapter; use `supervisor.ProtocolV2()`,
+`supervisor.Run`, `supervisor.StartCommand`, and `supervisor/attest`.
+
+Rollback: pin `muxcore/v0.28.0` or restore the prior product binary. Do not
+force a mixed-version live supervisor handoff or forward an old attestation
+advertisement. Old/new combinations remain ordinary MCP without private
+dormancy and should restart through the product's bounded replacement path.
 
 ### v0.28.0 - demand-driven upstream materialization
 
