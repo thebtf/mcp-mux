@@ -66,6 +66,8 @@ func TestPublicContractCompilesExternally(t *testing.T) {
 	_ = run
 	var startCommand func(context.Context, supervisor.Command) (*supervisor.CommandChild, error) = supervisor.StartCommand
 	_ = startCommand
+	var startWithFallback func(context.Context, supervisor.EngineRef, supervisor.EngineRef, supervisor.StartFunc) (supervisor.StartResult, error) = supervisor.StartWithFallback
+	_ = startWithFallback
 	_ = supervisor.Command{
 		Path:   "engine",
 		Args:   []string{"serve"},
