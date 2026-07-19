@@ -279,14 +279,14 @@ func (runner *runner) handleStartAttempt(event startAttemptEvent) {
 	}
 	runner.starting = false
 	if event.err != nil {
-		hadAuthority := startResultHasAuthority(event.result)
-		if hadAuthority {
+		hadChildAuthority := !isNilInterface(event.result.Child)
+		if startResultHasAuthority(event.result) {
 			if cleanupErr := runner.cleanupInvalidStart(event.result); cleanupErr != nil {
 				runner.terminate(ReasonProtocolFailure, errors.Join(event.err, cleanupErr))
 				return
 			}
 		}
-		if errors.Is(event.err, ErrStartRollbackUnproven) && !hadAuthority {
+		if errors.Is(event.err, ErrStartRollbackUnproven) && !hadChildAuthority {
 			runner.terminate(ReasonProtocolFailure, event.err)
 			return
 		}

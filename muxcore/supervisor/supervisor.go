@@ -54,7 +54,9 @@ type ControlAdmission interface {
 }
 
 // StartResult identifies the child that actually started. Actual may differ
-// from the requested engine when the product approved a fallback.
+// from the requested engine when the product approved a fallback. On error,
+// non-nil Child or Admission fields transfer exact cleanup authority to Run;
+// they are never published as a live generation.
 type StartResult struct {
 	Child     Child
 	Actual    EngineRef
@@ -66,8 +68,10 @@ type StartResult struct {
 type ResolveFunc func(context.Context) (EngineRef, error)
 
 // StartFunc starts one requested engine generation. Implementations must honor
-// context cancellation and roll back every partial process or admission
-// authority before returning an error.
+// context cancellation and, before returning an error, either retire every
+// partial authority or return all remaining Child and Admission authority in
+// StartResult. ErrStartRollbackUnproven is required while process-tree
+// retirement remains unproven.
 type StartFunc func(context.Context, EngineRef) (StartResult, error)
 
 // State is the externally observable supervisor state.

@@ -42,42 +42,7 @@ func TestStartWithFallbackUsesFallbackAfterCleanFailure(t *testing.T) {
 	}
 }
 
-func TestStartWithFallbackDoesNotRetryUnprovenRollback(t *testing.T) {
-	const requestedID = "secret-requested-engine"
-	const fallbackID = "secret-fallback-engine"
-	admission := new(fallbackTestAdmission)
-	calls := 0
-
-	result, err := StartWithFallback(
-		context.Background(),
-		EngineRef{ID: requestedID},
-		EngineRef{ID: fallbackID},
-		func(context.Context, EngineRef) (StartResult, error) {
-			calls++
-			return StartResult{Admission: admission}, errors.Join(
-				ErrStartRollbackUnproven,
-				errors.New("rollback exposed "+requestedID+" "+fallbackID),
-			)
-		},
-	)
-	if !errors.Is(err, ErrStartRollbackUnproven) {
-		t.Fatalf("StartWithFallback() error = %v, want ErrStartRollbackUnproven", err)
-	}
-	if strings.Contains(err.Error(), requestedID) || strings.Contains(err.Error(), fallbackID) {
-		t.Fatalf("StartWithFallback() error leaked identities: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("start calls = %d, want 1", calls)
-	}
-	if result.Child != nil || result.Admission != nil {
-		t.Fatalf("result = %#v, want no returned authority after admission cleanup", result)
-	}
-	if admission.closed != 1 {
-		t.Fatalf("admission Close calls = %d, want 1", admission.closed)
-	}
-}
-
-func TestStartWithFallbackReturnsAdmissionWhenRollbackCleanupFails(t *testing.T) {
+func TestStartWithFallbackReturnsAdmissionWithoutRetryForUnprovenRollback(t *testing.T) {
 	const requestedID = "secret-requested-engine"
 	const fallbackID = "secret-fallback-engine"
 	admission := &fallbackTestAdmission{closeErr: errors.New("close exposed " + requestedID + " " + fallbackID)}
@@ -107,8 +72,8 @@ func TestStartWithFallbackReturnsAdmissionWhenRollbackCleanupFails(t *testing.T)
 	if result.Admission != admission || result.Fallback {
 		t.Fatalf("result = %#v, want requested admission authority", result)
 	}
-	if admission.closed != 1 {
-		t.Fatalf("admission Close calls = %d, want 1", admission.closed)
+	if admission.closed != 0 {
+		t.Fatalf("admission Close calls = %d, want supervisor finalization to own cleanup", admission.closed)
 	}
 }
 

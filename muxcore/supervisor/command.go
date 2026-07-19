@@ -18,7 +18,8 @@ const defaultCommandGracefulTimeout = time.Second
 var (
 	// ErrStartRollbackUnproven reports that a failed StartFunc attempt may still
 	// own a child process, process tree, or admission endpoint. Run treats this
-	// as terminal unless the callback returns that authority for another cleanup.
+	// as terminal unless returned Child authority proves full tree retirement;
+	// admission authority is closed but is not process-retirement proof.
 	ErrStartRollbackUnproven = errors.New("supervisor: failed start rollback unproven")
 
 	// ErrProcessTreeUnproven reports that a command leader terminated without a

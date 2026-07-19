@@ -17,8 +17,8 @@ var (
 // Engine identities remain opaque and are never included in returned errors.
 // Failed attempts that retain authority are returned immediately with a fixed
 // classification so Run can finalize the exact authority before any later
-// generation starts. Admission-only rollback-unproven state is cleaned here;
-// failed cleanup returns that admission authority for Run to finalize.
+// generation starts. Rollback-unproven state remains fail-closed; admission
+// authority is returned for Run to close but cannot prove process retirement.
 func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start StartFunc) (StartResult, error) {
 	if start == nil {
 		return StartResult{}, errNilFallbackStarter
@@ -49,15 +49,6 @@ func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start
 
 func retainFailedStart(result StartResult, err error) (StartResult, error, bool) {
 	rollbackUnproven := errors.Is(err, ErrStartRollbackUnproven)
-	if rollbackUnproven && isNilInterface(result.Child) {
-		if isNilInterface(result.Admission) {
-			return StartResult{}, ErrStartRollbackUnproven, true
-		}
-		if closeErr := result.Admission.Close(); closeErr == nil {
-			return StartResult{}, ErrStartRollbackUnproven, true
-		}
-		return result, errors.Join(errRetainedStart, ErrStartRollbackUnproven), true
-	}
 	if rollbackUnproven || startResultHasAuthority(result) {
 		retainedErr := errRetainedStart
 		if rollbackUnproven {
