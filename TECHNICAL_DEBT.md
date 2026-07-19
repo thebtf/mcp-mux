@@ -42,11 +42,12 @@ current release:
   consider dropping the fallback or retaining a short-lived generation
   tombstone.
 
-- **Task-control capacity at the active limit** — `directionRegistry.canRegister`
-  counts live tasks and requests in one 256-entry budget, so a full task set can
-  reject `tasks/get`, `tasks/result`, and `tasks/cancel` requests needed to
-  retire those tasks. Reserve control-request capacity or split task/request
-  limits in v0.28.0.
+- **Persistent-fence response preflight** — task-correlated responses are
+  validated before forwarding, but the final persistent-fence insertion still
+  happens afterward. At a per-role fence-cap boundary the peer can receive the
+  response immediately before the session fails closed. State remains bounded
+  and no successor starts; consider a non-mutating fence-cap preflight only if
+  a future contract requires atomic peer-visible completion at exhaustion.
 - **Extremal retry coverage** — add a test with two prior general spawn retries,
   followed by two template mismatches and the cold fifth attempt.
 - **Detached listener test flake** —
