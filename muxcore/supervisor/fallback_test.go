@@ -8,14 +8,15 @@ import (
 )
 
 type fallbackTestAdmission struct {
-	closed int
+	closed   int
+	closeErr error
 }
 
 func (*fallbackTestAdmission) Verified() bool { return false }
 
 func (admission *fallbackTestAdmission) Close() error {
 	admission.closed++
-	return nil
+	return admission.closeErr
 }
 
 func TestStartWithFallbackUsesFallbackAfterCleanFailure(t *testing.T) {
@@ -42,20 +43,28 @@ func TestStartWithFallbackUsesFallbackAfterCleanFailure(t *testing.T) {
 }
 
 func TestStartWithFallbackDoesNotRetryUnprovenRollback(t *testing.T) {
+	const requestedID = "secret-requested-engine"
+	const fallbackID = "secret-fallback-engine"
 	admission := new(fallbackTestAdmission)
 	calls := 0
 
 	result, err := StartWithFallback(
 		context.Background(),
-		EngineRef{ID: "engine-a"},
-		EngineRef{ID: "stable-launcher"},
+		EngineRef{ID: requestedID},
+		EngineRef{ID: fallbackID},
 		func(context.Context, EngineRef) (StartResult, error) {
 			calls++
-			return StartResult{Admission: admission}, ErrStartRollbackUnproven
+			return StartResult{Admission: admission}, errors.Join(
+				ErrStartRollbackUnproven,
+				errors.New("rollback exposed "+requestedID+" "+fallbackID),
+			)
 		},
 	)
 	if !errors.Is(err, ErrStartRollbackUnproven) {
 		t.Fatalf("StartWithFallback() error = %v, want ErrStartRollbackUnproven", err)
+	}
+	if strings.Contains(err.Error(), requestedID) || strings.Contains(err.Error(), fallbackID) {
+		t.Fatalf("StartWithFallback() error leaked identities: %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("start calls = %d, want 1", calls)
@@ -68,21 +77,61 @@ func TestStartWithFallbackDoesNotRetryUnprovenRollback(t *testing.T) {
 	}
 }
 
+func TestStartWithFallbackReturnsAdmissionWhenRollbackCleanupFails(t *testing.T) {
+	const requestedID = "secret-requested-engine"
+	const fallbackID = "secret-fallback-engine"
+	admission := &fallbackTestAdmission{closeErr: errors.New("close exposed " + requestedID + " " + fallbackID)}
+	calls := 0
+
+	result, err := StartWithFallback(
+		context.Background(),
+		EngineRef{ID: requestedID},
+		EngineRef{ID: fallbackID},
+		func(context.Context, EngineRef) (StartResult, error) {
+			calls++
+			return StartResult{Admission: admission}, errors.Join(
+				ErrStartRollbackUnproven,
+				errors.New("rollback exposed "+requestedID+" "+fallbackID),
+			)
+		},
+	)
+	if !errors.Is(err, ErrStartRollbackUnproven) {
+		t.Fatalf("StartWithFallback() error = %v, want ErrStartRollbackUnproven", err)
+	}
+	if strings.Contains(err.Error(), requestedID) || strings.Contains(err.Error(), fallbackID) {
+		t.Fatalf("StartWithFallback() error leaked identities: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("start calls = %d, want 1", calls)
+	}
+	if result.Admission != admission || result.Fallback {
+		t.Fatalf("result = %#v, want requested admission authority", result)
+	}
+	if admission.closed != 1 {
+		t.Fatalf("admission Close calls = %d, want 1", admission.closed)
+	}
+}
+
 func TestStartWithFallbackReturnsPartialAuthorityWithoutRetry(t *testing.T) {
+	const requestedID = "secret-requested-engine"
+	const fallbackID = "secret-fallback-engine"
 	admission := new(fallbackTestAdmission)
 	calls := 0
 
 	result, err := StartWithFallback(
 		context.Background(),
-		EngineRef{ID: "engine-a"},
-		EngineRef{ID: "stable-launcher"},
+		EngineRef{ID: requestedID},
+		EngineRef{ID: fallbackID},
 		func(context.Context, EngineRef) (StartResult, error) {
 			calls++
-			return StartResult{Admission: admission}, errors.New("partial start")
+			return StartResult{Admission: admission}, errors.New("partial start " + requestedID + " " + fallbackID)
 		},
 	)
 	if err == nil {
 		t.Fatal("StartWithFallback() error = nil, want partial-start error")
+	}
+	if strings.Contains(err.Error(), requestedID) || strings.Contains(err.Error(), fallbackID) {
+		t.Fatalf("StartWithFallback() error leaked identities: %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("start calls = %d, want 1", calls)
@@ -92,6 +141,35 @@ func TestStartWithFallbackReturnsPartialAuthorityWithoutRetry(t *testing.T) {
 	}
 	if admission.closed != 0 {
 		t.Fatalf("admission Close calls = %d, want supervisor finalization to own cleanup", admission.closed)
+	}
+}
+
+func TestStartWithFallbackRedactsFallbackPartialAuthority(t *testing.T) {
+	const requestedID = "secret-requested-engine"
+	const fallbackID = "secret-fallback-engine"
+	requested := EngineRef{ID: requestedID}
+	fallback := EngineRef{ID: fallbackID}
+	admission := new(fallbackTestAdmission)
+	calls := 0
+
+	result, err := StartWithFallback(context.Background(), requested, fallback, func(_ context.Context, ref EngineRef) (StartResult, error) {
+		calls++
+		if ref == requested {
+			return StartResult{}, errors.New("requested failure exposed " + requestedID)
+		}
+		return StartResult{Admission: admission}, errors.New("fallback failure exposed " + fallbackID)
+	})
+	if err == nil {
+		t.Fatal("StartWithFallback() error = nil, want fallback partial-start error")
+	}
+	if strings.Contains(err.Error(), requestedID) || strings.Contains(err.Error(), fallbackID) {
+		t.Fatalf("StartWithFallback() error leaked identities: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("start calls = %d, want 2", calls)
+	}
+	if result.Admission != admission || !result.Fallback {
+		t.Fatalf("result = %#v, want fallback partial authority", result)
 	}
 }
 
@@ -121,8 +199,8 @@ func TestStartWithFallbackRedactsFailedIdentities(t *testing.T) {
 		context.Background(),
 		EngineRef{ID: requestedID},
 		EngineRef{ID: fallbackID},
-		func(context.Context, EngineRef) (StartResult, error) {
-			return StartResult{}, errors.New("start failed")
+		func(_ context.Context, ref EngineRef) (StartResult, error) {
+			return StartResult{}, errors.New("start failed for " + ref.ID)
 		},
 	)
 	if err == nil {

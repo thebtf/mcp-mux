@@ -11,8 +11,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Added `supervisor.StartWithFallback` for provider-generic requested/fallback
   start policy. It retries only after a clean start failure with no child or
-  admission authority, returns partial or rollback-unproven authority for the
-  supervisor to finalize, and keeps product engine identities out of errors.
+  admission authority, returns retained authority for supervisor finalization,
+  cleans admission-only rollback-unproven state in place when possible, returns
+  it for supervisor finalization when cleanup fails, and reduces callback errors
+  to fixed classifications that keep product engine identities opaque.
 
 ### Changed
 

@@ -9,13 +9,16 @@ var (
 	errNilFallbackStarter = errors.New("supervisor: nil fallback starter")
 	errNoDistinctFallback = errors.New("supervisor: requested child start failed and no distinct fallback is available")
 	errFallbackStart      = errors.New("supervisor: requested child and fallback start failed")
+	errRetainedStart      = errors.New("supervisor: child start failed with retained authority")
 )
 
 // StartWithFallback starts requested first, then fallback only after a clean
 // requested-start failure that returned no child or admission authority.
 // Engine identities remain opaque and are never included in returned errors.
-// A partial or rollback-unproven start is returned immediately so Run can
-// finalize the exact authority before any later generation starts.
+// Failed attempts that retain authority are returned immediately with a fixed
+// classification so Run can finalize the exact authority before any later
+// generation starts. Admission-only rollback-unproven state is cleaned here;
+// failed cleanup returns that admission authority for Run to finalize.
 func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start StartFunc) (StartResult, error) {
 	if start == nil {
 		return StartResult{}, errNilFallbackStarter
@@ -45,14 +48,22 @@ func StartWithFallback(ctx context.Context, requested, fallback EngineRef, start
 }
 
 func retainFailedStart(result StartResult, err error) (StartResult, error, bool) {
-	if errors.Is(err, ErrStartRollbackUnproven) && isNilInterface(result.Child) {
-		if !isNilInterface(result.Admission) {
-			err = errors.Join(err, result.Admission.Close())
+	rollbackUnproven := errors.Is(err, ErrStartRollbackUnproven)
+	if rollbackUnproven && isNilInterface(result.Child) {
+		if isNilInterface(result.Admission) {
+			return StartResult{}, ErrStartRollbackUnproven, true
 		}
-		return StartResult{}, err, true
+		if closeErr := result.Admission.Close(); closeErr == nil {
+			return StartResult{}, ErrStartRollbackUnproven, true
+		}
+		return result, errors.Join(errRetainedStart, ErrStartRollbackUnproven), true
 	}
-	if errors.Is(err, ErrStartRollbackUnproven) || startResultHasAuthority(result) {
-		return result, err, true
+	if rollbackUnproven || startResultHasAuthority(result) {
+		retainedErr := errRetainedStart
+		if rollbackUnproven {
+			retainedErr = errors.Join(retainedErr, ErrStartRollbackUnproven)
+		}
+		return result, retainedErr, true
 	}
 	return StartResult{}, nil, false
 }
