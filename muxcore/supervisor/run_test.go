@@ -28,6 +28,34 @@ func (admission *testAdmission) Close() error {
 	return nil
 }
 
+type scriptedTestAdmission struct {
+	mu        sync.Mutex
+	closeErrs []error
+	closed    int
+}
+
+func (*scriptedTestAdmission) Verified() bool { return false }
+
+func (admission *scriptedTestAdmission) Close() error {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	call := admission.closed
+	admission.closed++
+	if len(admission.closeErrs) == 0 {
+		return nil
+	}
+	if call >= len(admission.closeErrs) {
+		return admission.closeErrs[len(admission.closeErrs)-1]
+	}
+	return admission.closeErrs[call]
+}
+
+func (admission *scriptedTestAdmission) closeCalls() int {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	return admission.closed
+}
+
 type testChild struct {
 	stdinWriter  *io.PipeWriter
 	inputReader  *io.PipeReader
@@ -2027,6 +2055,67 @@ func TestRunUnprovenStartRollbackTerminatesWithoutRetry(t *testing.T) {
 	}
 	if starts != 1 {
 		t.Fatalf("start attempts = %d, want one fail-closed attempt", starts)
+	}
+}
+
+func TestRunStartWithFallbackAdmissionOnlyRollbackUnprovenTerminates(t *testing.T) {
+	tests := []struct {
+		name      string
+		closeErrs []error
+		wantError string
+	}{
+		{name: "cleanup succeeds"},
+		{
+			name:      "cleanup fails then would succeed",
+			closeErrs: []error{errors.New("transient admission cleanup failure"), nil},
+			wantError: "transient admission cleanup failure",
+		},
+		{
+			name:      "cleanup remains failed",
+			closeErrs: []error{errors.New("persistent admission cleanup failure")},
+			wantError: "persistent admission cleanup failure",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requested := EngineRef{ID: "requested-engine"}
+			fallback := EngineRef{ID: "fallback-engine"}
+			admission := &scriptedTestAdmission{closeErrs: test.closeErrs}
+			startCalls := 0
+			fallbackCalls := 0
+			harness := startHarness(t, Config{
+				Resolve: func(context.Context) (EngineRef, error) { return requested, nil },
+				Start: func(ctx context.Context, ref EngineRef) (StartResult, error) {
+					return StartWithFallback(ctx, ref, fallback, func(_ context.Context, candidate EngineRef) (StartResult, error) {
+						startCalls++
+						if candidate == fallback {
+							fallbackCalls++
+						}
+						return StartResult{Admission: admission}, ErrStartRollbackUnproven
+					})
+				},
+				RetryDelay: 5 * time.Millisecond,
+			})
+			defer harness.hostInput.Close()
+
+			select {
+			case err := <-harness.done:
+				if !errors.Is(err, ErrStartRollbackUnproven) {
+					t.Fatalf("Run error = %v, want rollback-unproven sentinel", err)
+				}
+				if test.wantError != "" && !strings.Contains(err.Error(), test.wantError) {
+					t.Fatalf("Run error = %v, want %q", err, test.wantError)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Run retried after admission-only rollback remained unproven")
+			}
+			if startCalls != 1 || fallbackCalls != 0 {
+				t.Fatalf("start calls = %d, fallback calls = %d; want one requested attempt", startCalls, fallbackCalls)
+			}
+			if calls := admission.closeCalls(); calls != 1 {
+				t.Fatalf("admission Close calls = %d, want one supervisor cleanup attempt", calls)
+			}
+		})
 	}
 }
 

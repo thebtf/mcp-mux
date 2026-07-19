@@ -287,13 +287,21 @@ func TestDefaultSupervisorDoesNotFallbackAfterUnprovenRollback(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("start calls = %d, fallback started before rollback proof", calls)
 	}
-	if result.Child != nil || result.Admission != nil {
-		t.Fatalf("non-process admission masked unproven rollback = %#v", result)
+	if result.Child != nil || result.Admission != admission {
+		t.Fatalf("unproven rollback authority = %#v, want returned admission", result)
+	}
+	select {
+	case <-admission.Done():
+		t.Fatal("start helper consumed admission owned by supervisor finalization")
+	default:
+	}
+	if closeErr := result.Admission.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	select {
 	case <-admission.Done():
 	case <-time.After(time.Second):
-		t.Fatal("unproven rollback left admission open")
+		t.Fatal("returned admission did not close")
 	}
 }
 

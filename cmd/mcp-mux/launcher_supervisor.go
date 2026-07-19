@@ -212,10 +212,9 @@ func canonicalLauncherEnginePath(path string) string {
 	return path
 }
 
-func launcherSupervisorStartResult(child *supervisor.CommandChild, admission *attest.Parent, actualPath string, fallback bool) supervisor.StartResult {
+func launcherSupervisorStartResult(child *supervisor.CommandChild, admission *attest.Parent, actualPath string) supervisor.StartResult {
 	result := supervisor.StartResult{
-		Actual:   supervisor.EngineRef{ID: canonicalLauncherEnginePath(actualPath)},
-		Fallback: fallback,
+		Actual: supervisor.EngineRef{ID: canonicalLauncherEnginePath(actualPath)},
 	}
 	if child != nil {
 		result.Child = child
@@ -232,37 +231,16 @@ func startDefaultSupervisedEngineChild(
 	args []string,
 	stderr io.Writer,
 ) (supervisor.StartResult, error) {
-	child, admission, err := launcherSupervisorCommandStart(ctx, launcherPath, enginePath, args, stderr)
-	if err == nil {
-		return launcherSupervisorStartResult(child, admission, enginePath, false), nil
-	}
-	if errors.Is(err, supervisor.ErrStartRollbackUnproven) && child == nil {
-		if admission != nil {
-			err = errors.Join(err, admission.Close())
+	requested := supervisor.EngineRef{ID: canonicalLauncherEnginePath(enginePath)}
+	fallback := supervisor.EngineRef{ID: canonicalLauncherEnginePath(launcherPath)}
+	return supervisor.StartWithFallback(ctx, requested, fallback, func(ctx context.Context, ref supervisor.EngineRef) (supervisor.StartResult, error) {
+		executablePath := enginePath
+		if ref != requested {
+			executablePath = launcherPath
 		}
-		return supervisor.StartResult{}, err
-	}
-	if errors.Is(err, supervisor.ErrStartRollbackUnproven) || child != nil || admission != nil {
-		return launcherSupervisorStartResult(child, admission, enginePath, false), err
-	}
-
-	if samePath(enginePath, launcherPath) {
-		return supervisor.StartResult{}, errors.New("active engine start failed and no distinct fallback is available")
-	}
-	fallbackChild, fallbackAdmission, fallbackErr := launcherSupervisorCommandStart(ctx, launcherPath, launcherPath, args, stderr)
-	if fallbackErr != nil {
-		if errors.Is(fallbackErr, supervisor.ErrStartRollbackUnproven) && fallbackChild == nil {
-			if fallbackAdmission != nil {
-				fallbackErr = errors.Join(fallbackErr, fallbackAdmission.Close())
-			}
-			return supervisor.StartResult{}, fallbackErr
-		}
-		if errors.Is(fallbackErr, supervisor.ErrStartRollbackUnproven) || fallbackChild != nil || fallbackAdmission != nil {
-			return launcherSupervisorStartResult(fallbackChild, fallbackAdmission, launcherPath, true), fallbackErr
-		}
-		return supervisor.StartResult{}, errors.New("active engine and stable launcher fallback start failed")
-	}
-	return launcherSupervisorStartResult(fallbackChild, fallbackAdmission, launcherPath, true), nil
+		child, admission, err := launcherSupervisorCommandStart(ctx, launcherPath, executablePath, args, stderr)
+		return launcherSupervisorStartResult(child, admission, executablePath), err
+	})
 }
 
 func startAttestedSupervisorCommand(
