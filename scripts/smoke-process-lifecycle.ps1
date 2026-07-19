@@ -302,7 +302,8 @@ function Start-Sessions {
         [void]$sessions.Add($session)
     }
 
-    $engineIdentities = Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase "initial"
+    $script:LastProbeDaemon = Wait-DaemonIdentity -Label "initial-daemon" -ExpectedPath $ExpectedEngine
+    $engineIdentities = Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase "initial" -ExcludedPid $script:LastProbeDaemon.pid
 
     foreach ($session in $sessions) {
         Send-Message -Session $session -Message @{
@@ -382,10 +383,12 @@ function Invoke-ParallelProbe {
             params = @{ name = "lifecycle_probe"; arguments = @{} }
         }
     }
-    $script:LastProbeEngines = if ([string]::IsNullOrWhiteSpace($ExpectedEngine)) {
-        @()
+    if ([string]::IsNullOrWhiteSpace($ExpectedEngine)) {
+        $script:LastProbeDaemon = $null
+        $script:LastProbeEngines = @()
     } else {
-        @(Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase $Phase)
+        $script:LastProbeDaemon = Wait-DaemonIdentity -Label "$Phase-daemon" -ExpectedPath $ExpectedEngine
+        $script:LastProbeEngines = @(Wait-EngineChildren -ExpectedEngine $ExpectedEngine -Phase $Phase -ExcludedPid $script:LastProbeDaemon.pid)
     }
     $probes = @()
     foreach ($session in $sessions) {
@@ -420,7 +423,7 @@ function Invoke-ParallelProbe {
 }
 
 function Wait-DaemonIdentity {
-    param([string]$Label, [string]$ExpectedEngine)
+    param([string]$Label, [string]$ExpectedPath)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $last = ""
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -429,7 +432,7 @@ function Wait-DaemonIdentity {
         if ($status.exit_code -eq 0 -and $status.stdout.Trim().StartsWith("{")) {
             $parsed = $status.stdout | ConvertFrom-Json
             if ($parsed.daemon -eq $true -and [int]$parsed.pid -gt 0) {
-                return Get-Identity -ProcessId ([int]$parsed.pid) -Label $Label -ExpectedPath $ExpectedEngine
+                return Get-Identity -ProcessId ([int]$parsed.pid) -Label $Label -ExpectedPath $ExpectedPath
             }
         }
         Start-Sleep -Milliseconds 200
@@ -438,25 +441,28 @@ function Wait-DaemonIdentity {
 }
 
 function Wait-EngineChildren {
-    param([string]$ExpectedEngine, [string]$Phase)
+    param([string]$ExpectedEngine, [string]$Phase, [int]$ExcludedPid = 0)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $rows = @(Get-CimInstance Win32_Process -Filter "name = 'mcp-mux-engine.exe'" -ErrorAction SilentlyContinue | Where-Object {
-            -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
-            [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) -ieq $ExpectedEngine
-        })
-        $found = @()
-        foreach ($session in $sessions) {
-            $row = $rows | Where-Object {
-                [int]$_.ParentProcessId -eq $session.launcher_identity.pid -and
-                -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
-                [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) -ieq $ExpectedEngine
-            } | Select-Object -First 1
-            if ($null -ne $row) {
-                $found += $row
-            }
-        }
-        if ($found.Count -eq $ParallelSessions) {
+		$rows = @(Get-CimInstance Win32_Process -Filter "name = 'mcp-mux-engine.exe'" -ErrorAction SilentlyContinue | Where-Object {
+			[int]$_.ProcessId -ne $ExcludedPid -and
+			-not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and
+			[System.IO.Path]::GetFullPath([string]$_.ExecutablePath) -ieq $ExpectedEngine
+		})
+		$found = @()
+		if ($rows.Count -eq $ParallelSessions) {
+			foreach ($session in $sessions) {
+				$matches = @($rows | Where-Object {
+					[int]$_.ParentProcessId -eq $session.launcher_identity.pid
+				})
+				if ($matches.Count -ne 1) {
+					$found = @()
+					break
+				}
+				$found += $matches[0]
+			}
+		}
+		if ($found.Count -eq $ParallelSessions) {
             $identities = @($found | ForEach-Object { Get-Identity -ProcessId ([int]$_.ProcessId) -Label "$Phase-engine" -ParentProcessId ([int]$_.ParentProcessId) -ExpectedPath $ExpectedEngine })
             if (@($identities.pid | Sort-Object -Unique).Count -ne $ParallelSessions) {
                 throw "$Phase did not create $ParallelSessions distinct isolated engine children"
@@ -569,20 +575,20 @@ try {
     $evidence.engine_v1 = $engineV1
     $initialEngines = @(Start-Sessions -ExpectedEngine $engineV1)
     $evidence.initial_engine_pids = @($initialEngines.pid)
+    $initialDaemon = $script:LastProbeDaemon
+    $evidence.daemon_pids += $initialDaemon.pid
     $initial = Invoke-ParallelProbe -BaseId 100 -Phase "initial"
     $evidence.initial = @($initial | Select-Object * -ExcludeProperty leader_identity, descendant_identity)
-    $initialDaemon = Wait-DaemonIdentity -Label "initial-daemon" -ExpectedEngine $engineV1
-    $evidence.daemon_pids += $initialDaemon.pid
 
     $initialMustExit = @($initialEngines) + @($initialDaemon) + @($initial.leader_identity) + @($initial.descendant_identity)
     Wait-LauncherOnly -MustExit $initialMustExit -Phase "initial idle"
 
     $wake = Invoke-ParallelProbe -BaseId 200 -Phase "wake" -ExpectedEngine $engineV1
     $wakeEngines = @($script:LastProbeEngines)
+    $wakeDaemon = $script:LastProbeDaemon
     $evidence.wake_engine_pids = @($wakeEngines.pid)
-    Assert-UniqueFromPrevious -Current $wake -Previous $initial -Phase "demand wake"
-    $wakeDaemon = Wait-DaemonIdentity -Label "wake-daemon" -ExpectedEngine $engineV1
     $evidence.daemon_pids += $wakeDaemon.pid
+    Assert-UniqueFromPrevious -Current $wake -Previous $initial -Phase "demand wake"
     $evidence.wake = @($wake | Select-Object * -ExcludeProperty leader_identity, descendant_identity)
 
     $wakeMustExit = @($wakeEngines) + @($wakeDaemon) + @($wake.leader_identity) + @($wake.descendant_identity)
@@ -595,10 +601,12 @@ try {
     }
     $postUpgrade = Invoke-ParallelProbe -BaseId 300 -Phase "post-upgrade" -ExpectedEngine $engineV2
     $upgradeEngines = @($script:LastProbeEngines)
+    $upgradeDaemon = $script:LastProbeDaemon
     $evidence.post_upgrade_engine_pids = @($upgradeEngines.pid)
+    $evidence.daemon_pids += $upgradeDaemon.pid
     $evidence.post_upgrade = @($postUpgrade | Select-Object * -ExcludeProperty leader_identity, descendant_identity)
 
-    $allMustExit = @($wakeEngines) + @($upgradeEngines) + @($wakeDaemon) + @($wake.leader_identity) + @($wake.descendant_identity) + @($postUpgrade.leader_identity) + @($postUpgrade.descendant_identity)
+    $allMustExit = @($wakeEngines) + @($upgradeEngines) + @($wakeDaemon) + @($upgradeDaemon) + @($wake.leader_identity) + @($wake.descendant_identity) + @($postUpgrade.leader_identity) + @($postUpgrade.descendant_identity)
     Wait-LauncherOnly -MustExit $allMustExit -Phase "post-upgrade idle"
 
     foreach ($session in $sessions) {

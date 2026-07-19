@@ -4,6 +4,7 @@ package procgroup
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"sync"
@@ -12,10 +13,11 @@ import (
 )
 
 type platformState struct {
-	mu        sync.Mutex
-	pgid      int
-	state     uint8
-	finalized chan struct{}
+	mu          sync.Mutex
+	pgid        int
+	state       uint8
+	finalized   chan struct{}
+	finalizeErr error
 }
 
 const (
@@ -44,6 +46,10 @@ func (p *Process) postStart() error {
 	return nil
 }
 
+func (p *Process) allowSurviveParentExitPlatform() error {
+	return nil
+}
+
 func (p *Process) takeGroupAuthority() (int, <-chan struct{}, bool) {
 	p.platform.mu.Lock()
 	defer p.platform.mu.Unlock()
@@ -53,22 +59,25 @@ func (p *Process) takeGroupAuthority() (int, <-chan struct{}, bool) {
 		p.platform.pgid = 0
 		p.platform.state = authorityFinalizing
 		return pgid, p.platform.finalized, true
-	case authorityFinalizing:
+	case authorityFinalizing, authorityFinalized:
 		return 0, p.platform.finalized, false
-	case authorityFinalized, authorityIdle:
+	case authorityIdle:
 		return 0, nil, false
 	default:
 		return 0, nil, false
 	}
 }
 
-func (p *Process) finishGroupAuthority() {
+func (p *Process) finishGroupAuthority(finalizeErr error) error {
 	p.platform.mu.Lock()
 	if p.platform.state == authorityFinalizing {
+		p.platform.finalizeErr = finalizeErr
 		p.platform.state = authorityFinalized
 		close(p.platform.finalized)
 	}
+	result := p.platform.finalizeErr
 	p.platform.mu.Unlock()
+	return result
 }
 
 func signalProcessGroup(pgid int, signal syscall.Signal) error {
@@ -82,10 +91,55 @@ func signalProcessGroup(pgid int, signal syscall.Signal) error {
 	return err
 }
 
-func waitAuthority(wait <-chan struct{}) {
-	if wait != nil {
-		<-wait
+func waitProcessGroupGone(pgid int, leaderDone <-chan struct{}) error {
+	if pgid <= 0 {
+		return nil
 	}
+	deadline := time.Now().Add(processTreeWaitTimeout)
+	if leaderDone != nil {
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-leaderDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			return fmt.Errorf("process group %d leader remained unreaped after %s", pgid, processTreeWaitTimeout)
+		}
+	}
+	for {
+		err := syscall.Kill(-pgid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		if err != nil && !processGroupProbePending(err) {
+			return fmt.Errorf("probe process group %d: %w", pgid, err)
+		}
+		if !time.Now().Before(deadline) {
+			if err != nil {
+				return fmt.Errorf("process group %d remained unretired after %s: %w", pgid, processTreeWaitTimeout, err)
+			}
+			return fmt.Errorf("process group %d remained alive after %s", pgid, processTreeWaitTimeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func processGroupRetirementError(waitErr, termErr, killErr error) error {
+	if waitErr == nil {
+		return nil
+	}
+	return errors.Join(termErr, killErr, waitErr)
+}
+
+func (p *Process) waitGroupAuthority(wait <-chan struct{}) error {
+	if wait == nil {
+		return nil
+	}
+	<-wait
+	p.platform.mu.Lock()
+	defer p.platform.mu.Unlock()
+	return p.platform.finalizeErr
 }
 
 func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
@@ -107,9 +161,9 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 
 	pgid, wait, owner := p.takeGroupAuthority()
 	if !owner {
-		waitAuthority(wait)
+		authorityErr := p.waitGroupAuthority(wait)
 		<-p.done
-		return nil
+		return authorityErr
 	}
 	termErr := signalProcessGroup(pgid, syscall.SIGTERM)
 	select {
@@ -117,12 +171,10 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 	case <-time.After(timeout):
 	}
 	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
-	p.finishGroupAuthority()
+	waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+	authorityErr := p.finishGroupAuthority(processGroupRetirementError(waitErr, termErr, killErr))
 	<-p.done
-	if termErr != nil {
-		return termErr
-	}
-	return killErr
+	return authorityErr
 }
 
 func (p *Process) killPlatform() error {
@@ -142,39 +194,50 @@ func (p *Process) killPlatform() error {
 
 	pgid, wait, owner := p.takeGroupAuthority()
 	if !owner {
-		waitAuthority(wait)
+		authorityErr := p.waitGroupAuthority(wait)
 		<-p.done
-		return nil
+		return authorityErr
 	}
-	err := signalProcessGroup(pgid, syscall.SIGKILL)
-	p.finishGroupAuthority()
+	killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+	waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+	authorityErr := p.finishGroupAuthority(processGroupRetirementError(waitErr, nil, killErr))
 	if p.Alive() {
 		<-p.done
 	}
-	return err
+	return authorityErr
 }
 
-func (p *Process) cleanupPlatform() {
+func (p *Process) cleanupPlatform() error {
 	if p.disableTree {
-		return
+		return nil
 	}
 	p.platform.mu.Lock()
 	if p.platform.state == authorityIdle {
 		p.platform.state = authorityFinalized
 		close(p.platform.finalized)
+		result := p.platform.finalizeErr
+		p.platform.mu.Unlock()
+		return result
 	}
 	p.platform.mu.Unlock()
+	pgid, wait, owner := p.takeGroupAuthority()
+	if owner {
+		killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+		waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+		return p.finishGroupAuthority(processGroupRetirementError(waitErr, nil, killErr))
+	}
+	return p.waitGroupAuthority(wait)
 }
 
-func (p *Process) reapPlatform() {
+func (p *Process) reapPlatform() error {
 	if p.disableTree {
-		return
+		return nil
 	}
 	pgid, wait, owner := p.takeGroupAuthority()
 	if owner {
-		_ = signalProcessGroup(pgid, syscall.SIGKILL)
-		p.finishGroupAuthority()
-		return
+		killErr := signalProcessGroup(pgid, syscall.SIGKILL)
+		waitErr := waitProcessGroupGone(pgid, p.leaderDone)
+		return p.finishGroupAuthority(processGroupRetirementError(waitErr, nil, killErr))
 	}
-	waitAuthority(wait)
+	return p.waitGroupAuthority(wait)
 }

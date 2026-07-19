@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -187,6 +188,33 @@ func TestMainIsolatedModeStillUsesDaemon(t *testing.T) {
 	}
 	if strings.Contains(output, "becoming owner") {
 		t.Fatalf("isolated daemon failure started a legacy owner; stderr:\n%s", output)
+	}
+}
+
+func TestEnsureDaemonParentOwnedChildDoesNotSpawn(t *testing.T) {
+	tempDir := shortTempDir(t, "parent-owned")
+	t.Setenv("TEMP", tempDir)
+	t.Setenv("TMP", tempDir)
+	t.Setenv(envLauncherOwnsDaemon, "1")
+
+	ctlPath := serverid.DaemonControlPath("", engineName)
+	_ = os.Remove(ctlPath)
+	t.Cleanup(func() { _ = os.Remove(ctlPath) })
+
+	oldStarter := daemonStarter
+	startCalled := false
+	daemonStarter = func() error {
+		startCalled = true
+		return nil
+	}
+	t.Cleanup(func() { daemonStarter = oldStarter })
+
+	err := ensureDaemonWithin(log.New(io.Discard, "", 0), time.Second)
+	if !errors.Is(err, errLauncherManagedDaemonUnavailable) {
+		t.Fatalf("ensureDaemonWithin() error = %v, want launcher-managed unavailable", err)
+	}
+	if startCalled {
+		t.Fatal("supervised child attempted to start the shared daemon inside its process tree")
 	}
 }
 

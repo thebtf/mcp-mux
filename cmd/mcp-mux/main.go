@@ -41,6 +41,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	"github.com/thebtf/mcp-mux/muxcore/session"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
 
@@ -52,6 +53,13 @@ const engineName = "mcp-mux"
 // ownSocketPrefix is the prefix for all temp socket/lock files owned by this engine.
 // Derived from engineName — single source of truth; use this constant, not the raw string.
 const ownSocketPrefix = engineName + "-"
+
+func supervisedDaemonReconnectError(err error) error {
+	if errors.Is(err, errLauncherManagedDaemonUnavailable) {
+		return fmt.Errorf("%w: %v", owner.ErrReconnectExit, err)
+	}
+	return err
+}
 
 func main() {
 	if handled, exitCode := maybeRunLauncher(); handled {
@@ -224,7 +232,7 @@ func main() {
 					time.Sleep(jitter)
 
 					if err := ensureDaemon(logger); err != nil {
-						return "", "", err
+						return "", "", supervisedDaemonReconnectError(err)
 					}
 					newToken, err := refreshTokenViaDaemon(currentToken, logger)
 					if err != nil {
@@ -246,11 +254,11 @@ func main() {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
 								if !sleepWithin(deadline, 100*time.Millisecond) {
-									return "", "", err
+									return "", "", supervisedDaemonReconnectError(err)
 								}
 								continue
 							}
-							return "", "", err
+							return "", "", supervisedDaemonReconnectError(err)
 						}
 						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
 						if err != nil {
@@ -270,6 +278,10 @@ func main() {
 					}
 				}
 				idleDelay, dormantGrace := shimLifecycleDurations(os.Getenv)
+				lifecycleProtocol := supervisor.Protocol{}
+				if launcherLifecycleOK {
+					lifecycleProtocol = supervisor.ProtocolV2()
+				}
 				if !launcherLifecycleOK {
 					// A v0.26 launcher cannot understand the private dormant control
 					// frames. Bootstrap only when the active child can prove its direct
@@ -293,16 +305,17 @@ func main() {
 
 				resilientStart := time.Now()
 				err = owner.RunResilientClient(owner.ResilientClientConfig{
-					Stdin:            os.Stdin,
-					Stdout:           os.Stdout,
-					InitialIPCPath:   daemonIPC,
-					Token:            daemonToken,
-					RefreshToken:     refreshFn,
-					Reconnect:        reconnectFn,
-					IdleSuspendDelay: idleDelay,
-					IdleSuspendGate:  suspendGate,
-					IdleDormantGrace: dormantGrace,
-					Logger:           logger,
+					Stdin:             os.Stdin,
+					Stdout:            os.Stdout,
+					InitialIPCPath:    daemonIPC,
+					Token:             daemonToken,
+					RefreshToken:      refreshFn,
+					Reconnect:         reconnectFn,
+					IdleSuspendDelay:  idleDelay,
+					IdleSuspendGate:   suspendGate,
+					IdleDormantGrace:  dormantGrace,
+					LifecycleProtocol: lifecycleProtocol,
+					Logger:            logger,
 				})
 				if err != nil {
 					exitCode := resilientClientExitCode(err)

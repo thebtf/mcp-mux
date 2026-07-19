@@ -1,71 +1,62 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
-	"sort"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
-	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor/attest"
 )
+
+type launcherStartChildFunc func(
+	context.Context,
+	string,
+	string,
+	[]string,
+	io.Writer,
+) (supervisor.StartResult, error)
 
 type launcherSupervisorConfig struct {
 	LauncherPath        string
 	InitialEnginePath   string
 	Args                []string
-	Stdin               io.Reader
+	Stdin               io.ReadCloser
 	Stdout              io.Writer
 	Stderr              io.Writer
 	ResolveActiveEngine func(string) (string, bool)
-	StartChild          func(launcherPath, enginePath string, args []string, stderr io.Writer) (*supervisedEngineChild, error)
+	StartChild          launcherStartChildFunc
+	PrepareStart        func(context.Context, string, string, []string, io.Writer) error
 	RespawnDelay        time.Duration
+	StartTimeout        time.Duration
 	ReplayTimeout       time.Duration
 	EnginePollInterval  time.Duration
 	DormantLease        time.Duration
 }
 
-type supervisedEngineChild struct {
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	kill   func()
-	waitCh <-chan error
-}
-
-type launcherStdinEvent struct {
-	msg *jsonrpc.Message
-	err error
-}
-
-type launcherChildOutput struct {
-	data []byte
-	err  error
-}
-
 const (
-	launcherDormantReadyMethod  = "$/mcp-mux/launcher/dormant-ready"
-	launcherCommitDormantMethod = "$/mcp-mux/launcher/commit-dormant"
-	launcherDormantAckMethod    = "$/mcp-mux/launcher/dormant-ack"
-	launcherDormantNackMethod   = "$/mcp-mux/launcher/dormant-nack"
-	launcherDormantExitCode     = 75
-	launcherDormantExitTimeout  = 2 * time.Second
-	// The supervisor must not kill a replacement while the child is still
-	// inside its own legal daemon-spawn budget. Doing so abandons a control
-	// request after the daemon may already have created an owner reservation.
+	launcherDormantExitTimeout   = 2 * time.Second
+	launcherFinalizationTimeout  = 2 * time.Second
+	defaultLauncherStartTimeout  = defaultDaemonSpawnTimeout
 	defaultLauncherReplayTimeout = defaultDaemonSpawnTimeout + 5*time.Second
+	defaultLauncherRespawnDelay  = 100 * time.Millisecond
+	defaultLauncherEnginePoll    = 5 * time.Second
 )
 
-type launcherChildState uint8
+var launcherSupervisorEnsureDaemon = func(ctx context.Context, logger *log.Logger, launcherPath, enginePath string) error {
+	return ensureDaemonWithinWithStarter(ctx, logger, 15*time.Second, func(startCtx context.Context) error {
+		return startDaemonProcessFromContext(startCtx, launcherPath, enginePath)
+	})
+}
 
-const (
-	launcherChildActive launcherChildState = iota
-	launcherChildQuiescing
-	launcherChildAwaitingDormantExit
-	launcherChildDormant
-)
+var launcherSupervisorCommandStart = startAttestedSupervisorCommand
 
 func shouldSuperviseEngineProcess(args []string) bool {
 	if len(args) == 0 {
@@ -85,7 +76,7 @@ func runLauncherStdioSupervisor(cfg launcherSupervisorConfig) int {
 		if stderr == nil {
 			stderr = io.Discard
 		}
-		fmt.Fprintf(stderr, "mcp-mux launcher: stdio supervisor failed: %v\n", err)
+		fmt.Fprintln(stderr, "mcp-mux launcher: stdio supervisor failed")
 		return 1
 	}
 	return 0
@@ -108,585 +99,230 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 		cfg.StartChild = startDefaultSupervisedEngineChild
 	}
 	if cfg.RespawnDelay == 0 {
-		cfg.RespawnDelay = 100 * time.Millisecond
+		cfg.RespawnDelay = defaultLauncherRespawnDelay
+	}
+	if cfg.StartTimeout == 0 {
+		cfg.StartTimeout = defaultLauncherStartTimeout
 	}
 	if cfg.ReplayTimeout == 0 {
 		cfg.ReplayTimeout = defaultLauncherReplayTimeout
 	}
 	if cfg.EnginePollInterval == 0 {
-		cfg.EnginePollInterval = 5 * time.Second
+		cfg.EnginePollInterval = defaultLauncherEnginePoll
 	}
 
-	child, childOut, childEnginePath, err := startLauncherSupervisorChild(cfg, nil, nil, false, nil)
-	if err != nil {
+	resolve := func(context.Context) (supervisor.EngineRef, error) {
+		enginePath, ok := cfg.ResolveActiveEngine(cfg.LauncherPath)
+		if !ok || enginePath == "" {
+			return supervisor.EngineRef{}, errors.New("launcher active engine path is unavailable")
+		}
+		return supervisor.EngineRef{ID: canonicalLauncherEnginePath(enginePath)}, nil
+	}
+	start := func(ctx context.Context, requested supervisor.EngineRef) (supervisor.StartResult, error) {
+		if cfg.PrepareStart != nil {
+			if err := cfg.PrepareStart(ctx, cfg.LauncherPath, requested.ID, cfg.Args, cfg.Stderr); err != nil {
+				return supervisor.StartResult{}, err
+			}
+		}
+		return cfg.StartChild(ctx, cfg.LauncherPath, requested.ID, cfg.Args, cfg.Stderr)
+	}
+
+	return supervisor.Run(context.Background(), supervisor.Config{
+		HostIn:                   cfg.Stdin,
+		HostOut:                  cfg.Stdout,
+		Resolve:                  resolve,
+		Start:                    start,
+		Observe:                  observeLauncherSupervisor,
+		ReplacementNotifications: launcherReplacementNotifications(cfg.Args),
+		RetryDelay:               cfg.RespawnDelay,
+		ReconcileInterval:        cfg.EnginePollInterval,
+		StartTimeout:             cfg.StartTimeout,
+		ReplayTimeout:            cfg.ReplayTimeout,
+		GracefulStopTimeout:      launcherFinalizationTimeout,
+		OutputDrainTimeout:       launcherFinalizationTimeout,
+		DormantExitTimeout:       launcherDormantExitTimeout,
+		DormantLease:             cfg.DormantLease,
+	})
+}
+
+func launcherReplacementNotifications(args []string) []supervisor.ListChangedKind {
+	if len(args) == 0 || args[0] != "serve" {
+		return nil
+	}
+	return []supervisor.ListChangedKind{
+		supervisor.ListChangedTools,
+		supervisor.ListChangedPrompts,
+	}
+}
+
+func launcherChildUsesDaemon(args []string) bool {
+	return len(args) > 0 && args[0] != "serve" && os.Getenv("MCP_MUX_NO_DAEMON") != "1"
+}
+
+func prepareSupervisedEngineStart(ctx context.Context, launcherPath, enginePath string, args []string, stderr io.Writer) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	childWait := child.waitCh
-	var childStdoutEOF bool
-	var childExited bool
-	var childExitErr error
-	var dormantInvalid bool
-	var enginePoll <-chan time.Time
-	var engineTicker *time.Ticker
-	if cfg.EnginePollInterval > 0 {
-		engineTicker = time.NewTicker(cfg.EnginePollInterval)
-		defer engineTicker.Stop()
-		enginePoll = engineTicker.C
+	if launcherPath == "" || enginePath == "" {
+		return errors.New("launcher or active engine path is empty")
 	}
-
-	stdinCh := make(chan launcherStdinEvent, 16)
-	go readLauncherSupervisorStdin(cfg.Stdin, stdinCh)
-
-	inflight := make(map[string]string)
-	var initializeRequest []byte
-	var initializedNotification []byte
-	state := launcherChildActive
-	var pendingFrames [][]byte
-	var dormantExitTimer *time.Timer
-	var dormantExitC <-chan time.Time
-	var dormantLeaseTimer *time.Timer
-	var dormantLeaseC <-chan time.Time
-
-	stopDormantExitTimer := func() {
-		if dormantExitTimer == nil {
-			return
-		}
-		dormantExitTimer.Stop()
-		dormantExitTimer = nil
-		dormantExitC = nil
+	activeEnginePath, ok := resolveActiveEngine(launcherPath)
+	if !ok || !samePath(activeEnginePath, enginePath) || !authorizeInstalledEnginePath(launcherPath, enginePath) {
+		return errors.New("active engine path is not authorized")
 	}
-	resetDormantExitTimer := func() {
-		stopDormantExitTimer()
-		dormantExitTimer = time.NewTimer(launcherDormantExitTimeout)
-		dormantExitC = dormantExitTimer.C
-	}
-	stopDormantLeaseTimer := func() {
-		if dormantLeaseTimer != nil {
-			dormantLeaseTimer.Stop()
-			dormantLeaseTimer = nil
-			dormantLeaseC = nil
-		}
-	}
-	resetDormantLeaseTimer := func() {
-		stopDormantLeaseTimer()
-		if cfg.DormantLease > 0 {
-			dormantLeaseTimer = time.NewTimer(cfg.DormantLease)
-			dormantLeaseC = dormantLeaseTimer.C
-		}
-	}
-	resetChildObservation := func() {
-		childWait = child.waitCh
-		childStdoutEOF = false
-		childExited = false
-		childExitErr = nil
-		dormantInvalid = false
-	}
-	childTerminalAction := func() (enterDormant, restart bool) {
-		if !childStdoutEOF || !childExited {
-			return false, false
-		}
-		if state == launcherChildAwaitingDormantExit && !dormantInvalid && launcherChildExitCode(childExitErr) == launcherDormantExitCode {
-			return true, false
-		}
-		return false, true
-	}
-	flushPending := func() error {
-		for len(pendingFrames) > 0 {
-			raw := pendingFrames[0]
-			if err := writeLauncherSupervisorFrame(child.stdin, raw); err != nil {
-				return err
-			}
-			if msg, parseErr := jsonrpc.Parse(raw); parseErr == nil && msg.IsRequest() {
-				inflight[string(msg.ID)] = msg.Method
-			}
-			pendingFrames = pendingFrames[1:]
-		}
+	if !launcherChildUsesDaemon(args) {
 		return nil
 	}
-	restartAndFlush := func() error {
-		stopDormantExitTimer()
-		stopDormantLeaseTimer()
-		preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
-		launcherDrainInflight(cfg.Stdout, inflight, "initialize")
-		if child != nil {
-			child.kill()
-			child.waitOrKill(2 * time.Second)
-		}
-		var restartErr error
-		child, childOut, childEnginePath, restartErr = restartLauncherSupervisorChild(
-			cfg, initializeRequest, initializedNotification, preserveInitialize, inflight,
-		)
-		if restartErr != nil {
-			return restartErr
-		}
-		resetChildObservation()
-		state = launcherChildActive
-		return flushPending()
+	if stderr == nil {
+		stderr = io.Discard
 	}
-	wakeAndFlush := func() error {
-		stopDormantLeaseTimer()
-		var startErr error
-		child, childOut, childEnginePath, startErr = startLauncherSupervisorChild(
-			cfg, initializeRequest, initializedNotification, false, inflight,
-		)
-		if startErr != nil {
-			child, childOut, childEnginePath, startErr = restartLauncherSupervisorChild(
-				cfg, initializeRequest, initializedNotification, false, inflight,
-			)
-		}
-		if startErr != nil {
-			return startErr
-		}
-		resetChildObservation()
-		state = launcherChildActive
-		if err := flushPending(); err != nil {
-			return restartAndFlush()
-		}
-		return nil
+	logger := log.New(stderr, "[mcp-mux:launcher] ", log.LstdFlags|log.Lmicroseconds)
+	if err := launcherSupervisorEnsureDaemon(ctx, logger, launcherPath, enginePath); err != nil {
+		return err
 	}
-
-	for {
-		select {
-		case ev := <-stdinCh:
-			if ev.err != nil {
-				stopDormantLeaseTimer()
-				child.closeStdin()
-				child.waitOrKill(2 * time.Second)
-				if ev.err == io.EOF {
-					return nil
-				}
-				return fmt.Errorf("stdin: %w", ev.err)
-			}
-
-			msg := ev.msg
-			if msg.IsRequest() && msg.Method == "initialize" {
-				initializeRequest = cloneBytes(msg.Raw)
-			}
-			if msg.IsNotification() && msg.Method == "notifications/initialized" {
-				initializedNotification = cloneBytes(msg.Raw)
-			}
-			if state != launcherChildActive {
-				pendingFrames = append(pendingFrames, cloneBytes(msg.Raw))
-				if state == launcherChildDormant {
-					if err := wakeAndFlush(); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			if msg.IsRequest() {
-				inflight[string(msg.ID)] = msg.Method
-			}
-			if err := writeLauncherSupervisorFrame(child.stdin, msg.Raw); err != nil {
-				if err := restartAndFlush(); err != nil {
-					return err
-				}
-			}
-
-		case out := <-childOut:
-			if out.err != nil {
-				childOut = nil
-				childStdoutEOF = errors.Is(out.err, io.EOF)
-				enterDormant, restart := childTerminalAction()
-				if enterDormant {
-					stopDormantExitTimer()
-					child = nil
-					childEnginePath = ""
-					state = launcherChildDormant
-					resetDormantLeaseTimer()
-					if len(pendingFrames) > 0 {
-						if err := wakeAndFlush(); err != nil {
-							return err
-						}
-					}
-				} else if restart || state == launcherChildActive || !childStdoutEOF {
-					if err := restartAndFlush(); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-
-			raw := bytes.TrimRight(out.data, "\r\n")
-			if msg, parseErr := jsonrpc.Parse(raw); parseErr == nil {
-				if msg.IsNotification() {
-					switch msg.Method {
-					case launcherDormantReadyMethod:
-						if state == launcherChildActive {
-							state = launcherChildQuiescing
-							resetDormantExitTimer()
-							commit := []byte(fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"method\":%q}", launcherCommitDormantMethod))
-							if err := writeLauncherSupervisorFrame(child.stdin, commit); err != nil {
-								if err := restartAndFlush(); err != nil {
-									return err
-								}
-							}
-						}
-						continue
-					case launcherDormantAckMethod:
-						if state == launcherChildQuiescing {
-							state = launcherChildAwaitingDormantExit
-							resetDormantExitTimer()
-						}
-						continue
-					case launcherDormantNackMethod:
-						if state == launcherChildQuiescing || state == launcherChildAwaitingDormantExit {
-							stopDormantExitTimer()
-							state = launcherChildActive
-							if err := flushPending(); err != nil {
-								if err := restartAndFlush(); err != nil {
-									return err
-								}
-							}
-						}
-						continue
-					}
-				}
-				if msg.IsResponse() {
-					delete(inflight, string(msg.ID))
-				}
-			}
-			if state == launcherChildAwaitingDormantExit {
-				if _, err := cfg.Stdout.Write(out.data); err != nil {
-					child.kill()
-					return nil
-				}
-				dormantInvalid = true
-				continue
-			}
-			if _, err := cfg.Stdout.Write(out.data); err != nil {
-				child.kill()
-				return nil
-			}
-
-		case <-dormantExitC:
-			if err := restartAndFlush(); err != nil {
-				return err
-			}
-
-		case <-dormantLeaseC:
-			if state == launcherChildDormant {
-				return nil
-			}
-
-		case exitErr := <-childWait:
-			childWait = nil
-			if child != nil {
-				child.waitCh = nil
-			}
-			childExited = true
-			childExitErr = exitErr
-			enterDormant, restart := childTerminalAction()
-			if enterDormant {
-				stopDormantExitTimer()
-				child = nil
-				childOut = nil
-				childEnginePath = ""
-				state = launcherChildDormant
-				resetDormantLeaseTimer()
-				if len(pendingFrames) > 0 {
-					if err := wakeAndFlush(); err != nil {
-						return err
-					}
-				}
-			} else if restart {
-				if err := restartAndFlush(); err != nil {
-					return err
-				}
-			} else if state == launcherChildActive {
-				resetDormantExitTimer()
-			}
-
-		case <-enginePoll:
-			if state != launcherChildActive {
-				continue
-			}
-			activeEnginePath, ok := cfg.ResolveActiveEngine(cfg.LauncherPath)
-			if !ok || activeEnginePath == "" || samePath(activeEnginePath, childEnginePath) {
-				continue
-			}
-			preserveInitialize := launcherHasInflightMethod(inflight, "initialize")
-			launcherDrainInflight(cfg.Stdout, inflight, "initialize")
-			child.kill()
-			child.waitOrKill(2 * time.Second)
-			child, childOut, childEnginePath, err = restartLauncherSupervisorChild(
-				cfg, initializeRequest, initializedNotification, preserveInitialize, inflight,
-			)
-			if err != nil {
-				return err
-			}
-			resetChildObservation()
-			launcherNotifyListChangedAfterEngineReplacement(cfg.Stdout, cfg.Stderr, cfg.Args)
-		}
-	}
+	return ctx.Err()
 }
 
-func startDefaultSupervisedEngineChild(launcherPath, enginePath string, args []string, stderr io.Writer) (*supervisedEngineChild, error) {
-	cmd := newLauncherEnvCommand(launcherPath, enginePath, args)
-	cmd.Stderr = stderr
-	child, err := startSupervisedChildCommand(cmd)
+func launcherSupervisorEnv(launcherPath string, args []string) []string {
+	env := launcherEnv(launcherPath)
+	if launcherChildUsesDaemon(args) {
+		env = setEnv(env, envLauncherOwnsDaemon, "1")
+	}
+	return env
+}
+
+func observeLauncherSupervisor(event supervisor.Event) {
+	launcherTracef(
+		"stdio_supervisor generation=%d state=%s reason=%s fallback=%t",
+		event.Generation,
+		event.State,
+		event.Reason,
+		event.Fallback,
+	)
+}
+
+func canonicalLauncherEnginePath(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+func launcherSupervisorStartResult(child *supervisor.CommandChild, admission *attest.Parent, actualPath string, fallback bool) supervisor.StartResult {
+	result := supervisor.StartResult{
+		Actual:   supervisor.EngineRef{ID: canonicalLauncherEnginePath(actualPath)},
+		Fallback: fallback,
+	}
+	if child != nil {
+		result.Child = child
+	}
+	if admission != nil {
+		result.Admission = admission
+	}
+	return result
+}
+
+func startDefaultSupervisedEngineChild(
+	ctx context.Context,
+	launcherPath, enginePath string,
+	args []string,
+	stderr io.Writer,
+) (supervisor.StartResult, error) {
+	child, admission, err := launcherSupervisorCommandStart(ctx, launcherPath, enginePath, args, stderr)
 	if err == nil {
-		return child, nil
+		return launcherSupervisorStartResult(child, admission, enginePath, false), nil
+	}
+	if errors.Is(err, supervisor.ErrStartRollbackUnproven) && child == nil {
+		if admission != nil {
+			err = errors.Join(err, admission.Close())
+		}
+		return supervisor.StartResult{}, err
+	}
+	if errors.Is(err, supervisor.ErrStartRollbackUnproven) || child != nil || admission != nil {
+		return launcherSupervisorStartResult(child, admission, enginePath, false), err
 	}
 
-	fmt.Fprintf(stderr, "mcp-mux launcher: start active engine %s: %v\n", enginePath, err)
-	fmt.Fprintln(stderr, "mcp-mux launcher: starting stable launcher binary as supervised engine fallback")
-	fallback := newLauncherEnvCommand(launcherPath, launcherPath, args)
-	fallback.Stderr = stderr
-	child, fallbackErr := startSupervisedChildCommand(fallback)
+	if samePath(enginePath, launcherPath) {
+		return supervisor.StartResult{}, errors.New("active engine start failed and no distinct fallback is available")
+	}
+	fallbackChild, fallbackAdmission, fallbackErr := launcherSupervisorCommandStart(ctx, launcherPath, launcherPath, args, stderr)
 	if fallbackErr != nil {
-		return nil, fmt.Errorf("start active engine %s: %v; start stable launcher fallback %s: %w", enginePath, err, launcherPath, fallbackErr)
-	}
-	return child, nil
-}
-
-func startSupervisedChildCommand(cmd *exec.Cmd) (*supervisedEngineChild, error) {
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	if err := startLauncherEnvCommand(cmd); err != nil {
-		_ = stdin.Close()
-		return nil, err
-	}
-
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-
-	return &supervisedEngineChild{
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdout),
-		waitCh: waitCh,
-		kill: func() {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
+		if errors.Is(fallbackErr, supervisor.ErrStartRollbackUnproven) && fallbackChild == nil {
+			if fallbackAdmission != nil {
+				fallbackErr = errors.Join(fallbackErr, fallbackAdmission.Close())
 			}
-		},
-	}, nil
+			return supervisor.StartResult{}, fallbackErr
+		}
+		if errors.Is(fallbackErr, supervisor.ErrStartRollbackUnproven) || fallbackChild != nil || fallbackAdmission != nil {
+			return launcherSupervisorStartResult(fallbackChild, fallbackAdmission, launcherPath, true), fallbackErr
+		}
+		return supervisor.StartResult{}, errors.New("active engine and stable launcher fallback start failed")
+	}
+	return launcherSupervisorStartResult(fallbackChild, fallbackAdmission, launcherPath, true), nil
 }
 
-func startLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeRequest, initializedNotification []byte, forwardInitializeResponse bool, inflight map[string]string) (*supervisedEngineChild, <-chan launcherChildOutput, string, error) {
-	enginePath := cfg.InitialEnginePath
-	if active, ok := cfg.ResolveActiveEngine(cfg.LauncherPath); ok && active != "" {
-		enginePath = active
+func startAttestedSupervisorCommand(
+	ctx context.Context,
+	launcherPath, executablePath string,
+	args []string,
+	stderr io.Writer,
+) (*supervisor.CommandChild, *attest.Parent, error) {
+	if samePath(executablePath, launcherPath) {
+		child, err := supervisor.StartCommand(ctx, supervisor.Command{
+			Path:   executablePath,
+			Args:   append([]string(nil), args...),
+			Env:    launcherSupervisorEnv(launcherPath, args),
+			Stderr: stderr,
+		})
+		return child, nil, err
+	}
+	activePath, ok := resolveActiveEngine(launcherPath)
+	if !ok || !samePath(activePath, executablePath) || !authorizeInstalledEnginePath(launcherPath, executablePath) {
+		return nil, nil, errors.New("active engine path is not authorized")
+	}
+	env := launcherSupervisorEnv(launcherPath, args)
+	admission, attestationErr := launcherAttestationStart()
+	if attestationErr != nil {
+		launcherTracef("attestation unavailable")
+		admission = nil
+	} else {
+		advertisement := admission.Advertisement()
+		env = setEnv(env, envLauncherProtocol, advertisement.Version+":"+fmt.Sprint(advertisement.ParentPID))
+		env = setEnv(env, envLauncherAttestation, advertisement.Endpoint)
 	}
 
-	child, err := cfg.StartChild(cfg.LauncherPath, enginePath, cfg.Args, cfg.Stderr)
+	child, err := supervisor.StartCommand(ctx, supervisor.Command{
+		Path:   executablePath,
+		Args:   append([]string(nil), args...),
+		Env:    env,
+		Stderr: stderr,
+	})
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("start engine child: %w", err)
-	}
-
-	var prelude [][]byte
-	if len(initializeRequest) > 0 {
-		response, preserved, err := replayLauncherSupervisorHandshake(child, initializeRequest, initializedNotification, cfg.ReplayTimeout)
-		if err != nil {
-			child.kill()
-			child.waitOrKill(2 * time.Second)
-			return nil, nil, "", fmt.Errorf("replay initialize into replacement engine: %w", err)
+		var closeErr error
+		if admission != nil {
+			closeErr = admission.Close()
 		}
-		prelude = preserved
-		if forwardInitializeResponse {
-			prelude = append(prelude, response)
-			if msg, parseErr := jsonrpc.Parse(bytes.TrimRight(response, "\r\n")); parseErr == nil && msg.IsResponse() && inflight != nil {
-				delete(inflight, string(msg.ID))
-			}
+		if errors.Is(err, supervisor.ErrStartRollbackUnproven) || closeErr != nil {
+			return child, admission, errors.Join(supervisor.ErrStartRollbackUnproven, err, closeErr)
 		}
+		return nil, nil, err
 	}
-
-	out := make(chan launcherChildOutput, 16)
-	go func() {
-		for _, line := range prelude {
-			out <- launcherChildOutput{data: line}
+	if admission == nil {
+		return child, nil, nil
+	}
+	if err := admission.BindChildPID(child.PID()); err != nil {
+		stopCtx, cancel := context.WithTimeout(context.Background(), launcherFinalizationTimeout)
+		stopErr := child.Stop(stopCtx)
+		cancel()
+		closeErr := admission.Close()
+		if stopErr != nil || closeErr != nil {
+			return child, admission, errors.Join(supervisor.ErrStartRollbackUnproven, err, stopErr, closeErr)
 		}
-		pumpLauncherSupervisorStdout(child.stdout, out)
-	}()
-	return child, out, enginePath, nil
-}
-
-func restartLauncherSupervisorChild(cfg launcherSupervisorConfig, initializeRequest, initializedNotification []byte, forwardInitializeResponse bool, inflight map[string]string) (*supervisedEngineChild, <-chan launcherChildOutput, string, error) {
-	for {
-		time.Sleep(cfg.RespawnDelay)
-		child, childOut, enginePath, err := startLauncherSupervisorChild(cfg, initializeRequest, initializedNotification, forwardInitializeResponse, inflight)
-		if err == nil {
-			fmt.Fprintln(cfg.Stderr, "mcp-mux launcher: replacement engine attached; stdio transport preserved")
-			return child, childOut, enginePath, nil
-		}
-		fmt.Fprintf(cfg.Stderr, "mcp-mux launcher: replacement engine start failed: %v; retrying\n", err)
+		return nil, nil, fmt.Errorf("bind launcher attestation child: %w", err)
 	}
-}
-
-func launcherNotifyListChangedAfterEngineReplacement(stdout, stderr io.Writer, args []string) {
-	if len(args) == 0 || args[0] != "serve" {
-		return
-	}
-	for _, method := range []string{
-		"notifications/tools/list_changed",
-		"notifications/prompts/list_changed",
-	} {
-		if _, err := fmt.Fprintf(stdout, `{"jsonrpc":"2.0","method":%q}`+"\n", method); err != nil {
-			fmt.Fprintf(stderr, "mcp-mux launcher: failed to send %s after engine replacement: %v\n", method, err)
-			return
-		}
-	}
-}
-
-func readLauncherSupervisorStdin(r io.Reader, out chan<- launcherStdinEvent) {
-	scanner := jsonrpc.NewScanner(r)
-	for {
-		msg, err := scanner.Scan()
-		if err != nil {
-			out <- launcherStdinEvent{err: err}
-			return
-		}
-		out <- launcherStdinEvent{msg: msg}
-	}
-}
-
-func pumpLauncherSupervisorStdout(r *bufio.Reader, out chan<- launcherChildOutput) {
-	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 0 {
-			data := cloneBytes(line)
-			out <- launcherChildOutput{data: data}
-		}
-		if err != nil {
-			out <- launcherChildOutput{err: err}
-			return
-		}
-	}
-}
-
-func replayLauncherSupervisorHandshake(child *supervisedEngineChild, initializeRequest, initializedNotification []byte, timeout time.Duration) ([]byte, [][]byte, error) {
-	request, err := jsonrpc.Parse(bytes.TrimSpace(initializeRequest))
-	if err != nil || !request.IsRequest() || request.Method != "initialize" {
-		return nil, nil, errors.New("cached initialize request is invalid")
-	}
-	initializeID := string(request.ID)
-	if err := writeLauncherSupervisorFrame(child.stdin, initializeRequest); err != nil {
-		return nil, nil, fmt.Errorf("write initialize: %w", err)
-	}
-
-	deadline := time.Now().Add(timeout)
-	var preserved [][]byte
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return nil, nil, fmt.Errorf("read initialize response: timeout after %s", timeout)
-		}
-		line, err := readLauncherSupervisorLineWithTimeout(child.stdout, remaining)
-		if err != nil {
-			return nil, nil, fmt.Errorf("read initialize response: %w", err)
-		}
-		msg, parseErr := jsonrpc.Parse(bytes.TrimRight(line, "\r\n"))
-		if parseErr == nil && msg.IsResponse() && string(msg.ID) == initializeID {
-			if len(initializedNotification) > 0 {
-				if err := writeLauncherSupervisorFrame(child.stdin, initializedNotification); err != nil {
-					return nil, nil, fmt.Errorf("write initialized notification: %w", err)
-				}
-			}
-			return line, preserved, nil
-		}
-		preserved = append(preserved, line)
-	}
-}
-
-func readLauncherSupervisorLineWithTimeout(r *bufio.Reader, timeout time.Duration) ([]byte, error) {
-	type result struct {
-		line []byte
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		line, err := r.ReadBytes('\n')
-		ch <- result{line: line, err: err}
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case res := <-ch:
-		if res.err != nil {
-			return nil, res.err
-		}
-		return res.line, nil
-	case <-timer.C:
-		return nil, fmt.Errorf("timeout after %s", timeout)
-	}
-}
-
-func writeLauncherSupervisorFrame(w io.Writer, raw []byte) error {
-	_, err := fmt.Fprintf(w, "%s\n", raw)
-	return err
-}
-
-func launcherChildExitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode()
-	}
-	return -1
-}
-
-func launcherDrainInflight(stdout io.Writer, inflight map[string]string, preserveMethod string) {
-	if len(inflight) == 0 {
-		return
-	}
-	ids := make([]string, 0, len(inflight))
-	for id, method := range inflight {
-		if preserveMethod != "" && method == preserveMethod {
-			continue
-		}
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		delete(inflight, id)
-		_, _ = fmt.Fprintf(stdout, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"mcp-mux engine restarted, request lost during launcher reconnect"}}`+"\n", id)
-	}
-}
-
-func launcherHasInflightMethod(inflight map[string]string, method string) bool {
-	for _, got := range inflight {
-		if got == method {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *supervisedEngineChild) closeStdin() {
-	if c != nil && c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-}
-
-func (c *supervisedEngineChild) waitOrKill(timeout time.Duration) {
-	if c == nil || c.waitCh == nil {
-		return
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-c.waitCh:
-	case <-timer.C:
-		c.kill()
-	}
-}
-
-func cloneBytes(in []byte) []byte {
-	if in == nil {
-		return nil
-	}
-	out := make([]byte, len(in))
-	copy(out, in)
-	return out
+	return child, admission, nil
 }

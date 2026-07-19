@@ -15,23 +15,26 @@ consumers; muxcore is a runtime layer and downstream behavior changes matter.
 Install the current release after its tag resolves through the Go proxy:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.28.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
 ```
 
-v0.28.0 includes the v0.25.3 native SessionHandler hot-update contract
-(`RestartWithSuccessor` / `ApplyUpdateAndRestart`), the v0.26.x opt-in daemon
-registry, the v0.26.4 occupied-control-pipe guard, the v0.26.5 owner fanout
-reduction, and the v0.26.6 auto-managed engine namespace. It preserves
-snapshot-restored `tools/list` cache during background refresh, keeps live
-downstream sessions attached across upstream process exit/update with explicit
-JSON-RPC errors for in-flight requests, enters degraded retry without closing
-the parent stdio transport, and safely cleans zero-session disposable owners.
-v0.27.0 adds opt-in shim idle/dormant controls, protocol-v2 tree-authority
-handoff, and full process-tree containment. v0.27.1 prevents permanent
-idle-gate outcomes from creating a control-plane retry herd, and v0.27.2 makes
-the first uncached request join a pending snapshot/template background start.
-v0.28.0 adds cache-only startup and demand-driven materialization for compatible
-templates.
+v0.29.0 includes the v0.28.0 demand-driven materialization and fail-closed
+process-retirement contracts described below, plus the earlier native update,
+registry, namespace, reconnect, idle/dormant, and protocol-v2 handoff behavior.
+It adds the public `muxcore/supervisor` and `muxcore/supervisor/attest`
+packages for products that need one stable MCP host transport around
+replaceable child engines. Ordinary `engine.New` users require no source
+change.
+
+### v0.29.0 - public stable-stdio supervisor
+
+`muxcore/supervisor` owns a stable host stdio transport, strict MCP framing,
+bounded pending FIFO, initialization-only replay, generation-safe correlation,
+serialized host output, and complete command-child retirement when paired with
+`supervisor.StartCommand`. `muxcore/supervisor/attest` adds optional one-shot
+direct-parent and exact-child-PID proof for private lifecycle control. Products
+retain executable authorization, version selection, fallback, update, daemon,
+and operator policy.
 
 ### v0.28.0 - demand-driven upstream materialization
 
@@ -125,7 +128,7 @@ direct resilient-client controls are additive:
 | --- | --- |
 | `owner.ResilientClientConfig.IdleSuspendDelay` | Parks daemon IPC after safe host inactivity. Zero disables and preserves the prior always-connected behavior. |
 | `owner.ResilientClientConfig.IdleSuspendGate` | Optional final safety check before parking. A nil gate relies on local checks; errors and denials keep IPC connected. |
-| `owner.ResilientClientConfig.IdleDormantGrace` | Positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. Zero or negative keeps the suspended shim process alive. |
+| `owner.ResilientClientConfig.IdleDormantGrace` | With an enabled `LifecycleProtocol`, positive values bound suspended exact-owner reconnect before the private supervised-launcher dormant handshake. With a disabled protocol the shim remains suspended until host demand; zero or negative also keeps the shim alive. |
 | `owner.ResilientClientConfig.AllowPersistentIdleSuspend` | False by default. Set true only when this shim has no unbuffered server-to-client background traffic, or the consumer owns buffering/replay. Persistent owners otherwise retain their downstream transport. |
 
 The `mcp-mux` product wires 10-minute idle and 30-second dormant defaults from
@@ -453,6 +456,116 @@ Rules:
 
 Use it for cheap admission decisions such as local rate limiting. Do not put
 network calls, database writes, or heavy policy evaluation in this hook.
+
+## Stable Stdio Supervisor (v0.29.0)
+
+`muxcore/supervisor` is the public boundary for products whose MCP host keeps
+one stdio transport open while the product replaces a child engine executable.
+Introduced in `muxcore/v0.29.0`. After the tag resolves through the Go proxy,
+pin it with:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.29.0
+```
+
+Minimal ordinary-supervision shape:
+
+```go
+err := supervisor.Run(ctx, supervisor.Config{
+    HostIn:  os.Stdin,
+    HostOut: os.Stdout,
+    Resolve: func(context.Context) (supervisor.EngineRef, error) {
+        path, err := resolveActiveEngine()
+        return supervisor.EngineRef{ID: path}, err
+    },
+    Start: func(ctx context.Context, requested supervisor.EngineRef) (supervisor.StartResult, error) {
+        child, err := supervisor.StartCommand(ctx, supervisor.Command{
+            Path:   requested.ID,
+            Args:   []string{"serve"},
+            Env:    os.Environ(),
+            Stderr: os.Stderr,
+        })
+        return supervisor.StartResult{Child: child, Actual: requested}, err
+    },
+})
+```
+
+`HostIn` transfers ownership of an `io.ReadCloser` to `Run` for the invocation.
+Its `Close` method must unblock any pending `Read`; the supervisor closes it on
+every shutdown path, so callers must not reuse the stream after `Run` returns.
+
+The supervisor guarantees:
+
+- one serialized writer to host stdout and at most one live child process-tree
+  authority;
+- strict bounded newline-delimited JSON-RPC/MCP validation in both directions;
+- count-and-byte bounded first-delivery FIFO while a child starts, replays,
+  finalizes, quiesces, or is dormant;
+- replay of only the cached `initialize` / `notifications/initialized`
+  handshake, while lifecycle-permitted client/server pings remain correlated
+  and server logging prelude preserves order;
+- explicit original-ID errors for delivered requests lost on a generation
+  change;
+- generation-safe request, cancellation, progress-token, and MCP task
+  correlation;
+- full Unix process-group or Windows Job Object retirement before a successor
+  starts when `StartCommand` is used;
+- optional tools/prompts/resources list-change notifications after replacement,
+  gated by the initialize capability contract already visible to the host.
+
+When `Start` reports a fallback whose `Actual` identity differs from the
+`requested` identity, reconciliation compares later `Resolve` results with the
+requested identity. A healthy fallback is not recycled merely because its
+actual executable differs; a product that wants a replacement must resolve a
+different `EngineRef` through its own recovery policy.
+
+After an authorized dormant ACK, at most one ordinary child frame is forwarded
+before dormancy is invalidated; later ordinary frames from that generation are
+suppressed until bounded finalization replaces it. If the forwarded frame is a
+request, its response remains correlated to the same generation until
+completion or retirement. A reader-observed host frame
+at or before the dormant-lease deadline wins the timer race, while a rejected or
+otherwise non-waking frame cannot permanently disarm lease expiry.
+
+`StartTimeout` bounds one `Resolve` + `Start` attempt; timeout is terminal rather
+than permitting overlapping child authorities, and `StartFunc` must honor its
+context and roll back partial authority. If rollback cannot be proven and no
+partial `StartResult` is available for `Run` to finalize, return
+`supervisor.ErrStartRollbackUnproven`; the supervisor terminates instead of
+retrying into a second authority. `ReplayTimeout` bounds both the first
+`initialize` response and replacement handshake replay. `DormantExitTimeout`
+bounds the ACK/NACK response to `commit-dormant` and is then re-armed for the
+post-ACK exit/output-drain proof. Built-in lifecycle logs contain only
+generation, state, finite reason, and fallback status; opaque engine identities
+are exposed only to an explicitly configured `Observe` callback.
+
+The product still owns executable authorization, active-version layout,
+command/args/cwd/environment construction, preferred-versus-fallback policy,
+update/bootstrap policy, and operator exit behavior. `supervisor` does not infer
+those facts from paths or MCP protocol negotiation.
+
+Products with a shared daemon must keep it outside each replaceable command child's process-tree authority. The `mcp-mux` stable launcher prepares its daemon before starting a supervised child; on Windows that leaves the daemon outside the child's KillOnJobClose Job. A marked child never starts the shared daemon itself and exits through `owner.ErrReconnectExit` if the daemon disappears, allowing the stable launcher to prepare it and restart the child on the same host transport.
+
+Private dormant control is disabled unless the exact child generation has a
+verified `supervisor/attest.Parent` receipt. Start the parent endpoint before
+the child, pass its generic `Advertisement` using product-owned env or argv,
+start the child, then call `BindChildPID` with the returned PID. The child calls
+`attest.VerifyParent` with its OS direct-parent PID. The package verifies client
+and server peer PIDs on Windows, Linux, and Darwin; unsupported platforms fail
+closed while ordinary supervision remains available. Product path/layout
+authorization remains a separate check after generic attestation.
+
+Rolling compatibility is deliberately fail-closed: a new supervisor runs an
+old engine as ordinary MCP; an old launcher runs a new engine without private
+dormancy; and a pre-attestation engine that emits a colliding private method is
+suppressed rather than committed or restarted in a loop. Do not copy the v2
+method strings, exit code, parser, replay loop, or attestation into a consumer.
+Use `supervisor.ProtocolV2()`, `supervisor.Run`, and `supervisor/attest`.
+
+To roll back, pin `muxcore/v0.28.0` or restore the prior product binary. Do not
+force a mixed-version live supervisor handoff or forward an old attestation
+advertisement. Old/new combinations run as ordinary MCP without private
+dormancy and should restart through the product's bounded replacement path.
 
 ## Upgrade and Restart Contract
 

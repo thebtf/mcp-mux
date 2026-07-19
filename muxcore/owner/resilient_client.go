@@ -17,6 +17,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 )
 
 const (
@@ -27,11 +28,6 @@ const (
 	msgFromIPCBufferSize      = 1000
 	defaultMaxRefreshAttempts = 3
 	idleSuspendGateRetryMax   = time.Minute
-
-	resilientDormantReadyMethod  = "$/mcp-mux/launcher/dormant-ready"
-	resilientDormantCommitMethod = "$/mcp-mux/launcher/commit-dormant"
-	resilientDormantAckMethod    = "$/mcp-mux/launcher/dormant-ack"
-	resilientDormantNackMethod   = "$/mcp-mux/launcher/dormant-nack"
 )
 
 // idleSuspendGateRetry is a variable so focused tests can exercise retries
@@ -89,10 +85,13 @@ type ResilientClientConfig struct {
 	// session. A nil gate allows suspension based on local safety checks alone.
 	// Errors and denied decisions fail closed and keep the session connected.
 	IdleSuspendGate func() (allowed bool, reason string, err error)
-	// IdleDormantGrace bounds exact-owner reconnect after suspension. A positive
-	// value enables the private supervised-launcher dormant handshake; zero or
-	// negative keeps the suspended shim alive for backward compatibility.
+	// IdleDormantGrace bounds exact-owner reconnect before the private dormant
+	// handshake when LifecycleProtocol is enabled. With a disabled protocol,
+	// the suspended shim waits for host demand regardless of this value.
 	IdleDormantGrace time.Duration
+	// LifecycleProtocol authorizes the private launcher-child dormancy wire.
+	// Its zero value is disabled; ordinary engine consumers remain unchanged.
+	LifecycleProtocol supervisor.Protocol
 	// AllowPersistentIdleSuspend is an explicit consumer assertion that this
 	// transport has no unbuffered server-to-client background traffic. Persistent
 	// owners stay connected by default because MCP permits notifications/requests
@@ -151,10 +150,9 @@ type resilientClient struct {
 	log                *log.Logger
 }
 
-// ErrReconnectExit is returned when the shim should exit after successful
-// reconnect so the MCP host restarts it with a fresh handshake. It is retained
-// for API compatibility; the default resilient path keeps stdio alive and does
-// not use this sentinel.
+// ErrReconnectExit asks a supervised product child to exit so its stable
+// parent can prepare shared dependencies and restart it without closing the
+// host transport. Ordinary reconnect failures remain in degraded retry.
 var (
 	ErrInjectFull    = errors.New("muxcore: inject buffer full")
 	ErrInjectClosed  = errors.New("muxcore: inject channel closed")
@@ -319,7 +317,8 @@ func (rc *resilientClient) runProxy(conn interface {
 	io.Reader
 	io.Writer
 	io.Closer
-}, stdoutMu *sync.Mutex, stdinDone <-chan error) error {
+}, stdoutMu *sync.Mutex, stdinDone <-chan error,
+) error {
 	for {
 		rc.suspendMu.Lock()
 		rc.suspending = false
@@ -490,7 +489,7 @@ func (rc *resilientClient) runProxy(conn interface {
 					}
 					return err
 				}
-				if graceExpired {
+				if graceExpired && rc.cfg.LifecycleProtocol.Enabled() {
 					var committed bool
 					demand, committed, err = rc.negotiateDormant(stdoutMu, stdinDone)
 					if err != nil {
@@ -582,7 +581,7 @@ func (rc *resilientClient) beginIdleSuspend() bool {
 func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error, deferred []byte) ([]byte, bool, error) {
 	var graceTimer *time.Timer
 	var graceC <-chan time.Time
-	if rc.cfg.IdleDormantGrace > 0 {
+	if rc.cfg.LifecycleProtocol.Enabled() && rc.cfg.IdleDormantGrace > 0 {
 		graceTimer = time.NewTimer(rc.cfg.IdleDormantGrace)
 		defer graceTimer.Stop()
 		graceC = graceTimer.C
@@ -607,30 +606,37 @@ func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error, deferr
 				return nil, true, nil
 			}
 		}
-		if msg, err := jsonrpc.Parse(data); err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
+		control, reserved, controlErr := rc.lifecycleControl(data)
+		if reserved {
 			rc.localWork.Add(-1)
-			continue
+			if controlErr != nil {
+				return nil, false, controlErr
+			}
+			if control == supervisor.ControlCommitDormant {
+				continue
+			}
+			return nil, false, fmt.Errorf("resilient: unexpected private lifecycle control %d while suspended", control)
 		}
 		return data, false, nil
 	}
 }
 
 func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-chan error) ([]byte, bool, error) {
-	if err := rc.writeDormantNotification(stdoutMu, resilientDormantReadyMethod); err != nil {
+	if err := rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantReady); err != nil {
 		return nil, false, err
 	}
 	rc.log.Printf("shim.dormant.ready")
 
 	select {
 	case data := <-rc.msgFromCC:
-		msg, err := jsonrpc.Parse(data)
-		if err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
+		control, reserved, controlErr := rc.lifecycleControl(data)
+		if reserved && controlErr == nil && control == supervisor.ControlCommitDormant {
 			rc.localWork.Add(-1)
 			rc.dormantMu.Lock()
 			select {
 			case demand := <-rc.msgFromCC:
 				rc.dormantMu.Unlock()
-				if err := rc.writeDormantNotification(stdoutMu, resilientDormantNackMethod); err != nil {
+				if err := rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantNack); err != nil {
 					rc.localWork.Add(-1)
 					return nil, false, err
 				}
@@ -640,13 +646,21 @@ func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-ch
 				rc.dormantCommitted = true
 				rc.dormantMu.Unlock()
 			}
-			if err := rc.writeDormantNotification(stdoutMu, resilientDormantAckMethod); err != nil {
+			if err := rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantAck); err != nil {
 				return nil, false, err
 			}
 			rc.log.Printf("shim.dormant.ack")
 			return nil, true, nil
 		}
-		if err := rc.writeDormantNotification(stdoutMu, resilientDormantNackMethod); err != nil {
+		if reserved {
+			rc.localWork.Add(-1)
+			if controlErr == nil {
+				controlErr = fmt.Errorf("unexpected private lifecycle control %d", control)
+			}
+			_ = rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantNack)
+			return nil, false, fmt.Errorf("resilient: dormant handshake: %w", controlErr)
+		}
+		if err := rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantNack); err != nil {
 			rc.localWork.Add(-1)
 			return nil, false, err
 		}
@@ -662,10 +676,25 @@ func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-ch
 	}
 }
 
-func (rc *resilientClient) writeDormantNotification(stdoutMu *sync.Mutex, method string) error {
+func (rc *resilientClient) lifecycleControl(data []byte) (supervisor.Control, bool, error) {
+	message, err := jsonrpc.Parse(data)
+	if err != nil {
+		return supervisor.ControlNone, false, nil
+	}
+	return rc.cfg.LifecycleProtocol.ControlOf(message)
+}
+
+func (rc *resilientClient) writeDormantNotification(stdoutMu *sync.Mutex, control supervisor.Control) error {
+	frame := rc.cfg.LifecycleProtocol.Frame(control)
+	if len(frame) == 0 {
+		return supervisor.ErrProtocolDisabled
+	}
 	stdoutMu.Lock()
-	_, err := fmt.Fprintf(rc.cfg.Stdout, "{\"jsonrpc\":\"2.0\",\"method\":%q}\n", method)
+	n, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", frame)
 	stdoutMu.Unlock()
+	if err == nil && n != len(frame)+1 {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
 	}
@@ -748,7 +777,7 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 				deferred = data
 				return
 			}
-			if msg, err := jsonrpc.Parse(data); err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
+			if _, reserved, _ := rc.lifecycleControl(data); reserved {
 				rc.localWork.Add(-1)
 				continue
 			}
@@ -808,7 +837,8 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	io.Reader
 	io.Writer
 	io.Closer
-}, error) {
+}, error,
+) {
 	// Send error responses for every request that was in-flight when the IPC
 	// died, BEFORE we start the poll loop. Without this, CC waits on each
 	// request until its own timeout (tens of seconds) and marks the transport
@@ -827,6 +857,9 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 		for attempt := 0; attempt < rc.cfg.MaxRefreshAttempts; attempt++ {
 			res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.RefreshToken)
 			if err != nil {
+				if errors.Is(err, ErrReconnectExit) {
+					return nil, err
+				}
 				if err == io.EOF {
 					return nil, io.EOF
 				}
@@ -871,6 +904,9 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	for {
 		res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.Reconnect)
 		if err != nil {
+			if errors.Is(err, ErrReconnectExit) {
+				return nil, err
+			}
 			if err == io.EOF {
 				return nil, io.EOF
 			}
@@ -969,7 +1005,8 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 	io.Reader
 	io.Writer
 	io.Closer
-}, string, error) {
+}, string, error,
+) {
 	conn, err := ipc.Dial(path)
 	if err != nil {
 		return nil, "dial", err
@@ -1063,7 +1100,8 @@ func (rc *resilientClient) ownerPrefixFromIPCPath(ipcPath string) string {
 func (rc *resilientClient) replayInit(conn interface {
 	io.Reader
 	io.Writer
-}) error {
+},
+) error {
 	rc.initCache.mu.Lock()
 	req := rc.initCache.request
 	requestID := rc.initCache.requestID
@@ -1210,7 +1248,7 @@ func (rc *resilientClient) flushBuffer(conn io.Writer) {
 	for {
 		select {
 		case data := <-rc.msgFromCC:
-			if msg, err := jsonrpc.Parse(data); err == nil && msg.IsNotification() && msg.Method == resilientDormantCommitMethod {
+			if _, reserved, _ := rc.lifecycleControl(data); reserved {
 				rc.localWork.Add(-1)
 				continue
 			}

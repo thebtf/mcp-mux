@@ -15,10 +15,11 @@ import (
 )
 
 type platformState struct {
-	mu        sync.Mutex
-	job       windows.Handle
-	state     uint8
-	finalized chan struct{}
+	mu          sync.Mutex
+	job         windows.Handle
+	state       uint8
+	finalized   chan struct{}
+	finalizeErr error
 }
 
 const (
@@ -29,7 +30,11 @@ const (
 )
 
 func configurePlatform(cmd *exec.Cmd, p *Process) error {
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	flags := uint32(windows.CREATE_NO_WINDOW)
+	if p.startSuspended {
+		flags |= windows.CREATE_SUSPENDED
+	}
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: flags}
 	if p.disableTree {
 		return nil
 	}
@@ -75,6 +80,82 @@ func (p *Process) postStart() error {
 	if err := windows.AssignProcessToJobObject(job, handle); err != nil {
 		return fmt.Errorf("AssignProcessToJobObject: %w", err)
 	}
+	if p.startSuspended {
+		return resumeProcessThreads(p.pid)
+	}
+	return nil
+}
+
+func (p *Process) allowSurviveParentExitPlatform() error {
+	p.platform.mu.Lock()
+	defer p.platform.mu.Unlock()
+	if p.platform.state != authorityActive || p.platform.job == 0 {
+		return errors.New("procgroup: process Job authority is not active")
+	}
+
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	if err := windows.QueryInformationJobObject(
+		p.platform.job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+		nil,
+	); err != nil {
+		return fmt.Errorf("QueryInformationJobObject: %w", err)
+	}
+	if info.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 {
+		return nil
+	}
+	info.BasicLimitInformation.LimitFlags &^= windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		p.platform.job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		return fmt.Errorf("SetInformationJobObject: %w", err)
+	}
+	return nil
+}
+
+func resumeProcessThreads(pid int) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return fmt.Errorf("CreateToolhelp32Snapshot: %w", err)
+	}
+	defer windows.CloseHandle(snapshot)
+
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	if err := windows.Thread32First(snapshot, &entry); err != nil {
+		return fmt.Errorf("Thread32First: %w", err)
+	}
+	resumed := 0
+	for {
+		if entry.OwnerProcessID == uint32(pid) {
+			thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+			if err != nil {
+				return fmt.Errorf("OpenThread %d: %w", entry.ThreadID, err)
+			}
+			previous, resumeErr := windows.ResumeThread(thread)
+			_ = windows.CloseHandle(thread)
+			if resumeErr != nil {
+				return fmt.Errorf("ResumeThread %d: %w", entry.ThreadID, resumeErr)
+			}
+			if previous > 0 {
+				resumed++
+			}
+		}
+		err = windows.Thread32Next(snapshot, &entry)
+		if errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("Thread32Next: %w", err)
+		}
+	}
+	if resumed == 0 {
+		return fmt.Errorf("no suspended threads found for pid %d", pid)
+	}
 	return nil
 }
 
@@ -87,31 +168,62 @@ func (p *Process) takeJobAuthority() (windows.Handle, <-chan struct{}, bool) {
 		p.platform.job = 0
 		p.platform.state = authorityFinalizing
 		return job, p.platform.finalized, true
-	case authorityFinalizing:
+	case authorityFinalizing, authorityFinalized:
 		return 0, p.platform.finalized, false
-	case authorityFinalized, authorityIdle:
+	case authorityIdle:
 		return 0, nil, false
 	default:
 		return 0, nil, false
 	}
 }
 
-func (p *Process) finishJobAuthority(job windows.Handle) {
+func (p *Process) finishJobAuthority(job windows.Handle, finalizeErr error) error {
 	if job != 0 {
-		_ = windows.CloseHandle(job)
+		if closeErr := windows.CloseHandle(job); closeErr != nil {
+			finalizeErr = errors.Join(finalizeErr, fmt.Errorf("close process Job: %w", closeErr))
+		}
 	}
 	p.platform.mu.Lock()
 	if p.platform.state == authorityFinalizing {
+		p.platform.finalizeErr = finalizeErr
 		p.platform.state = authorityFinalized
 		close(p.platform.finalized)
 	}
+	result := p.platform.finalizeErr
 	p.platform.mu.Unlock()
+	return result
 }
 
-func waitAuthority(wait <-chan struct{}) {
-	if wait != nil {
-		<-wait
+func (p *Process) waitJobAuthority(wait <-chan struct{}) error {
+	if wait == nil {
+		return nil
 	}
+	<-wait
+	p.platform.mu.Lock()
+	defer p.platform.mu.Unlock()
+	return p.platform.finalizeErr
+}
+
+func terminateJobAndWait(job windows.Handle) error {
+	if job == 0 {
+		return nil
+	}
+	terminateErr := windows.TerminateJobObject(job, 1)
+	waitMillis := uint32(processTreeWaitTimeout / time.Millisecond)
+	if waitMillis == 0 {
+		waitMillis = 1
+	}
+	status, waitErr := windows.WaitForSingleObject(job, waitMillis)
+	if waitErr != nil {
+		return errors.Join(terminateErr, fmt.Errorf("WaitForSingleObject(job): %w", waitErr))
+	}
+	if status == uint32(windows.WAIT_TIMEOUT) {
+		return errors.Join(terminateErr, fmt.Errorf("process Job remained alive after %s", processTreeWaitTimeout))
+	}
+	if status != windows.WAIT_OBJECT_0 {
+		return errors.Join(terminateErr, fmt.Errorf("unexpected Job wait status %d", status))
+	}
+	return terminateErr
 }
 
 func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
@@ -121,9 +233,9 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 
 	job, wait, owner := p.takeJobAuthority()
 	if !owner {
-		waitAuthority(wait)
+		authorityErr := p.waitJobAuthority(wait)
 		<-p.done
-		return nil
+		return authorityErr
 	}
 
 	dll := windows.NewLazySystemDLL("kernel32.dll")
@@ -135,13 +247,13 @@ func (p *Process) gracefulKillPlatform(timeout time.Duration) error {
 	case <-p.leaderDone:
 	case <-time.After(timeout):
 	}
-	err := windows.TerminateJobObject(job, 1)
-	p.finishJobAuthority(job)
-	<-p.done
-	if err != nil {
-		return fmt.Errorf("TerminateJobObject: %w", err)
+	authorityErr := terminateJobAndWait(job)
+	if authorityErr != nil {
+		authorityErr = fmt.Errorf("terminate process Job: %w", authorityErr)
 	}
-	return nil
+	authorityErr = p.finishJobAuthority(job, authorityErr)
+	<-p.done
+	return authorityErr
 }
 
 func (p *Process) killLeader() error {
@@ -165,42 +277,47 @@ func (p *Process) killPlatform() error {
 
 	job, wait, owner := p.takeJobAuthority()
 	if !owner {
-		waitAuthority(wait)
+		authorityErr := p.waitJobAuthority(wait)
 		<-p.done
-		return nil
+		return authorityErr
 	}
-	err := windows.TerminateJobObject(job, 1)
-	p.finishJobAuthority(job)
+	authorityErr := terminateJobAndWait(job)
+	if authorityErr != nil {
+		authorityErr = fmt.Errorf("terminate process Job: %w", authorityErr)
+	}
+	authorityErr = p.finishJobAuthority(job, authorityErr)
 	if p.Alive() {
 		<-p.done
 	}
-	if err != nil {
-		return fmt.Errorf("TerminateJobObject: %w", err)
-	}
-	return nil
+	return authorityErr
 }
 
-func (p *Process) cleanupPlatform() {
+func (p *Process) cleanupPlatform() error {
 	if p.disableTree {
-		return
+		return nil
 	}
 	job, wait, owner := p.takeJobAuthority()
 	if owner {
-		p.finishJobAuthority(job)
-		return
+		authorityErr := terminateJobAndWait(job)
+		if authorityErr != nil {
+			authorityErr = fmt.Errorf("terminate process Job: %w", authorityErr)
+		}
+		return p.finishJobAuthority(job, authorityErr)
 	}
-	waitAuthority(wait)
+	return p.waitJobAuthority(wait)
 }
 
-func (p *Process) reapPlatform() {
+func (p *Process) reapPlatform() error {
 	if p.disableTree {
-		return
+		return nil
 	}
 	job, wait, owner := p.takeJobAuthority()
 	if owner {
-		_ = windows.TerminateJobObject(job, 1)
-		p.finishJobAuthority(job)
-		return
+		authorityErr := terminateJobAndWait(job)
+		if authorityErr != nil {
+			authorityErr = fmt.Errorf("terminate process Job: %w", authorityErr)
+		}
+		return p.finishJobAuthority(job, authorityErr)
 	}
-	waitAuthority(wait)
+	return p.waitJobAuthority(wait)
 }
