@@ -100,7 +100,7 @@ func TestCorrelationActiveRequestsStayBounded(t *testing.T) {
 
 func TestCorrelationActiveRequestsAndTasksShareBudget(t *testing.T) {
 	registry := newDirectionRegistry()
-	for index := range activeCorrelationLimit - 1 {
+	for index := range activeCorrelationLimit - 2 {
 		request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"create-%d","method":"tools/call","params":{"task":{}}}`, index))
 		if err := registry.canRegister(request); err != nil {
 			t.Fatalf("register task request %d: %v", index, err)
@@ -115,20 +115,29 @@ func TestCorrelationActiveRequestsAndTasksShareBudget(t *testing.T) {
 
 	last := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"last","method":"tools/call","params":{"task":{}}}`)
 	if err := registry.canRegister(last); err != nil {
-		t.Fatalf("register final active correlation: %v", err)
+		t.Fatalf("register final executing correlation: %v", err)
 	}
 	lastRecord := registry.register(last, 1)
 	overflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"overflow","method":"tools/list"}`)
 	if err := registry.canRegister(overflow); err == nil {
-		t.Fatal("256 combined active requests and tasks accepted another request")
+		t.Fatal("executing tasks consumed the reserved control slot")
 	}
 	lastResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"last","result":{"task":{"taskId":"task-last","status":"working"}}}`)
 	if err := registry.canComplete(lastRecord, lastResponse); err != nil {
 		t.Fatalf("request-to-task conversion consumed a second active slot: %v", err)
 	}
 	registry.complete(lastRecord, lastResponse)
+	control := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"control","method":"tasks/get","params":{"taskId":"task-last"}}`)
+	if err := registry.canRegister(control); err != nil {
+		t.Fatalf("reserved control slot unavailable: %v", err)
+	}
+	registry.register(control, 1)
 	if got := len(registry.requests) + len(registry.tasks); got != activeCorrelationLimit {
 		t.Fatalf("combined active correlations = %d, want %d", got, activeCorrelationLimit)
+	}
+	secondControl := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"second-control","method":"tasks/get","params":{"taskId":"task-last"}}`)
+	if err := registry.canRegister(secondControl); err == nil {
+		t.Fatal("shared active ceiling accepted a 257th correlation")
 	}
 }
 
@@ -398,6 +407,198 @@ func TestTaskOperationResponsesRetireWithoutStatusNotification(t *testing.T) {
 				t.Fatalf("terminal operation retained state: tasks=%d tokens=%d", len(registry.tasks), len(registry.tokens))
 			}
 		})
+	}
+}
+
+func TestTaskLifecycleReservesControlSlot(t *testing.T) {
+	t.Run("executing tasks", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		for index := range activeCorrelationLimit - 1 {
+			id := fmt.Sprintf("task-%d", index)
+			registry.tasks[id] = &taskRecord{id: id, generation: 1, status: "working"}
+		}
+		ordinary := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"ordinary","method":"tools/list"}`)
+		if err := registry.canRegister(ordinary); err == nil {
+			t.Fatal("executing tasks consumed the reserved control slot")
+		}
+		control := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"control","method":"tasks/get","params":{"taskId":"task-0"}}`)
+		if err := registry.canRegister(control); err != nil {
+			t.Fatalf("reserved task control slot unavailable: %v", err)
+		}
+	})
+
+	t.Run("pending create", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		for index := range activeCorrelationLimit - 2 {
+			request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"ordinary-%d","method":"tools/list"}`, index))
+			registry.register(request, 1)
+		}
+		create := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","method":"tools/call","params":{"task":{}}}`)
+		if err := registry.canRegister(create); err != nil {
+			t.Fatalf("pending create at reserved ceiling: %v", err)
+		}
+		registry.register(create, 1)
+		ordinary := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"ordinary-overflow","method":"tools/list"}`)
+		if err := registry.canRegister(ordinary); err == nil {
+			t.Fatal("pending task create did not preserve control slot")
+		}
+	})
+
+	t.Run("terminal task", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
+		for index := range activeCorrelationLimit - 1 {
+			request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"ordinary-%d","method":"tools/list"}`, index))
+			registry.register(request, 1)
+		}
+		ordinary := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"ordinary-overflow","method":"tools/list"}`)
+		if err := registry.canRegister(ordinary); err == nil {
+			t.Fatal("terminal task did not preserve control slot")
+		}
+		control := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"control","method":"tasks/result","params":{"taskId":"task-1"}}`)
+		if err := registry.canRegister(control); err != nil {
+			t.Fatalf("terminal task control slot unavailable: %v", err)
+		}
+	})
+}
+
+func TestTerminalTaskLifecycleAndResultFinalization(t *testing.T) {
+	registry := newDirectionRegistry()
+	tokenKey := scalarKey{kind: scalarString, value: "task-token"}
+	registry.tokens[tokenKey] = &tokenRecord{generation: 1}
+	registry.tasks["task-1"] = &taskRecord{
+		id:            "task-1",
+		requestID:     taskTombstoneKey("create"),
+		generation:    1,
+		progressToken: &tokenKey,
+		status:        "working",
+	}
+	handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "completed"}, 1)
+	if err != nil || !handled {
+		t.Fatalf("terminal update: handled=%v err=%v", handled, err)
+	}
+	if registry.tasks["task-1"] != nil || registry.terminalTasks["task-1"] == nil {
+		t.Fatalf("terminal transition active=%#v terminal=%#v", registry.tasks["task-1"], registry.terminalTasks["task-1"])
+	}
+	if registry.tokens[tokenKey] != nil || !registry.persistentFences.contains(tombstoneToken, tokenKey) {
+		t.Fatal("terminal transition did not remove and fence progress token")
+	}
+	if registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) {
+		t.Fatal("routable terminal task was prematurely fenced")
+	}
+	if registryIdle(&registry) {
+		t.Fatal("routable terminal task allowed registry idle")
+	}
+
+	get := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+	getRecord := registry.register(get, 1)
+	getResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(getRecord, getResponse); err != nil {
+		t.Fatalf("terminal tasks/get response: %v", err)
+	}
+	if err := registry.complete(getRecord, getResponse); err != nil {
+		t.Fatal(err)
+	}
+	if task := registry.terminalTasks["task-1"]; task == nil || task.status != "completed" {
+		t.Fatalf("terminal tasks/get lost metadata: %#v", task)
+	}
+
+	resultError := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result-error","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	resultErrorRecord := registry.register(resultError, 1)
+	errorResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result-error","error":{"code":-32000,"message":"retry"}}`)
+	if err := registry.canComplete(resultErrorRecord, errorResponse); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.complete(resultErrorRecord, errorResponse); err != nil {
+		t.Fatal(err)
+	}
+	if registry.terminalTasks["task-1"] == nil {
+		t.Fatal("tasks/result error made terminal task non-retriable")
+	}
+
+	result := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	resultRecord := registry.register(result, 1)
+	resultResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"result","result":{"content":[]}}`)
+	if err := registry.canComplete(resultRecord, resultResponse); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.complete(resultRecord, resultResponse); err != nil {
+		t.Fatal(err)
+	}
+	if registry.terminalTasks["task-1"] != nil || !registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) {
+		t.Fatal("successful tasks/result did not finalize terminal task")
+	}
+	if !registryIdle(&registry) {
+		t.Fatal("finalized task kept registry non-idle")
+	}
+}
+
+func TestTerminalTaskRetentionAndGenerationInvalidation(t *testing.T) {
+	t.Run("terminal cap", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		for index := range retainedCorrelationLimit - activeCorrelationLimit {
+			id := fmt.Sprintf("terminal-%d", index)
+			registry.terminalTasks[id] = &taskRecord{id: id, generation: 1, status: "completed"}
+		}
+		registry.tasks["active"] = &taskRecord{id: "active", generation: 1, status: "working"}
+		handled, err := registry.updateTask(&taskMeta{id: "active", status: "completed"}, 1)
+		if err == nil || !handled {
+			t.Fatalf("terminal cap: handled=%v err=%v", handled, err)
+		}
+		if registry.tasks["active"] == nil || registry.terminalTasks["active"] != nil {
+			t.Fatal("terminal cap failure mutated task state")
+		}
+	})
+
+	t.Run("generation fence preflight", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		for index := range persistentFenceLimit {
+			if err := registry.persistentFences.add(tombstoneTask, taskTombstoneKey(fmt.Sprintf("fenced-%d", index))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
+		if _, err := registry.retireGenerationChecked(1); err == nil {
+			t.Fatal("generation invalidation hid terminal task fence exhaustion")
+		}
+		if registry.terminalTasks["task-1"] == nil {
+			t.Fatal("failed generation preflight removed terminal task")
+		}
+	})
+
+	t.Run("generation invalidation", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		registry.terminalTasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "completed"}
+		operation := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"operation","method":"tasks/get","params":{"taskId":"task-1"}}`)
+		registry.register(operation, 1)
+		if _, err := registry.retireGenerationChecked(1); err != nil {
+			t.Fatal(err)
+		}
+		if registry.terminalTasks["task-1"] != nil || !registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) {
+			t.Fatal("generation invalidation did not fence and remove terminal task")
+		}
+		response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+		if handled, err := registry.consumeRetiredResponse(response); err != nil || !handled {
+			t.Fatalf("late response after terminal invalidation: handled=%v err=%v", handled, err)
+		}
+	})
+}
+
+func TestActiveTaskOperationResponseAfterTerminalStatus(t *testing.T) {
+	registry := newDirectionRegistry()
+	registry.tasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "working"}
+	operation := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+	record := registry.register(operation, 1)
+	if handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "completed"}, 1); err != nil || !handled {
+		t.Fatalf("terminal update: handled=%v err=%v", handled, err)
+	}
+	terminal := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(record, terminal); err != nil {
+		t.Fatalf("terminal response after terminal status: %v", err)
+	}
+	working := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if err := registry.canComplete(record, working); err == nil {
+		t.Fatal("nonterminal response after terminal status was accepted")
 	}
 }
 
@@ -870,8 +1071,10 @@ func TestPersistentFenceCapacityErrorsPropagate(t *testing.T) {
 
 	t.Run("terminal task update", func(t *testing.T) {
 		registry := newDirectionRegistry()
-		fill(t, &registry, tombstoneTask)
-		registry.tasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "working"}
+		fill(t, &registry, tombstoneToken)
+		tokenKey := taskTombstoneKey("task-token")
+		registry.tasks["task-1"] = &taskRecord{id: "task-1", generation: 1, progressToken: &tokenKey, status: "working"}
+		registry.tokens[tokenKey] = &tokenRecord{generation: 1}
 		handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "completed"}, 1)
 		if err == nil || !handled {
 			t.Fatalf("terminal update: handled=%v err=%v", handled, err)

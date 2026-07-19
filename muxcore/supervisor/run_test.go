@@ -939,20 +939,37 @@ func TestRunCancellationProgressAndTaskLifetime(t *testing.T) {
 	if got := nextLine(t, childInput); !strings.Contains(got, `"method":"tasks/get"`) {
 		t.Fatalf("task get = %s", got)
 	}
-	if err := child.write(`{"jsonrpc":"2.0","id":"get-task","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`); err != nil {
-		t.Fatal(err)
-	}
-	_ = nextLine(t, harness.hostOutput)
 	if err := child.write(`{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"task-1","status":"completed"}}`); err != nil {
 		t.Fatal(err)
 	}
 	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"status":"completed"`) {
 		t.Fatalf("task status = %s", got)
 	}
+	if err := child.write(`{"jsonrpc":"2.0","id":"get-task","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"get-task"`) || !strings.Contains(got, `"status":"completed"`) {
+		t.Fatalf("terminal task get = %s", got)
+	}
 	if err := child.write(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"task-progress","progress":2}}`); err != nil {
 		t.Fatal(err)
 	}
 	assertNoLine(t, harness.hostOutput, 100*time.Millisecond)
+	harness.send(t, `{"jsonrpc":"2.0","id":"cancel-terminal","method":"tasks/cancel","params":{"taskId":"task-1"}}`)
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"cancel-terminal"`) || !strings.Contains(got, `"code":-32602`) {
+		t.Fatalf("terminal task cancel = %s", got)
+	}
+	assertNoLine(t, childInput, 100*time.Millisecond)
+	harness.send(t, `{"jsonrpc":"2.0","id":"task-result","method":"tasks/result","params":{"taskId":"task-1"}}`)
+	if got := nextLine(t, childInput); !strings.Contains(got, `"method":"tasks/result"`) {
+		t.Fatalf("task result request = %s", got)
+	}
+	if err := child.write(`{"jsonrpc":"2.0","id":"task-result","result":{"content":[]}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"task-result"`) || !strings.Contains(got, `"result"`) {
+		t.Fatalf("task result = %s", got)
+	}
 
 	harness.closeAndWait(t)
 }
@@ -994,17 +1011,46 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 	if err := child.write(`{"jsonrpc":"2.0","id":8,"method":"tasks/get","params":{"taskId":"child-task"}}`); err != nil {
 		t.Fatal(err)
 	}
-	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"method":"tasks/get"`) {
-		t.Fatalf("child task request = %s", got)
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":8`) || !strings.Contains(got, `"method":"tasks/get"`) {
+		t.Fatalf("child stale task request = %s", got)
 	}
-	harness.send(t, `{"jsonrpc":"2.0","id":8,"result":{"taskId":"child-task","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
-	_ = nextLine(t, childInput)
+	if err := child.write(`{"jsonrpc":"2.0","id":9,"method":"tasks/get","params":{"taskId":"child-task"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":9`) || !strings.Contains(got, `"method":"tasks/get"`) {
+		t.Fatalf("child terminal task request = %s", got)
+	}
 	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"child-task","status":"completed"}}`)
 	if got := nextLine(t, childInput); !strings.Contains(got, `"status":"completed"`) {
 		t.Fatalf("host task status = %s", got)
 	}
 	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"child-progress","progress":3}}`)
 	assertNoLine(t, childInput, 100*time.Millisecond)
+	harness.send(t, `{"jsonrpc":"2.0","id":8,"result":{"taskId":"child-task","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if got := nextLine(t, childInput); !strings.Contains(got, `"id":8`) || !strings.Contains(got, `"code":-32602`) || strings.Contains(got, `"result"`) {
+		t.Fatalf("nonterminal response after terminal status = %s", got)
+	}
+	harness.send(t, `{"jsonrpc":"2.0","id":9,"result":{"taskId":"child-task","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+	if got := nextLine(t, childInput); !strings.Contains(got, `"id":9`) || !strings.Contains(got, `"status":"completed"`) {
+		t.Fatalf("terminal response after task status = %s", got)
+	}
+	if err := child.write(`{"jsonrpc":"2.0","id":10,"method":"tasks/cancel","params":{"taskId":"child-task"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, childInput); !strings.Contains(got, `"id":10`) || !strings.Contains(got, `"code":-32602`) {
+		t.Fatalf("child terminal task cancel = %s", got)
+	}
+	assertNoLine(t, harness.hostOutput, 100*time.Millisecond)
+	if err := child.write(`{"jsonrpc":"2.0","id":11,"method":"tasks/result","params":{"taskId":"child-task"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":11`) || !strings.Contains(got, `"method":"tasks/result"`) {
+		t.Fatalf("child task result request = %s", got)
+	}
+	harness.send(t, `{"jsonrpc":"2.0","id":11,"result":{"content":[]}}`)
+	if got := nextLine(t, childInput); !strings.Contains(got, `"id":11`) || !strings.Contains(got, `"result"`) {
+		t.Fatalf("child task result = %s", got)
+	}
 
 	if err := child.write(`{"jsonrpc":"2.0","id":"cancel-child","method":"roots/list"}`); err != nil {
 		t.Fatal(err)
@@ -1018,6 +1064,85 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 	}
 	harness.send(t, `{"jsonrpc":"2.0","id":"cancel-child","result":{"roots":[]}}`)
 	assertNoLine(t, childInput, 100*time.Millisecond)
+	harness.closeAndWait(t)
+}
+
+func TestRunHostTaskNonterminalAfterTerminalIsNotForwarded(t *testing.T) {
+	first := newTestChild()
+	second := newTestChild()
+	firstInput := streamLines(first.inputReader)
+	secondInput := streamLines(second.inputReader)
+	protocolFailure := make(chan struct{}, 1)
+	var startMu sync.Mutex
+	starts := 0
+	harness := startHarness(t, Config{
+		Resolve: func(context.Context) (EngineRef, error) { return EngineRef{ID: "engine"}, nil },
+		Start: func(context.Context, EngineRef) (StartResult, error) {
+			startMu.Lock()
+			defer startMu.Unlock()
+			starts++
+			if starts == 1 {
+				return StartResult{Child: first, Actual: EngineRef{ID: "engine"}}, nil
+			}
+			return StartResult{Child: second, Actual: EngineRef{ID: "engine"}}, nil
+		},
+		RetryDelay: 10 * time.Millisecond,
+		Observe: func(event Event) {
+			if event.State == StateFinalizing && event.Reason == ReasonProtocolFailure {
+				select {
+				case protocolFailure <- struct{}{}:
+				default:
+				}
+			}
+		},
+	})
+
+	harness.send(t, `{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}`)
+	_ = nextLine(t, firstInput)
+	initializeResponse := `{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{"tasks":{"requests":{"tools":{"call":{}}}}},"serverInfo":{"name":"engine","version":"1"}}}`
+	if err := first.write(initializeResponse); err != nil {
+		t.Fatal(err)
+	}
+	_ = nextLine(t, harness.hostOutput)
+	harness.send(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	_ = nextLine(t, firstInput)
+	harness.send(t, `{"jsonrpc":"2.0","id":"create","method":"tools/call","params":{"task":{},"name":"task","arguments":{}}}`)
+	_ = nextLine(t, firstInput)
+	if err := first.write(`{"jsonrpc":"2.0","id":"create","result":{"task":{"taskId":"task-1","status":"working"}}}`); err != nil {
+		t.Fatal(err)
+	}
+	_ = nextLine(t, harness.hostOutput)
+	harness.send(t, `{"jsonrpc":"2.0","id":"get","method":"tasks/get","params":{"taskId":"task-1"}}`)
+	_ = nextLine(t, firstInput)
+	if err := first.write(`{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"task-1","status":"completed"}}`); err != nil {
+		t.Fatal(err)
+	}
+	_ = nextLine(t, harness.hostOutput)
+	if err := first.write(`{"jsonrpc":"2.0","id":"get","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-protocolFailure:
+	case <-time.After(3 * time.Second):
+		t.Fatal("nonterminal response after terminal status did not fail the child")
+	}
+	if got := nextLine(t, harness.hostOutput); !strings.Contains(got, `"id":"get"`) || !strings.Contains(got, `"error"`) || strings.Contains(got, `"status":"working"`) {
+		t.Fatalf("nonterminal task response was raw-forwarded: %s", got)
+	}
+	select {
+	case <-first.stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("invalid task response child was not finalized")
+	}
+	if got := nextLine(t, secondInput); !strings.Contains(got, `"method":"initialize"`) {
+		t.Fatalf("replacement initialize = %s", got)
+	}
+	if err := second.write(initializeResponse); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextLine(t, secondInput); !strings.Contains(got, "notifications/initialized") {
+		t.Fatalf("replacement initialized = %s", got)
+	}
 	harness.closeAndWait(t)
 }
 

@@ -49,11 +49,20 @@ type taskRecord struct {
 	status        string
 }
 
+type currentTaskState uint8
+
+const (
+	currentTaskActive currentTaskState = iota + 1
+	currentTaskTerminal
+	currentTaskFinalized
+)
+
 const (
 	tombstoneLimit           = 1024
 	persistentFenceLimit     = 1024
 	activeCorrelationLimit   = 256
 	retainedCorrelationLimit = tombstoneLimit + activeCorrelationLimit
+	terminalTaskLimit        = retainedCorrelationLimit - activeCorrelationLimit
 	maxCorrelationValueBytes = 16 * 1024
 )
 
@@ -179,6 +188,7 @@ type directionRegistry struct {
 	requests         map[scalarKey]*requestRecord
 	tokens           map[scalarKey]*tokenRecord
 	tasks            map[string]*taskRecord
+	terminalTasks    map[string]*taskRecord
 	tombstones       tombstoneSet
 	persistentFences persistentFence
 	retiredRequests  map[scalarKey]*requestRecord
@@ -191,10 +201,23 @@ func newDirectionRegistry() directionRegistry {
 		requests:        make(map[scalarKey]*requestRecord),
 		tokens:          make(map[scalarKey]*tokenRecord),
 		tasks:           make(map[string]*taskRecord),
+		terminalTasks:   make(map[string]*taskRecord),
 		retiredRequests: make(map[scalarKey]*requestRecord),
 		retiredTokens:   make(map[scalarKey]struct{}),
 		retiredTasks:    make(map[string]*taskRecord),
 	}
+}
+
+func (registry *directionRegistry) hasTaskLifecycle() bool {
+	if len(registry.tasks) > 0 || len(registry.terminalTasks) > 0 {
+		return true
+	}
+	for _, record := range registry.requests {
+		if record.taskAugmented {
+			return true
+		}
+	}
+	return false
 }
 
 func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
@@ -210,7 +233,11 @@ func (registry *directionRegistry) canRegister(frame *parsedFrame) error {
 	if _, exists := registry.requests[frame.id.key]; exists {
 		return fmt.Errorf("duplicate active request id")
 	}
-	if len(registry.requests)+len(registry.tasks) >= activeCorrelationLimit {
+	activeLimit := activeCorrelationLimit
+	if frame.taskOperation == "" && (frame.taskAugmented || registry.hasTaskLifecycle()) {
+		activeLimit--
+	}
+	if len(registry.requests)+len(registry.tasks) >= activeLimit {
 		return fmt.Errorf("active correlation limit reached")
 	}
 	if len(registry.requests)+len(registry.retiredRequests) >= retainedCorrelationLimit {
@@ -260,6 +287,9 @@ func (registry *directionRegistry) canBindTask(taskID string) error {
 	if _, exists := registry.tasks[taskID]; exists {
 		return fmt.Errorf("taskId belongs to an active task")
 	}
+	if _, exists := registry.terminalTasks[taskID]; exists {
+		return fmt.Errorf("taskId belongs to a terminal task")
+	}
 	if _, exists := registry.retiredTasks[taskID]; exists {
 		return fmt.Errorf("taskId belongs to a retired generation")
 	}
@@ -273,9 +303,47 @@ func (registry *directionRegistry) canBindTask(taskID string) error {
 	return nil
 }
 
+func (registry *directionRegistry) currentTaskForOperation(record *requestRecord) (*taskRecord, currentTaskState, error) {
+	taskKey := taskTombstoneKey(record.taskID)
+	active := registry.tasks[record.taskID]
+	terminal := registry.terminalTasks[record.taskID]
+	_, retired := registry.retiredTasks[record.taskID]
+	fenced := registry.persistentFences.contains(tombstoneTask, taskKey)
+	transitioned := registry.tombstones.contains(tombstoneTask, taskKey)
+	if active != nil {
+		if active.generation != record.generation || terminal != nil || retired || fenced || transitioned {
+			return nil, 0, fmt.Errorf("task operation has ambiguous active taskId state")
+		}
+		return active, currentTaskActive, nil
+	}
+	if terminal != nil {
+		if terminal.generation != record.generation || retired || fenced || transitioned {
+			return nil, 0, fmt.Errorf("task operation has ambiguous terminal taskId state")
+		}
+		return terminal, currentTaskTerminal, nil
+	}
+	if retired || transitioned {
+		return nil, 0, fmt.Errorf("task operation collides with retired taskId state")
+	}
+	if fenced {
+		return nil, currentTaskFinalized, nil
+	}
+	return nil, 0, fmt.Errorf("unknown taskId")
+}
+
 func (registry *directionRegistry) canComplete(record *requestRecord, response *parsedFrame) error {
-	if _, handled, err := taskOperationResponse(record, response); handled {
-		return err
+	if meta, handled, err := taskOperationResponse(record, response); handled {
+		if err != nil {
+			return err
+		}
+		_, state, stateErr := registry.currentTaskForOperation(record)
+		if stateErr != nil {
+			return stateErr
+		}
+		if meta != nil && (meta.status == "working" || meta.status == "input_required") && state != currentTaskActive {
+			return fmt.Errorf("nonterminal task operation response follows terminal task status")
+		}
+		return nil
 	}
 	if !record.taskAugmented || response.kind == frameError {
 		return nil
@@ -317,19 +385,23 @@ func (registry *directionRegistry) complete(record *requestRecord, response *par
 	if err := registry.fenceRequest(record, !bindTask); err != nil {
 		return err
 	}
-	if operation && operationMeta != nil && operationMeta.status != "working" && operationMeta.status != "input_required" {
-		if _, err := registry.retireTask(operationMeta.id, record.generation); err != nil {
+	if operation && operationMeta != nil {
+		var handled bool
+		if record.method == "tasks/result" {
+			handled, err = registry.finalizeTask(record.taskID, record.generation)
+		} else {
+			handled, err = registry.updateTask(operationMeta, record.generation)
+		}
+		if err != nil {
 			return err
+		}
+		if !handled {
+			return fmt.Errorf("unknown taskId")
 		}
 	}
 
 	delete(registry.requests, record.id.key)
 	if operation {
-		if operationMeta != nil && (operationMeta.status == "working" || operationMeta.status == "input_required") {
-			if task := registry.tasks[operationMeta.id]; task != nil && task.generation == record.generation {
-				task.status = operationMeta.status
-			}
-		}
 		registry.removeToken(record)
 		return nil
 	}
@@ -378,20 +450,74 @@ func (registry *directionRegistry) removeToken(record *requestRecord) {
 }
 
 func (registry *directionRegistry) updateTask(meta *taskMeta, generation uint64) (bool, error) {
-	task := registry.tasks[meta.id]
-	if task == nil || task.generation != generation {
-		return false, nil
+	active := registry.tasks[meta.id]
+	terminal := registry.terminalTasks[meta.id]
+	if active != nil && terminal != nil {
+		return true, fmt.Errorf("taskId belongs to active and terminal tasks")
 	}
-	if meta.status == "working" || meta.status == "input_required" {
-		task.status = meta.status
+	if active != nil {
+		if active.generation != generation {
+			return false, nil
+		}
+		if meta.status == "working" || meta.status == "input_required" {
+			active.status = meta.status
+			return true, nil
+		}
+		if len(registry.terminalTasks) >= terminalTaskLimit {
+			return true, fmt.Errorf("terminal task retention limit reached")
+		}
+		if active.progressToken != nil {
+			if err := registry.persistentFences.add(tombstoneToken, *active.progressToken); err != nil {
+				return true, err
+			}
+		}
+		delete(registry.tasks, meta.id)
+		if active.progressToken != nil {
+			delete(registry.tokens, *active.progressToken)
+		}
+		active.status = meta.status
+		registry.terminalTasks[meta.id] = active
 		return true, nil
 	}
-	return registry.retireTask(meta.id, generation)
+	if terminal != nil {
+		if terminal.generation != generation {
+			return false, nil
+		}
+		if meta.status == "working" || meta.status == "input_required" {
+			return true, fmt.Errorf("nonterminal task status follows terminal task status")
+		}
+		terminal.status = meta.status
+		return true, nil
+	}
+	if registry.persistentFences.contains(tombstoneTask, taskTombstoneKey(meta.id)) {
+		if meta.status == "working" || meta.status == "input_required" {
+			return true, fmt.Errorf("nonterminal task status follows finalized task")
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
-func (registry *directionRegistry) retireTask(taskID string, generation uint64) (bool, error) {
-	task := registry.tasks[taskID]
-	if task == nil || task.generation != generation {
+func (registry *directionRegistry) finalizeTask(taskID string, generation uint64) (bool, error) {
+	active := registry.tasks[taskID]
+	terminal := registry.terminalTasks[taskID]
+	if active != nil && terminal != nil {
+		return true, fmt.Errorf("taskId belongs to active and terminal tasks")
+	}
+	if _, retired := registry.retiredTasks[taskID]; retired {
+		return true, fmt.Errorf("taskId belongs to current and retired task state")
+	}
+	task := active
+	if task == nil {
+		task = terminal
+	}
+	if task == nil {
+		if registry.persistentFences.contains(tombstoneTask, taskTombstoneKey(taskID)) {
+			return true, nil
+		}
+		return false, nil
+	}
+	if task.generation != generation {
 		return false, nil
 	}
 	entries := []tombstoneKey{{role: tombstoneTask, key: taskTombstoneKey(taskID)}}
@@ -402,6 +528,7 @@ func (registry *directionRegistry) retireTask(taskID string, generation uint64) 
 		return true, err
 	}
 	delete(registry.tasks, taskID)
+	delete(registry.terminalTasks, taskID)
 	if task.progressToken != nil {
 		delete(registry.tokens, *task.progressToken)
 	}
@@ -431,6 +558,9 @@ func (registry *directionRegistry) retireGenerationChecked(generation uint64) ([
 	if len(registry.tasks)+len(registry.retiredTasks) > retainedCorrelationLimit {
 		return nil, fmt.Errorf("task correlation retention limit exceeded")
 	}
+	if len(registry.terminalTasks) > terminalTaskLimit {
+		return nil, fmt.Errorf("terminal task retention limit exceeded")
+	}
 
 	entries := make([]tombstoneKey, 0)
 	for _, record := range registry.requests {
@@ -448,8 +578,29 @@ func (registry *directionRegistry) retireGenerationChecked(generation uint64) ([
 		if _, exists := registry.retiredTasks[id]; exists {
 			return nil, fmt.Errorf("taskId belongs to active and retired generations")
 		}
+		if _, exists := registry.terminalTasks[id]; exists {
+			return nil, fmt.Errorf("taskId belongs to active and terminal tasks")
+		}
 		if task.requestID.kind != 0 {
 			entries = append(entries, tombstoneKey{role: tombstoneRequest, key: task.requestID})
+		}
+	}
+	for id, task := range registry.terminalTasks {
+		if task.generation != generation {
+			continue
+		}
+		if _, exists := registry.tasks[id]; exists {
+			return nil, fmt.Errorf("taskId belongs to active and terminal tasks")
+		}
+		if _, exists := registry.retiredTasks[id]; exists {
+			return nil, fmt.Errorf("taskId belongs to terminal and retired tasks")
+		}
+		if registry.tombstones.contains(tombstoneTask, taskTombstoneKey(id)) || registry.persistentFences.contains(tombstoneTask, taskTombstoneKey(id)) {
+			return nil, fmt.Errorf("terminal taskId is already fenced")
+		}
+		entries = append(entries, tombstoneKey{role: tombstoneTask, key: taskTombstoneKey(id)})
+		if task.progressToken != nil {
+			entries = append(entries, tombstoneKey{role: tombstoneToken, key: *task.progressToken})
 		}
 	}
 	if err := registry.persistentFences.addMany(entries...); err != nil {
@@ -475,6 +626,11 @@ func (registry *directionRegistry) retireGenerationChecked(generation uint64) ([
 		if task.progressToken != nil {
 			delete(registry.tokens, *task.progressToken)
 			registry.retiredTokens[*task.progressToken] = struct{}{}
+		}
+	}
+	for id, task := range registry.terminalTasks {
+		if task.generation == generation {
+			delete(registry.terminalTasks, id)
 		}
 	}
 	sort.Slice(lost, func(i, j int) bool {
@@ -603,10 +759,11 @@ func (registry *directionRegistry) retiredTaskForOperation(record *requestRecord
 	taskKey := taskTombstoneKey(record.taskID)
 	retired := registry.retiredTasks[record.taskID]
 	_, active := registry.tasks[record.taskID]
+	_, terminal := registry.terminalTasks[record.taskID]
 	fenced := registry.persistentFences.contains(tombstoneTask, taskKey)
 	transitioned := registry.tombstones.contains(tombstoneTask, taskKey)
 	if retired == nil {
-		if active || transitioned {
+		if active || terminal || transitioned {
 			return nil, false, fmt.Errorf("retired task operation collides with current taskId state")
 		}
 		if fenced {
@@ -614,7 +771,7 @@ func (registry *directionRegistry) retiredTaskForOperation(record *requestRecord
 		}
 		return nil, false, fmt.Errorf("retired task operation references unknown taskId")
 	}
-	if active || fenced || transitioned {
+	if active || terminal || fenced || transitioned {
 		return nil, false, fmt.Errorf("retired task operation has ambiguous taskId state")
 	}
 	return retired, false, nil
@@ -658,10 +815,16 @@ func (registry *directionRegistry) consumeRetiredTaskStatus(meta *taskMeta) (boo
 		if _, exists := registry.tasks[meta.id]; exists {
 			return true, fmt.Errorf("taskId belongs to an active task and a persistent fence")
 		}
+		if _, exists := registry.terminalTasks[meta.id]; exists {
+			return true, fmt.Errorf("taskId belongs to a terminal task and a persistent fence")
+		}
 		return true, nil
 	}
 	if _, exists := registry.tasks[meta.id]; exists {
 		return true, fmt.Errorf("taskId belongs to active and retired generations")
+	}
+	if _, exists := registry.terminalTasks[meta.id]; exists {
+		return true, fmt.Errorf("taskId belongs to terminal and retired generations")
 	}
 	if registry.tombstones.contains(tombstoneTask, taskKey) || registry.persistentFences.contains(tombstoneTask, taskKey) {
 		return true, fmt.Errorf("retired taskId is also fenced")

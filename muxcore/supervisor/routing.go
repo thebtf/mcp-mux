@@ -5,6 +5,8 @@ import (
 	"fmt"
 )
 
+var errTerminalTaskCancel = errors.New("task is already terminal")
+
 func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	if runner.terminal {
 		return
@@ -86,6 +88,24 @@ func invalidFrameResponse(err error) (int, string) {
 		return -32700, "parse error"
 	}
 	return codeInvalidRequest, "invalid JSON-RPC frame"
+}
+
+func validateTaskOperation(registry *directionRegistry, frame *parsedFrame, generation uint64) error {
+	active := registry.tasks[frame.taskID]
+	terminal := registry.terminalTasks[frame.taskID]
+	if active != nil && terminal != nil {
+		return fmt.Errorf("taskId belongs to active and terminal tasks")
+	}
+	if active != nil && active.generation == generation {
+		return nil
+	}
+	if terminal != nil && terminal.generation == generation {
+		if frame.taskOperation == "tasks/cancel" {
+			return errTerminalTaskCancel
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown taskId")
 }
 
 func isInitializationPing(frame *parsedFrame) bool {
@@ -225,6 +245,14 @@ func (runner *runner) validateHostRequest(frame *parsedFrame) error {
 	if frame.utilityErr != nil {
 		return fmt.Errorf("invalid request metadata")
 	}
+	if frame.taskOperation != "" {
+		if runner.current == nil {
+			return fmt.Errorf("unknown taskId")
+		}
+		if err := validateTaskOperation(&runner.host, frame, runner.current.id); err != nil {
+			return err
+		}
+	}
 	if err := runner.host.canRegister(frame); err != nil {
 		return err
 	}
@@ -239,12 +267,6 @@ func (runner *runner) validateHostRequest(frame *parsedFrame) error {
 	if frame.progressToken != nil && runner.pending.containsProgressToken(frame.progressToken.key) {
 		return fmt.Errorf("duplicate pending progress token")
 	}
-	if frame.taskOperation != "" {
-		task := runner.host.tasks[frame.taskID]
-		if task == nil || runner.current == nil || task.generation != runner.current.id {
-			return fmt.Errorf("unknown taskId")
-		}
-	}
 	return nil
 }
 
@@ -257,7 +279,11 @@ func (runner *runner) deliverHostFirst(item *pendingFrame) {
 	}
 	if frame.kind == frameRequest {
 		if err := runner.validateHostRequest(frame); err != nil {
-			runner.rejectHostRequest(frame, codeInvalidRequest, err.Error())
+			code := codeInvalidRequest
+			if errors.Is(err, errTerminalTaskCancel) {
+				code = codeInvalidParams
+			}
+			runner.rejectHostRequest(frame, code, err.Error())
 			return
 		}
 	}
@@ -489,16 +515,15 @@ func (runner *runner) handleChildRequest(frame *parsedFrame) {
 		runner.rejectChildRequest(frame, codeInvalidParams, "invalid request metadata")
 		return
 	}
+	if frame.taskOperation != "" {
+		if err := validateTaskOperation(&runner.child, frame, runner.current.id); err != nil {
+			runner.rejectChildRequest(frame, codeInvalidParams, err.Error())
+			return
+		}
+	}
 	if err := runner.child.canRegister(frame); err != nil {
 		runner.replaceCurrent(ReasonProtocolFailure)
 		return
-	}
-	if frame.taskOperation != "" {
-		task := runner.child.tasks[frame.taskID]
-		if task == nil || task.generation != runner.current.id {
-			runner.rejectChildRequest(frame, codeInvalidParams, "unknown taskId")
-			return
-		}
 	}
 	if err := runner.writeHost(frame.raw); err != nil {
 		runner.terminate(ReasonHostOutputFailure, err)
@@ -631,7 +656,7 @@ func (runner *runner) safeToCommitDormant(_ uint64) bool {
 }
 
 func registryIdle(registry *directionRegistry) bool {
-	return len(registry.requests) == 0 && len(registry.tokens) == 0 && len(registry.tasks) == 0
+	return len(registry.requests) == 0 && len(registry.tokens) == 0 && len(registry.tasks) == 0 && len(registry.terminalTasks) == 0
 }
 
 func (runner *runner) rejectHostRequest(frame *parsedFrame, code int, message string) {
