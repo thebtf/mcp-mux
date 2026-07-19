@@ -24,12 +24,22 @@ func (runner *runner) replaceCurrent(reason Reason) {
 	runner.resolving = false
 	runner.resolveID++
 	runner.setState(StateFinalizing, reason)
-	runner.commitQuiescingCancellations()
+	if err := runner.commitQuiescingCancellations(); err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
 	runner.pending.discardSameGenerationOnly()
 
 	generation := runner.current.id
-	lost := runner.host.retireGeneration(generation)
-	runner.child.retireGeneration(generation)
+	lost, err := runner.host.retireGenerationChecked(generation)
+	if err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
+	if _, err := runner.child.retireGenerationChecked(generation); err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
 	for _, record := range lost {
 		if err := runner.writeHost(localErrorFrame(record.id.raw, codeInternal, lostRequestMessage)); err != nil {
 			runner.terminate(ReasonHostOutputFailure, err)
@@ -191,8 +201,15 @@ func (runner *runner) maybeCompleteDormancy() {
 	runner.stopTimer(&runner.dormantExitTimer)
 	runner.setState(StateFinalizing, ReasonDormantCommit)
 	generationID := generation.id
-	lost := runner.host.retireGeneration(generationID)
-	runner.child.retireGeneration(generationID)
+	lost, err := runner.host.retireGenerationChecked(generationID)
+	if err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
+	if _, err := runner.child.retireGenerationChecked(generationID); err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
 	for _, record := range lost {
 		if err := runner.writeHost(localErrorFrame(record.id.raw, codeInternal, lostRequestMessage)); err != nil {
 			runner.terminate(ReasonHostOutputFailure, err)

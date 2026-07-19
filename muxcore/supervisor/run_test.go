@@ -209,8 +209,10 @@ func nextLine(t *testing.T, stream lineStream) string {
 func assertNoLine(t *testing.T, stream lineStream, duration time.Duration) {
 	t.Helper()
 	select {
-	case line := <-stream.lines:
-		t.Fatalf("unexpected line: %s", line)
+	case line, ok := <-stream.lines:
+		if ok {
+			t.Fatalf("unexpected line: %s", line)
+		}
 	case err := <-stream.errs:
 		if !errors.Is(err, io.EOF) {
 			t.Fatalf("line stream failed: %v", err)
@@ -1019,14 +1021,15 @@ func TestRunChildOriginatedCorrelationIsDirectionSafe(t *testing.T) {
 	harness.closeAndWait(t)
 }
 
-func TestRunLateRetiredTaskResultCollisionFailsClosed(t *testing.T) {
+func TestRunLateRetiredTaskResultCollisionTerminatesSession(t *testing.T) {
 	first := newTestChild()
 	second := newTestChild()
 	third := newTestChild()
 	firstInput := streamLines(first.inputReader)
 	secondInput := streamLines(second.inputReader)
 	thirdInput := streamLines(third.inputReader)
-	protocolFailure := make(chan struct{}, 1)
+	terminalProtocolFailure := make(chan struct{}, 1)
+	unexpectedThirdStart := make(chan struct{}, 1)
 	var startMu sync.Mutex
 	startCount := 0
 	harness := startHarness(t, Config{
@@ -1040,17 +1043,19 @@ func TestRunLateRetiredTaskResultCollisionFailsClosed(t *testing.T) {
 				return StartResult{Child: first, Actual: EngineRef{ID: "engine"}}, nil
 			case 2:
 				return StartResult{Child: second, Actual: EngineRef{ID: "engine"}}, nil
-			case 3:
-				return StartResult{Child: third, Actual: EngineRef{ID: "engine"}}, nil
 			default:
-				return StartResult{}, errors.New("unexpected extra start")
+				select {
+				case unexpectedThirdStart <- struct{}{}:
+				default:
+				}
+				return StartResult{Child: third, Actual: EngineRef{ID: "engine"}}, nil
 			}
 		},
 		RetryDelay: 10 * time.Millisecond,
 		Observe: func(event Event) {
-			if event.State == StateFinalizing && event.Reason == ReasonProtocolFailure {
+			if event.State == StateTerminal && event.Reason == ReasonProtocolFailure {
 				select {
-				case protocolFailure <- struct{}{}:
+				case terminalProtocolFailure <- struct{}{}:
 				default:
 				}
 			}
@@ -1095,27 +1100,47 @@ func TestRunLateRetiredTaskResultCollisionFailsClosed(t *testing.T) {
 		t.Fatalf("new task response = %s", got)
 	}
 
-	harness.send(t, `{"jsonrpc":"2.0","id":"old","result":{"task":{"taskId":"collision","status":"working"}}}`)
+	lateTraffic := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":"old","result":{"task":{"taskId":"collision","status":"working"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"collision","status":"completed"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"new-token","progress":1}}`,
+	}, "\n") + "\n"
+	if _, err := io.WriteString(harness.hostInput, lateTraffic); err != nil {
+		t.Fatal(err)
+	}
+
 	select {
-	case <-protocolFailure:
+	case err := <-harness.done:
+		if err == nil {
+			t.Fatal("collision terminated Run without a protocol error")
+		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("late task ID collision did not finalize with ReasonProtocolFailure")
+		t.Fatal("late task collision did not terminate Run")
+	}
+	select {
+	case <-terminalProtocolFailure:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not terminate with ReasonProtocolFailure")
 	}
 	select {
 	case <-second.stopped:
-	case <-time.After(3 * time.Second):
-		t.Fatal("late task ID collision did not finalize the replacement generation")
+	case <-time.After(time.Second):
+		t.Fatal("terminal collision did not finalize the current child")
 	}
-	if got := nextLine(t, thirdInput); !strings.Contains(got, `"method":"initialize"`) {
-		t.Fatalf("third replay initialize = %s", got)
+	startMu.Lock()
+	gotStarts := startCount
+	startMu.Unlock()
+	if gotStarts != 2 {
+		t.Fatalf("starts = %d, want exactly 2", gotStarts)
 	}
-	if err := third.write(`{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"third","version":"1"}}}`); err != nil {
-		t.Fatal(err)
+	select {
+	case <-unexpectedThirdStart:
+		t.Fatal("terminal collision started a third generation")
+	default:
 	}
-	if got := nextLine(t, thirdInput); !strings.Contains(got, "notifications/initialized") {
-		t.Fatalf("third initialized notification = %s", got)
-	}
-	harness.closeAndWait(t)
+	assertNoLine(t, secondInput, 100*time.Millisecond)
+	assertNoLine(t, thirdInput, 100*time.Millisecond)
+	_ = harness.hostInput.Close()
 }
 
 func TestRunPendingCancellationAndQueueOverflow(t *testing.T) {

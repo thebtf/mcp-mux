@@ -35,7 +35,7 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	if isResponse(frame) && frame.id != nil {
 		handled, err := runner.child.consumeRetiredResponse(frame)
 		if err != nil {
-			runner.replaceCurrent(ReasonProtocolFailure)
+			runner.terminate(ReasonProtocolFailure, err)
 			return
 		}
 		if handled {
@@ -45,7 +45,7 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 	if frame.method == "notifications/tasks/status" && frame.taskStatus != nil {
 		handled, err := runner.child.consumeRetiredTaskStatus(frame.taskStatus)
 		if err != nil {
-			runner.replaceCurrent(ReasonProtocolFailure)
+			runner.terminate(ReasonProtocolFailure, err)
 			return
 		}
 		if handled {
@@ -294,7 +294,10 @@ func (runner *runner) handleHostResponse(frame *parsedFrame) {
 		return
 	}
 	if err := runner.child.canComplete(record, frame); err != nil {
-		runner.child.cancel(record)
+		if cancelErr := runner.child.cancel(record); cancelErr != nil {
+			runner.terminate(ReasonProtocolFailure, cancelErr)
+			return
+		}
 		outcome, writeErr := runner.writeChild(localErrorFrame(frame.id.raw, codeInvalidParams, err.Error()))
 		if outcome != writeDelivered || writeErr != nil {
 			runner.replaceCurrent(ReasonWriteFailure)
@@ -303,7 +306,10 @@ func (runner *runner) handleHostResponse(frame *parsedFrame) {
 	}
 	outcome, err := runner.writeChild(frame.raw)
 	if outcome != writeNotWritten {
-		runner.child.complete(record, frame)
+		if completeErr := runner.child.complete(record, frame); completeErr != nil {
+			runner.terminate(ReasonProtocolFailure, completeErr)
+			return
+		}
 	}
 	if outcome != writeDelivered || err != nil {
 		runner.replaceCurrent(ReasonWriteFailure)
@@ -330,7 +336,10 @@ func (runner *runner) handleHostCancellation(item *pendingFrame) {
 	if runner.state != StateActive {
 		return
 	}
-	runner.host.cancel(record)
+	if err := runner.host.cancel(record); err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
 	outcome, err := runner.writeChild(frame.raw)
 	if outcome != writeDelivered || err != nil {
 		runner.replaceCurrent(ReasonWriteFailure)
@@ -354,7 +363,12 @@ func (runner *runner) handleHostTaskStatus(frame *parsedFrame) {
 	if frame.utilityErr != nil || frame.taskStatus == nil || runner.current == nil {
 		return
 	}
-	if !runner.child.updateTask(frame.taskStatus, runner.current.id) {
+	handled, err := runner.child.updateTask(frame.taskStatus, runner.current.id)
+	if err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
+	if !handled {
 		return
 	}
 	outcome, err := runner.writeChild(frame.raw)
@@ -392,7 +406,10 @@ func (runner *runner) handleChildFrame(frame *parsedFrame) {
 		}
 		if isResponse(frame) && frame.id != nil {
 			if record := runner.host.requests[frame.id.key]; record != nil && record.generation == runner.current.id {
-				runner.host.complete(record, frame)
+				if err := runner.host.complete(record, frame); err != nil {
+					runner.terminate(ReasonProtocolFailure, err)
+					return
+				}
 			}
 		}
 		runner.dormancyInvalid = true
@@ -455,7 +472,9 @@ func (runner *runner) handleChildResponse(frame *parsedFrame) {
 		runner.terminate(ReasonHostOutputFailure, err)
 		return
 	}
-	runner.host.complete(record, frame)
+	if err := runner.host.complete(record, frame); err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+	}
 }
 
 func (runner *runner) handleChildRequest(frame *parsedFrame) {
@@ -519,7 +538,12 @@ func (runner *runner) handleChildTaskStatus(frame *parsedFrame) {
 	if frame.utilityErr != nil || frame.taskStatus == nil || runner.current == nil {
 		return
 	}
-	if !runner.host.updateTask(frame.taskStatus, runner.current.id) {
+	handled, err := runner.host.updateTask(frame.taskStatus, runner.current.id)
+	if err != nil {
+		runner.terminate(ReasonProtocolFailure, err)
+		return
+	}
+	if !handled {
 		return
 	}
 	if err := runner.writeHost(frame.raw); err != nil {
@@ -527,9 +551,9 @@ func (runner *runner) handleChildTaskStatus(frame *parsedFrame) {
 	}
 }
 
-func (runner *runner) commitQuiescingCancellations() {
+func (runner *runner) commitQuiescingCancellations() error {
 	if runner.current == nil {
-		return
+		return nil
 	}
 	for _, item := range runner.pending.items {
 		if !item.sameGenerationOnly || item.frame.cancellation == nil {
@@ -539,8 +563,11 @@ func (runner *runner) commitQuiescingCancellations() {
 		if record == nil || record.generation != runner.current.id || record.initialize || record.taskAugmented {
 			continue
 		}
-		runner.host.cancel(record)
+		if err := runner.host.cancel(record); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (runner *runner) handleChildControl(frame *parsedFrame) {
@@ -586,7 +613,10 @@ func (runner *runner) handleChildControl(frame *parsedFrame) {
 			return
 		}
 		runner.stopTimer(&runner.childExitDrainTimer)
-		runner.commitQuiescingCancellations()
+		if err := runner.commitQuiescingCancellations(); err != nil {
+			runner.terminate(ReasonProtocolFailure, err)
+			return
+		}
 		runner.pending.discardSameGenerationOnly()
 		runner.setState(StateAwaitingDormantExit, ReasonDormantCommit)
 		runner.dormantExitTimer = runner.cfg.runtimeClock.NewTimer(runner.cfg.DormantExitTimeout)

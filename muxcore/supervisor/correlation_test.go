@@ -25,6 +25,25 @@ func seedRetiredTaskRequest(t *testing.T, registry *directionRegistry, requestID
 	return request
 }
 
+func seedRetiredTaskOperation(t *testing.T, method string) *directionRegistry {
+	t.Helper()
+	registry := newDirectionRegistry()
+	request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","method":"tools/call","params":{"_meta":{"progressToken":"task-token"},"task":{}}}`)
+	record := registry.register(request, 1)
+	response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","result":{"task":{"taskId":"task-1","status":"working"}}}`)
+	if err := registry.canComplete(record, response); err != nil {
+		t.Fatal(err)
+	}
+	registry.complete(record, response)
+	operation := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"operation","method":%q,"params":{"taskId":"task-1"}}`, method))
+	if err := registry.canRegister(operation); err != nil {
+		t.Fatal(err)
+	}
+	registry.register(operation, 1)
+	registry.retireGeneration(1)
+	return &registry
+}
+
 func TestCorrelationTombstonesPreventImmediateReuseAndStayBounded(t *testing.T) {
 	registry := newDirectionRegistry()
 	request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"same","method":"tools/list"}`)
@@ -76,6 +95,56 @@ func TestCorrelationActiveRequestsStayBounded(t *testing.T) {
 	overflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"overflow","method":"tools/list"}`)
 	if err := registry.canRegister(overflow); err == nil {
 		t.Fatal("active correlation limit accepted another request")
+	}
+}
+
+func TestCorrelationActiveRequestsAndTasksShareBudget(t *testing.T) {
+	registry := newDirectionRegistry()
+	for index := range activeCorrelationLimit - 1 {
+		request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"create-%d","method":"tools/call","params":{"task":{}}}`, index))
+		if err := registry.canRegister(request); err != nil {
+			t.Fatalf("register task request %d: %v", index, err)
+		}
+		record := registry.register(request, 1)
+		response := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"create-%d","result":{"task":{"taskId":"task-%d","status":"working"}}}`, index, index))
+		if err := registry.canComplete(record, response); err != nil {
+			t.Fatalf("complete task request %d: %v", index, err)
+		}
+		registry.complete(record, response)
+	}
+
+	last := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"last","method":"tools/call","params":{"task":{}}}`)
+	if err := registry.canRegister(last); err != nil {
+		t.Fatalf("register final active correlation: %v", err)
+	}
+	lastRecord := registry.register(last, 1)
+	overflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"overflow","method":"tools/list"}`)
+	if err := registry.canRegister(overflow); err == nil {
+		t.Fatal("256 combined active requests and tasks accepted another request")
+	}
+	lastResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"last","result":{"task":{"taskId":"task-last","status":"working"}}}`)
+	if err := registry.canComplete(lastRecord, lastResponse); err != nil {
+		t.Fatalf("request-to-task conversion consumed a second active slot: %v", err)
+	}
+	registry.complete(lastRecord, lastResponse)
+	if got := len(registry.requests) + len(registry.tasks); got != activeCorrelationLimit {
+		t.Fatalf("combined active correlations = %d, want %d", got, activeCorrelationLimit)
+	}
+}
+
+func TestSuccessorAcceptsWorkWithRetiredRequestTolerance(t *testing.T) {
+	registry := newDirectionRegistry()
+	for index := range activeCorrelationLimit {
+		request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"retired-%d","method":"tools/list"}`, index))
+		if err := registry.canRegister(request); err != nil {
+			t.Fatal(err)
+		}
+		registry.register(request, 1)
+	}
+	registry.retireGeneration(1)
+	successor := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"successor","method":"tools/list"}`)
+	if err := registry.canRegister(successor); err != nil {
+		t.Fatalf("successor request rejected with %d retired requests: %v", activeCorrelationLimit, err)
 	}
 }
 
@@ -143,6 +212,47 @@ func TestSuccessfulReplayPreservesOnlyRetiredChildRequestFence(t *testing.T) {
 	}
 	if err := runner.child.canRegister(tokenReuse); err != nil {
 		t.Fatalf("consumed retired response did not release the token at the next replay: %v", err)
+	}
+}
+
+func TestTerminalTaskFencesSurviveCrashReplay(t *testing.T) {
+	childInput := new(bufferWriteCloser)
+	runner := &runner{
+		state:             StateReplaying,
+		current:           &generation{id: 2, stdin: childInput},
+		child:             newDirectionRegistry(),
+		host:              newDirectionRegistry(),
+		initializeRequest: []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}`),
+		initialized:       []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`),
+	}
+	request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","method":"tools/call","params":{"_meta":{"progressToken":"task-token"},"task":{}}}`)
+	record := runner.child.register(request, 1)
+	response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"create","result":{"task":{"taskId":"task-1","status":"working"}}}`)
+	if err := runner.child.canComplete(record, response); err != nil {
+		t.Fatal(err)
+	}
+	runner.child.complete(record, response)
+	terminal := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"task-1","status":"completed"}}`)
+	handled, err := runner.child.updateTask(terminal.taskStatus, 1)
+	if err != nil || !handled {
+		t.Fatalf("terminal task status: handled=%v err=%v", handled, err)
+	}
+	runner.child.retireGeneration(1)
+	replay := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"replacement","version":"1"}}}`)
+	runner.completeReplay(replay)
+
+	if err := runner.child.canRegister(request); err == nil {
+		t.Fatal("terminal task request ID fence was cleared by replay")
+	}
+	tokenReuse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"token-reuse","method":"tools/list","params":{"_meta":{"progressToken":"task-token"}}}`)
+	if err := runner.child.canRegister(tokenReuse); err == nil {
+		t.Fatal("terminal task progress token fence was cleared by replay")
+	}
+	replacement := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"replacement","method":"tools/call","params":{"task":{}}}`)
+	replacementRecord := runner.child.register(replacement, 2)
+	reused := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"replacement","result":{"task":{"taskId":"task-1","status":"working"}}}`)
+	if err := runner.child.canComplete(replacementRecord, reused); err == nil {
+		t.Fatal("terminal task ID fence was cleared by replay")
 	}
 }
 
@@ -302,6 +412,99 @@ func TestTaskOperationResponseRejectsMismatchedTaskID(t *testing.T) {
 	}
 }
 
+func TestRetiredTaskOperationLateResponses(t *testing.T) {
+	t.Run("nonterminal get updates retired task", func(t *testing.T) {
+		registry := seedRetiredTaskOperation(t, "tasks/get")
+		response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"input_required","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`)
+		handled, err := registry.consumeRetiredResponse(response)
+		if err != nil || !handled {
+			t.Fatalf("consume nonterminal get: handled=%v err=%v", handled, err)
+		}
+		if task := registry.retiredTasks["task-1"]; task == nil || task.status != "input_required" {
+			t.Fatalf("retired task after get = %#v", task)
+		}
+		if registry.retiredRequests[response.id.key] != nil {
+			t.Fatal("nonterminal get retained operation request")
+		}
+		if !registry.persistentFences.contains(tombstoneRequest, response.id.key) {
+			t.Fatal("nonterminal get did not persistently fence operation request")
+		}
+	})
+
+	for _, method := range []string{"tasks/get", "tasks/cancel", "tasks/result"} {
+		t.Run(method+" error keeps retired task live", func(t *testing.T) {
+			registry := seedRetiredTaskOperation(t, method)
+			response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"operation","error":{"code":-32000,"message":"not ready"}}`)
+			handled, err := registry.consumeRetiredResponse(response)
+			if err != nil || !handled {
+				t.Fatalf("consume operation error: handled=%v err=%v", handled, err)
+			}
+			if registry.retiredTasks["task-1"] == nil {
+				t.Fatal("operation error released retired task")
+			}
+			if _, exists := registry.retiredTokens[scalarKey{kind: scalarString, value: "task-token"}]; !exists {
+				t.Fatal("operation error released retired task token")
+			}
+			if registry.retiredRequests[response.id.key] != nil || !registry.persistentFences.contains(tombstoneRequest, response.id.key) {
+				t.Fatal("operation error did not release and persistently fence request")
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		method   string
+		response string
+	}{
+		{name: "terminal get", method: "tasks/get", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "cancel", method: "tasks/cancel", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"cancelled","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "result", method: "tasks/result", response: `{"jsonrpc":"2.0","id":"operation","result":{"content":[]}}`},
+	} {
+		t.Run(testCase.name+" retires without status", func(t *testing.T) {
+			registry := seedRetiredTaskOperation(t, testCase.method)
+			response := mustParseCorrelationFrame(t, testCase.response)
+			handled, err := registry.consumeRetiredResponse(response)
+			if err != nil || !handled {
+				t.Fatalf("consume terminal operation: handled=%v err=%v", handled, err)
+			}
+			tokenKey := scalarKey{kind: scalarString, value: "task-token"}
+			if len(registry.retiredTasks) != 0 || len(registry.retiredTokens) != 0 {
+				t.Fatalf("terminal operation retained task state: tasks=%d tokens=%d", len(registry.retiredTasks), len(registry.retiredTokens))
+			}
+			if !registry.persistentFences.contains(tombstoneRequest, response.id.key) ||
+				!registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("task-1")) ||
+				!registry.persistentFences.contains(tombstoneToken, tokenKey) {
+				t.Fatal("terminal operation did not persistently fence request/task/token")
+			}
+		})
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		method   string
+		response string
+	}{
+		{name: "get mismatch", method: "tasks/get", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"other","status":"completed","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "cancel nonterminal", method: "tasks/cancel", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"working","createdAt":"2026-01-01T00:00:00Z","lastUpdatedAt":"2026-01-01T00:00:01Z","ttl":60000}}`},
+		{name: "malformed get", method: "tasks/get", response: `{"jsonrpc":"2.0","id":"operation","result":{"taskId":"task-1","status":"unknown"}}`},
+	} {
+		t.Run(testCase.name+" retains all state", func(t *testing.T) {
+			registry := seedRetiredTaskOperation(t, testCase.method)
+			response := mustParseCorrelationFrame(t, testCase.response)
+			handled, err := registry.consumeRetiredResponse(response)
+			if err == nil || !handled {
+				t.Fatalf("invalid retired operation: handled=%v err=%v", handled, err)
+			}
+			if registry.retiredRequests[response.id.key] == nil || registry.retiredTasks["task-1"] == nil {
+				t.Fatal("invalid retired operation released request or task")
+			}
+			if _, exists := registry.retiredTokens[scalarKey{kind: scalarString, value: "task-token"}]; !exists {
+				t.Fatal("invalid retired operation released task token")
+			}
+		})
+	}
+}
+
 func TestRetiredLateWorkingResultPreservesTaskAndToken(t *testing.T) {
 	registry := newDirectionRegistry()
 	request := seedRetiredTaskRequest(t, &registry, "retired-request", "retired-token")
@@ -343,7 +546,7 @@ func TestRetiredTaskErrorTransitionsRequestAndTokenToTombstones(t *testing.T) {
 	if len(registry.retiredRequests) != 0 || len(registry.retiredTokens) != 0 || len(registry.retiredTasks) != 0 {
 		t.Fatalf("retired error retained state: requests=%d tokens=%d tasks=%d", len(registry.retiredRequests), len(registry.retiredTokens), len(registry.retiredTasks))
 	}
-	if !registry.retiredTombstones.contains(tombstoneRequest, request.id.key) || !registry.retiredTombstones.contains(tombstoneToken, request.progressToken.key) {
+	if !registry.persistentFences.contains(tombstoneRequest, request.id.key) || !registry.persistentFences.contains(tombstoneToken, request.progressToken.key) {
 		t.Fatal("retired error did not transition request and token to tombstones")
 	}
 }
@@ -400,7 +603,7 @@ func TestRetiredLateResultRejectsEveryTaskIDCollision(t *testing.T) {
 			registry.tombstones.add(tombstoneTask, taskTombstoneKey("collision"))
 		}},
 		{name: "retired tombstoned", setup: func(registry *directionRegistry) {
-			registry.retiredTombstones.add(tombstoneTask, taskTombstoneKey("collision"))
+			_ = registry.persistentFences.add(tombstoneTask, taskTombstoneKey("collision"))
 		}},
 	}
 	for _, testCase := range testCases {
@@ -456,7 +659,7 @@ func TestTerminalRetiredTaskStatusFencesImmediateReuse(t *testing.T) {
 	if len(registry.retiredTasks) != 0 || len(registry.retiredTokens) != 0 {
 		t.Fatalf("terminal retired status retained state: tasks=%d tokens=%d", len(registry.retiredTasks), len(registry.retiredTokens))
 	}
-	if !registry.retiredTombstones.contains(tombstoneTask, taskTombstoneKey("retired-task")) || !registry.retiredTombstones.contains(tombstoneToken, request.progressToken.key) {
+	if !registry.persistentFences.contains(tombstoneTask, taskTombstoneKey("retired-task")) || !registry.persistentFences.contains(tombstoneToken, request.progressToken.key) {
 		t.Fatal("terminal retired status did not create task and token tombstones")
 	}
 	replacement := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"replacement","method":"tools/call","params":{"task":{}}}`)
@@ -508,89 +711,165 @@ func TestSuccessfulReplayPreservesRetiredTaskTransitionFences(t *testing.T) {
 	}
 }
 
-func TestActiveAndRetiredCorrelationBudgetsStayBounded(t *testing.T) {
-	t.Run("request IDs", func(t *testing.T) {
+func TestCorrelationRetentionCeilingAllowsBulkRetirementWithoutOvershoot(t *testing.T) {
+	registry := newDirectionRegistry()
+	retentionLimit := tombstoneLimit + activeCorrelationLimit
+	for wave := range retentionLimit / activeCorrelationLimit {
+		generation := uint64(wave + 1)
+		for index := range activeCorrelationLimit {
+			id := wave*activeCorrelationLimit + index
+			request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"request-%d","method":"roots/list","params":{"_meta":{"progressToken":"token-%d"}}}`, id, id))
+			if err := registry.canRegister(request); err != nil {
+				t.Fatalf("register retained correlation %d: %v", id, err)
+			}
+			registry.register(request, generation)
+		}
+		registry.retireGeneration(generation)
+	}
+	if got := len(registry.retiredRequests); got != retentionLimit {
+		t.Fatalf("retired requests = %d, want %d", got, retentionLimit)
+	}
+	if got := len(registry.retiredTokens); got != retentionLimit {
+		t.Fatalf("retired tokens = %d, want %d", got, retentionLimit)
+	}
+	overflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"overflow","method":"roots/list"}`)
+	if err := registry.canRegister(overflow); err == nil {
+		t.Fatal("active+retired retention ceiling accepted request overflow")
+	}
+	if len(registry.retiredRequests) != retentionLimit || len(registry.retiredTokens) != retentionLimit {
+		t.Fatal("retention overflow mutated retired state")
+	}
+
+	taskRegistry := newDirectionRegistry()
+	for index := range retentionLimit {
+		taskRegistry.retiredTasks[fmt.Sprintf("task-%d", index)] = &taskRecord{}
+	}
+	if err := taskRegistry.canBindTask("task-overflow"); err == nil {
+		t.Fatal("active+retired task retention ceiling accepted overflow")
+	}
+}
+
+func TestPersistentTaskFencesArePerRoleNonEvicting(t *testing.T) {
+	for _, role := range []tombstoneRole{tombstoneRequest, tombstoneToken, tombstoneTask} {
+		t.Run(fmt.Sprintf("role-%d", role), func(t *testing.T) {
+			registry := newDirectionRegistry()
+			for index := range persistentFenceLimit {
+				if err := registry.persistentFences.add(role, taskTombstoneKey(fmt.Sprintf("value-%d", index))); err != nil {
+					t.Fatalf("add persistent fence %d: %v", index, err)
+				}
+			}
+			overflow := taskTombstoneKey("overflow")
+			if err := registry.persistentFences.add(role, overflow); err == nil {
+				t.Fatal("persistent fence accepted the 1025th role entry")
+			}
+			if !registry.persistentFences.contains(role, taskTombstoneKey("value-0")) {
+				t.Fatal("persistent fence evicted the oldest entry")
+			}
+			if registry.persistentFences.contains(role, overflow) {
+				t.Fatal("rejected persistent fence entry was retained")
+			}
+			registry.clearTransitionTombstones()
+			if !registry.persistentFences.contains(role, taskTombstoneKey("value-0")) {
+				t.Fatal("transition clear removed persistent fence")
+			}
+			registry.clearRetiredCorrelations()
+			if registry.persistentFences.contains(role, taskTombstoneKey("value-0")) {
+				t.Fatal("retired correlation clear retained persistent fence")
+			}
+		})
+	}
+}
+
+func TestPersistentFenceCapacityErrorsPropagate(t *testing.T) {
+	fill := func(t *testing.T, registry *directionRegistry, role tombstoneRole) {
+		t.Helper()
+		for index := range persistentFenceLimit {
+			if err := registry.persistentFences.add(role, taskTombstoneKey(fmt.Sprintf("full-%d", index))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("complete", func(t *testing.T) {
 		registry := newDirectionRegistry()
-		split := activeCorrelationLimit / 2
-		for index := range split {
-			frame := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"retired-%d","method":"roots/list"}`, index))
-			if err := registry.canRegister(frame); err != nil {
-				t.Fatal(err)
-			}
-			registry.register(frame, 1)
+		fill(t, &registry, tombstoneRequest)
+		request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"complete","method":"tools/call","params":{"task":{}}}`)
+		record := registry.register(request, 1)
+		response := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"complete","error":{"code":-32000,"message":"failed"}}`)
+		if err := registry.complete(record, response); err == nil {
+			t.Fatal("complete hid persistent request fence exhaustion")
 		}
-		registry.retireGeneration(1)
-		for index := split; index < activeCorrelationLimit; index++ {
-			frame := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"active-%d","method":"roots/list"}`, index))
-			if err := registry.canRegister(frame); err != nil {
-				t.Fatal(err)
-			}
-			registry.register(frame, 2)
-		}
-		if got := len(registry.requests) + len(registry.retiredRequests); got != activeCorrelationLimit {
-			t.Fatalf("request correlations = %d, want %d", got, activeCorrelationLimit)
-		}
-		overflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"overflow","method":"roots/list"}`)
-		if err := registry.canRegister(overflow); err == nil {
-			t.Fatal("active+retired request budget accepted overflow")
+		if registry.requests[record.id.key] == nil {
+			t.Fatal("failed complete released an unfenced request")
 		}
 	})
 
-	t.Run("progress tokens and task IDs", func(t *testing.T) {
+	t.Run("cancel", func(t *testing.T) {
 		registry := newDirectionRegistry()
-		addTask := func(index int, generation uint64) {
-			t.Helper()
-			request := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"request-%d","method":"tools/call","params":{"_meta":{"progressToken":"token-%d"},"task":{}}}`, index, index))
-			if err := registry.canRegister(request); err != nil {
-				t.Fatal(err)
-			}
-			record := registry.register(request, generation)
-			response := mustParseCorrelationFrame(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":"request-%d","result":{"task":{"taskId":"task-%d","status":"working"}}}`, index, index))
-			if err := registry.canComplete(record, response); err != nil {
-				t.Fatal(err)
-			}
-			registry.complete(record, response)
+		fill(t, &registry, tombstoneRequest)
+		request := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"cancel","method":"tasks/get","params":{"taskId":"task-1"}}`)
+		record := registry.register(request, 1)
+		if err := registry.cancel(record); err == nil {
+			t.Fatal("cancel hid persistent request fence exhaustion")
 		}
-		split := activeCorrelationLimit / 2
-		for index := range split {
-			addTask(index, 1)
+		if registry.requests[record.id.key] == nil {
+			t.Fatal("failed cancel released an unfenced request")
 		}
-		registry.retireGeneration(1)
-		for index := split; index < activeCorrelationLimit; index++ {
-			addTask(index, 2)
+	})
+
+	t.Run("terminal task update", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		fill(t, &registry, tombstoneTask)
+		registry.tasks["task-1"] = &taskRecord{id: "task-1", generation: 1, status: "working"}
+		handled, err := registry.updateTask(&taskMeta{id: "task-1", status: "completed"}, 1)
+		if err == nil || !handled {
+			t.Fatalf("terminal update: handled=%v err=%v", handled, err)
 		}
-		if got := len(registry.tokens) + len(registry.retiredTokens); got != activeCorrelationLimit {
-			t.Fatalf("progress token correlations = %d, want %d", got, activeCorrelationLimit)
+		if registry.tasks["task-1"] == nil {
+			t.Fatal("failed terminal update released an unfenced task")
 		}
-		if got := len(registry.tasks) + len(registry.retiredTasks); got != activeCorrelationLimit {
-			t.Fatalf("task correlations = %d, want %d", got, activeCorrelationLimit)
+	})
+
+	t.Run("generation retirement", func(t *testing.T) {
+		registry := newDirectionRegistry()
+		fill(t, &registry, tombstoneRequest)
+		registry.tasks["task-1"] = &taskRecord{
+			id:         "task-1",
+			requestID:  taskTombstoneKey("task-request"),
+			generation: 1,
+			status:     "working",
 		}
-		tokenOverflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"token-overflow","method":"roots/list","params":{"_meta":{"progressToken":"token-overflow"}}}`)
-		if err := registry.canRegister(tokenOverflow); err == nil {
-			t.Fatal("active+retired progress token budget accepted overflow")
+		if _, err := registry.retireGenerationChecked(1); err == nil {
+			t.Fatal("generation retirement hid persistent request fence exhaustion")
 		}
-		taskOverflow := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"task-overflow","method":"tools/call","params":{"task":{}}}`)
-		if err := registry.canRegister(taskOverflow); err != nil {
-			t.Fatal(err)
-		}
-		overflowRecord := registry.register(taskOverflow, 2)
-		overflowResponse := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","id":"task-overflow","result":{"task":{"taskId":"task-overflow","status":"working"}}}`)
-		if err := registry.canComplete(overflowRecord, overflowResponse); err == nil {
-			t.Fatal("active+retired task budget accepted overflow")
+		if registry.tasks["task-1"] == nil || registry.retiredTasks["task-1"] != nil {
+			t.Fatal("failed generation retirement partially moved task state")
 		}
 	})
 }
 
-func TestRetiredTaskTransitionTombstonesStayBounded(t *testing.T) {
-	registry := newDirectionRegistry()
-	for index := range tombstoneLimit + 32 {
-		registry.retiredTombstones.add(tombstoneTask, taskTombstoneKey(fmt.Sprintf("task-%d", index)))
+func TestRetiredTaskStatusCollisionTerminatesRunner(t *testing.T) {
+	childInput := new(bufferWriteCloser)
+	runner := &runner{
+		cancel:            func() {},
+		state:             StateActive,
+		current:           &generation{id: 2, stdin: childInput},
+		child:             newDirectionRegistry(),
+		host:              newDirectionRegistry(),
+		initializeRequest: []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}`),
+		initialized:       []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`),
 	}
-	if got := len(registry.retiredTombstones.values); got != tombstoneLimit {
-		t.Fatalf("retired task tombstones = %d, want bounded %d", got, tombstoneLimit)
+	runner.child.retiredTasks["collision"] = &taskRecord{id: "collision", generation: 1, status: "working"}
+	runner.child.tasks["collision"] = &taskRecord{id: "collision", generation: 2, status: "working"}
+	status := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"collision","status":"completed"}}`)
+	runner.handleHostEvent(hostFrameEvent{frame: status})
+	if !runner.terminal || runner.terminalReason != ReasonProtocolFailure {
+		t.Fatalf("status collision terminal=%v reason=%s", runner.terminal, runner.terminalReason)
 	}
-	if !registry.retiredTombstones.contains(tombstoneTask, taskTombstoneKey(fmt.Sprintf("task-%d", tombstoneLimit+31))) {
-		t.Fatal("latest task tombstone was lost")
+	later := mustParseCorrelationFrame(t, `{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"collision","status":"failed"}}`)
+	runner.handleHostEvent(hostFrameEvent{frame: later})
+	if got := childInput.String(); got != "" {
+		t.Fatalf("traffic reached child after terminal status collision: %s", got)
 	}
 }
 
