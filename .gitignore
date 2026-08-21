@@ -8,6 +8,7 @@ dist/
 mcp-mux.versions/
 coverage.out
 coverage.html
+.scannerwork/
 .gomodcache/
 .agent/*
 !.agent/arch
