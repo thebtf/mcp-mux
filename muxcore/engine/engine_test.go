@@ -672,7 +672,7 @@ func TestRefreshTokenViaDaemonModernRequiresExactControlEcho(t *testing.T) {
 		{name: "mismatched echo", echoPresent: true, echo: "2025-03-26"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			ctlPath := filepath.Join(t.TempDir(), "refresh.sock")
+			ctlPath := serverid.DaemonControlPath(shortEngineBaseDir(t), "refresh")
 			server := startEngineRefreshControlServer(t, ctlPath, testCase.echoPresent, testCase.echo)
 			if _, err := refreshTokenViaDaemon(ctlPath, "previous-token", modernProtocolEra, log.New(io.Discard, "", 0)); !errors.Is(err, daemon.ErrProtocolEraMismatch) {
 				t.Fatalf("refreshTokenViaDaemon() error = %v, want %v", err, daemon.ErrProtocolEraMismatch)
