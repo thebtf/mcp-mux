@@ -566,7 +566,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "refresh"); err != nil {
 			return "", "", err
 		}
-		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, e.logger)
+		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, protocolWire, e.logger)
 		if err != nil {
 			return "", "", err
 		}
@@ -912,10 +912,15 @@ func decodeCanSuspendResponse(resp *control.Response) (bool, string, error) {
 	return *verdict.Allowed, verdict.Reason, nil
 }
 
-func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (string, error) {
+func refreshTokenViaDaemon(ctlPath, prevToken, protocolEra string, logger *log.Logger) (string, error) {
+	requestedEra, parseErr := era.ParseProtocolEra(protocolEra)
+	if parseErr != nil {
+		return "", daemon.ErrProtocolEraMismatch
+	}
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:       "refresh-token",
-		PrevToken: prevToken,
+		Cmd:         "refresh-token",
+		PrevToken:   prevToken,
+		ProtocolEra: protocolEra,
 	}, refreshRPCTimeout)
 	if err != nil {
 		return "", fmt.Errorf("refresh token via daemon: %w", err)
@@ -928,9 +933,14 @@ func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (strin
 			return "", daemon.ErrUnknownToken
 		case daemon.ErrDaemonShuttingDown.Error():
 			return "", daemon.ErrDaemonShuttingDown
+		case daemon.ErrProtocolEraMismatch.Error():
+			return "", daemon.ErrProtocolEraMismatch
 		default:
 			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
 		}
+	}
+	if requestedEra == era.EraModern20260728 && resp.ProtocolEra != protocolEra {
+		return "", daemon.ErrProtocolEraMismatch
 	}
 	logger.Printf("engine client: refreshed reconnect token")
 	return resp.Token, nil

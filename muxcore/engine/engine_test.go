@@ -19,6 +19,7 @@ import (
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
@@ -657,6 +658,34 @@ func TestRunClientConfiguresRefreshToken(t *testing.T) {
 	}
 	if handler.spawnRequests[1].ReconnectReason != "fallback_spawn" {
 		t.Fatalf("fallback spawn ReconnectReason = %q, want fallback_spawn", handler.spawnRequests[1].ReconnectReason)
+	}
+}
+
+func TestRefreshTokenViaDaemonModernRequiresExactControlEcho(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+	for _, testCase := range []struct {
+		name        string
+		echoPresent bool
+		echo        string
+	}{
+		{name: "absent echo"},
+		{name: "mismatched echo", echoPresent: true, echo: "2025-03-26"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctlPath := filepath.Join(t.TempDir(), "refresh.sock")
+			server := startEngineRefreshControlServer(t, ctlPath, testCase.echoPresent, testCase.echo)
+			if _, err := refreshTokenViaDaemon(ctlPath, "previous-token", modernProtocolEra, log.New(io.Discard, "", 0)); !errors.Is(err, daemon.ErrProtocolEraMismatch) {
+				t.Fatalf("refreshTokenViaDaemon() error = %v, want %v", err, daemon.ErrProtocolEraMismatch)
+			}
+			select {
+			case got := <-server.protocolEras:
+				if got != modernProtocolEra {
+					t.Fatalf("refresh request protocol era = %q, want %q", got, modernProtocolEra)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("refresh server did not observe request")
+			}
+		})
 	}
 }
 
@@ -1931,6 +1960,47 @@ func (server *engineAdmissionControlServer) serve(connection io.ReadWriteCloser)
 	default:
 		_ = json.NewEncoder(connection).Encode(control.Response{OK: false, Message: "unsupported test command"})
 	}
+}
+
+type engineRefreshControlServer struct {
+	protocolEras chan string
+	echoPresent  bool
+	echo         string
+}
+
+func startEngineRefreshControlServer(t *testing.T, socketPath string, echoPresent bool, echo string) *engineRefreshControlServer {
+	t.Helper()
+	listener, err := ipc.Listen(socketPath)
+	if err != nil {
+		t.Fatalf("listen for engine refresh control: %v", err)
+	}
+	server := &engineRefreshControlServer{protocolEras: make(chan string, 1), echoPresent: echoPresent, echo: echo}
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer connection.Close()
+		var request control.Request
+		if json.NewDecoder(connection).Decode(&request) != nil || request.Cmd != "refresh-token" {
+			return
+		}
+		server.protocolEras <- request.ProtocolEra
+		response := struct {
+			OK          bool    `json:"ok"`
+			Token       string  `json:"token,omitempty"`
+			ProtocolEra *string `json:"protocol_era,omitempty"`
+		}{OK: true, Token: "refreshed-token"}
+		if server.echoPresent {
+			response.ProtocolEra = &server.echo
+		}
+		_ = json.NewEncoder(connection).Encode(response)
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		ipc.Cleanup(socketPath)
+	})
+	return server
 }
 
 func (server *engineAdmissionControlServer) commandCount() int {

@@ -443,13 +443,18 @@ func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, m
 
 // refreshTokenViaDaemon asks the daemon to mint a fresh reconnect token for a
 // still-alive owner associated with prevToken.
-func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error) {
+func refreshTokenViaDaemon(prevToken, protocolEra string, logger *log.Logger) (string, error) {
+	requestedEra, parseErr := era.ParseProtocolEra(protocolEra)
+	if parseErr != nil {
+		return "", daemon.ErrProtocolEraMismatch
+	}
 	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	rpcStart := time.Now()
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:       "refresh-token",
-		PrevToken: prevToken,
+		Cmd:         "refresh-token",
+		PrevToken:   prevToken,
+		ProtocolEra: protocolEra,
 	}, 5*time.Second)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
@@ -465,9 +470,14 @@ func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error)
 			return "", daemon.ErrUnknownToken
 		case daemon.ErrDaemonShuttingDown.Error():
 			return "", daemon.ErrDaemonShuttingDown
+		case daemon.ErrProtocolEraMismatch.Error():
+			return "", daemon.ErrProtocolEraMismatch
 		default:
 			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
 		}
+	}
+	if requestedEra == era.EraModern20260728 && resp.ProtocolEra != protocolEra {
+		return "", daemon.ErrProtocolEraMismatch
 	}
 
 	logger.Printf("daemon_rpc_refresh status=ok duration=%v", rpcDur)

@@ -283,7 +283,7 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", supervisedDaemonReconnectError(err)
 					}
-					newToken, err := refreshTokenViaDaemon(currentToken, logger)
+					newToken, err := refreshTokenViaDaemon(currentToken, protocolWire, logger)
 					if err != nil {
 						return "", "", err
 					}

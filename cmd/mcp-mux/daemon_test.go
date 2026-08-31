@@ -41,6 +41,7 @@ type refreshTestHandler struct {
 	refreshToken string
 	refreshErr   error
 	prevToken    string
+	protocolEra  string
 	spawnErr     error
 }
 
@@ -69,6 +70,15 @@ func (h *refreshTestHandler) HandleRefreshSessionToken(prevToken string) (string
 	return h.refreshToken, nil
 }
 
+func (h *refreshTestHandler) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (string, error) {
+	h.prevToken = prevToken
+	h.protocolEra = protocolEra
+	if h.refreshErr != nil {
+		return "", h.refreshErr
+	}
+	return h.refreshToken, nil
+}
+
 func (h *refreshTestHandler) HandleReconnectGiveUp(string) error { return nil }
 
 func (h *refreshTestHandler) HandleListOwners(control.Request) (control.ListOwnersResponse, error) {
@@ -80,7 +90,7 @@ func TestRefreshTokenViaDaemon(t *testing.T) {
 	handler := &refreshTestHandler{refreshToken: "new-token"}
 	startFakeDaemon(t, tempDir, handler)
 
-	token, err := refreshTokenViaDaemon("prev-token", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
+	token, err := refreshTokenViaDaemon("prev-token", "", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
 	if err != nil {
 		t.Fatalf("refreshTokenViaDaemon() error = %v", err)
 	}
@@ -97,7 +107,7 @@ func TestRefreshTokenViaDaemonOwnerGone(t *testing.T) {
 	handler := &refreshTestHandler{refreshErr: daemon.ErrOwnerGone}
 	startFakeDaemon(t, tempDir, handler)
 
-	_, err := refreshTokenViaDaemon("prev-token", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
+	_, err := refreshTokenViaDaemon("prev-token", "", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
 	if !errors.Is(err, daemon.ErrOwnerGone) {
 		t.Fatalf("refreshTokenViaDaemon() error = %v, want %v", err, daemon.ErrOwnerGone)
 	}
@@ -108,9 +118,24 @@ func TestRefreshTokenViaDaemonUnknownToken(t *testing.T) {
 	handler := &refreshTestHandler{refreshErr: daemon.ErrUnknownToken}
 	startFakeDaemon(t, tempDir, handler)
 
-	_, err := refreshTokenViaDaemon("prev-token", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
+	_, err := refreshTokenViaDaemon("prev-token", "", log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
 	if !errors.Is(err, daemon.ErrUnknownToken) {
 		t.Fatalf("refreshTokenViaDaemon() error = %v, want %v", err, daemon.ErrUnknownToken)
+	}
+}
+
+func TestRefreshTokenViaDaemonModernSendsAndRequiresEra(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+	tempDir := shortTempDir(t, "rm")
+	handler := &refreshTestHandler{refreshToken: "modern-token"}
+	startFakeDaemon(t, tempDir, handler)
+
+	token, err := refreshTokenViaDaemon("prev-token", modernProtocolEra, log.New(os.Stderr, "[cmd-test] ", log.LstdFlags))
+	if err != nil {
+		t.Fatalf("refreshTokenViaDaemon() error = %v", err)
+	}
+	if token != "modern-token" || handler.protocolEra != modernProtocolEra {
+		t.Fatalf("modern refresh token=%q era=%q, want token=%q era=%q", token, handler.protocolEra, "modern-token", modernProtocolEra)
 	}
 }
 

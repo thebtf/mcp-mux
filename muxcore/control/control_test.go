@@ -293,6 +293,19 @@ func (m *mockDaemonHandler) HandleRefreshSessionToken(prevToken string) (string,
 	return "refreshed-token", nil
 }
 
+type modernRefreshDaemonHandler struct {
+	mockDaemonHandler
+	protocolEra string
+}
+
+func (m *modernRefreshDaemonHandler) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (string, error) {
+	m.protocolEra = protocolEra
+	if m.refreshErr != nil {
+		return "", m.refreshErr
+	}
+	return "modern-refreshed-token", nil
+}
+
 func (m *mockDaemonHandler) HandleReconnectGiveUp(reason string) error {
 	m.giveUpCalled = true
 	m.giveUpArg = reason
@@ -386,6 +399,52 @@ func TestRefreshToken(t *testing.T) {
 	}
 	if resp.Token != "refreshed-token" {
 		t.Fatalf("resp.Token = %q, want %q", resp.Token, "refreshed-token")
+	}
+}
+
+func TestRefreshTokenWithModernEraUsesOptionalHandlerAndEchoesEra(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+	path := testSocketPath(t)
+	handler := &modernRefreshDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token", ProtocolEra: modernProtocolEra})
+	if err != nil {
+		t.Fatalf("Send modern refresh-token: %v", err)
+	}
+	if !resp.OK || resp.Token != "modern-refreshed-token" || resp.ProtocolEra != modernProtocolEra {
+		t.Fatalf("modern refresh response = %+v", resp)
+	}
+	if handler.protocolEra != modernProtocolEra {
+		t.Fatalf("modern refresh era = %q, want %q", handler.protocolEra, modernProtocolEra)
+	}
+	if handler.refreshCalled {
+		t.Fatal("modern refresh fell through to legacy handler")
+	}
+}
+
+func TestRefreshTokenRejectsUnsupportedEraWithoutLegacyFallback(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token", ProtocolEra: "unknown-era"})
+	if err != nil {
+		t.Fatalf("Send unsupported refresh-token: %v", err)
+	}
+	if resp.OK {
+		t.Fatalf("unsupported era refresh succeeded: %+v", resp)
+	}
+	if handler.refreshCalled {
+		t.Fatal("unsupported era refresh fell through to legacy handler")
 	}
 }
 

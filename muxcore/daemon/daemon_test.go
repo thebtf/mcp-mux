@@ -886,6 +886,37 @@ func TestHandleRefreshSessionToken_HappyPath(t *testing.T) {
 	}
 }
 
+func TestHandleRefreshSessionTokenWithProtocolEra_ValidatesExactModernOwner(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+	d := testDaemon(t)
+	sid := "owner-modern-refresh"
+	o := testModernReconnectOwner(t, sid)
+	seedReconnectHistory(t, o, "modern-prev-token", "/project/modern", nil)
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid, ProtocolEra: era.EraModern20260728}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, sid)
+
+	newToken, err := d.HandleRefreshSessionTokenWithProtocolEra("modern-prev-token", modernProtocolEra)
+	if err != nil || newToken == "" || newToken == "modern-prev-token" {
+		t.Fatalf("modern refresh = (%q, %v), want fresh token", newToken, err)
+	}
+
+	legacySID := "owner-legacy-refresh"
+	legacy := testReconnectOwner(t, legacySID)
+	seedReconnectHistory(t, legacy, "legacy-prev-token", "/project/legacy", nil)
+	d.mu.Lock()
+	d.owners[legacySID] = &OwnerEntry{Owner: legacy, ServerID: legacySID, ProtocolEra: era.EraLegacy}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, legacySID)
+	if _, err := d.HandleRefreshSessionTokenWithProtocolEra("legacy-prev-token", modernProtocolEra); !errors.Is(err, ErrProtocolEraMismatch) {
+		t.Fatalf("modern refresh against legacy owner error = %v, want %v", err, ErrProtocolEraMismatch)
+	}
+	if _, err := d.HandleRefreshSessionTokenWithProtocolEra("modern-prev-token", "unknown-era"); !errors.Is(err, ErrProtocolEraMismatch) {
+		t.Fatalf("unknown era refresh error = %v, want %v", err, ErrProtocolEraMismatch)
+	}
+}
+
 func TestLoadSnapshotRestoresReconnectTokenHistory(t *testing.T) {
 	os.Remove(SnapshotPath())
 

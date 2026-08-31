@@ -95,6 +95,13 @@ type DaemonHandler interface {
 	HandleListOwners(req Request) (ListOwnersResponse, error)
 }
 
+// RefreshSessionTokenWithProtocolEraHandler is an optional daemon control-plane
+// extension for modern reconnects. Legacy refresh requests continue through
+// DaemonHandler.HandleRefreshSessionToken unchanged.
+type RefreshSessionTokenWithProtocolEraHandler interface {
+	HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (newToken string, err error)
+}
+
 // SpawnResponseFailureHandler is an optional daemon-side lifecycle hook. The
 // control server invokes it only when HandleSpawn succeeded but the response
 // could not be delivered to the requesting shim. Implementations should revoke

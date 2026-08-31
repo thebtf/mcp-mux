@@ -75,6 +75,10 @@ var ErrUnknownToken = errors.New("unknown token")
 // belonged to is no longer alive enough to accept a refreshed bind.
 var ErrOwnerGone = errors.New("owner gone")
 
+// ErrProtocolEraMismatch indicates that a modern refresh token does not belong
+// to an owner selected for the requested protocol era.
+var ErrProtocolEraMismatch = errors.New("protocol era mismatch")
+
 // ErrDaemonShuttingDown indicates the daemon is no longer accepting new owner
 // spawns because shutdown or graceful restart has already begun.
 var ErrDaemonShuttingDown = errors.New("daemon shutting down")
@@ -2386,6 +2390,60 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 	}
 
 	newToken, err := entry.Owner.SessionMgr().RegisterReconnect(prevToken, d.ownerIsAccepting)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrUnknownToken):
+			d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+			return "", ErrUnknownToken
+		case errors.Is(err, session.ErrOwnerGone):
+			d.logger.Printf("shim.reconnect.refresh_fail reason=owner_gone")
+			return "", ErrOwnerGone
+		default:
+			d.logger.Printf("shim.reconnect.refresh_fail reason=internal")
+			return "", err
+		}
+	}
+
+	d.reconnectRefreshed.Add(1)
+	d.logger.Printf("shim.reconnect.refresh_ok owner=%s", shortServerID(ownerKey))
+	return newToken, nil
+}
+
+// HandleRefreshSessionTokenWithProtocolEra validates a modern refresh against
+// the exact live owner before minting a replacement token.
+func (d *Daemon) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (string, error) {
+	requestedEra, err := era.ParseProtocolEra(protocolEra)
+	if err != nil || requestedEra != era.EraModern20260728 {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=protocol_era_mismatch")
+		return "", ErrProtocolEraMismatch
+	}
+	if d.shuttingDown.Load() {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=daemon_shutting_down")
+		return "", ErrDaemonShuttingDown
+	}
+	if prevToken == "" {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+		return "", ErrUnknownToken
+	}
+
+	entry, ownerKey := d.lookupReconnectOwner(prevToken)
+	if entry == nil || entry.Owner == nil {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+		return "", ErrUnknownToken
+	}
+	d.mu.RLock()
+	current, ok := d.owners[ownerKey]
+	d.mu.RUnlock()
+	if !ok || current != entry {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=owner_gone")
+		return "", ErrOwnerGone
+	}
+	if current.ProtocolEra != requestedEra {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=protocol_era_mismatch")
+		return "", ErrProtocolEraMismatch
+	}
+
+	newToken, err := current.Owner.SessionMgr().RegisterReconnect(prevToken, d.ownerIsAccepting)
 	if err != nil {
 		switch {
 		case errors.Is(err, session.ErrUnknownToken):
