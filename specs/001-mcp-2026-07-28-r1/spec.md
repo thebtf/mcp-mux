@@ -51,30 +51,29 @@ An operator can allow expected cleanup, restart, and reconnect events without a 
 
 **Why this priority**: R1 must be safe during lifecycle re-entry, not only on its first request. A controlled cold start or explicit refusal is safer than an ambiguous restore.
 
-**Independent Test**: Exercise snapshot, handoff, reaper, zero-session removal, retry rehydration, respawn, daemon loss, upstream loss, and downstream reconnect for an isolated modern owner. Inspect the resulting owner era, route state, and forwarded traffic.
+**Independent Test**: Exercise snapshot, handoff, reaper, zero-session removal, retry rehydration, respawn, daemon loss, upstream loss, and downstream reconnect for an isolated modern owner. Inspect the resulting owner era, the clearing of existing ephemeral state after loss, and forwarded traffic.
 
 **Acceptance Scenarios**:
 
 1. **Given** a modern owner reaches a snapshot or live-handoff boundary without a safe explicit modern transfer, **When** the boundary is attempted, **Then** mcp-mux excludes the owner and cold-starts or fails closed instead of restoring it as legacy.
 2. **Given** an isolated modern owner is removed, retried, respawned, or loses its daemon or upstream, **When** a lifecycle path re-enters, **Then** it preserves the selected modern era or ends safely without replaying requests, retries, progress, or subscriptions.
-3. **Given** a modern downstream reconnects after a loss or replacement, **When** it seeks readmission, **Then** it receives an exact-era fresh route set or an explicit failure that requires a new launch. It never attaches to a legacy owner or inherits a prior subscription route.
+3. **Given** a modern downstream reconnects after a loss or replacement, **When** it seeks readmission, **Then** it receives the exact selected era with existing ephemeral state cleared or an explicit failure that requires a new launch. It never attaches to a legacy owner or inherits a prior subscription state.
 
 ---
 
 ### User Story 4 - Inspect an isolated modern owner safely (Priority: P3)
 
-An operator can tell whether an owner is modern, isolated, cache-off, and subject to R1 lifecycle quarantine without exposing request content, credentials, or identifiers that link users.
+An operator can use an existing owner, daemon, list, CLI, or `mux_list` projection that carries `OwnerInfo` to identify a modern R1 owner as isolated, cache-off, and subject to lifecycle quarantine without exposing request content, credentials, or identifiers that link users.
 
-**Why this priority**: Operators need truthful status to diagnose an R1 boundary and make a safe rollback decision.
+**Why this priority**: Operators need minimal truthful readback to diagnose an R1 boundary and make a safe rollback decision.
 
-**Independent Test**: Inspect every supported owner-status surface for a modern owner. Send one standard modern logging message and one prohibited upstream JSON-RPC request. Verify recipient behavior and redaction.
+**Independent Test**: Inspect direct owner status, daemon status/list, CLI status, and `mux_list` when it carries `OwnerInfo`. Confirm the exact modern control echo separately. Verify the four required policy fields, any existing readiness field, runtime logging behavior, and redaction.
 
 **Acceptance Scenarios**:
 
-1. **Given** an isolated modern owner is active, **When** an operator reads its supported status, **Then** the status reports its era, forced isolation, cache-off policy, and lifecycle-quarantine state without exposing payloads, credentials, opaque state, or linkable compatibility material.
-2. **Given** the isolated modern upstream emits a standard logging message, **When** it has one downstream recipient, **Then** the message may reach that sole recipient once and no other recipient exists.
+1. **Given** an isolated modern owner is active, **When** an operator reads an existing `OwnerInfo` projection, **Then** it reports `protocol_era=2026-07-28`, `sharing_policy=forced-isolated`, `cache_policy=off`, and `lifecycle_policy=r1-quarantine`, retains any existing readiness field, and exposes no payloads, credentials, opaque state, or linkable compatibility material.
+2. **Given** the isolated modern upstream emits a standard logging message, **When** it has one downstream recipient, **Then** the message may reach that sole recipient once and no other recipient exists. Logging is not required as a status field.
 3. **Given** a modern upstream emits a JSON-RPC request toward the host, **When** mcp-mux receives it, **Then** mcp-mux does not forward that request to the downstream host.
-
 ### Edge Cases
 
 - A first request with only part of the required modern metadata, a null metadata object, an unsupported version, or conflicting era signals is refused before it can select an owner.
@@ -86,7 +85,7 @@ An operator can tell whether an owner is modern, isolated, cache-off, and subjec
 
 ## Authority, terminology, and normative references
 
-This specification follows the MCP 2026-07-28 normative contract and the accepted protocol-era boundary decision. The protocol defines modern behavior per request. It does not remove mcp-mux's local responsibilities for owner selection, process safety, admission, response delivery, lifecycle control, or truthful status.
+This specification follows MCP 2026-07-28 at the official source revision `5f5440bb26a62e2cf3440b92da5a667efa03b267`, cited in [`research.md`](research.md). The protocol defines modern behavior per request. It does not remove mcp-mux's local responsibilities for owner selection, process safety, admission, response delivery, lifecycle control, or truthful status.
 
 - **Legacy**: The released MCP behavior selected by the legacy initialization path. Legacy remains the default for existing users.
 - **Modern**: Native MCP 2026-07-28 behavior selected from valid per-request protocol metadata.
@@ -106,11 +105,11 @@ This specification follows the MCP 2026-07-28 normative contract and the accepte
 | Legacy | Modern owner | Any R1 selection | Unsupported. The route is refused. R1 does not convert legacy traffic to modern traffic. |
 | Dual-era host that discovers then initializes on the same shim | Automatic fallback | Not enabled in R1 | Unsupported by automatic R1 selection. The operator uses an explicit known-legacy or known-modern path. |
 
-## Public API contract: library, CLI, control, status, registry
+## Public API contract: library, CLI, control, and minimal readback
 
 R1 gives a known modern host an explicit, documented selection path. Existing callers that do not select modern support retain the legacy default. The product must not repurpose historical sharing terminology as a protocol-era selection.
 
-A modern selection is accepted only after the target control path confirms the exact selected era. A status reader can distinguish legacy from modern, see that R1 modern use is forced isolated and cache-off, and see whether lifecycle quarantine has required removal, cold start, or refusal. The status contract is truthful but minimal. It does not disclose request bodies, tokens, environment values, opaque request state, tenant or authorization values, compatibility keys, digests, or linkable fingerprints.
+A modern selection is accepted only after the target control path confirms the exact selected era. Existing owner status, daemon status/list, CLI status, and `mux_list` projections that carry `OwnerInfo` expose the four R1 policy facts. Existing readiness fields retain their current meaning where present. R1 does not require a logging status field or a registry, `mux_engines`, topology, lifecycle-state, or counter contract. Readback remains redacted and does not disclose request bodies, tokens, environment values, opaque request state, tenant or authorization values, compatibility keys, digests, or linkable fingerprints.
 
 ## Owner identity and pre-spawn compatibility contract
 
@@ -134,13 +133,11 @@ The R1 modern owner is isolated. Standard modern logging can therefore reach its
 
 Modern MCP does not allow an upstream JSON-RPC request to become a downstream host request. If an upstream sends such a request, mcp-mux contains it and does not forward it through legacy callback, last-active, or broadcast behavior.
 
-## Causal correlation: terminal authority, request, cancellation, progress, subscription, MRTR retry, and cleanup
+## Causal correlation: existing single-recipient state and loss cleanup
 
-R1 does not claim shared modern correlation. It has exactly one downstream recipient per modern owner. This release preserves ordinary native request and response delivery for that recipient while containing every terminal or generation-loss boundary.
+R1 does not claim shared modern correlation. It reuses current single-recipient routing, request-ID remap, process-bound inflight and generation fences, and existing ephemeral session, progress, and subscription state. `ExistingEphemeralRouteState` is a conceptual name for that reuse. It is not a new map, API, or route authority.
 
-After a modern loss, mcp-mux must not replay an open request, a multi-round-trip retry, progress, or a subscription. A host that needs to continue after reconnect sends a fresh native request. A host that needs a subscription sends a new `subscriptions/listen` request and receives a new acknowledgement. R1 does not create, replay, or continue a subscription on the host's behalf.
-
-Opaque request state remains opaque. R1 neither interprets it nor creates a retry lineage. A downstream retry is ordinary fresh host traffic.
+After a modern loss, mcp-mux clears existing ephemeral state and suppresses replay of open requests, multi-round-trip retries, progress, and subscriptions. A host that needs to continue after reconnect sends a fresh native request. A host that needs a subscription sends a new `subscriptions/listen` request and receives a new acknowledgement. R1 does not create, replay, or continue a subscription on the host's behalf. Opaque request state remains opaque. R1 neither interprets it nor creates a retry lineage. Collision-safe shared causal correlation is deferred to R2.
 
 ## Lifecycle: R1 quarantine; generation, respawn, reconnect, snapshot, handoff, reaper; host re-listen
 
@@ -153,28 +150,26 @@ R1 applies lifecycle quarantine to every named re-entry path for a modern owner.
 | Reaper or zero-session removal | Drain and remove the modern owner. | Rebuilding it from an implicit legacy default. |
 | Retry rehydration or respawn | Preserve the exact selected era, cold-start, or fail closed. | Reconstructing modern work as legacy. |
 | Daemon or upstream loss | End the current modern generation once and clear live work. | Replaying requests, retries, progress, or subscriptions. |
-| Downstream reconnect | Admit the host only to the exact selected era with a fresh route set, or require a new explicit launch. | Reattaching to a legacy owner or reusing an old route. |
+| Downstream reconnect | Admit the host only to the exact selected era after clearing existing ephemeral state, or require a new explicit launch. | Reattaching to a legacy owner or reusing old ephemeral state. |
 
 The R1 quarantine remains active until a separately released lifecycle contract proves safe same-era persistence and handoff. A later release must not weaken the R1 safety result by treating absent era information as legacy.
 
 ## Security, redaction, and authorization partitioning
 
-A downstream host's self-reported identity is not a sharing or security decision. R1 does not need a modern sharing partition because it forces isolation.
+The product must reject invalid era selection before unsafe owner election. Required R1 control and OwnerInfo readback must redact sensitive values. The product must not expose raw credentials, raw environment values, request content, opaque request state, tenant or authorization values, compatibility keys, digests, or linkable identifiers through those readbacks.
 
-The product must reject invalid era selection before unsafe owner election. It must redact sensitive values from status and lifecycle records. It must never expose raw credentials, raw environment values, request content, opaque request state, tenant or authorization values, compatibility keys, digests, or linkable identifiers through an R1 status, registry, snapshot, handoff, or control readback surface.
+## Minimal admission and rollback readback
 
-## Observability and operational status
+The exact modern control echo proves admission. Each existing owner status, daemon status/list, CLI status, or `mux_list` projection that carries `OwnerInfo` must expose these facts for an active R1 owner:
 
-For every active modern R1 owner, supported status surfaces must agree on these facts:
+- `protocol_era=2026-07-28`;
+- `sharing_policy=forced-isolated`;
+- `cache_policy=off`; and
+- `lifecycle_policy=r1-quarantine`.
 
-- protocol era;
-- forced-isolation policy;
-- cache-off policy;
-- logging policy for the sole downstream recipient;
-- readiness or current lifecycle-quarantine outcome; and
-- safe, redacted counters for refused, dropped, removed, cold-started, or failed boundaries when the product exposes counters.
+Where a projection already exposes readiness, it retains that readiness field with its existing meaning. Standard logging remains a tested runtime behavior, not a mandatory readback field. R1 does not add a registry descriptor schema or capability, a `mux_engines` or topology contract, a lifecycle-state taxonomy, or a safe-counter model. Those observability extensions are deferred to R3.
 
-Status may show that a route was contained. Status must not reveal why by printing user payloads or private compatibility material.
+Readback must not expose request content or private compatibility material.
 
 ## Consumer migration, release, and rollback
 
@@ -201,8 +196,8 @@ To roll back, operators stop admitting new modern owners and drain or remove exi
 - **FR-011 (MPE-R1-007)**: A standard modern logging message MAY reach the sole downstream recipient of an isolated R1 modern owner. It MUST NOT be broadcast to another recipient or synthesized by mcp-mux.
 - **FR-012 (MPE-R1-008)**: The product MUST exclude a modern R1 owner from every snapshot or handoff path that cannot carry an explicit safe modern era. The resulting action MUST cold-start or fail closed. It MUST NOT restore or attach that owner as legacy.
 - **FR-013 (MPE-R1-009)**: For reaper, zero-session removal, retry rehydration, respawn, daemon loss, and upstream loss, the product MUST preserve the exact selected modern era or drain, cold-start, or fail closed. It MUST NOT replay a request, multi-round-trip retry, progress update, or subscription.
-- **FR-014 (MPE-R1-010)**: A modern downstream reconnect MUST receive the exact selected era with a fresh route set or an explicit failure requiring a new launch. It MUST NOT attach modern work to a legacy owner or reuse a prior subscription route.
-- **FR-015 (MPE-OBS-001)**: Supported status, list, registry, snapshot, handoff, and control readback surfaces MUST truthfully expose the modern era, isolation policy, logging policy, cache-off state, lifecycle-quarantine state, and safe counters that they support. They MUST NOT expose secrets, payloads, opaque state, keys, digests, or linkable fingerprints.
+- **FR-014 (MPE-R1-010)**: A modern downstream reconnect MUST receive the exact selected era with existing ephemeral state cleared or an explicit failure requiring a new launch. It MUST NOT attach modern work to a legacy owner or reuse prior subscription state.
+- **FR-015 (MPE-OBS-001)**: A successful modern spawn control response MUST echo the exact selected era. Each existing owner status, daemon status/list, CLI status, or `mux_list` projection that carries `OwnerInfo` MUST expose `protocol_era=2026-07-28`, `sharing_policy=forced-isolated`, `cache_policy=off`, and `lifecycle_policy=r1-quarantine`. Existing readiness fields MUST retain their current meaning where present. R1 MUST NOT add a registry descriptor schema or capability, a `mux_engines` or topology contract, a lifecycle-state taxonomy, or a safe-counter model. Required R1 readbacks MUST NOT expose secrets, payloads, opaque state, keys, digests, or linkable fingerprints.
 - **FR-016 (MPE-OBS-002)**: Public R1 documentation MUST distinguish protocol era from historical sharing flags and state R1 isolation, logging behavior, host re-listen behavior, exclusions, and safe fallbacks.
 - **FR-017 (MPE-OBS-003)**: The release MUST produce built-deliverable customer evidence for one known modern host and one legacy host, plus a consumer handoff and rollback record.
 
@@ -212,7 +207,7 @@ To roll back, operators stop admitting new modern owners and drain or remove exi
 - **Opening message**: The first host message used to establish a valid era before owner selection. For a modern owner, it reaches the upstream unchanged.
 - **R1 isolated modern owner**: A dedicated modern owner with one downstream recipient, cache-off behavior, and lifecycle quarantine.
 - **Lifecycle-quarantine outcome**: A truthful safe result for an unsafe modern lifecycle boundary: exact-era continuation, cold start, drain and removal, or explicit refusal.
-- **Operational status**: Redacted information that lets an operator distinguish era, isolation, cache policy, logging policy, and quarantine state.
+- **Operational readback**: The exact control echo plus the minimal redacted `OwnerInfo` facts that identify era, forced isolation, cache policy, and lifecycle policy. Existing readiness fields remain available where present.
 
 ## Success Criteria *(mandatory)*
 
@@ -223,7 +218,7 @@ To roll back, operators stop admitting new modern owners and drain or remove exi
 - **SC-003**: In the released legacy reference scenario, 100% of compared legacy request sequences, result sequences, and identity bytes match the released baseline.
 - **SC-004**: Across snapshot, handoff, reaper, zero-session removal, retry rehydration, respawn, daemon loss, upstream loss, and reconnect scenarios, zero modern owners restore or attach as legacy, and zero stale requests, retries, progress updates, or subscriptions are replayed.
 - **SC-005**: In the modern native-path scenario, mcp-mux generates zero legacy initialization, list, list-change, cache, template, or replay messages. A standard log reaches the sole recipient at most once, and zero upstream JSON-RPC requests reach a downstream host.
-- **SC-006**: In every supported modern-owner status surface, 100% of inspected records agree on era, forced isolation, cache-off state, and lifecycle-quarantine state, while exposing zero prohibited sensitive or linkable values.
+- **SC-006**: In every required owner status, daemon status/list, CLI status, and `mux_list` projection that carries `OwnerInfo`, 100% of inspected records agree on `protocol_era=2026-07-28`, `sharing_policy=forced-isolated`, `cache_policy=off`, and `lifecycle_policy=r1-quarantine`, preserve any existing readiness field, and expose zero prohibited sensitive or linkable values.
 - **SC-007**: Before release, one known modern host completes a native request through the built deliverable and one legacy host completes its released reference flow without a behavior change.
 
 ## Assumptions
@@ -245,7 +240,7 @@ R1 explicitly excludes the following work:
 - Transparent subscription continuity, automatic re-listen, or replay after a loss or reconnect.
 - Shared modern logging attribution or delivery.
 - Persisted modern snapshot or live handoff support before a separately released versioned same-era contract.
-- R2 causal multiplexing and R3 persisted-lifecycle behavior.
+- R2 causal multiplexing, R3 persisted-lifecycle behavior, and R3 registry, `mux_engines`, topology, lifecycle-state, and counter observability.
 - Reinterpreting historical sharing terminology as a protocol-era option.
 
 ## Verification scenarios and acceptance evidence
@@ -261,7 +256,7 @@ The following scenarios define future acceptance evidence. They are not evidence
 | Modern readiness | An isolated modern owner receives traffic after opening. | No mux-generated legacy initialization, list, roots, list-change, cache, template, or replay traffic appears. |
 | Directionality and logging | The upstream sends a standard log and a JSON-RPC request. | The log reaches only the sole downstream recipient at most once. The JSON-RPC request never reaches a downstream host. |
 | Lifecycle quarantine | Snapshot, handoff, reaper, zero-session removal, retry rehydration, respawn, daemon loss, upstream loss, and reconnect are exercised. | Every outcome preserves exact era, cold-starts, drains and removes, or fails closed. No modern owner becomes legacy and no live work is replayed. |
-| Truthful status | Each supported status surface is inspected during normal, cold-start, removal, and refusal outcomes. | Era, policy, cache-off, and quarantine facts agree. No prohibited sensitive or linkable material appears. |
+| Minimal R1 readback | Inspect the direct owner status, daemon status/list, CLI status, and `mux_list` projections that carry `OwnerInfo` during normal, removal, and refusal outcomes. | The four required policy facts agree. Existing readiness fields retain their current meaning. No prohibited sensitive or linkable material appears. |
 | Built-deliverable customer proof | An operator uses the release deliverable with one modern and one legacy host. | The modern host completes a native request, and the legacy host retains released behavior. |
 
 ## Open authority decisions and falsifiers
