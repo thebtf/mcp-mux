@@ -58,19 +58,22 @@ A successful explicit-modern invocation has these observable properties:
 - `server/discover` is forwarded unchanged if the host sends it, but is never injected by mcp-mux;
 - a direct valid modern request is also a valid opener;
 - mcp-mux sends no legacy `initialize`, `notifications/initialized`, roots/list, list-change, cache, template, or replay frame to the modern upstream;
-- standard request-scoped logging can reach only the sole recipient; and
+- after request opt-in, a valid request-scoped standard log reaches the sole recipient once and is never synthesized or broadcast; and
 - status exposes the R1 policy facts defined in [`owner-status.md`](owner-status.md).
 
 ## Compatibility rules
 
 | Consumer or behavior | Required R1 result |
 | --- | --- |
-| Existing library caller with no policy field set | Byte-compatible legacy default; no source change required. |
+| Existing library caller with no policy field set | Released legacy behavior. Legacy identity remains byte-identical to the released baseline. |
 | Existing CLI invocation without modern selector | Released legacy behavior. |
+| Known MCP 2026-07-28 host with same-era upstream and explicit modern policy | Supported through one forced-isolated native route. |
 | Legacy host on modern policy | Explicit refusal; no translation or fallback. |
 | Modern host against a legacy owner/upstream identity | Explicit refusal; no translation. |
+| Modern host against unknown, absent, or control-era-mismatched upstream identity | Explicit refusal before unsafe attachment or fallback. |
 | Dual-era host requiring same-shim probe/fallback | Not supported automatically in R1; operator uses an explicit known-legacy or known-modern invocation. |
 | Older daemon that cannot echo era | Modern caller fails closed; legacy caller continues existing compatibility behavior. |
+| Any omitted combination using explicit modern policy | Unsupported and refused fail-closed before unsafe attachment. |
 
 ## Non-goals and security boundary
 

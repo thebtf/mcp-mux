@@ -94,7 +94,7 @@
 - **Add R2 route authorities in R1** — deferred. Shared collision-safe correlation needs its own authorized R2 contract.
 ### R-07 — Modern logging is request-scoped and sole-recipient only
 
-**Decision**: **INFERRED.** R1 never synthesizes `notifications/message`, never converts stderr into an MCP logging notification, never broadcasts a log, and never uses logging to select an owner. If a valid standard modern log arrives on the sole isolated route for a request that opted in with `io.modelcontextprotocol/logLevel`, it may reach that one recipient at most once. This is runtime behavior tested by R1. R1 does not make logging a required status field.
+**Decision**: **INFERRED.** R1 never synthesizes `notifications/message`, never converts stderr into an MCP logging notification, never broadcasts a log, and never uses logging to select an owner. When a valid standard modern log arrives on the sole isolated route for a request that opted in with `io.modelcontextprotocol/logLevel`, mcp-mux forwards it to that sole recipient once. This is runtime behavior tested by R1. R1 does not make logging a required status field.
 
 **Rationale**: **OBSERVED.** Structured logging is deprecated; when retained it is enabled by a particular request’s `_meta` and must be delivered on that request’s response stream, not a subscription stream (`OBS-005`; primary source revision listed above). Stderr is a separate transport concern. R1’s forced isolation makes one recipient safe without inventing shared attribution.
 
@@ -117,7 +117,7 @@
 
 ### R-09 — Era and sharing are independent; R1 forces isolation
 
-**Decision**: **INFERRED.** Protocol era is a typed owner fact independent of existing `cwd`/`git`/`global`/`isolated` sharing mode. R1 modern always becomes one forced-isolated owner; its physical identity is distinct from legacy and safe as an IPC path component. Legacy `GenerateContextKey` output remains byte-identical. No raw era suffix, client information, post-connect authorization, command similarity, or unknown mode may make modern traffic shareable.
+**Decision**: **INFERRED.** Protocol era is a typed owner fact independent of existing `cwd`/`git`/`global`/`isolated` sharing mode. R1 modern always becomes one forced-isolated owner; its physical identity is distinct from legacy and safe as an IPC path component. Legacy `GenerateContextKey` output is byte-identical to the released baseline. No raw era suffix, client information, post-connect authorization, command similarity, or unknown mode may make modern traffic shareable.
 
 **Rationale**: **OBSERVED.** Protocol statelessness says a server cannot rely on previous wire messages; it does not remove local ownership or authorize cross-client reuse (`ERA-005`). Candidate owner identity is directly used to form IPC paths (`muxcore/serverid/serverid.go:GenerateContextKey/IPCPath`). Current owner reuse is era-blind and existing `Mode` has legacy fallback behavior. The root audit documented that a raw `|era=modern` suffix would be Windows-invalid; the candidate must instead use an encoded/opaque, filesystem-safe physical identity.
 
@@ -133,24 +133,24 @@
 
 | Boundary | R1 disposition |
 | --- | --- |
-| Snapshot export or restore | Exclude era-less modern records. A later explicit modern launch cold-starts or fails closed; no cache/token/live-route hydration. |
+| Snapshot export or restore | Exclude era-less modern records. A later explicit modern launch cold-starts or fails closed; no cache/token/live-route hydration and no R1 transfer field/schema version. |
 | Live handoff | Refuse/omit a modern owner before detach through the current era-less payload; cold-start or fail closed. |
 | Reaper or zero-session removal | Use existing activity/CAS/finalization gates to drain and remove; never reconstruct implicit legacy state. |
-| Retry rehydration or in-memory respawn | Continue only with an exact immutable modern era and modern policy; otherwise cold-start or fail closed. |
-| Daemon or upstream loss | Terminate the current generation and its routes once; no request, MRTR, progress, subscription, or legacy recovery replay. |
+| Retry rehydration or in-memory respawn | Retry rehydration is bounded restoration of retry-family identity, counter, and eligibility after lifecycle re-entry. Continue only with an explicit immutable modern era and modern policy; otherwise cold-start or fail closed. |
+| Daemon or upstream loss | Terminate the current generation and its routes once; clear existing ephemeral state; no request, MRTR, progress, subscription, or legacy recovery replay. If the daemon survives upstream-generation loss, only fresh exact-era admission may continue. |
 | Downstream reconnect | Exact-era fresh admission with an empty route set, or explicit new-launch failure. No old subscription route survives; the host sends a new `subscriptions/listen`. |
 
 **Rationale**: **OBSERVED.** The candidate has mature current-process/generation and finalization protections (`owner.go:handleUpstreamMessageFrom`, `writeUpstreamFromCurrent`, inflight claim paths; `owner/materialization.go`; `daemon/owner_lifecycle.go`). Yet control, snapshot, handoff, and owner configuration lack an era field; current snapshot/handoff records can hydrate cache/token/classification state and current reconnect replays initialize. MCP requires a new listen after stdio reconnect (`LIFE-011`) and does not authorize replay. R1 therefore uses conservative exclusion rather than designing R3 transfer semantics.
 
 **Alternatives considered**:
 
-- **Persist modern lifecycle state in R1** — rejected. Versioned same-era descriptors and compatibility rules are R3 scope.
+- **Add a modern era field or schema version to the current snapshot/handoff payload** — rejected as an invalid R1 gate. FR-012 requires exclusion whenever that payload cannot carry a safe explicit era. The current payload is era-less, so R1 proves exclusion, cold start, or fail-closed behavior. Versioned same-era transfer remains R3 scope.
 - **Drop current process/generation gates as obsolete under statelessness** — rejected. They are local authority, not protocol conversation state.
 - **Replay buffered work after a loss** — rejected. A loss ends current work; a host-issued request is fresh traffic.
 
 ### R-11 — Minimal R1 OwnerInfo readback proves admission and rollback
 
-**Decision**: **INFERRED.** The modern spawn control response echoes the exact selected era. Each existing direct owner status, daemon status/list, CLI status, or `mux_list` projection that carries `OwnerInfo` exposes `protocol_era`, `sharing_policy=forced-isolated`, `cache_policy=off`, and `lifecycle_policy=r1-quarantine`. An existing readiness field retains its current meaning wherever that surface already provides one. Logging remains tested runtime behavior, not a required readback field. R1 adds no registry descriptor schema or capability, `mux_engines` contract, topology contract, lifecycle-state taxonomy, or safe-counter model. All R1 readbacks retain existing redaction.
+**Decision**: **INFERRED.** The modern spawn control response echoes the exact selected era. Each existing direct owner status, daemon status/list, CLI status, or `mux_list` projection that carries `OwnerInfo` exposes `protocol_era`, `sharing_policy=forced-isolated`, `cache_policy=off`, and `lifecycle_policy=r1-quarantine`. An existing readiness field retains its current meaning wherever that surface already provides one. Logging remains tested runtime behavior, not a required readback field. R1 adds no registry descriptor schema or capability, `mux_engines` contract, topology contract, lifecycle-state taxonomy, or safe-counter model; focused negative tests prove that absence.
 
 **Rationale**: **OBSERVED.** The candidate already projects owner data through `muxcore/owner/owner.go:Status`, `muxcore/daemon/daemon.go:HandleStatus/HandleListOwners`, `muxcore/control/protocol.go:13-45`, CLI status, and `internal/mcpserver/server.go` `mux_list`. These seams need minimal admission and rollback truth. A registry descriptor, topology contract, or new lifecycle accounting system would add R3 observability scope without improving the R1 safety boundary.
 
@@ -161,7 +161,7 @@
 - **Expose the fields only in CLI output** — rejected. The existing direct projections that carry `OwnerInfo` must not disagree.
 ### R-12 — Testing separates legacy parity, focused R1 safety, and built customer proof
 
-**Decision**: **INFERRED.** The later implementation must add focused RED/GREEN cases at ingress, control/identity, native owner readiness/directionality/logging, every named lifecycle quarantine boundary, minimal OwnerInfo readback/redaction, and customer workflow. Existing legacy tests remain independent parity tests and are never repurposed as modern proof. The final implementation must have one independent checker run the customer matrix in `quickstart.md` on the exact built candidate.
+**Decision**: **INFERRED.** The later implementation must add focused RED/GREEN cases at ingress, control/identity, native owner readiness/directionality/logging, every named lifecycle quarantine boundary, minimal OwnerInfo readback/redaction, and customer workflow. SC-001 uses a deterministic corpus of at least 100 valid modern opening frames. Existing legacy tests remain independent parity tests and are never repurposed as modern proof. Windows and Unix runner contracts precede runner implementation. The final implementation must have one independent `nvmd-checker`, distinct from the makers, run the customer matrix in `quickstart.md` on the exact built candidate and record the required receipt schema.
 
 **Rationale**: **OBSERVED.** Existing tests cover legacy bootstrap/cache/replay, process generations, snapshot/handoff, reaper, zero-session removal, reconnect, status, and registry, but no candidate fixture proves modern pre-spawn admission or quarantine. The adjacent suites are `muxcore/engine/engine_test.go`, `muxcore/control/control_test.go`, `muxcore/serverid/serverid_test.go`, daemon snapshot/handoff/reaper/lifecycle suites, owner materialization/resilient suites, direct status/list tests, CLI status tests, and `internal/mcpserver` tests. R1 proves the exact control echo plus the selected OwnerInfo projections. Descriptor schemas, comprehensive counters, `mux_engines`, and topology remain R3 work.
 
@@ -178,7 +178,7 @@
 | Is `clientInfo` mandatory? | No. Omitted is valid; present is validated. |
 | What is `-32602` versus `-32022`? | Malformed required metadata is `-32602`; a valid unsupported declared version is `-32022` with support/request data; local control mismatch remains local. |
 | Does modern statelessness permit sharing or remove lifecycle state? | No. R1 forces isolation and retains local control/generation authority. |
-| What happens to modern server requests, MRTR, logging, and opaque state? | Server requests are contained; MRTR and opaque state pass natively; logs are request-scoped and sole-recipient only. |
-| What happens after loss/reconnect? | Current work ends; no replay or automatic re-listen; host issues fresh request/listen after exact-era admission. |
-| Does R1 implement persistence or handoff? | No. Era-less snapshot/handoff is quarantined through exclusion, cold start, or failure. |
+| What happens to modern server requests, MRTR, logging, and opaque state? | Server requests are contained; MRTR and opaque state pass natively; an opted-in valid request-scoped log reaches the sole recipient once without synthesis/broadcast. |
+| What happens after loss/reconnect? | Current work ends; existing ephemeral state clears; no replay or automatic re-listen occurs; a surviving daemon admits only an exact-era fresh route after upstream loss. |
+| Does R1 implement persistence or handoff? | No. The era-less current payload is excluded, cold-started, or failed closed. Adding a field/schema version is rejected for R1 and reserved for R3. |
 | Does any R1 question remain unresolved? | No. R2 sharing and R3 persistence are explicit exclusions, not unresolved R1 decisions. |

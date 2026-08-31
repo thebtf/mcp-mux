@@ -36,9 +36,10 @@ The names below are caller-first design recommendations, not frozen exported ide
 | Public protocol policy | Caller configuration before the opening frame | `LegacyOnly` (zero) or pinned `Modern20260728` | Historical `cwd`/`git`/`global`/`isolated` sharing flags |
 | Opening request metadata | Per modern request | Required version + capabilities; optional validated client info | Owner-level authorization, cache key, or durable identity |
 | Sharing policy | Daemon-owned admission result | Released legacy behavior, or `ForcedIsolated` for R1 modern | The wire protocol era |
-| Physical owner identity | Daemon/serverid input before IPC bind | Byte-stable legacy identity; domain-separated filesystem-safe modern identity | A public compatibility fingerprint or an authorization key |
+| Physical owner identity | Daemon/serverid input before IPC bind | Legacy identity byte-identical to the released baseline; domain-separated filesystem-safe modern identity | A public compatibility fingerprint or an authorization key |
 | Owner lifecycle | Local daemon/owner authority | Owner, process generation, materialization and finalization states | An MCP protocol session |
 | Existing ephemeral route state | In-memory, generation-scoped | Current single-recipient routing, request-ID remap, process-bound inflight/generation fences, and existing ephemeral session/progress/subscription state | A new R1 map, API, correlation authority, or persisted MRTR lineage |
+| Retry rehydration | Bounded lifecycle re-entry decision | Restore retry-family identity, counter, and eligibility only when the exact modern era is explicit | A persisted modern snapshot/handoff record or a legacy default |
 | Operational readback | Existing direct `OwnerInfo` projections | Four R1 policy facts plus existing readiness fields where present | Request content, credentials, tokens, opaque state, or digests |
 
 ## Entities and types
@@ -116,12 +117,12 @@ An absent/unknown/mismatched echo cannot produce `Connected`; it leaves no upstr
 
 | Field | R1 rule |
 | --- | --- |
-| `legacyBytes` | Existing `serverid.GenerateContextKey` output is unchanged for every legacy input. |
+| `legacyBytes` | Existing `serverid.GenerateContextKey` output is byte-identical to the released baseline for every legacy input. |
 | `eraDomain` | Modern identity includes a typed, domain-separated modern discriminator before physical endpoint derivation. |
 | `physicalComponent` | Opaque/encoded and valid on Windows and Unix filesystem/socket naming rules. |
 | `publicProjection` | Status may identify an owner by existing safe ID conventions but must not expose a compatibility hash, authorization partition, or raw input material. |
 
-`OwnerIdentity` ensures modern and legacy identities cannot collide through exact lookup, shared lookup, retry-counter rehydration, reconnect, or lifecycle re-entry. It does not grant reuse: forced isolation is a separate decision.
+`OwnerIdentity` ensures modern and legacy identities cannot collide through exact lookup, shared lookup, retry rehydration, reconnect, or lifecycle re-entry. It does not grant reuse: forced isolation is a separate decision.
 
 ### 7. `R1ModernOwner`
 
@@ -131,7 +132,7 @@ An absent/unknown/mismatched echo cannot produce `Connected`; it leaves no upstr
 | `sharing` | Exactly `ForcedIsolated`; one downstream recipient maximum. |
 | `cachePolicy` | `Off`; no hydration, template, response cache, cache invalidation, or replay. |
 | `bootstrapPolicy` | `NativePassThrough`; no synthetic legacy handshake/lists/roots/list change. |
-| `loggingBehavior` | Existing request-scoped logging may reach the sole recipient. It is runtime behavior, not an `OwnerInfo` field. |
+| `loggingBehavior` | After request opt-in, a valid request-scoped standard log is forwarded to the sole recipient once. mcp-mux never synthesizes or broadcasts it. It is runtime behavior, not an `OwnerInfo` field. |
 | `lifecyclePolicy` | `R1Quarantine`. |
 | `generation` | Current local process generation, governed by existing current-process and finalization fences. |
 | `existingEphemeralRouteState` | Existing single-recipient routing and ephemeral session/progress/subscription state. This is a conceptual reuse label, not a new stored field. |
@@ -143,30 +144,39 @@ The owner keeps the existing daemon/owner/process authority. R1 does not create 
 | Entity | R1 rule |
 | --- | --- |
 | `ProcessGeneration` | The existing monotonically current generation remains the concrete process/tree authority. Only the exact current process may accept a response, cancellation, or cache-side effect. `RetirementProven` remains the gate before release or replacement. |
-| `ExistingEphemeralRouteState` | The existing single-recipient routing, request-ID remap, process-bound inflight/generation fences, and ephemeral session/progress/subscription state remain in their current owners. R1 clears that existing state at terminal loss and suppresses replay. |
+| `ExistingEphemeralRouteState` | The existing single-recipient routing, request-ID remap, process-bound inflight/generation fences, and ephemeral session/progress/subscription state remain in their current owners. R1 clears that existing state once at terminal loss. A daemon that survives an upstream-generation loss admits only a fresh exact-era route. |
 
 `ExistingEphemeralRouteState` is not a new map, API, or correlation authority. R1 does not introduce `CorrelationSet`, `RequestRoute`, `ProgressRoute`, or `SubscriptionRoute`. Collision-safe shared causal correlation is R2 work.
 
-### 9. Native MRTR and subscriptions
+### 9. `RetryRehydration`
+
+`RetryRehydration` is the bounded restoration of a retry-family identity, counter, and eligibility after lifecycle restore or re-entry. It is not a persisted modern snapshot, handoff payload, registry field, lifecycle taxonomy, or public counter model.
+
+| Input state | R1 result |
+| --- | --- |
+| Exact immutable `Modern20260728` era and current retry-family state are present | Reuse the existing bounded retry mechanism without adding legacy bootstrap, cache, replay, or a new lifecycle controller. |
+| Modern retry candidate has absent, unknown, malformed, or mismatched era | Cold-start after fresh explicit modern admission or fail closed. Do not derive `Legacy`, `ModeGlobal`, or any implicit compatibility default. |
+
+### 10. Native MRTR and subscriptions
 
 `input_required`, `inputRequests`, `inputResponses`, result types, and opaque `requestState` remain native protocol data. A host retry has a new JSON-RPC ID and is ordinary fresh traffic. R1 does not inspect, persist, cache, or bind opaque `requestState` as mux retry lineage.
 
 After terminal loss or reconnect, existing ephemeral request, progress, and subscription state is cleared. The host sends a new `subscriptions/listen` request when it needs a subscription. R1 does not define a `WorkState`, `SubscriptionState`, or subscription state machine, and it does not authorize automatic re-listen or replay.
 
-### 10. Quarantine disposition
+### 11. Quarantine disposition
 
 An existing lifecycle path may only preserve the exact modern era in a safe in-memory continuation, drain and remove, cold-start after a fresh explicit modern admission, or fail closed. The following rules describe dispositions, not a new persisted type, registry record, public lifecycle-state taxonomy, or counter model.
 
 | Disposition | Meaning | Permitted boundaries |
 | --- | --- | --- |
-| Exact-era in-memory continuation | An existing generation/retry mechanism continues only with the immutable modern era and no-legacy policy. | Narrow respawn/retry only when all exact-era facts remain present. |
+| Exact-era in-memory continuation | An existing generation/retry mechanism continues only with the immutable modern era and no-legacy policy. `RetryRehydration` restores retry-family identity, counter, and eligibility only under that condition. | Narrow respawn/retry only when all exact-era facts remain present. |
 | Drain and remove | Existing activity, CAS, and finalization gates remove the owner after whole-tree retirement proof. | Reaper, zero-session, rollback, or unsupported continuation. |
 | Cold start | A later explicit modern launch begins with no transferred modern route, cache, template, token, snapshot, or handoff data. | Snapshot/handoff exclusion or safe restart path. |
 | Explicit refusal | No safe route exists; operator/host receives explicit failure. | Mismatched control, era-less transfer, unsafe reconnect, or unsupported lifecycle state. |
 
 `RestoreAsLegacy`, `AttachToLegacy`, `PersistLiveRoute`, `ReplayRequest`, `ReplayMRTR`, `ReplayProgress`, `ReplaySubscription`, and `AutoRelisten` are illegal outcomes for a modern owner.
 
-### 11. `OwnerInfo` readback
+### 12. `OwnerInfo` readback
 
 | Public field | Modern R1 value | Never contains |
 | --- | --- | --- |
@@ -176,9 +186,9 @@ An existing lifecycle path may only preserve the exact modern era in a safe in-m
 | `lifecycle_policy` | `r1-quarantine` | Snapshot/handoff internal payload |
 | Existing readiness field | Existing value and meaning, where the projection already provides it | Opaque request state or client identity |
 
-Existing owner status, daemon status/list, CLI status, and `mux_list` projections that carry `OwnerInfo` share the four R1 policy facts. The successful control response separately echoes the exact selected era. R1 adds no logging field, registry descriptor schema/capability, `mux_engines` or topology contract, lifecycle-state taxonomy, or safe-counter model.
+Existing owner status, daemon status/list, CLI status, and `mux_list` projections that carry `OwnerInfo` share the four R1 policy facts and retain readiness meaning. The successful control response separately echoes the exact selected era. R1 adds no logging field, registry descriptor schema/capability, `mux_engines` or topology contract, lifecycle-state taxonomy, or safe-counter model.
 
-### 12. `AdmissionError`
+### 13. `AdmissionError`
 
 | Category | Wire/local result | Side-effect boundary |
 | --- | --- | --- |
@@ -216,7 +226,7 @@ LifecycleEvent
 
 ## Persistence boundary
 
-R1 stores no modern owner or route state in snapshots or handoff payloads. R1 does not add a registry descriptor schema/capability or durable status/counter record. Any later persisted descriptor requires an explicit versioned same-era contract and is outside this data model.
+R1 stores no modern owner or route state in snapshots or handoff payloads. The current payload is era-less, so R1 excludes the modern owner and never adds a modern era field or schema version in R1. R1 does not add a registry descriptor schema/capability or durable status/counter record. Any later persisted descriptor requires an explicit versioned same-era contract and is outside this data model.
 
 ## Recommended module ownership
 
@@ -229,4 +239,4 @@ R1 stores no modern owner or route state in snapshots or handoff payloads. R1 do
 | `muxcore/daemon` | Compare era before any attach/reuse; force modern isolation; preserve/reject era on lifecycle entry; project minimal `OwnerInfo` fields through existing status/list seams | R2 sharing/correlation or R3 persistence/observability |
 | `muxcore/owner` | Native modern readiness, directionality containment, existing ephemeral-state clearing, and minimal `OwnerInfo` values | Translation, legacy traffic injection, automatic host retry/re-listen, or a new route authority |
 | `cmd/mcp-mux` and `internal/mcpserver` | Preserve existing `OwnerInfo` values through CLI status and `mux_list` where that projection exists | Registry descriptor changes, `mux_engines`, topology, state taxonomy, or counter model |
-| snapshot/handoff/reaper/lifecycle | Apply the quarantine disposition using existing process authority | Versioned modern transfer |
+| snapshot/handoff/reaper/lifecycle | Apply the quarantine disposition using existing process authority, including bounded retry rehydration only with explicit era | Versioned modern transfer, a new lifecycle controller, or public counter/taxonomy work |

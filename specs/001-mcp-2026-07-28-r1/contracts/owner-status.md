@@ -9,7 +9,7 @@ R1 exposes the minimum readback needed to prove modern admission and support rol
 - CLI `status`; and
 - `internal/mcpserver` `mux_list`.
 
-R1 does not add a registry descriptor schema or capability, a `mux_engines` or topology contract, a lifecycle-state taxonomy, or a safe-counter model. Those observability changes are R3 scope.
+R1 does not add a registry descriptor schema or capability, a `mux_engines` or topology contract, a lifecycle-state taxonomy, or a safe-counter model. Focused negative proof must show that an active R1 owner introduces none of those surfaces. Those observability changes are R3 scope.
 
 ## Required R1 facts
 
@@ -19,9 +19,9 @@ R1 does not add a registry descriptor schema or capability, a `mux_engines` or t
 | `sharing_policy` | `forced-isolated` | Existing released behavior | Distinct from protocol era. |
 | `cache_policy` | `off` | Existing released behavior | Covers response cache, template reuse, and replay. |
 | `lifecycle_policy` | `r1-quarantine` | Existing released behavior | Shows the R1 exclusion, cold-start, or fail-closed rule. |
-| Existing readiness field | Existing value and meaning, where the projection already provides it | Existing value and meaning | R1 adds no readiness field or lifecycle-state vocabulary. |
+| Existing readiness field | Existing value and meaning, where the projection already provides it | Existing value and meaning | R1 adds no readiness field or lifecycle-state vocabulary. A modern record in an equivalent readiness state retains the released meaning. |
 
-Each listed projection that carries `OwnerInfo` must expose the four R1 policy facts. Standard logging remains a runtime behavior tested under FR-011. It is not a required `OwnerInfo` field.
+Each listed projection that carries `OwnerInfo` must expose the four R1 policy facts. After request opt-in, a valid request-scoped standard log reaches the sole recipient once and is never synthesized or broadcast. Logging is not a required `OwnerInfo` field.
 
 ## Control echo
 
@@ -52,10 +52,10 @@ cache_policy = off
 lifecycle_policy = r1-quarantine
 ```
 
-Where a projection already has a readiness field, it keeps that field's existing meaning. If a projection cannot determine the required facts reliably, it returns its existing unavailable/unknown read result. It does not fabricate a legacy value.
+Where a projection already has a readiness field, it keeps that field's released meaning for an equivalent readiness state. If a projection cannot determine the required facts reliably, it returns its existing unavailable/unknown read result. It does not fabricate a legacy value.
 
 Status supports an operator deciding to stop new modern admissions and drain/remove modern owners. It is informational. An operator cannot mutate an era through status, list, CLI, or `mux_list` readback. A rollback must preserve the R1 rule that live modern work is not converted to legacy or replayed.
 
 ## Testable read-side assertions
 
-Implementation proof must inspect the exact control echo and every available direct owner status, daemon status/list, CLI status, and `mux_list` projection that carries `OwnerInfo` for one modern owner. It must compare the four required policy fields, preserve existing readiness semantics where present, and scan output and relevant errors for the redaction exclusions above. It must separately prove that legacy status retains released behavior.
+Implementation proof must inspect the exact control echo and every available direct owner status, daemon status/list, CLI status, and `mux_list` projection that carries `OwnerInfo` for one modern owner. It must compare the four required policy fields, compare each existing readiness field with a released equivalent readiness state, and scan output and relevant errors for the redaction exclusions above. It must also prove that the active R1 owner adds no registry descriptor/capability, `mux_engines`/topology contract, lifecycle taxonomy, or counter model, and separately prove that legacy status retains released behavior.

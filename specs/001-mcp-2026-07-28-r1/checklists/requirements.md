@@ -34,4 +34,5 @@
 - Requirements-quality validation iteration 2 of 3 passed all 16 checks after the explicit edge-case review.
 - `spec.md` contains 17 stable functional requirements and 7 measurable success criteria.
 - `spec.md` has zero `[NEEDS CLARIFICATION:` markers, placeholder tokens, or unfinished markers.
+- Post-correction requirements-quality re-evaluation retained every marker. The clarified corpus, logging, lifecycle, compatibility, readback, and handoff contracts remain testable and in scope; no marker represents implementation completion.
 - R1 scope explicitly retains legacy behavior and excludes modern sharing, cache, semantic translation, automatic same-shim fallback, transparent subscription continuity, and R2 or R3 behavior.

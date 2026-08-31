@@ -72,14 +72,14 @@ The control response may not include host payload, opaque metadata, token histor
 ## Identity and owner election requirements
 
 - `ProtocolEra` participates in every exact lookup, retry/respawn identity, reconnect selection, and lifecycle constructor input that could otherwise attach an owner.
-- Legacy `serverid.GenerateContextKey` bytes are unchanged.
-- Modern physical identity is domain-separated and safe in Windows/Unix IPC paths; a raw delimiter such as `|` is prohibited.
+- Legacy `serverid.GenerateContextKey` output is byte-identical to the released baseline.
+- Modern physical identity is domain-separated and produces an actual valid endpoint/file component on Windows and a Unix-safe segment with no `/` or NUL.
 - `ProtocolEra` and sharing policy remain two distinct data fields.
 - R1 modern has `ForcedIsolated` sharing regardless of command/args/CWD/environment similarity.
 
 ## Reconnect and compatibility
 
-The existing refresh-token and fallback-spawn mechanism retains its process/token safety gates. A modern reconnect must carry and revalidate the exact modern era, receive an exact echo, and use the existing single-recipient path with no preserved ephemeral session, progress, or subscription state. Otherwise it returns an explicit new-launch failure. It must not invoke legacy `replayInit`, synthesize list change, attach through an old token to a legacy owner, or reuse old ephemeral state.
+The existing refresh-token and fallback-spawn mechanism retains its process/token safety gates. A modern reconnect must carry and revalidate the exact modern era, receive an exact echo, and use the existing single-recipient path with no preserved ephemeral session, progress, or subscription state. If the daemon survives an upstream-generation loss, the next successful route is fresh exact-era admission with that state cleared. Otherwise it returns an explicit new-launch failure. It must not invoke legacy `replayInit`, synthesize list change, attach through an old token to a legacy owner, or reuse old ephemeral state.
 
 ## Testable control assertions
 
@@ -89,5 +89,5 @@ Implementation proof must show:
 2. a valid modern echo permits only an isolated modern owner;
 3. absent, malformed, unknown, old-daemon, and mismatched echo each refuse before attach;
 4. an existing legacy owner with matching launch inputs is never returned to a modern request;
-5. legacy ID bytes remain unchanged and modern endpoint derivation is valid on Windows and Unix; and
+5. legacy ID bytes are byte-identical to the released baseline, and modern endpoint derivation creates a valid Windows component and a Unix-safe no-NUL/no-separator segment; and
 6. control/status errors redact every prohibited value.
