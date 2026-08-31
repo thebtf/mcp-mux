@@ -134,12 +134,12 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### Slice D: Loss and reconnect
 
-- [ ] T052 [P] [US3] Add RED daemon/upstream-loss tests for the cleared-state branch: the daemon survives, the upstream generation dies, existing ephemeral request/progress/subscription state clears once, a stale generation cannot deliver, and no old route or replay remains in `muxcore/daemon/daemon_test.go` and `muxcore/owner/owner_test.go`.
-- [ ] T053 [P] [US3] Add RED reconnect tests that admit only an exact modern era onto a fresh empty route after loss, require a host-issued new `subscriptions/listen`, and reject legacy replay/list-change/automatic re-listen in `muxcore/owner/resilient_client_reconnect_test.go`.
-- [ ] T054 [US3] Clear existing ephemeral route state once after terminal modern loss and preserve exact-generation rejection of stale response, cancellation, progress, subscription, cache, or replacement authority in `muxcore/daemon/daemon.go` and `muxcore/owner/owner.go`.
-- [ ] T055 [US3] Make modern reconnect require exact-era fresh admission or an explicit new-launch failure and bypass legacy replay, synthetic list change, and automatic re-listen behavior in `muxcore/owner/resilient_client.go`.
-- [ ] T056 [US3] Run the focused loss and reconnect tests in `muxcore/daemon/daemon_test.go`, `muxcore/owner/owner_test.go`, and `muxcore/owner/resilient_client_reconnect_test.go`.
-- [ ] T057 [US3] Stage and commit the proven loss/reconnect slice: `muxcore/daemon/daemon.go`, `muxcore/daemon/daemon_test.go`, `muxcore/owner/owner.go`, `muxcore/owner/owner_test.go`, `muxcore/owner/resilient_client.go`, and `muxcore/owner/resilient_client_reconnect_test.go`.
+- [x] T052 [P] [US3] Add RED daemon/upstream-loss tests for the cleared-state branch: the daemon survives, the upstream generation dies, existing ephemeral request/progress/subscription state clears once, a stale generation cannot deliver, and no old route or replay remains in `muxcore/daemon/daemon_test.go` and `muxcore/owner/owner_test.go`.
+- [x] T053 [P] [US3] Add RED reconnect tests that admit only an exact modern era onto a fresh empty route after loss, require a host-issued new `subscriptions/listen`, and reject legacy replay/list-change/automatic re-listen in `muxcore/owner/resilient_client_reconnect_test.go`.
+- [x] T054 [US3] Clear existing ephemeral route state once after terminal modern loss and preserve exact-generation rejection of stale response, cancellation, progress, subscription, cache, or replacement authority in `muxcore/daemon/daemon.go` and `muxcore/owner/owner.go`.
+- [x] T055 [US3] Make modern reconnect require exact-era fresh admission or an explicit new-launch failure and bypass legacy replay, synthetic list change, and automatic re-listen behavior in `muxcore/owner/resilient_client.go`.
+- [x] T056 [US3] Run the focused loss and reconnect tests in `muxcore/daemon/daemon_test.go`, `muxcore/owner/owner_test.go`, and `muxcore/owner/resilient_client_reconnect_test.go`.
+- [x] T057 [US3] Stage and commit the proven loss/reconnect slice: `cmd/mcp-mux/main.go`, `muxcore/engine/engine.go`, `muxcore/daemon/daemon_test.go`, `muxcore/owner/materialization.go`, `muxcore/owner/owner.go`, `muxcore/owner/owner_test.go`, `muxcore/owner/resilient_client.go`, and `muxcore/owner/resilient_client_reconnect_test.go`.
 
 **Checkpoint**: Every R1 lifecycle boundary preserves exact era or takes an explicit safe quarantine outcome. No slice introduces R2 correlation or R3 persistence.
 
