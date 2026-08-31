@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-08-31
+
 ### Added
 
 - Added the opt-in `--mcp-protocol=2026-07-28` route for a known MCP
@@ -46,11 +48,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Validation
 
-- Release validation is scoped to the 100-frame native opening corpus,
-  same-era byte preservation, forced isolation and readback, legacy parity,
-  lifecycle quarantine/loss behavior, and rollback. This Unreleased entry
-  describes the required scope and does not claim release, publication, or
-  customer proof.
+- Release validation covers the 100-frame native opening corpus, same-era byte
+  preservation, forced isolation and readback, legacy parity, lifecycle
+  quarantine/loss behavior, rollback, and Windows and Unix customer proof.
 
 ### Rollback
 
@@ -290,7 +290,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.29.1...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/thebtf/mcp-mux/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/thebtf/mcp-mux/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/thebtf/mcp-mux/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/thebtf/mcp-mux/compare/v0.27.2...v0.28.0

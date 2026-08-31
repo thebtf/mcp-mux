@@ -692,15 +692,16 @@ including BSD targets without both proofs, fail closed and never emit private
 dormant frames.
 
 The stable stdio loop, strict MCP correlation, shared protocol-v2 codec,
-process-tree finalization, and generic peer-PID attestation are public in
-`muxcore/v0.29.1` through `muxcore/supervisor` and
-`muxcore/supervisor/attest`. Native consumers should pin that tag and use
-`supervisor.Run`, `supervisor.StartCommand`, `supervisor.StartWithFallback`,
-`supervisor.ProtocolV2`, and the attestation package; they must not copy the
-`mcp-mux` product adapter, private
-wire constants, parser, replay loop, or exit code. To roll back, pin
-`muxcore/v0.29.0` or restore the prior product binary and use the product's
-bounded replacement path rather than forcing a mixed-version live handoff.
+process-tree finalization, generic peer-PID attestation, and the explicit native
+MCP `2026-07-28` route are public in `muxcore/v0.30.0`. Native consumers should
+pin that tag and use `engine.Config.ProtocolPolicy` for an explicit known
+same-era modern route; legacy remains the zero-value default. Supervisor users
+should continue to use `supervisor.Run`, `supervisor.StartCommand`,
+`supervisor.StartWithFallback`, `supervisor.ProtocolV2`, and the attestation
+package rather than copying the `mcp-mux` product adapter, private wire
+constants, parser, replay loop, or exit code. To roll back, pin
+`muxcore/v0.29.1` or restore the prior product binary after stopping new modern
+admissions and retiring active modern owners through the quarantine path.
 
 The shared daemon is owned by the stable launcher rather than by any supervised engine generation. The launcher prepares it before starting a child; on Windows the daemon therefore remains outside the child's KillOnJobClose Job Object. A supervised child never spawns that daemon inside its own process tree and exits back to the stable launcher if the daemon must be recreated, preserving the host-facing stdio pipe.
 

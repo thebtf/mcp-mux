@@ -114,13 +114,27 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.29.x)
+## muxcore Library API (v0.30.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
 ```
+
+### v0.30.0 - explicit native MCP 2026-07-28 route
+
+**No required consumer code changes for ordinary existing users.** Legacy is
+still the zero-value default. A consumer opts into the new route only by setting
+`engine.Config.ProtocolPolicy` to `era.PolicyModern20260728` before admission
+for a known MCP `2026-07-28` host and same-era upstream.
+
+Modern R1 owners are forced isolated and bypass legacy bootstrap, response
+cache, template reuse, and replay. Unsafe snapshot, handoff, reaper, retry,
+respawn, loss, or reconnect transitions preserve the exact era or quarantine
+the route; they never downgrade modern work to legacy. Rollback: stop new
+modern admissions, retire active modern owners through the existing lifecycle
+authority, then pin `muxcore/v0.29.1` or restore the previous product binary.
 
 ### v0.29.1 - fallback start policy and exact-generation registry mutation
 

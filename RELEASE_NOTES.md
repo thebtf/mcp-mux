@@ -1,6 +1,8 @@
-# mcp-mux R1 (Unreleased)
+# mcp-mux v0.30.0
 
-**Type:** Additive, opt-in compatibility release draft
+**Release date:** 2026-08-31
+
+**Type:** Additive, opt-in minor release
 
 ## Summary
 
@@ -65,11 +67,10 @@ ready to resume work.
 
 ## Validation scope
 
-Before release, validation must cover the 100-frame native opening corpus,
-same-era byte preservation, forced isolation, minimal redacted readback,
-legacy parity, lifecycle quarantine and loss behavior, and rollback. This is
-a release draft: it does not claim a version bump, tag, publication, or
-customer proof.
+Validation covers the 100-frame native opening corpus, same-era byte
+preservation, forced isolation, minimal redacted readback, legacy parity,
+lifecycle quarantine and loss behavior, rollback, Windows and Unix customer
+proof, full Go test and vet suites, and the repository critical suite.
 
 ## Rollback
 
