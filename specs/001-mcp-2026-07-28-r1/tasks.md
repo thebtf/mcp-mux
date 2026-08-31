@@ -107,12 +107,12 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### Slice A: Snapshot and handoff exclusion only
 
-- [ ] T034 [P] [US3] Add RED snapshot export, restore, and staged-restore tests that observe an era-less current snapshot payload excluding a modern owner and never hydrating it as legacy, cache, token, or live route in `muxcore/daemon/snapshot_test.go`.
-- [ ] T035 [P] [US3] Add RED live-handoff tests that observe a modern owner excluded or refused before the current era-less transfer payload detaches it in `muxcore/daemon/handoff_test.go`.
-- [ ] T036 [US3] Exclude modern owners from current era-less snapshot export, restore, staged restore, and cache/token/live-route hydration in `muxcore/daemon/snapshot.go`. Do not add an era field, schema version, or retry rehydration here.
-- [ ] T037 [US3] Exclude or refuse modern owners from current handoff collection, transfer, and successor adoption while retaining existing handoff authority and fallback gates in `muxcore/daemon/handoff.go` and `muxcore/daemon/daemon.go`.
-- [ ] T038 [US3] Run the focused snapshot and handoff quarantine tests in `muxcore/daemon/snapshot_test.go` and `muxcore/daemon/handoff_test.go`.
-- [ ] T039 [US3] Stage and commit the proven snapshot/handoff exclusion slice: `muxcore/daemon/snapshot.go`, `muxcore/daemon/snapshot_test.go`, `muxcore/daemon/handoff.go`, `muxcore/daemon/handoff_test.go`, and `muxcore/daemon/daemon.go`.
+- [x] T034 [P] [US3] Add RED snapshot export, restore, and staged-restore tests that observe an era-less current snapshot payload excluding a modern owner and never hydrating it as legacy, cache, token, or live route in `muxcore/daemon/snapshot_test.go`.
+- [x] T035 [P] [US3] Add RED live-handoff tests that observe a modern owner excluded or refused before the current era-less transfer payload detaches it in `muxcore/daemon/handoff_test.go`.
+- [x] T036 [US3] Exclude modern owners from current era-less snapshot export, restore, staged restore, and cache/token/live-route hydration in `muxcore/daemon/snapshot.go`. Do not add an era field, schema version, or retry rehydration here.
+- [x] T037 [US3] Exclude or refuse modern owners from current handoff collection, transfer, and successor adoption while retaining existing handoff authority and fallback gates in `muxcore/daemon/handoff.go` and `muxcore/daemon/daemon.go`.
+- [x] T038 [US3] Run the focused snapshot and handoff quarantine tests in `muxcore/daemon/snapshot_test.go` and `muxcore/daemon/handoff_test.go`.
+- [x] T039 [US3] Stage and commit the proven snapshot/handoff exclusion slice: `muxcore/daemon/snapshot.go`, `muxcore/daemon/snapshot_test.go`, `muxcore/daemon/handoff.go`, `muxcore/daemon/handoff_test.go`, and `muxcore/daemon/daemon.go`.
 
 ### Slice B: Reaper and zero-session removal
 
