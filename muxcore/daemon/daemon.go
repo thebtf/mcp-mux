@@ -140,6 +140,39 @@ type OwnerEntry struct {
 	removalRetrying   bool
 }
 
+const (
+	nativeOwnerIDPrefix                   = "native-"
+	modernProtocolEraClassificationSource = "protocol-era"
+	modernProtocolEraClassificationReason = "2026-07-28"
+)
+
+func isModernOwnerID(serverID string) bool {
+	return strings.HasPrefix(serverID, nativeOwnerIDPrefix)
+}
+
+func isModernOwnerEntry(entry *OwnerEntry) bool {
+	return entry != nil && (entry.ProtocolEra == era.EraModern20260728 || isModernOwnerID(entry.ServerID))
+}
+
+func isModernSnapshotRecord(snapshot mcpsnapshot.OwnerSnapshot) bool {
+	if isModernOwnerID(snapshot.ServerID) {
+		return true
+	}
+	if snapshot.ClassificationSource != modernProtocolEraClassificationSource {
+		return false
+	}
+	for _, reason := range snapshot.ClassificationReason {
+		if reason == modernProtocolEraClassificationReason {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeLifecycleBoundaryError() *era.AdmissionError {
+	return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
+}
+
 type templateEntry struct {
 	snapshot       mcpsnapshot.OwnerSnapshot
 	classification classify.SharingMode
@@ -2078,7 +2111,7 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 	d.mu.RLock()
 	entries := make([]*OwnerEntry, 0, len(d.owners))
 	for _, e := range d.owners {
-		if e.Owner != nil {
+		if e != nil && e.Owner != nil && !isModernOwnerEntry(e) {
 			entries = append(entries, e)
 		}
 	}
@@ -2109,16 +2142,16 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 
 func (d *Daemon) hasHandoffUpstreamOwners() bool {
 	d.mu.RLock()
-	owners := make([]*owner.Owner, 0, len(d.owners))
+	entries := make([]*OwnerEntry, 0, len(d.owners))
 	for _, e := range d.owners {
-		if e.Owner != nil {
-			owners = append(owners, e.Owner)
+		if e != nil && e.Owner != nil && !isModernOwnerEntry(e) {
+			entries = append(entries, e)
 		}
 	}
 	d.mu.RUnlock()
 
-	for _, o := range owners {
-		if o.HasHandoffUpstream() {
+	for _, entry := range entries {
+		if entry.Owner.HasHandoffUpstream() {
 			return true
 		}
 	}

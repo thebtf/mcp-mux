@@ -7,9 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 // mockFDConn implements fdConn using in-memory channels for unit testing.
@@ -269,10 +274,14 @@ type scriptedHandoffConn struct {
 	fds    [][]uintptr
 	fdAt   int
 	closed []uintptr
+	writes []any
 	schema handoffHandleSchema
 }
 
-func (c *scriptedHandoffConn) WriteJSON(any) error { return nil }
+func (c *scriptedHandoffConn) WriteJSON(v any) error {
+	c.writes = append(c.writes, v)
+	return nil
+}
 
 func (c *scriptedHandoffConn) ReadJSON(v any) error {
 	if c.readAt >= len(c.reads) {
@@ -553,4 +562,348 @@ func TestReceiveHandoff_FinalAckFailureClosesTakenStderrHandle(t *testing.T) {
 	if len(base.closed) != 3 || base.closed[0] != 31 || base.closed[1] != 32 || base.closed[2] != 33 {
 		t.Fatalf("closed handles=%v, want stdin/stdout/stderr [31 32 33]", base.closed)
 	}
+}
+
+func spawnHandoffProcessOwner(t *testing.T, d *Daemon, protocolEra string) *OwnerEntry {
+	t.Helper()
+	_, serverID, _, err := d.Spawn(control.Request{
+		Cmd:         "spawn",
+		Command:     "go",
+		Args:        []string{"run", "../../testdata/mock_server.go"},
+		Cwd:         ".",
+		Mode:        "global",
+		ProtocolEra: protocolEra,
+	})
+	if err != nil {
+		t.Fatalf("Spawn() process-backed owner: %v", err)
+	}
+
+	var entry *OwnerEntry
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		entry = d.Entry(serverID)
+		return entry != nil && entry.Owner != nil && entry.Owner.HasHandoffUpstream() && entry.Owner.IsAccepting() && entry.Owner.MaterializationState() == owner.MaterializationReady
+	}, "process-backed owner did not become handoff-ready")
+	return entry
+}
+
+func TestModernOnlyDaemonHasNoHandoffEligibleUpstream(t *testing.T) {
+	d := testDaemon(t)
+	entry := spawnHandoffProcessOwner(t, d, "2026-07-28")
+
+	if got := entry.ProtocolEra; got != era.EraModern20260728 {
+		t.Fatalf("ProtocolEra = %v, want modern 2026-07-28", got)
+	}
+	if !strings.HasPrefix(entry.ServerID, "native-") {
+		t.Fatalf("modern ServerID = %q, want native-<hex>", entry.ServerID)
+	}
+	beforePID := entry.Owner.Status()["upstream_pid"]
+
+	if d.hasHandoffUpstreamOwners() {
+		t.Fatal("modern-only daemon reports a handoff-eligible upstream")
+	}
+	if d.Entry(entry.ServerID) != entry {
+		t.Fatal("modern owner entry changed while checking handoff eligibility")
+	}
+	if !entry.Owner.IsAccepting() {
+		t.Fatal("modern owner listener stopped while checking handoff eligibility")
+	}
+	if !entry.Owner.HasHandoffUpstream() {
+		t.Fatal("modern owner process detached while checking handoff eligibility")
+	}
+	if got := entry.Owner.Status()["upstream_pid"]; got != beforePID {
+		t.Fatalf("modern upstream PID changed from %v to %v", beforePID, got)
+	}
+	select {
+	case <-entry.Owner.Done():
+		t.Fatal("modern owner completed while checking handoff eligibility")
+	default:
+	}
+}
+
+func TestCollectHandoffUpstreamsLeavesModernOwnerUntouched(t *testing.T) {
+	d := testDaemon(t)
+	legacy := spawnHandoffProcessOwner(t, d, "")
+	modern := spawnHandoffProcessOwner(t, d, "2026-07-28")
+
+	if got := legacy.ProtocolEra; got != era.EraLegacy {
+		t.Fatalf("legacy ProtocolEra = %v, want legacy", got)
+	}
+	if got := modern.ProtocolEra; got != era.EraModern20260728 {
+		t.Fatalf("modern ProtocolEra = %v, want modern 2026-07-28", got)
+	}
+	beforePID := modern.Owner.Status()["upstream_pid"]
+	beforeState := modern.Owner.MaterializationState()
+
+	upstreams := d.collectHandoffUpstreams()
+	t.Cleanup(func() {
+		if err := settleHandoffUpstreams(upstreams, nil); err != nil {
+			t.Errorf("abort prepared legacy handoff lease: %v", err)
+		}
+	})
+
+	var legacyPrepared, modernPrepared bool
+	for _, upstream := range upstreams {
+		switch upstream.ServerID {
+		case legacy.ServerID:
+			legacyPrepared = true
+		case modern.ServerID:
+			modernPrepared = true
+		default:
+			t.Errorf("prepared unexpected handoff upstream %q", upstream.ServerID)
+		}
+	}
+	if !legacyPrepared {
+		t.Errorf("legacy owner %q was not prepared for handoff", legacy.ServerID)
+	}
+	if modernPrepared {
+		t.Errorf("modern owner %q was prepared for legacy handoff", modern.ServerID)
+	}
+	if got, want := len(upstreams), 1; got != want {
+		t.Errorf("prepared handoff upstreams = %d, want %d legacy-only", got, want)
+	}
+	if d.Entry(modern.ServerID) != modern {
+		t.Error("modern owner entry changed during legacy handoff collection")
+	}
+	if !modern.Owner.IsAccepting() {
+		t.Error("modern owner listener changed during legacy handoff collection")
+	}
+	if !modern.Owner.HasHandoffUpstream() {
+		t.Error("modern owner process detached during legacy handoff collection")
+	}
+	if got := modern.Owner.Status()["upstream_pid"]; got != beforePID {
+		t.Errorf("modern upstream PID changed from %v to %v", beforePID, got)
+	}
+	if got := modern.Owner.MaterializationState(); got != beforeState {
+		t.Errorf("modern materialization state changed from %s to %s", beforeState, got)
+	}
+	select {
+	case <-modern.Owner.Done():
+		t.Error("modern owner completed during legacy handoff collection")
+	default:
+	}
+}
+
+func TestPerformHandoffQuarantinesNativeUpstreamBeforeFDTransfer(t *testing.T) {
+	const nativeID = "native-a1b2c3d4e5f60708"
+
+	var committed, aborted int
+	upstream := HandoffUpstream{
+		ServerID: nativeID,
+		Command:  "native-command",
+		PID:      101,
+		StdinFD:  11,
+		StdoutFD: 12,
+		StderrFD: 13,
+		commit:   func() error { committed++; return nil },
+		abort:    func() error { aborted++; return nil },
+	}
+	oldConn, successorConn := newMockFDConnPair()
+	if err := successorConn.WriteJSON(NewHelloMsg("secret")); err != nil {
+		t.Fatalf("send successor hello: %v", err)
+	}
+
+	type peerResult struct {
+		ready     ReadyMsg
+		transfers int
+		done      DoneMsg
+		err       error
+	}
+	peerDone := make(chan peerResult, 1)
+	go func() {
+		result := peerResult{}
+		defer func() { peerDone <- result }()
+
+		if err := successorConn.ReadJSON(&result.ready); err != nil {
+			result.err = err
+			return
+		}
+		accepted := make([]string, 0, len(result.ready.Upstreams))
+		for _, ref := range result.ready.Upstreams {
+			var transfer FdTransferMsg
+			if err := successorConn.ReadJSON(&transfer); err != nil {
+				result.err = err
+				return
+			}
+			fds, _, err := successorConn.RecvFDs()
+			if err != nil {
+				result.err = err
+				return
+			}
+			if transfer.ServerID != ref.ServerID || len(fds) != 3 {
+				result.err = errors.New("successor received invalid native transfer")
+				return
+			}
+			result.transfers++
+			accepted = append(accepted, ref.ServerID)
+			if err := successorConn.WriteJSON(NewAckTransferMsg(ref.ServerID, true, nil)); err != nil {
+				result.err = err
+				return
+			}
+		}
+		if err := successorConn.ReadJSON(&result.done); err != nil {
+			result.err = err
+			return
+		}
+		if err := successorConn.WriteJSON(NewHandoffAckResult(accepted, nil)); err != nil {
+			result.err = err
+		}
+	}()
+
+	result, err := performHandoff(context.Background(), oldConn, "secret", []HandoffUpstream{upstream})
+	if err != nil {
+		t.Fatalf("performHandoff: %v", err)
+	}
+	peer := <-peerDone
+	if peer.err != nil {
+		t.Fatalf("successor peer: %v", peer.err)
+	}
+	if got := len(peer.ready.Upstreams); got != 0 {
+		t.Errorf("ready announced %d native upstreams, want none", got)
+	}
+	if peer.transfers != 0 {
+		t.Errorf("native upstream transferred %d handle batches, want none", peer.transfers)
+	}
+	if len(peer.done.Transferred) != 0 || len(peer.done.Aborted) != 0 {
+		t.Errorf("done partition = transferred %v aborted %v, want quarantined native ID absent from wire", peer.done.Transferred, peer.done.Aborted)
+	}
+	if len(result.Transferred) != 0 || len(result.Aborted) != 1 || result.Aborted[0] != nativeID {
+		t.Errorf("handoff result = transferred %v aborted %v, want native aborted", result.Transferred, result.Aborted)
+	}
+	if committed != 0 || aborted != 1 {
+		t.Errorf("native lease settlement = committed %d aborted %d, want 0/1", committed, aborted)
+	}
+}
+
+func TestPerformHandoffNativeQuarantineRemainsReceiptCompatible(t *testing.T) {
+	const nativeID = "native-a1b2c3d4e5f60708"
+	var committed, aborted int
+	upstream := HandoffUpstream{
+		ServerID: nativeID,
+		Command:  "native-command",
+		PID:      101,
+		StdinFD:  11,
+		StdoutFD: 12,
+		StderrFD: 13,
+		commit:   func() error { committed++; return nil },
+		abort:    func() error { aborted++; return nil },
+	}
+	oldConn, successorConn := newMockFDConnPair()
+	type performResult struct {
+		result HandoffResult
+		err    error
+	}
+	performDone := make(chan performResult, 1)
+	receiveDone := make(chan struct {
+		upstreams []HandoffUpstream
+		err       error
+	}, 1)
+	go func() {
+		result, err := performHandoff(context.Background(), oldConn, "secret", []HandoffUpstream{upstream})
+		performDone <- performResult{result: result, err: err}
+	}()
+	go func() {
+		upstreams, err := receiveHandoff(context.Background(), successorConn, "secret")
+		receiveDone <- struct {
+			upstreams []HandoffUpstream
+			err       error
+		}{upstreams: upstreams, err: err}
+	}()
+
+	performed := <-performDone
+	received := <-receiveDone
+	if performed.err != nil {
+		t.Fatalf("performHandoff: %v", performed.err)
+	}
+	if received.err != nil {
+		t.Fatalf("receiveHandoff: %v", received.err)
+	}
+	if len(received.upstreams) != 0 {
+		t.Fatalf("successor received quarantined native upstreams: %+v", received.upstreams)
+	}
+	if len(performed.result.Transferred) != 0 || len(performed.result.Aborted) != 1 || performed.result.Aborted[0] != nativeID {
+		t.Fatalf("handoff result = transferred %v aborted %v, want native aborted locally", performed.result.Transferred, performed.result.Aborted)
+	}
+	if committed != 0 || aborted != 1 {
+		t.Fatalf("native lease settlement = committed %d aborted %d, want 0/1", committed, aborted)
+	}
+}
+
+func TestPrepareHandoffReceiveQuarantinesNativeReady(t *testing.T) {
+	const nativeID = "native-a1b2c3d4e5f60708"
+
+	t.Run("refuses before handle receipt", func(t *testing.T) {
+		conn := &scriptedHandoffConn{
+			schema: handoffHandleSchema{count: 3},
+			reads: []scriptedHandoffRead{
+				{msg: NewReadyMsg([]UpstreamRef{{ServerID: nativeID, Command: "native-command", PID: 101}})},
+				{msg: NewFdTransferMsgWithStderr(nativeID, HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"}, HandleMeta{Kind: "stderr"})},
+				{msg: NewDoneMsg([]string{nativeID}, nil)},
+			},
+			fds: [][]uintptr{{31, 32, 33}},
+		}
+
+		receipt, err := prepareHandoffReceive(context.Background(), conn, "secret")
+		if receipt != nil {
+			t.Cleanup(receipt.abort)
+		}
+		if err == nil {
+			t.Error("prepareHandoffReceive accepted native Ready, want quarantine failure")
+		}
+		if conn.readAt != 1 {
+			t.Errorf("native Ready consumed %d protocol messages, want Ready only", conn.readAt)
+		}
+		if conn.fdAt != 0 {
+			t.Errorf("native Ready received %d handle batches, want none", conn.fdAt)
+		}
+		if receipt != nil && (len(receipt.received) != 0 || len(receipt.owned) != 0 || len(receipt.taken) != 0) {
+			t.Errorf("native Ready created receipt state: received=%v owned=%v taken=%v", receipt.received, receipt.owned, receipt.taken)
+		}
+		for _, write := range conn.writes {
+			if ack, ok := write.(AckTransferMsg); ok && ack.Type == MsgAckTransfer {
+				t.Errorf("native Ready emitted receipt ack for %q", ack.ServerID)
+			}
+		}
+	})
+
+	t.Run("legacy final partition remains valid", func(t *testing.T) {
+		const legacyID = "legacy-handoff"
+		conn := &scriptedHandoffConn{
+			schema: handoffHandleSchema{count: 3},
+			reads: []scriptedHandoffRead{
+				{msg: NewReadyMsg([]UpstreamRef{{ServerID: legacyID, Command: "legacy-command", PID: 102}})},
+				{msg: NewFdTransferMsgWithStderr(legacyID, HandleMeta{Kind: "stdin"}, HandleMeta{Kind: "stdout"}, HandleMeta{Kind: "stderr"})},
+				{msg: NewDoneMsg([]string{legacyID}, nil)},
+			},
+			fds: [][]uintptr{{41, 42, 43}},
+		}
+
+		receipt, err := prepareHandoffReceive(context.Background(), conn, "secret")
+		if err != nil {
+			t.Fatalf("prepareHandoffReceive legacy: %v", err)
+		}
+		t.Cleanup(receipt.abort)
+		upstream, ok := receipt.take(legacyID)
+		if !ok || upstream.ServerID != legacyID {
+			t.Fatalf("take legacy upstream = %+v, %t", upstream, ok)
+		}
+		if err := receipt.finalize([]string{legacyID}); err != nil {
+			t.Fatalf("finalize legacy receipt: %v", err)
+		}
+		if conn.fdAt != 1 {
+			t.Errorf("legacy Ready received %d handle batches, want 1", conn.fdAt)
+		}
+		if len(conn.closed) != 0 {
+			t.Errorf("legacy adopted handles were closed: %v", conn.closed)
+		}
+		if len(conn.writes) == 0 {
+			t.Fatal("legacy receipt did not write a final handoff acknowledgment")
+		}
+		ack, ok := conn.writes[len(conn.writes)-1].(HandoffAckMsg)
+		if !ok {
+			t.Fatalf("legacy final message = %T, want HandoffAckMsg", conn.writes[len(conn.writes)-1])
+		}
+		if len(ack.Accepted) != 1 || ack.Accepted[0] != legacyID || len(ack.Aborted) != 0 {
+			t.Errorf("legacy final partition = accepted %v aborted %v, want legacy accepted", ack.Accepted, ack.Aborted)
+		}
+	})
 }

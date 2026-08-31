@@ -215,13 +215,16 @@ func (d *Daemon) acquireSnapshotOwnerPins() ([]snapshotOwnerPin, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for sid, entry := range d.owners {
-		if entry != nil && entry.Owner != nil && entry.removalInProgress {
+		if entry == nil || entry.Owner == nil || isModernOwnerEntry(entry) {
+			continue
+		}
+		if entry.removalInProgress {
 			return nil, fmt.Errorf("snapshot owner %s removal is still finalizing", shortServerID(sid))
 		}
 	}
 	pins := make([]snapshotOwnerPin, 0, len(d.owners))
 	for sid, entry := range d.owners {
-		if entry.Owner == nil {
+		if entry == nil || entry.Owner == nil || isModernOwnerEntry(entry) {
 			continue
 		}
 		if entry.snapshotPins == 0 {
@@ -435,6 +438,9 @@ func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) sn
 
 func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffUpstream, restoreSource string, eager, publishTemplate bool) (*OwnerEntry, bool, error) {
 	snap := plan.snapshot
+	if isModernSnapshotRecord(snap) {
+		return nil, false, unsafeLifecycleBoundaryError()
+	}
 	if isRestartRestoreMode() {
 		// Snapshot capture cannot exclude a late list_changed or discovery
 		// response from the predecessor. Preserve initialize for protocol and
@@ -650,6 +656,9 @@ func (d *Daemon) loadSnapshot() int {
 	restored := 0
 
 	for _, ownerSnap := range snap.Owners {
+		if isModernSnapshotRecord(ownerSnap) {
+			continue
+		}
 		if ownerSnap.Classification == classify.ModeIsolated && len(ownerSnap.CwdSet) > 1 {
 			d.logger.Printf("snapshot: healing poisoned isolated owner %s: cwdSet %v -> [%s]",
 				shortServerID(ownerSnap.ServerID), ownerSnap.CwdSet, ownerSnap.Cwd)
@@ -757,15 +766,20 @@ func (d *Daemon) loadSnapshotMetadataOnly(reason string) int {
 	d.mu.Unlock()
 
 	restoreCaches := !isRestartRestoreMode()
+	eligible := 0
 	for _, ownerSnap := range snap.Owners {
+		if isModernSnapshotRecord(ownerSnap) {
+			continue
+		}
+		eligible++
 		if restoreCaches && ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
 			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
 		}
 		d.rehydrateRetryCounter(ownerSnap.ServerID, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)
 	}
 
-	d.logger.Printf("snapshot: deferred restore of %d owners (%s)", len(snap.Owners), reason)
-	return len(snap.Owners)
+	d.logger.Printf("snapshot: deferred restore of %d owners (%s)", eligible, reason)
+	return eligible
 }
 
 // restoreHealthGateWindow is the time we allow newly-restored owners to fully
