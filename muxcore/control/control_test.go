@@ -1075,3 +1075,62 @@ func TestControlServer_ReadDeadlineFiresOnSilentClient(t *testing.T) {
 			elapsed, deadline, clientDeadline, slack)
 	}
 }
+
+func TestProtocolEraJSONCompatibility(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{
+			name:  "legacy request omits era",
+			value: Request{Cmd: "spawn"},
+			want:  `{"cmd":"spawn"}`,
+		},
+		{
+			name:  "modern request writes exact era",
+			value: Request{Cmd: "spawn", ProtocolEra: "2026-07-28"},
+			want:  `{"cmd":"spawn","protocol_era":"2026-07-28"}`,
+		},
+		{
+			name:  "legacy response omits era",
+			value: Response{OK: true},
+			want:  `{"ok":true}`,
+		},
+		{
+			name:  "modern response writes exact era",
+			value: Response{OK: true, ProtocolEra: "2026-07-28"},
+			want:  `{"ok":true,"protocol_era":"2026-07-28"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.value)
+			if err != nil {
+				t.Fatalf("json.Marshal(%T) error = %v", tt.value, err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("json.Marshal(%T) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProtocolEraUnknownJSONFieldsRemainTolerated(t *testing.T) {
+	var request Request
+	if err := json.Unmarshal([]byte(`{"cmd":"spawn","unknown_request_field":true}`), &request); err != nil {
+		t.Fatalf("unmarshal request with unknown field: %v", err)
+	}
+	if request.Cmd != "spawn" {
+		t.Fatalf("request command = %q, want spawn", request.Cmd)
+	}
+
+	var response Response
+	if err := json.Unmarshal([]byte(`{"ok":true,"unknown_response_field":true}`), &response); err != nil {
+		t.Fatalf("unmarshal response with unknown field: %v", err)
+	}
+	if !response.OK {
+		t.Fatal("response OK = false, want true")
+	}
+}

@@ -31,17 +31,19 @@ type Request struct {
 
 	// PrevToken is the previously consumed session token used by the daemon's
 	// "refresh-token" command to mint a fresh reconnect token for the same owner.
-	PrevToken string `json:"prev_token,omitempty"`
+	PrevToken   string `json:"prev_token,omitempty"`
+	ProtocolEra string `json:"protocol_era,omitempty"`
 }
 
 // Response is the reply to a control command.
 type Response struct {
-	OK       bool            `json:"ok"`
-	Message  string          `json:"message,omitempty"`
-	Data     json.RawMessage `json:"data,omitempty"`
-	IPCPath  string          `json:"ipc_path,omitempty"`
-	ServerID string          `json:"server_id,omitempty"`
-	Token    string          `json:"token,omitempty"` // handshake token for session binding
+	OK          bool            `json:"ok"`
+	Message     string          `json:"message,omitempty"`
+	Data        json.RawMessage `json:"data,omitempty"`
+	IPCPath     string          `json:"ipc_path,omitempty"`
+	ServerID    string          `json:"server_id,omitempty"`
+	Token       string          `json:"token,omitempty"` // handshake token for session binding
+	ProtocolEra string          `json:"protocol_era,omitempty"`
 }
 
 // CommandHandler is implemented by the Owner to handle control commands.
