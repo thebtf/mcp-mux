@@ -5,15 +5,25 @@
 param(
     [int]$WatchSeconds = 1,
     [int]$TimeoutSeconds = 60,
-    [string]$Launcher = $env:MCP_LAUNCHER
+    [string]$Launcher = $env:MCP_LAUNCHER,
+    [string]$ArtifactRoot = $env:MCP_MUX_ARTIFACT_ROOT
 )
 
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$RunDir = Join-Path $RepoRoot ".agent\tmp\critical-suite-$Stamp"
-$ReportsDir = Join-Path $RepoRoot ".agent\reports"
+if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+    $gitCommonDir = (& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommonDir)) {
+        throw "cannot resolve the primary repository from the candidate worktree"
+    }
+    $primaryRoot = Split-Path -Parent ([System.IO.Path]::GetFullPath($gitCommonDir))
+    $ArtifactRoot = Join-Path $primaryRoot ".agent"
+}
+$ArtifactRoot = [System.IO.Path]::GetFullPath($ArtifactRoot)
+$RunDir = Join-Path $ArtifactRoot "tmp\critical-suite-$Stamp"
+$ReportsDir = Join-Path $ArtifactRoot "reports"
 $Binary = Join-Path $RunDir "mcp-mux.exe"
 $SmokeEvidence = Join-Path $ReportsDir "critical-smoke-time-upstream-$Stamp.json"
 $NativeUpdateEvidence = Join-Path $ReportsDir "critical-native-sessionhandler-update-$Stamp.json"
@@ -93,6 +103,7 @@ try {
         & .\scripts\smoke-time-upstream.ps1 `
             -Binary $Binary `
             -EvidencePath $SmokeEvidence `
+            -RuntimeDir (Join-Path $RunDir "time-upstream") `
             -TimeoutSeconds $TimeoutSeconds
         if ($LASTEXITCODE -ne 0) {
             throw "smoke-time-upstream exited with code $LASTEXITCODE"
@@ -100,7 +111,7 @@ try {
     }
 
     Invoke-CriticalStep "current topology proofing oracle" {
-        & .\scripts\run-current-topology-poc.ps1 -Launcher $Launcher -WatchSeconds $WatchSeconds
+        & .\scripts\run-current-topology-poc.ps1 -Launcher $Launcher -WatchSeconds $WatchSeconds -RuntimeDir (Join-Path $RunDir "current-topology")
         if ($LASTEXITCODE -ne 0) {
             throw "run-current-topology-poc exited with code $LASTEXITCODE"
         }

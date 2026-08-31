@@ -81,10 +81,10 @@ function Start-FixtureSession {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
-    $psi.Environment["NATIVE_FIXTURE_BASE_DIR"] = $BaseDir
-    $psi.Environment["NATIVE_FIXTURE_LOG_PATH"] = $FixtureLog
-    $psi.Environment["TEMP"] = $RunDir
-    $psi.Environment["TMP"] = $RunDir
+    $psi.EnvironmentVariables["NATIVE_FIXTURE_BASE_DIR"] = $BaseDir
+    $psi.EnvironmentVariables["NATIVE_FIXTURE_LOG_PATH"] = $FixtureLog
+    $psi.EnvironmentVariables["TEMP"] = $RunDir
+    $psi.EnvironmentVariables["TMP"] = $RunDir
 
     $proc = [System.Diagnostics.Process]::new()
     $proc.StartInfo = $psi
