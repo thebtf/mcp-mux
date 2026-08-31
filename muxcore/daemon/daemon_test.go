@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -453,6 +454,81 @@ func TestDaemonModernSpawnForcesIsolationAndRejectsEqualLegacyReuse(t *testing.T
 	}
 	if got, want := entry.Mode, string(serverid.ModeIsolated); got != want {
 		t.Errorf("modern owner sharing mode = %q, want forced isolation %q", got, want)
+	}
+}
+
+// TestDaemonControlSpawnRejectsUnknownEraBeforeOwnerAdmission ensures a
+// future/invalid control-era request cannot consume a handshake token or touch
+// an existing owner's identity, session reservation, or reuse metadata.
+func TestDaemonControlSpawnRejectsUnknownEraBeforeOwnerAdmission(t *testing.T) {
+	d := testDaemon(t)
+	request := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	}
+
+	_, sid, _, err := d.Spawn(request)
+	if err != nil {
+		t.Fatalf("initial legacy Spawn() error: %v", err)
+	}
+	before := d.Entry(sid)
+	if before == nil || before.Owner == nil {
+		t.Fatal("initial legacy Spawn() did not retain an owner")
+	}
+	ownerBefore := before.Owner
+	pendingBefore := ownerBefore.SessionMgr().PendingCount()
+	lastSessionBefore := before.LastSession
+	ownerCountBefore := d.OwnerCount()
+
+	originalGenerateToken := generateTokenFunc
+	var tokenCalls atomic.Int64
+	generateTokenFunc = func() (string, error) {
+		tokenCalls.Add(1)
+		return "", errors.New("unexpected token generation for rejected era")
+	}
+	t.Cleanup(func() { generateTokenFunc = originalGenerateToken })
+
+	for _, protocolEra := range []string{"legacy", "2026-07-29"} {
+		t.Run(protocolEra, func(t *testing.T) {
+			response, sendErr := control.Send(d.ctlSrv.SocketPath(), control.Request{
+				Cmd:             request.Cmd,
+				Command:         request.Command,
+				Args:            request.Args,
+				Mode:            request.Mode,
+				ProtocolEra:     protocolEra,
+				ReconnectReason: "fallback_spawn",
+			})
+			if sendErr != nil {
+				t.Fatalf("control.Send() error: %v", sendErr)
+			}
+			if response.OK {
+				t.Fatalf("invalid protocol era response = %+v, want rejection", response)
+			}
+			if response.IPCPath != "" || response.ServerID != "" || response.Token != "" || response.ProtocolEra != "" {
+				t.Errorf("rejected response leaked spawn attachment data: %+v", response)
+			}
+			if got := tokenCalls.Load(); got != 0 {
+				t.Fatalf("rejected era generated %d handshake tokens, want 0", got)
+			}
+			if got := d.OwnerCount(); got != ownerCountBefore {
+				t.Fatalf("OwnerCount() = %d, want unchanged %d", got, ownerCountBefore)
+			}
+			after := d.Entry(sid)
+			if after == nil || after.Owner != ownerBefore {
+				t.Fatal("rejected era replaced or removed the existing owner")
+			}
+			if got := after.Owner.SessionMgr().PendingCount(); got != pendingBefore {
+				t.Errorf("owner pending reservations = %d, want unchanged %d", got, pendingBefore)
+			}
+			if !after.LastSession.Equal(lastSessionBefore) {
+				t.Errorf("owner LastSession changed from %s to %s during rejected era admission", lastSessionBefore, after.LastSession)
+			}
+			if got := d.HandleStatus()["shim_reconnect_fallback_spawned"]; got != uint64(0) {
+				t.Errorf("shim_reconnect_fallback_spawned = %v, want 0 after rejected era", got)
+			}
+		})
 	}
 }
 

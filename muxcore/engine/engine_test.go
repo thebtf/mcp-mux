@@ -20,6 +20,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -1589,4 +1590,348 @@ func classifyEngineSC001Opening(t *testing.T, index int, raw string) (string, bo
 	}
 	_, hasClientInfo := meta["io.modelcontextprotocol/clientInfo"]
 	return envelope.Method, hasClientInfo
+}
+
+func TestRunClientModernPolicyRejectsSelectorBeforeDaemonAdmission(t *testing.T) {
+	tests := []struct {
+		name          string
+		opening       string
+		wantKind      era.AdmissionErrorKind
+		wantCode      int
+		wantID        string
+		wantSupported []string
+		wantRequested string
+	}{
+		{
+			name:     "missing modern metadata",
+			opening:  `{"jsonrpc":"2.0","id":101,"method":"tools/list","params":{}}` + "\n",
+			wantKind: era.AdmissionInvalidModernParams,
+			wantCode: -32602,
+			wantID:   "101",
+		},
+		{
+			name:          "unsupported declared version",
+			opening:       `{"jsonrpc":"2.0","id":102,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-03-26","io.modelcontextprotocol/clientCapabilities":{}}}}` + "\n",
+			wantKind:      era.AdmissionUnsupportedModernVersion,
+			wantCode:      -32022,
+			wantID:        "102",
+			wantSupported: []string{"2026-07-28"},
+			wantRequested: "2025-03-26",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			const name = "engine-modern-selector-refusal"
+			controlServer := startEngineAdmissionControlServer(t, serverid.DaemonControlPath(baseDir, name), true, "2026-07-28")
+			readStdout := redirectEngineClientStdio(t, testCase.opening)
+
+			eng, err := New(Config{
+				Name:           name,
+				Namespace:      name,
+				Command:        "test-command",
+				BaseDir:        baseDir,
+				ProtocolPolicy: era.PolicyModern20260728,
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			originalRunResilientClient := runResilientClient
+			bridgeCalls := 0
+			runResilientClient = func(owner.ResilientClientConfig) error {
+				bridgeCalls++
+				return errors.New("resilient bridge must not run after selector refusal")
+			}
+			t.Cleanup(func() { runResilientClient = originalRunResilientClient })
+
+			runErr := eng.runClient(context.Background())
+			var admissionErr *era.AdmissionError
+			if !errors.As(runErr, &admissionErr) {
+				t.Errorf("runClient() error = %v, want AdmissionError(%s)", runErr, testCase.wantKind)
+			} else if got := admissionErr.Kind(); got != testCase.wantKind {
+				t.Errorf("AdmissionError.Kind() = %s, want %s", got, testCase.wantKind)
+			}
+
+			if got := controlServer.commandCount(); got != 0 {
+				t.Errorf("daemon control calls = %d, want 0 before selector refusal", got)
+			}
+			if bridgeCalls != 0 {
+				t.Errorf("resilient bridge calls = %d, want 0 after selector refusal", bridgeCalls)
+			}
+
+			assertEngineAdmissionResponse(t, string(readStdout()), testCase.wantID, testCase.wantCode, testCase.wantSupported, testCase.wantRequested)
+		})
+	}
+}
+
+func TestRunClientModernPolicyRejectsBadControlEchoBeforeResilientBridge(t *testing.T) {
+	const validOpening = `{"jsonrpc":"2.0","id":201,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}` + "\n"
+
+	tests := []struct {
+		name        string
+		echoPresent bool
+		echo        string
+	}{
+		{name: "absent echo"},
+		{name: "old daemon echo", echoPresent: true, echo: "2025-03-26"},
+		{name: "unknown echo", echoPresent: true, echo: "not-a-supported-era"},
+		{name: "mismatched legacy echo", echoPresent: true, echo: ""},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			baseDir := t.TempDir()
+			const name = "engine-modern-control-echo"
+			controlServer := startEngineAdmissionControlServer(t, serverid.DaemonControlPath(baseDir, name), testCase.echoPresent, testCase.echo)
+			readStdout := redirectEngineClientStdio(t, validOpening)
+
+			eng, err := New(Config{
+				Name:           name,
+				Namespace:      name,
+				Command:        "test-command",
+				BaseDir:        baseDir,
+				ProtocolPolicy: era.PolicyModern20260728,
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			originalRunResilientClient := runResilientClient
+			bridgeCalls := 0
+			runResilientClient = func(owner.ResilientClientConfig) error {
+				bridgeCalls++
+				return errors.New("resilient bridge must not run after control-era refusal")
+			}
+			t.Cleanup(func() { runResilientClient = originalRunResilientClient })
+
+			runErr := eng.runClient(context.Background())
+			var admissionErr *era.AdmissionError
+			if !errors.As(runErr, &admissionErr) {
+				t.Errorf("runClient() error = %v, want AdmissionError(%s)", runErr, era.AdmissionControlEraMismatch)
+			} else if got := admissionErr.Kind(); got != era.AdmissionControlEraMismatch {
+				t.Errorf("AdmissionError.Kind() = %s, want %s", got, era.AdmissionControlEraMismatch)
+			}
+			if errors.Is(runErr, era.AdmissionUnsupportedModernVersion) {
+				t.Errorf("runClient() error = %v, must not classify a local control echo as -32022", runErr)
+			}
+
+			if got := controlServer.commandCountFor("ping"); got != 1 {
+				t.Errorf("control ping calls = %d, want 1", got)
+			}
+			if got := controlServer.commandCountFor("spawn"); got != 1 {
+				t.Errorf("control spawn calls = %d, want 1", got)
+			}
+			if bridgeCalls != 0 {
+				t.Errorf("resilient bridge calls = %d, want 0 after control-era refusal", bridgeCalls)
+			}
+			if output := string(readStdout()); strings.Contains(output, "-32022") {
+				t.Errorf("local control-echo output = %q, must not claim -32022", output)
+			}
+		})
+	}
+}
+
+func redirectEngineClientStdio(t *testing.T, input string) func() []byte {
+	t.Helper()
+	stdin, err := os.CreateTemp(t.TempDir(), "engine-admission-stdin-*.ndjson")
+	if err != nil {
+		t.Fatalf("create engine stdin fixture: %v", err)
+	}
+	if _, err := io.WriteString(stdin, input); err != nil {
+		stdin.Close()
+		t.Fatalf("write engine stdin fixture: %v", err)
+	}
+	if _, err := stdin.Seek(0, io.SeekStart); err != nil {
+		stdin.Close()
+		t.Fatalf("rewind engine stdin fixture: %v", err)
+	}
+
+	stdout, err := os.CreateTemp(t.TempDir(), "engine-admission-stdout-*.ndjson")
+	if err != nil {
+		stdin.Close()
+		t.Fatalf("create engine stdout fixture: %v", err)
+	}
+
+	originalStdin, originalStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdin, stdout
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout = originalStdin, originalStdout
+		stdin.Close()
+		stdout.Close()
+	})
+
+	return func() []byte {
+		t.Helper()
+		if _, err := stdout.Seek(0, io.SeekStart); err != nil {
+			t.Fatalf("rewind engine stdout fixture: %v", err)
+		}
+		output, err := io.ReadAll(stdout)
+		if err != nil {
+			t.Fatalf("read engine stdout fixture: %v", err)
+		}
+		return output
+	}
+}
+
+func assertEngineAdmissionResponse(t *testing.T, output, wantID string, wantCode int, wantSupported []string, wantRequested string) {
+	t.Helper()
+	if !strings.HasSuffix(output, "\n") {
+		t.Errorf("admission output = %q, want newline-delimited JSON-RPC response", output)
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(output))
+	var response struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  json.RawMessage `json:"result"`
+		Error   *struct {
+			Code    int             `json:"code"`
+			Message string          `json:"message"`
+			Data    json.RawMessage `json:"data"`
+		} `json:"error"`
+	}
+	if err := decoder.Decode(&response); err != nil {
+		t.Fatalf("decode admission output %q: %v", output, err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err == nil {
+		t.Errorf("admission output contains more than one JSON-RPC response: %q", output)
+	} else if !errors.Is(err, io.EOF) {
+		t.Errorf("decode trailing admission output %q: %v", output, err)
+	}
+
+	if got := response.JSONRPC; got != "2.0" {
+		t.Errorf("response jsonrpc = %q, want 2.0", got)
+	}
+	if got := string(response.ID); got != wantID {
+		t.Errorf("response id = %s, want %s", got, wantID)
+	}
+	if len(response.Result) != 0 {
+		t.Errorf("error response unexpectedly contains result = %s", response.Result)
+	}
+	if response.Error == nil {
+		t.Fatal("response has no JSON-RPC error")
+	}
+	if got := response.Error.Code; got != wantCode {
+		t.Errorf("response error code = %d, want %d", got, wantCode)
+	}
+	if response.Error.Message == "" {
+		t.Error("response error message is empty")
+	}
+	if wantSupported == nil {
+		return
+	}
+
+	var data struct {
+		Supported []string `json:"supported"`
+		Requested string   `json:"requested"`
+	}
+	if err := json.Unmarshal(response.Error.Data, &data); err != nil {
+		t.Fatalf("decode unsupported-version response data %s: %v", response.Error.Data, err)
+	}
+	if len(data.Supported) != len(wantSupported) {
+		t.Errorf("response supported versions = %q, want %q", data.Supported, wantSupported)
+	} else {
+		for index, want := range wantSupported {
+			if got := data.Supported[index]; got != want {
+				t.Errorf("response supported version[%d] = %q, want %q", index, got, want)
+			}
+		}
+	}
+	if got := data.Requested; got != wantRequested {
+		t.Errorf("response requested version = %q, want %q", got, wantRequested)
+	}
+}
+
+type engineAdmissionControlServer struct {
+	mu            sync.Mutex
+	commandCounts map[string]int
+	echoPresent   bool
+	echo          string
+}
+
+func startEngineAdmissionControlServer(t *testing.T, socketPath string, echoPresent bool, echo string) *engineAdmissionControlServer {
+	t.Helper()
+	listener, err := ipc.Listen(socketPath)
+	if err != nil {
+		t.Fatalf("listen for engine admission control: %v", err)
+	}
+
+	server := &engineAdmissionControlServer{
+		commandCounts: make(map[string]int),
+		echoPresent:   echoPresent,
+		echo:          echo,
+	}
+	go func() {
+		for {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go server.serve(connection)
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		ipc.Cleanup(socketPath)
+	})
+	return server
+}
+
+func (server *engineAdmissionControlServer) serve(connection io.ReadWriteCloser) {
+	defer connection.Close()
+
+	var request control.Request
+	if err := json.NewDecoder(connection).Decode(&request); err != nil {
+		return
+	}
+	server.mu.Lock()
+	server.commandCounts[request.Cmd]++
+	server.mu.Unlock()
+
+	switch request.Cmd {
+	case "ping":
+		_ = json.NewEncoder(connection).Encode(control.Response{OK: true, Message: "pong"})
+	case "spawn":
+		protocolEra := server.echo
+		response := struct {
+			OK          bool    `json:"ok"`
+			Message     string  `json:"message,omitempty"`
+			IPCPath     string  `json:"ipc_path,omitempty"`
+			ServerID    string  `json:"server_id,omitempty"`
+			Token       string  `json:"token,omitempty"`
+			ProtocolEra *string `json:"protocol_era,omitempty"`
+		}{
+			OK:       true,
+			Message:  "spawned",
+			IPCPath:  "unreachable-ipc",
+			ServerID: "modern-server",
+			Token:    "modern-token",
+		}
+		if server.echoPresent {
+			response.ProtocolEra = &protocolEra
+		}
+		_ = json.NewEncoder(connection).Encode(response)
+	default:
+		_ = json.NewEncoder(connection).Encode(control.Response{OK: false, Message: "unsupported test command"})
+	}
+}
+
+func (server *engineAdmissionControlServer) commandCount() int {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+
+	var count int
+	for _, commandCount := range server.commandCounts {
+		count += commandCount
+	}
+	return count
+}
+
+func (server *engineAdmissionControlServer) commandCountFor(command string) int {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	return server.commandCounts[command]
 }

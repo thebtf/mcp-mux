@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -475,7 +476,6 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 //  3. Connect to the returned IPC socket.
 //  4. Bridge stdin/stdout ↔ IPC with automatic reconnect.
 func (e *MuxEngine) runClient(ctx context.Context) error {
-	e.markReady(ModeClient, nil)
 	protocolEra, err := protocolEraForPolicy(e.cfg.ProtocolPolicy)
 	if err != nil {
 		return err
@@ -485,17 +485,20 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		return fmt.Errorf("engine client: protocol era: %w", err)
 	}
 
-	clientStdin := io.Reader(os.Stdin)
-	if protocolEra == era.EraModern20260728 {
-		opening, remainder, readErr := era.ReadOpeningFrame(os.Stdin)
-		if readErr != nil {
-			return fmt.Errorf("engine client: read modern opening frame: %w", readErr)
-		}
-		rawOpening, available := opening.Take()
+	selection, err := era.SelectOpening(e.cfg.ProtocolPolicy, os.Stdin)
+	if err != nil {
+		writeEngineAdmissionError(os.Stdout, err)
+		return err
+	}
+	e.markReady(ModeClient, nil)
+
+	clientStdin := selection.Remainder
+	if selection.Frame != nil {
+		rawOpening, available := selection.Frame.Take()
 		if !available {
 			return fmt.Errorf("engine client: modern opening frame unavailable")
 		}
-		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), remainder)
+		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), selection.Remainder)
 	}
 
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
@@ -542,6 +545,11 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
 	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, protocolWire, e.logger)
 	if err != nil {
+		if errors.Is(err, era.AdmissionControlEraMismatch) {
+			admission := selection.AdmissionError(era.AdmissionControlEraMismatch)
+			writeEngineAdmissionError(os.Stdout, admission)
+			return admission
+		}
 		return fmt.Errorf("engine client: spawn: %w", err)
 	}
 
@@ -602,6 +610,15 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		EnginePrefix:               e.cfg.Name,
 		Logger:                     e.logger,
 	})
+}
+
+func writeEngineAdmissionError(output io.Writer, err error) {
+	var admission *era.AdmissionError
+	if !errors.As(err, &admission) {
+		return
+	}
+	_, _ = output.Write(admission.JSONRPCResponse())
+	_, _ = output.Write([]byte{'\n'})
 }
 
 func idleSuspendDelay(cfg Config) time.Duration {
@@ -845,7 +862,7 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 	if protocolEra != "" && resp.ProtocolEra != protocolEra {
-		return "", "", "", fmt.Errorf("daemon spawn protocol era = %q, want %q", resp.ProtocolEra, protocolEra)
+		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
 	}
 
 	sid := resp.ServerID

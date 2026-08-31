@@ -14,6 +14,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/rotlog"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -428,7 +429,7 @@ func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, m
 		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
 	if protocolEra != "" && resp.ProtocolEra != protocolEra {
-		return "", "", "", fmt.Errorf("daemon spawn protocol era = %q, want %q", resp.ProtocolEra, protocolEra)
+		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
 	}
 
 	shortID := resp.ServerID

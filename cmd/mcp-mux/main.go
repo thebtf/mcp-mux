@@ -63,6 +63,15 @@ func supervisedDaemonReconnectError(err error) error {
 	return err
 }
 
+func writeCLIAdmissionError(output io.Writer, err error) {
+	var admission *era.AdmissionError
+	if !errors.As(err, &admission) {
+		return
+	}
+	_, _ = output.Write(admission.JSONRPCResponse())
+	_, _ = output.Write([]byte{'\n'})
+}
+
 func main() {
 	if handled, exitCode := maybeRunLauncher(); handled {
 		os.Exit(exitCode)
@@ -171,20 +180,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: --mcp-protocol=2026-07-28 requires daemon control routing")
 		os.Exit(1)
 	}
-
-	clientStdin := io.Reader(os.Stdin)
+	policy := era.PolicyLegacyOnly
 	if protocolEra == era.EraModern20260728 {
-		opening, remainder, readErr := era.ReadOpeningFrame(os.Stdin)
-		if readErr != nil {
-			fmt.Fprintf(os.Stderr, "error: read modern opening frame: %v\n", readErr)
-			os.Exit(1)
-		}
-		rawOpening, available := opening.Take()
+		policy = era.PolicyModern20260728
+	}
+	selection, err := era.SelectOpening(policy, os.Stdin)
+	if err != nil {
+		writeCLIAdmissionError(os.Stdout, err)
+		fmt.Fprintf(os.Stderr, "error: modern opening admission: %v\n", err)
+		os.Exit(1)
+	}
+	clientStdin := selection.Remainder
+	if selection.Frame != nil {
+		rawOpening, available := selection.Frame.Take()
 		if !available {
 			fmt.Fprintln(os.Stderr, "error: modern opening frame unavailable")
 			os.Exit(1)
 		}
-		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), remainder)
+		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), selection.Remainder)
 	}
 
 	// Get current working directory
@@ -245,6 +258,9 @@ func main() {
 			spawnStart := time.Now()
 			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonForEra(command, cmdArgs, cwd, modeStr, shimEnv, protocolWire, logger)
 			if err != nil {
+				if errors.Is(err, era.AdmissionControlEraMismatch) {
+					writeCLIAdmissionError(os.Stdout, selection.AdmissionError(era.AdmissionControlEraMismatch))
+				}
 				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q daemon_required=true",
 					time.Since(spawnStart), err.Error())
 				os.Exit(1)

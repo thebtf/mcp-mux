@@ -3,6 +3,7 @@ package era
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 )
 
@@ -119,14 +120,40 @@ func (kind AdmissionErrorKind) Error() string {
 	return "admission: " + kind.String()
 }
 
-// AdmissionError exposes only a redacted error category.
+// AdmissionError exposes only a redacted error category while retaining the
+// safe JSON-RPC response fields needed at the ingress boundary.
 type AdmissionError struct {
-	kind AdmissionErrorKind
+	kind      AdmissionErrorKind
+	id        json.RawMessage
+	code      int
+	requested string
 }
 
 // NewAdmissionError constructs a category-only admission error.
 func NewAdmissionError(kind AdmissionErrorKind) *AdmissionError {
-	return &AdmissionError{kind: kind}
+	return newAdmissionError(kind, admissionErrorCode(kind), nil, "")
+}
+
+func newAdmissionError(kind AdmissionErrorKind, code int, id json.RawMessage, requested string) *AdmissionError {
+	return &AdmissionError{
+		kind:      kind,
+		id:        id,
+		code:      code,
+		requested: requested,
+	}
+}
+
+func admissionErrorCode(kind AdmissionErrorKind) int {
+	switch kind {
+	case AdmissionMalformedFrame:
+		return -32600
+	case AdmissionInvalidModernParams:
+		return -32602
+	case AdmissionUnsupportedModernVersion:
+		return -32022
+	default:
+		return -32000
+	}
 }
 
 // Kind returns the redacted admission-error category.
@@ -143,6 +170,60 @@ func (err *AdmissionError) Error() string {
 		return ""
 	}
 	return err.kind.Error()
+}
+
+// JSONRPCResponse returns the local JSON-RPC error response without a framing
+// newline. It never includes the opening payload or client metadata.
+func (err *AdmissionError) JSONRPCResponse() []byte {
+	if err == nil {
+		return []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}`)
+	}
+
+	code := err.code
+	if code == 0 {
+		code = admissionErrorCode(err.kind)
+	}
+	message := "Admission refused"
+	switch code {
+	case -32700:
+		message = "Parse error"
+	case -32600:
+		message = "Invalid Request"
+	case -32602:
+		message = "Invalid params"
+	case -32022:
+		message = "Unsupported protocol version"
+	}
+
+	response := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    any    `json:"data,omitempty"`
+		} `json:"error"`
+	}{
+		JSONRPC: "2.0",
+		ID:      err.id,
+	}
+	response.Error.Code = code
+	response.Error.Message = message
+	if err.kind == AdmissionUnsupportedModernVersion {
+		response.Error.Data = struct {
+			Supported []string `json:"supported"`
+			Requested string   `json:"requested"`
+		}{
+			Supported: []string{modern20260728Wire},
+			Requested: err.requested,
+		}
+	}
+
+	payload, marshalErr := json.Marshal(response)
+	if marshalErr != nil {
+		return []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}`)
+	}
+	return payload
 }
 
 // Is compares admission errors by their redacted category.
