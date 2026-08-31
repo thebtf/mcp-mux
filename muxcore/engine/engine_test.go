@@ -453,7 +453,11 @@ func TestRunProxy_NoHandler(t *testing.T) {
 
 func shortEngineBaseDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "me*")
+	root := ""
+	if runtime.GOOS != "windows" {
+		root = "/tmp"
+	}
+	dir, err := os.MkdirTemp(root, "me*")
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
