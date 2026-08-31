@@ -17,6 +17,7 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/remap"
 	muxsession "github.com/thebtf/mcp-mux/muxcore/session"
@@ -3253,5 +3254,184 @@ func TestBlockedQueuedWriteDoesNotHoldMaterializationMutex(t *testing.T) {
 	case <-forwardDone:
 	case <-time.After(time.Second):
 		t.Fatal("queued write did not complete")
+	}
+}
+
+func TestModernFinalizeBlockedRetainsAuthorityUntilProofBeforeSingleNativeReplacement(t *testing.T) {
+	var starts atomic.Int32
+	frames := make(chan string, 8)
+	o, err := NewOwner(OwnerConfig{
+		IPCPath:                     testIPCPath(t),
+		ProtocolEra:                 era.EraModern20260728,
+		MaterializationPolicy:       MaterializationOnDemand,
+		DeferInitialMaterialization: true,
+		HandlerFunc: func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+			starts.Add(1)
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				frames <- scanner.Text()
+			}
+			return scanner.Err()
+		},
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner(modern): %v", err)
+	}
+	defer o.Shutdown()
+
+	session := newControllerTestSession(o)
+	defer session.close()
+
+	retiringStarted := make(chan struct{})
+	retiring := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		close(retiringStarted)
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	})
+	defer retiring.Close()
+	select {
+	case <-retiringStarted:
+	case <-time.After(time.Second):
+		t.Fatal("retiring process fixture did not start")
+	}
+
+	proofErr := errors.New("synthetic modern process-tree authority remains")
+	var allowProof atomic.Bool
+	o.materializationFinalizationProbe = func(got *upstream.Process) error {
+		if got != retiring {
+			return fmt.Errorf("finalization probe process = %p, want retiring %p", got, retiring)
+		}
+		if !allowProof.Load() {
+			return proofErr
+		}
+		return nil
+	}
+
+	a := newMaterializationAttempt(1, MaterializationTriggerUpstreamExit)
+	a.process = retiring
+	o.upstreamEventMu.Lock()
+	o.materializationMu.Lock()
+	o.mu.Lock()
+	o.upstream = retiring
+	o.upstreamDead.Store(true)
+	o.mu.Unlock()
+	o.materializationGeneration = a.generation
+	o.materializationAttempt = a
+	o.materializationState = MaterializationFinalizing
+	o.materializationTrigger = a.trigger
+	o.retiringProcess = retiring
+	// Prevent the retry worker from closing the fixture before this test gives
+	// the finalization probe its explicit proof.
+	o.retirementRetryProcess.Store(retiring)
+	o.materializationMu.Unlock()
+	o.upstreamEventMu.Unlock()
+
+	if err := o.blockMaterializationFinalization(a, retiring, proofErr); !errors.Is(err, proofErr) {
+		t.Fatalf("block finalization = %v, want proof error", err)
+	}
+	o.finishMaterializationFailure(a, proofErr)
+
+	if state := o.MaterializationState(); state != MaterializationFinalizeBlocked {
+		t.Fatalf("modern finalization state = %s, want %s", state, MaterializationFinalizeBlocked)
+	}
+	if current := o.currentUpstream(); current != retiring {
+		t.Fatalf("modern blocked current process = %p, want retiring %p", current, retiring)
+	}
+	o.materializationMu.Lock()
+	blockedRetiring := o.retiringProcess
+	blockedErr := o.materializationBlockedErr
+	o.materializationMu.Unlock()
+	if blockedRetiring != retiring || !errors.Is(blockedErr, proofErr) {
+		t.Fatalf("modern blocked authority = retiring:%p err:%v, want %p/%v", blockedRetiring, blockedErr, retiring, proofErr)
+	}
+	select {
+	case <-o.Done():
+		t.Fatal("modern owner completed while finalization proof remained denied")
+	default:
+	}
+	select {
+	case <-retiring.Done:
+		t.Fatal("retiring process exited before finalization proof")
+	default:
+	}
+	if !o.MaterializationBlocksEviction() {
+		t.Fatal("modern FINALIZE_BLOCKED owner did not block eviction")
+	}
+
+	if _, err := fmt.Fprint(session.write, `{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"blocked","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`+"\n"); err != nil {
+		t.Fatalf("write blocked modern demand: %v", err)
+	}
+	blockedDemand := scanControllerResponseWithID(session.read, 47)
+	if blockedDemand.err != nil || !strings.Contains(string(blockedDemand.response), proofErr.Error()) {
+		t.Fatalf("blocked modern demand: response=%s err=%v", blockedDemand.response, blockedDemand.err)
+	}
+	if blocked := o.startMaterialization(MaterializationTriggerUpstreamExit); !errors.Is(blocked.err, proofErr) {
+		t.Fatalf("modern successor admission while proof denied = %v, want proof error", blocked.err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("modern successor starts while proof denied = %d, want 0", got)
+	}
+
+	allowProof.Store(true)
+	if !o.completeRetiringProcess(retiring, MaterializationTriggerUpstreamExit) {
+		t.Fatal("modern retiring process did not complete after proof")
+	}
+	waitForCondition(t, 2*time.Second, func() bool {
+		return starts.Load() == 1 && o.MaterializationState() == MaterializationReady && o.currentUpstream() != nil
+	}, "modern replacement did not start after finalization proof")
+	if successor := o.currentUpstream(); successor == retiring {
+		t.Fatal("modern replacement retained the retired process authority")
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("modern replacement injected legacy bootstrap traffic: %s", frame)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("modern replacement starts = %d, want exactly 1", got)
+	}
+}
+
+func TestMaterializationAttemptCapturesEraAndRefusesDriftBeforeSpawn(t *testing.T) {
+	o := newMinimalOwner()
+	o.materializationPolicy = MaterializationPersistent
+	o.protocolEra = era.EraModern20260728
+	var starts atomic.Int32
+	o.handlerFunc = func(context.Context, io.Reader, io.Writer) error {
+		starts.Add(1)
+		return errors.New("unexpected spawn after materialization era drift")
+	}
+
+	o.materializationMu.Lock()
+	a, start := o.startMaterializationLocked(MaterializationTriggerPersistent)
+	o.materializationMu.Unlock()
+	if !start {
+		t.Fatalf("modern materialization attempt was not elected: err=%v", a.err)
+	}
+	if got, want := a.protocolEra, era.EraModern20260728; got != want {
+		t.Fatalf("elected materialization era = %v, want %v", got, want)
+	}
+
+	// Simulate a corrupted owner-era transition after election. The attempt is
+	// the authority for this generation and must fail before a legacy bootstrap
+	// or any successor process can be spawned.
+	o.protocolEra = era.EraLegacy
+	go o.runMaterialization(a)
+	select {
+	case <-a.done:
+	case <-time.After(time.Second):
+		a.cancelMaterialization()
+		t.Fatal("materialization did not fail closed after owner era drift")
+	}
+	if !errors.Is(a.startedErr, errMaterializationEraChanged) || !errors.Is(a.err, errMaterializationEraChanged) {
+		t.Fatalf("materialization era drift errors = started:%v done:%v, want %v", a.startedErr, a.err, errMaterializationEraChanged)
+	}
+	if got := starts.Load(); got != 0 {
+		t.Fatalf("materialization spawned %d process(es) after era drift, want 0", got)
+	}
+	if current := o.currentUpstream(); current != nil {
+		t.Fatalf("materialization installed upstream %p after era drift", current)
 	}
 }

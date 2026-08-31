@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/listchanged"
@@ -101,6 +102,7 @@ func newMaterializationSignals() *materializationSignals {
 type materializationAttempt struct {
 	generation            uint64
 	trigger               MaterializationTrigger
+	protocolEra           era.ProtocolEra
 	launch                LaunchContext
 	launchFrozen          bool
 	launchRequiresSession bool
@@ -278,6 +280,7 @@ func (o *Owner) startMaterializationLocked(trigger MaterializationTrigger) (*mat
 
 	o.materializationGeneration++
 	a := newMaterializationAttempt(o.materializationGeneration, trigger)
+	a.protocolEra = o.protocolEra
 	a.launch = o.electLaunchContextLocked()
 	for _, demand := range o.pendingDemands {
 		if demand.state == localDemandWaiting && demand.generation == 0 {
@@ -401,9 +404,20 @@ var (
 	errMaterializationCancelled        = errors.New("upstream materialization cancelled for restart")
 	errMaterializationInitiatorGone    = errors.New("materialization initiator disconnected before isolated classification commit")
 	errMaterializationContextReelected = errors.New("fresh isolated classification requires retained-session rematerialization")
+	errMaterializationEraChanged       = errors.New("materialization protocol era changed")
 )
 
+func (o *Owner) materializationEraMatches(a *materializationAttempt) bool {
+	return a != nil && a.protocolEra == o.protocolEra
+}
+
 func (o *Owner) runMaterialization(a *materializationAttempt) {
+	if !o.materializationEraMatches(a) {
+		a.signalStarted(errMaterializationEraChanged)
+		o.finishMaterializationFailure(a, errMaterializationEraChanged)
+		return
+	}
+
 	wait := materializationRetryInitial
 	attemptNumber := 0
 
@@ -451,11 +465,32 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			}
 			a.launchFrozen = true
 		}
+		if !o.materializationEraMatches(a) {
+			o.materializationMu.Unlock()
+			o.launchContextMu.Unlock()
+			a.signalStarted(errMaterializationEraChanged)
+			o.finishMaterializationFailure(a, errMaterializationEraChanged)
+			return
+		}
 		launch := LaunchContext{SessionID: a.launch.SessionID, Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
 		o.materializationMu.Unlock()
 
 		proc, err := o.spawnReplacementUpstream(launch)
 		o.launchContextMu.Unlock()
+		if !o.materializationEraMatches(a) {
+			driftErr := error(errMaterializationEraChanged)
+			if err != nil {
+				driftErr = errors.Join(driftErr, err)
+			}
+			if proc != nil {
+				if retireErr := o.retireFailedMaterializationStart(a, proc); retireErr != nil {
+					driftErr = errors.Join(driftErr, retireErr)
+				}
+			}
+			a.signalStarted(driftErr)
+			o.finishMaterializationFailure(a, driftErr)
+			return
+		}
 		if err != nil {
 			o.logger.Printf("upstream materialization start failed generation=%d attempt=%d trigger=%s err=%v", a.generation, attemptNumber, a.trigger, err)
 			if proc != nil {
@@ -500,7 +535,7 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 
 		go o.readUpstream(proc)
 		go o.monitorUpstreamExit(proc)
-		if o.isModern() {
+		if a.protocolEra == era.EraModern20260728 {
 			signals.signalDiscoveryReady()
 		} else if err := o.sendProactiveInitFor(a, signals); err != nil {
 			signals.signalFailure(err)
@@ -626,7 +661,7 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 	o.materializationMu.Lock()
 	a.process = proc
 	a.signals = signals
-	if o.isModern() {
+	if a.protocolEra == era.EraModern20260728 {
 		o.cacheStage = nil
 	} else {
 		o.cacheStage = &cacheStage{generation: a.generation, process: proc, signals: signals}
@@ -747,10 +782,15 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 			o.mu.RLock()
 			current := o.upstream
 			o.mu.RUnlock()
-			live := state == MaterializationMaterializing && retiring == nil && current == a.process && !o.upstreamDead.Load()
+			eraMatches := o.materializationEraMatches(a)
+			live := state == MaterializationMaterializing && retiring == nil && current == a.process && !o.upstreamDead.Load() && eraMatches
 			if !live {
 				if readyErr == nil {
-					readyErr = errors.New("materialization generation lost process authority before ready")
+					if !eraMatches {
+						readyErr = errMaterializationEraChanged
+					} else {
+						readyErr = errors.New("materialization generation lost process authority before ready")
+					}
 				}
 				if retryTrigger == "" {
 					retryTrigger = MaterializationTriggerUpstreamExit
@@ -760,7 +800,7 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 					o.retireReadyProcess(a.process, retryTrigger)
 				}
 				o.finishMaterializationFailure(a, readyErr)
-				if o.shouldRetryMaterialization(retryTrigger) {
+				if !errors.Is(readyErr, errMaterializationEraChanged) && o.shouldRetryMaterialization(retryTrigger) {
 					o.startMaterialization(retryTrigger)
 				}
 				return
@@ -770,7 +810,7 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 			o.materializationTrigger = a.trigger
 			o.restartResumeTrigger = ""
 			o.materializationMu.Unlock()
-			if o.isModern() {
+			if a.protocolEra == era.EraModern20260728 {
 				o.initReadyOnce.Do(func() {
 					if o.initReady != nil {
 						close(o.initReady)
@@ -808,7 +848,9 @@ func (o *Owner) finishMaterializationFailure(a *materializationAttempt, err erro
 	o.materializationMu.Unlock()
 	a.finish(err)
 	o.writeFailedLocalDemands(demands, err)
-	o.resumeMaterializationAfterRestartPin()
+	if !errors.Is(err, errMaterializationEraChanged) {
+		o.resumeMaterializationAfterRestartPin()
+	}
 }
 
 func (o *Owner) clearProactiveTracking() {
@@ -844,7 +886,7 @@ func (o *Owner) acceptsProcessEvent(proc *upstream.Process) bool {
 }
 
 func (o *Owner) sendProactiveInitFor(a *materializationAttempt, signals *materializationSignals) error {
-	if o.isModern() {
+	if a.protocolEra == era.EraModern20260728 {
 		signals.signalDiscoveryReady()
 		return nil
 	}

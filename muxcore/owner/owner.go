@@ -87,6 +87,28 @@ func nextProactiveNamespace() string {
 	return fmt.Sprintf("mux-init-%d-%d", os.Getpid(), proactiveOwnerSequence.Add(1))
 }
 
+const nativeOwnerIDPrefix = "native-"
+
+func isNativeOwnerID(serverID string) bool {
+	return strings.HasPrefix(serverID, nativeOwnerIDPrefix)
+}
+
+func hasUnsafeLifecycleBoundary(cfg OwnerConfig, serverIDs ...string) bool {
+	if cfg.ProtocolEra == era.EraModern20260728 || isNativeOwnerID(cfg.ServerID) {
+		return true
+	}
+	for _, serverID := range serverIDs {
+		if isNativeOwnerID(serverID) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeLifecycleBoundaryError() error {
+	return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
+}
+
 func (o *Owner) isModern() bool {
 	return o.protocolEra == era.EraModern20260728
 }
@@ -393,6 +415,9 @@ type OwnerConfig struct {
 func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	if _, err := cfg.ProtocolEra.Wire(); err != nil {
 		return nil, fmt.Errorf("owner from snapshot: protocol era: %w", err)
+	}
+	if hasUnsafeLifecycleBoundary(cfg, snap.ServerID) {
+		return nil, unsafeLifecycleBoundaryError()
 	}
 	logger := cfg.Logger
 	if logger == nil {

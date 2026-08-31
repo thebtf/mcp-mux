@@ -416,8 +416,11 @@ func (d *Daemon) forgetOwnerIfCurrent(serverID string, expected *OwnerEntry, rea
 }
 
 func (d *Daemon) deleteOwnerEntryLocked(serverID string) {
+	entry := d.owners[serverID]
 	delete(d.owners, serverID)
-	d.cleanupForcedIsolatedRetryCounterLocked(serverID)
+	if !isModernOwnerEntry(entry) {
+		d.cleanupForcedIsolatedRetryCounterLocked(serverID)
+	}
 }
 
 func (d *Daemon) cleanupForcedIsolatedRetryCounterLocked(serverID string) {

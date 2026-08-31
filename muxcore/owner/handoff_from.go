@@ -24,6 +24,12 @@ import (
 //
 // Returns an error if the FD attachment fails or the IPC listener cannot bind.
 func NewOwnerFromHandoff(cfg OwnerConfig, payload HandoffPayload) (*Owner, error) {
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		return nil, fmt.Errorf("owner: NewOwnerFromHandoff: protocol era: %w", err)
+	}
+	if hasUnsafeLifecycleBoundary(cfg, payload.ServerID) {
+		return nil, unsafeLifecycleBoundaryError()
+	}
 	proc, err := upstream.AttachFromFDsWithAuthority(
 		payload.PID, payload.StdinFD, payload.StdoutFD, payload.StderrFD, payload.AuthorityFD, payload.Command, cfg.Logger,
 	)
@@ -39,6 +45,19 @@ func NewOwnerFromHandoff(cfg OwnerConfig, payload HandoffPayload) (*Owner, error
 // real transferred OS file descriptors. Production code always passes the result
 // of upstream.AttachFromFDs.
 func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream.Process) (*Owner, error) {
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		if proc != nil {
+			_ = proc.Close()
+		}
+		return nil, fmt.Errorf("owner: NewOwnerFromHandoff: protocol era: %w", err)
+	}
+	if hasUnsafeLifecycleBoundary(cfg, payload.ServerID) {
+		if proc != nil {
+			_ = proc.Close()
+		}
+		return nil, unsafeLifecycleBoundaryError()
+	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
@@ -75,6 +94,7 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		sessionHandler:         cfg.SessionHandler,
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               srvID,
+		protocolEra:            cfg.ProtocolEra,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,

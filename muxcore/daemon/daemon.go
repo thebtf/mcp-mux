@@ -1200,6 +1200,13 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 }
 
 func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) int64 {
+	if req == nil || entry == nil {
+		return 0
+	}
+	protocolEra, err := era.ParseProtocolEra(req.ProtocolEra)
+	if err != nil || protocolEra != era.EraLegacy || entry.ProtocolEra != era.EraLegacy || isModernOwnerEntry(entry) {
+		return 0
+	}
 	base := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
 	ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(base, &atomic.Int64{})
 	n := ctr.(*atomic.Int64).Add(1)
@@ -1782,7 +1789,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
 	if !o.PreRegisterInitial(token, req.Cwd, sessionEnv) {
-		if o.IsClassifiedIsolated() {
+		if protocolEra == era.EraLegacy && o.IsClassifiedIsolated() {
 			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
 		}
 		return "", "", "", errSpawnRetry
