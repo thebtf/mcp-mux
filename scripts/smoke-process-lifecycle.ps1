@@ -19,14 +19,20 @@ $ParallelSessions = 8
 function Get-Sha256Hex {
     param([string]$Path)
 
-    $stream = [System.IO.File]::OpenRead($Path)
-    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    $algorithm = $null
     try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
         return ([System.BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
     }
     finally {
-        $algorithm.Dispose()
-        $stream.Dispose()
+        if ($null -ne $algorithm) {
+            $algorithm.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
     }
 }
 $RepoRoot = Split-Path -Parent $PSScriptRoot
