@@ -1596,6 +1596,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		Cwd:                         req.Cwd,
 		IPCPath:                     ipcPath,
 		ControlPath:                 controlPath,
+		ServerID:                    sid,
 		ProtocolEra:                 protocolEra,
 		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
 		MaterializationPolicy:       materializationPolicy,
