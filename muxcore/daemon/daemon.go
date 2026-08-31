@@ -2492,14 +2492,16 @@ func (d *Daemon) HandleStatus() map[string]any {
 		s := view.owner.Status()
 		s["server_id"] = view.serverID
 		s["persistent"] = view.persistent
-		s["owner_generation"] = view.ownerGeneration
-		if view.restoredFromOwnerGeneration != "" {
-			s["restored_from_owner_generation"] = view.restoredFromOwnerGeneration
-		}
-		if view.restoreSource != "" {
-			s["restore_source"] = view.restoreSource
-		} else {
-			s["restore_source"] = "fresh"
+		if protocolEra, _ := s["protocol_era"].(string); protocolEra != "2026-07-28" {
+			s["owner_generation"] = view.ownerGeneration
+			if view.restoredFromOwnerGeneration != "" {
+				s["restored_from_owner_generation"] = view.restoredFromOwnerGeneration
+			}
+			if view.restoreSource != "" {
+				s["restore_source"] = view.restoreSource
+			} else {
+				s["restore_source"] = "fresh"
+			}
 		}
 		s["last_session"] = view.lastSession.Format(time.RFC3339)
 		effectiveIdleTimeout := view.idleTimeout
@@ -2616,6 +2618,10 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 		cachedTools, _ := s["cached_tools"].(bool)
 		cachedPrompts, _ := s["cached_prompts"].(bool)
 		cachedResources, _ := s["cached_resources"].(bool)
+		protocolEra, _ := s["protocol_era"].(string)
+		sharingPolicy, _ := s["sharing_policy"].(string)
+		cachePolicy, _ := s["cache_policy"].(string)
+		lifecyclePolicy, _ := s["lifecycle_policy"].(string)
 		owners = append(owners, control.OwnerInfo{
 			ServerID:             view.serverID,
 			EngineName:           d.name,
@@ -2635,6 +2641,10 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 			CachedTools:          cachedTools,
 			CachedPrompts:        cachedPrompts,
 			CachedResources:      cachedResources,
+			ProtocolEra:          protocolEra,
+			SharingPolicy:        sharingPolicy,
+			CachePolicy:          cachePolicy,
+			LifecyclePolicy:      lifecyclePolicy,
 		})
 	}
 	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil

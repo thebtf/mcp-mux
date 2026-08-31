@@ -72,6 +72,10 @@ type OwnerInfo struct {
 	CachedTools          bool     `json:"cached_tools,omitempty"`
 	CachedPrompts        bool     `json:"cached_prompts,omitempty"`
 	CachedResources      bool     `json:"cached_resources,omitempty"`
+	ProtocolEra          string   `json:"protocol_era,omitempty"`
+	SharingPolicy        string   `json:"sharing_policy,omitempty"`
+	CachePolicy          string   `json:"cache_policy,omitempty"`
+	LifecyclePolicy      string   `json:"lifecycle_policy,omitempty"`
 }
 
 // ListOwnersResponse is the response payload for the "list_owners" daemon RPC.

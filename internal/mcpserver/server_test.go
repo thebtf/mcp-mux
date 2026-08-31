@@ -815,6 +815,15 @@ func TestToolsCallMuxListNoServers(t *testing.T) {
 	if servers, ok := decoded["servers"].([]any); !ok || len(servers) != 0 {
 		t.Errorf("expected empty 'servers' array, got: %s", text)
 	}
+	if len(decoded) != 2 {
+		t.Errorf("unavailable mux_list keys = %v, want only servers and note", decoded)
+	}
+	for _, fact := range muxListR1PolicyFacts {
+		if _, found := decoded[fact.key]; found {
+			t.Errorf("unavailable mux_list unexpectedly reported %q: %s", fact.key, text)
+		}
+	}
+	assertMuxListPayloadSafe(t, decoded)
 }
 
 // --- Tests with fake control server ---
@@ -890,9 +899,11 @@ type fakeDaemonHandler struct {
 func (h *fakeDaemonHandler) HandleSpawn(_ control.Request) (string, string, string, error) {
 	return h.spawnServerID, h.spawnCtlPath, h.spawnLockPath, h.spawnErr
 }
+
 func (h *fakeDaemonHandler) HandleRemove(_ string) error {
 	return h.removeErr
 }
+
 func (h *fakeDaemonHandler) HandleStopOwner(req control.Request) (string, error) {
 	h.stopOwnerCalled = true
 	h.stopOwnerReq = req
@@ -907,15 +918,19 @@ func (h *fakeDaemonHandler) HandleStopOwner(req control.Request) (string, error)
 	}
 	return fmt.Sprintf("stopped via daemon (drain timeout %dms)", req.DrainTimeoutMs), nil
 }
+
 func (h *fakeDaemonHandler) HandleGracefulRestart(_ int) (string, func(), error) {
 	return h.restartMsg, h.restartAfter, h.restartErr
 }
+
 func (h *fakeDaemonHandler) HandleRefreshSessionToken(_ string) (string, error) {
 	return h.refreshToken, h.refreshErr
 }
+
 func (h *fakeDaemonHandler) HandleReconnectGiveUp(_ string) error {
 	return h.reconnectErr
 }
+
 func (h *fakeDaemonHandler) HandleListOwners(_ control.Request) (control.ListOwnersResponse, error) {
 	return h.listOwnersResp, h.listOwnersErr
 }
@@ -2088,4 +2103,265 @@ func TestMuxStopRefusesForeignID(t *testing.T) {
 	if !strings.Contains(result.Content[0].Text, "not managed by this mcp-mux daemon") {
 		t.Errorf("expected 'not managed by this mcp-mux daemon', got: %s", result.Content[0].Text)
 	}
+}
+
+const muxListRedactionSentinel = "r1-mux-list-route-sentinel"
+
+var muxListR1PolicyFacts = []struct {
+	key   string
+	value string
+}{
+	{key: "protocol_era", value: "2026-07-28"},
+	{key: "sharing_policy", value: "forced-isolated"},
+	{key: "cache_policy", value: "off"},
+	{key: "lifecycle_policy", value: "r1-quarantine"},
+}
+
+// TestMuxListR1PolicyProjection keeps mux_list a minimal OwnerInfo readback:
+// four nonempty R1 facts for modern owners, the released shape for legacy
+// owners, and no route data or R3 observability contract in its JSON payload.
+func TestMuxListR1PolicyProjection(t *testing.T) {
+	modern := r1MuxListOwner(t, `{
+		"server_id":"modern0011223344",
+		"engine_name":"mcp-mux",
+		"command":"mock-modern",
+		"args":["--modern"],
+		"cwd":"/safe/project",
+		"cwd_set":["/safe/project"],
+		"sessions":2,
+		"pending":0,
+		"upstream_pid":4242,
+		"classification":"isolated",
+		"classification_source":"opening",
+		"classification_reason":["isolated"],
+		"opaque_request_state":{"route_id":"r1-mux-list-route-sentinel"},
+		"mux_version":"test",
+		"persistent":false,
+		"cached_init":false,
+		"cached_tools":false,
+		"cached_prompts":false,
+		"cached_resources":false,
+		"protocol_era":"2026-07-28",
+		"sharing_policy":"forced-isolated",
+		"cache_policy":"off",
+		"lifecycle_policy":"r1-quarantine"
+	}`)
+	legacy := r1MuxListOwner(t, `{
+		"server_id":"legacy0011223344",
+		"engine_name":"mcp-mux",
+		"command":"mock-legacy",
+		"args":["--legacy"],
+		"cwd":"/safe/project",
+		"cwd_set":["/safe/project"],
+		"sessions":2,
+		"pending":0,
+		"upstream_pid":4242,
+		"classification":"isolated",
+		"classification_source":"opening",
+		"classification_reason":["isolated"],
+		"mux_version":"test",
+		"persistent":false,
+		"cached_init":false,
+		"cached_tools":false,
+		"cached_prompts":false,
+		"cached_resources":false
+	}`)
+
+	formatter := &Server{}
+	for _, verbose := range []bool{false, true} {
+		rows := formatter.formatOwnerList([]control.OwnerInfo{modern, legacy}, verbose, true, "")
+		assertMuxListOwnerRow(t, muxListRowByID(t, rows, modern.ServerID), modern.ServerID, verbose, true)
+		assertMuxListOwnerRow(t, muxListRowByID(t, rows, legacy.ServerID), legacy.ServerID, verbose, false)
+	}
+
+	baseDir := shortBaseDir(t, "mcpmux-r1-list-")
+	localCtl := filepath.Join(baseDir, "mcp-mux-muxd.ctl.sock")
+	startFakeDaemonControlServer(t, localCtl, control.ListOwnersResponse{Owners: []control.OwnerInfo{modern, legacy}})
+	clientW, clientR, _ := newTestServerFull(t, localCtl, baseDir)
+	defer clientW.Close()
+
+	for _, verbose := range []bool{false, true} {
+		rows := callMuxListRows(t, clientW, clientR, 700+boolToInt(verbose), fmt.Sprintf(`{"all":true,"verbose":%t}`, verbose))
+		assertMuxListOwnerRow(t, muxListRowByID(t, rows, modern.ServerID), modern.ServerID, verbose, true)
+		assertMuxListOwnerRow(t, muxListRowByID(t, rows, legacy.ServerID), legacy.ServerID, verbose, false)
+		assertMuxListPayloadSafe(t, rows)
+	}
+
+	scoped := modern
+	scoped.EngineName = "r1-test-engine"
+	scopedCtl := filepath.Join(baseDir, "r1-test-engine-muxd.ctl.sock")
+	startFakeDaemonControlServerWithStatus(t, scopedCtl, map[string]any{
+		"engine_name": "r1-test-engine",
+		"pid":         1234,
+		"owner_count": 1,
+	}, control.ListOwnersResponse{Owners: []control.OwnerInfo{scoped}})
+	writeTestEngineDescriptor(t, baseDir, "r1-test-engine", "R1 Test Engine", scopedCtl)
+
+	scopedRows := callMuxListRows(t, clientW, clientR, 703, `{"engine_name":"r1-test-engine","all":true,"verbose":true}`)
+	assertMuxListOwnerRow(t, muxListRowByID(t, scopedRows, scoped.ServerID), scoped.ServerID, true, true)
+	assertMuxListPayloadSafe(t, scopedRows)
+}
+
+func r1MuxListOwner(t *testing.T, input string) control.OwnerInfo {
+	t.Helper()
+	var owner control.OwnerInfo
+	if err := json.Unmarshal([]byte(input), &owner); err != nil {
+		t.Fatalf("unmarshal R1 OwnerInfo fixture: %v", err)
+	}
+	return owner
+}
+
+func callMuxListRows(t *testing.T, clientW io.Writer, clientR io.Reader, id int, arguments string) []map[string]any {
+	t.Helper()
+	sendLine(t, clientW, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"mux_list","arguments":%s}}`, id, arguments))
+	resp := parseResponse(t, readLine(t, clientR))
+	assertID(t, resp, id)
+	assertNoError(t, resp)
+
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	unmarshalResult(t, resp, &result)
+	if result.IsError || len(result.Content) != 1 {
+		t.Fatalf("mux_list result = %+v, want one non-error content item", result)
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &rows); err != nil {
+		t.Fatalf("mux_list content is not a JSON server list: %v (raw: %q)", err, result.Content[0].Text)
+	}
+	return rows
+}
+
+func muxListRowByID(t *testing.T, rows []map[string]any, serverID string) map[string]any {
+	t.Helper()
+	for _, row := range rows {
+		if row["server_id"] == serverID {
+			return row
+		}
+	}
+	t.Fatalf("mux_list rows missing server_id %q: %#v", serverID, rows)
+	return nil
+}
+
+func assertMuxListOwnerRow(t *testing.T, row map[string]any, serverID string, verbose, modern bool) {
+	t.Helper()
+	if got, ok := row["server_id"].(string); !ok || got != serverID {
+		t.Errorf("server_id = %#v, want %q", row["server_id"], serverID)
+	}
+
+	keys := []string{"server_id", "engine_name", "command", "args", "sessions", "pending", "class", "version"}
+	if verbose {
+		keys = []string{"server_id", "engine_name", "command", "args", "cwd", "cwd_set", "sessions", "pending", "upstream_pid", "classification", "classification_source", "mux_version", "persistent", "cached_init", "cached_tools", "cached_prompts", "cached_resources"}
+	}
+	for _, key := range keys {
+		if _, ok := row[key]; !ok {
+			t.Errorf("mux_list row missing released %s key %q: %#v", map[bool]string{false: "concise", true: "verbose"}[verbose], key, row)
+		}
+	}
+	if verbose {
+		if _, ok := row["classification_reason"]; !modern && !ok {
+			t.Errorf("legacy verbose mux_list row lost classification_reason: %#v", row)
+		}
+	}
+
+	if modern {
+		for _, fact := range muxListR1PolicyFacts {
+			if got, ok := row[fact.key].(string); !ok || got != fact.value {
+				t.Errorf("modern mux_list %s = %#v, want %q", fact.key, row[fact.key], fact.value)
+			}
+		}
+	} else {
+		for _, fact := range muxListR1PolicyFacts {
+			if _, found := row[fact.key]; found {
+				t.Errorf("legacy mux_list unexpectedly has %q: %#v", fact.key, row)
+			}
+		}
+	}
+
+	if got := muxListInteger(t, row, "sessions"); got != 2 {
+		t.Errorf("sessions = %d, want 2", got)
+	}
+	if got := muxListInteger(t, row, "pending"); got != 0 {
+		t.Errorf("pending = %d, want 0", got)
+	}
+	if verbose {
+		if got := muxListInteger(t, row, "upstream_pid"); got != 4242 {
+			t.Errorf("upstream_pid = %d, want 4242", got)
+		}
+		for _, key := range []string{"persistent", "cached_init", "cached_tools", "cached_prompts", "cached_resources"} {
+			if got, ok := row[key].(bool); !ok || got {
+				t.Errorf("%s = %#v, want false", key, row[key])
+			}
+		}
+	}
+}
+
+func muxListInteger(t *testing.T, row map[string]any, key string) int {
+	t.Helper()
+	switch value := row[key].(type) {
+	case int:
+		return value
+	case float64:
+		return int(value)
+	default:
+		t.Errorf("%s type = %T, want integer", key, row[key])
+		return 0
+	}
+}
+
+func assertMuxListPayloadSafe(t *testing.T, payload any) {
+	t.Helper()
+	forbiddenKeys := map[string]struct{}{
+		"registry":            {},
+		"registry_descriptor": {},
+		"registry_capability": {},
+		"descriptor":          {},
+		"descriptors":         {},
+		"mux_engines":         {},
+		"mux_topology":        {},
+		"topology":            {},
+		"taxonomy":            {},
+		"lifecycle_taxonomy":  {},
+		"counter":             {},
+		"counters":            {},
+		"logging":             {},
+		"logs":                {},
+	}
+	var walk func(any)
+	walk = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			for key, child := range value {
+				lowerKey := strings.ToLower(key)
+				if _, forbidden := forbiddenKeys[lowerKey]; forbidden || strings.HasSuffix(lowerKey, "_count") {
+					t.Errorf("mux_list payload contains R3 key %q", key)
+				}
+				walk(child)
+			}
+		case []map[string]any:
+			for _, child := range value {
+				walk(child)
+			}
+		case []any:
+			for _, child := range value {
+				walk(child)
+			}
+		case string:
+			if strings.Contains(value, muxListRedactionSentinel) {
+				t.Errorf("mux_list payload leaked prohibited route sentinel: %q", value)
+			}
+		}
+	}
+	walk(payload)
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

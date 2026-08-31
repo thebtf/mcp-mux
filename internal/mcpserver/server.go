@@ -756,8 +756,10 @@ func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, 
 				continue
 			}
 		}
+
+		var server map[string]any
 		if verbose {
-			servers = append(servers, map[string]any{
+			server = map[string]any{
 				"server_id":             owner.ServerID,
 				"engine_name":           owner.EngineName,
 				"command":               owner.Command,
@@ -776,9 +778,9 @@ func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, 
 				"cached_tools":          owner.CachedTools,
 				"cached_prompts":        owner.CachedPrompts,
 				"cached_resources":      owner.CachedResources,
-			})
+			}
 		} else {
-			servers = append(servers, map[string]any{
+			server = map[string]any{
 				"server_id":   owner.ServerID,
 				"engine_name": owner.EngineName,
 				"command":     owner.Command,
@@ -787,13 +789,30 @@ func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, 
 				"pending":     owner.Pending,
 				"class":       owner.Classification,
 				"version":     owner.MuxVersion,
-			})
+			}
 		}
+		addOwnerPolicyFields(server, owner)
+		servers = append(servers, server)
 	}
 	if servers == nil {
 		return []map[string]any{}
 	}
 	return servers
+}
+
+func addOwnerPolicyFields(server map[string]any, owner control.OwnerInfo) {
+	if owner.ProtocolEra != "" {
+		server["protocol_era"] = owner.ProtocolEra
+	}
+	if owner.SharingPolicy != "" {
+		server["sharing_policy"] = owner.SharingPolicy
+	}
+	if owner.CachePolicy != "" {
+		server["cache_policy"] = owner.CachePolicy
+	}
+	if owner.LifecyclePolicy != "" {
+		server["lifecycle_policy"] = owner.LifecyclePolicy
+	}
 }
 
 func registrySummary(matches []registry.VerifiedDescriptor) string {

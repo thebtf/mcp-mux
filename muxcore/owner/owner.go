@@ -3179,10 +3179,16 @@ func (o *Owner) SetIdleTimeout(d time.Duration) {
 
 // Status returns a JSON-serializable status summary.
 func (o *Owner) Status() map[string]any {
+	modern := o.isModern()
+
 	o.mu.RLock()
-	sessionIDs := make([]int, 0, len(o.sessions))
-	for id := range o.sessions {
-		sessionIDs = append(sessionIDs, id)
+	sessionCount := len(o.sessions)
+	var sessionIDs []int
+	if !modern {
+		sessionIDs = make([]int, 0, sessionCount)
+		for id := range o.sessions {
+			sessionIDs = append(sessionIDs, id)
+		}
 	}
 	classification := string(o.autoClassification)
 	classificationSource := o.classificationSource
@@ -3212,8 +3218,7 @@ func (o *Owner) Status() map[string]any {
 		"args":                       o.args,
 		"cwd":                        primaryCwd,
 		"cwd_set":                    cwds,
-		"sessions":                   sessionIDs,
-		"session_count":              len(sessionIDs),
+		"session_count":              sessionCount,
 		"pending_requests":           o.pendingRequests.Load(),
 		"uptime_seconds":             time.Since(o.startTime).Seconds(),
 		"cached_init":                hasCachedInit,
@@ -3229,7 +3234,16 @@ func (o *Owner) Status() map[string]any {
 		"restart_pin_count":          o.restartPins.Load(),
 		"cache_ready":                hasCachedInit && hasCachedTools,
 		"upstream_live":              upstreamPresent && !o.upstreamDead.Load(),
-		"finalization_error":         finalizationError,
+	}
+
+	if modern {
+		status["protocol_era"] = "2026-07-28"
+		status["sharing_policy"] = "forced-isolated"
+		status["cache_policy"] = "off"
+		status["lifecycle_policy"] = "r1-quarantine"
+	} else {
+		status["sessions"] = sessionIDs
+		status["finalization_error"] = finalizationError
 	}
 
 	if classification != "" {
@@ -3240,29 +3254,31 @@ func (o *Owner) Status() map[string]any {
 		}
 	}
 
-	// Include inflight request details when requests are pending
-	var inflight []map[string]any
-	var oldestMs int64
-	o.inflightTracker.Range(func(key, value any) bool {
-		req := value.(*InflightRequest)
-		inflight = append(inflight, map[string]any{
-			"method":          req.Method,
-			"tool":            req.Tool,
-			"session":         req.SessionID,
-			"started_at":      req.StartTime.UTC().Format(time.RFC3339Nano),
-			"elapsed_seconds": time.Since(req.StartTime).Seconds(),
+	// Include in-flight request details only in legacy status.
+	if !modern {
+		var inflight []map[string]any
+		var oldestMs int64
+		o.inflightTracker.Range(func(key, value any) bool {
+			req := value.(*InflightRequest)
+			inflight = append(inflight, map[string]any{
+				"method":          req.Method,
+				"tool":            req.Tool,
+				"session":         req.SessionID,
+				"started_at":      req.StartTime.UTC().Format(time.RFC3339Nano),
+				"elapsed_seconds": time.Since(req.StartTime).Seconds(),
+			})
+			age := time.Since(req.StartTime).Milliseconds()
+			if age > oldestMs {
+				oldestMs = age
+			}
+			return true
 		})
-		age := time.Since(req.StartTime).Milliseconds()
-		if age > oldestMs {
-			oldestMs = age
+		if len(inflight) > 0 {
+			status["inflight"] = inflight
 		}
-		return true
-	})
-	if len(inflight) > 0 {
-		status["inflight"] = inflight
-	}
-	if oldestMs > 0 {
-		status["oldest_request_age_ms"] = oldestMs
+		if oldestMs > 0 {
+			status["oldest_request_age_ms"] = oldestMs
+		}
 	}
 
 	return status

@@ -855,3 +855,182 @@ func newModernLossRecordingProcess(t *testing.T, frames chan<- string) *upstream
 	t.Cleanup(func() { _ = proc.Close() })
 	return proc
 }
+
+// T058 locks the modern owner-status projection to its four safe policy facts
+// and ensures request- and route-sensitive diagnostics stay local to the
+// legacy control-plane shape.
+func TestOwnerStatusModernFactsRedactSensitiveDetails(t *testing.T) {
+	const (
+		payloadSentinel    = "payload-sentinel"
+		opaqueSentinel     = "opaque-sentinel"
+		tokenSentinel      = "token-sentinel"
+		credentialSentinel = "credential-sentinel"
+		envSentinel        = "env-sentinel"
+		routeSentinel      = "route-sentinel"
+	)
+
+	newReadyOwner := func(protocolEra era.ProtocolEra) *Owner {
+		t.Helper()
+		o, err := NewOwner(OwnerConfig{
+			IPCPath:        testIPCPath(t),
+			UpstreamWriter: io.Discard,
+			ProtocolEra:    protocolEra,
+			Logger:         testLogger(t),
+		})
+		if err != nil {
+			t.Fatalf("NewOwner(%v): %v", protocolEra, err)
+		}
+		t.Cleanup(o.Shutdown)
+		return o
+	}
+
+	seedSensitiveStatusState := func(o *Owner, session *Session) {
+		t.Helper()
+		o.mu.Lock()
+		o.initResp = []byte(`{"jsonrpc":"2.0","result":{}}`)
+		o.toolList = []byte(`{"jsonrpc":"2.0","result":{"tools":[]}}`)
+		o.promptList = []byte(`{"jsonrpc":"2.0","result":{"prompts":[]}}`)
+		o.resourceList = []byte(`{"jsonrpc":"2.0","result":{"resources":[]}}`)
+		o.mu.Unlock()
+		o.pendingRequests.Store(1)
+		o.inflightTracker.Store(`"`+routeSentinel+`"`, &InflightRequest{
+			Method:    "method-" + payloadSentinel,
+			Tool:      "tool-" + opaqueSentinel,
+			SessionID: session.ID,
+			StartTime: time.Now().Add(-time.Second),
+		})
+		o.materializationMu.Lock()
+		o.materializationBlockedErr = errors.New(strings.Join([]string{
+			"payload=" + payloadSentinel,
+			"opaque=" + opaqueSentinel,
+			"token=" + tokenSentinel,
+			"credential=" + credentialSentinel,
+			"env=" + envSentinel,
+			"route=" + routeSentinel,
+		}, " "))
+		o.materializationMu.Unlock()
+		t.Cleanup(func() {
+			o.materializationMu.Lock()
+			o.materializationBlockedErr = nil
+			o.materializationMu.Unlock()
+		})
+	}
+
+	legacy := newReadyOwner(era.EraLegacy)
+	legacySession, _ := addModernOwnerSession(t, legacy, t.TempDir())
+	seedSensitiveStatusState(legacy, legacySession)
+
+	modern := newReadyOwner(era.EraModern20260728)
+	modernSession, _ := addModernOwnerSession(t, modern, t.TempDir())
+	seedSensitiveStatusState(modern, modernSession)
+
+	legacyStatus := legacy.Status()
+	modernStatus := modern.Status()
+
+	wantFacts := map[string]string{
+		"protocol_era":     "2026-07-28",
+		"sharing_policy":   "forced-isolated",
+		"cache_policy":     "off",
+		"lifecycle_policy": "r1-quarantine",
+	}
+	for key, want := range wantFacts {
+		got, ok := modernStatus[key]
+		if !ok {
+			t.Errorf("modern Status missing policy fact %q", key)
+			continue
+		}
+		if got != want {
+			t.Errorf("modern Status[%q] = %#v, want %q", key, got, want)
+		}
+		if _, ok := got.(string); !ok {
+			t.Errorf("modern Status[%q] type = %T, want string", key, got)
+		}
+		if _, ok := legacyStatus[key]; ok {
+			t.Errorf("legacy Status unexpectedly exposes modern policy fact %q", key)
+		}
+	}
+
+	wantSharedStatus := map[string]any{
+		"session_count":      1,
+		"pending_requests":   int64(1),
+		"cached_init":        true,
+		"cached_tools":       true,
+		"cached_prompts":     true,
+		"cached_resources":   true,
+		"cache_ready":        true,
+		"upstream_live":      true,
+		"persistent_pending": false,
+	}
+	for key, want := range wantSharedStatus {
+		legacyGot, legacyOK := legacyStatus[key]
+		modernGot, modernOK := modernStatus[key]
+		if !legacyOK || legacyGot != want {
+			t.Errorf("legacy Status[%q] = %#v (present=%t), want %#v", key, legacyGot, legacyOK, want)
+		}
+		if !modernOK || modernGot != want {
+			t.Errorf("modern Status[%q] = %#v (present=%t), want %#v", key, modernGot, modernOK, want)
+		}
+		if legacyGot != modernGot {
+			t.Errorf("ready legacy/modern Status[%q] differ: legacy=%#v modern=%#v", key, legacyGot, modernGot)
+		}
+	}
+
+	sensitiveKeys := []string{"sessions", "inflight", "oldest_request_age_ms", "finalization_error"}
+	for _, key := range sensitiveKeys {
+		if _, ok := legacyStatus[key]; !ok {
+			t.Errorf("legacy Status lost existing sensitive detail key %q", key)
+		}
+		if _, ok := modernStatus[key]; ok {
+			t.Errorf("modern Status exposes sensitive detail key %q", key)
+		}
+	}
+
+	legacyJSON, err := json.Marshal(legacyStatus)
+	if err != nil {
+		t.Fatalf("marshal legacy Status: %v", err)
+	}
+	modernJSON, err := json.Marshal(modernStatus)
+	if err != nil {
+		t.Fatalf("marshal modern Status: %v", err)
+	}
+	for _, sentinel := range []string{
+		payloadSentinel,
+		opaqueSentinel,
+		tokenSentinel,
+		credentialSentinel,
+		envSentinel,
+		routeSentinel,
+	} {
+		if !strings.Contains(string(legacyJSON), sentinel) {
+			t.Errorf("legacy serialized Status lost sentinel %q", sentinel)
+		}
+		if strings.Contains(string(modernJSON), sentinel) {
+			t.Errorf("modern serialized Status leaked sentinel %q: %s", sentinel, modernJSON)
+		}
+	}
+
+	allowedModernOnly := map[string]bool{
+		"protocol_era":          true,
+		"sharing_policy":        true,
+		"cache_policy":          true,
+		"lifecycle_policy":      true,
+		"auto_classification":   true,
+		"classification_source": true,
+		"classification_reason": true,
+	}
+	for key := range modernStatus {
+		if _, existsInLegacy := legacyStatus[key]; !existsInLegacy && !allowedModernOnly[key] {
+			t.Errorf("modern Status added uncontracted key %q", key)
+		}
+	}
+	for _, key := range []string{
+		"registry", "registry_descriptor", "topology", "topology_descriptor",
+		"owner_taxonomy", "taxonomy", "owner_type", "owner_kind",
+		"owner_count", "modern_owner_count", "status_counter",
+		"logging", "log_level", "status_log",
+	} {
+		if _, ok := modernStatus[key]; ok {
+			t.Errorf("modern Status exposes forbidden registry/topology/taxonomy/counter/logging key %q", key)
+		}
+	}
+}

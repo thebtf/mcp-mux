@@ -908,19 +908,56 @@ func runStatus() {
 	runStatusWithWriters(os.Stdout, os.Stderr)
 }
 
+func sanitizeModernStatus(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		if protocolEra, _ := value["protocol_era"].(string); protocolEra == "2026-07-28" {
+			delete(value, "sessions")
+			delete(value, "inflight")
+			delete(value, "oldest_request_age_ms")
+			delete(value, "finalization_error")
+			delete(value, "owner_generation")
+			delete(value, "restored_from_owner_generation")
+			delete(value, "restore_source")
+		}
+		for _, child := range value {
+			sanitizeModernStatus(child)
+		}
+	case []any:
+		for _, child := range value {
+			sanitizeModernStatus(child)
+		}
+	}
+}
+
 func runStatusWithWriters(stdout, stderr io.Writer) {
 	// Try daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
 	resp, err := queryDaemonStatusForCLI(ctlPath)
 	daemonResp, daemonErr := resp, err
-	if err == nil && resp.OK && resp.Data != nil {
-		var pretty json.RawMessage
-		if json.Valid(resp.Data) {
-			pretty = resp.Data
+	invalidSuccessfulStatus := false
+	if err == nil && resp != nil && resp.OK {
+		var status map[string]any
+		if resp.Data == nil {
+			daemonErr = fmt.Errorf("control: read response: invalid JSON: empty response")
+			invalidSuccessfulStatus = true
+		} else if err := json.Unmarshal(resp.Data, &status); err != nil {
+			daemonErr = errors.New("control: read response: invalid JSON")
+			invalidSuccessfulStatus = true
+		} else if status == nil {
+			daemonErr = fmt.Errorf("control: read response: invalid JSON: expected object")
+			invalidSuccessfulStatus = true
+		} else {
+			sanitizeModernStatus(status)
+			formatted, err := json.MarshalIndent(status, "", "  ")
+			if err != nil {
+				daemonErr = errors.New("control: read response: invalid JSON")
+				invalidSuccessfulStatus = true
+			} else {
+				fmt.Fprintln(stdout, string(formatted))
+				return
+			}
 		}
-		formatted, _ := json.MarshalIndent(pretty, "", "  ")
-		fmt.Fprintln(stdout, string(formatted))
-		return
 	}
 	if os.Getenv("MCPMUX_STATUS_TRACE") == "1" {
 		if err != nil {
@@ -930,6 +967,10 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 		} else {
 			fmt.Fprintf(stderr, "mcp-mux status trace: daemon_status path=%q ok=%v message=%q data_len=%d\n", ctlPath, resp.OK, resp.Message, len(resp.Data))
 		}
+	}
+	if invalidSuccessfulStatus {
+		printStatusUnknown(stdout, daemonResp, daemonErr)
+		return
 	}
 
 	// Fallback: legacy per-server scan
@@ -967,7 +1008,8 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 
 		if resp.OK && resp.Data != nil {
 			var data map[string]any
-			if err := json.Unmarshal(resp.Data, &data); err == nil {
+			if err := json.Unmarshal(resp.Data, &data); err == nil && data != nil {
+				sanitizeModernStatus(data)
 				data["server_id"] = id
 				enriched, _ := json.Marshal(data)
 				results = append(results, enriched)
