@@ -155,20 +155,20 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### RED Tests for User Story 4
 
-- [ ] T058 [P] [US4] Add RED direct-owner status tests for four R1 policy facts, readiness meaning identical to the released equivalent state, and redaction of payload, opaque state, token, credential, environment, and route identifiers in `muxcore/owner/owner_test.go`.
-- [ ] T059 [P] [US4] Add RED daemon status and `list_owners` tests for exact `OwnerInfo` agreement, unavailable truthfulness, and preserved readiness meaning in `muxcore/daemon/status_contract_test.go` and `muxcore/daemon/list_owners_test.go`.
-- [ ] T060 [P] [US4] Add RED CLI status tests for retaining four required facts and the existing readiness meaning without fabricating unavailable or legacy values in `cmd/mcp-mux/status_test.go`.
-- [ ] T061 [P] [US4] Add RED `mux_list` projection tests that, for an active R1 owner, prove field agreement/redaction and prove R1 adds no registry descriptor/capability, `mux_engines` or topology output contract, lifecycle taxonomy, or counter model in `internal/mcpserver/server_test.go`.
+- [x] T058 [P] [US4] Add RED direct-owner status tests for four R1 policy facts, readiness meaning identical to the released equivalent state, and redaction of payload, opaque state, token, credential, environment, and route identifiers in `muxcore/owner/owner_test.go`.
+- [x] T059 [P] [US4] Add RED daemon status and `list_owners` tests for exact `OwnerInfo` agreement, unavailable truthfulness, and preserved readiness meaning in `muxcore/daemon/status_contract_test.go` and `muxcore/daemon/list_owners_test.go`.
+- [x] T060 [P] [US4] Add RED CLI status tests for retaining four required facts and the existing readiness meaning without fabricating unavailable or legacy values in `cmd/mcp-mux/status_test.go`.
+- [x] T061 [P] [US4] Add RED `mux_list` projection tests that, for an active R1 owner, prove field agreement/redaction and prove R1 adds no registry descriptor/capability, `mux_engines` or topology output contract, lifecycle taxonomy, or counter model in `internal/mcpserver/server_test.go`.
 
 ### Implementation for User Story 4
 
-- [ ] T062 [US4] Add only the four additive `OwnerInfo` policy fields in `muxcore/control/protocol.go`; do not add registry, topology, lifecycle-taxonomy, counter, or logging fields.
-- [ ] T063 [US4] Populate truthful modern `protocol_era`, `sharing_policy`, `cache_policy`, and `lifecycle_policy` while retaining existing readiness and redaction rules in `muxcore/owner/owner.go`.
-- [ ] T064 [US4] Preserve direct owner facts through daemon status and `HandleListOwners` without converting unknown state to legacy in `muxcore/daemon/daemon.go`.
-- [ ] T065 [US4] Render available R1 `OwnerInfo` policy facts through the existing CLI status projection without disclosing prohibited data in `cmd/mcp-mux/main.go`.
-- [ ] T066 [US4] Preserve the same minimal fields and redaction through `formatOwnerList` and `mux_list` without adding a topology or registry contract in `internal/mcpserver/server.go`.
-- [ ] T067 [US4] Run the focused owner, daemon, CLI, and `mux_list` readback tests in `muxcore/owner/owner_test.go`, `muxcore/daemon/status_contract_test.go`, `muxcore/daemon/list_owners_test.go`, `cmd/mcp-mux/status_test.go`, and `internal/mcpserver/server_test.go`.
-- [ ] T068 [US4] Stage and commit the proven readback slice: `muxcore/control/protocol.go`, `muxcore/owner/owner.go`, `muxcore/owner/owner_test.go`, `muxcore/daemon/daemon.go`, `muxcore/daemon/status_contract_test.go`, `muxcore/daemon/list_owners_test.go`, `cmd/mcp-mux/main.go`, `cmd/mcp-mux/status_test.go`, `internal/mcpserver/server.go`, and `internal/mcpserver/server_test.go`.
+- [x] T062 [US4] Add only the four additive `OwnerInfo` policy fields in `muxcore/control/protocol.go`; do not add registry, topology, lifecycle-taxonomy, counter, or logging fields.
+- [x] T063 [US4] Populate truthful modern `protocol_era`, `sharing_policy`, `cache_policy`, and `lifecycle_policy` while retaining existing readiness and redaction rules in `muxcore/owner/owner.go`.
+- [x] T064 [US4] Preserve direct owner facts through daemon status and `HandleListOwners` without converting unknown state to legacy in `muxcore/daemon/daemon.go`.
+- [x] T065 [US4] Render available R1 `OwnerInfo` policy facts through the existing CLI status projection without disclosing prohibited data in `cmd/mcp-mux/main.go`.
+- [x] T066 [US4] Preserve the same minimal fields and redaction through `formatOwnerList` and `mux_list` without adding a topology or registry contract in `internal/mcpserver/server.go`.
+- [x] T067 [US4] Run the focused owner, daemon, CLI, and `mux_list` readback tests in `muxcore/owner/owner_test.go`, `muxcore/daemon/status_contract_test.go`, `muxcore/daemon/list_owners_test.go`, `cmd/mcp-mux/status_test.go`, and `internal/mcpserver/server_test.go`.
+- [x] T068 [US4] Stage and commit the proven readback slice: `muxcore/control/protocol.go`, `muxcore/owner/owner.go`, `muxcore/owner/owner_test.go`, `muxcore/daemon/daemon.go`, `muxcore/daemon/status_contract_test.go`, `muxcore/daemon/list_owners_test.go`, `cmd/mcp-mux/main.go`, `cmd/mcp-mux/status_test.go`, `internal/mcpserver/server.go`, and `internal/mcpserver/server_test.go`.
 
 **Checkpoint**: An operator can distinguish an active R1 owner from legacy behavior using approved minimal facts only.
 
