@@ -401,6 +401,31 @@ func addModernOwnerSession(t *testing.T, o *Owner, cwd string) (*Session, *safeB
 	return session, output
 }
 
+type gatedWriter struct {
+	started chan struct{}
+	release <-chan struct{}
+	mu      sync.Mutex
+	output  bytes.Buffer
+}
+
+func (w *gatedWriter) Write(data []byte) (int, error) {
+	select {
+	case <-w.started:
+	default:
+		close(w.started)
+	}
+	<-w.release
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.output.Write(data)
+}
+
+func (w *gatedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.output.String()
+}
+
 func TestModernOwner_NativeReadinessSkipsLegacyBootstrap(t *testing.T) {
 	started := make(chan struct{}, 1)
 	frames := make(chan []byte, 4)
@@ -566,6 +591,100 @@ func TestModernOwner_ForwardsOnlyOptedInStandardLogToSoleSession(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if got, want := downstream.String(), string(standardLog)+"\n"; got != want {
 		t.Fatalf("standard log was synthesized, duplicated, or transformed: got %q, want %q", got, want)
+	}
+}
+
+func TestModernOwner_DeliversSubscriptionNotificationsAfterAcknowledgement(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	listen := []byte(`{"jsonrpc":"2.0","id":"modern-listen","method":"subscriptions/listen","params":{"uri":"file:///project","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(listen)); err != nil {
+		t.Fatalf("forward modern subscriptions/listen: %v", err)
+	}
+	if got, want := upstream.String(), string(listen)+"\n"; got != want {
+		t.Fatalf("modern subscriptions/listen upstream bytes = %q, want %q", got, want)
+	}
+
+	acknowledgement := []byte(`{"jsonrpc":"2.0","id":"modern-listen","result":{"subscriptionId":"modern-subscription"}}`)
+	if err := o.handleUpstreamMessage(parseMessage(acknowledgement)); err != nil {
+		t.Fatalf("route modern subscriptions/listen acknowledgement: %v", err)
+	}
+	notification := []byte(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///project"}}`)
+	if err := o.handleUpstreamMessage(parseMessage(notification)); err != nil {
+		t.Fatalf("route modern subscription notification: %v", err)
+	}
+
+	if got, want := downstream.String(), string(acknowledgement)+"\n"+string(notification)+"\n"; got != want {
+		t.Fatalf("modern subscription notification delivery = %q, want %q", got, want)
+	}
+}
+
+func TestModernOwner_BackpressuresRequestScopedLogs(t *testing.T) {
+	const burst = 300
+
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	writer := &gatedWriter{started: make(chan struct{}), release: gate}
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session := NewSession(strings.NewReader(""), writer)
+	o.admissionMu.Lock()
+	o.addSessionLocked(session)
+	o.admissionMu.Unlock()
+	t.Cleanup(session.Close)
+	t.Cleanup(release)
+
+	optedInRequest := []byte(`{"jsonrpc":"2.0","id":"modern-log-backpressure","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info"}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(optedInRequest)); err != nil {
+		t.Fatalf("forward log-opted modern request: %v", err)
+	}
+	standardLog := []byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"mock-modern-server","data":"backpressure"}}`)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- o.handleUpstreamMessage(parseMessage(standardLog)) }()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("first request-scoped log did not begin delivery")
+	}
+
+	restDone := make(chan error, 1)
+	go func() {
+		for range burst {
+			if err := o.handleUpstreamMessage(parseMessage(standardLog)); err != nil {
+				restDone <- err
+				return
+			}
+		}
+		restDone <- nil
+	}()
+	select {
+	case err := <-restDone:
+		t.Fatalf("request-scoped logs escaped downstream backpressure: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first request-scoped log delivery: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request-scoped log did not finish after downstream release")
+	}
+	select {
+	case err := <-restDone:
+		if err != nil {
+			t.Fatalf("queued request-scoped log delivery: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request-scoped logs did not finish after downstream release")
+	}
+	if got, want := strings.Count(writer.String(), string(standardLog)), burst+1; got != want {
+		t.Fatalf("request-scoped logs delivered = %d, want %d", got, want)
 	}
 }
 

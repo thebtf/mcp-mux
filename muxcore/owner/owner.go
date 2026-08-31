@@ -1591,12 +1591,41 @@ func (o *Owner) handleModernUpstreamNotification(proc *upstream.Process, msg *js
 		}
 		return nil
 	}
-	requireLogSubscription := msg.Method == "notifications/message"
-	session := o.modernInflightSession(proc, requireLogSubscription)
-	if session != nil {
-		session.SendNotification(msg.Raw)
+	if msg.Method == "notifications/message" {
+		// Request-scoped logs must preserve the upstream order and cannot use
+		// the bounded, lossy asynchronous notification queue.
+		session := o.modernInflightSession(proc, true)
+		if session == nil {
+			return nil
+		}
+		return session.WriteRaw(msg.Raw)
 	}
-	return nil
+
+	// A modern owner is forced isolated. Subscription notifications continue
+	// after their listen request has completed, so route them to its one live
+	// recipient instead of tying them to a completed inflight request.
+	session := o.soleModernSession()
+	if session == nil {
+		return nil
+	}
+	return session.WriteRaw(msg.Raw)
+}
+
+func (o *Owner) soleModernSession() *Session {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	var only *Session
+	for _, session := range o.sessions {
+		if session == nil || session.IsClosed() {
+			continue
+		}
+		if only != nil {
+			return nil
+		}
+		only = session
+	}
+	return only
 }
 
 func (o *Owner) modernInflightSession(proc *upstream.Process, requireLogSubscription bool) *Session {
