@@ -377,14 +377,26 @@ func daemonExecutableForSpawn(currentExe string) string {
 // owner ID, and handshake token.
 // Emits a "daemon_rpc_spawn" log line with the total RPC duration for post-mortem latency analysis.
 func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, string, error) {
-	return spawnViaDaemonWithReason(command, args, cwd, mode, env, "", logger)
+	return spawnViaDaemonForEra(command, args, cwd, mode, env, "", logger)
+}
+
+func spawnViaDaemonForEra(command string, args []string, cwd, mode string, env map[string]string, protocolEra string, logger *log.Logger) (string, string, string, error) {
+	return spawnViaDaemonWithReasonForEra(command, args, cwd, mode, env, "", protocolEra, logger)
 }
 
 func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, string, error) {
-	return spawnViaDaemonWithReasonTimeout(command, args, cwd, mode, env, reconnectReason, logger, defaultDaemonSpawnTimeout)
+	return spawnViaDaemonWithReasonForEra(command, args, cwd, mode, env, reconnectReason, "", logger)
+}
+
+func spawnViaDaemonWithReasonForEra(command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger) (string, string, string, error) {
+	return spawnViaDaemonWithReasonTimeoutForEra(command, args, cwd, mode, env, reconnectReason, protocolEra, logger, defaultDaemonSpawnTimeout)
 }
 
 func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
+	return spawnViaDaemonWithReasonTimeoutForEra(command, args, cwd, mode, env, reconnectReason, "", logger, timeout)
+}
+
+func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
 	if timeout <= 0 {
 		return "", "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
 	}
@@ -401,6 +413,7 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 		Mode:            mode,
 		Env:             env,
 		ReconnectReason: reconnectReason,
+		ProtocolEra:     protocolEra,
 	}, timeout)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
@@ -414,10 +427,10 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 		}
 		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
+	if protocolEra != "" && resp.ProtocolEra != protocolEra {
+		return "", "", "", fmt.Errorf("daemon spawn protocol era = %q, want %q", resp.ProtocolEra, protocolEra)
+	}
 
-	// Safe ID truncation: resp.ServerID may be shorter than 8 chars in edge cases
-	// (test daemons, non-hashed IDs). Matches the pattern used in
-	// muxcore/engine/engine.go and muxcore/daemon/snapshot.go.
 	shortID := resp.ServerID
 	if len(shortID) > 8 {
 		shortID = shortID[:8]

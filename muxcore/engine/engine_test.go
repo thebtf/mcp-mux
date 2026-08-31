@@ -3,10 +3,14 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -15,6 +19,7 @@ import (
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -1393,4 +1398,195 @@ func TestEngine_ProxyModeReady(t *testing.T) {
 	stdoutW.Close()
 	stdinR.Close()
 	<-runDone
+}
+
+type openingCaptureControlHandler struct {
+	runClientControlHandler
+	onSpawn func(control.Request)
+}
+
+func (h *openingCaptureControlHandler) HandleSpawn(req control.Request) (string, string, string, error) {
+	if h.onSpawn != nil {
+		h.onSpawn(req)
+	}
+	return h.runClientControlHandler.HandleSpawn(req)
+}
+
+func TestRunClientModernPolicyPrebuffersSC001CorpusBeforeSpawnAndPreservesStdin(t *testing.T) {
+	frames := readEngineSC001OpeningCorpus(t)
+	var direct, discovery, absentClientInfo, presentClientInfo int
+
+	for index, opening := range frames {
+		method, hasClientInfo := classifyEngineSC001Opening(t, index, opening)
+		if method == "server/discover" {
+			discovery++
+		} else {
+			direct++
+		}
+		if hasClientInfo {
+			presentClientInfo++
+		} else {
+			absentClientInfo++
+		}
+
+		t.Run(fmt.Sprintf("%03d/%s", index+1, method), func(t *testing.T) {
+			openingBytes := []byte(opening + "\n")
+			tail := []byte("{\"jsonrpc\":\"2.0\",\"id\":992,\"method\":\"notifications/cancelled\",\"params\":{}}\n")
+			wantStdin := append(append([]byte(nil), openingBytes...), tail...)
+
+			stdin, err := os.CreateTemp(t.TempDir(), "modern-opening-*.ndjson")
+			if err != nil {
+				t.Fatalf("create stdin fixture: %v", err)
+			}
+			if _, err := stdin.Write(wantStdin); err != nil {
+				t.Fatalf("write stdin fixture: %v", err)
+			}
+			if _, err := stdin.Seek(0, io.SeekStart); err != nil {
+				t.Fatalf("rewind stdin fixture: %v", err)
+			}
+			originalStdin := os.Stdin
+			os.Stdin = stdin
+			t.Cleanup(func() {
+				os.Stdin = originalStdin
+				stdin.Close()
+			})
+
+			name := fmt.Sprintf("engine-modern-opening-%d", index)
+			baseDir := t.TempDir()
+			var spawnObservation struct {
+				sync.Mutex
+				offset int64
+				err    error
+			}
+			handler := &openingCaptureControlHandler{}
+			handler.onSpawn = func(req control.Request) {
+				offset, seekErr := stdin.Seek(0, io.SeekCurrent)
+				spawnObservation.Lock()
+				defer spawnObservation.Unlock()
+				spawnObservation.offset = offset
+				if seekErr != nil {
+					spawnObservation.err = fmt.Errorf("inspect stdin position at spawn: %w", seekErr)
+					return
+				}
+				if req.ProtocolEra != "2026-07-28" {
+					spawnObservation.err = fmt.Errorf("spawn protocol era = %q, want 2026-07-28", req.ProtocolEra)
+				}
+			}
+
+			ctlPath := serverid.DaemonControlPath(baseDir, name)
+			srv, err := control.NewServer(ctlPath, handler, log.New(io.Discard, "", 0))
+			if err != nil {
+				t.Fatalf("start control server: %v", err)
+			}
+			t.Cleanup(func() { srv.Close() })
+
+			engine, err := New(Config{
+				Name:           name,
+				Namespace:      name,
+				Command:        "test-command",
+				BaseDir:        baseDir,
+				ProtocolPolicy: era.PolicyModern20260728,
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			stopErr := errors.New("stop after stdin capture")
+			originalRunResilientClient := runResilientClient
+			captured := false
+			runResilientClient = func(cfg owner.ResilientClientConfig) error {
+				captured = true
+				got, err := io.ReadAll(cfg.Stdin)
+				if err != nil {
+					return fmt.Errorf("read resilient bridge stdin: %w", err)
+				}
+				if !bytes.Equal(got, wantStdin) {
+					return fmt.Errorf("resilient bridge stdin = %q, want %q", got, wantStdin)
+				}
+				if deliveries := bytes.Count(got, openingBytes); deliveries != 1 {
+					return fmt.Errorf("opening delivery count = %d, want 1", deliveries)
+				}
+				return stopErr
+			}
+			t.Cleanup(func() { runResilientClient = originalRunResilientClient })
+
+			if err := engine.runClient(context.Background()); !errors.Is(err, stopErr) {
+				t.Fatalf("runClient() error = %v, want %v", err, stopErr)
+			}
+			if !captured {
+				t.Fatal("runClient did not call the resilient bridge")
+			}
+
+			spawnObservation.Lock()
+			offset, observationErr := spawnObservation.offset, spawnObservation.err
+			spawnObservation.Unlock()
+			if observationErr != nil {
+				t.Fatal(observationErr)
+			}
+			if offset == 0 {
+				t.Fatal("spawn began before the modern opening frame was read from stdin")
+			}
+
+			handler.mu.Lock()
+			spawnCalls := len(handler.spawnRequests)
+			handler.mu.Unlock()
+			if spawnCalls != 1 {
+				t.Fatalf("spawn calls = %d, want 1", spawnCalls)
+			}
+		})
+	}
+
+	if direct == 0 || discovery == 0 {
+		t.Fatalf("SC-001 opening coverage direct=%d discovery=%d, want both", direct, discovery)
+	}
+	if absentClientInfo == 0 || presentClientInfo == 0 {
+		t.Fatalf("SC-001 clientInfo coverage absent=%d present=%d, want both", absentClientInfo, presentClientInfo)
+	}
+}
+
+func readEngineSC001OpeningCorpus(t *testing.T) []string {
+	t.Helper()
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate engine test source")
+	}
+
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(source), "..", "..", "testdata", "modern_opening_corpus.ndjson"))
+	if err != nil {
+		t.Fatalf("read SC-001 opening corpus: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(lines) < 100 {
+		t.Fatalf("SC-001 opening corpus has %d frame(s), want at least 100", len(lines))
+	}
+	return lines
+}
+
+func classifyEngineSC001Opening(t *testing.T, index int, raw string) (string, bool) {
+	t.Helper()
+	var envelope struct {
+		Method string `json:"method"`
+		Params struct {
+			Meta json.RawMessage `json:"_meta"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("SC-001 frame %d is not valid JSON: %v", index, err)
+	}
+	if envelope.Method == "" {
+		t.Fatalf("SC-001 frame %d has no method", index)
+	}
+
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(envelope.Params.Meta, &meta); err != nil || meta == nil {
+		t.Fatalf("SC-001 frame %d has invalid params._meta: %v", index, err)
+	}
+	if _, ok := meta["io.modelcontextprotocol/protocolVersion"]; !ok {
+		t.Fatalf("SC-001 frame %d has no protocol version", index)
+	}
+	if _, ok := meta["io.modelcontextprotocol/clientCapabilities"]; !ok {
+		t.Fatalf("SC-001 frame %d has no client capabilities", index)
+	}
+	_, hasClientInfo := meta["io.modelcontextprotocol/clientInfo"]
+	return envelope.Method, hasClientInfo
 }

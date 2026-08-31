@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/thebtf/mcp-mux/muxcore/era"
 )
 
 type SharingMode string
@@ -190,6 +192,73 @@ func GenerateContextKey(mode SharingMode, cmd string, args, env []string, rawCwd
 		return "isolated-" + suffix
 	}
 	return suffix
+}
+
+// GenerateContextKeyForEra derives a filesystem-safe owner identity for one
+// protocol era. Legacy delegates to GenerateContextKey byte-for-byte. Modern
+// identities are domain-separated and nonce-bound so each daemon admission
+// receives an isolated physical endpoint.
+func GenerateContextKeyForEra(protocolEra era.ProtocolEra, mode SharingMode, cmd string, args, env []string, rawCwd, nonce string) (string, error) {
+	if protocolEra == era.EraLegacy {
+		return GenerateContextKey(mode, cmd, args, env, rawCwd), nil
+	}
+	if protocolEra != era.EraModern20260728 {
+		return "", fmt.Errorf("serverid: unsupported protocol era")
+	}
+	if !safeModernNonce(nonce) {
+		return "", fmt.Errorf("serverid: unsafe modern nonce")
+	}
+
+	hash := sha256.New()
+	hash.Write([]byte("mcp-mux/protocol-era"))
+	hash.Write([]byte{0})
+	hash.Write([]byte("2026-07-28"))
+	hash.Write([]byte{0})
+	hash.Write([]byte(string(mode)))
+	hash.Write([]byte{0})
+	hash.Write([]byte(cmd))
+	for _, arg := range args {
+		hash.Write([]byte{0})
+		hash.Write([]byte(arg))
+	}
+
+	scopePath := ""
+	switch mode {
+	case ModeCwd, ModeIsolated:
+		scopePath = CanonicalizePath(rawCwd)
+	case ModeGit:
+		scopePath = findGitRoot(CanonicalizePath(rawCwd))
+	case ModeGlobal:
+		scopePath = "global"
+	}
+	hash.Write([]byte{0})
+	hash.Write([]byte(scopePath))
+
+	if mode != ModeIsolated && len(env) > 0 {
+		envCopy := append([]string(nil), env...)
+		sort.Strings(envCopy)
+		for _, entry := range envCopy {
+			hash.Write([]byte{0})
+			hash.Write([]byte(entry))
+		}
+	}
+	hash.Write([]byte{0})
+	hash.Write([]byte(nonce))
+	return "native-" + hex.EncodeToString(hash.Sum(nil))[:16], nil
+}
+
+func safeModernNonce(nonce string) bool {
+	if nonce == "" {
+		return false
+	}
+	for _, b := range []byte(nonce) {
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9') || b == '-' || b == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // resolveBaseDir returns baseDir if non-empty, otherwise os.TempDir().

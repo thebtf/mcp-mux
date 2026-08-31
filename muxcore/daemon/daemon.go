@@ -25,6 +25,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
@@ -98,6 +99,7 @@ type OwnerEntry struct {
 	Args                        []string
 	Cwd                         string
 	Mode                        string
+	ProtocolEra                 era.ProtocolEra
 	Env                         map[string]string
 	Persistent                  bool
 	LastSession                 time.Time
@@ -1141,6 +1143,9 @@ func (d *Daemon) waitForOwnerAdmissionThaw(o *owner.Owner) error {
 // revision mismatches are separately bounded so two mismatches still reach one
 // cold/template-bypass attempt even after an earlier general retry.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
+	if _, err := era.ParseProtocolEra(req.ProtocolEra); err != nil {
+		return "", "", "", fmt.Errorf("spawn: %w", err)
+	}
 	var isolatedRetry int64
 	templateMismatches := 0
 	templateBypass := false
@@ -1175,6 +1180,10 @@ func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) i
 // the mutation must persist across iterations of the Spawn retry loop.
 func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templateMismatches *int, templateBypass *bool) (string, string, string, error) {
 	req := *reqPtr
+	protocolEra, err := era.ParseProtocolEra(req.ProtocolEra)
+	if err != nil {
+		return "", "", "", fmt.Errorf("spawn: %w", err)
+	}
 	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
 	// Mode now gets the global identity (one upstream per (cmd, args)) per the
 	// spec's original "one upstream per (cmd, args), isolation as exception"
@@ -1200,6 +1209,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			req.Mode, req.Command, req.Args)
 		mode = serverid.ModeGlobal
 	}
+	if protocolEra == era.EraModern20260728 {
+		mode = serverid.ModeIsolated
+		req.Mode = string(mode)
+		reqPtr.Mode = req.Mode
+	}
 
 	// Generate handshake token upfront — valid for this spawn call only.
 	token, err := generateToken()
@@ -1223,7 +1237,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	d.mu.RUnlock()
 
 	// Server identity is based on command+args+cwd only, NOT env.
-	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
+	sid, err := serverid.GenerateContextKeyForEra(protocolEra, mode, req.Command, req.Args, nil, req.Cwd, token)
+	if err != nil {
+		return "", "", "", fmt.Errorf("spawn: server identity: %w", err)
+	}
 
 	// CR-002 codex PR #121 fix: when the forced-isolated retry path bumped a
 	// per-base-sid counter, append the counter as `-r<N>` so each retry
@@ -1236,7 +1253,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// non-zero counter and start at `-r<latest>`; reconnects of those sessions
 	// race-bump again. Reaper cleans orphaned -rN owners per CR-003 idle-
 	// isolated timeout.
-	if mode == serverid.ModeIsolated {
+	if protocolEra == era.EraLegacy && mode == serverid.ModeIsolated {
 		n := *isolatedRetry
 		if n == 0 {
 			if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
@@ -1257,7 +1274,13 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	}
 
 	d.mu.Lock()
-	if mode == serverid.ModeIsolated {
+	if protocolEra == era.EraModern20260728 {
+		if _, occupied := d.owners[sid]; occupied {
+			d.mu.Unlock()
+			return "", "", "", fmt.Errorf("spawn: modern identity collision")
+		}
+	}
+	if protocolEra == era.EraLegacy && mode == serverid.ModeIsolated {
 		if _, occupied := d.owners[sid]; occupied {
 			baseSID := serverid.GenerateContextKey(serverid.ModeIsolated, req.Command, req.Args, nil, req.Cwd)
 			ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseSID, &atomic.Int64{})
@@ -1272,7 +1295,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	}
 
 	// 1. Exact match (same command+args+cwd)?
-	if entry, ok := d.owners[sid]; ok {
+	if entry, ok := d.owners[sid]; ok && protocolEra == era.EraLegacy {
 		if entry.creating != nil {
 			// Another goroutine is creating this owner — wait with timeout.
 			creating := entry.creating
@@ -1495,7 +1518,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	//    (classified as shared or session-aware). Unclassified owners are NOT shared
 	//    across different CWDs — every process has exactly one CWD, so sharing an
 	//    unclassified server with a different CWD risks context leaks.
-	if mode == serverid.ModeCwd {
+	if protocolEra == era.EraLegacy && mode == serverid.ModeCwd {
 		if existing := d.findSharedOwnerLocked(req.Command, req.Args, effectiveEnv, req.Cwd); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
@@ -1528,6 +1551,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		Command:         req.Command,
 		Args:            req.Args,
 		Cwd:             req.Cwd,
+		ProtocolEra:     protocolEra,
 		OwnerGeneration: ownerGeneration,
 		RestoreSource:   "fresh",
 		creating:        make(chan struct{}),
@@ -1572,7 +1596,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		Cwd:                         req.Cwd,
 		IPCPath:                     ipcPath,
 		ControlPath:                 controlPath,
-		ServerID:                    sid,
+		ProtocolEra:                 protocolEra,
 		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
 		MaterializationPolicy:       materializationPolicy,
 		DeferInitialMaterialization: true,
@@ -1591,6 +1615,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		OnCacheInvalidated:   d.invalidateOwnerTemplate,
 		Logger:               log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 	}
+	if protocolEra == era.EraModern20260728 {
+		ownerCfg.OnCacheReady = nil
+		ownerCfg.OnCacheInvalidated = nil
+	}
 
 	// Template-backed owners stay cache-only until a cache miss, explicit
 	// persistent policy, or another owner-local materialization trigger occurs.
@@ -1599,7 +1627,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	var selectedTemplate templateMatch
 	fromTemplate := false
 	templatePersistent := false
-	if !*templateBypass {
+	if protocolEra == era.EraLegacy && !*templateBypass {
 		if match, ok := d.getCompatibleTemplate(req.Command, req.Args, req.Cwd, sessionEnv); ok {
 			tmpl := match.snapshot
 			// Adapt only instance identity. Compatibility was already decided
@@ -1643,7 +1671,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		}
 		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
 	}
-	if d.sessionHandler != nil {
+	if protocolEra == era.EraLegacy && d.sessionHandler != nil {
 		o.MarkClassifiedAs(classify.ModeShared)
 	}
 	if !fromTemplate && d.beforeColdOwnerPromotion != nil {
@@ -1689,7 +1717,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		return "", "", "", errSpawnRetry
 	}
 	placeholder.Owner = o
-	placeholder.Mode = req.Mode
+	placeholder.Mode = string(mode)
 	placeholder.Env = sessionEnv
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout

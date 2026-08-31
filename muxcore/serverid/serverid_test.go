@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/thebtf/mcp-mux/muxcore/era"
 )
 
 func TestGenerateContextKeyDeterministic(t *testing.T) {
@@ -21,6 +23,120 @@ func TestGenerateContextKeyDifferentEnv(t *testing.T) {
 	id2 := GenerateContextKey(ModeCwd, "node", []string{"server.js"}, []string{"API=2"}, "/dev/app")
 	if id1 == id2 {
 		t.Errorf("different env produced same ID: %s", id1)
+	}
+}
+
+func TestGenerateContextKeyForEra_LegacyKeepsCurrentBytes(t *testing.T) {
+	got, err := GenerateContextKeyForEra(
+		era.EraLegacy,
+		ModeGlobal,
+		"node",
+		[]string{"server.js"},
+		nil,
+		"",
+		"ignored-by-legacy",
+	)
+	if err != nil {
+		t.Fatalf("GenerateContextKeyForEra(legacy) error = %v", err)
+	}
+
+	// SHA-256(v1.0.0 NUL node NUL server.js NUL global), truncated to 16 hex.
+	const want = "d039a10ca7008687"
+	if got != want {
+		t.Errorf("legacy key = %q, want released byte-identical key %q", got, want)
+	}
+}
+
+func TestGenerateContextKeyForEra_ModernIsDomainSeparatedAndNonceUnique(t *testing.T) {
+	cwd := t.TempDir()
+	legacy, err := GenerateContextKeyForEra(
+		era.EraLegacy,
+		ModeIsolated,
+		"node",
+		[]string{"server.js"},
+		nil,
+		cwd,
+		"",
+	)
+	if err != nil {
+		t.Fatalf("GenerateContextKeyForEra(legacy) error = %v", err)
+	}
+	modernOne, err := GenerateContextKeyForEra(
+		era.EraModern20260728,
+		ModeIsolated,
+		"node",
+		[]string{"server.js"},
+		nil,
+		cwd,
+		"modern-nonce-one",
+	)
+	if err != nil {
+		t.Fatalf("GenerateContextKeyForEra(modern nonce one) error = %v", err)
+	}
+	modernTwo, err := GenerateContextKeyForEra(
+		era.EraModern20260728,
+		ModeIsolated,
+		"node",
+		[]string{"server.js"},
+		nil,
+		cwd,
+		"modern-nonce-two",
+	)
+	if err != nil {
+		t.Fatalf("GenerateContextKeyForEra(modern nonce two) error = %v", err)
+	}
+
+	if modernOne == legacy {
+		t.Errorf("modern key %q collided with legacy identity", modernOne)
+	}
+	if modernOne == modernTwo {
+		t.Errorf("different modern nonces produced one key %q", modernOne)
+	}
+}
+
+func TestGenerateContextKeyForEra_ModernKeyCreatesSafeWindowsPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path-component contract")
+	}
+
+	id, err := GenerateContextKeyForEra(
+		era.EraModern20260728,
+		ModeIsolated,
+		"node",
+		[]string{"server.js"},
+		nil,
+		t.TempDir(),
+		"safe-windows-nonce",
+	)
+	if err != nil {
+		t.Fatalf("GenerateContextKeyForEra(modern) error = %v", err)
+	}
+	path := IPCPath(t.TempDir(), "mcp-mux", id)
+	if err := os.WriteFile(path, []byte("safe"), 0o600); err != nil {
+		t.Fatalf("modern key must form a creatable Windows path component: %v", err)
+	}
+}
+
+func TestGenerateContextKeyForEra_ModernRejectsUnixUnsafeNonce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix path-component validation contract")
+	}
+
+	for _, nonce := range []string{"segment/escape", "nul\x00byte"} {
+		t.Run(strings.ReplaceAll(nonce, "\x00", "-nul-"), func(t *testing.T) {
+			_, err := GenerateContextKeyForEra(
+				era.EraModern20260728,
+				ModeIsolated,
+				"node",
+				[]string{"server.js"},
+				nil,
+				t.TempDir(),
+				nonce,
+			)
+			if err == nil {
+				t.Errorf("modern nonce %q was accepted, want Unix path-component rejection", nonce)
+			}
+		})
 	}
 }
 

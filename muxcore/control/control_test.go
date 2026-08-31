@@ -212,6 +212,7 @@ func TestSendWithTimeout(t *testing.T) {
 type mockDaemonHandler struct {
 	mockHandler
 	spawnCalled   bool
+	spawnReq      Request
 	removeCalled  bool
 	stopCalled    bool
 	refreshCalled bool
@@ -234,6 +235,7 @@ type mockDaemonHandler struct {
 }
 
 func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, error) {
+	m.spawnReq = req
 	m.spawnCalled = true
 	if m.spawnStarted != nil {
 		close(m.spawnStarted)
@@ -533,11 +535,59 @@ func TestSpawnWithDaemonHandler(t *testing.T) {
 	if resp.ServerID != "srv-abc" {
 		t.Errorf("ServerID = %q, want %q", resp.ServerID, "srv-abc")
 	}
+	if got := handler.spawnReq.ProtocolEra; got != "" {
+		t.Errorf("legacy spawn forwarded protocol era = %q, want omitted", got)
+	}
+	if got := resp.ProtocolEra; got != "" {
+		t.Errorf("legacy spawn response protocol era = %q, want omitted", got)
+	}
+	wire, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal legacy spawn response: %v", err)
+	}
+	if bytes.Contains(wire, []byte(`"protocol_era"`)) {
+		t.Errorf("legacy spawn response wire = %s, want protocol_era omitted", wire)
+	}
 	if !handler.spawnCalled {
 		t.Error("HandleSpawn was not called")
 	}
 	if handler.rollbackSID != "" || handler.rollbackToken != "" {
 		t.Fatalf("successful spawn unexpectedly rolled back (%q, %q)", handler.rollbackSID, handler.rollbackToken)
+	}
+}
+
+func TestSpawnWithDaemonHandlerEchoesExactModernProtocolEra(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{
+		spawnIPCPath: "/tmp/modern.sock",
+		spawnSrvID:   "srv-modern",
+	}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{
+		Cmd:         "spawn",
+		Command:     "myserver",
+		Args:        []string{"--flag"},
+		Mode:        "global",
+		ProtocolEra: modernProtocolEra,
+	})
+	if err != nil {
+		t.Fatalf("Send modern spawn: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("modern spawn not OK: %s", resp.Message)
+	}
+	if got := handler.spawnReq.ProtocolEra; got != modernProtocolEra {
+		t.Errorf("HandleSpawn protocol era = %q, want exact %q", got, modernProtocolEra)
+	}
+	if got := resp.ProtocolEra; got != modernProtocolEra {
+		t.Errorf("modern spawn response protocol era = %q, want exact %q", got, modernProtocolEra)
 	}
 }
 

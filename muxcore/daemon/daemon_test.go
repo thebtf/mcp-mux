@@ -406,6 +406,56 @@ func TestDaemonSpawnReusesExisting(t *testing.T) {
 	}
 }
 
+func TestDaemonModernSpawnForcesIsolationAndRejectsEqualLegacyReuse(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+
+	d := testDaemon(t)
+	spawn := func(label string, req control.Request) *control.Response {
+		resp, err := control.Send(d.ctlSrv.SocketPath(), req)
+		if err != nil {
+			t.Fatalf("Send %s spawn: %v", label, err)
+		}
+		if !resp.OK {
+			t.Fatalf("%s spawn not OK: %s", label, resp.Message)
+		}
+		return resp
+	}
+
+	legacy := spawn("legacy", control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	})
+	modern := spawn("modern", control.Request{
+		Cmd:         "spawn",
+		Command:     "go",
+		Args:        []string{"run", "../../testdata/mock_server.go"},
+		Mode:        "global",
+		ProtocolEra: modernProtocolEra,
+	})
+
+	if got := modern.ProtocolEra; got != modernProtocolEra {
+		t.Errorf("modern spawn response protocol era = %q, want exact %q", got, modernProtocolEra)
+	}
+	if modern.ServerID == legacy.ServerID {
+		t.Errorf("modern spawn reused legacy server ID %q for equal launch inputs", modern.ServerID)
+	}
+	if modern.IPCPath == legacy.IPCPath {
+		t.Errorf("modern spawn reused legacy IPC path %q for equal launch inputs", modern.IPCPath)
+	}
+	if got, want := d.OwnerCount(), 2; got != want {
+		t.Errorf("OwnerCount() = %d, want %d after separate legacy and modern launches", got, want)
+	}
+	entry := d.Entry(modern.ServerID)
+	if entry == nil {
+		t.Fatal("modern spawn did not retain an owner entry")
+	}
+	if got, want := entry.Mode, string(serverid.ModeIsolated); got != want {
+		t.Errorf("modern owner sharing mode = %q, want forced isolation %q", got, want)
+	}
+}
+
 func TestDaemonRemove(t *testing.T) {
 	d := testDaemon(t)
 

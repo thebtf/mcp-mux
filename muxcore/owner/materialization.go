@@ -500,7 +500,9 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 
 		go o.readUpstream(proc)
 		go o.monitorUpstreamExit(proc)
-		if err := o.sendProactiveInitFor(a, signals); err != nil {
+		if o.isModern() {
+			signals.signalDiscoveryReady()
+		} else if err := o.sendProactiveInitFor(a, signals); err != nil {
 			signals.signalFailure(err)
 		}
 
@@ -624,7 +626,11 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 	o.materializationMu.Lock()
 	a.process = proc
 	a.signals = signals
-	o.cacheStage = &cacheStage{generation: a.generation, process: proc, signals: signals}
+	if o.isModern() {
+		o.cacheStage = nil
+	} else {
+		o.cacheStage = &cacheStage{generation: a.generation, process: proc, signals: signals}
+	}
 	o.mu.Lock()
 	o.upstream = proc
 	o.upstreamDead.Store(false)
@@ -764,6 +770,13 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 			o.materializationTrigger = a.trigger
 			o.restartResumeTrigger = ""
 			o.materializationMu.Unlock()
+			if o.isModern() {
+				o.initReadyOnce.Do(func() {
+					if o.initReady != nil {
+						close(o.initReady)
+					}
+				})
+			}
 			a.finish(nil)
 			o.logger.Printf("upstream materialization ready generation=%d trigger=%s", a.generation, a.trigger)
 			return
@@ -831,6 +844,10 @@ func (o *Owner) acceptsProcessEvent(proc *upstream.Process) bool {
 }
 
 func (o *Owner) sendProactiveInitFor(a *materializationAttempt, signals *materializationSignals) error {
+	if o.isModern() {
+		signals.signalDiscoveryReady()
+		return nil
+	}
 	proc := a.process
 	if proc == nil {
 		return errors.New("upstream process unavailable")
@@ -881,6 +898,9 @@ func (o *Owner) sendProactiveInitFor(a *materializationAttempt, signals *materia
 }
 
 func (o *Owner) cacheResponseFrom(proc *upstream.Process, method string, raw []byte) {
+	if o.isModern() {
+		return
+	}
 	if proc == nil {
 		o.cacheResponse(method, raw)
 		return
@@ -897,6 +917,9 @@ func (o *Owner) cacheResponseFrom(proc *upstream.Process, method string, raw []b
 // lease held. It avoids recursively acquiring RWMutex.RLock from the message
 // handler, which would deadlock behind a queued writer.
 func (o *Owner) cacheResponseFromLocked(proc *upstream.Process, method string, raw []byte) {
+	if o.isModern() {
+		return
+	}
 	// Active materialization stages are generation-fenced by attempt/process CAS.
 	if proc != nil && o.stageMaterializationCacheResponse(proc, method, raw) {
 		return
@@ -907,6 +930,9 @@ func (o *Owner) cacheResponseFromLocked(proc *upstream.Process, method string, r
 }
 
 func (o *Owner) stageMaterializationListChanged(proc *upstream.Process, method string) bool {
+	if o.isModern() {
+		return false
+	}
 	switch method {
 	case "notifications/tools/list_changed", "notifications/prompts/list_changed", "notifications/resources/list_changed":
 	default:
@@ -924,6 +950,9 @@ func (o *Owner) stageMaterializationListChanged(proc *upstream.Process, method s
 }
 
 func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method string, raw []byte) bool {
+	if o.isModern() {
+		return false
+	}
 	switch method {
 	case "initialize", "tools/list", "prompts/list", "resources/list", "resources/templates/list":
 	default:
@@ -987,6 +1016,9 @@ func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method
 }
 
 func (o *Owner) commitMaterializationCache(a *materializationAttempt) {
+	if o.isModern() {
+		return
+	}
 	o.materializationMu.Lock()
 	if o.materializationAttempt != a || o.cacheStage == nil || o.cacheStage.generation != a.generation {
 		o.materializationMu.Unlock()
@@ -1437,6 +1469,9 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	if demand.message.Method == "initialize" && !o.initFingerprintMatches(demand.message.Raw) {
 		cached = nil
 	}
+	if o.isModern() {
+		cached = nil
+	}
 	o.materializationMu.Unlock()
 
 	if cached != nil {
@@ -1514,6 +1549,9 @@ func (o *Owner) forwardRequestNow(s *Session, msg *jsonrpc.Message) error {
 }
 
 func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
+	if o.isModern() {
+		return o.forwardModernRequestPrepared(s, msg)
+	}
 	o.pendingRequests.Add(1)
 	newID := remap.Remap(s.ID, msg.ID)
 	remapped, err := jsonrpc.ReplaceID(msg.Raw, newID)
@@ -1581,6 +1619,47 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 		return usedProc, true, nil
 	}
 	return usedProc, false, nil
+}
+
+func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
+	o.pendingRequests.Add(1)
+	inflight := &InflightRequest{
+		Method:        msg.Method,
+		Tool:          extractToolName(msg.Raw),
+		SessionID:     s.ID,
+		StartTime:     time.Now(),
+		logSubscribed: modernLogSubscribed(msg.Raw),
+	}
+	key := string(msg.ID)
+	o.inflightTracker.Store(key, inflight)
+	usedProc, writeErr := o.writeUpstreamFromCurrent(msg.Raw, inflight.process.Store)
+	if writeErr == nil {
+		return usedProc, false, nil
+	}
+
+	o.logger.Printf("session %d: native upstream write failed for request id=%s: %v", s.ID, key, writeErr)
+	if _, loaded := o.inflightTracker.LoadAndDelete(key); loaded {
+		o.decrementPending()
+	}
+	_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+	return usedProc, true, nil
+}
+
+func modernLogSubscribed(raw []byte) bool {
+	var request struct {
+		Params struct {
+			Meta map[string]json.RawMessage `json:"_meta"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return false
+	}
+	rawLevel, ok := request.Params.Meta["io.modelcontextprotocol/logLevel"]
+	if !ok {
+		return false
+	}
+	var level string
+	return json.Unmarshal(rawLevel, &level) == nil && level != "" && level != "off"
 }
 
 func (o *Owner) ensureUpstreamReadyForRequest() error {

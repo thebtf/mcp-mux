@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,6 +24,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -177,6 +179,10 @@ type Config struct {
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 
+	// ProtocolPolicy selects the caller's protocol-era route. Its zero value
+	// preserves the released legacy ingress and daemon ordering.
+	ProtocolPolicy era.ProtocolPolicy
+
 	// OnInject forwards to owner.ResilientClientConfig.OnInject. See owner package
 	// for closure semantics. Zero value (nil) preserves pre-v0.23 behavior.
 	OnInject func(inject func([]byte) error)
@@ -276,6 +282,9 @@ type MuxEngine struct {
 // New creates a MuxEngine with the given configuration.
 // Validates config and applies defaults.
 func New(cfg Config) (*MuxEngine, error) {
+	if _, err := protocolEraForPolicy(cfg.ProtocolPolicy); err != nil {
+		return nil, err
+	}
 	if cfg.Command == "" && cfg.Handler == nil && cfg.SessionHandler == nil {
 		return nil, fmt.Errorf("engine: Command, Handler, or SessionHandler is required")
 	}
@@ -298,6 +307,17 @@ func New(cfg Config) (*MuxEngine, error) {
 		logger.Printf("engine: warning: both Handler and SessionHandler set, SessionHandler takes priority")
 	}
 	return &MuxEngine{cfg: cfg, logger: logger, ready: make(chan struct{})}, nil
+}
+
+func protocolEraForPolicy(policy era.ProtocolPolicy) (era.ProtocolEra, error) {
+	switch policy {
+	case era.PolicyLegacyOnly:
+		return era.EraLegacy, nil
+	case era.PolicyModern20260728:
+		return era.EraModern20260728, nil
+	default:
+		return era.EraLegacy, fmt.Errorf("engine: unsupported protocol policy %d", policy)
+	}
 }
 
 // isDaemonMode checks whether the current process was invoked with the daemon flag.
@@ -456,6 +476,27 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 //  4. Bridge stdin/stdout ↔ IPC with automatic reconnect.
 func (e *MuxEngine) runClient(ctx context.Context) error {
 	e.markReady(ModeClient, nil)
+	protocolEra, err := protocolEraForPolicy(e.cfg.ProtocolPolicy)
+	if err != nil {
+		return err
+	}
+	protocolWire, err := protocolEra.Wire()
+	if err != nil {
+		return fmt.Errorf("engine client: protocol era: %w", err)
+	}
+
+	clientStdin := io.Reader(os.Stdin)
+	if protocolEra == era.EraModern20260728 {
+		opening, remainder, readErr := era.ReadOpeningFrame(os.Stdin)
+		if readErr != nil {
+			return fmt.Errorf("engine client: read modern opening frame: %w", readErr)
+		}
+		rawOpening, available := opening.Take()
+		if !available {
+			return fmt.Errorf("engine client: modern opening frame unavailable")
+		}
+		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), remainder)
+	}
 
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 
@@ -499,7 +540,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	env := collectEnv()
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
-	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
+	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, protocolWire, e.logger)
 	if err != nil {
 		return fmt.Errorf("engine client: spawn: %w", err)
 	}
@@ -532,7 +573,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "reconnect"); err != nil {
 			return "", "", err
 		}
-		newIPC, newServerID, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", e.logger)
+		newIPC, newServerID, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", protocolWire, e.logger)
 		if err != nil {
 			return "", "", err
 		}
@@ -543,7 +584,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	}
 
 	return runResilientClient(owner.ResilientClientConfig{
-		Stdin:            os.Stdin,
+		Stdin:            clientStdin,
 		Stdout:           os.Stdout,
 		InitialIPCPath:   ipcPath,
 		Token:            token,
@@ -781,11 +822,11 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path
 // server identity, and handshake token for the owner that will serve our server
 // identity.
-func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, string, error) {
-	return spawnViaDaemonWithReason(ctlPath, command, args, cwd, mode, env, "", logger)
+func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, protocolEra string, logger *log.Logger) (string, string, string, error) {
+	return spawnViaDaemonWithReason(ctlPath, command, args, cwd, mode, env, "", protocolEra, logger)
 }
 
-func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, string, error) {
+func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger) (string, string, string, error) {
 	// spawnRPCTimeout covers daemon processing + upstream process start + proactive init.
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:             "spawn",
@@ -795,12 +836,16 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 		Mode:            mode,
 		Env:             env,
 		ReconnectReason: reconnectReason,
+		ProtocolEra:     protocolEra,
 	}, spawnRPCTimeout)
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
 		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+	}
+	if protocolEra != "" && resp.ProtocolEra != protocolEra {
+		return "", "", "", fmt.Errorf("daemon spawn protocol era = %q, want %q", resp.ProtocolEra, protocolEra)
 	}
 
 	sid := resp.ServerID

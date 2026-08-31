@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -102,6 +104,7 @@ func main() {
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
 	daemon := flag.Bool("daemon", false, "Run as headless owner (no stdio session, for restart)")
+	mcpProtocol := flag.String("mcp-protocol", "", "MCP protocol era (2026-07-28)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -110,6 +113,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       mcp-mux stop [--drain-timeout 30s] [--force]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux status")
 		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
+		os.Exit(1)
+	}
+	protocolEra, err := era.ParseProtocolEra(*mcpProtocol)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: unsupported MCP protocol %q\n", *mcpProtocol)
+		os.Exit(1)
+	}
+	protocolWire, err := protocolEra.Wire()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: protocol era: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -153,6 +166,27 @@ func main() {
 		*daemon = true
 	}
 
+	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
+	if protocolEra == era.EraModern20260728 && (noDaemon || *daemon) {
+		fmt.Fprintln(os.Stderr, "error: --mcp-protocol=2026-07-28 requires daemon control routing")
+		os.Exit(1)
+	}
+
+	clientStdin := io.Reader(os.Stdin)
+	if protocolEra == era.EraModern20260728 {
+		opening, remainder, readErr := era.ReadOpeningFrame(os.Stdin)
+		if readErr != nil {
+			fmt.Fprintf(os.Stderr, "error: read modern opening frame: %v\n", readErr)
+			os.Exit(1)
+		}
+		rawOpening, available := opening.Take()
+		if !available {
+			fmt.Fprintln(os.Stderr, "error: modern opening frame unavailable")
+			os.Exit(1)
+		}
+		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), remainder)
+	}
+
 	// Get current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -194,7 +228,6 @@ func main() {
 	// daemon's spawn path can mint and pre-register that token for the shim.
 	// Connecting directly to the owner's IPC socket skips that registration and
 	// gets rejected as "invalid/missing token".
-	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
 	if !noDaemon {
 		// Consume the one-shot launcher attestation before daemon startup can
 		// delay the child beyond the bounded parent listener lifetime.
@@ -210,7 +243,7 @@ func main() {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
-			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonForEra(command, cmdArgs, cwd, modeStr, shimEnv, protocolWire, logger)
 			if err != nil {
 				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q daemon_required=true",
 					time.Since(spawnStart), err.Error())
@@ -260,7 +293,7 @@ func main() {
 							}
 							return "", "", supervisedDaemonReconnectError(err)
 						}
-						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
+						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeoutForEra(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", protocolWire, logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
@@ -305,7 +338,7 @@ func main() {
 
 				resilientStart := time.Now()
 				err = owner.RunResilientClient(owner.ResilientClientConfig{
-					Stdin:             os.Stdin,
+					Stdin:             clientStdin,
 					Stdout:            os.Stdout,
 					InitialIPCPath:    daemonIPC,
 					Token:             daemonToken,

@@ -1,6 +1,7 @@
 package owner
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thejerf/suture/v4"
 )
 
@@ -360,5 +362,207 @@ func TestServe_ReturnsErrDoNotRestartAfterShutdown(t *testing.T) {
 	// Post-fix: returns ErrDoNotRestart → suture stops cycling, no cleanup event.
 	if got != suture.ErrDoNotRestart {
 		t.Errorf("Serve on shut-down owner returned %v, want suture.ErrDoNotRestart", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T015: Native MCP 2026-07-28 owner behavior
+// ---------------------------------------------------------------------------
+
+func newModernWriterOwner(
+	t *testing.T,
+	writer io.Writer,
+	onCacheReady func(*Owner, OwnerSnapshot) bool,
+) *Owner {
+	t.Helper()
+	o, err := NewOwner(OwnerConfig{
+		IPCPath:        testIPCPath(t),
+		UpstreamWriter: writer,
+		ProtocolEra:    era.EraModern20260728,
+		OnCacheReady:   onCacheReady,
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner(modern): %v", err)
+	}
+	t.Cleanup(o.Shutdown)
+	return o
+}
+
+func addModernOwnerSession(t *testing.T, o *Owner, cwd string) (*Session, *safeBuf) {
+	t.Helper()
+	session, output := newTestSession(cwd)
+	o.admissionMu.Lock()
+	o.addSessionLocked(session)
+	o.admissionMu.Unlock()
+	t.Cleanup(session.Close)
+	return session, output
+}
+
+func TestModernOwner_NativeReadinessSkipsLegacyBootstrap(t *testing.T) {
+	started := make(chan struct{}, 1)
+	frames := make(chan []byte, 4)
+	o, err := NewOwner(OwnerConfig{
+		IPCPath:     testIPCPath(t),
+		ProtocolEra: era.EraModern20260728,
+		HandlerFunc: func(ctx context.Context, stdin io.Reader, _ io.Writer) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				frame := append([]byte(nil), scanner.Bytes()...)
+				select {
+				case frames <- frame:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return scanner.Err()
+		},
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner(modern): %v", err)
+	}
+	t.Cleanup(o.Shutdown)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("modern upstream handler did not start")
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("modern owner injected legacy bootstrap traffic before host demand: %s", frame)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if !o.IsClassifiedIsolated() {
+		t.Fatal("modern owner is not forced isolated")
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return o.MaterializationState() == MaterializationReady
+	}, "modern owner did not become ready without legacy discovery")
+}
+
+func TestModernOwner_PreservesNativeRequestsAndMRTRWithoutCacheOrReplay(t *testing.T) {
+	var upstream safeBuf
+	cachePublishes := 0
+	o := newModernWriterOwner(t, &upstream, func(*Owner, OwnerSnapshot) bool {
+		cachePublishes++
+		return true
+	})
+	if !o.IsClassifiedIsolated() {
+		t.Fatal("modern owner is not forced isolated")
+	}
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	listRequest := []byte(`{"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}},"id":"modern-list-1","jsonrpc":"2.0"}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(listRequest)); err != nil {
+		t.Fatalf("forward native tools/list: %v", err)
+	}
+	if got, want := upstream.String(), string(listRequest)+"\n"; got != want {
+		t.Fatalf("first native request upstream bytes = %q, want exactly %q", got, want)
+	}
+
+	listResponse := []byte(`{"id":"modern-list-1","result":{"tools":[{"name":"modern_echo"}]},"jsonrpc":"2.0"}`)
+	if err := o.handleUpstreamMessage(parseMessage(listResponse)); err != nil {
+		t.Fatalf("route native tools/list response: %v", err)
+	}
+	if got, want := downstream.String(), string(listResponse)+"\n"; got != want {
+		t.Fatalf("native tools/list response = %q, want byte-exact %q", got, want)
+	}
+	if cached := o.getCachedResponse("tools/list"); cached != nil {
+		t.Fatalf("modern tools/list response entered legacy cache: %s", cached)
+	}
+	if cachePublishes != 0 {
+		t.Fatalf("modern response invoked legacy cache/template publication %d time(s)", cachePublishes)
+	}
+
+	listRetry := []byte(`{"jsonrpc":"2.0","id":"modern-list-2","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(listRetry)); err != nil {
+		t.Fatalf("forward second native tools/list: %v", err)
+	}
+	wantUpstream := string(listRequest) + "\n" + string(listRetry) + "\n"
+	if got := upstream.String(); got != wantUpstream {
+		t.Fatalf("modern tools/list replayed cache or rewrote retry: got %q, want %q", got, wantUpstream)
+	}
+
+	callRequest := []byte(`{"params":{"name":"modern_echo","arguments":{"message":"native"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}},"jsonrpc":"2.0","id":"modern-call-1","method":"tools/call"}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(callRequest)); err != nil {
+		t.Fatalf("forward native tools/call: %v", err)
+	}
+	wantUpstream += string(callRequest) + "\n"
+	if got := upstream.String(); got != wantUpstream {
+		t.Fatalf("native tools/call upstream bytes = %q, want exactly %q", got, wantUpstream)
+	}
+
+	inputRequired := []byte(`{"jsonrpc":"2.0","id":"modern-call-1","result":{"resultType":"input_required","inputRequests":{"fixture_confirmation":{"method":"elicitation/create","params":{"requestedSchema":{"type":"object","required":["confirmed"]}}}},"requestState":{"opaque":["preserve",{"byte":"exact"}]}}}`)
+	if err := o.handleUpstreamMessage(parseMessage(inputRequired)); err != nil {
+		t.Fatalf("route native input_required response: %v", err)
+	}
+	wantDownstream := string(listResponse) + "\n" + string(inputRequired) + "\n"
+	if got := downstream.String(); got != wantDownstream {
+		t.Fatalf("native input_required result was changed or misrouted: got %q, want %q", got, wantDownstream)
+	}
+}
+
+func TestModernOwner_ContainsUpstreamJSONRPCRequests(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	demand := []byte(`{"jsonrpc":"2.0","id":"modern-call-active","method":"tools/call","params":{"name":"modern_echo","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(demand)); err != nil {
+		t.Fatalf("forward native request: %v", err)
+	}
+
+	serverRequest := []byte(`{"jsonrpc":"2.0","id":"upstream-server-request","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"must stay contained"}}],"maxTokens":16}}`)
+	if err := o.handleUpstreamMessage(parseMessage(serverRequest)); err != nil && !errors.Is(err, era.AdmissionContainedUpstreamRequest) {
+		t.Fatalf("contain modern upstream request: %v", err)
+	}
+	if waitCondition(t, 200*time.Millisecond, func() bool {
+		return downstream.String() != ""
+	}) {
+		t.Fatalf("modern upstream JSON-RPC request reached downstream: %s", downstream.String())
+	}
+}
+
+func TestModernOwner_ForwardsOnlyOptedInStandardLogToSoleSession(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	standardLog := []byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"mock-modern-server","data":"request-scoped fixture log"}}`)
+	if err := o.handleUpstreamMessage(parseMessage(standardLog)); err != nil {
+		t.Fatalf("handle unopted standard log: %v", err)
+	}
+	if waitCondition(t, 150*time.Millisecond, func() bool {
+		return downstream.String() != ""
+	}) {
+		t.Fatalf("standard log without request opt-in reached downstream: %s", downstream.String())
+	}
+
+	optedInRequest := []byte(`{"jsonrpc":"2.0","id":"modern-log-opt-in","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info"}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(optedInRequest)); err != nil {
+		t.Fatalf("forward log-opted native request: %v", err)
+	}
+	if got, want := upstream.String(), string(optedInRequest)+"\n"; got != want {
+		t.Fatalf("modern logging opt-in generated or rewrote upstream traffic: got %q, want %q", got, want)
+	}
+
+	if err := o.handleUpstreamMessage(parseMessage(standardLog)); err != nil {
+		t.Fatalf("handle opted-in standard log: %v", err)
+	}
+	if !waitCondition(t, time.Second, func() bool {
+		return strings.Count(downstream.String(), string(standardLog)) == 1
+	}) {
+		t.Fatalf("opted-in standard log was not delivered once: %s", downstream.String())
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got, want := downstream.String(), string(standardLog)+"\n"; got != want {
+		t.Fatalf("standard log was synthesized, duplicated, or transformed: got %q, want %q", got, want)
 	}
 }
