@@ -124,13 +124,13 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### Slice C: Retry rehydration, respawn, and blocked finalization
 
-- [ ] T045 [P] [US3] Add RED retry-rehydration tests against the existing retry selection that permit bounded restoration of retry-family identity, counter, and eligibility only with an explicit modern era, and otherwise cold-start or refuse without a legacy default in `muxcore/daemon/retry_counter_rehydrate_test.go`.
-- [ ] T046 [P] [US3] Add RED owner-respawn tests that permit same-era modern replacement only after terminal work and reject legacy bootstrap, cache, and replay on the replacement in `muxcore/owner/respawn_test.go`.
-- [ ] T047 [P] [US3] Add RED blocked-finalization tests that keep the exact current owner authoritative until `RetirementProven` or the existing explicit failure path resolves in `muxcore/owner/materialization_controller_test.go`.
-- [ ] T048 [US3] Carry the immutable modern era through bounded retry-family rehydration and retry eligibility without a legacy default in `muxcore/daemon/daemon.go` and `muxcore/daemon/owner_lifecycle.go`.
-- [ ] T049 [US3] Restrict owner-local replacement to the same explicit modern era and retain current process-generation and finalization fences before a successor becomes authoritative in `muxcore/owner/materialization.go`.
-- [ ] T050 [US3] Run the focused retry, respawn, and blocked-finalization tests in `muxcore/daemon/retry_counter_rehydrate_test.go`, `muxcore/owner/respawn_test.go`, and `muxcore/owner/materialization_controller_test.go`.
-- [ ] T051 [US3] Stage and commit the proven retry/respawn/finalization slice: `muxcore/daemon/daemon.go`, `muxcore/daemon/owner_lifecycle.go`, `muxcore/daemon/retry_counter_rehydrate_test.go`, `muxcore/owner/materialization.go`, `muxcore/owner/respawn_test.go`, and `muxcore/owner/materialization_controller_test.go`.
+- [x] T045 [P] [US3] Add RED retry-rehydration tests against the existing retry selection that permit bounded restoration of retry-family identity, counter, and eligibility only with an explicit modern era, and otherwise cold-start or refuse without a legacy default in `muxcore/daemon/retry_counter_rehydrate_test.go`.
+- [x] T046 [P] [US3] Add RED owner-respawn tests that permit same-era modern replacement only after terminal work and reject legacy bootstrap, cache, and replay on the replacement in `muxcore/owner/respawn_test.go`.
+- [x] T047 [P] [US3] Add RED blocked-finalization tests that keep the exact current owner authoritative until `RetirementProven` or the existing explicit failure path resolves in `muxcore/owner/materialization_controller_test.go`.
+- [x] T048 [US3] Carry the immutable modern era through bounded retry-family rehydration and retry eligibility without a legacy default in `muxcore/daemon/daemon.go` and `muxcore/daemon/owner_lifecycle.go`.
+- [x] T049 [US3] Restrict owner-local replacement to the same explicit modern era and retain current process-generation and finalization fences before a successor becomes authoritative in `muxcore/owner/materialization.go`.
+- [x] T050 [US3] Run the focused retry, respawn, and blocked-finalization tests in `muxcore/daemon/retry_counter_rehydrate_test.go`, `muxcore/owner/respawn_test.go`, and `muxcore/owner/materialization_controller_test.go`.
+- [x] T051 [US3] Stage and commit the proven retry/respawn/finalization slice: `muxcore/daemon/daemon.go`, `muxcore/daemon/snapshot.go`, `muxcore/daemon/owner_lifecycle.go`, `muxcore/daemon/retry_counter_rehydrate_test.go`, `muxcore/owner/materialization.go`, `muxcore/owner/materialization_controller_test.go`, `muxcore/owner/owner.go`, `muxcore/owner/handoff_from.go`, and `muxcore/owner/respawn_test.go`.
 
 ### Slice D: Loss and reconnect
 
