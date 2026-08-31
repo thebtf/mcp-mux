@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thejerf/suture/v4"
 )
@@ -30,6 +31,46 @@ const (
 
 var finalizeOwnerForRemoval = func(o *owner.Owner, soft bool) (int, bool, error) {
 	return o.FinalizeForRemoval(soft, 30*time.Second)
+}
+
+type ownerEntryIdentity struct {
+	serverID        string
+	protocolEra     era.ProtocolEra
+	ownerGeneration string
+}
+
+func captureOwnerEntryIdentity(entry *OwnerEntry) ownerEntryIdentity {
+	if entry == nil {
+		return ownerEntryIdentity{}
+	}
+	return ownerEntryIdentity{
+		serverID:        entry.ServerID,
+		protocolEra:     entry.ProtocolEra,
+		ownerGeneration: entry.OwnerGeneration,
+	}
+}
+
+func (identity ownerEntryIdentity) matches(entry *OwnerEntry) bool {
+	return entry != nil &&
+		entry.ServerID == identity.serverID &&
+		entry.ProtocolEra == identity.protocolEra &&
+		entry.OwnerGeneration == identity.ownerGeneration
+}
+
+type zeroIdleOwnerView struct {
+	identity ownerEntryIdentity
+	entry    *OwnerEntry
+	owner    *owner.Owner
+	zeroAt   time.Time
+}
+
+func (v zeroIdleOwnerView) matches(current *OwnerEntry) bool {
+	return current != nil &&
+		current == v.entry &&
+		current.Owner == v.owner &&
+		v.identity.matches(current) &&
+		!current.Persistent &&
+		current.LastSession.Equal(v.zeroAt)
 }
 
 type ownerRemovalResult struct {
@@ -103,30 +144,37 @@ func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *Owne
 	result := ownerRemovalResult{ServerID: serverID, Reason: ownerRemovalReasonIdle, Soft: true}
 	d.mu.RLock()
 	entry, ok := d.owners[serverID]
-	if !ok || (expected != nil && entry != expected) || entry == nil || entry.Owner == nil || !entry.LastSession.Equal(zeroAt) {
+	if !ok || (expected != nil && entry != expected) || entry == nil || entry.Owner == nil || entry.ServerID != serverID {
 		d.mu.RUnlock()
 		return result, false, nil
 	}
-	ownerRef := entry.Owner
-	persistent := entry.Persistent
-	lastSession := entry.LastSession
+	view := zeroIdleOwnerView{
+		identity: captureOwnerEntryIdentity(entry),
+		entry:    entry,
+		owner:    entry.Owner,
+		zeroAt:   zeroAt,
+	}
+	if !view.matches(entry) {
+		d.mu.RUnlock()
+		return result, false, nil
+	}
 	d.mu.RUnlock()
 
 	sample := evictionSample{
-		Sessions:               ownerRef.SessionCount(),
-		PendingSessions:        ownerRef.SessionMgr().PendingCount(),
-		Persistent:             persistent,
-		PendingRequests:        ownerRef.PendingRequests(),
-		ActiveProgressTokens:   ownerRef.ActiveProgressTokens(),
-		HasBusyWork:            ownerRef.HasActiveBusyWork(),
-		UpstreamDead:           ownerRef.UpstreamDead(),
-		CacheReady:             ownerRef.CacheReady(),
-		MaterializationBlocked: ownerRef.MaterializationBlocksEviction(),
+		Sessions:               view.owner.SessionCount(),
+		PendingSessions:        view.owner.SessionMgr().PendingCount(),
+		Persistent:             false,
+		PendingRequests:        view.owner.PendingRequests(),
+		ActiveProgressTokens:   view.owner.ActiveProgressTokens(),
+		HasBusyWork:            view.owner.HasActiveBusyWork(),
+		UpstreamDead:           view.owner.UpstreamDead(),
+		CacheReady:             view.owner.CacheReady(),
+		MaterializationBlocked: view.owner.MaterializationBlocksEviction(),
 		IdleTimeout:            idleTimeout,
-		OwnerIdleOverride:      ownerRef.IdleTimeout(),
-		LastSession:            lastSession,
-		LastActivity:           ownerRef.LastActivity(),
-		IsolatedClassified:     ownerRef.IsClassifiedIsolated(),
+		OwnerIdleOverride:      view.owner.IdleTimeout(),
+		LastSession:            view.zeroAt,
+		LastActivity:           view.owner.LastActivity(),
+		IsolatedClassified:     view.owner.IsClassifiedIsolated(),
 	}
 	decision := shouldEvict(sample, time.Now(), idleTimeout, 0)
 	if !decision.evict {
@@ -139,9 +187,7 @@ func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *Owne
 		reason = ownerRemovalReasonZombie
 		soft = false
 	}
-	removed, err := d.finalizeAndRemoveOwner(serverID, entry, reason, soft, func(current *OwnerEntry) bool {
-		return current.Owner == ownerRef && !current.Persistent && current.LastSession.Equal(zeroAt)
-	}, true)
+	removed, err := d.finalizeAndRemoveOwner(serverID, view.entry, reason, soft, view.matches, true)
 	return removed, removed.Removed, err
 }
 

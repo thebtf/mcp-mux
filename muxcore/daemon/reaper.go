@@ -38,6 +38,7 @@ type Reaper struct {
 
 type reaperOwnerView struct {
 	sid         string
+	identity    ownerEntryIdentity
 	entry       *OwnerEntry
 	owner       *owner.Owner
 	persistent  bool
@@ -47,8 +48,10 @@ type reaperOwnerView struct {
 
 func (v reaperOwnerView) matches(current *OwnerEntry) bool {
 	return current != nil &&
+		v.sid == v.identity.serverID &&
 		current == v.entry &&
 		current.Owner == v.owner &&
+		v.identity.matches(current) &&
 		current.Persistent == v.persistent &&
 		current.IdleTimeout == v.idleTimeout &&
 		current.LastSession.Equal(v.lastSession)
@@ -122,6 +125,7 @@ func (r *Reaper) sweep() int {
 	for sid, entry := range r.daemon.owners {
 		entries = append(entries, reaperOwnerView{
 			sid:         sid,
+			identity:    captureOwnerEntryIdentity(entry),
 			entry:       entry,
 			owner:       entry.Owner,
 			persistent:  entry.Persistent,

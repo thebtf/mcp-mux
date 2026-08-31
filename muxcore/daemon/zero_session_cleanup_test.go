@@ -2,12 +2,15 @@ package daemon
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
 func testZeroSessionCleanupDaemon(t *testing.T, cleanupDelay time.Duration) *Daemon {
@@ -269,5 +272,403 @@ func TestZeroSessionCleanupReconnectReservationClosesWakeRace(t *testing.T) {
 	}, "zero-session cleanup remained blocked after reservation was consumed")
 	if cleanupErr != nil {
 		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() after bind error = %v", cleanupErr)
+	}
+}
+
+func TestOwnerEntryIdentityAndZeroIdleOwnerViewRequireExactModernFacts(t *testing.T) {
+	const (
+		sid        = "native-zero-idle-exact"
+		generation = "owner_gen_modern_exact"
+	)
+	zeroAt := time.Now().UTC()
+	ownerRef := testReconnectOwner(t, sid)
+	entry := &OwnerEntry{
+		Owner:           ownerRef,
+		ServerID:        sid,
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: generation,
+		LastSession:     zeroAt,
+	}
+	identity := ownerEntryIdentity{
+		serverID:        entry.ServerID,
+		protocolEra:     entry.ProtocolEra,
+		ownerGeneration: entry.OwnerGeneration,
+	}
+	view := zeroIdleOwnerView{
+		identity: identity,
+		entry:    entry,
+		owner:    ownerRef,
+		zeroAt:   zeroAt,
+	}
+
+	if !identity.matches(entry) {
+		t.Fatal("ownerEntryIdentity rejected unchanged modern entry")
+	}
+	if !view.matches(entry) {
+		t.Fatal("zeroIdleOwnerView rejected unchanged exact modern entry")
+	}
+
+	sameFacts := *entry
+	if !identity.matches(&sameFacts) {
+		t.Fatal("ownerEntryIdentity rejected equal modern identity facts")
+	}
+	if view.matches(&sameFacts) {
+		t.Fatal("zeroIdleOwnerView accepted a different entry pointer")
+	}
+
+	replacementOwner := testReconnectOwner(t, "native-zero-idle-replacement")
+	entry.Owner = replacementOwner
+	if view.matches(entry) {
+		t.Fatal("zeroIdleOwnerView accepted a different owner pointer")
+	}
+	entry.Owner = ownerRef
+
+	for _, test := range []struct {
+		name            string
+		identityMatches bool
+		mutate          func(*OwnerEntry)
+	}{
+		{
+			name: "server ID drift",
+			mutate: func(current *OwnerEntry) {
+				current.ServerID = "native-zero-idle-drifted"
+			},
+		},
+		{
+			name: "protocol era drift",
+			mutate: func(current *OwnerEntry) {
+				current.ProtocolEra = era.EraLegacy
+			},
+		},
+		{
+			name: "owner generation drift",
+			mutate: func(current *OwnerEntry) {
+				current.OwnerGeneration = "owner_gen_modern_drifted"
+			},
+		},
+		{
+			name:            "persistence changed",
+			identityMatches: true,
+			mutate: func(current *OwnerEntry) {
+				current.Persistent = true
+			},
+		},
+		{
+			name:            "zero session timestamp changed",
+			identityMatches: true,
+			mutate: func(current *OwnerEntry) {
+				current.LastSession = zeroAt.Add(time.Nanosecond)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := *entry
+			test.mutate(&candidate)
+			if got := identity.matches(&candidate); got != test.identityMatches {
+				t.Fatalf("ownerEntryIdentity.matches() = %v, want %v", got, test.identityMatches)
+			}
+
+			saved := *entry
+			test.mutate(entry)
+			if view.matches(entry) {
+				t.Fatal("zeroIdleOwnerView accepted changed eligibility facts")
+			}
+			*entry = saved
+		})
+	}
+}
+
+func TestZeroSessionCleanupRejectsRegistryKeyIdentityMismatch(t *testing.T) {
+	d := testZeroSessionCleanupDaemon(t, time.Hour)
+	d.supervisor = nil
+	const (
+		registryKey = "native-zero-idle-registry-key"
+		entryID     = "native-zero-idle-entry-id"
+	)
+	ownerRef := testReconnectOwner(t, entryID)
+	zeroAt := time.Now().Add(-time.Second)
+	entry := &OwnerEntry{
+		Owner:           ownerRef,
+		ServerID:        entryID,
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: "owner_gen_registry_mismatch",
+		LastSession:     zeroAt,
+		IdleTimeout:     time.Millisecond,
+	}
+	d.mu.Lock()
+	d.owners[registryKey] = entry
+	d.mu.Unlock()
+	time.Sleep(20 * time.Millisecond)
+
+	original := finalizeOwnerForRemoval
+	finalizerCalled := false
+	finalizeOwnerForRemoval = func(*owner.Owner, bool) (int, bool, error) {
+		finalizerCalled = true
+		return 0, true, nil
+	}
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+
+	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(registryKey, entry, zeroAt, time.Millisecond); err != nil {
+		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() error: %v", err)
+	} else if removed {
+		t.Fatal("zero-session cleanup removed an entry whose ServerID did not match its registry key")
+	}
+	if finalizerCalled {
+		t.Fatal("zero-session cleanup finalized an entry whose ServerID did not match its registry key")
+	}
+	if current := d.Entry(registryKey); current != entry {
+		t.Fatalf("registry-key mismatch changed current entry: got=%p want=%p", current, entry)
+	}
+}
+
+func TestZeroSessionCleanupModernOwnerRemovesWithoutLegacyRecoveryState(t *testing.T) {
+	const label = "zero-cleanup-modern-disposable"
+	d := testZeroSessionCleanupDaemon(t, 25*time.Millisecond)
+
+	ipcPath, sid, token, err := d.Spawn(control.Request{
+		Cmd:         "spawn",
+		Command:     "session-handler",
+		Args:        []string{label},
+		Mode:        "global",
+		ProtocolEra: "2026-07-28",
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("modern owner entry missing after spawn")
+	}
+	if entry.ProtocolEra != era.EraModern20260728 || !isModernOwnerID(sid) {
+		t.Fatalf("spawned entry is not exact modern owner: sid=%q era=%v", sid, entry.ProtocolEra)
+	}
+	generation := entry.OwnerGeneration
+	if generation == "" {
+		t.Fatal("modern owner generation is empty")
+	}
+
+	conn := dialLifecycleSession(t, ipcPath, token)
+	waitOwnerSessionCount(t, entry, 1)
+	if err := conn.Close(); err != nil {
+		t.Fatalf("conn.Close() error: %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+	waitForOwnerMissing(t, d, sid)
+
+	if current := d.Entry(sid); current != nil {
+		t.Fatalf("zero-session cleanup left a modern successor: %#v", current)
+	}
+	if got := d.OwnerCount(); got != 0 {
+		t.Fatalf("owner count after modern cleanup = %d, want no successor", got)
+	}
+	if entry.OwnerGeneration != generation {
+		t.Fatalf("removed modern entry generation changed from %q to %q", generation, entry.OwnerGeneration)
+	}
+	if _, ok := d.getTemplate("session-handler", []string{label}); ok {
+		t.Fatal("modern zero-session cleanup published a legacy template")
+	}
+	retryCounters := 0
+	d.forcedIsolatedRetryCounters.Range(func(_, _ any) bool {
+		retryCounters++
+		return true
+	})
+	if retryCounters != 0 {
+		t.Fatalf("modern zero-session cleanup hydrated %d retry counters", retryCounters)
+	}
+	if _, err := d.HandleRefreshSessionToken(token); !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("HandleRefreshSessionToken(%q) error = %v, want ErrUnknownToken after removal", token, err)
+	}
+	assertOwnerRemovalStatus(t, d.HandleStatus(), 1, "idle", 1)
+}
+
+func TestZeroSessionCleanupModernReconnectReservationRetainsThenRemovesSameGeneration(t *testing.T) {
+	d := testZeroSessionCleanupDaemon(t, time.Hour)
+
+	ipcPath, sid, previousToken, err := d.Spawn(control.Request{
+		Cmd:         "spawn",
+		Command:     "session-handler",
+		Args:        []string{"zero-cleanup-modern-reconnect"},
+		Mode:        "global",
+		ProtocolEra: "2026-07-28",
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error: %v", err)
+	}
+	entry := d.Entry(sid)
+	if entry == nil || entry.Owner == nil {
+		t.Fatal("modern owner entry missing after spawn")
+	}
+	if entry.ProtocolEra != era.EraModern20260728 || !isModernOwnerID(sid) {
+		t.Fatalf("spawned entry is not exact modern owner: sid=%q era=%v", sid, entry.ProtocolEra)
+	}
+	generation := entry.OwnerGeneration
+
+	conn := dialLifecycleSession(t, ipcPath, previousToken)
+	waitOwnerSessionCount(t, entry, 1)
+	lastSessionBeforeDisconnect := entry.LastSession
+	if err := conn.Close(); err != nil {
+		t.Fatalf("initial conn.Close() error: %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+	waitForDaemonCondition(t, time.Second, func() bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return !entry.LastSession.Equal(lastSessionBeforeDisconnect)
+	}, "initial modern disconnect did not publish zero-session timestamp")
+
+	zeroAt := time.Now().Add(-time.Second)
+	d.mu.Lock()
+	entry.LastSession = zeroAt
+	d.mu.Unlock()
+	reconnectToken, err := entry.Owner.SessionMgr().RegisterReconnect(previousToken, func(ownerKey string) bool {
+		return ownerKey == sid && d.Entry(ownerKey) == entry
+	})
+	if err != nil {
+		t.Fatalf("RegisterReconnect() error: %v", err)
+	}
+	if got := entry.Owner.SessionMgr().PendingCount(); got != 1 {
+		t.Fatalf("PendingCount() with modern reconnect reservation = %d, want 1", got)
+	}
+	if _, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond); err != nil {
+		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() with reservation error: %v", err)
+	} else if removed {
+		t.Fatal("zero-session cleanup removed modern owner with reconnect reservation")
+	}
+	if current := d.Entry(sid); current != entry || current.OwnerGeneration != generation {
+		t.Fatalf("reconnect reservation replaced modern generation: %#v", current)
+	}
+
+	wakeConn := dialLifecycleSession(t, ipcPath, reconnectToken)
+	waitOwnerSessionCount(t, entry, 1)
+	if got := entry.Owner.SessionMgr().PendingCount(); got != 0 {
+		t.Fatalf("PendingCount() after reconnect consumption = %d, want 0", got)
+	}
+	lastSessionBeforeWakeDisconnect := entry.LastSession
+	if err := wakeConn.Close(); err != nil {
+		t.Fatalf("wake conn.Close() error: %v", err)
+	}
+	waitOwnerSessionCount(t, entry, 0)
+	waitForDaemonCondition(t, time.Second, func() bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		return !entry.LastSession.Equal(lastSessionBeforeWakeDisconnect)
+	}, "consumed modern reconnect did not publish zero-session timestamp")
+
+	zeroAt = time.Now().Add(-time.Second)
+	d.mu.Lock()
+	entry.LastSession = zeroAt
+	d.mu.Unlock()
+	var cleanupErr error
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		_, removed, err := d.removeOwnerIfCurrentAndZeroIdle(sid, entry, zeroAt, time.Millisecond)
+		if err != nil {
+			cleanupErr = err
+			return true
+		}
+		return removed
+	}, "zero-session cleanup remained blocked after modern reservation consumption")
+	if cleanupErr != nil {
+		t.Fatalf("removeOwnerIfCurrentAndZeroIdle() after reservation consumption error: %v", cleanupErr)
+	}
+	if entry.OwnerGeneration != generation {
+		t.Fatalf("modern generation changed before removal: got %q want %q", entry.OwnerGeneration, generation)
+	}
+	if current := d.Entry(sid); current != nil {
+		t.Fatalf("modern owner remained after consumed reconnect cleanup: %#v", current)
+	}
+	if got := d.OwnerCount(); got != 0 {
+		t.Fatalf("owner count after consumed reconnect cleanup = %d, want 0", got)
+	}
+	if _, err := d.HandleRefreshSessionToken(reconnectToken); !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("HandleRefreshSessionToken(%q) error = %v, want ErrUnknownToken after removal", reconnectToken, err)
+	}
+}
+
+func TestZeroSessionCleanupModernFinalizationUnprovenRetainsExactGeneration(t *testing.T) {
+	const (
+		sid        = "native-zero-idle-finalization"
+		generation = "owner_gen_modern_finalization"
+		pending    = "modern-finalization-pending"
+		bound      = "modern-finalization-bound"
+	)
+	d := testZeroSessionCleanupDaemon(t, time.Hour)
+	d.supervisor = nil
+	ownerRef := testReconnectOwner(t, sid)
+	zeroAt := time.Now().Add(-time.Second)
+	entry := &OwnerEntry{
+		Owner:           ownerRef,
+		ServerID:        sid,
+		Command:         "modern-finalization-command",
+		Args:            []string{"--modern"},
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: generation,
+		LastSession:     zeroAt,
+	}
+	ownerRef.SessionMgr().PreRegisterForOwner(pending, sid, "/modern", nil)
+	seedReconnectHistoryForOwner(t, ownerRef, bound, sid)
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	original := finalizeOwnerForRemoval
+	t.Cleanup(func() { finalizeOwnerForRemoval = original })
+	calls := 0
+	finalizeOwnerForRemoval = func(got *owner.Owner, soft bool) (int, bool, error) {
+		if got != ownerRef || !soft {
+			t.Fatalf("finalizer got owner=%p soft=%v, want owner=%p soft=true", got, soft, ownerRef)
+		}
+		calls++
+		return 0, false, errors.New("synthetic modern retirement proof pending")
+	}
+
+	view := zeroIdleOwnerView{
+		identity: ownerEntryIdentity{
+			serverID:        entry.ServerID,
+			protocolEra:     entry.ProtocolEra,
+			ownerGeneration: entry.OwnerGeneration,
+		},
+		entry:  entry,
+		owner:  ownerRef,
+		zeroAt: zeroAt,
+	}
+	result, err := d.finalizeAndRemoveOwner(sid, entry, ownerRemovalReasonIdle, true, view.matches, false)
+	if err == nil {
+		t.Fatal("finalizeAndRemoveOwner() error = nil, want unproven retirement")
+	}
+	if result.Removed {
+		t.Fatalf("finalizeAndRemoveOwner() removed modern owner before proof: %+v", result)
+	}
+	if calls != ownerFinalizationAttempts {
+		t.Fatalf("finalizer calls = %d, want %d bounded proof attempts", calls, ownerFinalizationAttempts)
+	}
+	current := d.Entry(sid)
+	if current != entry {
+		t.Fatalf("unproven finalization replaced or forgot modern entry: %#v", current)
+	}
+	if current.Owner != ownerRef || current.ServerID != sid || current.ProtocolEra != era.EraModern20260728 || current.OwnerGeneration != generation {
+		t.Fatalf("unproven finalization changed modern identity: %#v", current)
+	}
+	if current.removalInProgress {
+		t.Fatal("unproven finalization left removal serialization stuck")
+	}
+	if !ownerRef.SessionMgr().IsPreRegistered(pending) {
+		t.Fatal("unproven finalization removed modern pending reservation")
+	}
+	if ownerKey, _, _, ok := ownerRef.SessionMgr().LookupHistory(bound); !ok || ownerKey != sid {
+		t.Fatalf("unproven finalization removed modern reconnect history: owner=%q ok=%v", ownerKey, ok)
+	}
+	if _, ok := d.getTemplate(entry.Command, entry.Args); ok {
+		t.Fatal("unproven modern finalization published a legacy template")
+	}
+	retryCounters := 0
+	d.forcedIsolatedRetryCounters.Range(func(_, _ any) bool {
+		retryCounters++
+		return true
+	})
+	if retryCounters != 0 {
+		t.Fatalf("unproven modern finalization hydrated %d retry counters", retryCounters)
+	}
+	if got := d.OwnerCount(); got != 1 {
+		t.Fatalf("unproven modern finalization owner count = %d, want exact retained owner", got)
 	}
 }
