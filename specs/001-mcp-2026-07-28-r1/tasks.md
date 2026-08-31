@@ -18,10 +18,10 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 **Purpose**: Establish the isolated same-era fixture and deterministic SC-001 corpus without changing the released legacy fixture.
 
-- [ ] T001 Add a RED fixture-contract test in `testdata/mock_modern_server_test.go` that requires `testdata/modern_opening_corpus.ndjson` to contain at least 100 valid newline-delimited modern opening frames spanning direct and host-sent `server/discover` openers, absent and present `clientInfo`, JSON property-order variants, and whitespace variants; require byte-exact capture plus native result behavior.
-- [ ] T002 Implement and extend `testdata/mock_modern_server.go` and the deterministic `testdata/modern_opening_corpus.ndjson` support corpus so the fixture captures direct/discovery opening bytes and provides controlled `input_required`, request-scoped log, contained-server-request, and loss modes.
-- [ ] T003 Run the focused fixture-contract test in `testdata/mock_modern_server_test.go` against the corpus and fixture.
-- [ ] T004 Stage and commit the proven fixture slice: `testdata/mock_modern_server.go`, `testdata/mock_modern_server_test.go`, and `testdata/modern_opening_corpus.ndjson`.
+- [x] T001 Add a RED fixture-contract test in `testdata/mock_modern_server_test.go` that requires `testdata/modern_opening_corpus.ndjson` to contain at least 100 valid newline-delimited modern opening frames spanning direct and host-sent `server/discover` openers, absent and present `clientInfo`, JSON property-order variants, and whitespace variants; require byte-exact capture plus native result behavior.
+- [x] T002 Implement and extend `testdata/mock_modern_server.go` and the deterministic `testdata/modern_opening_corpus.ndjson` support corpus so the fixture captures direct/discovery opening bytes and provides controlled `input_required`, request-scoped log, contained-server-request, and loss modes.
+- [x] T003 Run the focused fixture-contract test in `testdata/mock_modern_server_test.go` against the corpus and fixture.
+- [x] T004 Stage and commit the proven fixture slice: `testdata/mock_modern_server.go`, `testdata/mock_modern_server_test.go`, and `testdata/modern_opening_corpus.ndjson`.
 
 **Checkpoint**: The committed fixture and corpus are available before the foundational era contract begins. `testdata/mock_server.go` remains the released legacy-parity fixture.
 
@@ -33,12 +33,12 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 **Dependency**: Start only after T004 commits the fixture slice. The public zero value remains legacy.
 
-- [ ] T005 Add RED tests for zero-valued legacy policy, immutable supported modern era, raw opening-frame ownership, and local admission-error categories in `muxcore/era/era_test.go`.
-- [ ] T006 Implement `ProtocolEra`, `ProtocolPolicy`, `OpeningFrame`, and `AdmissionError` with a zero-valued legacy default and fixed `Modern20260728` value in `muxcore/era/era.go`.
-- [ ] T007 Add RED wire-compatibility tests for absent legacy control fields and explicit modern control-era echo serialization in `muxcore/control/control_test.go`.
-- [ ] T008 Add additive `protocol_era` request/response fields while retaining omitted-field legacy compatibility in `muxcore/control/protocol.go`.
-- [ ] T009 Run the focused shared-era contract tests in `muxcore/era/era_test.go` and `muxcore/control/control_test.go`.
-- [ ] T010 Stage and commit the proven shared-era contract slice: `muxcore/era/era.go`, `muxcore/era/era_test.go`, `muxcore/control/protocol.go`, and `muxcore/control/control_test.go`.
+- [x] T005 Add RED tests for zero-valued legacy policy, immutable supported modern era, raw opening-frame ownership, and local admission-error categories in `muxcore/era/era_test.go`.
+- [x] T006 Implement `ProtocolEra`, `ProtocolPolicy`, `OpeningFrame`, and `AdmissionError` with a zero-valued legacy default and fixed `Modern20260728` value in `muxcore/era/era.go`.
+- [x] T007 Add RED wire-compatibility tests for absent legacy control fields and explicit modern control-era echo serialization in `muxcore/control/control_test.go`.
+- [x] T008 Add additive `protocol_era` request/response fields while retaining omitted-field legacy compatibility in `muxcore/control/protocol.go`.
+- [x] T009 Run the focused shared-era contract tests in `muxcore/era/era_test.go` and `muxcore/control/control_test.go`.
+- [x] T010 Stage and commit the proven shared-era contract slice: `muxcore/era/era.go`, `muxcore/era/era_test.go`, `muxcore/control/protocol.go`, and `muxcore/control/control_test.go`.
 
 **Checkpoint**: Typed policy and control vocabulary exist, but no caller receives modern behavior until the story phases implement it.
 
@@ -52,22 +52,22 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### RED Tests for User Story 1
 
-- [ ] T011 [P] [US1] Add RED CLI tests for additive `--mcp-protocol=2026-07-28` selection and the no-selector legacy default in `cmd/mcp-mux/modern_policy_test.go`.
-- [ ] T012 [P] [US1] Add RED engine tests that drive the committed SC-001 corpus through one-frame pre-election buffering and assert direct/discovery byte preservation, exactly-one upstream delivery, and absent optional `clientInfo` acceptance in `muxcore/engine/engine_test.go`.
-- [ ] T013 [P] [US1] Add RED daemon tests for an exact modern control echo, forced isolation, and refusal to reuse a legacy owner under matching launch inputs in `muxcore/daemon/daemon_test.go`.
-- [ ] T014 [P] [US1] Add RED identity tests that prove legacy identity is byte-identical to the released baseline, create an actual modern endpoint/file component safely on Windows, and reject Unix `/` segments and NUL in the modern component in `muxcore/serverid/serverid_test.go`.
-- [ ] T015 [P] [US1] Add RED owner tests for native no-bootstrap/no-cache/no-template/no-replay readiness, opaque MRTR pass-through, contained upstream requests, and this logging contract: after request opt-in, a valid request-scoped standard log on the isolated route reaches its sole downstream once and is never synthesized or broadcast in `muxcore/owner/owner_test.go`.
+- [x] T011 [P] [US1] Add RED CLI tests for additive `--mcp-protocol=2026-07-28` selection and the no-selector legacy default in `cmd/mcp-mux/modern_policy_test.go`.
+- [x] T012 [P] [US1] Add RED shared-reader and engine tests that drive the committed SC-001 corpus through one-frame pre-election buffering, retain prefetched tail bytes, and assert direct/discovery byte preservation, exactly-one upstream delivery, and absent optional `clientInfo` acceptance in `muxcore/era/opening_test.go` and `muxcore/engine/engine_test.go`.
+- [x] T013 [P] [US1] Add RED daemon and control-dispatch tests for an exact modern control echo, forced isolation, refusal to reuse a legacy owner under matching launch inputs, and omitted-field legacy response compatibility in `muxcore/daemon/daemon_test.go` and `muxcore/control/control_test.go`.
+- [x] T014 [P] [US1] Add RED identity tests that prove legacy identity is byte-identical to the released baseline, create an actual modern endpoint/file component safely on Windows, and reject Unix `/` segments and NUL in the modern component in `muxcore/serverid/serverid_test.go`.
+- [x] T015 [P] [US1] Add RED owner tests for native no-bootstrap/no-cache/no-template/no-replay readiness, opaque MRTR pass-through, contained upstream requests, and this logging contract: after request opt-in, a valid request-scoped standard log on the isolated route reaches its sole downstream once and is never synthesized or broadcast in `muxcore/owner/owner_test.go`.
 
 ### Implementation for User Story 1
 
-- [ ] T016 [US1] Parse the additive explicit policy and buffer one raw opening frame before `runOwner` owner election while preserving the no-selector legacy invocation in `cmd/mcp-mux/main.go`.
-- [ ] T017 [US1] Add public policy configuration and pre-election selection through `(*MuxEngine).Run` and `runClient`, retaining an accepted raw frame for one downstream-to-upstream write in `muxcore/engine/engine.go`.
-- [ ] T018 [US1] Carry a validated era through `Spawn` and `spawnOnce`, force every modern owner isolated, reject cross-era reuse, and return the exact echo in `muxcore/daemon/daemon.go`.
-- [ ] T019 [US1] Domain-separate the modern physical identity while keeping every legacy identity byte-identical to the released baseline and making the modern component valid on Windows and Unix in `muxcore/serverid/serverid.go`.
-- [ ] T020 [US1] Store immutable era and native R1 owner policy through `OwnerConfig`, `NewOwner`, `handleDownstreamMessage`, and upstream routing without adding R2 route authorities in `muxcore/owner/owner.go`.
-- [ ] T021 [US1] Bypass `sendProactiveInit`, cache/template publication, legacy list-change synthesis, and legacy replay for a modern owner while writing the accepted opening bytes unchanged in `muxcore/owner/materialization.go`.
-- [ ] T022 [US1] Run the focused native-route and legacy-parity tests in `cmd/mcp-mux/modern_policy_test.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon_test.go`, `muxcore/serverid/serverid_test.go`, and `muxcore/owner/owner_test.go`.
-- [ ] T023 [US1] Stage and commit the proven native-route slice: `cmd/mcp-mux/main.go`, `cmd/mcp-mux/modern_policy_test.go`, `muxcore/engine/engine.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon.go`, `muxcore/daemon/daemon_test.go`, `muxcore/serverid/serverid.go`, `muxcore/serverid/serverid_test.go`, `muxcore/owner/owner.go`, `muxcore/owner/materialization.go`, and `muxcore/owner/owner_test.go`.
+- [x] T016 [US1] Implement the shared bounded persistent-reader opener in `muxcore/era/opening.go`; parse the additive explicit policy, buffer one raw opening frame before `runOwner` owner election, and carry the selected era through the private `spawnViaDaemon*` request/echo path while preserving the no-selector legacy invocation in `cmd/mcp-mux/main.go` and `cmd/mcp-mux/daemon.go`.
+- [x] T017 [US1] Add public policy configuration and pre-election selection through `(*MuxEngine).Run` and `runClient`, prepending the one-time accepted raw frame to the persistent remainder reader for one downstream-to-upstream write in `muxcore/engine/engine.go`.
+- [x] T018 [US1] Validate the era before side effects in `Spawn` and `spawnOnce`, force every modern owner isolated, reject cross-era reuse, and return the validated era through successful control dispatch in `muxcore/daemon/daemon.go` and `muxcore/control/server.go`.
+- [x] T019 [US1] Domain-separate the modern physical identity while keeping every legacy identity byte-identical to the released baseline and making the modern component valid on Windows and Unix in `muxcore/serverid/serverid.go`.
+- [x] T020 [US1] Store immutable era and native R1 owner policy through `OwnerConfig`, `NewOwner`, `handleDownstreamMessage`, and upstream routing without adding R2 route authorities in `muxcore/owner/owner.go`.
+- [x] T021 [US1] Bypass `sendProactiveInit`, cache/template publication, legacy list-change synthesis, and legacy replay for a modern owner while writing the accepted opening bytes unchanged in `muxcore/owner/materialization.go`.
+- [x] T022 [US1] Run the focused native-route and legacy-parity tests in `cmd/mcp-mux/modern_policy_test.go`, `muxcore/era/opening_test.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon_test.go`, `muxcore/control/control_test.go`, `muxcore/serverid/serverid_test.go`, and `muxcore/owner/owner_test.go`.
+- [x] T023 [US1] Stage and commit the proven native-route slice: `cmd/mcp-mux/main.go`, `cmd/mcp-mux/daemon.go`, `cmd/mcp-mux/modern_policy_test.go`, `muxcore/era/opening.go`, `muxcore/era/opening_test.go`, `muxcore/engine/engine.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon.go`, `muxcore/daemon/daemon_test.go`, `muxcore/control/server.go`, `muxcore/control/control_test.go`, `muxcore/serverid/serverid.go`, `muxcore/serverid/serverid_test.go`, `muxcore/owner/owner.go`, `muxcore/owner/materialization.go`, and `muxcore/owner/owner_test.go`.
 
 **Checkpoint**: The positive R1 route works for a known modern host. It is not safe until strict refusal completes.
 
@@ -81,19 +81,19 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### RED Tests for User Story 2
 
-- [ ] T024 [P] [US2] Add RED table tests for missing, null, non-object, malformed, unsupported, conflicting, and ambiguous modern metadata with exact `-32602` versus `-32022` classification in `muxcore/era/selector_test.go`.
-- [ ] T025 [P] [US2] Add RED daemon tests that invalid or unknown explicit control eras perform zero identity, spawn, reuse, or attachment side effects in `muxcore/daemon/daemon_test.go`.
-- [ ] T026 [P] [US2] Add RED shim tests for absent, old-daemon, unknown, and mismatched successful control echoes that fail before IPC attachment without falsely returning `-32022` in `muxcore/engine/engine_test.go`.
-- [ ] T027 [P] [US2] Add RED CLI tests that malformed metadata, unsupported versions, and local control mismatches produce the correct admission error with zero upstream start and zero legacy fallback in `cmd/mcp-mux/modern_admission_test.go`.
+- [x] T024 [P] [US2] Add RED table tests for missing, null, non-object, malformed, unsupported, conflicting, and ambiguous modern metadata with exact `-32602` versus `-32022` classification in `muxcore/era/selector_test.go`.
+- [x] T025 [P] [US2] Add RED daemon tests that invalid or unknown explicit control eras perform zero identity, spawn, reuse, or attachment side effects in `muxcore/daemon/daemon_test.go`.
+- [x] T026 [P] [US2] Add RED shim tests for absent, old-daemon, unknown, and mismatched successful control echoes that fail before IPC attachment without falsely returning `-32022` in `muxcore/engine/engine_test.go`.
+- [x] T027 [P] [US2] Add RED CLI tests that malformed metadata, unsupported versions, and local control mismatches produce the correct admission error with zero upstream start and zero legacy fallback in `cmd/mcp-mux/modern_admission_test.go`.
 
 ### Implementation for User Story 2
 
-- [ ] T028 [US2] Implement one-newline-frame strict modern selector parsing that preserves accepted raw bytes and returns local `AdmissionError` categories without a legacy fallback in `muxcore/era/selector.go`.
-- [ ] T029 [US2] After T028 has made local admission errors native at ingress, emit them before `spawnViaDaemonWithReason`, require an exact modern control echo before attachment, and keep later same-era upstream errors native in `muxcore/engine/engine.go`.
-- [ ] T030 [US2] Independently validate explicit control-era input before owner identity/election and reject malformed or cross-era requests before attachment in `muxcore/daemon/daemon.go`.
-- [ ] T031 [US2] After T029, map valid ingress admission errors to the CLI JSON-RPC path while preserving local control-failure distinctions and preventing speculative legacy retries in `cmd/mcp-mux/main.go`.
-- [ ] T032 [US2] Run the focused strict-admission tests in `muxcore/era/selector_test.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon_test.go`, and `cmd/mcp-mux/modern_admission_test.go`.
-- [ ] T033 [US2] Stage and commit the proven strict-admission slice: `muxcore/era/selector.go`, `muxcore/era/selector_test.go`, `muxcore/engine/engine.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon.go`, `muxcore/daemon/daemon_test.go`, `cmd/mcp-mux/main.go`, and `cmd/mcp-mux/modern_admission_test.go`.
+- [x] T028 [US2] Implement one-newline-frame strict modern selector parsing that preserves accepted raw bytes and returns local `AdmissionError` categories without a legacy fallback in `muxcore/era/selector.go`.
+- [x] T029 [US2] After T028 has made local admission errors native at ingress, emit them before `spawnViaDaemonWithReason`, require an exact modern control echo before attachment, and keep later same-era upstream errors native in `muxcore/engine/engine.go`.
+- [x] T030 [US2] Independently validate explicit control-era input before owner identity/election and reject malformed or cross-era requests before attachment in `muxcore/daemon/daemon.go`.
+- [x] T031 [US2] After T029, map valid ingress admission errors to the CLI JSON-RPC path while preserving local control-failure distinctions and preventing speculative legacy retries in `cmd/mcp-mux/main.go`.
+- [x] T032 [US2] Run the focused strict-admission tests in `muxcore/era/selector_test.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon_test.go`, and `cmd/mcp-mux/modern_admission_test.go`.
+- [x] T033 [US2] Stage and commit the proven strict-admission slice: `muxcore/era/era.go`, `muxcore/era/selector.go`, `muxcore/era/selector_test.go`, `muxcore/engine/engine.go`, `muxcore/engine/engine_test.go`, `muxcore/daemon/daemon_test.go`, `cmd/mcp-mux/main.go`, `cmd/mcp-mux/daemon.go`, and `cmd/mcp-mux/modern_admission_test.go`.
 
 **Checkpoint**: Phases 1 through 4 are the smallest safe R1 demonstration. Release readiness still requires lifecycle quarantine, truthful readback, customer proof, and independent checking.
 
