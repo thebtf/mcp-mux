@@ -116,11 +116,11 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 ### Slice B: Reaper and zero-session removal
 
-- [ ] T040 [P] [US3] Add RED reaper tests that use existing eligibility/activity gates to drain and remove a modern owner without synthesizing a legacy replacement in `muxcore/daemon/reaper_test.go`.
-- [ ] T041 [P] [US3] Add RED zero-session cleanup tests that preserve existing reservation and exact-entry CAS gates, then drain/remove instead of reconstructing legacy behavior in `muxcore/daemon/zero_session_cleanup_test.go`.
-- [ ] T042 [US3] Apply the reaper and zero-session quarantine decisions through existing activity, CAS, exact-current-entry, and finalization rails in `muxcore/daemon/reaper.go` and `muxcore/daemon/owner_lifecycle.go`.
-- [ ] T043 [US3] Run the focused removal tests in `muxcore/daemon/reaper_test.go` and `muxcore/daemon/zero_session_cleanup_test.go`.
-- [ ] T044 [US3] Stage and commit the proven removal slice: `muxcore/daemon/reaper.go`, `muxcore/daemon/owner_lifecycle.go`, `muxcore/daemon/reaper_test.go`, and `muxcore/daemon/zero_session_cleanup_test.go`.
+- [x] T040 [P] [US3] Add RED reaper tests that use existing eligibility/activity gates to drain and remove a modern owner without synthesizing a legacy replacement in `muxcore/daemon/reaper_test.go`.
+- [x] T041 [P] [US3] Add RED zero-session cleanup tests that preserve existing reservation and exact-entry CAS gates, then drain/remove instead of reconstructing legacy behavior in `muxcore/daemon/zero_session_cleanup_test.go`.
+- [x] T042 [US3] Apply the reaper and zero-session quarantine decisions through existing activity, CAS, exact-current-entry, and finalization rails in `muxcore/daemon/reaper.go` and `muxcore/daemon/owner_lifecycle.go`.
+- [x] T043 [US3] Run the focused removal tests in `muxcore/daemon/reaper_test.go` and `muxcore/daemon/zero_session_cleanup_test.go`.
+- [x] T044 [US3] Stage and commit the proven removal slice: `muxcore/daemon/reaper.go`, `muxcore/daemon/owner_lifecycle.go`, `muxcore/daemon/reaper_test.go`, and `muxcore/daemon/zero_session_cleanup_test.go`.
 
 ### Slice C: Retry rehydration, respawn, and blocked finalization
 
