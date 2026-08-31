@@ -569,6 +569,39 @@ func TestModernOwner_ForwardsOnlyOptedInStandardLogToSoleSession(t *testing.T) {
 	}
 }
 
+func TestModernOwner_TracksAndCausallyRoutesProgress(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	request := []byte(`{"jsonrpc":"2.0","id":"modern-progress","method":"tools/call","params":{"name":"modern_echo","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"modern-progress-token"}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(request)); err != nil {
+		t.Fatalf("forward modern progress request: %v", err)
+	}
+
+	unknown := []byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"unknown-progress-token","progress":1}}`)
+	if err := o.handleUpstreamMessage(parseMessage(unknown)); err != nil {
+		t.Fatalf("handle unknown modern progress: %v", err)
+	}
+	if waitCondition(t, 200*time.Millisecond, func() bool { return downstream.String() != "" }) {
+		t.Fatalf("unknown modern progress reached downstream: %s", downstream.String())
+	}
+
+	if got := o.ActiveProgressTokens(); got != 1 {
+		t.Fatalf("active modern progress tokens = %d, want 1", got)
+	}
+
+	known := []byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"modern-progress-token","progress":2}}`)
+	if err := o.handleUpstreamMessage(parseMessage(known)); err != nil {
+		t.Fatalf("handle known modern progress: %v", err)
+	}
+	if !waitCondition(t, time.Second, func() bool {
+		return strings.Contains(downstream.String(), string(known))
+	}) {
+		t.Fatalf("known modern progress did not reach downstream: %s", downstream.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // T052: Native owner loss is process-bound
 // ---------------------------------------------------------------------------

@@ -1677,6 +1677,7 @@ func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (
 		inflight.process.Store(proc)
 		o.pendingRequests.Add(1)
 		o.inflightTracker.Store(key, inflight)
+		o.trackProgressToken(s.ID, key, msg.Raw)
 		published = true
 	})
 	if writeErr == nil {

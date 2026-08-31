@@ -1585,6 +1585,12 @@ func (o *Owner) handleModernUpstreamNotification(proc *upstream.Process, msg *js
 	if strings.HasPrefix(msg.Method, "notifications/x-mux/") {
 		return nil
 	}
+	if msg.Method == "notifications/progress" {
+		if err := o.routeProgressNotification(msg.Raw); err != nil {
+			o.logger.Printf("drop notifications/progress: %v (preventing transport tear-down in MCP client)", err)
+		}
+		return nil
+	}
 	requireLogSubscription := msg.Method == "notifications/message"
 	session := o.modernInflightSession(proc, requireLogSubscription)
 	if session != nil {
