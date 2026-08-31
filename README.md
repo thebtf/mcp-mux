@@ -126,6 +126,54 @@ MCP_MUX_ISOLATED=1 mcp-mux uvx my-server
 mcp-mux --isolated uvx my-server
 ```
 
+## Modern R1 (MCP 2026-07-28)
+
+Use R1 only when the host and upstream are both known to speak MCP `2026-07-28`. It is an additive opt-in. Omitting `--mcp-protocol=2026-07-28` preserves the legacy quick start and default behavior. R1 does not translate legacy and modern traffic.
+
+Put `--mcp-protocol=2026-07-28` before the upstream command:
+
+```sh
+mcp-mux --mcp-protocol=2026-07-28 my-modern-server --stdio
+```
+
+For example, configure the server in `.mcp.json` as follows:
+
+```json
+{
+  "mcpServers": {
+    "modern-server": {
+      "command": "mcp-mux",
+      "args": [
+        "--mcp-protocol=2026-07-28",
+        "my-modern-server",
+        "--stdio"
+      ]
+    }
+  }
+}
+```
+
+R1 forces isolation. It disables response caching, discovery templates, and replay. There is no automatic fallback to the legacy protocol or a shared mode. Server log notifications stay request-scoped and require the request to opt in with `_meta.io.modelcontextprotocol/logLevel`; mcp-mux does not broadcast them.
+
+After an owner or transport loss, mcp-mux returns errors for in-flight modern requests. The host must issue fresh retries and a fresh `subscriptions/listen`; R1 does not replay requests or subscriptions.
+
+To inspect the R1 policy, run `mcp-mux status` and look for these four fields:
+
+- `protocol_era: "2026-07-28"`
+- `sharing_policy: "forced-isolated"`
+- `cache_policy: "off"`
+- `lifecycle_policy: "r1-quarantine"`
+
+R1 is separate from the historical `--stateless` flag. `--stateless` changes legacy server identity and sharing. It does not select an MCP protocol era or make R1 shareable.
+
+To roll back an R1 configuration:
+
+1. Remove `--mcp-protocol=2026-07-28` from the host configuration to stop new R1 admissions.
+2. Let current R1 owners drain, or remove them with `mux_stop` by the `server_id` shown in `mcp-mux status`. `mux_stop` is the existing control-plane tool for any owner. R1 adds no separate stop path. `mcp-mux stop --drain-timeout 30s` drains and stops the whole local daemon.
+3. Start a new host connection with the legacy configuration. Never downgrade a live R1 owner or replay old requests or subscriptions.
+
+A refused, absent, or mismatched era confirmation means modern admission failed. Do not retry the same route as legacy.
+
 ## Auto-Classification
 
 When no explicit mode is set, mcp-mux classifies each server automatically using this priority order:

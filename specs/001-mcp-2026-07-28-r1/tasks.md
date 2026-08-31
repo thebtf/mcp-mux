@@ -178,19 +178,17 @@ description: "Dependency-ordered implementation tasks for MCP 2026-07-28 R1 Nati
 
 **Purpose**: Document the additive public boundary, prepare the candidate-owned consumer handoff, prove exact built artifacts on Windows and Unix, then obtain an independent implementation-time checker receipt. Do not merge, tag, publish, or perform external consumer handoff in this phase.
 
-- [ ] T069 [P] Document the explicit selector, forced isolation, cache-off behavior, no automatic fallback, request-scoped logging, host re-listen duty, and rollback rules in `README.md` and `README.ru.md`.
-- [ ] T070 [P] Document the consumer-visible era boundary, preserved process-generation/`RetirementProven` authority, and R1 exclusions in `AGENTS.md` and `docs/mux-protocol.md`.
-- [ ] T071 [P] Draft the user-visible R1 change and rollback statement without publication in `CHANGELOG.md` and `RELEASE_NOTES.md`.
-- [ ] T072 [P] Prepare `specs/001-mcp-2026-07-28-r1/consumer-handoff.md` with the impacted `aimux`, `engram`, and other `muxcore` consumer map, additive migration, rollback, evidence, and release-stage publication boundary.
-- [ ] T073 [P] Add a RED Windows runner-contract test/support script in `scripts/verify-r1-native-isolation.contract.ps1` that fails until the runner builds into a fresh `BaseDir`, drives modern and legacy scenarios, captures a transcript, and fails when required evidence is missing.
-- [ ] T074 [P] Add a RED Unix runner-contract test/support script in `scripts/verify-r1-native-isolation.contract.sh` with the same fresh-build, modern/legacy, transcript, and missing-evidence contract.
-- [ ] T075 Build the Windows customer-proof runner in `scripts/verify-r1-native-isolation.ps1` to satisfy T073.
-- [ ] T076 Build the Unix customer-proof runner in `scripts/verify-r1-native-isolation.sh` to satisfy T074.
-- [ ] T077 Run both runner-contract scripts and their platform runners against their exact fresh candidate builds. Record platform-specific transcripts, fixture IDs, and evidence hashes in `specs/001-mcp-2026-07-28-r1/platform-proof.md`.
-- [ ] T078 Build the exact candidate from `cmd/mcp-mux/main.go`, execute Scenarios 1 through 8 in `specs/001-mcp-2026-07-28-r1/quickstart.md`, and record source/binary identity, policy spelling, all corpus results, captured opening bytes, control echo, status/redaction snapshots, modern/legacy outcomes, consumer-handoff preparation, rollback, and fixture revision in `specs/001-mcp-2026-07-28-r1/release-evidence.md`.
-- [ ] T079 Stage and commit the proven documentation and repeatable customer-proof slice: `README.md`, `README.ru.md`, `AGENTS.md`, `docs/mux-protocol.md`, `CHANGELOG.md`, `RELEASE_NOTES.md`, `specs/001-mcp-2026-07-28-r1/consumer-handoff.md`, `scripts/verify-r1-native-isolation.contract.ps1`, `scripts/verify-r1-native-isolation.contract.sh`, `scripts/verify-r1-native-isolation.ps1`, `scripts/verify-r1-native-isolation.sh`, `specs/001-mcp-2026-07-28-r1/platform-proof.md`, and `specs/001-mcp-2026-07-28-r1/release-evidence.md`.
-- [ ] T080 Have an `nvmd-checker` distinct from every maker inspect only the exact T079 parent, re-derive the selected-era and legacy-parity boundary from the pinned protocol source, execute the completed quickstart matrix, and write `specs/001-mcp-2026-07-28-r1/independent-check.md`. The receipt must record protocol revision; parent, source, and binary SHA; boundary re-derivation; quickstart scenarios executed; platform and fixture IDs; evidence hashes; findings with dispositions; and a verdict.
-- [ ] T081 Stage and commit the evidence-only final slice: `specs/001-mcp-2026-07-28-r1/independent-check.md`. The receipt must name the exact T079 parent SHA it exercised; do not amend the T079 proof commit.
+- [x] T069 [P] Document the exact selector and configuration, forced isolation and cache-off policy, no fallback, host retry/re-listen duty, request-scoped log opt-in, four status facts, rollback, and `--stateless` distinction in `README.md` and `README.ru.md`.
+- [x] T070 [P] Document the additive MCP `2026-07-28` boundary, explicit policy versus sharing inputs, exact control-era propagation, native no-bootstrap/cache/replay behavior, preserved owner/process authority, lifecycle quarantine, rollback, and R1 exclusions in `AGENTS.md` and `docs/mux-protocol.md`.
+- [x] T071 [P] Write the unreleased R1 change, compatibility, migration, validation scope, and rollback statement in `CHANGELOG.md` and `RELEASE_NOTES.md` without claiming publication.
+- [x] T072 [P] Prepare `specs/001-mcp-2026-07-28-r1/consumer-handoff.md` with the `mcp-mux`, `aimux`, `engram`, and other `muxcore` consumer map; additive adoption rules; prohibited consumer-local workarounds; rollback; evidence fields; and release-stage publication boundary.
+- [x] T073 [P] Add `scripts/verify-r1-native-isolation.contract.ps1` with a deliberately incomplete negative fixture, fresh-output enforcement, Windows PowerShell 5.1 runner invocation, and required evidence-schema validation.
+- [x] T074 [P] Add `scripts/verify-r1-native-isolation.contract.sh` with the same negative fixture, fresh-output enforcement, offline local-toolchain boundary, Unix runner invocation, and required evidence-schema validation.
+- [x] T075 Implement `scripts/verify-r1-native-isolation.ps1` to build the exact Windows candidate and fixtures, execute Scenarios 1 through 8, record 100 corpus outcomes, isolate process state, and emit validated evidence and a transcript.
+- [x] T076 Implement `scripts/verify-r1-native-isolation.sh` to build the exact Unix candidate and fixtures offline, use a short Linux process/socket base, execute Scenarios 1 through 8, record 100 corpus outcomes, and emit validated evidence and a transcript.
+- [x] T077 Run both runner contracts against fresh candidate builds. Preserve exact Windows and Unix summaries, transcripts, artifact hashes, source/binary/fixture/corpus identities, modern and legacy outcomes, rollback, and consumer-handoff preparation in `specs/001-mcp-2026-07-28-r1/release-evidence.md` and the frozen `.agent/evidence/r1-native-isolation/manifest.json`.
+- [x] T078 Have an `nvmd-checker` distinct from every maker read the frozen Windows and Unix evidence, recompute source/binary/fixture/corpus/summary/transcript/artifact hashes, re-derive the selected-era and legacy-parity boundary from the pinned protocol and candidate source, inspect Scenarios 1 through 8 and rollback, disposition findings, and create `specs/001-mcp-2026-07-28-r1/independent-check.md` with its exact verdict.
+- [x] T079 After T078 passes, update every Phase 7 checkbox and commit the exact documentation, runner, evidence, quickstart, and task-ledger paths: `README.md`, `README.ru.md`, `AGENTS.md`, `docs/mux-protocol.md`, `CHANGELOG.md`, `RELEASE_NOTES.md`, `specs/001-mcp-2026-07-28-r1/consumer-handoff.md`, `specs/001-mcp-2026-07-28-r1/quickstart.md`, `scripts/verify-r1-native-isolation.contract.ps1`, `scripts/verify-r1-native-isolation.contract.sh`, `scripts/verify-r1-native-isolation.ps1`, `scripts/verify-r1-native-isolation.sh`, `specs/001-mcp-2026-07-28-r1/release-evidence.md`, `specs/001-mcp-2026-07-28-r1/independent-check.md`, and `specs/001-mcp-2026-07-28-r1/tasks.md`.
 
 ---
 
@@ -208,9 +206,9 @@ Fixture and corpus (T001–T004, committed)
             -> US3 retry/respawn/finalization (T045–T051, committed)
               -> US3 loss/reconnect (T052–T057, committed)
                 -> US4 minimal readback (T058–T068, committed)
-                  -> Customer proof and consumer-handoff preparation (T069–T079, committed)
-                    -> Independent checker receipt (T080)
-                      -> Evidence-only commit (T081, committed)
+                  -> Customer proof and consumer-handoff preparation (T069–T077)
+                    -> Independent exact-evidence check (T078)
+                      -> Phase 7 proof commit (T079)
 ```
 
 - **Fixture**: T004 is a prerequisite for T005. The corpus becomes the nonzero deterministic SC-001 denominator.
@@ -218,7 +216,7 @@ Fixture and corpus (T001–T004, committed)
 - **T028 → T031**: T028 establishes local selector errors. T029 exposes them at engine ingress. Only then may T031 map admission errors on the CLI path without inventing a legacy retry.
 - **US3**: Each lifecycle slice begins with observable RED tests, runs its focused suite, and commits before the next slice. Snapshot/handoff has no retry rehydration ownership.
 - **US4**: It starts only after T057. US3 and US4 must not be claimed in parallel because they share daemon and owner source paths.
-- **Independent check**: T080 examines the exact post-T079 parent. T081 is the final evidence-only commit; it is not source work.
+- **Independent check**: T078 examines the frozen evidence bound to the exact product source and proof-script hashes. T079 commits the receipt with the documentation and repeatable proof scripts.
 
 ### Per-story parallel examples
 
@@ -284,7 +282,7 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 | FR-014 / MPE-R1-010 | T052–T057, T077–T078 |
 | FR-015 / MPE-OBS-001 | T058–T068, T078 |
 | FR-016 / MPE-OBS-002 | T069–T072 |
-| FR-017 / MPE-OBS-003 | T072–T081 |
+| FR-017 / MPE-OBS-003 | T072–T079 |
 
 ### Success criteria
 
@@ -296,7 +294,7 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 | SC-004 | T034–T057, T077–T078 |
 | SC-005 | T012, T015, T020–T021, T078 |
 | SC-006 | T058–T068, T078 |
-| SC-007 | T072–T081 |
+| SC-007 | T072–T079 |
 
 ### Custom checklist traceability
 
@@ -337,11 +335,11 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 | CHK031 | T058–T068 |
 | CHK032 | T058–T068, T078 |
 | CHK033 | T001–T004, T022, T032, T038, T043, T050, T056, T067, T078 |
-| CHK034 | T073–T081 |
+| CHK034 | T073–T079 |
 | CHK035 | T072, T078 |
 | CHK036 | T001–T004, T012, T077–T078 |
 | CHK037 | T015, T020–T021, T034–T039, T062, T069–T070 |
-| CHK038 | T072, T078, T080 |
+| CHK038 | T072, T078–T079 |
 
 `checklists/requirements.md` remains satisfied: all 17 functional requirements and all 7 success criteria map above; no clarification or placeholder is introduced; legacy behavior is retained; and excluded R2/R3 capabilities remain outside the implementation tasks.
 
@@ -357,7 +355,7 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 | Treat current era-less snapshot/handoff payloads as exclusion, not R1 persistence | T034–T039 | Snapshot/handoff exclusion commit; no schema/version field |
 | Preserve existing lifecycle authority through removal, retry, respawn, loss, reconnect, and blocked finalization | T040–T057 | Three focused lifecycle commits |
 | Keep readback minimal and defer R3 observability | T058–T068 | Negative public-surface tests and readback commit |
-| Prove the customer boundary and prepare, not publish, consumer handoff | T069–T081 | Exact-build proof commit, checker receipt, final evidence-only commit |
+| Prove the customer boundary and prepare, not publish, consumer handoff | T069–T079 | Exact-build proof, independent evidence check, and Phase 7 proof commit |
 
 ## Plan Boundary Contract to Task Mapping
 
@@ -383,7 +381,7 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 | G-004 snapshot/handoff mixed retry rehydration | Accepted | T034–T039 own exclusion/no-hydration only. T045–T051 own retry rehydration. |
 | G-005 lifecycle slice was oversized | Accepted | T040–T044, T045–T051, and T052–T057 are separate RED/run/commit slices. |
 | G-006 US3/US4 had an unsafe parallel claim | Accepted | US4 begins only after T057. The dependency graph forbids a parallel US3/US4 claim. |
-| G-007 checker evidence was uncommitted | Accepted | T080 writes the receipt and T081 commits it as evidence-only. |
+| G-007 checker evidence was uncommitted | Accepted | T078 writes the independent receipt and T079 commits it with the exact proof slice. |
 | G-008 runners lacked prior RED support | Accepted | T073–T077 add and run Windows/Unix runner-contract support before T079 commits it. |
 | S-001 plan said tasks were absent | Accepted | `plan.md` now identifies this generated graph. |
 | A-1 snapshot/handoff era-persistence proposal | Rejected as an invalid R1 gate | FR-012 requires exclusion when the current era-less payload cannot carry a safe explicit era. T034–T039 prove exclusion/cold-start/fail-closed. Schema field/versioning remains R3. |
@@ -392,7 +390,7 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 | A-4 platform identity | Accepted | T014 requires actual Windows-safe creation and Unix segment/NUL safety. |
 | A-6 logging ambiguity | Accepted | T015 and the supporting contracts require opted-in valid request-scoped logs to reach the sole downstream once, never synthesized or broadcast. |
 | A-9 retry rehydration definition | Accepted | T045/T048 implement the data-model and lifecycle-contract definition at existing observable boundaries. |
-| A-10, A-11, A-21 checker parent/identity/schema | Accepted | T080 requires an `nvmd-checker`, exact T079 parent, and the receipt schema; T081 commits only that evidence. |
+| A-10, A-11, A-21 checker parent/identity/schema | Accepted | T078 requires a distinct `nvmd-checker`, frozen source and evidence identities, and the receipt schema; T079 commits the receipt. |
 | A-12 runner proof ordering | Accepted | T073–T077 are RED-before-runner implementation and platform-specific proof. |
 | A-13, A-19 plan traceability | Accepted | The two mapping appendices above map corrections and boundary contracts to tasks. |
 | A-14 SC-001 denominator | Accepted | T001–T004 establish the deterministic corpus of at least 100 frames. |
@@ -410,4 +408,4 @@ The smallest safe R1 demonstration is T001 through T033: fixture/corpus, shared 
 1. **Build the safety core first**: Commit the fixture/corpus and era/control boundary before positive and negative admission paths.
 2. **Quarantine in proven slices**: Keep snapshot/handoff exclusion, removal, retry/respawn/finalization, and loss/reconnect separate so each commit has its own focused proof.
 3. **Expose only truthful minimal state**: Add four `OwnerInfo` facts through existing projections. Preserve readiness meaning and prove that R3 observability surfaces remain absent.
-4. **Prove as a customer**: Run fresh Windows and Unix artifacts, retain modern and legacy evidence separately, prepare the consumer handoff, then have an independent checker examine the exact proof parent.
+4. **Prove as a customer**: Run fresh Windows and Unix artifacts, retain modern and legacy evidence separately, prepare the consumer handoff, then have an independent checker examine the frozen proof bytes.

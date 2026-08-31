@@ -119,6 +119,54 @@ MCP_MUX_ISOLATED=1 mcp-mux uvx my-server
 mcp-mux --isolated uvx my-server
 ```
 
+## Modern R1 (MCP 2026-07-28)
+
+Используйте R1 только если host и upstream заведомо работают с MCP `2026-07-28`. Это отдельный opt-in. Без `--mcp-protocol=2026-07-28` сохраняются прежний Quick Start и поведение по умолчанию. R1 не переводит трафик между legacy и modern.
+
+Укажите `--mcp-protocol=2026-07-28` перед командой upstream:
+
+```sh
+mcp-mux --mcp-protocol=2026-07-28 my-modern-server --stdio
+```
+
+Например, настройте сервер в `.mcp.json` так:
+
+```json
+{
+  "mcpServers": {
+    "modern-server": {
+      "command": "mcp-mux",
+      "args": [
+        "--mcp-protocol=2026-07-28",
+        "my-modern-server",
+        "--stdio"
+      ]
+    }
+  }
+}
+```
+
+R1 принудительно изолирует upstream. Он отключает кеширование ответов, discovery templates и повторную отправку запросов. Автоматического перехода на legacy protocol или shared mode нет. Лог-уведомления сервера остаются в контексте запроса и требуют opt-in через `_meta.io.modelcontextprotocol/logLevel`; mcp-mux не рассылает их всем сессиям.
+
+После потери owner или transport mcp-mux возвращает ошибки для незавершённых modern-запросов. Host должен отправить новый запрос и новый `subscriptions/listen`; R1 не повторяет запросы и подписки.
+
+Чтобы проверить политику R1, выполните `mcp-mux status` и найдите следующие четыре поля:
+
+- `protocol_era: "2026-07-28"`
+- `sharing_policy: "forced-isolated"`
+- `cache_policy: "off"`
+- `lifecycle_policy: "r1-quarantine"`
+
+R1 отличается от исторического флага `--stateless`. `--stateless` меняет legacy-идентичность сервера и режим совместного использования. Он не выбирает эпоху протокола MCP и не делает R1 разделяемым.
+
+Чтобы откатить конфигурацию R1:
+
+1. Удалите `--mcp-protocol=2026-07-28` из конфигурации host, чтобы остановить новые R1-admission.
+2. Дождитесь завершения текущих R1-owner или удалите их через `mux_stop` по `server_id` из `mcp-mux status`. `mux_stop` уже останавливает любой owner через control plane. R1 не добавляет отдельный способ остановки. `mcp-mux stop --drain-timeout 30s` завершает и останавливает весь локальный daemon.
+3. Откройте новое соединение host с legacy-конфигурацией. Никогда не понижайте активный R1-owner до legacy и не повторяйте старые запросы или подписки.
+
+Если подтверждение эпохи отсутствует, не совпадает или содержит отказ, modern-подключение не установлено. Не повторяйте тот же маршрут как legacy.
+
 ## Автоматическая классификация
 
 Если режим явно не задан, mcp-mux классифицирует каждый сервер автоматически по следующему приоритету:

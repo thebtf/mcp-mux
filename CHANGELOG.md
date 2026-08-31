@@ -7,6 +7,58 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Added the opt-in `--mcp-protocol=2026-07-28` route for a known MCP
+  `2026-07-28` host and same-era upstream. A successful admission uses one
+  dedicated native modern owner and forwards the opening request unchanged;
+  it does not translate the legacy initialization protocol.
+- Added minimal redacted R1 owner readback through existing `OwnerInfo`
+  projections: `protocol_era=2026-07-28`,
+  `sharing_policy=forced-isolated`, `cache_policy=off`, and
+  `lifecycle_policy=r1-quarantine`.
+
+### Changed
+
+- Explicit-modern owners are always isolated. Their legacy bootstrap, shared
+  response cache, template reuse, and replay paths are disabled. Upstream
+  JSON-RPC requests are contained, and eligible standard logs remain
+  request-scoped and sole-recipient.
+- Modern lifecycle transitions retain the selected era under the existing
+  process-generation and `RetirementProven` authority. An unsafe transition
+  drains, cold-starts, or fails closed rather than restoring an era-less
+  modern owner as legacy. After loss, unfinished modern work is not replayed;
+  the host must issue a fresh exact-era retry or re-listen.
+
+### Compatibility
+
+- This is an additive, non-breaking opt-in. The default remains the released
+  legacy path, whose externally observable behavior and owner identity remain
+  unchanged. R1 does not add automatic protocol probing, fallback, modern
+  sharing, or persisted modern handoff state.
+
+### Migration
+
+- Keep existing configurations unchanged to retain legacy behavior. To use
+  R1, select `--mcp-protocol=2026-07-28` before the opening request only for a
+  known modern host and same-era upstream; validate the modern admission
+  result and use the four policy readback facts above for operational checks.
+
+### Validation
+
+- Release validation is scoped to the 100-frame native opening corpus,
+  same-era byte preservation, forced isolation and readback, legacy parity,
+  lifecycle quarantine/loss behavior, and rollback. This Unreleased entry
+  describes the required scope and does not claim release, publication, or
+  customer proof.
+
+### Rollback
+
+- Stop new explicit-modern admissions, then drain or remove modern owners
+  through R1 quarantine. Do not downgrade live modern work to legacy, hand it
+  to a legacy owner, or replay unfinished work. Restore the prior compatible
+  binary or dependency revision only after that bounded retirement path.
+
 ## [0.29.1] - 2026-07-19
 
 ### Added

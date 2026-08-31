@@ -1,50 +1,63 @@
 # R1 Consumer-Handoff Preparation
 
-**Status**: Candidate-owned preparation only. This file does not publish, file, send, or update an external consumer handoff.
+**Status**: Candidate-owned preparation only. This document does not publish a release, resolve a module version, create or update an Engram issue, contact a consumer, or record completed adoption.
 
-## Purpose
+## Scope
 
-R1 changes the `mcp-mux` modern-admission boundary while keeping released legacy behavior as the default. This artifact prepares the consumer record required before release for `aimux`, `engram`, and every other `muxcore` consumer discovered during release inventory.
+R1 adds a native MCP `2026-07-28` route to `mcp-mux`. The current CLI selector is `--mcp-protocol=2026-07-28`. An invocation without that selector keeps the released legacy path.
 
-The R1 public change is additive. A consumer receives modern behavior only when it explicitly selects the pinned `2026-07-28` policy for a known modern host and same-era upstream. Consumers that do not opt in retain released legacy behavior. Legacy identity remains byte-identical to the released baseline.
+For an embedded `muxcore` consumer, set `engine.Config.ProtocolPolicy` to `era.PolicyModern20260728` before `engine.New` or `(*engine.MuxEngine).Run` begins admission. The zero value, `era.PolicyLegacyOnly`, keeps the released legacy ingress and daemon ordering.
 
-## Consumer map
+The modern route is limited to a known MCP `2026-07-28` host and a same-era upstream. It is forced isolated. Response cache, template reuse, and replay are off. `mcp-mux` does not automatically fall back to legacy. A valid request-scoped standard log can reach the sole downstream after request opt-in. Upstream JSON-RPC requests remain contained.
 
-| Consumer | R1 impact | Additive migration | Rollback | Required evidence |
-| --- | --- | --- | --- | --- |
-| `mcp-mux` | Owns the R1 selector, forced isolation, lifecycle quarantine, and minimal readback. | Ship the exact candidate only after the customer-proof and independent-check receipts are complete. Use the explicit modern policy only for a known modern host. | Stop new explicit-modern admissions. Drain/remove modern owners through R1 quarantine. Restore the prior product binary if a product rollback is required. | Candidate source/binary SHA, SC-001 corpus result, quickstart transcripts, status/redaction evidence, and rollback result. |
-| `aimux` | No behavior changes by default. It can encounter the new boundary only if it adopts the candidate `muxcore` revision or invokes `mcp-mux` with the explicit modern policy. | Keep the existing zero-value/legacy configuration. If adopting R1, opt in per known modern route and prove the same-era customer matrix without copying mcp-mux private control or lifecycle logic. | Pin or restore the prior compatible `muxcore`/product revision. Do not force a mixed-era live handoff. | Consumer revision, opt-in decision, legacy-parity result, any modern proof, and rollback result. |
-| `engram` | No behavior changes by default. The R1 selector remains opt-in and does not alter existing legacy engines. | Retain the existing legacy configuration unless a known modern upstream is explicitly selected. Use the released public policy only; do not add a consumer-local retry, replay, stale-process, or lifecycle controller. | Pin or restore the prior compatible `muxcore`/product revision. Do not convert live modern work to legacy. | Consumer revision, opt-in decision, legacy-parity result, any modern proof, and rollback result. |
-| Other `muxcore` consumers | The release inventory determines the complete set. No unknown consumer receives a silent behavior change because the default remains legacy. | Keep existing configuration unless the consumer explicitly adopts the modern policy for a known same-era route. Do not copy private mcp-mux protocol, owner, or lifecycle behavior. | Restore the consumer's prior compatible dependency/product revision. Do not operate a mixed-era live handoff. | Inventory identity, dependency revision, opt-in decision, legacy-parity result, any modern proof, and rollback result. |
+The existing `mcp-mux` process-generation lifecycle and `RetirementProven` authority remain the only authority for owner retirement. A loss requires the host to make a fresh exact-era admission or to re-listen after a new route is established. R1 does not preserve live modern subscriptions across loss.
 
-## Additive migration boundary
+## Impacted consumers
 
-A consumer migration is valid only when all of the following are true:
+| Consumer | Current impact | Candidate-owned preparation | Future consumer decision |
+| --- | --- | --- | --- |
+| `mcp-mux` | Provides the selector, the embedded `ProtocolPolicy`, forced isolation, lifecycle quarantine, and four readback facts. | Record the exact candidate source and binary identities, modern and legacy proof, and rollback evidence after the required release checks run. | Release the candidate through the release process. No consumer adoption is implied by this preparation. |
+| `aimux` | Keeps its current behavior unless it updates to the released `muxcore` version and explicitly selects the modern policy for a known same-era route. | Identify the affected revision and retain the required adoption record fields below. | Keep the legacy default, or make an explicit route-by-route opt-in after the released module version is known. |
+| `engram` | Keeps its current behavior unless it updates to the released `muxcore` version and explicitly selects the modern policy for a known same-era route. | Identify the affected revision and retain the required adoption record fields below. | Keep the legacy default, or make an explicit route-by-route opt-in after the released module version is known. |
+| Other `muxcore` consumers | The release inventory determines the complete set. An unknown consumer does not silently enter the modern route because legacy remains the default. | Add every consumer named by release inventory, test evidence, an issue, a release note, or an operator directive. | Keep the legacy default, or complete the same explicit opt-in and evidence record. |
+
+## Additive adoption rules
+
+A consumer can adopt R1 only when all of these conditions hold:
 
 1. The consumer identifies a known MCP `2026-07-28` host and same-era upstream.
-2. The consumer explicitly selects the R1 modern policy before its opening frame.
-3. The consumer accepts a control response only when it echoes the exact modern era.
-4. The consumer treats loss/reconnect as fresh exact-era admission or explicit new-launch failure. It does not add replay, automatic re-listen, or an implicit legacy fallback.
-5. The consumer verifies its released legacy path before and after the change. Its legacy identity remains byte-identical to the released baseline.
+2. The consumer selects `--mcp-protocol=2026-07-28`, or sets `engine.Config.ProtocolPolicy` to `era.PolicyModern20260728`, before admission starts.
+3. Control echoes `protocol_era=2026-07-28` before the route attaches.
+4. Owner readback reports `protocol_era=2026-07-28`, `sharing_policy=forced-isolated`, `cache_policy=off`, and `lifecycle_policy=r1-quarantine`.
+5. The consumer proves its released legacy path before and after its adoption change. Legacy identity remains byte-identical to the released baseline.
 
-No migration is implied by a shared-mode flag, `clientInfo`, a discovery response, an upstream name, or a failed modern attempt.
+Sharing inputs do not select the modern route: `MCP_MUX_ISOLATED`, `--isolated`, `MCP_MUX_STATELESS`, `--stateless`, and `x-mux.sharing`. `clientInfo`, discovery responses, upstream names, and a failed modern attempt also do not select it.
+
+## Prohibited consumer-local workarounds
+
+Consumers must not add local owner lifecycle controllers, process cleanup, process-generation tracking, forced retirement, snapshot recovery, reconnect controllers, automatic re-listen, request replay, subscription replay, or a legacy fallback for modern traffic. These mechanisms would conflict with `mcp-mux` owner authority and `RetirementProven`.
+
+After a loss, consumers must either make a fresh exact-era admission or report the new-launch failure. For `subscriptions/listen`, the consumer must issue a new native listen request after the new route is established. A consumer must not transfer live modern work to a legacy owner, reuse old opaque state, or simulate a successful continuation.
 
 ## Rollback boundary
 
-Rollback stops new explicit-modern admissions and uses the existing R1 quarantine path to drain or remove modern owners. It never converts live modern work to legacy, hands it to a legacy owner, or replays unfinished work.
+Rollback stops new invocations that select `--mcp-protocol=2026-07-28` and drains or removes active modern owners through the existing R1 lifecycle-quarantine path. It never downgrades live modern work to legacy, hands it to a legacy owner, or replays unfinished work.
 
-For a consumer dependency rollback, restore the prior compatible module/product revision. Do not force a mixed-version, mixed-era, or live state transfer.
+For a consumer dependency rollback, restore the previous compatible consumer or `muxcore` revision after the consumer has stopped modern admissions. Do not perform a mixed-version, mixed-era, or live-state transfer.
 
-## Evidence record for release-stage handoff
+## Required release-stage handoff record
 
-The release record must preserve these facts for each mapped consumer:
+For every impacted consumer, the release-stage Engram issue or comment must contain:
 
-- consumer identity and revision;
-- whether it opted into the R1 modern policy;
-- exact candidate source and binary SHA;
-- legacy-parity evidence and, when applicable, modern customer-proof evidence;
-- quickstart scenario, fixture, platform, transcript, and evidence-hash references;
-- rollback result; and
-- disposition: no action needed, additive migration verified, deferred, or blocked.
+- the released `muxcore` tag and module-resolution proof;
+- the consumer identity and revision;
+- the reason R1 is consumer-impacting, including the protocol-era, owner-lifecycle, and no-replay invariants;
+- the explicit opt-in decision, or a statement that the consumer remains on legacy;
+- required implementation steps and the prohibited consumer-local workarounds;
+- consumer smoke-test and acceptance evidence, including legacy parity and modern proof when the consumer opts in;
+- rollback and compatibility notes; and
+- provider evidence: exact commit, test evidence, release tag, and candidate source/binary identity.
 
-`release-evidence.md` records the candidate-level proof. `independent-check.md` records an independent re-derivation of the R1 boundary. A release-stage handoff may use these records, but this implementation-phase artifact does not contact external systems or publish consumer notices.
+After the released `muxcore` version is known and resolvable, the release owner creates or updates the Engram issue for `aimux`, `engram`, and every other identified consumer. The release owner rereads each touched issue and records its ID and latest status in release evidence. If Engram is unavailable, release closeout records `CONSUMER_HANDOFF_BLOCKED` and does not call the full critical scope shipped.
+
+`release-evidence.md` records candidate-level proof. `independent-check.md` records the independent boundary check. Neither document, nor this preparation, substitutes for release-stage publication or consumer adoption.

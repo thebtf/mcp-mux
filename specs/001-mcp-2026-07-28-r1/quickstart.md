@@ -1,6 +1,6 @@
 # R1 Customer Validation Guide
 
-> This is a **future built-deliverable** validation guide. It is not evidence that the unimplemented plan currently works, and no command in this guide was run during the Plan stage. Run it from the exact implementation candidate after the public selector and customer fixture exist.
+> This is the executable customer-proof guide for the R1 candidate. The guide is not evidence by itself. `release-evidence.md` records the exact generated Windows and Unix runs.
 
 ## What this proves
 
@@ -40,7 +40,7 @@ Scenario 8 records the required rollback evidence. It does not add a separate su
 - A clean temporary base directory so owner IPC and snapshot state cannot be inherited from another run.
 - Windows or Unix tooling appropriate for the target. Run the lifecycle matrix and runner contracts on both platform families before release because IPC/process retirement is platform-sensitive.
 
-The examples use the recommended explicit selector spelling `--mcp-protocol=2026-07-28`. If the final additive CLI API chooses a different spelling, substitute only that documented spelling; preserve the semantic policy and every expected outcome below.
+Use the fixed additive selector spelling `--mcp-protocol=2026-07-28` in every modern scenario.
 ## SC-001 deterministic acceptance corpus
 
 Treat `testdata/modern_opening_corpus.ndjson` as the SC-001 denominator. The corpus is deterministic and has at least 100 valid frames. It includes direct requests and host-sent `server/discover`, optional `clientInfo` absent/present cases, JSON property-order variants, and whitespace variants. Run every frame against a fresh same-era fixture route. For every accepted frame, record exactly one upstream capture that is byte-identical except for transport newline framing.
@@ -223,4 +223,4 @@ Rollback is complete only when no new modern admission is possible and no live m
 
 ## Release evidence record
 
-Record the exact T079 parent SHA, source SHA, binary SHA, operating system, selected public policy spelling, corpus revision, upstream fixture revision, captured opening bytes, control echo, status snapshots, all scenario outcomes, runner-contract transcripts, evidence hashes, candidate-owned consumer-handoff preparation, rollback result, and independent checker identity. The record must clearly distinguish successful modern proof, legacy parity proof, and allowed lifecycle cold-start/refusal from failure. `independent-check.md` separately records the pinned protocol revision; parent/source/binary SHA; boundary re-derivation; scenarios executed; platform and fixture IDs; evidence hashes; findings/dispositions; and verdict.
+Record the product source SHA, platform-specific binary SHA, operating system, selected public policy spelling, corpus and fixture revisions, captured opening bytes, control echo, status snapshots, all scenario outcomes, runner-contract transcripts, evidence hashes, candidate-owned consumer-handoff preparation, rollback result, and independent checker identity. The record must distinguish successful modern proof, legacy parity proof, and allowed lifecycle cold-start or refusal from failure. `independent-check.md` separately records the pinned protocol revision; source, binary, fixture, corpus, transcript, and artifact hashes; boundary re-derivation; scenarios checked; platform and fixture IDs; findings and dispositions; and verdict.
