@@ -451,6 +451,16 @@ func TestRunProxy_NoHandler(t *testing.T) {
 	}
 }
 
+func shortEngineBaseDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "me*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestRunDaemonDoesNotStealActiveControlSocket(t *testing.T) {
 	baseDir, err := os.MkdirTemp("", "ea*")
 	if err != nil {
@@ -1453,7 +1463,7 @@ func TestRunClientModernPolicyPrebuffersSC001CorpusBeforeSpawnAndPreservesStdin(
 			})
 
 			name := fmt.Sprintf("engine-modern-opening-%d", index)
-			baseDir := t.TempDir()
+			baseDir := shortEngineBaseDir(t)
 			var spawnObservation struct {
 				sync.Mutex
 				offset int64
@@ -1622,7 +1632,7 @@ func TestRunClientModernPolicyRejectsSelectorBeforeDaemonAdmission(t *testing.T)
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			baseDir := t.TempDir()
+			baseDir := shortEngineBaseDir(t)
 			const name = "engine-modern-selector-refusal"
 			controlServer := startEngineAdmissionControlServer(t, serverid.DaemonControlPath(baseDir, name), true, "2026-07-28")
 			readStdout := redirectEngineClientStdio(t, testCase.opening)
@@ -1682,7 +1692,7 @@ func TestRunClientModernPolicyRejectsBadControlEchoBeforeResilientBridge(t *test
 
 	for _, testCase := range tests {
 		t.Run(testCase.name, func(t *testing.T) {
-			baseDir := t.TempDir()
+			baseDir := shortEngineBaseDir(t)
 			const name = "engine-modern-control-echo"
 			controlServer := startEngineAdmissionControlServer(t, serverid.DaemonControlPath(baseDir, name), testCase.echoPresent, testCase.echo)
 			readStdout := redirectEngineClientStdio(t, validOpening)
