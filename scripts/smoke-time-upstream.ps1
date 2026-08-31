@@ -10,10 +10,34 @@ param(
 
     [int]$TimeoutSeconds = 30,
 
+    [string]$UvCacheRoot = $env:MCP_MUX_UV_CACHE_DIR,
+
+    [bool]$Offline = ($env:MCP_MUX_UV_OFFLINE -eq "1"),
+
     [switch]$SkipUpstreamWarmup
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-Sha256Hex {
+    param([string]$Path)
+
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $algorithm) {
+            $algorithm.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
 
 $FailureString = "connection closed: initialize response"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
@@ -42,9 +66,16 @@ New-Item -ItemType Directory -Force -Path $RuntimeDir | Out-Null
 
 $ShimLogPath = Join-Path $RuntimeDir "shim.log"
 $DaemonLogPath = Join-Path $RuntimeDir "mcp-muxd-debug.log"
-$UvCacheDir = Join-Path $TempRoot "mcp-mux-smoke-uv-cache"
+if ([string]::IsNullOrWhiteSpace($UvCacheRoot)) {
+    $UvCacheDir = Join-Path $TempRoot "mcp-mux-smoke-uv-cache"
+}
+else {
+    $UvCacheDir = [System.IO.Path]::GetFullPath($UvCacheRoot)
+}
 $UvToolDir = Join-Path $RuntimeDir "uv-tools"
-New-Item -ItemType Directory -Force -Path $UvCacheDir | Out-Null
+if (-not (Test-Path -LiteralPath $UvCacheDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $UvCacheDir | Out-Null
+}
 New-Item -ItemType Directory -Force -Path $UvToolDir | Out-Null
 
 function ConvertTo-NativeArgument {
@@ -86,6 +117,12 @@ function Set-SmokeEnvironment {
     $StartInfo.EnvironmentVariables["MCP_MUX_IDLE_TIMEOUT"] = "30s"
     $StartInfo.EnvironmentVariables["UV_CACHE_DIR"] = $UvCacheDir
     $StartInfo.EnvironmentVariables["UV_TOOL_DIR"] = $UvToolDir
+    if ($Offline) {
+        $StartInfo.EnvironmentVariables["UV_OFFLINE"] = "1"
+    }
+    else {
+        [void]$StartInfo.EnvironmentVariables.Remove("UV_OFFLINE")
+    }
 }
 
 function New-SmokeProcessStartInfo {
@@ -261,7 +298,7 @@ function Wait-SmokeStatusWithOwners {
         } else {
             try {
                 $parsed = ConvertFrom-SmokeStatusJson -Text $status.stdout -Label "status after reconnect"
-                if ((Get-SmokeStatusOwners -Status $parsed).Count -gt 0) {
+                if (@(Get-SmokeStatusOwners -Status $parsed).Count -gt 0) {
                     return [pscustomobject]@{
                         parsed = $parsed
                         stdout = $status.stdout
@@ -402,12 +439,19 @@ function Invoke-DefaultTimeWarmup {
     $oldTmp = $env:TMP
     $oldUvCache = $env:UV_CACHE_DIR
     $oldUvTool = $env:UV_TOOL_DIR
+    $oldUvOffline = $env:UV_OFFLINE
     $attempts = @()
     try {
         $env:TEMP = $RuntimeDir
         $env:TMP = $RuntimeDir
         $env:UV_CACHE_DIR = $UvCacheDir
         $env:UV_TOOL_DIR = $UvToolDir
+        if ($Offline) {
+            $env:UV_OFFLINE = "1"
+        }
+        else {
+            Remove-Item Env:UV_OFFLINE -ErrorAction SilentlyContinue
+        }
         for ($attempt = 1; $attempt -le 3; $attempt++) {
             $output = & $UpstreamCommand[0] $UpstreamCommand[1] "--help" 2>&1
             $exitCode = $LASTEXITCODE
@@ -441,6 +485,7 @@ function Invoke-DefaultTimeWarmup {
         $env:TMP = $oldTmp
         $env:UV_CACHE_DIR = $oldUvCache
         $env:UV_TOOL_DIR = $oldUvTool
+        $env:UV_OFFLINE = $oldUvOffline
     }
 }
 
@@ -450,7 +495,7 @@ $evidence = [ordered]@{
     binary_path                = $ResolvedBinary
     production_binary_path     = $ProductionBinary
     production_binary_used     = $false
-    binary_hash_sha256         = (Get-FileHash -Algorithm SHA256 -LiteralPath $ResolvedBinary).Hash
+    binary_hash_sha256         = Get-Sha256Hex -Path $ResolvedBinary
     binary_size                = (Get-Item -LiteralPath $ResolvedBinary).Length
     runtime_dir                = $RuntimeDir
     uv_cache_dir               = $UvCacheDir

@@ -25,6 +25,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/listchanged"
@@ -86,14 +87,55 @@ func nextProactiveNamespace() string {
 	return fmt.Sprintf("mux-init-%d-%d", os.Getpid(), proactiveOwnerSequence.Add(1))
 }
 
+const nativeOwnerIDPrefix = "native-"
+
+func isNativeOwnerID(serverID string) bool {
+	return strings.HasPrefix(serverID, nativeOwnerIDPrefix)
+}
+
+func hasUnsafeLifecycleBoundary(cfg OwnerConfig, serverIDs ...string) bool {
+	if cfg.ProtocolEra == era.EraModern20260728 || isNativeOwnerID(cfg.ServerID) {
+		return true
+	}
+	for _, serverID := range serverIDs {
+		if isNativeOwnerID(serverID) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeLifecycleBoundaryError() error {
+	return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
+}
+
+func (o *Owner) isModern() bool {
+	return o.protocolEra == era.EraModern20260728
+}
+
+func (o *Owner) forceModernClassification() {
+	if !o.isModern() {
+		return
+	}
+	o.autoClassification = classify.ModeIsolated
+	o.classificationSource = "protocol-era"
+	o.classificationReason = []string{"2026-07-28"}
+	o.classifiedOnce.Do(func() {
+		if o.classified != nil {
+			close(o.classified)
+		}
+	})
+}
+
 // InflightRequest holds metadata about a request currently being processed by upstream.
 // Used for observability: mux_list --verbose shows what's pending and for how long.
 type InflightRequest struct {
-	Method    string    `json:"method"`
-	Tool      string    `json:"tool,omitempty"`
-	SessionID int       `json:"session"`
-	StartTime time.Time `json:"started_at"`
-	process   atomic.Pointer[upstream.Process]
+	Method        string    `json:"method"`
+	Tool          string    `json:"tool,omitempty"`
+	SessionID     int       `json:"session"`
+	StartTime     time.Time `json:"started_at"`
+	logSubscribed bool
+	process       atomic.Pointer[upstream.Process]
 }
 
 // proactiveRequest is claimed exactly once by its response or bound upstream death.
@@ -127,6 +169,7 @@ type Owner struct {
 	sessionHandlerWithMeta      muxcore.SessionHandlerWithSessionMeta
 	upstreamWriter              io.Writer // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID                    string    // server identity hash
+	protocolEra                 era.ProtocolEra
 	listener                    net.Listener
 	logger                      *log.Logger
 
@@ -260,6 +303,10 @@ type OwnerConfig struct {
 	// ServerID is the server identity hash. Used in callbacks to identify this owner.
 	ServerID string
 
+	// ProtocolEra is immutable for the owner lifetime. Its zero value preserves
+	// legacy routing and cache behavior.
+	ProtocolEra era.ProtocolEra
+
 	// OnZeroSessions is called with the exact owner whose last session left.
 	// If nil, the owner does not auto-shutdown on zero sessions.
 	OnZeroSessions func(*Owner)
@@ -366,6 +413,12 @@ type OwnerConfig struct {
 // The caller chooses eager, persistent, or demand-driven materialization via
 // OwnerConfig.MaterializationPolicy after registering the owner in the daemon.
 func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		return nil, fmt.Errorf("owner from snapshot: protocol era: %w", err)
+	}
+	if hasUnsafeLifecycleBoundary(cfg, snap.ServerID) {
+		return nil, unsafeLifecycleBoundaryError()
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
@@ -396,6 +449,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		sessionHandler:         cfg.SessionHandler,
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
+		protocolEra:            cfg.ProtocolEra,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
@@ -441,8 +495,12 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		imported := o.sessionMgr.ImportBoundHistory(boundTokenSnapshotsToSession(snap.BoundTokens))
 		logger.Printf("owner restored %d reconnect token history entries from snapshot", imported)
 	}
-	// Pre-populate one coherent cache generation from the snapshot.
-	o.hydrateSnapshotCache(snap)
+	if o.isModern() {
+		o.forceModernClassification()
+	} else {
+		// Pre-populate one coherent cache generation from the snapshot.
+		o.hydrateSnapshotCache(snap)
+	}
 
 	// Close initReady and classified immediately — caches already populated
 	o.initReadyOnce.Do(func() { close(o.initReady) })
@@ -541,6 +599,9 @@ func (o *Owner) applyCachedRuntimeSettings() {
 // If cfg.HandlerFunc is set, the handler is run in-process via io.Pipe instead
 // of spawning a subprocess.
 func NewOwner(cfg OwnerConfig) (*Owner, error) {
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		return nil, fmt.Errorf("owner: protocol era: %w", err)
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = log.Default()
@@ -563,6 +624,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		sessionHandler:         cfg.SessionHandler,
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
+		protocolEra:            cfg.ProtocolEra,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
@@ -593,6 +655,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		pendingDemands:         make(map[string]*localDemand),
 		persistentPending:      cfg.PersistentPending,
 	}
+	o.forceModernClassification()
 	o.progressIntervalNs.Store(int64(5 * time.Second))
 
 	if o.tokenHandshake {
@@ -816,7 +879,9 @@ func (o *Owner) startRegisteredSession(s *Session) {
 	}
 
 	// Notify upstream that roots may have changed (new client = new potential root)
-	o.sendRootsListChanged()
+	if !o.isModern() {
+		o.sendRootsListChanged()
+	}
 	go o.readSession(s)
 }
 
@@ -878,6 +943,10 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		return s.WriteRaw(errBytes)
 	}
 	// FramePass (zero value, default) — fall through to normal dispatch.
+
+	if o.isModern() {
+		return o.handleModernDownstreamMessage(s, msg)
+	}
 
 	switch {
 	case msg.IsNotification():
@@ -958,6 +1027,67 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 	default:
 		return fmt.Errorf("unexpected message type from downstream: %s", msg.Type)
 	}
+}
+
+func (o *Owner) handleModernDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
+	switch {
+	case msg.IsNotification():
+		if msg.Method == "notifications/cancelled" {
+			return o.forwardModernCancelledNotification(s, msg)
+		}
+		if !o.hasWritableUpstream() {
+			return nil
+		}
+		return o.forwardNotificationIfReady(msg.Raw)
+
+	case msg.IsRequest():
+		if o.sessionHandler != nil {
+			return o.dispatchToSessionHandler(s, msg)
+		}
+		if !o.materializationReadyForRequests() {
+			queued, err := o.enqueueLocalDemand(s, msg)
+			if queued || err != nil {
+				return err
+			}
+		}
+		return o.forwardRequestNow(s, msg)
+
+	case msg.IsResponse():
+		return era.NewAdmissionError(era.AdmissionContainedUpstreamRequest)
+
+	default:
+		return fmt.Errorf("unexpected message type from downstream: %s", msg.Type)
+	}
+}
+
+func (o *Owner) forwardModernCancelledNotification(s *Session, msg *jsonrpc.Message) error {
+	var envelope struct {
+		Params struct {
+			RequestID json.RawMessage `json:"requestId"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(msg.Raw, &envelope); err != nil || envelope.Params.RequestID == nil {
+		return nil
+	}
+
+	tracked, ok := o.inflightTracker.Load(string(envelope.Params.RequestID))
+	if !ok {
+		return nil
+	}
+	inflight, ok := tracked.(*InflightRequest)
+	if !ok || inflight.SessionID != s.ID {
+		return nil
+	}
+	if proc := inflight.process.Load(); proc != nil {
+		if !o.acceptsProcessEvent(proc) {
+			return nil
+		}
+		return o.writeUpstreamToProcess(proc, msg.Raw)
+	}
+	if o.upstreamWriter != nil {
+		return o.writeUpstream(msg.Raw)
+	}
+	return nil
 }
 
 // dispatchToSessionHandler calls the SessionHandler directly instead of writing
@@ -1201,7 +1331,7 @@ func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
 		return false
 	}
 	o.upstreamDead.Store(true)
-	responses := o.claimInflightRequests()
+	responses := o.claimInflightRequests(proc)
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)
@@ -1293,6 +1423,9 @@ func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.M
 // caller holds upstreamEventMu for reading. Synthetic test messages pass nil.
 func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jsonrpc.Message) error {
 	if msg.IsNotification() {
+		if o.isModern() {
+			return o.handleModernUpstreamNotification(proc, msg)
+		}
 		if proc != nil && o.stageMaterializationListChanged(proc, msg.Method) {
 			return nil
 		}
@@ -1334,10 +1467,16 @@ func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jso
 	}
 
 	if msg.IsRequest() {
+		if o.isModern() {
+			return era.NewAdmissionError(era.AdmissionContainedUpstreamRequest)
+		}
 		return o.handleUpstreamRequest(msg)
 	}
 	if !msg.IsResponse() {
 		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
+	}
+	if o.isModern() {
+		return o.handleModernUpstreamResponse(proc, msg)
 	}
 	if request, claimed := o.claimProactive(string(msg.ID)); claimed {
 		o.decrementPending()
@@ -1420,6 +1559,93 @@ func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jso
 	}
 	o.logger.Printf("session %d: response delivered (%d bytes)", result.SessionID, len(restored))
 	return nil
+}
+
+func (o *Owner) handleModernUpstreamResponse(proc *upstream.Process, msg *jsonrpc.Message) error {
+	requestID := string(msg.ID)
+	tracked, ok := o.inflightTracker.Load(requestID)
+	if !ok {
+		return nil
+	}
+	inflight, ok := tracked.(*InflightRequest)
+	if !ok || !o.claimModernInflight(requestID, inflight, proc) {
+		return nil
+	}
+	o.clearModernInflightState(requestID)
+	o.mu.RLock()
+	session := o.sessions[inflight.SessionID]
+	o.mu.RUnlock()
+	if session == nil {
+		return nil
+	}
+	return session.WriteRaw(msg.Raw)
+}
+
+func (o *Owner) handleModernUpstreamNotification(proc *upstream.Process, msg *jsonrpc.Message) error {
+	if strings.HasPrefix(msg.Method, "notifications/x-mux/") {
+		return nil
+	}
+	if msg.Method == "notifications/progress" {
+		if err := o.routeProgressNotification(msg.Raw); err != nil {
+			o.logger.Printf("drop notifications/progress: %v (preventing transport tear-down in MCP client)", err)
+		}
+		return nil
+	}
+	if msg.Method == "notifications/message" {
+		// Request-scoped logs must preserve the upstream order and cannot use
+		// the bounded, lossy asynchronous notification queue.
+		session := o.modernInflightSession(proc, true)
+		if session == nil {
+			return nil
+		}
+		return session.WriteRaw(msg.Raw)
+	}
+
+	// A modern owner is forced isolated. Subscription notifications continue
+	// after their listen request has completed, so route them to its one live
+	// recipient instead of tying them to a completed inflight request.
+	session := o.soleModernSession()
+	if session == nil {
+		return nil
+	}
+	return session.WriteRaw(msg.Raw)
+}
+
+func (o *Owner) soleModernSession() *Session {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	var only *Session
+	for _, session := range o.sessions {
+		if session == nil || session.IsClosed() {
+			continue
+		}
+		if only != nil {
+			return nil
+		}
+		only = session
+	}
+	return only
+}
+
+func (o *Owner) modernInflightSession(proc *upstream.Process, requireLogSubscription bool) *Session {
+	var sessionID int
+	o.inflightTracker.Range(func(_, value any) bool {
+		inflight, ok := value.(*InflightRequest)
+		if !ok || (proc != nil && inflight.process.Load() != proc) ||
+			(requireLogSubscription && !inflight.logSubscribed) {
+			return true
+		}
+		sessionID = inflight.SessionID
+		return false
+	})
+	if sessionID == 0 {
+		return nil
+	}
+	o.mu.RLock()
+	session := o.sessions[sessionID]
+	o.mu.RUnlock()
+	return session
 }
 
 // handleUpstreamRequest handles server→client requests from the upstream.
@@ -1659,6 +1885,9 @@ func (o *Owner) clearProgressTokensForRequest(requestID string) {
 
 // sendRootsListChanged notifies the upstream that roots have changed.
 func (o *Owner) sendRootsListChanged() {
+	if o.isModern() {
+		return
+	}
 	notification := `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`
 	if err := o.forwardNotificationIfReady([]byte(notification)); err != nil {
 		o.logger.Printf("failed to send roots/list_changed: %v", err)
@@ -1679,6 +1908,9 @@ func pathToFileURI(p string) string {
 
 // broadcast sends a message to all connected sessions.
 func (o *Owner) broadcast(data []byte) error {
+	if o.isModern() {
+		return nil
+	}
 	// Invalidate caches for list-changed notifications before forwarding
 	o.invalidateCacheIfNeeded(data)
 
@@ -1704,6 +1936,9 @@ func (o *Owner) broadcast(data []byte) error {
 // re-fetch its tool/prompt/resource lists. Uses async delivery (SendNotification)
 // so the caller is never blocked by a slow session.
 func (o *Owner) broadcastListChanged() {
+	if o.isModern() {
+		return
+	}
 	notifications := []string{
 		`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`,
 		`{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}`,
@@ -1795,6 +2030,9 @@ func (o *Owner) removeSession(s *Session) {
 	}
 	o.mu.Unlock()
 	o.launchContextMu.Unlock()
+	if o.isModern() {
+		o.removeModernInflightForSession(s.ID)
+	}
 	o.cancelLocalDemandsForSession(s.ID)
 	if remaining == 0 {
 		o.cancelDisposableMaterializationForZeroSessions()
@@ -2242,7 +2480,11 @@ type drainedInflightResponse struct {
 
 // claimInflightRequests atomically detaches generation-owned request state.
 // It performs no downstream session I/O, so callers may hold upstreamEventMu.
-func (o *Owner) claimInflightRequests() []drainedInflightResponse {
+func (o *Owner) claimInflightRequests(proc *upstream.Process) []drainedInflightResponse {
+	if o.isModern() {
+		return o.claimModernInflightRequests(proc)
+	}
+
 	entries := o.sessionMgr.DrainInflight()
 	if len(entries) == 0 {
 		return nil
@@ -2285,6 +2527,79 @@ func (o *Owner) claimInflightRequests() []drainedInflightResponse {
 	return responses
 }
 
+func (o *Owner) claimModernInflightRequests(proc *upstream.Process) []drainedInflightResponse {
+	responses := make([]drainedInflightResponse, 0)
+	claimed := 0
+	o.inflightTracker.Range(func(key, value any) bool {
+		requestID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		inflight, ok := value.(*InflightRequest)
+		if !ok || (proc != nil && inflight.process.Load() != proc) {
+			return true
+		}
+		o.mu.RLock()
+		session := o.sessions[inflight.SessionID]
+		o.mu.RUnlock()
+		var payload []byte
+		if session != nil {
+			var err error
+			payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
+			if err != nil {
+				o.logger.Printf("drainInflight: build error for %s: %v", requestID, err)
+				return true
+			}
+		}
+		if !o.claimModernInflight(requestID, inflight, proc) {
+			return true
+		}
+		claimed++
+		o.clearModernInflightState(requestID)
+		if session != nil {
+			responses = append(responses, drainedInflightResponse{
+				session:   session,
+				sessionID: inflight.SessionID,
+				payload:   payload,
+			})
+		}
+		return true
+	})
+	if claimed > 0 {
+		o.logger.Printf("upstream died: sending error responses for %d in-flight requests", claimed)
+	}
+	return responses
+}
+
+func (o *Owner) claimModernInflight(requestID string, inflight *InflightRequest, proc *upstream.Process) bool {
+	if inflight == nil || (proc != nil && inflight.process.Load() != proc) {
+		return false
+	}
+	return o.inflightTracker.CompareAndDelete(requestID, inflight)
+}
+
+func (o *Owner) clearModernInflightState(requestID string) {
+	o.decrementPending()
+	o.methodTags.Delete(requestID)
+	o.timedOutIDs.Delete(requestID)
+	o.clearProgressTokensForRequest(requestID)
+}
+
+func (o *Owner) removeModernInflightForSession(sessionID int) {
+	o.inflightTracker.Range(func(key, value any) bool {
+		requestID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		inflight, ok := value.(*InflightRequest)
+		if !ok || inflight.SessionID != sessionID || !o.claimModernInflight(requestID, inflight, nil) {
+			return true
+		}
+		o.clearModernInflightState(requestID)
+		return true
+	})
+}
+
 func (o *Owner) drainProactiveRequests(proc *upstream.Process) {
 	o.proactiveRequests.Range(func(key, value any) bool {
 		request := value.(proactiveRequest)
@@ -2307,7 +2622,7 @@ func (o *Owner) deliverInflightResponses(responses []drainedInflightResponse) {
 }
 
 func (o *Owner) drainInflightRequests() {
-	o.deliverInflightResponses(o.claimInflightRequests())
+	o.deliverInflightResponses(o.claimInflightRequests(nil))
 }
 
 // FinalizeForRemoval tears down admission and retries the owned process
@@ -2774,6 +3089,9 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 	up := o.upstream
 	o.mu.RUnlock()
 	if writer != nil {
+		if bind != nil {
+			bind(nil)
+		}
 		if _, err := writer.Write(data); err != nil {
 			return nil, fmt.Errorf("upstream writer: write: %w", err)
 		}
@@ -2896,10 +3214,16 @@ func (o *Owner) SetIdleTimeout(d time.Duration) {
 
 // Status returns a JSON-serializable status summary.
 func (o *Owner) Status() map[string]any {
+	modern := o.isModern()
+
 	o.mu.RLock()
-	sessionIDs := make([]int, 0, len(o.sessions))
-	for id := range o.sessions {
-		sessionIDs = append(sessionIDs, id)
+	sessionCount := len(o.sessions)
+	var sessionIDs []int
+	if !modern {
+		sessionIDs = make([]int, 0, sessionCount)
+		for id := range o.sessions {
+			sessionIDs = append(sessionIDs, id)
+		}
 	}
 	classification := string(o.autoClassification)
 	classificationSource := o.classificationSource
@@ -2929,8 +3253,7 @@ func (o *Owner) Status() map[string]any {
 		"args":                       o.args,
 		"cwd":                        primaryCwd,
 		"cwd_set":                    cwds,
-		"sessions":                   sessionIDs,
-		"session_count":              len(sessionIDs),
+		"session_count":              sessionCount,
 		"pending_requests":           o.pendingRequests.Load(),
 		"uptime_seconds":             time.Since(o.startTime).Seconds(),
 		"cached_init":                hasCachedInit,
@@ -2946,7 +3269,16 @@ func (o *Owner) Status() map[string]any {
 		"restart_pin_count":          o.restartPins.Load(),
 		"cache_ready":                hasCachedInit && hasCachedTools,
 		"upstream_live":              upstreamPresent && !o.upstreamDead.Load(),
-		"finalization_error":         finalizationError,
+	}
+
+	if modern {
+		status["protocol_era"] = "2026-07-28"
+		status["sharing_policy"] = "forced-isolated"
+		status["cache_policy"] = "off"
+		status["lifecycle_policy"] = "r1-quarantine"
+	} else {
+		status["sessions"] = sessionIDs
+		status["finalization_error"] = finalizationError
 	}
 
 	if classification != "" {
@@ -2957,29 +3289,31 @@ func (o *Owner) Status() map[string]any {
 		}
 	}
 
-	// Include inflight request details when requests are pending
-	var inflight []map[string]any
-	var oldestMs int64
-	o.inflightTracker.Range(func(key, value any) bool {
-		req := value.(*InflightRequest)
-		inflight = append(inflight, map[string]any{
-			"method":          req.Method,
-			"tool":            req.Tool,
-			"session":         req.SessionID,
-			"started_at":      req.StartTime.UTC().Format(time.RFC3339Nano),
-			"elapsed_seconds": time.Since(req.StartTime).Seconds(),
+	// Include in-flight request details only in legacy status.
+	if !modern {
+		var inflight []map[string]any
+		var oldestMs int64
+		o.inflightTracker.Range(func(key, value any) bool {
+			req := value.(*InflightRequest)
+			inflight = append(inflight, map[string]any{
+				"method":          req.Method,
+				"tool":            req.Tool,
+				"session":         req.SessionID,
+				"started_at":      req.StartTime.UTC().Format(time.RFC3339Nano),
+				"elapsed_seconds": time.Since(req.StartTime).Seconds(),
+			})
+			age := time.Since(req.StartTime).Milliseconds()
+			if age > oldestMs {
+				oldestMs = age
+			}
+			return true
 		})
-		age := time.Since(req.StartTime).Milliseconds()
-		if age > oldestMs {
-			oldestMs = age
+		if len(inflight) > 0 {
+			status["inflight"] = inflight
 		}
-		return true
-	})
-	if len(inflight) > 0 {
-		status["inflight"] = inflight
-	}
-	if oldestMs > 0 {
-		status["oldest_request_age_ms"] = oldestMs
+		if oldestMs > 0 {
+			status["oldest_request_age_ms"] = oldestMs
+		}
 	}
 
 	return status
@@ -3118,6 +3452,9 @@ func (o *Owner) exportSessionsLocked() []SessionSnapshot {
 
 // getCachedResponse returns the cached response for the given method, or nil.
 func (o *Owner) getCachedResponse(method string) []byte {
+	if o.isModern() {
+		return nil
+	}
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 
@@ -3139,6 +3476,9 @@ func (o *Owner) getCachedResponse(method string) []byte {
 
 // replayFromCache sends a cached response to the session with the client's request ID.
 func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte) error {
+	if o.isModern() {
+		return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
+	}
 	replaced, err := jsonrpc.ReplaceID(cached, msg.ID)
 	if err != nil {
 		return fmt.Errorf("replay %s: replace id: %w", msg.Method, err)
@@ -3158,6 +3498,9 @@ func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte)
 
 // cacheResponse stores a raw JSON-RPC response for later replay.
 func (o *Owner) cacheResponse(method string, raw []byte) {
+	if o.isModern() {
+		return
+	}
 	if o.cacheResponseState(method, raw) {
 		o.broadcastListChanged()
 	}
@@ -3180,6 +3523,9 @@ func successfulJSONRPCResponse(raw []byte) bool {
 // session I/O. The caller may hold upstreamEventMu to linearize a live process
 // response against process-generation replacement.
 func (o *Owner) cacheResponseState(method string, raw []byte) bool {
+	if o.isModern() {
+		return false
+	}
 	if !successfulJSONRPCResponse(raw) {
 		o.logger.Printf("not caching unsuccessful %s response", method)
 		return false
@@ -3319,6 +3665,9 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 // invalidateCacheIfNeeded checks if a notification from upstream signals that a
 // cached list has changed, and clears the relevant cache entry.
 func (o *Owner) invalidateCacheIfNeeded(data []byte) {
+	if o.isModern() {
+		return
+	}
 	msg, err := jsonrpc.Parse(data)
 	if err != nil || !msg.IsNotification() {
 		return
@@ -3349,6 +3698,9 @@ func (o *Owner) invalidateCacheIfNeeded(data []byte) {
 // captureInitFingerprint extracts protocolVersion from an initialize request
 // and stores it for fingerprint matching against later clients.
 func (o *Owner) captureInitFingerprint(raw []byte) {
+	if o.isModern() {
+		return
+	}
 	var req struct {
 		Params struct {
 			ProtocolVersion string `json:"protocolVersion"`

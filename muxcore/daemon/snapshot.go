@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
@@ -41,7 +42,10 @@ var retrySidPattern = regexp.MustCompile(`^(isolated-[0-9a-f]+)-r(\d+)$`)
 // recomputed base instead. This keeps the retry suffix consistent with what
 // a fresh Spawn would compute, not with whatever happened to be in the
 // snapshot's literal sid field.
-func (d *Daemon) rehydrateRetryCounter(sid, cmd string, args []string, cwd string) {
+func (d *Daemon) rehydrateRetryCounter(protocolEra era.ProtocolEra, sid, cmd string, args []string, cwd string) {
+	if protocolEra != era.EraLegacy {
+		return
+	}
 	m := retrySidPattern.FindStringSubmatch(sid)
 	if m == nil {
 		return
@@ -215,13 +219,16 @@ func (d *Daemon) acquireSnapshotOwnerPins() ([]snapshotOwnerPin, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for sid, entry := range d.owners {
-		if entry != nil && entry.Owner != nil && entry.removalInProgress {
+		if entry == nil || entry.Owner == nil || isModernOwnerEntry(entry) {
+			continue
+		}
+		if entry.removalInProgress {
 			return nil, fmt.Errorf("snapshot owner %s removal is still finalizing", shortServerID(sid))
 		}
 	}
 	pins := make([]snapshotOwnerPin, 0, len(d.owners))
 	for sid, entry := range d.owners {
-		if entry.Owner == nil {
+		if entry == nil || entry.Owner == nil || isModernOwnerEntry(entry) {
 			continue
 		}
 		if entry.snapshotPins == 0 {
@@ -435,6 +442,9 @@ func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) sn
 
 func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffUpstream, restoreSource string, eager, publishTemplate bool) (*OwnerEntry, bool, error) {
 	snap := plan.snapshot
+	if isModernSnapshotRecord(snap) {
+		return nil, false, unsafeLifecycleBoundaryError()
+	}
 	if isRestartRestoreMode() {
 		// Snapshot capture cannot exclude a late list_changed or discovery
 		// response from the predecessor. Preserve initialize for protocol and
@@ -514,7 +524,7 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 	d.owners[snap.ServerID] = entry
 	d.mu.Unlock()
 	restoredOwner.ResolvePersistent(effectivePersistent)
-	d.rehydrateRetryCounter(snap.ServerID, snap.Command, snap.Args, snap.Cwd)
+	d.rehydrateRetryCounter(era.EraLegacy, snap.ServerID, snap.Command, snap.Args, snap.Cwd)
 	if publishTemplate && snap.CachedInit != "" && snap.CachedTools != "" {
 		snap.Persistent = effectivePersistent
 		if !d.publishOwnerCache(restoredOwner, snap) {
@@ -650,6 +660,9 @@ func (d *Daemon) loadSnapshot() int {
 	restored := 0
 
 	for _, ownerSnap := range snap.Owners {
+		if isModernSnapshotRecord(ownerSnap) {
+			continue
+		}
 		if ownerSnap.Classification == classify.ModeIsolated && len(ownerSnap.CwdSet) > 1 {
 			d.logger.Printf("snapshot: healing poisoned isolated owner %s: cwdSet %v -> [%s]",
 				shortServerID(ownerSnap.ServerID), ownerSnap.CwdSet, ownerSnap.Cwd)
@@ -757,15 +770,20 @@ func (d *Daemon) loadSnapshotMetadataOnly(reason string) int {
 	d.mu.Unlock()
 
 	restoreCaches := !isRestartRestoreMode()
+	eligible := 0
 	for _, ownerSnap := range snap.Owners {
+		if isModernSnapshotRecord(ownerSnap) {
+			continue
+		}
+		eligible++
 		if restoreCaches && ownerSnap.CachedInit != "" && ownerSnap.CachedTools != "" {
 			d.updateTemplate(ownerSnap.Command, ownerSnap.Args, ownerSnap)
 		}
-		d.rehydrateRetryCounter(ownerSnap.ServerID, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)
+		d.rehydrateRetryCounter(era.EraLegacy, ownerSnap.ServerID, ownerSnap.Command, ownerSnap.Args, ownerSnap.Cwd)
 	}
 
-	d.logger.Printf("snapshot: deferred restore of %d owners (%s)", len(snap.Owners), reason)
-	return len(snap.Owners)
+	d.logger.Printf("snapshot: deferred restore of %d owners (%s)", eligible, reason)
+	return eligible
 }
 
 // restoreHealthGateWindow is the time we allow newly-restored owners to fully

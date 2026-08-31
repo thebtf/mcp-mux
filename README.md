@@ -126,6 +126,54 @@ MCP_MUX_ISOLATED=1 mcp-mux uvx my-server
 mcp-mux --isolated uvx my-server
 ```
 
+## Modern R1 (MCP 2026-07-28)
+
+Use R1 only when the host and upstream are both known to speak MCP `2026-07-28`. It is an additive opt-in. Omitting `--mcp-protocol=2026-07-28` preserves the legacy quick start and default behavior. R1 does not translate legacy and modern traffic.
+
+Put `--mcp-protocol=2026-07-28` before the upstream command:
+
+```sh
+mcp-mux --mcp-protocol=2026-07-28 my-modern-server --stdio
+```
+
+For example, configure the server in `.mcp.json` as follows:
+
+```json
+{
+  "mcpServers": {
+    "modern-server": {
+      "command": "mcp-mux",
+      "args": [
+        "--mcp-protocol=2026-07-28",
+        "my-modern-server",
+        "--stdio"
+      ]
+    }
+  }
+}
+```
+
+R1 forces isolation. It disables response caching, discovery templates, and replay. There is no automatic fallback to the legacy protocol or a shared mode. Server log notifications stay request-scoped and require the request to opt in with `_meta.io.modelcontextprotocol/logLevel`; mcp-mux does not broadcast them.
+
+After an owner or transport loss, mcp-mux returns errors for in-flight modern requests. The host must issue fresh retries and a fresh `subscriptions/listen`; R1 does not replay requests or subscriptions.
+
+To inspect the R1 policy, run `mcp-mux status` and look for these four fields:
+
+- `protocol_era: "2026-07-28"`
+- `sharing_policy: "forced-isolated"`
+- `cache_policy: "off"`
+- `lifecycle_policy: "r1-quarantine"`
+
+R1 is separate from the historical `--stateless` flag. `--stateless` changes legacy server identity and sharing. It does not select an MCP protocol era or make R1 shareable.
+
+To roll back an R1 configuration:
+
+1. Remove `--mcp-protocol=2026-07-28` from the host configuration to stop new R1 admissions.
+2. Let current R1 owners drain, or remove them with `mux_stop` by the `server_id` shown in `mcp-mux status`. `mux_stop` is the existing control-plane tool for any owner. R1 adds no separate stop path. `mcp-mux stop --drain-timeout 30s` drains and stops the whole local daemon.
+3. Start a new host connection with the legacy configuration. Never downgrade a live R1 owner or replay old requests or subscriptions.
+
+A refused, absent, or mismatched era confirmation means modern admission failed. Do not retry the same route as legacy.
+
 ## Auto-Classification
 
 When no explicit mode is set, mcp-mux classifies each server automatically using this priority order:
@@ -644,15 +692,16 @@ including BSD targets without both proofs, fail closed and never emit private
 dormant frames.
 
 The stable stdio loop, strict MCP correlation, shared protocol-v2 codec,
-process-tree finalization, and generic peer-PID attestation are public in
-`muxcore/v0.29.1` through `muxcore/supervisor` and
-`muxcore/supervisor/attest`. Native consumers should pin that tag and use
-`supervisor.Run`, `supervisor.StartCommand`, `supervisor.StartWithFallback`,
-`supervisor.ProtocolV2`, and the attestation package; they must not copy the
-`mcp-mux` product adapter, private
-wire constants, parser, replay loop, or exit code. To roll back, pin
-`muxcore/v0.29.0` or restore the prior product binary and use the product's
-bounded replacement path rather than forcing a mixed-version live handoff.
+process-tree finalization, generic peer-PID attestation, and the explicit native
+MCP `2026-07-28` route are public in `muxcore/v0.30.0`. Native consumers should
+pin that tag and use `engine.Config.ProtocolPolicy` for an explicit known
+same-era modern route; legacy remains the zero-value default. Supervisor users
+should continue to use `supervisor.Run`, `supervisor.StartCommand`,
+`supervisor.StartWithFallback`, `supervisor.ProtocolV2`, and the attestation
+package rather than copying the `mcp-mux` product adapter, private wire
+constants, parser, replay loop, or exit code. To roll back, pin
+`muxcore/v0.29.1` or restore the prior product binary after stopping new modern
+admissions and retiring active modern owners through the quarantine path.
 
 The shared daemon is owned by the stable launcher rather than by any supervised engine generation. The launcher prepares it before starting a child; on Windows the daemon therefore remains outside the child's KillOnJobClose Job Object. A supervised child never spawns that daemon inside its own process tree and exits back to the stable launcher if the daemon must be recreated, preserving the host-facing stdio pipe.
 

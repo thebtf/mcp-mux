@@ -1,8 +1,10 @@
 package owner
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -12,6 +14,8 @@ import (
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
+	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 	"github.com/thejerf/suture/v4"
 )
 
@@ -360,5 +364,825 @@ func TestServe_ReturnsErrDoNotRestartAfterShutdown(t *testing.T) {
 	// Post-fix: returns ErrDoNotRestart → suture stops cycling, no cleanup event.
 	if got != suture.ErrDoNotRestart {
 		t.Errorf("Serve on shut-down owner returned %v, want suture.ErrDoNotRestart", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T015: Native MCP 2026-07-28 owner behavior
+// ---------------------------------------------------------------------------
+
+func newModernWriterOwner(
+	t *testing.T,
+	writer io.Writer,
+	onCacheReady func(*Owner, OwnerSnapshot) bool,
+) *Owner {
+	t.Helper()
+	o, err := NewOwner(OwnerConfig{
+		IPCPath:        testIPCPath(t),
+		UpstreamWriter: writer,
+		ProtocolEra:    era.EraModern20260728,
+		OnCacheReady:   onCacheReady,
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner(modern): %v", err)
+	}
+	t.Cleanup(o.Shutdown)
+	return o
+}
+
+func addModernOwnerSession(t *testing.T, o *Owner, cwd string) (*Session, *safeBuf) {
+	t.Helper()
+	session, output := newTestSession(cwd)
+	o.admissionMu.Lock()
+	o.addSessionLocked(session)
+	o.admissionMu.Unlock()
+	t.Cleanup(session.Close)
+	return session, output
+}
+
+type gatedWriter struct {
+	started chan struct{}
+	release <-chan struct{}
+	mu      sync.Mutex
+	output  bytes.Buffer
+}
+
+func (w *gatedWriter) Write(data []byte) (int, error) {
+	select {
+	case <-w.started:
+	default:
+		close(w.started)
+	}
+	<-w.release
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.output.Write(data)
+}
+
+func (w *gatedWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.output.String()
+}
+
+func TestModernOwner_NativeReadinessSkipsLegacyBootstrap(t *testing.T) {
+	started := make(chan struct{}, 1)
+	frames := make(chan []byte, 4)
+	o, err := NewOwner(OwnerConfig{
+		IPCPath:     testIPCPath(t),
+		ProtocolEra: era.EraModern20260728,
+		HandlerFunc: func(ctx context.Context, stdin io.Reader, _ io.Writer) error {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			scanner := bufio.NewScanner(stdin)
+			for scanner.Scan() {
+				frame := append([]byte(nil), scanner.Bytes()...)
+				select {
+				case frames <- frame:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return scanner.Err()
+		},
+		Logger: testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner(modern): %v", err)
+	}
+	t.Cleanup(o.Shutdown)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("modern upstream handler did not start")
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("modern owner injected legacy bootstrap traffic before host demand: %s", frame)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if !o.IsClassifiedIsolated() {
+		t.Fatal("modern owner is not forced isolated")
+	}
+	waitForCondition(t, time.Second, func() bool {
+		return o.MaterializationState() == MaterializationReady
+	}, "modern owner did not become ready without legacy discovery")
+}
+
+func TestModernOwner_PreservesNativeRequestsAndMRTRWithoutCacheOrReplay(t *testing.T) {
+	var upstream safeBuf
+	cachePublishes := 0
+	o := newModernWriterOwner(t, &upstream, func(*Owner, OwnerSnapshot) bool {
+		cachePublishes++
+		return true
+	})
+	if !o.IsClassifiedIsolated() {
+		t.Fatal("modern owner is not forced isolated")
+	}
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	listRequest := []byte(`{"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}},"id":"modern-list-1","jsonrpc":"2.0"}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(listRequest)); err != nil {
+		t.Fatalf("forward native tools/list: %v", err)
+	}
+	if got, want := upstream.String(), string(listRequest)+"\n"; got != want {
+		t.Fatalf("first native request upstream bytes = %q, want exactly %q", got, want)
+	}
+
+	listResponse := []byte(`{"id":"modern-list-1","result":{"tools":[{"name":"modern_echo"}]},"jsonrpc":"2.0"}`)
+	if err := o.handleUpstreamMessage(parseMessage(listResponse)); err != nil {
+		t.Fatalf("route native tools/list response: %v", err)
+	}
+	if got, want := downstream.String(), string(listResponse)+"\n"; got != want {
+		t.Fatalf("native tools/list response = %q, want byte-exact %q", got, want)
+	}
+	if cached := o.getCachedResponse("tools/list"); cached != nil {
+		t.Fatalf("modern tools/list response entered legacy cache: %s", cached)
+	}
+	if cachePublishes != 0 {
+		t.Fatalf("modern response invoked legacy cache/template publication %d time(s)", cachePublishes)
+	}
+
+	listRetry := []byte(`{"jsonrpc":"2.0","id":"modern-list-2","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(listRetry)); err != nil {
+		t.Fatalf("forward second native tools/list: %v", err)
+	}
+	wantUpstream := string(listRequest) + "\n" + string(listRetry) + "\n"
+	if got := upstream.String(); got != wantUpstream {
+		t.Fatalf("modern tools/list replayed cache or rewrote retry: got %q, want %q", got, wantUpstream)
+	}
+
+	callRequest := []byte(`{"params":{"name":"modern_echo","arguments":{"message":"native"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}},"jsonrpc":"2.0","id":"modern-call-1","method":"tools/call"}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(callRequest)); err != nil {
+		t.Fatalf("forward native tools/call: %v", err)
+	}
+	wantUpstream += string(callRequest) + "\n"
+	if got := upstream.String(); got != wantUpstream {
+		t.Fatalf("native tools/call upstream bytes = %q, want exactly %q", got, wantUpstream)
+	}
+
+	inputRequired := []byte(`{"jsonrpc":"2.0","id":"modern-call-1","result":{"resultType":"input_required","inputRequests":{"fixture_confirmation":{"method":"elicitation/create","params":{"requestedSchema":{"type":"object","required":["confirmed"]}}}},"requestState":{"opaque":["preserve",{"byte":"exact"}]}}}`)
+	if err := o.handleUpstreamMessage(parseMessage(inputRequired)); err != nil {
+		t.Fatalf("route native input_required response: %v", err)
+	}
+	wantDownstream := string(listResponse) + "\n" + string(inputRequired) + "\n"
+	if got := downstream.String(); got != wantDownstream {
+		t.Fatalf("native input_required result was changed or misrouted: got %q, want %q", got, wantDownstream)
+	}
+}
+
+func TestModernOwner_ContainsUpstreamJSONRPCRequests(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	demand := []byte(`{"jsonrpc":"2.0","id":"modern-call-active","method":"tools/call","params":{"name":"modern_echo","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(demand)); err != nil {
+		t.Fatalf("forward native request: %v", err)
+	}
+
+	serverRequest := []byte(`{"jsonrpc":"2.0","id":"upstream-server-request","method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"must stay contained"}}],"maxTokens":16}}`)
+	if err := o.handleUpstreamMessage(parseMessage(serverRequest)); err != nil && !errors.Is(err, era.AdmissionContainedUpstreamRequest) {
+		t.Fatalf("contain modern upstream request: %v", err)
+	}
+	if waitCondition(t, 200*time.Millisecond, func() bool {
+		return downstream.String() != ""
+	}) {
+		t.Fatalf("modern upstream JSON-RPC request reached downstream: %s", downstream.String())
+	}
+}
+
+func TestModernOwner_ForwardsOnlyOptedInStandardLogToSoleSession(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	standardLog := []byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"mock-modern-server","data":"request-scoped fixture log"}}`)
+	if err := o.handleUpstreamMessage(parseMessage(standardLog)); err != nil {
+		t.Fatalf("handle unopted standard log: %v", err)
+	}
+	if waitCondition(t, 150*time.Millisecond, func() bool {
+		return downstream.String() != ""
+	}) {
+		t.Fatalf("standard log without request opt-in reached downstream: %s", downstream.String())
+	}
+
+	optedInRequest := []byte(`{"jsonrpc":"2.0","id":"modern-log-opt-in","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info"}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(optedInRequest)); err != nil {
+		t.Fatalf("forward log-opted native request: %v", err)
+	}
+	if got, want := upstream.String(), string(optedInRequest)+"\n"; got != want {
+		t.Fatalf("modern logging opt-in generated or rewrote upstream traffic: got %q, want %q", got, want)
+	}
+
+	if err := o.handleUpstreamMessage(parseMessage(standardLog)); err != nil {
+		t.Fatalf("handle opted-in standard log: %v", err)
+	}
+	if !waitCondition(t, time.Second, func() bool {
+		return strings.Count(downstream.String(), string(standardLog)) == 1
+	}) {
+		t.Fatalf("opted-in standard log was not delivered once: %s", downstream.String())
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got, want := downstream.String(), string(standardLog)+"\n"; got != want {
+		t.Fatalf("standard log was synthesized, duplicated, or transformed: got %q, want %q", got, want)
+	}
+}
+
+func TestModernOwner_DeliversSubscriptionNotificationsAfterAcknowledgement(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	listen := []byte(`{"jsonrpc":"2.0","id":"modern-listen","method":"subscriptions/listen","params":{"uri":"file:///project","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(listen)); err != nil {
+		t.Fatalf("forward modern subscriptions/listen: %v", err)
+	}
+	if got, want := upstream.String(), string(listen)+"\n"; got != want {
+		t.Fatalf("modern subscriptions/listen upstream bytes = %q, want %q", got, want)
+	}
+
+	acknowledgement := []byte(`{"jsonrpc":"2.0","id":"modern-listen","result":{"subscriptionId":"modern-subscription"}}`)
+	if err := o.handleUpstreamMessage(parseMessage(acknowledgement)); err != nil {
+		t.Fatalf("route modern subscriptions/listen acknowledgement: %v", err)
+	}
+	notification := []byte(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///project"}}`)
+	if err := o.handleUpstreamMessage(parseMessage(notification)); err != nil {
+		t.Fatalf("route modern subscription notification: %v", err)
+	}
+
+	if got, want := downstream.String(), string(acknowledgement)+"\n"+string(notification)+"\n"; got != want {
+		t.Fatalf("modern subscription notification delivery = %q, want %q", got, want)
+	}
+}
+
+func TestModernOwner_BackpressuresRequestScopedLogs(t *testing.T) {
+	const burst = 300
+
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	writer := &gatedWriter{started: make(chan struct{}), release: gate}
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session := NewSession(strings.NewReader(""), writer)
+	o.admissionMu.Lock()
+	o.addSessionLocked(session)
+	o.admissionMu.Unlock()
+	t.Cleanup(session.Close)
+	t.Cleanup(release)
+
+	optedInRequest := []byte(`{"jsonrpc":"2.0","id":"modern-log-backpressure","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info"}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(optedInRequest)); err != nil {
+		t.Fatalf("forward log-opted modern request: %v", err)
+	}
+	standardLog := []byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"mock-modern-server","data":"backpressure"}}`)
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- o.handleUpstreamMessage(parseMessage(standardLog)) }()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("first request-scoped log did not begin delivery")
+	}
+
+	restDone := make(chan error, 1)
+	go func() {
+		for range burst {
+			if err := o.handleUpstreamMessage(parseMessage(standardLog)); err != nil {
+				restDone <- err
+				return
+			}
+		}
+		restDone <- nil
+	}()
+	select {
+	case err := <-restDone:
+		t.Fatalf("request-scoped logs escaped downstream backpressure: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first request-scoped log delivery: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first request-scoped log did not finish after downstream release")
+	}
+	select {
+	case err := <-restDone:
+		if err != nil {
+			t.Fatalf("queued request-scoped log delivery: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request-scoped logs did not finish after downstream release")
+	}
+	if got, want := strings.Count(writer.String(), string(standardLog)), burst+1; got != want {
+		t.Fatalf("request-scoped logs delivered = %d, want %d", got, want)
+	}
+}
+
+func TestModernOwner_TracksAndCausallyRoutesProgress(t *testing.T) {
+	var upstream safeBuf
+	o := newModernWriterOwner(t, &upstream, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+
+	request := []byte(`{"jsonrpc":"2.0","id":"modern-progress","method":"tools/call","params":{"name":"modern_echo","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":"modern-progress-token"}}}`)
+	if err := o.handleDownstreamMessage(session, parseMessage(request)); err != nil {
+		t.Fatalf("forward modern progress request: %v", err)
+	}
+
+	unknown := []byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"unknown-progress-token","progress":1}}`)
+	if err := o.handleUpstreamMessage(parseMessage(unknown)); err != nil {
+		t.Fatalf("handle unknown modern progress: %v", err)
+	}
+	if waitCondition(t, 200*time.Millisecond, func() bool { return downstream.String() != "" }) {
+		t.Fatalf("unknown modern progress reached downstream: %s", downstream.String())
+	}
+
+	if got := o.ActiveProgressTokens(); got != 1 {
+		t.Fatalf("active modern progress tokens = %d, want 1", got)
+	}
+
+	known := []byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"modern-progress-token","progress":2}}`)
+	if err := o.handleUpstreamMessage(parseMessage(known)); err != nil {
+		t.Fatalf("handle known modern progress: %v", err)
+	}
+	if !waitCondition(t, time.Second, func() bool {
+		return strings.Contains(downstream.String(), string(known))
+	}) {
+		t.Fatalf("known modern progress did not reach downstream: %s", downstream.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T052: Native owner loss is process-bound
+// ---------------------------------------------------------------------------
+
+func assertModernProcessLossErrors(t *testing.T, output string, wantIDs ...string) {
+	t.Helper()
+
+	counts := make(map[string]int, len(wantIDs))
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		var response struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Error   *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
+			t.Errorf("loss response is not JSON: %v; output=%q", err, output)
+			continue
+		}
+		if response.JSONRPC != "2.0" {
+			t.Errorf("loss response jsonrpc = %q, want 2.0", response.JSONRPC)
+		}
+		if response.Error == nil || response.Error.Code != -32603 || response.Error.Message != "upstream process exited" {
+			t.Errorf("loss response error = %#v, want -32603 upstream process exited", response.Error)
+		}
+		counts[string(response.ID)]++
+	}
+	if err := scanner.Err(); err != nil {
+		t.Errorf("scan loss responses: %v", err)
+	}
+	if len(counts) != len(wantIDs) {
+		t.Errorf("loss response IDs = %v, want exactly %v", counts, wantIDs)
+	}
+	for _, id := range wantIDs {
+		if got := counts[id]; got != 1 {
+			t.Errorf("loss response count for original ID %s = %d, want 1", id, got)
+		}
+	}
+}
+
+func TestModernOwner_ProcessBoundLossClaimsNativeInflightExactlyOnce(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+	proc := &upstream.Process{}
+
+	entries := []struct {
+		requestID     string
+		progressToken string
+		logSubscribed bool
+	}{
+		{requestID: `"native-loss-string"`, progressToken: `"native-loss-progress-string"`, logSubscribed: true},
+		{requestID: `418`, progressToken: `"native-loss-progress-number"`},
+	}
+	for _, entry := range entries {
+		inflight := &InflightRequest{
+			Method:        "tools/call",
+			SessionID:     session.ID,
+			StartTime:     time.Now(),
+			logSubscribed: entry.logSubscribed,
+		}
+		inflight.process.Store(proc)
+		o.inflightTracker.Store(entry.requestID, inflight)
+		o.pendingRequests.Add(1)
+		seedProgressToken(o, session.ID, entry.requestID, entry.progressToken)
+	}
+	o.mu.Lock()
+	o.upstream = proc
+	o.mu.Unlock()
+
+	if !o.markCurrentUpstreamDead(proc) {
+		t.Fatal("exact current process loss was not claimed")
+	}
+	assertModernProcessLossErrors(t, downstream.String(), entries[0].requestID, entries[1].requestID)
+	for _, entry := range entries {
+		if _, ok := o.inflightTracker.Load(entry.requestID); ok {
+			t.Errorf("lost native request %s remained tracked", entry.requestID)
+		}
+	}
+	if got := o.PendingRequests(); got != 0 {
+		t.Errorf("pending native requests after loss = %d, want 0", got)
+	}
+	if got := o.ActiveProgressTokens(); got != 0 {
+		t.Errorf("active progress tokens after loss = %d, want 0", got)
+	}
+	o.mu.RLock()
+	progressOwners := len(o.progressOwners)
+	progressRequestIDs := len(o.progressTokenRequestID)
+	requestTokens := len(o.requestToTokens)
+	o.mu.RUnlock()
+	if progressOwners != 0 || progressRequestIDs != 0 || requestTokens != 0 {
+		t.Errorf("loss left progress routes: owners=%d requestIDs=%d requestTokens=%d", progressOwners, progressRequestIDs, requestTokens)
+	}
+
+	firstDelivery := downstream.String()
+	_ = o.markCurrentUpstreamDead(proc)
+	if got := downstream.String(); got != firstDelivery {
+		t.Errorf("second exact-process loss duplicated responses: got %q, want %q", got, firstDelivery)
+	}
+}
+
+func TestModernOwner_PublishesProcessBoundInflightBeforeWrite(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, _ := addModernOwnerSession(t, o, t.TempDir())
+	o.upstreamWriter = nil
+	proc := newModernLossProcess(t)
+	o.mu.Lock()
+	o.upstream = proc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+
+	const requestID = `"published-before-write"`
+	hookObserved := false
+	o.beforeCurrentUpstreamWrite = func(selected *upstream.Process) {
+		if selected != proc {
+			t.Fatalf("selected process = %p, want %p", selected, proc)
+		}
+		tracked, ok := o.inflightTracker.Load(requestID)
+		if !ok {
+			t.Fatal("modern inflight entry was not published before the process write")
+		}
+		inflight, ok := tracked.(*InflightRequest)
+		if !ok || inflight.process.Load() != proc {
+			t.Fatalf("published inflight process = %v, want exact selected process %p", tracked, proc)
+		}
+		if got := o.PendingRequests(); got != 1 {
+			t.Fatalf("pending requests at write boundary = %d, want 1", got)
+		}
+		hookObserved = true
+	}
+	request := parseMessage([]byte(`{"jsonrpc":"2.0","id":"published-before-write","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`))
+	if _, writeFailed, err := o.forwardModernRequestPrepared(session, request); err != nil || writeFailed {
+		t.Fatalf("forwardModernRequestPrepared = writeFailed:%v err:%v", writeFailed, err)
+	}
+	if !hookObserved {
+		t.Fatal("current-upstream write hook was not observed")
+	}
+	o.deliverInflightResponses(o.claimInflightRequests(proc))
+}
+
+func TestModernOwner_WrongGenerationCannotConsumeOrRouteInflight(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+	o.upstreamWriter = nil
+	oldProc := newModernLossProcess(t)
+	currentProc := newModernLossProcess(t)
+	o.mu.Lock()
+	o.upstream = currentProc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+
+	const requestID = `"generation-bound"`
+	inflight := &InflightRequest{Method: "subscriptions/listen", SessionID: session.ID, StartTime: time.Now(), logSubscribed: true}
+	inflight.process.Store(oldProc)
+	o.inflightTracker.Store(requestID, inflight)
+	o.pendingRequests.Store(1)
+
+	notification := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"stale"}}`))
+	if err := o.handleUpstreamMessageFrom(currentProc, notification); err != nil {
+		t.Fatalf("handle wrong-generation notification: %v", err)
+	}
+	response := parseMessage([]byte(`{"jsonrpc":"2.0","id":"generation-bound","result":{"ok":true}}`))
+	if err := o.handleUpstreamMessageFrom(currentProc, response); err != nil {
+		t.Fatalf("handle wrong-generation response: %v", err)
+	}
+	if got := downstream.String(); got != "" {
+		t.Fatalf("wrong generation delivered modern traffic: %q", got)
+	}
+	if _, ok := o.inflightTracker.Load(requestID); !ok {
+		t.Fatal("wrong generation consumed the exact old-generation inflight entry")
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("wrong generation changed pending count to %d, want 1", got)
+	}
+}
+
+func TestModernOwner_CancelTargetsOnlyCurrentProcessGeneration(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, _ := addModernOwnerSession(t, o, t.TempDir())
+	o.upstreamWriter = nil
+	oldFrames := make(chan string, 1)
+	currentFrames := make(chan string, 1)
+	oldProc := newModernLossRecordingProcess(t, oldFrames)
+	currentProc := newModernLossRecordingProcess(t, currentFrames)
+	o.mu.Lock()
+	o.upstream = currentProc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+
+	const requestID = `"cancel-generation"`
+	inflight := &InflightRequest{Method: "tools/call", SessionID: session.ID, StartTime: time.Now()}
+	inflight.process.Store(oldProc)
+	o.inflightTracker.Store(requestID, inflight)
+	cancel := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-generation","reason":"host"}}`))
+	if err := o.handleModernDownstreamMessage(session, cancel); err != nil {
+		t.Fatalf("stale-generation cancel: %v", err)
+	}
+	select {
+	case frame := <-oldFrames:
+		t.Fatalf("stale cancel reached old generation: %s", frame)
+	case frame := <-currentFrames:
+		t.Fatalf("stale cancel reached replacement generation: %s", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	currentInflight := &InflightRequest{Method: "tools/call", SessionID: session.ID, StartTime: time.Now()}
+	currentInflight.process.Store(currentProc)
+	o.inflightTracker.Store(requestID, currentInflight)
+	if err := o.handleModernDownstreamMessage(session, cancel); err != nil {
+		t.Fatalf("current-generation cancel: %v", err)
+	}
+	select {
+	case frame := <-currentFrames:
+		if !strings.Contains(frame, `"notifications/cancelled"`) {
+			t.Fatalf("current cancel frame = %s", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("current generation did not receive cancellation")
+	}
+}
+
+func TestModernOwner_RemoveSessionClearsEphemeralInflightRoutes(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, _ := addModernOwnerSession(t, o, t.TempDir())
+	const (
+		requestID = `"session-route"`
+		token     = `"session-progress"`
+	)
+	inflight := &InflightRequest{Method: "subscriptions/listen", SessionID: session.ID, StartTime: time.Now(), logSubscribed: true}
+	o.inflightTracker.Store(requestID, inflight)
+	o.pendingRequests.Store(1)
+	seedProgressToken(o, session.ID, requestID, token)
+
+	o.removeSession(session)
+	if _, ok := o.inflightTracker.Load(requestID); ok {
+		t.Fatal("disconnected modern session retained inflight subscription route")
+	}
+	if got := o.PendingRequests(); got != 0 {
+		t.Fatalf("disconnected modern session pending requests = %d, want 0", got)
+	}
+	if got := o.ActiveProgressTokens(); got != 0 {
+		t.Fatalf("disconnected modern session progress tokens = %d, want 0", got)
+	}
+	o.mu.RLock()
+	progressOwners := len(o.progressOwners)
+	progressRequestIDs := len(o.progressTokenRequestID)
+	requestTokens := len(o.requestToTokens)
+	o.mu.RUnlock()
+	if progressOwners != 0 || progressRequestIDs != 0 || requestTokens != 0 {
+		t.Fatalf("disconnected modern session retained routes: owners=%d requestIDs=%d requestTokens=%d", progressOwners, progressRequestIDs, requestTokens)
+	}
+}
+
+func newModernLossProcess(t *testing.T) *upstream.Process {
+	t.Helper()
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	})
+	t.Cleanup(func() { _ = proc.Close() })
+	return proc
+}
+
+func newModernLossRecordingProcess(t *testing.T, frames chan<- string) *upstream.Process {
+	t.Helper()
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			frames <- scanner.Text()
+		}
+		return scanner.Err()
+	})
+	t.Cleanup(func() { _ = proc.Close() })
+	return proc
+}
+
+// T058 locks the modern owner-status projection to its four safe policy facts
+// and ensures request- and route-sensitive diagnostics stay local to the
+// legacy control-plane shape.
+func TestOwnerStatusModernFactsRedactSensitiveDetails(t *testing.T) {
+	const (
+		payloadSentinel    = "payload-sentinel"
+		opaqueSentinel     = "opaque-sentinel"
+		tokenSentinel      = "token-sentinel"
+		credentialSentinel = "credential-sentinel"
+		envSentinel        = "env-sentinel"
+		routeSentinel      = "route-sentinel"
+	)
+
+	newReadyOwner := func(protocolEra era.ProtocolEra) *Owner {
+		t.Helper()
+		o, err := NewOwner(OwnerConfig{
+			IPCPath:        testIPCPath(t),
+			UpstreamWriter: io.Discard,
+			ProtocolEra:    protocolEra,
+			Logger:         testLogger(t),
+		})
+		if err != nil {
+			t.Fatalf("NewOwner(%v): %v", protocolEra, err)
+		}
+		t.Cleanup(o.Shutdown)
+		return o
+	}
+
+	seedSensitiveStatusState := func(o *Owner, session *Session) {
+		t.Helper()
+		o.mu.Lock()
+		o.initResp = []byte(`{"jsonrpc":"2.0","result":{}}`)
+		o.toolList = []byte(`{"jsonrpc":"2.0","result":{"tools":[]}}`)
+		o.promptList = []byte(`{"jsonrpc":"2.0","result":{"prompts":[]}}`)
+		o.resourceList = []byte(`{"jsonrpc":"2.0","result":{"resources":[]}}`)
+		o.mu.Unlock()
+		o.pendingRequests.Store(1)
+		o.inflightTracker.Store(`"`+routeSentinel+`"`, &InflightRequest{
+			Method:    "method-" + payloadSentinel,
+			Tool:      "tool-" + opaqueSentinel,
+			SessionID: session.ID,
+			StartTime: time.Now().Add(-time.Second),
+		})
+		o.materializationMu.Lock()
+		o.materializationBlockedErr = errors.New(strings.Join([]string{
+			"payload=" + payloadSentinel,
+			"opaque=" + opaqueSentinel,
+			"token=" + tokenSentinel,
+			"credential=" + credentialSentinel,
+			"env=" + envSentinel,
+			"route=" + routeSentinel,
+		}, " "))
+		o.materializationMu.Unlock()
+		t.Cleanup(func() {
+			o.materializationMu.Lock()
+			o.materializationBlockedErr = nil
+			o.materializationMu.Unlock()
+		})
+	}
+
+	legacy := newReadyOwner(era.EraLegacy)
+	legacySession, _ := addModernOwnerSession(t, legacy, t.TempDir())
+	seedSensitiveStatusState(legacy, legacySession)
+
+	modern := newReadyOwner(era.EraModern20260728)
+	modernSession, _ := addModernOwnerSession(t, modern, t.TempDir())
+	seedSensitiveStatusState(modern, modernSession)
+
+	legacyStatus := legacy.Status()
+	modernStatus := modern.Status()
+
+	wantFacts := map[string]string{
+		"protocol_era":     "2026-07-28",
+		"sharing_policy":   "forced-isolated",
+		"cache_policy":     "off",
+		"lifecycle_policy": "r1-quarantine",
+	}
+	for key, want := range wantFacts {
+		got, ok := modernStatus[key]
+		if !ok {
+			t.Errorf("modern Status missing policy fact %q", key)
+			continue
+		}
+		if got != want {
+			t.Errorf("modern Status[%q] = %#v, want %q", key, got, want)
+		}
+		if _, ok := got.(string); !ok {
+			t.Errorf("modern Status[%q] type = %T, want string", key, got)
+		}
+		if _, ok := legacyStatus[key]; ok {
+			t.Errorf("legacy Status unexpectedly exposes modern policy fact %q", key)
+		}
+	}
+
+	wantSharedStatus := map[string]any{
+		"session_count":      1,
+		"pending_requests":   int64(1),
+		"cached_init":        true,
+		"cached_tools":       true,
+		"cached_prompts":     true,
+		"cached_resources":   true,
+		"cache_ready":        true,
+		"upstream_live":      true,
+		"persistent_pending": false,
+	}
+	for key, want := range wantSharedStatus {
+		legacyGot, legacyOK := legacyStatus[key]
+		modernGot, modernOK := modernStatus[key]
+		if !legacyOK || legacyGot != want {
+			t.Errorf("legacy Status[%q] = %#v (present=%t), want %#v", key, legacyGot, legacyOK, want)
+		}
+		if !modernOK || modernGot != want {
+			t.Errorf("modern Status[%q] = %#v (present=%t), want %#v", key, modernGot, modernOK, want)
+		}
+		if legacyGot != modernGot {
+			t.Errorf("ready legacy/modern Status[%q] differ: legacy=%#v modern=%#v", key, legacyGot, modernGot)
+		}
+	}
+
+	sensitiveKeys := []string{"sessions", "inflight", "oldest_request_age_ms", "finalization_error"}
+	for _, key := range sensitiveKeys {
+		if _, ok := legacyStatus[key]; !ok {
+			t.Errorf("legacy Status lost existing sensitive detail key %q", key)
+		}
+		if _, ok := modernStatus[key]; ok {
+			t.Errorf("modern Status exposes sensitive detail key %q", key)
+		}
+	}
+
+	legacyJSON, err := json.Marshal(legacyStatus)
+	if err != nil {
+		t.Fatalf("marshal legacy Status: %v", err)
+	}
+	modernJSON, err := json.Marshal(modernStatus)
+	if err != nil {
+		t.Fatalf("marshal modern Status: %v", err)
+	}
+	for _, sentinel := range []string{
+		payloadSentinel,
+		opaqueSentinel,
+		tokenSentinel,
+		credentialSentinel,
+		envSentinel,
+		routeSentinel,
+	} {
+		if !strings.Contains(string(legacyJSON), sentinel) {
+			t.Errorf("legacy serialized Status lost sentinel %q", sentinel)
+		}
+		if strings.Contains(string(modernJSON), sentinel) {
+			t.Errorf("modern serialized Status leaked sentinel %q: %s", sentinel, modernJSON)
+		}
+	}
+
+	allowedModernOnly := map[string]bool{
+		"protocol_era":          true,
+		"sharing_policy":        true,
+		"cache_policy":          true,
+		"lifecycle_policy":      true,
+		"auto_classification":   true,
+		"classification_source": true,
+		"classification_reason": true,
+	}
+	for key := range modernStatus {
+		if _, existsInLegacy := legacyStatus[key]; !existsInLegacy && !allowedModernOnly[key] {
+			t.Errorf("modern Status added uncontracted key %q", key)
+		}
+	}
+	for _, key := range []string{
+		"registry", "registry_descriptor", "topology", "topology_descriptor",
+		"owner_taxonomy", "taxonomy", "owner_type", "owner_kind",
+		"owner_count", "modern_owner_count", "status_counter",
+		"logging", "log_level", "status_log",
+	} {
+		if _, ok := modernStatus[key]; ok {
+			t.Errorf("modern Status exposes forbidden registry/topology/taxonomy/counter/logging key %q", key)
+		}
 	}
 }

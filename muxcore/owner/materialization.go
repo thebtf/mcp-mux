@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/listchanged"
@@ -101,6 +102,7 @@ func newMaterializationSignals() *materializationSignals {
 type materializationAttempt struct {
 	generation            uint64
 	trigger               MaterializationTrigger
+	protocolEra           era.ProtocolEra
 	launch                LaunchContext
 	launchFrozen          bool
 	launchRequiresSession bool
@@ -278,6 +280,7 @@ func (o *Owner) startMaterializationLocked(trigger MaterializationTrigger) (*mat
 
 	o.materializationGeneration++
 	a := newMaterializationAttempt(o.materializationGeneration, trigger)
+	a.protocolEra = o.protocolEra
 	a.launch = o.electLaunchContextLocked()
 	for _, demand := range o.pendingDemands {
 		if demand.state == localDemandWaiting && demand.generation == 0 {
@@ -401,9 +404,20 @@ var (
 	errMaterializationCancelled        = errors.New("upstream materialization cancelled for restart")
 	errMaterializationInitiatorGone    = errors.New("materialization initiator disconnected before isolated classification commit")
 	errMaterializationContextReelected = errors.New("fresh isolated classification requires retained-session rematerialization")
+	errMaterializationEraChanged       = errors.New("materialization protocol era changed")
 )
 
+func (o *Owner) materializationEraMatches(a *materializationAttempt) bool {
+	return a != nil && a.protocolEra == o.protocolEra
+}
+
 func (o *Owner) runMaterialization(a *materializationAttempt) {
+	if !o.materializationEraMatches(a) {
+		a.signalStarted(errMaterializationEraChanged)
+		o.finishMaterializationFailure(a, errMaterializationEraChanged)
+		return
+	}
+
 	wait := materializationRetryInitial
 	attemptNumber := 0
 
@@ -451,11 +465,32 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			}
 			a.launchFrozen = true
 		}
+		if !o.materializationEraMatches(a) {
+			o.materializationMu.Unlock()
+			o.launchContextMu.Unlock()
+			a.signalStarted(errMaterializationEraChanged)
+			o.finishMaterializationFailure(a, errMaterializationEraChanged)
+			return
+		}
 		launch := LaunchContext{SessionID: a.launch.SessionID, Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
 		o.materializationMu.Unlock()
 
 		proc, err := o.spawnReplacementUpstream(launch)
 		o.launchContextMu.Unlock()
+		if !o.materializationEraMatches(a) {
+			driftErr := error(errMaterializationEraChanged)
+			if err != nil {
+				driftErr = errors.Join(driftErr, err)
+			}
+			if proc != nil {
+				if retireErr := o.retireFailedMaterializationStart(a, proc); retireErr != nil {
+					driftErr = errors.Join(driftErr, retireErr)
+				}
+			}
+			a.signalStarted(driftErr)
+			o.finishMaterializationFailure(a, driftErr)
+			return
+		}
 		if err != nil {
 			o.logger.Printf("upstream materialization start failed generation=%d attempt=%d trigger=%s err=%v", a.generation, attemptNumber, a.trigger, err)
 			if proc != nil {
@@ -500,7 +535,9 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 
 		go o.readUpstream(proc)
 		go o.monitorUpstreamExit(proc)
-		if err := o.sendProactiveInitFor(a, signals); err != nil {
+		if a.protocolEra == era.EraModern20260728 {
+			signals.signalDiscoveryReady()
+		} else if err := o.sendProactiveInitFor(a, signals); err != nil {
 			signals.signalFailure(err)
 		}
 
@@ -624,7 +661,11 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 	o.materializationMu.Lock()
 	a.process = proc
 	a.signals = signals
-	o.cacheStage = &cacheStage{generation: a.generation, process: proc, signals: signals}
+	if a.protocolEra == era.EraModern20260728 {
+		o.cacheStage = nil
+	} else {
+		o.cacheStage = &cacheStage{generation: a.generation, process: proc, signals: signals}
+	}
 	o.mu.Lock()
 	o.upstream = proc
 	o.upstreamDead.Store(false)
@@ -741,10 +782,15 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 			o.mu.RLock()
 			current := o.upstream
 			o.mu.RUnlock()
-			live := state == MaterializationMaterializing && retiring == nil && current == a.process && !o.upstreamDead.Load()
+			eraMatches := o.materializationEraMatches(a)
+			live := state == MaterializationMaterializing && retiring == nil && current == a.process && !o.upstreamDead.Load() && eraMatches
 			if !live {
 				if readyErr == nil {
-					readyErr = errors.New("materialization generation lost process authority before ready")
+					if !eraMatches {
+						readyErr = errMaterializationEraChanged
+					} else {
+						readyErr = errors.New("materialization generation lost process authority before ready")
+					}
 				}
 				if retryTrigger == "" {
 					retryTrigger = MaterializationTriggerUpstreamExit
@@ -754,7 +800,7 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 					o.retireReadyProcess(a.process, retryTrigger)
 				}
 				o.finishMaterializationFailure(a, readyErr)
-				if o.shouldRetryMaterialization(retryTrigger) {
+				if !errors.Is(readyErr, errMaterializationEraChanged) && o.shouldRetryMaterialization(retryTrigger) {
 					o.startMaterialization(retryTrigger)
 				}
 				return
@@ -764,6 +810,13 @@ func (o *Owner) finishMaterializationSuccess(a *materializationAttempt) {
 			o.materializationTrigger = a.trigger
 			o.restartResumeTrigger = ""
 			o.materializationMu.Unlock()
+			if a.protocolEra == era.EraModern20260728 {
+				o.initReadyOnce.Do(func() {
+					if o.initReady != nil {
+						close(o.initReady)
+					}
+				})
+			}
 			a.finish(nil)
 			o.logger.Printf("upstream materialization ready generation=%d trigger=%s", a.generation, a.trigger)
 			return
@@ -795,7 +848,9 @@ func (o *Owner) finishMaterializationFailure(a *materializationAttempt, err erro
 	o.materializationMu.Unlock()
 	a.finish(err)
 	o.writeFailedLocalDemands(demands, err)
-	o.resumeMaterializationAfterRestartPin()
+	if !errors.Is(err, errMaterializationEraChanged) {
+		o.resumeMaterializationAfterRestartPin()
+	}
 }
 
 func (o *Owner) clearProactiveTracking() {
@@ -831,6 +886,10 @@ func (o *Owner) acceptsProcessEvent(proc *upstream.Process) bool {
 }
 
 func (o *Owner) sendProactiveInitFor(a *materializationAttempt, signals *materializationSignals) error {
+	if a.protocolEra == era.EraModern20260728 {
+		signals.signalDiscoveryReady()
+		return nil
+	}
 	proc := a.process
 	if proc == nil {
 		return errors.New("upstream process unavailable")
@@ -881,6 +940,9 @@ func (o *Owner) sendProactiveInitFor(a *materializationAttempt, signals *materia
 }
 
 func (o *Owner) cacheResponseFrom(proc *upstream.Process, method string, raw []byte) {
+	if o.isModern() {
+		return
+	}
 	if proc == nil {
 		o.cacheResponse(method, raw)
 		return
@@ -897,6 +959,9 @@ func (o *Owner) cacheResponseFrom(proc *upstream.Process, method string, raw []b
 // lease held. It avoids recursively acquiring RWMutex.RLock from the message
 // handler, which would deadlock behind a queued writer.
 func (o *Owner) cacheResponseFromLocked(proc *upstream.Process, method string, raw []byte) {
+	if o.isModern() {
+		return
+	}
 	// Active materialization stages are generation-fenced by attempt/process CAS.
 	if proc != nil && o.stageMaterializationCacheResponse(proc, method, raw) {
 		return
@@ -907,6 +972,9 @@ func (o *Owner) cacheResponseFromLocked(proc *upstream.Process, method string, r
 }
 
 func (o *Owner) stageMaterializationListChanged(proc *upstream.Process, method string) bool {
+	if o.isModern() {
+		return false
+	}
 	switch method {
 	case "notifications/tools/list_changed", "notifications/prompts/list_changed", "notifications/resources/list_changed":
 	default:
@@ -924,6 +992,9 @@ func (o *Owner) stageMaterializationListChanged(proc *upstream.Process, method s
 }
 
 func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method string, raw []byte) bool {
+	if o.isModern() {
+		return false
+	}
 	switch method {
 	case "initialize", "tools/list", "prompts/list", "resources/list", "resources/templates/list":
 	default:
@@ -987,6 +1058,9 @@ func (o *Owner) stageMaterializationCacheResponse(proc *upstream.Process, method
 }
 
 func (o *Owner) commitMaterializationCache(a *materializationAttempt) {
+	if o.isModern() {
+		return
+	}
 	o.materializationMu.Lock()
 	if o.materializationAttempt != a || o.cacheStage == nil || o.cacheStage.generation != a.generation {
 		o.materializationMu.Unlock()
@@ -1437,6 +1511,9 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	if demand.message.Method == "initialize" && !o.initFingerprintMatches(demand.message.Raw) {
 		cached = nil
 	}
+	if o.isModern() {
+		cached = nil
+	}
 	o.materializationMu.Unlock()
 
 	if cached != nil {
@@ -1514,6 +1591,9 @@ func (o *Owner) forwardRequestNow(s *Session, msg *jsonrpc.Message) error {
 }
 
 func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
+	if o.isModern() {
+		return o.forwardModernRequestPrepared(s, msg)
+	}
 	o.pendingRequests.Add(1)
 	newID := remap.Remap(s.ID, msg.ID)
 	remapped, err := jsonrpc.ReplaceID(msg.Raw, newID)
@@ -1581,6 +1661,52 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 		return usedProc, true, nil
 	}
 	return usedProc, false, nil
+}
+
+func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
+	inflight := &InflightRequest{
+		Method:        msg.Method,
+		Tool:          extractToolName(msg.Raw),
+		SessionID:     s.ID,
+		StartTime:     time.Now(),
+		logSubscribed: modernLogSubscribed(msg.Raw),
+	}
+	key := string(msg.ID)
+	published := false
+	usedProc, writeErr := o.writeUpstreamFromCurrent(msg.Raw, func(proc *upstream.Process) {
+		inflight.process.Store(proc)
+		o.pendingRequests.Add(1)
+		o.inflightTracker.Store(key, inflight)
+		o.trackProgressToken(s.ID, key, msg.Raw)
+		published = true
+	})
+	if writeErr == nil {
+		return usedProc, false, nil
+	}
+
+	o.logger.Printf("session %d: native upstream write failed for request id=%s: %v", s.ID, key, writeErr)
+	if published && o.claimModernInflight(key, inflight, nil) {
+		o.clearModernInflightState(key)
+	}
+	_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+	return usedProc, true, nil
+}
+
+func modernLogSubscribed(raw []byte) bool {
+	var request struct {
+		Params struct {
+			Meta map[string]json.RawMessage `json:"_meta"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return false
+	}
+	rawLevel, ok := request.Params.Meta["io.modelcontextprotocol/logLevel"]
+	if !ok {
+		return false
+	}
+	var level string
+	return json.Unmarshal(rawLevel, &level) == nil && level != "" && level != "off"
 }
 
 func (o *Owner) ensureUpstreamReadyForRequest() error {
@@ -1672,7 +1798,7 @@ func (o *Owner) monitorMaterializedProcessExit(proc *upstream.Process) {
 		default:
 		}
 		o.mu.Unlock()
-		responses := o.claimInflightRequests()
+		responses := o.claimInflightRequests(proc)
 		o.materializationMu.Unlock()
 		o.upstreamEventMu.Unlock()
 		o.deliverInflightResponses(responses)
@@ -1716,7 +1842,7 @@ func (o *Owner) retireReadyProcess(proc *upstream.Process, trigger Materializati
 	o.retiringProcess = proc
 	o.materializationState = MaterializationFinalizing
 	o.materializationTrigger = trigger
-	responses := o.claimInflightRequests()
+	responses := o.claimInflightRequests(proc)
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)
@@ -1782,7 +1908,7 @@ func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger Material
 	if o.cacheStage != nil && o.cacheStage.process == proc {
 		o.cacheStage = nil
 	}
-	responses := o.claimInflightRequests()
+	responses := o.claimInflightRequests(proc)
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)

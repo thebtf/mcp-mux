@@ -1,12 +1,16 @@
 param(
     [string]$Launcher = $env:MCP_LAUNCHER,
-    [int]$WatchSeconds = 2
+    [int]$WatchSeconds = 2,
+    [string]$RuntimeDir = $env:MCP_MUX_CURRENT_TOPOLOGY_DIR
 )
 
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$RuntimeDir = Join-Path $RepoRoot ".agent\current-topology-poc"
+if ([string]::IsNullOrWhiteSpace($RuntimeDir)) {
+    $RuntimeDir = Join-Path $RepoRoot ".agent\current-topology-poc"
+}
+$RuntimeDir = [System.IO.Path]::GetFullPath($RuntimeDir)
 $Binary = Join-Path $RuntimeDir "current-topology-poc.exe"
 $ControlSocket = Join-Path $RuntimeDir "control.sock"
 

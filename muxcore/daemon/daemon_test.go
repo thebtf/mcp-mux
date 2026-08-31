@@ -12,11 +12,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
@@ -258,6 +260,23 @@ func testReconnectOwner(t *testing.T, sid string) *owner.Owner {
 	return o
 }
 
+func testModernReconnectOwner(t *testing.T, sid string) *owner.Owner {
+	t.Helper()
+	ipcPath := shortSocketPath(t, "modern-refresh.sock")
+	o, err := owner.NewOwner(owner.OwnerConfig{
+		IPCPath:        ipcPath,
+		ServerID:       sid,
+		SessionHandler: noopSessionHandler{},
+		ProtocolEra:    era.EraModern20260728,
+		Logger:         testLogger(t),
+	})
+	if err != nil {
+		t.Fatalf("NewOwner(modern) error: %v", err)
+	}
+	t.Cleanup(func() { o.Shutdown() })
+	return o
+}
+
 func seedReconnectHistory(t *testing.T, o *owner.Owner, token, cwd string, env map[string]string) {
 	t.Helper()
 	sess := &owner.Session{ID: 1}
@@ -403,6 +422,284 @@ func TestDaemonSpawnReusesExisting(t *testing.T) {
 	}
 	if d.OwnerCount() != 1 {
 		t.Errorf("OwnerCount() = %d, want 1 (should reuse)", d.OwnerCount())
+	}
+}
+
+func TestDaemonModernSpawnForcesIsolationAndRejectsEqualLegacyReuse(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+
+	d := testDaemon(t)
+	spawn := func(label string, req control.Request) *control.Response {
+		resp, err := control.Send(d.ctlSrv.SocketPath(), req)
+		if err != nil {
+			t.Fatalf("Send %s spawn: %v", label, err)
+		}
+		if !resp.OK {
+			t.Fatalf("%s spawn not OK: %s", label, resp.Message)
+		}
+		return resp
+	}
+
+	legacy := spawn("legacy", control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	})
+	modern := spawn("modern", control.Request{
+		Cmd:         "spawn",
+		Command:     "go",
+		Args:        []string{"run", "../../testdata/mock_server.go"},
+		Mode:        "global",
+		ProtocolEra: modernProtocolEra,
+	})
+
+	if got := modern.ProtocolEra; got != modernProtocolEra {
+		t.Errorf("modern spawn response protocol era = %q, want exact %q", got, modernProtocolEra)
+	}
+	if modern.ServerID == legacy.ServerID {
+		t.Errorf("modern spawn reused legacy server ID %q for equal launch inputs", modern.ServerID)
+	}
+	if modern.IPCPath == legacy.IPCPath {
+		t.Errorf("modern spawn reused legacy IPC path %q for equal launch inputs", modern.IPCPath)
+	}
+	if got, want := d.OwnerCount(), 2; got != want {
+		t.Errorf("OwnerCount() = %d, want %d after separate legacy and modern launches", got, want)
+	}
+	entry := d.Entry(modern.ServerID)
+	if entry == nil {
+		t.Fatal("modern spawn did not retain an owner entry")
+	}
+	if got, want := entry.Mode, string(serverid.ModeIsolated); got != want {
+		t.Errorf("modern owner sharing mode = %q, want forced isolation %q", got, want)
+	}
+}
+
+// TestDaemonControlSpawnRejectsUnknownEraBeforeOwnerAdmission ensures a
+// future/invalid control-era request cannot consume a handshake token or touch
+// an existing owner's identity, session reservation, or reuse metadata.
+func TestDaemonControlSpawnRejectsUnknownEraBeforeOwnerAdmission(t *testing.T) {
+	d := testDaemon(t)
+	request := control.Request{
+		Cmd:     "spawn",
+		Command: "go",
+		Args:    []string{"run", "../../testdata/mock_server.go"},
+		Mode:    "global",
+	}
+
+	_, sid, _, err := d.Spawn(request)
+	if err != nil {
+		t.Fatalf("initial legacy Spawn() error: %v", err)
+	}
+	before := d.Entry(sid)
+	if before == nil || before.Owner == nil {
+		t.Fatal("initial legacy Spawn() did not retain an owner")
+	}
+	ownerBefore := before.Owner
+	pendingBefore := ownerBefore.SessionMgr().PendingCount()
+	lastSessionBefore := before.LastSession
+	ownerCountBefore := d.OwnerCount()
+
+	originalGenerateToken := generateTokenFunc
+	var tokenCalls atomic.Int64
+	generateTokenFunc = func() (string, error) {
+		tokenCalls.Add(1)
+		return "", errors.New("unexpected token generation for rejected era")
+	}
+	t.Cleanup(func() { generateTokenFunc = originalGenerateToken })
+
+	for _, protocolEra := range []string{"legacy", "2026-07-29"} {
+		t.Run(protocolEra, func(t *testing.T) {
+			response, sendErr := control.Send(d.ctlSrv.SocketPath(), control.Request{
+				Cmd:             request.Cmd,
+				Command:         request.Command,
+				Args:            request.Args,
+				Mode:            request.Mode,
+				ProtocolEra:     protocolEra,
+				ReconnectReason: "fallback_spawn",
+			})
+			if sendErr != nil {
+				t.Fatalf("control.Send() error: %v", sendErr)
+			}
+			if response.OK {
+				t.Fatalf("invalid protocol era response = %+v, want rejection", response)
+			}
+			if response.IPCPath != "" || response.ServerID != "" || response.Token != "" || response.ProtocolEra != "" {
+				t.Errorf("rejected response leaked spawn attachment data: %+v", response)
+			}
+			if got := tokenCalls.Load(); got != 0 {
+				t.Fatalf("rejected era generated %d handshake tokens, want 0", got)
+			}
+			if got := d.OwnerCount(); got != ownerCountBefore {
+				t.Fatalf("OwnerCount() = %d, want unchanged %d", got, ownerCountBefore)
+			}
+			after := d.Entry(sid)
+			if after == nil || after.Owner != ownerBefore {
+				t.Fatal("rejected era replaced or removed the existing owner")
+			}
+			if got := after.Owner.SessionMgr().PendingCount(); got != pendingBefore {
+				t.Errorf("owner pending reservations = %d, want unchanged %d", got, pendingBefore)
+			}
+			if !after.LastSession.Equal(lastSessionBefore) {
+				t.Errorf("owner LastSession changed from %s to %s during rejected era admission", lastSessionBefore, after.LastSession)
+			}
+			if got := d.HandleStatus()["shim_reconnect_fallback_spawned"]; got != uint64(0) {
+				t.Errorf("shim_reconnect_fallback_spawned = %v, want 0 after rejected era", got)
+			}
+		})
+	}
+}
+
+func TestDaemonModernStaleUpstreamExitPreservesReplacement(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+
+	const (
+		sid   = "native-modern-stale-upstream-exit"
+		token = "modern-stale-replacement-token"
+	)
+	stale := testModernReconnectOwner(t, sid)
+	replacement := testModernReconnectOwner(t, sid)
+	seedReconnectHistory(t, replacement, token, "/project/replacement", nil)
+	lastSession := time.Now().Add(-time.Hour)
+	entry := &OwnerEntry{
+		Owner:           replacement,
+		ServerID:        sid,
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: "modern_replacement_generation",
+		LastSession:     lastSession,
+	}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	d.onUpstreamExit(stale)
+
+	if current := d.Entry(sid); current != entry || current.Owner != replacement {
+		t.Fatalf("stale modern upstream-exit callback changed current entry: %#v", current)
+	}
+	if entry.ProtocolEra != era.EraModern20260728 || entry.OwnerGeneration != "modern_replacement_generation" || !entry.LastSession.Equal(lastSession) {
+		t.Fatalf("stale modern upstream-exit callback mutated replacement metadata: %#v", entry)
+	}
+	if _, _, _, ok := replacement.SessionMgr().LookupHistory(token); !ok {
+		t.Fatal("stale modern upstream-exit callback cleared replacement reconnect history")
+	}
+	if got := d.OwnerCount(); got != 1 {
+		t.Fatalf("OwnerCount() = %d after stale callback, want 1", got)
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("stale modern upstream-exit callback shut down daemon")
+	default:
+	}
+	if !ipc.IsAvailable(d.ctlSrv.SocketPath()) {
+		t.Fatal("stale modern upstream-exit callback closed daemon control socket")
+	}
+}
+
+func TestDaemonModernCurrentUpstreamExitRemovesOnlyCurrentOwner(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+
+	const (
+		currentSID    = "native-modern-current-upstream-exit"
+		currentToken  = "modern-current-removal-token"
+		survivorSID   = "native-modern-survivor-upstream-exit"
+		survivorToken = "modern-survivor-retained-token"
+	)
+	currentOwner := testModernReconnectOwner(t, currentSID)
+	survivorOwner := testModernReconnectOwner(t, survivorSID)
+	seedReconnectHistory(t, currentOwner, currentToken, "/project/current", nil)
+	seedReconnectHistory(t, survivorOwner, survivorToken, "/project/survivor", nil)
+	currentEntry := &OwnerEntry{
+		Owner:           currentOwner,
+		ServerID:        currentSID,
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: "modern_current_generation",
+	}
+	survivorEntry := &OwnerEntry{
+		Owner:           survivorOwner,
+		ServerID:        survivorSID,
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: "modern_survivor_generation",
+	}
+	d.mu.Lock()
+	d.owners[currentSID] = currentEntry
+	d.owners[survivorSID] = survivorEntry
+	d.mu.Unlock()
+
+	d.onUpstreamExit(currentOwner)
+
+	if current := d.Entry(currentSID); current != nil {
+		t.Fatalf("current modern owner remained after terminal upstream exit: %#v", current)
+	}
+	if current := d.Entry(survivorSID); current != survivorEntry || current.Owner != survivorOwner {
+		t.Fatalf("terminal modern upstream-exit callback changed unrelated entry: %#v", current)
+	}
+	if _, _, _, ok := currentOwner.SessionMgr().LookupHistory(currentToken); ok {
+		t.Fatal("terminal modern upstream-exit callback retained removed owner's reconnect history")
+	}
+	if _, _, _, ok := survivorOwner.SessionMgr().LookupHistory(survivorToken); !ok {
+		t.Fatal("terminal modern upstream-exit callback cleared unrelated owner's reconnect history")
+	}
+	if got := d.OwnerCount(); got != 1 {
+		t.Fatalf("OwnerCount() = %d after current callback, want 1", got)
+	}
+	assertOwnerRemovalStatus(t, d.HandleStatus(), 1, "upstream_exit", 1)
+	select {
+	case <-d.Done():
+		t.Fatal("terminal modern upstream-exit callback shut down daemon")
+	default:
+	}
+	if !ipc.IsAvailable(d.ctlSrv.SocketPath()) {
+		t.Fatal("terminal modern upstream-exit callback closed daemon control socket")
+	}
+}
+
+func TestDaemonModernPersistentUpstreamExitRetainsCurrentOwner(t *testing.T) {
+	d := testDaemon(t)
+	d.supervisor = nil
+
+	const (
+		sid   = "native-modern-persistent-upstream-exit"
+		token = "modern-persistent-retained-token"
+	)
+	o := testModernReconnectOwner(t, sid)
+	seedReconnectHistory(t, o, token, "/project/persistent", nil)
+	entry := &OwnerEntry{
+		Owner:           o,
+		ServerID:        sid,
+		ProtocolEra:     era.EraModern20260728,
+		OwnerGeneration: "modern_persistent_generation",
+		Persistent:      true,
+	}
+	d.mu.Lock()
+	d.owners[sid] = entry
+	d.mu.Unlock()
+
+	d.onUpstreamExit(o)
+
+	if current := d.Entry(sid); current != entry || current.Owner != o {
+		t.Fatalf("persistent modern owner changed after upstream exit: %#v", current)
+	}
+	if _, _, _, ok := o.SessionMgr().LookupHistory(token); !ok {
+		t.Fatal("persistent modern upstream-exit callback cleared owner-local reconnect history")
+	}
+	if got := d.OwnerCount(); got != 1 {
+		t.Fatalf("OwnerCount() = %d after persistent callback, want 1", got)
+	}
+	select {
+	case <-o.Done():
+		t.Fatal("persistent modern owner shut down instead of retaining owner-local recovery")
+	default:
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("persistent modern upstream-exit callback shut down daemon")
+	default:
+	}
+	if !ipc.IsAvailable(d.ctlSrv.SocketPath()) {
+		t.Fatal("persistent modern upstream-exit callback closed daemon control socket")
 	}
 }
 
@@ -586,6 +883,37 @@ func TestHandleRefreshSessionToken_HappyPath(t *testing.T) {
 	}
 	if sess.Env["A"] != "B" {
 		t.Fatalf("session Env[A] = %q, want %q", sess.Env["A"], "B")
+	}
+}
+
+func TestHandleRefreshSessionTokenWithProtocolEra_ValidatesExactModernOwner(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+	d := testDaemon(t)
+	sid := "owner-modern-refresh"
+	o := testModernReconnectOwner(t, sid)
+	seedReconnectHistory(t, o, "modern-prev-token", "/project/modern", nil)
+	d.mu.Lock()
+	d.owners[sid] = &OwnerEntry{Owner: o, ServerID: sid, ProtocolEra: era.EraModern20260728}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, sid)
+
+	newToken, err := d.HandleRefreshSessionTokenWithProtocolEra("modern-prev-token", modernProtocolEra)
+	if err != nil || newToken == "" || newToken == "modern-prev-token" {
+		t.Fatalf("modern refresh = (%q, %v), want fresh token", newToken, err)
+	}
+
+	legacySID := "owner-legacy-refresh"
+	legacy := testReconnectOwner(t, legacySID)
+	seedReconnectHistory(t, legacy, "legacy-prev-token", "/project/legacy", nil)
+	d.mu.Lock()
+	d.owners[legacySID] = &OwnerEntry{Owner: legacy, ServerID: legacySID, ProtocolEra: era.EraLegacy}
+	d.mu.Unlock()
+	waitOwnerAccepting(t, d, legacySID)
+	if _, err := d.HandleRefreshSessionTokenWithProtocolEra("legacy-prev-token", modernProtocolEra); !errors.Is(err, ErrProtocolEraMismatch) {
+		t.Fatalf("modern refresh against legacy owner error = %v, want %v", err, ErrProtocolEraMismatch)
+	}
+	if _, err := d.HandleRefreshSessionTokenWithProtocolEra("modern-prev-token", "unknown-era"); !errors.Is(err, ErrProtocolEraMismatch) {
+		t.Fatalf("unknown era refresh error = %v, want %v", err, ErrProtocolEraMismatch)
 	}
 }
 

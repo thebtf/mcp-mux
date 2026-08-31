@@ -25,6 +25,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
@@ -74,6 +75,10 @@ var ErrUnknownToken = errors.New("unknown token")
 // belonged to is no longer alive enough to accept a refreshed bind.
 var ErrOwnerGone = errors.New("owner gone")
 
+// ErrProtocolEraMismatch indicates that a modern refresh token does not belong
+// to an owner selected for the requested protocol era.
+var ErrProtocolEraMismatch = errors.New("protocol era mismatch")
+
 // ErrDaemonShuttingDown indicates the daemon is no longer accepting new owner
 // spawns because shutdown or graceful restart has already begun.
 var ErrDaemonShuttingDown = errors.New("daemon shutting down")
@@ -98,6 +103,7 @@ type OwnerEntry struct {
 	Args                        []string
 	Cwd                         string
 	Mode                        string
+	ProtocolEra                 era.ProtocolEra
 	Env                         map[string]string
 	Persistent                  bool
 	LastSession                 time.Time
@@ -136,6 +142,39 @@ type OwnerEntry struct {
 	removalInProgress bool
 	removalDone       chan struct{}
 	removalRetrying   bool
+}
+
+const (
+	nativeOwnerIDPrefix                   = "native-"
+	modernProtocolEraClassificationSource = "protocol-era"
+	modernProtocolEraClassificationReason = "2026-07-28"
+)
+
+func isModernOwnerID(serverID string) bool {
+	return strings.HasPrefix(serverID, nativeOwnerIDPrefix)
+}
+
+func isModernOwnerEntry(entry *OwnerEntry) bool {
+	return entry != nil && (entry.ProtocolEra == era.EraModern20260728 || isModernOwnerID(entry.ServerID))
+}
+
+func isModernSnapshotRecord(snapshot mcpsnapshot.OwnerSnapshot) bool {
+	if isModernOwnerID(snapshot.ServerID) {
+		return true
+	}
+	if snapshot.ClassificationSource != modernProtocolEraClassificationSource {
+		return false
+	}
+	for _, reason := range snapshot.ClassificationReason {
+		if reason == modernProtocolEraClassificationReason {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeLifecycleBoundaryError() *era.AdmissionError {
+	return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
 }
 
 type templateEntry struct {
@@ -1141,6 +1180,9 @@ func (d *Daemon) waitForOwnerAdmissionThaw(o *owner.Owner) error {
 // revision mismatches are separately bounded so two mismatches still reach one
 // cold/template-bypass attempt even after an earlier general retry.
 func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
+	if _, err := era.ParseProtocolEra(req.ProtocolEra); err != nil {
+		return "", "", "", fmt.Errorf("spawn: %w", err)
+	}
 	var isolatedRetry int64
 	templateMismatches := 0
 	templateBypass := false
@@ -1162,6 +1204,13 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 }
 
 func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) int64 {
+	if req == nil || entry == nil {
+		return 0
+	}
+	protocolEra, err := era.ParseProtocolEra(req.ProtocolEra)
+	if err != nil || protocolEra != era.EraLegacy || entry.ProtocolEra != era.EraLegacy || isModernOwnerEntry(entry) {
+		return 0
+	}
 	base := serverid.GenerateContextKey(serverid.ModeIsolated, entry.Command, entry.Args, nil, entry.Cwd)
 	ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(base, &atomic.Int64{})
 	n := ctr.(*atomic.Int64).Add(1)
@@ -1175,6 +1224,10 @@ func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) i
 // the mutation must persist across iterations of the Spawn retry loop.
 func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templateMismatches *int, templateBypass *bool) (string, string, string, error) {
 	req := *reqPtr
+	protocolEra, err := era.ParseProtocolEra(req.ProtocolEra)
+	if err != nil {
+		return "", "", "", fmt.Errorf("spawn: %w", err)
+	}
 	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
 	// Mode now gets the global identity (one upstream per (cmd, args)) per the
 	// spec's original "one upstream per (cmd, args), isolation as exception"
@@ -1200,6 +1253,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			req.Mode, req.Command, req.Args)
 		mode = serverid.ModeGlobal
 	}
+	if protocolEra == era.EraModern20260728 {
+		mode = serverid.ModeIsolated
+		req.Mode = string(mode)
+		reqPtr.Mode = req.Mode
+	}
 
 	// Generate handshake token upfront — valid for this spawn call only.
 	token, err := generateToken()
@@ -1223,7 +1281,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	d.mu.RUnlock()
 
 	// Server identity is based on command+args+cwd only, NOT env.
-	sid := serverid.GenerateContextKey(mode, req.Command, req.Args, nil, req.Cwd)
+	sid, err := serverid.GenerateContextKeyForEra(protocolEra, mode, req.Command, req.Args, nil, req.Cwd, token)
+	if err != nil {
+		return "", "", "", fmt.Errorf("spawn: server identity: %w", err)
+	}
 
 	// CR-002 codex PR #121 fix: when the forced-isolated retry path bumped a
 	// per-base-sid counter, append the counter as `-r<N>` so each retry
@@ -1236,7 +1297,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// non-zero counter and start at `-r<latest>`; reconnects of those sessions
 	// race-bump again. Reaper cleans orphaned -rN owners per CR-003 idle-
 	// isolated timeout.
-	if mode == serverid.ModeIsolated {
+	if protocolEra == era.EraLegacy && mode == serverid.ModeIsolated {
 		n := *isolatedRetry
 		if n == 0 {
 			if ctrI, ok := d.forcedIsolatedRetryCounters.Load(sid); ok {
@@ -1257,7 +1318,13 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	}
 
 	d.mu.Lock()
-	if mode == serverid.ModeIsolated {
+	if protocolEra == era.EraModern20260728 {
+		if _, occupied := d.owners[sid]; occupied {
+			d.mu.Unlock()
+			return "", "", "", fmt.Errorf("spawn: modern identity collision")
+		}
+	}
+	if protocolEra == era.EraLegacy && mode == serverid.ModeIsolated {
 		if _, occupied := d.owners[sid]; occupied {
 			baseSID := serverid.GenerateContextKey(serverid.ModeIsolated, req.Command, req.Args, nil, req.Cwd)
 			ctr, _ := d.forcedIsolatedRetryCounters.LoadOrStore(baseSID, &atomic.Int64{})
@@ -1272,7 +1339,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	}
 
 	// 1. Exact match (same command+args+cwd)?
-	if entry, ok := d.owners[sid]; ok {
+	if entry, ok := d.owners[sid]; ok && protocolEra == era.EraLegacy {
 		if entry.creating != nil {
 			// Another goroutine is creating this owner — wait with timeout.
 			creating := entry.creating
@@ -1495,7 +1562,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	//    (classified as shared or session-aware). Unclassified owners are NOT shared
 	//    across different CWDs — every process has exactly one CWD, so sharing an
 	//    unclassified server with a different CWD risks context leaks.
-	if mode == serverid.ModeCwd {
+	if protocolEra == era.EraLegacy && mode == serverid.ModeCwd {
 		if existing := d.findSharedOwnerLocked(req.Command, req.Args, effectiveEnv, req.Cwd); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
@@ -1528,6 +1595,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		Command:         req.Command,
 		Args:            req.Args,
 		Cwd:             req.Cwd,
+		ProtocolEra:     protocolEra,
 		OwnerGeneration: ownerGeneration,
 		RestoreSource:   "fresh",
 		creating:        make(chan struct{}),
@@ -1573,6 +1641,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		IPCPath:                     ipcPath,
 		ControlPath:                 controlPath,
 		ServerID:                    sid,
+		ProtocolEra:                 protocolEra,
 		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
 		MaterializationPolicy:       materializationPolicy,
 		DeferInitialMaterialization: true,
@@ -1591,6 +1660,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		OnCacheInvalidated:   d.invalidateOwnerTemplate,
 		Logger:               log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
 	}
+	if protocolEra == era.EraModern20260728 {
+		ownerCfg.OnCacheReady = nil
+		ownerCfg.OnCacheInvalidated = nil
+	}
 
 	// Template-backed owners stay cache-only until a cache miss, explicit
 	// persistent policy, or another owner-local materialization trigger occurs.
@@ -1599,7 +1672,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	var selectedTemplate templateMatch
 	fromTemplate := false
 	templatePersistent := false
-	if !*templateBypass {
+	if protocolEra == era.EraLegacy && !*templateBypass {
 		if match, ok := d.getCompatibleTemplate(req.Command, req.Args, req.Cwd, sessionEnv); ok {
 			tmpl := match.snapshot
 			// Adapt only instance identity. Compatibility was already decided
@@ -1643,7 +1716,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		}
 		d.logger.Printf("spawned owner %s for %s %v (cold start)", sid[:8], req.Command, req.Args)
 	}
-	if d.sessionHandler != nil {
+	if protocolEra == era.EraLegacy && d.sessionHandler != nil {
 		o.MarkClassifiedAs(classify.ModeShared)
 	}
 	if !fromTemplate && d.beforeColdOwnerPromotion != nil {
@@ -1689,7 +1762,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		return "", "", "", errSpawnRetry
 	}
 	placeholder.Owner = o
-	placeholder.Mode = req.Mode
+	placeholder.Mode = string(mode)
 	placeholder.Env = sessionEnv
 	placeholder.LastSession = time.Now()
 	placeholder.IdleTimeout = d.ownerIdleTimeout
@@ -1720,7 +1793,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
 	if !o.PreRegisterInitial(token, req.Cwd, sessionEnv) {
-		if o.IsClassifiedIsolated() {
+		if protocolEra == era.EraLegacy && o.IsClassifiedIsolated() {
 			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
 		}
 		return "", "", "", errSpawnRetry
@@ -2049,7 +2122,7 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 	d.mu.RLock()
 	entries := make([]*OwnerEntry, 0, len(d.owners))
 	for _, e := range d.owners {
-		if e.Owner != nil {
+		if e != nil && e.Owner != nil && !isModernOwnerEntry(e) {
 			entries = append(entries, e)
 		}
 	}
@@ -2080,16 +2153,16 @@ func (d *Daemon) collectHandoffUpstreams() []HandoffUpstream {
 
 func (d *Daemon) hasHandoffUpstreamOwners() bool {
 	d.mu.RLock()
-	owners := make([]*owner.Owner, 0, len(d.owners))
+	entries := make([]*OwnerEntry, 0, len(d.owners))
 	for _, e := range d.owners {
-		if e.Owner != nil {
-			owners = append(owners, e.Owner)
+		if e != nil && e.Owner != nil && !isModernOwnerEntry(e) {
+			entries = append(entries, e)
 		}
 	}
 	d.mu.RUnlock()
 
-	for _, o := range owners {
-		if o.HasHandoffUpstream() {
+	for _, entry := range entries {
+		if entry.Owner.HasHandoffUpstream() {
 			return true
 		}
 	}
@@ -2336,6 +2409,60 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 	return newToken, nil
 }
 
+// HandleRefreshSessionTokenWithProtocolEra validates a modern refresh against
+// the exact live owner before minting a replacement token.
+func (d *Daemon) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (string, error) {
+	requestedEra, err := era.ParseProtocolEra(protocolEra)
+	if err != nil || requestedEra != era.EraModern20260728 {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=protocol_era_mismatch")
+		return "", ErrProtocolEraMismatch
+	}
+	if d.shuttingDown.Load() {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=daemon_shutting_down")
+		return "", ErrDaemonShuttingDown
+	}
+	if prevToken == "" {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+		return "", ErrUnknownToken
+	}
+
+	entry, ownerKey := d.lookupReconnectOwner(prevToken)
+	if entry == nil || entry.Owner == nil {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+		return "", ErrUnknownToken
+	}
+	d.mu.RLock()
+	current, ok := d.owners[ownerKey]
+	d.mu.RUnlock()
+	if !ok || current != entry {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=owner_gone")
+		return "", ErrOwnerGone
+	}
+	if current.ProtocolEra != requestedEra {
+		d.logger.Printf("shim.reconnect.refresh_fail reason=protocol_era_mismatch")
+		return "", ErrProtocolEraMismatch
+	}
+
+	newToken, err := current.Owner.SessionMgr().RegisterReconnect(prevToken, d.ownerIsAccepting)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrUnknownToken):
+			d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
+			return "", ErrUnknownToken
+		case errors.Is(err, session.ErrOwnerGone):
+			d.logger.Printf("shim.reconnect.refresh_fail reason=owner_gone")
+			return "", ErrOwnerGone
+		default:
+			d.logger.Printf("shim.reconnect.refresh_fail reason=internal")
+			return "", err
+		}
+	}
+
+	d.reconnectRefreshed.Add(1)
+	d.logger.Printf("shim.reconnect.refresh_ok owner=%s", shortServerID(ownerKey))
+	return newToken, nil
+}
+
 // HandleCanSuspend verifies owner-wide safety before a shim intentionally
 // releases its data-plane session.
 func (d *Daemon) HandleCanSuspend(prevToken string) (control.SuspendCheckResponse, error) {
@@ -2423,14 +2550,16 @@ func (d *Daemon) HandleStatus() map[string]any {
 		s := view.owner.Status()
 		s["server_id"] = view.serverID
 		s["persistent"] = view.persistent
-		s["owner_generation"] = view.ownerGeneration
-		if view.restoredFromOwnerGeneration != "" {
-			s["restored_from_owner_generation"] = view.restoredFromOwnerGeneration
-		}
-		if view.restoreSource != "" {
-			s["restore_source"] = view.restoreSource
-		} else {
-			s["restore_source"] = "fresh"
+		if protocolEra, _ := s["protocol_era"].(string); protocolEra != "2026-07-28" {
+			s["owner_generation"] = view.ownerGeneration
+			if view.restoredFromOwnerGeneration != "" {
+				s["restored_from_owner_generation"] = view.restoredFromOwnerGeneration
+			}
+			if view.restoreSource != "" {
+				s["restore_source"] = view.restoreSource
+			} else {
+				s["restore_source"] = "fresh"
+			}
 		}
 		s["last_session"] = view.lastSession.Format(time.RFC3339)
 		effectiveIdleTimeout := view.idleTimeout
@@ -2547,6 +2676,10 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 		cachedTools, _ := s["cached_tools"].(bool)
 		cachedPrompts, _ := s["cached_prompts"].(bool)
 		cachedResources, _ := s["cached_resources"].(bool)
+		protocolEra, _ := s["protocol_era"].(string)
+		sharingPolicy, _ := s["sharing_policy"].(string)
+		cachePolicy, _ := s["cache_policy"].(string)
+		lifecyclePolicy, _ := s["lifecycle_policy"].(string)
 		owners = append(owners, control.OwnerInfo{
 			ServerID:             view.serverID,
 			EngineName:           d.name,
@@ -2566,6 +2699,10 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 			CachedTools:          cachedTools,
 			CachedPrompts:        cachedPrompts,
 			CachedResources:      cachedResources,
+			ProtocolEra:          protocolEra,
+			SharingPolicy:        sharingPolicy,
+			CachePolicy:          cachePolicy,
+			LifecyclePolicy:      lifecyclePolicy,
 		})
 	}
 	return control.ListOwnersResponse{Owners: owners, Truncated: truncated}, nil

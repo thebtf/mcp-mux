@@ -7,12 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/owner"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 )
 
@@ -748,5 +751,354 @@ func TestNewRestartActivationFailureRewritesRecoverySnapshot(t *testing.T) {
 	}
 	if _, leaked := recovered.Owners[0].Env["MCPMUX_TEST_SUCCESSOR_ONLY_ENV"]; leaked {
 		t.Fatal("rewritten recovery snapshot captured successor-only environment")
+	}
+}
+
+func assertSnapshotSchemaRemainsEraLess(t *testing.T) {
+	t.Helper()
+	if got := mcpsnapshot.SnapshotVersion; got != 2 {
+		t.Fatalf("SnapshotVersion = %d, want unchanged 2", got)
+	}
+	for _, typ := range []reflect.Type{
+		reflect.TypeOf(mcpsnapshot.DaemonSnapshot{}),
+		reflect.TypeOf(mcpsnapshot.OwnerSnapshot{}),
+		reflect.TypeOf(mcpsnapshot.SessionSnapshot{}),
+	} {
+		if _, found := typ.FieldByName("ProtocolEra"); found {
+			t.Fatalf("%s unexpectedly grew ProtocolEra; snapshot schema must remain era-less", typ.Name())
+		}
+	}
+}
+
+func assertSnapshotWireRemainsEraLess(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile snapshot: %v", err)
+	}
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
+		t.Fatalf("Unmarshal snapshot header: %v", err)
+	}
+	if header.Version != mcpsnapshot.SnapshotVersion {
+		t.Fatalf("snapshot version = %d, want %d", header.Version, mcpsnapshot.SnapshotVersion)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatalf("Unmarshal snapshot envelope: %v", err)
+	}
+	if _, found := envelope["protocol_era"]; found {
+		t.Fatal("snapshot envelope unexpectedly carries protocol_era")
+	}
+	var owners []map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["owners"], &owners); err != nil {
+		t.Fatalf("Unmarshal snapshot owners: %v", err)
+	}
+	for _, ownerWire := range owners {
+		if _, found := ownerWire["protocol_era"]; found {
+			t.Fatal("snapshot owner unexpectedly carries protocol_era")
+		}
+	}
+}
+
+func modernSnapshotFixture(t *testing.T, command string) mcpsnapshot.OwnerSnapshot {
+	t.Helper()
+	now := time.Now().UTC()
+	snap := daemonMaterializationSnapshot(false)
+	snap.ServerID = "native-0123456789abcdef"
+	snap.Command = command
+	snap.Args = []string{"--modern-snapshot"}
+	snap.Cwd = t.TempDir()
+	snap.Mode = "isolated"
+	snap.Classification = classify.ModeIsolated
+	snap.ClassificationSource = "protocol-era"
+	snap.ClassificationReason = []string{"2026-07-28"}
+	snap.CachedPrompts = snap.CachedTools
+	snap.CachedResources = snap.CachedTools
+	snap.CachedResourceTemplates = snap.CachedTools
+	snap.BoundTokens = []mcpsnapshot.BoundTokenSnapshot{{
+		Token:    "modern-snapshot-token",
+		OwnerKey: snap.ServerID,
+		Cwd:      snap.Cwd,
+		Env:      map[string]string{"MODERN_SNAPSHOT_MARKER": "1"},
+		BoundAt:  now,
+		LastUsed: now,
+	}}
+	return snap
+}
+
+func TestSnapshotModernSerializeExcludesLiveOwnerState(t *testing.T) {
+	assertSnapshotSchemaRemainsEraLess(t)
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+
+	d := testDaemon(t)
+	legacy := daemonMaterializationSnapshot(false)
+	legacy.ServerID = "legacy-live-snapshot"
+	legacy.Command = "legacy-live-snapshot-command"
+	legacy.Cwd = t.TempDir()
+	legacy.Mode = "global"
+	legacyEntry, _, err := d.restoreSnapshotPlan(d.makeSnapshotRestorePlan(legacy), nil, "snapshot_fallback", false, true)
+	if err != nil {
+		t.Fatalf("restore legacy snapshot: %v", err)
+	}
+
+	modernCwd := "."
+	_, modernServerID, _, err := d.Spawn(control.Request{
+		Cmd:         "spawn",
+		Command:     "go",
+		Args:        []string{"run", "../../testdata/mock_server.go"},
+		Cwd:         modernCwd,
+		Mode:        "global",
+		ProtocolEra: "2026-07-28",
+	})
+	if err != nil {
+		t.Fatalf("spawn live modern owner: %v", err)
+	}
+	modernEntry := d.Entry(modernServerID)
+	if modernEntry == nil || modernEntry.Owner == nil {
+		t.Fatal("spawned modern owner is missing")
+	}
+	sessionReader, sessionWriter := io.Pipe()
+	t.Cleanup(func() { _ = sessionWriter.Close() })
+	liveSession := owner.NewSession(sessionReader, io.Discard)
+	liveSession.MuxSessionID = "modern-live-session"
+	liveSession.Cwd = modernCwd
+	modernEntry.Owner.AddSession(liveSession)
+	seedReconnectHistory(t, modernEntry.Owner, "modern-live-token", modernCwd, map[string]string{"MODERN_LIVE_MARKER": "1"})
+
+	modernState, modernSessions := modernEntry.Owner.ExportSnapshotState()
+	if len(modernState.BoundTokens) == 0 {
+		t.Fatal("modern fixture reconnect-token marker is missing")
+	}
+	if len(modernSessions) != 1 || modernSessions[0].MuxSessionID != "modern-live-session" {
+		t.Fatalf("modern fixture sessions: count=%d first_id=%q", len(modernSessions), func() string {
+			if len(modernSessions) == 0 {
+				return ""
+			}
+			return modernSessions[0].MuxSessionID
+		}())
+	}
+
+	path, err := d.SerializeSnapshot()
+	if err != nil {
+		t.Fatalf("SerializeSnapshot: %v", err)
+	}
+	assertSnapshotWireRemainsEraLess(t, path)
+	snap, err := DeserializeSnapshot(testLogger(t))
+	if err != nil || snap == nil {
+		t.Fatalf("DeserializeSnapshot = (%v, %v)", snap, err)
+	}
+	if len(snap.Owners) != 1 {
+		t.Fatalf("serialized owner count = %d, want only cached legacy owner", len(snap.Owners))
+	}
+	if got := snap.Owners[0]; got.ServerID != legacyEntry.ServerID || got.CachedTools == "" {
+		t.Fatalf("serialized owner = %q cached_tools=%t, want cached legacy owner %q", got.ServerID, got.CachedTools != "", legacyEntry.ServerID)
+	}
+	if len(snap.Sessions) != 0 {
+		t.Fatalf("serialized session count = %d, want modern live session excluded", len(snap.Sessions))
+	}
+}
+
+func TestSnapshotModernForgedRecordRestoresOnlyLegacy(t *testing.T) {
+	assertSnapshotSchemaRemainsEraLess(t)
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+	t.Setenv(snapshotRestartEnv, "")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", "")
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "")
+
+	now := time.Now().UTC()
+	legacy := daemonMaterializationSnapshot(false)
+	legacy.ServerID = "legacy-forged-snapshot"
+	legacy.Command = "legacy-forged-snapshot-command"
+	legacy.Cwd = t.TempDir()
+	legacy.Mode = "global"
+	legacy.BoundTokens = []mcpsnapshot.BoundTokenSnapshot{{
+		Token:    "legacy-restore-token",
+		OwnerKey: legacy.ServerID,
+		Cwd:      legacy.Cwd,
+		BoundAt:  now,
+		LastUsed: now,
+	}}
+	modern := modernSnapshotFixture(t, "modern-forged-snapshot-command")
+	path, err := mcpsnapshot.Serialize(&DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: now.Format(time.RFC3339Nano),
+		Owners:    []mcpsnapshot.OwnerSnapshot{legacy, modern},
+		Sessions: []mcpsnapshot.SessionSnapshot{
+			{MuxSessionID: "legacy-forged-session", OwnerServerID: legacy.ServerID},
+			{MuxSessionID: "modern-forged-session", OwnerServerID: modern.ServerID},
+		},
+	}, testLogger(t))
+	if err != nil {
+		t.Fatalf("Serialize forged snapshot: %v", err)
+	}
+	assertSnapshotWireRemainsEraLess(t, path)
+
+	d := testDaemon(t)
+	d.handlerFunc = func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	}
+	if restored := d.loadSnapshot(); restored != 1 {
+		t.Fatalf("loadSnapshot restored %d owners, want only legacy", restored)
+	}
+	if entry := d.Entry(legacy.ServerID); entry == nil || entry.Owner == nil {
+		t.Fatal("legacy snapshot owner was not restored")
+	}
+	if entry := d.Entry(modern.ServerID); entry != nil {
+		t.Fatalf("modern marker restored as legacy entry %q", entry.ServerID)
+	}
+	if _, ok := d.getTemplate(legacy.Command, legacy.Args); !ok {
+		t.Fatal("legacy snapshot template was not restored")
+	}
+	if _, ok := d.getTemplate(modern.Command, modern.Args); ok {
+		t.Fatal("modern marker published a template")
+	}
+	if token, err := d.HandleRefreshSessionToken("legacy-restore-token"); err != nil || token == "" {
+		t.Fatalf("legacy token restore = (%q, %v), want refreshed token", token, err)
+	}
+	if _, err := d.HandleRefreshSessionToken("modern-snapshot-token"); !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("modern marker hydrated reconnect token: %v", err)
+	}
+}
+
+func TestSnapshotModernMetadataOnlySkipsTemplateAndRetryEffects(t *testing.T) {
+	assertSnapshotSchemaRemainsEraLess(t)
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+	t.Setenv(snapshotRestartEnv, "")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", "")
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "")
+
+	legacy := daemonMaterializationSnapshot(false)
+	legacy.Command = "legacy-metadata-snapshot-command"
+	legacy.Args = []string{"--metadata"}
+	legacy.Cwd = t.TempDir()
+	legacy.Mode = "isolated"
+	legacy.Classification = classify.ModeIsolated
+	retryBase := serverid.GenerateContextKey(serverid.ModeIsolated, legacy.Command, legacy.Args, nil, legacy.Cwd)
+	legacy.ServerID = retryBase + "-r2"
+	modern := modernSnapshotFixture(t, "modern-metadata-snapshot-command")
+	path, err := mcpsnapshot.Serialize(&DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Owners:    []mcpsnapshot.OwnerSnapshot{legacy, modern},
+	}, testLogger(t))
+	if err != nil {
+		t.Fatalf("Serialize metadata snapshot: %v", err)
+	}
+	assertSnapshotWireRemainsEraLess(t, path)
+
+	d := testDaemon(t)
+	if deferred := d.loadSnapshotMetadataOnly("modern-quarantine"); deferred != 1 {
+		t.Fatalf("loadSnapshotMetadataOnly deferred %d owners, want only legacy", deferred)
+	}
+	if d.Entry(legacy.ServerID) != nil || d.Entry(modern.ServerID) != nil {
+		t.Fatal("metadata-only load restored an owner")
+	}
+	if _, ok := d.getTemplate(legacy.Command, legacy.Args); !ok {
+		t.Fatal("metadata-only load skipped the eligible legacy template")
+	}
+	if _, ok := d.getTemplate(modern.Command, modern.Args); ok {
+		t.Fatal("metadata-only load published the modern template")
+	}
+	if got := mustLoadCounter(t, d, retryBase); got != 2 {
+		t.Fatalf("eligible retry counter = %d, want 2", got)
+	}
+	counters := 0
+	d.forcedIsolatedRetryCounters.Range(func(_, _ any) bool {
+		counters++
+		return true
+	})
+	if counters != 1 {
+		t.Fatalf("metadata-only retry counters = %d, want only eligible legacy record", counters)
+	}
+}
+
+func TestSnapshotModernRestartStagingAndRecoveryRemainQuarantined(t *testing.T) {
+	assertSnapshotSchemaRemainsEraLess(t)
+	_ = os.Remove(SnapshotPath())
+	t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
+	t.Setenv(snapshotRestartEnv, "1")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", "")
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "")
+
+	legacy := daemonMaterializationSnapshot(false)
+	legacy.ServerID = "legacy-restart-snapshot"
+	legacy.Command = "legacy-restart-snapshot-command"
+	legacy.Cwd = t.TempDir()
+	legacy.Mode = "global"
+	modern := modernSnapshotFixture(t, "modern-restart-snapshot-command")
+	path, err := mcpsnapshot.Serialize(&DaemonSnapshot{
+		Version:   mcpsnapshot.SnapshotVersion,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Owners:    []mcpsnapshot.OwnerSnapshot{legacy, modern},
+		Sessions: []mcpsnapshot.SessionSnapshot{
+			{MuxSessionID: "legacy-restart-session", OwnerServerID: legacy.ServerID},
+			{MuxSessionID: "modern-restart-session", OwnerServerID: modern.ServerID},
+		},
+	}, testLogger(t))
+	if err != nil {
+		t.Fatalf("Serialize restart snapshot: %v", err)
+	}
+	assertSnapshotWireRemainsEraLess(t, path)
+
+	d := testDaemon(t)
+	d.handlerFunc = func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	}
+	if planned := d.loadSnapshot(); planned != 1 {
+		t.Fatalf("restart load planned %d owners, want only legacy", planned)
+	}
+	d.mu.RLock()
+	staged := append([]snapshotRestorePlan(nil), d.restartStaging...)
+	recovery := d.restartRecoverySnapshot
+	d.mu.RUnlock()
+	if len(staged) != 1 {
+		t.Fatalf("restart staging count = %d, want only legacy owner", len(staged))
+	}
+	if staged[0].snapshot.ServerID != legacy.ServerID {
+		t.Fatalf("staged owner = %q, want legacy owner %q", staged[0].snapshot.ServerID, legacy.ServerID)
+	}
+	if recovery == nil {
+		t.Fatal("restart recovery snapshot is nil")
+	}
+	if len(recovery.Owners) != 1 || len(recovery.Sessions) != 1 {
+		t.Fatalf("restart recovery counts = owners:%d sessions:%d, want 1/1", len(recovery.Owners), len(recovery.Sessions))
+	}
+	if recovery.Owners[0].ServerID != legacy.ServerID || recovery.Sessions[0].OwnerServerID != legacy.ServerID {
+		t.Fatalf("restart recovery owner/session IDs = %q/%q, want legacy owner %q", recovery.Owners[0].ServerID, recovery.Sessions[0].OwnerServerID, legacy.ServerID)
+	}
+	recoveryPath, err := d.rewriteRestartRecoverySnapshot()
+	if err != nil {
+		t.Fatalf("rewriteRestartRecoverySnapshot: %v", err)
+	}
+	assertSnapshotWireRemainsEraLess(t, recoveryPath)
+	rewritten, err := DeserializeSnapshot(testLogger(t))
+	if err != nil || rewritten == nil {
+		t.Fatalf("Deserialize rewritten restart recovery = (%v, %v)", rewritten != nil, err)
+	}
+	if len(rewritten.Owners) != 1 || len(rewritten.Sessions) != 1 {
+		t.Fatalf("rewritten restart recovery counts = owners:%d sessions:%d, want 1/1", len(rewritten.Owners), len(rewritten.Sessions))
+	}
+	if rewritten.Owners[0].ServerID != legacy.ServerID || rewritten.Sessions[0].OwnerServerID != legacy.ServerID {
+		t.Fatalf("rewritten recovery owner/session IDs = %q/%q, want legacy owner %q", rewritten.Owners[0].ServerID, rewritten.Sessions[0].OwnerServerID, legacy.ServerID)
+	}
+	if activated, err := d.activateRestartStaging(); err != nil || activated != 1 {
+		t.Fatalf("activateRestartStaging = (%d, %v), want only legacy activation", activated, err)
+	}
+	if entry := d.Entry(legacy.ServerID); entry == nil || entry.Owner == nil {
+		t.Fatal("legacy restart owner was not activated")
+	}
+	if entry := d.Entry(modern.ServerID); entry != nil {
+		t.Fatalf("modern marker was hydrated as restart owner %q", entry.ServerID)
+	}
+	if _, err := d.HandleRefreshSessionToken("modern-snapshot-token"); !errors.Is(err, ErrUnknownToken) {
+		t.Fatalf("modern restart marker hydrated reconnect token: %v", err)
 	}
 }

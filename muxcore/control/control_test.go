@@ -212,6 +212,7 @@ func TestSendWithTimeout(t *testing.T) {
 type mockDaemonHandler struct {
 	mockHandler
 	spawnCalled   bool
+	spawnReq      Request
 	removeCalled  bool
 	stopCalled    bool
 	refreshCalled bool
@@ -234,6 +235,7 @@ type mockDaemonHandler struct {
 }
 
 func (m *mockDaemonHandler) HandleSpawn(req Request) (string, string, string, error) {
+	m.spawnReq = req
 	m.spawnCalled = true
 	if m.spawnStarted != nil {
 		close(m.spawnStarted)
@@ -289,6 +291,19 @@ func (m *mockDaemonHandler) HandleRefreshSessionToken(prevToken string) (string,
 		return "", m.refreshErr
 	}
 	return "refreshed-token", nil
+}
+
+type modernRefreshDaemonHandler struct {
+	mockDaemonHandler
+	protocolEra string
+}
+
+func (m *modernRefreshDaemonHandler) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (string, error) {
+	m.protocolEra = protocolEra
+	if m.refreshErr != nil {
+		return "", m.refreshErr
+	}
+	return "modern-refreshed-token", nil
 }
 
 func (m *mockDaemonHandler) HandleReconnectGiveUp(reason string) error {
@@ -384,6 +399,52 @@ func TestRefreshToken(t *testing.T) {
 	}
 	if resp.Token != "refreshed-token" {
 		t.Fatalf("resp.Token = %q, want %q", resp.Token, "refreshed-token")
+	}
+}
+
+func TestRefreshTokenWithModernEraUsesOptionalHandlerAndEchoesEra(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+	path := testSocketPath(t)
+	handler := &modernRefreshDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token", ProtocolEra: modernProtocolEra})
+	if err != nil {
+		t.Fatalf("Send modern refresh-token: %v", err)
+	}
+	if !resp.OK || resp.Token != "modern-refreshed-token" || resp.ProtocolEra != modernProtocolEra {
+		t.Fatalf("modern refresh response = %+v", resp)
+	}
+	if handler.protocolEra != modernProtocolEra {
+		t.Fatalf("modern refresh era = %q, want %q", handler.protocolEra, modernProtocolEra)
+	}
+	if handler.refreshCalled {
+		t.Fatal("modern refresh fell through to legacy handler")
+	}
+}
+
+func TestRefreshTokenRejectsUnsupportedEraWithoutLegacyFallback(t *testing.T) {
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{Cmd: "refresh-token", PrevToken: "prev-token", ProtocolEra: "unknown-era"})
+	if err != nil {
+		t.Fatalf("Send unsupported refresh-token: %v", err)
+	}
+	if resp.OK {
+		t.Fatalf("unsupported era refresh succeeded: %+v", resp)
+	}
+	if handler.refreshCalled {
+		t.Fatal("unsupported era refresh fell through to legacy handler")
 	}
 }
 
@@ -533,11 +594,59 @@ func TestSpawnWithDaemonHandler(t *testing.T) {
 	if resp.ServerID != "srv-abc" {
 		t.Errorf("ServerID = %q, want %q", resp.ServerID, "srv-abc")
 	}
+	if got := handler.spawnReq.ProtocolEra; got != "" {
+		t.Errorf("legacy spawn forwarded protocol era = %q, want omitted", got)
+	}
+	if got := resp.ProtocolEra; got != "" {
+		t.Errorf("legacy spawn response protocol era = %q, want omitted", got)
+	}
+	wire, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal legacy spawn response: %v", err)
+	}
+	if bytes.Contains(wire, []byte(`"protocol_era"`)) {
+		t.Errorf("legacy spawn response wire = %s, want protocol_era omitted", wire)
+	}
 	if !handler.spawnCalled {
 		t.Error("HandleSpawn was not called")
 	}
 	if handler.rollbackSID != "" || handler.rollbackToken != "" {
 		t.Fatalf("successful spawn unexpectedly rolled back (%q, %q)", handler.rollbackSID, handler.rollbackToken)
+	}
+}
+
+func TestSpawnWithDaemonHandlerEchoesExactModernProtocolEra(t *testing.T) {
+	const modernProtocolEra = "2026-07-28"
+
+	path := testSocketPath(t)
+	handler := &mockDaemonHandler{
+		spawnIPCPath: "/tmp/modern.sock",
+		spawnSrvID:   "srv-modern",
+	}
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	defer srv.Close()
+
+	resp, err := Send(path, Request{
+		Cmd:         "spawn",
+		Command:     "myserver",
+		Args:        []string{"--flag"},
+		Mode:        "global",
+		ProtocolEra: modernProtocolEra,
+	})
+	if err != nil {
+		t.Fatalf("Send modern spawn: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("modern spawn not OK: %s", resp.Message)
+	}
+	if got := handler.spawnReq.ProtocolEra; got != modernProtocolEra {
+		t.Errorf("HandleSpawn protocol era = %q, want exact %q", got, modernProtocolEra)
+	}
+	if got := resp.ProtocolEra; got != modernProtocolEra {
+		t.Errorf("modern spawn response protocol era = %q, want exact %q", got, modernProtocolEra)
 	}
 }
 
@@ -1073,5 +1182,64 @@ func TestControlServer_ReadDeadlineFiresOnSilentClient(t *testing.T) {
 	if elapsed > deadline {
 		t.Errorf("server held connection for %v, want <= %v (clientDeadline %v + slack %v)",
 			elapsed, deadline, clientDeadline, slack)
+	}
+}
+
+func TestProtocolEraJSONCompatibility(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{
+			name:  "legacy request omits era",
+			value: Request{Cmd: "spawn"},
+			want:  `{"cmd":"spawn"}`,
+		},
+		{
+			name:  "modern request writes exact era",
+			value: Request{Cmd: "spawn", ProtocolEra: "2026-07-28"},
+			want:  `{"cmd":"spawn","protocol_era":"2026-07-28"}`,
+		},
+		{
+			name:  "legacy response omits era",
+			value: Response{OK: true},
+			want:  `{"ok":true}`,
+		},
+		{
+			name:  "modern response writes exact era",
+			value: Response{OK: true, ProtocolEra: "2026-07-28"},
+			want:  `{"ok":true,"protocol_era":"2026-07-28"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := json.Marshal(tt.value)
+			if err != nil {
+				t.Fatalf("json.Marshal(%T) error = %v", tt.value, err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("json.Marshal(%T) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProtocolEraUnknownJSONFieldsRemainTolerated(t *testing.T) {
+	var request Request
+	if err := json.Unmarshal([]byte(`{"cmd":"spawn","unknown_request_field":true}`), &request); err != nil {
+		t.Fatalf("unmarshal request with unknown field: %v", err)
+	}
+	if request.Cmd != "spawn" {
+		t.Fatalf("request command = %q, want spawn", request.Cmd)
+	}
+
+	var response Response
+	if err := json.Unmarshal([]byte(`{"ok":true,"unknown_response_field":true}`), &response); err != nil {
+		t.Fatalf("unmarshal response with unknown field: %v", err)
+	}
+	if !response.OK {
+		t.Fatal("response OK = false, want true")
 	}
 }

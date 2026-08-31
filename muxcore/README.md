@@ -15,15 +15,26 @@ consumers; muxcore is a runtime layer and downstream behavior changes matter.
 Install the current release after its tag resolves through the Go proxy:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
 ```
 
-v0.29.1 includes the v0.29.0 stable-stdio supervisor, v0.28.0 demand-driven
-materialization, and fail-closed process-retirement contracts described below,
-plus the earlier native update, registry, namespace, reconnect, idle/dormant,
-and protocol-v2 handoff behavior. It adds the public
-`supervisor.StartWithFallback` policy helper and exact-generation daemon
-registry mutation. Ordinary `engine.New` users require no source change.
+v0.30.0 adds an explicit native MCP `2026-07-28` route while retaining the
+released legacy path as the zero-value default. Existing consumers require no
+source or configuration change. A known same-era consumer opts in before
+admission with `engine.Config.ProtocolPolicy = era.PolicyModern20260728`.
+
+### v0.30.0 - explicit native MCP 2026-07-28 route
+
+R1 modern owners are forced isolated and forward the opening request unchanged
+without legacy initialization, response cache, template reuse, or replay. The
+existing process-generation and `RetirementProven` lifecycle authority remains
+authoritative; unsafe transitions preserve the exact era or quarantine the
+route rather than restoring it as legacy. Status exposes only the minimal
+redacted protocol, sharing, cache, and lifecycle policy facts.
+
+Current rollback: stop new modern admissions, retire active modern owners
+through the existing lifecycle path, then pin `muxcore/v0.29.1` or restore the
+prior product binary. Do not transfer live modern state into a legacy owner.
 
 ### v0.29.1 - fallback start policy and exact-generation registry mutation
 

@@ -196,6 +196,10 @@ func performHandoffAfterHello(ctx context.Context, conn fdConn, upstreams []Hand
 			return HandoffResult{Phase: "ready"}, fmt.Errorf("performHandoff: duplicate server_id %q", u.ServerID)
 		}
 		seen[u.ServerID] = struct{}{}
+		if isModernOwnerID(u.ServerID) {
+			preAborted = append(preAborted, u.ServerID)
+			continue
+		}
 		if u.PID <= 0 || u.StdinFD == 0 || u.StdoutFD == 0 || u.StderrFD == 0 ||
 			(schema.requiresAuthority && u.AuthorityFD == 0) ||
 			(!schema.requiresAuthority && u.AuthorityFD != 0) {
@@ -256,7 +260,9 @@ func performHandoffAfterHello(ctx context.Context, conn fdConn, upstreams []Hand
 	}
 
 	if err := conn.WriteJSON(NewDoneMsg(receipted, rejected)); err != nil {
-		return HandoffResult{Transferred: nil, Aborted: append(preAborted, rejected...), Phase: "done-send"},
+		aborted := append([]string(nil), preAborted...)
+		aborted = append(aborted, rejected...)
+		return HandoffResult{Transferred: nil, Aborted: aborted, Phase: "done-send"},
 			fmt.Errorf("performHandoff: send done: %w", err)
 	}
 
@@ -434,6 +440,9 @@ func prepareHandoffReceive(ctx context.Context, conn fdConn, token string) (rece
 	refs := make(map[string]UpstreamRef, len(ready.Upstreams))
 	order := make([]string, 0, len(ready.Upstreams))
 	for _, ref := range ready.Upstreams {
+		if isModernOwnerID(ref.ServerID) {
+			return nil, unsafeLifecycleBoundaryError()
+		}
 		if ref.ServerID == "" || ref.PID <= 0 {
 			return nil, fmt.Errorf("receiveHandoff: invalid ready upstream %+v", ref)
 		}
@@ -723,7 +732,7 @@ func writeHandoffToken(dir string) (token string, path string, err error) {
 	path = filepath.Join(dir, "mcp-mux-handoff.tok")
 	// os.WriteFile with 0600 perm. On Windows the perm is advisory;
 	// matches the existing daemon token discipline.
-	if err := os.WriteFile(path, []byte(token), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
 		return "", "", fmt.Errorf("handoff: write token to %s: %w", path, err)
 	}
 	return token, path, nil

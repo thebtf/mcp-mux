@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,7 @@ import (
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -59,6 +61,15 @@ func supervisedDaemonReconnectError(err error) error {
 		return fmt.Errorf("%w: %v", owner.ErrReconnectExit, err)
 	}
 	return err
+}
+
+func writeCLIAdmissionError(output io.Writer, err error) {
+	var admission *era.AdmissionError
+	if !errors.As(err, &admission) {
+		return
+	}
+	_, _ = output.Write(admission.JSONRPCResponse())
+	_, _ = output.Write([]byte{'\n'})
 }
 
 func main() {
@@ -102,6 +113,7 @@ func main() {
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
 	daemon := flag.Bool("daemon", false, "Run as headless owner (no stdio session, for restart)")
+	mcpProtocol := flag.String("mcp-protocol", "", "MCP protocol era (2026-07-28)")
 	flag.Parse()
 
 	args := flag.Args()
@@ -110,6 +122,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       mcp-mux stop [--drain-timeout 30s] [--force]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux status")
 		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
+		os.Exit(1)
+	}
+	protocolEra, err := era.ParseProtocolEra(*mcpProtocol)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: unsupported MCP protocol %q\n", *mcpProtocol)
+		os.Exit(1)
+	}
+	protocolWire, err := protocolEra.Wire()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: protocol era: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -153,6 +175,31 @@ func main() {
 		*daemon = true
 	}
 
+	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
+	if protocolEra == era.EraModern20260728 && (noDaemon || *daemon) {
+		fmt.Fprintln(os.Stderr, "error: --mcp-protocol=2026-07-28 requires daemon control routing")
+		os.Exit(1)
+	}
+	policy := era.PolicyLegacyOnly
+	if protocolEra == era.EraModern20260728 {
+		policy = era.PolicyModern20260728
+	}
+	selection, err := era.SelectOpening(policy, os.Stdin)
+	if err != nil {
+		writeCLIAdmissionError(os.Stdout, err)
+		fmt.Fprintf(os.Stderr, "error: modern opening admission: %v\n", err)
+		os.Exit(1)
+	}
+	clientStdin := selection.Remainder
+	if selection.Frame != nil {
+		rawOpening, available := selection.Frame.Take()
+		if !available {
+			fmt.Fprintln(os.Stderr, "error: modern opening frame unavailable")
+			os.Exit(1)
+		}
+		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), selection.Remainder)
+	}
+
 	// Get current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -194,7 +241,6 @@ func main() {
 	// daemon's spawn path can mint and pre-register that token for the shim.
 	// Connecting directly to the owner's IPC socket skips that registration and
 	// gets rejected as "invalid/missing token".
-	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
 	if !noDaemon {
 		// Consume the one-shot launcher attestation before daemon startup can
 		// delay the child beyond the bounded parent listener lifetime.
@@ -210,8 +256,11 @@ func main() {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
-			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemon(command, cmdArgs, cwd, modeStr, shimEnv, logger)
+			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonForEra(command, cmdArgs, cwd, modeStr, shimEnv, protocolWire, logger)
 			if err != nil {
+				if errors.Is(err, era.AdmissionControlEraMismatch) {
+					writeCLIAdmissionError(os.Stdout, selection.AdmissionError(era.AdmissionControlEraMismatch))
+				}
 				logger.Printf("shim startup step=daemon_spawn status=error duration=%v err=%q daemon_required=true",
 					time.Since(spawnStart), err.Error())
 				os.Exit(1)
@@ -234,7 +283,7 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", supervisedDaemonReconnectError(err)
 					}
-					newToken, err := refreshTokenViaDaemon(currentToken, logger)
+					newToken, err := refreshTokenViaDaemon(currentToken, protocolWire, logger)
 					if err != nil {
 						return "", "", err
 					}
@@ -260,7 +309,7 @@ func main() {
 							}
 							return "", "", supervisedDaemonReconnectError(err)
 						}
-						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeout(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", logger, time.Until(deadline))
+						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeoutForEra(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", protocolWire, logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())
@@ -305,10 +354,11 @@ func main() {
 
 				resilientStart := time.Now()
 				err = owner.RunResilientClient(owner.ResilientClientConfig{
-					Stdin:             os.Stdin,
+					Stdin:             clientStdin,
 					Stdout:            os.Stdout,
 					InitialIPCPath:    daemonIPC,
 					Token:             daemonToken,
+					ProtocolEra:       protocolEra,
 					RefreshToken:      refreshFn,
 					Reconnect:         reconnectFn,
 					IdleSuspendDelay:  idleDelay,
@@ -858,19 +908,56 @@ func runStatus() {
 	runStatusWithWriters(os.Stdout, os.Stderr)
 }
 
+func sanitizeModernStatus(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		if protocolEra, _ := value["protocol_era"].(string); protocolEra == "2026-07-28" {
+			delete(value, "sessions")
+			delete(value, "inflight")
+			delete(value, "oldest_request_age_ms")
+			delete(value, "finalization_error")
+			delete(value, "owner_generation")
+			delete(value, "restored_from_owner_generation")
+			delete(value, "restore_source")
+		}
+		for _, child := range value {
+			sanitizeModernStatus(child)
+		}
+	case []any:
+		for _, child := range value {
+			sanitizeModernStatus(child)
+		}
+	}
+}
+
 func runStatusWithWriters(stdout, stderr io.Writer) {
 	// Try daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
 	resp, err := queryDaemonStatusForCLI(ctlPath)
 	daemonResp, daemonErr := resp, err
-	if err == nil && resp.OK && resp.Data != nil {
-		var pretty json.RawMessage
-		if json.Valid(resp.Data) {
-			pretty = resp.Data
+	invalidSuccessfulStatus := false
+	if err == nil && resp != nil && resp.OK {
+		var status map[string]any
+		if resp.Data == nil {
+			daemonErr = fmt.Errorf("control: read response: invalid JSON: empty response")
+			invalidSuccessfulStatus = true
+		} else if err := json.Unmarshal(resp.Data, &status); err != nil {
+			daemonErr = errors.New("control: read response: invalid JSON")
+			invalidSuccessfulStatus = true
+		} else if status == nil {
+			daemonErr = fmt.Errorf("control: read response: invalid JSON: expected object")
+			invalidSuccessfulStatus = true
+		} else {
+			sanitizeModernStatus(status)
+			formatted, err := json.MarshalIndent(status, "", "  ")
+			if err != nil {
+				daemonErr = errors.New("control: read response: invalid JSON")
+				invalidSuccessfulStatus = true
+			} else {
+				fmt.Fprintln(stdout, string(formatted))
+				return
+			}
 		}
-		formatted, _ := json.MarshalIndent(pretty, "", "  ")
-		fmt.Fprintln(stdout, string(formatted))
-		return
 	}
 	if os.Getenv("MCPMUX_STATUS_TRACE") == "1" {
 		if err != nil {
@@ -880,6 +967,10 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 		} else {
 			fmt.Fprintf(stderr, "mcp-mux status trace: daemon_status path=%q ok=%v message=%q data_len=%d\n", ctlPath, resp.OK, resp.Message, len(resp.Data))
 		}
+	}
+	if invalidSuccessfulStatus {
+		printStatusUnknown(stdout, daemonResp, daemonErr)
+		return
 	}
 
 	// Fallback: legacy per-server scan
@@ -917,7 +1008,8 @@ func runStatusWithWriters(stdout, stderr io.Writer) {
 
 		if resp.OK && resp.Data != nil {
 			var data map[string]any
-			if err := json.Unmarshal(resp.Data, &data); err == nil {
+			if err := json.Unmarshal(resp.Data, &data); err == nil && data != nil {
+				sanitizeModernStatus(data)
 				data["server_id"] = id
 				enriched, _ := json.Marshal(data)
 				results = append(results, enriched)

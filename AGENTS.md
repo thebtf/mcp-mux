@@ -40,6 +40,54 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 - **Shared** (default): One upstream serves all clients
 - **Isolated** (`--isolated`): Each client gets its own upstream
 
+
+## MCP 2026-07-28 R1 native boundary
+
+R1 is an additive opt-in for a known MCP `2026-07-28` host and a same-era upstream. It preserves the existing legacy default, legacy identity, and legacy route. It is not protocol negotiation or a legacy-to-modern bridge.
+
+### Select the protocol era before owner election
+
+- CLI callers select R1 with `--mcp-protocol=2026-07-28`.
+- Library callers set `engine.Config.ProtocolPolicy` to `era.PolicyModern20260728`.
+- The zero value, `era.PolicyLegacyOnly`, keeps existing legacy ingress.
+- `MCP_MUX_ISOLATED`, `--isolated`, `MCP_MUX_STATELESS`, `--stateless`, and `x-mux.sharing` remain sharing inputs. They never select an MCP protocol era.
+- `clientInfo`, discovery responses, upstream names, and failed modern attempts also never select an era.
+
+The selected `era.ProtocolEra` travels through `control.Request.ProtocolEra`, `control.Response.ProtocolEra`, `owner.OwnerConfig.ProtocolEra`, and `owner.ResilientClientConfig.ProtocolEra`. Modern admission requires an exact `2026-07-28` control echo before attachment. The opening frame is one newline-delimited JSON-RPC request with `params._meta.io.modelcontextprotocol/protocolVersion` set to `2026-07-28` and an object-valued `params._meta.io.modelcontextprotocol/clientCapabilities`. `io.modelcontextprotocol/clientInfo` is optional, but valid string `name` and `version` values are required when it is present. The same frame reaches the same-era upstream unchanged. `server/discover` is valid when the host sends it; mcp-mux never generates it.
+
+### Keep modern traffic native and isolated
+
+R1 forces one downstream recipient per modern owner. Its `sharing_policy` is `forced-isolated`, regardless of command, arguments, CWD, environment, historical sharing flags, or an existing legacy owner. A modern route never falls back to, attaches to, or reuses a legacy owner.
+
+Do not add legacy bootstrap or recovery behavior to this route. A modern owner sends no mux-generated `initialize`, `notifications/initialized`, roots/list, list-change, cache, template, or replay traffic. It does not use response caching, template reuse, cache invalidation, or reconnect replay. A modern upstream JSON-RPC request is contained rather than forwarded to the host. After request opt-in with `io.modelcontextprotocol/logLevel`, a valid request-scoped standard log reaches the sole recipient once. mcp-mux never synthesizes or broadcasts that log.
+
+### Preserve owner and process authority
+
+R1 retains the existing daemon, owner, `OwnerGeneration`, exact-current-process, in-flight, stale-event, bounded-retry, reaper, and zero-session gates. It does not add a modern daemon, reaper, spawn lock, replay loop, or cleanup authority. `upstream.Process.RetirementProven()` remains the gate before an owner retires process-tree authority or a replacement can proceed. When retirement proof is unavailable, retain the exact owner as authoritative and follow the existing finalization retry path. Do not delete it or start a competing or legacy replacement.
+
+### Apply lifecycle quarantine
+
+Current snapshot and handoff payloads are era-less. Exclude modern owners from those payloads instead of adding an R1 era field or schema version. A later modern launch cold-starts after fresh explicit admission or fails closed. It never restores or attaches as legacy.
+
+For reaper, zero-session removal, retry rehydration, respawn, daemon loss, upstream loss, and downstream reconnect, preserve the exact modern era or drain and remove, cold-start, or fail closed. Retry rehydration may reuse the existing bounded mechanism only when the exact modern era and policy remain present. After a loss, clear existing request, progress, and subscription state once. The host sends fresh native traffic and a new `subscriptions/listen` request when needed. No request, multi-round-trip retry, progress update, subscription, cache state, or legacy bootstrap replays.
+
+### Readback, rollback, and exclusions
+
+The exact control echo proves admission. Existing direct owner status and status/list projections that carry `control.OwnerInfo` report these policy facts for an active modern owner:
+
+```text
+protocol_era = 2026-07-28
+sharing_policy = forced-isolated
+cache_policy = off
+lifecycle_policy = r1-quarantine
+```
+
+Existing readiness fields keep their established meaning. The R1 facts never expose request payloads, opaque request state, credentials, token history, raw environment values, authorization material, cache/template data, or route identifiers.
+
+To roll back, stop callers from selecting `era.PolicyModern20260728` or `--mcp-protocol=2026-07-28`, then drain or remove existing modern owners through the existing lifecycle path. Never convert live modern work to legacy or replay unfinished work.
+
+R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
+
 ## CONVENTIONS
 
 - Investigation reports: `.agent/reports/YYYY-MM-DD-topic.md`
@@ -66,13 +114,27 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.29.x)
+## muxcore Library API (v0.30.x)
 
 ### Upgrade
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
 ```
+
+### v0.30.0 - explicit native MCP 2026-07-28 route
+
+**No required consumer code changes for ordinary existing users.** Legacy is
+still the zero-value default. A consumer opts into the new route only by setting
+`engine.Config.ProtocolPolicy` to `era.PolicyModern20260728` before admission
+for a known MCP `2026-07-28` host and same-era upstream.
+
+Modern R1 owners are forced isolated and bypass legacy bootstrap, response
+cache, template reuse, and replay. Unsafe snapshot, handoff, reaper, retry,
+respawn, loss, or reconnect transitions preserve the exact era or quarantine
+the route; they never downgrade modern work to legacy. Rollback: stop new
+modern admissions, retire active modern owners through the existing lifecycle
+authority, then pin `muxcore/v0.29.1` or restore the previous product binary.
 
 ### v0.29.1 - fallback start policy and exact-generation registry mutation
 

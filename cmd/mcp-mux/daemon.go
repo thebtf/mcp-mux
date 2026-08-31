@@ -14,6 +14,7 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/rotlog"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -377,14 +378,26 @@ func daemonExecutableForSpawn(currentExe string) string {
 // owner ID, and handshake token.
 // Emits a "daemon_rpc_spawn" log line with the total RPC duration for post-mortem latency analysis.
 func spawnViaDaemon(command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, string, error) {
-	return spawnViaDaemonWithReason(command, args, cwd, mode, env, "", logger)
+	return spawnViaDaemonForEra(command, args, cwd, mode, env, "", logger)
+}
+
+func spawnViaDaemonForEra(command string, args []string, cwd, mode string, env map[string]string, protocolEra string, logger *log.Logger) (string, string, string, error) {
+	return spawnViaDaemonWithReasonForEra(command, args, cwd, mode, env, "", protocolEra, logger)
 }
 
 func spawnViaDaemonWithReason(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, string, error) {
-	return spawnViaDaemonWithReasonTimeout(command, args, cwd, mode, env, reconnectReason, logger, defaultDaemonSpawnTimeout)
+	return spawnViaDaemonWithReasonForEra(command, args, cwd, mode, env, reconnectReason, "", logger)
+}
+
+func spawnViaDaemonWithReasonForEra(command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger) (string, string, string, error) {
+	return spawnViaDaemonWithReasonTimeoutForEra(command, args, cwd, mode, env, reconnectReason, protocolEra, logger, defaultDaemonSpawnTimeout)
 }
 
 func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
+	return spawnViaDaemonWithReasonTimeoutForEra(command, args, cwd, mode, env, reconnectReason, "", logger, timeout)
+}
+
+func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
 	if timeout <= 0 {
 		return "", "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
 	}
@@ -401,6 +414,7 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 		Mode:            mode,
 		Env:             env,
 		ReconnectReason: reconnectReason,
+		ProtocolEra:     protocolEra,
 	}, timeout)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
@@ -414,10 +428,10 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 		}
 		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
 	}
+	if protocolEra != "" && resp.ProtocolEra != protocolEra {
+		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
+	}
 
-	// Safe ID truncation: resp.ServerID may be shorter than 8 chars in edge cases
-	// (test daemons, non-hashed IDs). Matches the pattern used in
-	// muxcore/engine/engine.go and muxcore/daemon/snapshot.go.
 	shortID := resp.ServerID
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
@@ -429,13 +443,18 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 
 // refreshTokenViaDaemon asks the daemon to mint a fresh reconnect token for a
 // still-alive owner associated with prevToken.
-func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error) {
+func refreshTokenViaDaemon(prevToken, protocolEra string, logger *log.Logger) (string, error) {
+	requestedEra, parseErr := era.ParseProtocolEra(protocolEra)
+	if parseErr != nil {
+		return "", daemon.ErrProtocolEraMismatch
+	}
 	ctlPath := serverid.DaemonControlPath("", engineName)
 
 	rpcStart := time.Now()
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:       "refresh-token",
-		PrevToken: prevToken,
+		Cmd:         "refresh-token",
+		PrevToken:   prevToken,
+		ProtocolEra: protocolEra,
 	}, 5*time.Second)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
@@ -451,9 +470,14 @@ func refreshTokenViaDaemon(prevToken string, logger *log.Logger) (string, error)
 			return "", daemon.ErrUnknownToken
 		case daemon.ErrDaemonShuttingDown.Error():
 			return "", daemon.ErrDaemonShuttingDown
+		case daemon.ErrProtocolEraMismatch.Error():
+			return "", daemon.ErrProtocolEraMismatch
 		default:
 			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
 		}
+	}
+	if requestedEra == era.EraModern20260728 && resp.ProtocolEra != protocolEra {
+		return "", daemon.ErrProtocolEraMismatch
 	}
 
 	logger.Printf("daemon_rpc_refresh status=ok duration=%v", rpcDur)

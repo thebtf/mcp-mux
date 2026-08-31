@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
@@ -190,6 +191,9 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		return Response{OK: true, Data: data}, nil
 
 	case "spawn":
+		if _, err := era.ParseProtocolEra(req.ProtocolEra); err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}, nil
+		}
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
 			return Response{OK: false, Message: "spawn not supported (not a daemon)"}, nil
@@ -198,7 +202,7 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		if err != nil {
 			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}, nil
 		}
-		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID, Token: token}, nil
+		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID, Token: token, ProtocolEra: req.ProtocolEra}, nil
 
 	case "remove":
 		dh, ok := s.handler.(DaemonHandler)
@@ -247,7 +251,20 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		if !ok {
 			return Response{OK: false, Message: "refresh-token not supported (not a daemon)"}, nil
 		}
-		newToken, err := dh.HandleRefreshSessionToken(req.PrevToken)
+		requestedEra, err := era.ParseProtocolEra(req.ProtocolEra)
+		if err != nil {
+			return Response{OK: false, Message: fmt.Sprintf("refresh-token: %v", err)}, nil
+		}
+		var newToken string
+		if requestedEra == era.EraModern20260728 {
+			eh, ok := dh.(RefreshSessionTokenWithProtocolEraHandler)
+			if !ok {
+				return Response{OK: false, Message: "refresh-token modern era not supported"}, nil
+			}
+			newToken, err = eh.HandleRefreshSessionTokenWithProtocolEra(req.PrevToken, req.ProtocolEra)
+		} else {
+			newToken, err = dh.HandleRefreshSessionToken(req.PrevToken)
+		}
 		if err != nil {
 			switch {
 			case matchesControlError(err, errUnknownToken):
@@ -257,6 +274,9 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 			default:
 				return Response{OK: false, Message: err.Error()}, nil
 			}
+		}
+		if requestedEra == era.EraModern20260728 {
+			return Response{OK: true, Token: newToken, ProtocolEra: req.ProtocolEra}, nil
 		}
 		return Response{OK: true, Token: newToken}, nil
 

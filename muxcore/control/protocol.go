@@ -31,17 +31,19 @@ type Request struct {
 
 	// PrevToken is the previously consumed session token used by the daemon's
 	// "refresh-token" command to mint a fresh reconnect token for the same owner.
-	PrevToken string `json:"prev_token,omitempty"`
+	PrevToken   string `json:"prev_token,omitempty"`
+	ProtocolEra string `json:"protocol_era,omitempty"`
 }
 
 // Response is the reply to a control command.
 type Response struct {
-	OK       bool            `json:"ok"`
-	Message  string          `json:"message,omitempty"`
-	Data     json.RawMessage `json:"data,omitempty"`
-	IPCPath  string          `json:"ipc_path,omitempty"`
-	ServerID string          `json:"server_id,omitempty"`
-	Token    string          `json:"token,omitempty"` // handshake token for session binding
+	OK          bool            `json:"ok"`
+	Message     string          `json:"message,omitempty"`
+	Data        json.RawMessage `json:"data,omitempty"`
+	IPCPath     string          `json:"ipc_path,omitempty"`
+	ServerID    string          `json:"server_id,omitempty"`
+	Token       string          `json:"token,omitempty"` // handshake token for session binding
+	ProtocolEra string          `json:"protocol_era,omitempty"`
 }
 
 // CommandHandler is implemented by the Owner to handle control commands.
@@ -70,6 +72,10 @@ type OwnerInfo struct {
 	CachedTools          bool     `json:"cached_tools,omitempty"`
 	CachedPrompts        bool     `json:"cached_prompts,omitempty"`
 	CachedResources      bool     `json:"cached_resources,omitempty"`
+	ProtocolEra          string   `json:"protocol_era,omitempty"`
+	SharingPolicy        string   `json:"sharing_policy,omitempty"`
+	CachePolicy          string   `json:"cache_policy,omitempty"`
+	LifecyclePolicy      string   `json:"lifecycle_policy,omitempty"`
 }
 
 // ListOwnersResponse is the response payload for the "list_owners" daemon RPC.
@@ -87,6 +93,13 @@ type DaemonHandler interface {
 	HandleRefreshSessionToken(prevToken string) (newToken string, err error)
 	HandleReconnectGiveUp(reason string) error
 	HandleListOwners(req Request) (ListOwnersResponse, error)
+}
+
+// RefreshSessionTokenWithProtocolEraHandler is an optional daemon control-plane
+// extension for modern reconnects. Legacy refresh requests continue through
+// DaemonHandler.HandleRefreshSessionToken unchanged.
+type RefreshSessionTokenWithProtocolEraHandler interface {
+	HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (newToken string, err error)
 }
 
 // SpawnResponseFailureHandler is an optional daemon-side lifecycle hook. The

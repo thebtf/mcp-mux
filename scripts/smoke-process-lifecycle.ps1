@@ -15,9 +15,29 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ParallelSessions = 8
+
+function Get-Sha256Hex {
+    param([string]$Path)
+
+    $stream = $null
+    $algorithm = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        return ([System.BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $algorithm) {
+            $algorithm.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $CandidateBinary = [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $CandidateBinary).Path)
-if (-not $IsWindows) {
+if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw "process lifecycle smoke currently requires Windows process-tree evidence"
 }
 if ($TimeoutSeconds -lt 30) {
@@ -54,7 +74,7 @@ $evidence = [ordered]@{
     fixture_advertised_idle_timeout_seconds = 20
     fixture_idle_timeout_rationale = "Measured response window ~5.1s plus two Windows metadata snapshots of 3.9-4.8s and margin; fixture-only calibration."
     run_dir = $RunDir
-    candidate_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $CandidateBinary).Hash
+    candidate_sha256 = Get-Sha256Hex -Path $CandidateBinary
     engine_v1 = ""
     engine_v2 = ""
     initial_engine_pids = @()
@@ -77,11 +97,65 @@ $evidence = [ordered]@{
     error = ""
 }
 
+function ConvertTo-WindowsCommandLineArgument {
+    param([AllowEmptyString()] [string]$Argument)
+
+    if ($null -eq $Argument -or $Argument.Length -eq 0) {
+        return '""'
+    }
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append([char]34)
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq [char]92) {
+            $backslashes++
+            continue
+        }
+        if ($character -eq [char]34) {
+            for ($index = 0; $index -lt ($backslashes * 2 + 1); $index++) {
+                [void]$builder.Append([char]92)
+            }
+            [void]$builder.Append([char]34)
+            $backslashes = 0
+            continue
+        }
+        for ($index = 0; $index -lt $backslashes; $index++) {
+            [void]$builder.Append([char]92)
+        }
+        $backslashes = 0
+        [void]$builder.Append($character)
+    }
+    for ($index = 0; $index -lt ($backslashes * 2); $index++) {
+        [void]$builder.Append([char]92)
+    }
+    [void]$builder.Append([char]34)
+    return $builder.ToString()
+}
+
+function ConvertTo-WindowsCommandLine {
+    param([string[]]$Arguments)
+
+    $rendered = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($argument in @($Arguments)) {
+        [void]$rendered.Add((ConvertTo-WindowsCommandLineArgument -Argument $argument))
+    }
+    return [string]::Join(" ", $rendered.ToArray())
+}
+
 function Set-Arguments {
     param([System.Diagnostics.ProcessStartInfo]$StartInfo, [string[]]$Arguments)
-    foreach ($argument in $Arguments) {
-        [void]$StartInfo.ArgumentList.Add($argument)
+
+    if ($null -ne $StartInfo.PSObject.Properties["ArgumentList"]) {
+        foreach ($argument in $Arguments) {
+            [void]$StartInfo.ArgumentList.Add($argument)
+        }
+        return
     }
+    $StartInfo.Arguments = ConvertTo-WindowsCommandLine -Arguments $Arguments
 }
 
 function Set-IsolatedEnvironment {
@@ -124,7 +198,7 @@ function Invoke-IsolatedProcess {
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit($TimeoutMs)) {
-        $process.Kill($true)
+        $process.Kill()
         throw "timed out running $FileName $($Arguments -join ' ')"
     }
     return [pscustomobject]@{ exit_code = $process.ExitCode; stdout = $stdout.Result; stderr = $stderr.Result }
@@ -332,7 +406,7 @@ function Get-StableProbeMetadataSet {
         $rawRows = @($rows | Sort-Object ProcessId | ForEach-Object {
             [pscustomobject]@{ pid = [int]$_.ProcessId; parent_pid = [int]$_.ParentProcessId; creation_date = [string]$_.CreationDate; executable_path = [System.IO.Path]::GetFullPath([string]$_.ExecutablePath) }
         })
-        $signature = $rawRows | ForEach-Object { "$($_.pid)|$($_.parent_pid)|$($_.creation_date)|$($_.executable_path)" } | Join-String -Separator ";"
+        $signature = (@($rawRows | ForEach-Object { "$($_.pid)|$($_.parent_pid)|$($_.creation_date)|$($_.executable_path)" }) -join ";")
         [void]$parentageSnapshots.Add([pscustomobject]@{
             phase = $Phase; attempt = $attempts; queried_utc = $queriedUtc
             elapsed_ms = [int](([DateTime]::UtcNow - $started).TotalMilliseconds)

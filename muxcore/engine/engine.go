@@ -4,10 +4,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +25,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -177,6 +180,10 @@ type Config struct {
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
 
+	// ProtocolPolicy selects the caller's protocol-era route. Its zero value
+	// preserves the released legacy ingress and daemon ordering.
+	ProtocolPolicy era.ProtocolPolicy
+
 	// OnInject forwards to owner.ResilientClientConfig.OnInject. See owner package
 	// for closure semantics. Zero value (nil) preserves pre-v0.23 behavior.
 	OnInject func(inject func([]byte) error)
@@ -276,6 +283,9 @@ type MuxEngine struct {
 // New creates a MuxEngine with the given configuration.
 // Validates config and applies defaults.
 func New(cfg Config) (*MuxEngine, error) {
+	if _, err := protocolEraForPolicy(cfg.ProtocolPolicy); err != nil {
+		return nil, err
+	}
 	if cfg.Command == "" && cfg.Handler == nil && cfg.SessionHandler == nil {
 		return nil, fmt.Errorf("engine: Command, Handler, or SessionHandler is required")
 	}
@@ -298,6 +308,17 @@ func New(cfg Config) (*MuxEngine, error) {
 		logger.Printf("engine: warning: both Handler and SessionHandler set, SessionHandler takes priority")
 	}
 	return &MuxEngine{cfg: cfg, logger: logger, ready: make(chan struct{})}, nil
+}
+
+func protocolEraForPolicy(policy era.ProtocolPolicy) (era.ProtocolEra, error) {
+	switch policy {
+	case era.PolicyLegacyOnly:
+		return era.EraLegacy, nil
+	case era.PolicyModern20260728:
+		return era.EraModern20260728, nil
+	default:
+		return era.EraLegacy, fmt.Errorf("engine: unsupported protocol policy %d", policy)
+	}
 }
 
 // isDaemonMode checks whether the current process was invoked with the daemon flag.
@@ -455,7 +476,30 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 //  3. Connect to the returned IPC socket.
 //  4. Bridge stdin/stdout ↔ IPC with automatic reconnect.
 func (e *MuxEngine) runClient(ctx context.Context) error {
+	protocolEra, err := protocolEraForPolicy(e.cfg.ProtocolPolicy)
+	if err != nil {
+		return err
+	}
+	protocolWire, err := protocolEra.Wire()
+	if err != nil {
+		return fmt.Errorf("engine client: protocol era: %w", err)
+	}
+
+	selection, err := era.SelectOpening(e.cfg.ProtocolPolicy, os.Stdin)
+	if err != nil {
+		writeEngineAdmissionError(os.Stdout, err)
+		return err
+	}
 	e.markReady(ModeClient, nil)
+
+	clientStdin := selection.Remainder
+	if selection.Frame != nil {
+		rawOpening, available := selection.Frame.Take()
+		if !available {
+			return fmt.Errorf("engine client: modern opening frame unavailable")
+		}
+		clientStdin = io.MultiReader(bytes.NewReader(rawOpening), selection.Remainder)
+	}
 
 	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 
@@ -499,8 +543,13 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	env := collectEnv()
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
-	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, e.logger)
+	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, protocolWire, e.logger)
 	if err != nil {
+		if errors.Is(err, era.AdmissionControlEraMismatch) {
+			admission := selection.AdmissionError(era.AdmissionControlEraMismatch)
+			writeEngineAdmissionError(os.Stdout, admission)
+			return admission
+		}
 		return fmt.Errorf("engine client: spawn: %w", err)
 	}
 
@@ -517,7 +566,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "refresh"); err != nil {
 			return "", "", err
 		}
-		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, e.logger)
+		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, protocolWire, e.logger)
 		if err != nil {
 			return "", "", err
 		}
@@ -532,7 +581,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "reconnect"); err != nil {
 			return "", "", err
 		}
-		newIPC, newServerID, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", e.logger)
+		newIPC, newServerID, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", protocolWire, e.logger)
 		if err != nil {
 			return "", "", err
 		}
@@ -543,10 +592,11 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	}
 
 	return runResilientClient(owner.ResilientClientConfig{
-		Stdin:            os.Stdin,
+		Stdin:            clientStdin,
 		Stdout:           os.Stdout,
 		InitialIPCPath:   ipcPath,
 		Token:            token,
+		ProtocolEra:      protocolEra,
 		OnInject:         e.cfg.OnInject,
 		RefreshToken:     refreshFn,
 		Reconnect:        reconnectFn,
@@ -561,6 +611,15 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		EnginePrefix:               e.cfg.Name,
 		Logger:                     e.logger,
 	})
+}
+
+func writeEngineAdmissionError(output io.Writer, err error) {
+	var admission *era.AdmissionError
+	if !errors.As(err, &admission) {
+		return
+	}
+	_, _ = output.Write(admission.JSONRPCResponse())
+	_, _ = output.Write([]byte{'\n'})
 }
 
 func idleSuspendDelay(cfg Config) time.Duration {
@@ -781,11 +840,11 @@ func waitForDaemon(ctlPath string, timeout time.Duration) error {
 // spawnViaDaemon sends a spawn request to the daemon and returns the IPC path
 // server identity, and handshake token for the owner that will serve our server
 // identity.
-func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, logger *log.Logger) (string, string, string, error) {
-	return spawnViaDaemonWithReason(ctlPath, command, args, cwd, mode, env, "", logger)
+func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, env map[string]string, protocolEra string, logger *log.Logger) (string, string, string, error) {
+	return spawnViaDaemonWithReason(ctlPath, command, args, cwd, mode, env, "", protocolEra, logger)
 }
 
-func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason string, logger *log.Logger) (string, string, string, error) {
+func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger) (string, string, string, error) {
 	// spawnRPCTimeout covers daemon processing + upstream process start + proactive init.
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:             "spawn",
@@ -795,12 +854,16 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 		Mode:            mode,
 		Env:             env,
 		ReconnectReason: reconnectReason,
+		ProtocolEra:     protocolEra,
 	}, spawnRPCTimeout)
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if !resp.OK {
 		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+	}
+	if protocolEra != "" && resp.ProtocolEra != protocolEra {
+		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
 	}
 
 	sid := resp.ServerID
@@ -849,10 +912,15 @@ func decodeCanSuspendResponse(resp *control.Response) (bool, string, error) {
 	return *verdict.Allowed, verdict.Reason, nil
 }
 
-func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (string, error) {
+func refreshTokenViaDaemon(ctlPath, prevToken, protocolEra string, logger *log.Logger) (string, error) {
+	requestedEra, parseErr := era.ParseProtocolEra(protocolEra)
+	if parseErr != nil {
+		return "", daemon.ErrProtocolEraMismatch
+	}
 	resp, err := control.SendWithTimeout(ctlPath, control.Request{
-		Cmd:       "refresh-token",
-		PrevToken: prevToken,
+		Cmd:         "refresh-token",
+		PrevToken:   prevToken,
+		ProtocolEra: protocolEra,
 	}, refreshRPCTimeout)
 	if err != nil {
 		return "", fmt.Errorf("refresh token via daemon: %w", err)
@@ -865,9 +933,14 @@ func refreshTokenViaDaemon(ctlPath, prevToken string, logger *log.Logger) (strin
 			return "", daemon.ErrUnknownToken
 		case daemon.ErrDaemonShuttingDown.Error():
 			return "", daemon.ErrDaemonShuttingDown
+		case daemon.ErrProtocolEraMismatch.Error():
+			return "", daemon.ErrProtocolEraMismatch
 		default:
 			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
 		}
+	}
+	if requestedEra == era.EraModern20260728 && resp.ProtocolEra != protocolEra {
+		return "", daemon.ErrProtocolEraMismatch
 	}
 	logger.Printf("engine client: refreshed reconnect token")
 	return resp.Token, nil
