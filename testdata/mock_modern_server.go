@@ -113,6 +113,9 @@ func runModernFixture(input io.Reader, output io.Writer, getenv func(string) str
 			if err := writeError(writer, request.ID, problem); err != nil {
 				return err
 			}
+			if err := writer.Flush(); err != nil {
+				return err
+			}
 			continue
 		}
 		if mode == fixtureModeLossBeforeResult {
@@ -140,6 +143,9 @@ func runModernFixture(input io.Reader, output io.Writer, getenv func(string) str
 			}
 		}
 		if err != nil {
+			return err
+		}
+		if err := writer.Flush(); err != nil {
 			return err
 		}
 		if mode == fixtureModeLossAfterResult {

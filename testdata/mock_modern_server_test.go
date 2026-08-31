@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -101,6 +103,59 @@ func TestModernOpeningCorpusAndFixtureContract(t *testing.T) {
 		}
 		sort.Strings(keys)
 		t.Errorf("fixture did not return native results for ids %s", strings.Join(keys, ", "))
+	}
+}
+
+func TestModernFixtureFlushesEachResponseBeforeInputCloses(t *testing.T) {
+	fixtureDir := modernFixtureDir(t)
+	binary := buildModernFixture(t, fixtureDir)
+	cmd := exec.Command(binary)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("fixture stdin pipe: %v", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("fixture stdout pipe: %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture: %v", err)
+	}
+	responseDone := make(chan string, 1)
+	go func() {
+		line, _ := bufio.NewReader(stdout).ReadString('\n')
+		responseDone <- line
+	}()
+
+	request := modernRequest("flush-before-eof", "tools/list", false)
+	if _, err := fmt.Fprintln(stdin, request); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case line := <-responseDone:
+		responses := decodeNDJSON(t, line)
+		if len(responses) != 1 || string(responses[0].ID) != `"flush-before-eof"` || len(responses[0].Error) != 0 {
+			t.Fatalf("flushed response = %q, want one successful response before EOF", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("modern fixture buffered its response until input EOF")
+	}
+
+	if err := stdin.Close(); err != nil {
+		t.Fatalf("close fixture stdin: %v", err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("fixture after input close: %v\nstderr:\n%s", err, stderr.String())
+		}
+	case <-time.After(time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("modern fixture did not stop after input EOF")
 	}
 }
 
