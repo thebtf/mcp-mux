@@ -1079,6 +1079,9 @@ func (o *Owner) forwardModernCancelledNotification(s *Session, msg *jsonrpc.Mess
 		return nil
 	}
 	if proc := inflight.process.Load(); proc != nil {
+		if !o.acceptsProcessEvent(proc) {
+			return nil
+		}
 		return o.writeUpstreamToProcess(proc, msg.Raw)
 	}
 	if o.upstreamWriter != nil {
@@ -1328,7 +1331,7 @@ func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
 		return false
 	}
 	o.upstreamDead.Store(true)
-	responses := o.claimInflightRequests()
+	responses := o.claimInflightRequests(proc)
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)
@@ -1421,7 +1424,7 @@ func (o *Owner) handleUpstreamMessageFrom(proc *upstream.Process, msg *jsonrpc.M
 func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jsonrpc.Message) error {
 	if msg.IsNotification() {
 		if o.isModern() {
-			return o.handleModernUpstreamNotification(msg)
+			return o.handleModernUpstreamNotification(proc, msg)
 		}
 		if proc != nil && o.stageMaterializationListChanged(proc, msg.Method) {
 			return nil
@@ -1473,7 +1476,7 @@ func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jso
 		return fmt.Errorf("unexpected message type from upstream: %s", msg.Type)
 	}
 	if o.isModern() {
-		return o.handleModernUpstreamResponse(msg)
+		return o.handleModernUpstreamResponse(proc, msg)
 	}
 	if request, claimed := o.claimProactive(string(msg.ID)); claimed {
 		o.decrementPending()
@@ -1558,16 +1561,17 @@ func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jso
 	return nil
 }
 
-func (o *Owner) handleModernUpstreamResponse(msg *jsonrpc.Message) error {
-	tracked, claimed := o.inflightTracker.LoadAndDelete(string(msg.ID))
-	if !claimed {
-		return nil
-	}
-	o.decrementPending()
-	inflight, ok := tracked.(*InflightRequest)
+func (o *Owner) handleModernUpstreamResponse(proc *upstream.Process, msg *jsonrpc.Message) error {
+	requestID := string(msg.ID)
+	tracked, ok := o.inflightTracker.Load(requestID)
 	if !ok {
 		return nil
 	}
+	inflight, ok := tracked.(*InflightRequest)
+	if !ok || !o.claimModernInflight(requestID, inflight, proc) {
+		return nil
+	}
+	o.clearModernInflightState(requestID)
 	o.mu.RLock()
 	session := o.sessions[inflight.SessionID]
 	o.mu.RUnlock()
@@ -1577,23 +1581,24 @@ func (o *Owner) handleModernUpstreamResponse(msg *jsonrpc.Message) error {
 	return session.WriteRaw(msg.Raw)
 }
 
-func (o *Owner) handleModernUpstreamNotification(msg *jsonrpc.Message) error {
+func (o *Owner) handleModernUpstreamNotification(proc *upstream.Process, msg *jsonrpc.Message) error {
 	if strings.HasPrefix(msg.Method, "notifications/x-mux/") {
 		return nil
 	}
 	requireLogSubscription := msg.Method == "notifications/message"
-	session := o.modernInflightSession(requireLogSubscription)
+	session := o.modernInflightSession(proc, requireLogSubscription)
 	if session != nil {
 		session.SendNotification(msg.Raw)
 	}
 	return nil
 }
 
-func (o *Owner) modernInflightSession(requireLogSubscription bool) *Session {
+func (o *Owner) modernInflightSession(proc *upstream.Process, requireLogSubscription bool) *Session {
 	var sessionID int
 	o.inflightTracker.Range(func(_, value any) bool {
 		inflight, ok := value.(*InflightRequest)
-		if !ok || (requireLogSubscription && !inflight.logSubscribed) {
+		if !ok || (proc != nil && inflight.process.Load() != proc) ||
+			(requireLogSubscription && !inflight.logSubscribed) {
 			return true
 		}
 		sessionID = inflight.SessionID
@@ -1990,6 +1995,9 @@ func (o *Owner) removeSession(s *Session) {
 	}
 	o.mu.Unlock()
 	o.launchContextMu.Unlock()
+	if o.isModern() {
+		o.removeModernInflightForSession(s.ID)
+	}
 	o.cancelLocalDemandsForSession(s.ID)
 	if remaining == 0 {
 		o.cancelDisposableMaterializationForZeroSessions()
@@ -2437,7 +2445,11 @@ type drainedInflightResponse struct {
 
 // claimInflightRequests atomically detaches generation-owned request state.
 // It performs no downstream session I/O, so callers may hold upstreamEventMu.
-func (o *Owner) claimInflightRequests() []drainedInflightResponse {
+func (o *Owner) claimInflightRequests(proc *upstream.Process) []drainedInflightResponse {
+	if o.isModern() {
+		return o.claimModernInflightRequests(proc)
+	}
+
 	entries := o.sessionMgr.DrainInflight()
 	if len(entries) == 0 {
 		return nil
@@ -2480,6 +2492,79 @@ func (o *Owner) claimInflightRequests() []drainedInflightResponse {
 	return responses
 }
 
+func (o *Owner) claimModernInflightRequests(proc *upstream.Process) []drainedInflightResponse {
+	responses := make([]drainedInflightResponse, 0)
+	claimed := 0
+	o.inflightTracker.Range(func(key, value any) bool {
+		requestID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		inflight, ok := value.(*InflightRequest)
+		if !ok || (proc != nil && inflight.process.Load() != proc) {
+			return true
+		}
+		o.mu.RLock()
+		session := o.sessions[inflight.SessionID]
+		o.mu.RUnlock()
+		var payload []byte
+		if session != nil {
+			var err error
+			payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
+			if err != nil {
+				o.logger.Printf("drainInflight: build error for %s: %v", requestID, err)
+				return true
+			}
+		}
+		if !o.claimModernInflight(requestID, inflight, proc) {
+			return true
+		}
+		claimed++
+		o.clearModernInflightState(requestID)
+		if session != nil {
+			responses = append(responses, drainedInflightResponse{
+				session:   session,
+				sessionID: inflight.SessionID,
+				payload:   payload,
+			})
+		}
+		return true
+	})
+	if claimed > 0 {
+		o.logger.Printf("upstream died: sending error responses for %d in-flight requests", claimed)
+	}
+	return responses
+}
+
+func (o *Owner) claimModernInflight(requestID string, inflight *InflightRequest, proc *upstream.Process) bool {
+	if inflight == nil || (proc != nil && inflight.process.Load() != proc) {
+		return false
+	}
+	return o.inflightTracker.CompareAndDelete(requestID, inflight)
+}
+
+func (o *Owner) clearModernInflightState(requestID string) {
+	o.decrementPending()
+	o.methodTags.Delete(requestID)
+	o.timedOutIDs.Delete(requestID)
+	o.clearProgressTokensForRequest(requestID)
+}
+
+func (o *Owner) removeModernInflightForSession(sessionID int) {
+	o.inflightTracker.Range(func(key, value any) bool {
+		requestID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		inflight, ok := value.(*InflightRequest)
+		if !ok || inflight.SessionID != sessionID || !o.claimModernInflight(requestID, inflight, nil) {
+			return true
+		}
+		o.clearModernInflightState(requestID)
+		return true
+	})
+}
+
 func (o *Owner) drainProactiveRequests(proc *upstream.Process) {
 	o.proactiveRequests.Range(func(key, value any) bool {
 		request := value.(proactiveRequest)
@@ -2502,7 +2587,7 @@ func (o *Owner) deliverInflightResponses(responses []drainedInflightResponse) {
 }
 
 func (o *Owner) drainInflightRequests() {
-	o.deliverInflightResponses(o.claimInflightRequests())
+	o.deliverInflightResponses(o.claimInflightRequests(nil))
 }
 
 // FinalizeForRemoval tears down admission and retries the owned process
@@ -2969,6 +3054,9 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 	up := o.upstream
 	o.mu.RUnlock()
 	if writer != nil {
+		if bind != nil {
+			bind(nil)
+		}
 		if _, err := writer.Write(data); err != nil {
 			return nil, fmt.Errorf("upstream writer: write: %w", err)
 		}

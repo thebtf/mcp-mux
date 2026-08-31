@@ -1664,7 +1664,6 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 }
 
 func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
-	o.pendingRequests.Add(1)
 	inflight := &InflightRequest{
 		Method:        msg.Method,
 		Tool:          extractToolName(msg.Raw),
@@ -1673,15 +1672,20 @@ func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (
 		logSubscribed: modernLogSubscribed(msg.Raw),
 	}
 	key := string(msg.ID)
-	o.inflightTracker.Store(key, inflight)
-	usedProc, writeErr := o.writeUpstreamFromCurrent(msg.Raw, inflight.process.Store)
+	published := false
+	usedProc, writeErr := o.writeUpstreamFromCurrent(msg.Raw, func(proc *upstream.Process) {
+		inflight.process.Store(proc)
+		o.pendingRequests.Add(1)
+		o.inflightTracker.Store(key, inflight)
+		published = true
+	})
 	if writeErr == nil {
 		return usedProc, false, nil
 	}
 
 	o.logger.Printf("session %d: native upstream write failed for request id=%s: %v", s.ID, key, writeErr)
-	if _, loaded := o.inflightTracker.LoadAndDelete(key); loaded {
-		o.decrementPending()
+	if published && o.claimModernInflight(key, inflight, nil) {
+		o.clearModernInflightState(key)
 	}
 	_ = o.writeDemandError(s, msg.ID, "upstream write failed")
 	return usedProc, true, nil
@@ -1793,7 +1797,7 @@ func (o *Owner) monitorMaterializedProcessExit(proc *upstream.Process) {
 		default:
 		}
 		o.mu.Unlock()
-		responses := o.claimInflightRequests()
+		responses := o.claimInflightRequests(proc)
 		o.materializationMu.Unlock()
 		o.upstreamEventMu.Unlock()
 		o.deliverInflightResponses(responses)
@@ -1837,7 +1841,7 @@ func (o *Owner) retireReadyProcess(proc *upstream.Process, trigger Materializati
 	o.retiringProcess = proc
 	o.materializationState = MaterializationFinalizing
 	o.materializationTrigger = trigger
-	responses := o.claimInflightRequests()
+	responses := o.claimInflightRequests(proc)
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)
@@ -1903,7 +1907,7 @@ func (o *Owner) completeRetiringProcess(proc *upstream.Process, trigger Material
 	if o.cacheStage != nil && o.cacheStage.process == proc {
 		o.cacheStage = nil
 	}
-	responses := o.claimInflightRequests()
+	responses := o.claimInflightRequests(proc)
 	o.materializationMu.Unlock()
 	o.upstreamEventMu.Unlock()
 	o.deliverInflightResponses(responses)

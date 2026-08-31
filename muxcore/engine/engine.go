@@ -596,6 +596,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		Stdout:           os.Stdout,
 		InitialIPCPath:   ipcPath,
 		Token:            token,
+		ProtocolEra:      protocolEra,
 		OnInject:         e.cfg.OnInject,
 		RefreshToken:     refreshFn,
 		Reconnect:        reconnectFn,

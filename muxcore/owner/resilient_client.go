@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/supervisor"
@@ -64,7 +65,8 @@ type ResilientClientConfig struct {
 	Stdin          io.Reader
 	Stdout         io.Writer
 	InitialIPCPath string
-	Token          string // handshake token from initial spawn; sent to owner on connect
+	Token          string          // handshake token from initial spawn; sent to owner on connect
+	ProtocolEra    era.ProtocolEra // zero value preserves legacy reconnect behavior
 	// OnInject, when non-nil, is invoked exactly once after the initial IPC
 	// handshake completes. The closure pushes raw JSON-RPC frames into msgFromCC
 	// via select-default semantics. Single-fire across reconnects. Closure is
@@ -173,6 +175,10 @@ var (
 // failures keep the shim process alive so the parent stdio transport survives
 // daemon/owner restarts and temporary backend outages.
 func RunResilientClient(cfg ResilientClientConfig) error {
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		return fmt.Errorf("resilient client: protocol era: %w", err)
+	}
+
 	if cfg.ReconnectTimeout == 0 {
 		cfg.ReconnectTimeout = defaultReconnectTimeout
 	}
@@ -1018,6 +1024,9 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 			conn.Close()
 			return nil, "handshake", err
 		}
+	}
+	if rc.cfg.ProtocolEra == era.EraModern20260728 {
+		return conn, "", nil
 	}
 
 	if err := rc.replayInit(conn); err != nil {

@@ -358,6 +358,7 @@ func main() {
 					Stdout:            os.Stdout,
 					InitialIPCPath:    daemonIPC,
 					Token:             daemonToken,
+					ProtocolEra:       protocolEra,
 					RefreshToken:      refreshFn,
 					Reconnect:         reconnectFn,
 					IdleSuspendDelay:  idleDelay,

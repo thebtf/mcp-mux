@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
 	"github.com/thejerf/suture/v4"
 )
 
@@ -565,4 +567,291 @@ func TestModernOwner_ForwardsOnlyOptedInStandardLogToSoleSession(t *testing.T) {
 	if got, want := downstream.String(), string(standardLog)+"\n"; got != want {
 		t.Fatalf("standard log was synthesized, duplicated, or transformed: got %q, want %q", got, want)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// T052: Native owner loss is process-bound
+// ---------------------------------------------------------------------------
+
+func assertModernProcessLossErrors(t *testing.T, output string, wantIDs ...string) {
+	t.Helper()
+
+	counts := make(map[string]int, len(wantIDs))
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		var response struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id"`
+			Error   *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
+			t.Errorf("loss response is not JSON: %v; output=%q", err, output)
+			continue
+		}
+		if response.JSONRPC != "2.0" {
+			t.Errorf("loss response jsonrpc = %q, want 2.0", response.JSONRPC)
+		}
+		if response.Error == nil || response.Error.Code != -32603 || response.Error.Message != "upstream process exited" {
+			t.Errorf("loss response error = %#v, want -32603 upstream process exited", response.Error)
+		}
+		counts[string(response.ID)]++
+	}
+	if err := scanner.Err(); err != nil {
+		t.Errorf("scan loss responses: %v", err)
+	}
+	if len(counts) != len(wantIDs) {
+		t.Errorf("loss response IDs = %v, want exactly %v", counts, wantIDs)
+	}
+	for _, id := range wantIDs {
+		if got := counts[id]; got != 1 {
+			t.Errorf("loss response count for original ID %s = %d, want 1", id, got)
+		}
+	}
+}
+
+func TestModernOwner_ProcessBoundLossClaimsNativeInflightExactlyOnce(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+	proc := &upstream.Process{}
+
+	entries := []struct {
+		requestID     string
+		progressToken string
+		logSubscribed bool
+	}{
+		{requestID: `"native-loss-string"`, progressToken: `"native-loss-progress-string"`, logSubscribed: true},
+		{requestID: `418`, progressToken: `"native-loss-progress-number"`},
+	}
+	for _, entry := range entries {
+		inflight := &InflightRequest{
+			Method:        "tools/call",
+			SessionID:     session.ID,
+			StartTime:     time.Now(),
+			logSubscribed: entry.logSubscribed,
+		}
+		inflight.process.Store(proc)
+		o.inflightTracker.Store(entry.requestID, inflight)
+		o.pendingRequests.Add(1)
+		seedProgressToken(o, session.ID, entry.requestID, entry.progressToken)
+	}
+	o.mu.Lock()
+	o.upstream = proc
+	o.mu.Unlock()
+
+	if !o.markCurrentUpstreamDead(proc) {
+		t.Fatal("exact current process loss was not claimed")
+	}
+	assertModernProcessLossErrors(t, downstream.String(), entries[0].requestID, entries[1].requestID)
+	for _, entry := range entries {
+		if _, ok := o.inflightTracker.Load(entry.requestID); ok {
+			t.Errorf("lost native request %s remained tracked", entry.requestID)
+		}
+	}
+	if got := o.PendingRequests(); got != 0 {
+		t.Errorf("pending native requests after loss = %d, want 0", got)
+	}
+	if got := o.ActiveProgressTokens(); got != 0 {
+		t.Errorf("active progress tokens after loss = %d, want 0", got)
+	}
+	o.mu.RLock()
+	progressOwners := len(o.progressOwners)
+	progressRequestIDs := len(o.progressTokenRequestID)
+	requestTokens := len(o.requestToTokens)
+	o.mu.RUnlock()
+	if progressOwners != 0 || progressRequestIDs != 0 || requestTokens != 0 {
+		t.Errorf("loss left progress routes: owners=%d requestIDs=%d requestTokens=%d", progressOwners, progressRequestIDs, requestTokens)
+	}
+
+	firstDelivery := downstream.String()
+	_ = o.markCurrentUpstreamDead(proc)
+	if got := downstream.String(); got != firstDelivery {
+		t.Errorf("second exact-process loss duplicated responses: got %q, want %q", got, firstDelivery)
+	}
+}
+
+func TestModernOwner_PublishesProcessBoundInflightBeforeWrite(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, _ := addModernOwnerSession(t, o, t.TempDir())
+	o.upstreamWriter = nil
+	proc := newModernLossProcess(t)
+	o.mu.Lock()
+	o.upstream = proc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+
+	const requestID = `"published-before-write"`
+	hookObserved := false
+	o.beforeCurrentUpstreamWrite = func(selected *upstream.Process) {
+		if selected != proc {
+			t.Fatalf("selected process = %p, want %p", selected, proc)
+		}
+		tracked, ok := o.inflightTracker.Load(requestID)
+		if !ok {
+			t.Fatal("modern inflight entry was not published before the process write")
+		}
+		inflight, ok := tracked.(*InflightRequest)
+		if !ok || inflight.process.Load() != proc {
+			t.Fatalf("published inflight process = %v, want exact selected process %p", tracked, proc)
+		}
+		if got := o.PendingRequests(); got != 1 {
+			t.Fatalf("pending requests at write boundary = %d, want 1", got)
+		}
+		hookObserved = true
+	}
+	request := parseMessage([]byte(`{"jsonrpc":"2.0","id":"published-before-write","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`))
+	if _, writeFailed, err := o.forwardModernRequestPrepared(session, request); err != nil || writeFailed {
+		t.Fatalf("forwardModernRequestPrepared = writeFailed:%v err:%v", writeFailed, err)
+	}
+	if !hookObserved {
+		t.Fatal("current-upstream write hook was not observed")
+	}
+	o.deliverInflightResponses(o.claimInflightRequests(proc))
+}
+
+func TestModernOwner_WrongGenerationCannotConsumeOrRouteInflight(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+	o.upstreamWriter = nil
+	oldProc := newModernLossProcess(t)
+	currentProc := newModernLossProcess(t)
+	o.mu.Lock()
+	o.upstream = currentProc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+
+	const requestID = `"generation-bound"`
+	inflight := &InflightRequest{Method: "subscriptions/listen", SessionID: session.ID, StartTime: time.Now(), logSubscribed: true}
+	inflight.process.Store(oldProc)
+	o.inflightTracker.Store(requestID, inflight)
+	o.pendingRequests.Store(1)
+
+	notification := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"stale"}}`))
+	if err := o.handleUpstreamMessageFrom(currentProc, notification); err != nil {
+		t.Fatalf("handle wrong-generation notification: %v", err)
+	}
+	response := parseMessage([]byte(`{"jsonrpc":"2.0","id":"generation-bound","result":{"ok":true}}`))
+	if err := o.handleUpstreamMessageFrom(currentProc, response); err != nil {
+		t.Fatalf("handle wrong-generation response: %v", err)
+	}
+	if got := downstream.String(); got != "" {
+		t.Fatalf("wrong generation delivered modern traffic: %q", got)
+	}
+	if _, ok := o.inflightTracker.Load(requestID); !ok {
+		t.Fatal("wrong generation consumed the exact old-generation inflight entry")
+	}
+	if got := o.PendingRequests(); got != 1 {
+		t.Fatalf("wrong generation changed pending count to %d, want 1", got)
+	}
+}
+
+func TestModernOwner_CancelTargetsOnlyCurrentProcessGeneration(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, _ := addModernOwnerSession(t, o, t.TempDir())
+	o.upstreamWriter = nil
+	oldFrames := make(chan string, 1)
+	currentFrames := make(chan string, 1)
+	oldProc := newModernLossRecordingProcess(t, oldFrames)
+	currentProc := newModernLossRecordingProcess(t, currentFrames)
+	o.mu.Lock()
+	o.upstream = currentProc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+
+	const requestID = `"cancel-generation"`
+	inflight := &InflightRequest{Method: "tools/call", SessionID: session.ID, StartTime: time.Now()}
+	inflight.process.Store(oldProc)
+	o.inflightTracker.Store(requestID, inflight)
+	cancel := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-generation","reason":"host"}}`))
+	if err := o.handleModernDownstreamMessage(session, cancel); err != nil {
+		t.Fatalf("stale-generation cancel: %v", err)
+	}
+	select {
+	case frame := <-oldFrames:
+		t.Fatalf("stale cancel reached old generation: %s", frame)
+	case frame := <-currentFrames:
+		t.Fatalf("stale cancel reached replacement generation: %s", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	currentInflight := &InflightRequest{Method: "tools/call", SessionID: session.ID, StartTime: time.Now()}
+	currentInflight.process.Store(currentProc)
+	o.inflightTracker.Store(requestID, currentInflight)
+	if err := o.handleModernDownstreamMessage(session, cancel); err != nil {
+		t.Fatalf("current-generation cancel: %v", err)
+	}
+	select {
+	case frame := <-currentFrames:
+		if !strings.Contains(frame, `"notifications/cancelled"`) {
+			t.Fatalf("current cancel frame = %s", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("current generation did not receive cancellation")
+	}
+}
+
+func TestModernOwner_RemoveSessionClearsEphemeralInflightRoutes(t *testing.T) {
+	o := newModernWriterOwner(t, io.Discard, nil)
+	session, _ := addModernOwnerSession(t, o, t.TempDir())
+	const (
+		requestID = `"session-route"`
+		token     = `"session-progress"`
+	)
+	inflight := &InflightRequest{Method: "subscriptions/listen", SessionID: session.ID, StartTime: time.Now(), logSubscribed: true}
+	o.inflightTracker.Store(requestID, inflight)
+	o.pendingRequests.Store(1)
+	seedProgressToken(o, session.ID, requestID, token)
+
+	o.removeSession(session)
+	if _, ok := o.inflightTracker.Load(requestID); ok {
+		t.Fatal("disconnected modern session retained inflight subscription route")
+	}
+	if got := o.PendingRequests(); got != 0 {
+		t.Fatalf("disconnected modern session pending requests = %d, want 0", got)
+	}
+	if got := o.ActiveProgressTokens(); got != 0 {
+		t.Fatalf("disconnected modern session progress tokens = %d, want 0", got)
+	}
+	o.mu.RLock()
+	progressOwners := len(o.progressOwners)
+	progressRequestIDs := len(o.progressTokenRequestID)
+	requestTokens := len(o.requestToTokens)
+	o.mu.RUnlock()
+	if progressOwners != 0 || progressRequestIDs != 0 || requestTokens != 0 {
+		t.Fatalf("disconnected modern session retained routes: owners=%d requestIDs=%d requestTokens=%d", progressOwners, progressRequestIDs, requestTokens)
+	}
+}
+
+func newModernLossProcess(t *testing.T) *upstream.Process {
+	t.Helper()
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		_, err := io.Copy(io.Discard, stdin)
+		return err
+	})
+	t.Cleanup(func() { _ = proc.Close() })
+	return proc
+}
+
+func newModernLossRecordingProcess(t *testing.T, frames chan<- string) *upstream.Process {
+	t.Helper()
+	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
+		scanner := bufio.NewScanner(stdin)
+		for scanner.Scan() {
+			frames <- scanner.Text()
+		}
+		return scanner.Err()
+	})
+	t.Cleanup(func() { _ = proc.Close() })
+	return proc
 }

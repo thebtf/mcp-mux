@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
@@ -64,7 +65,8 @@ func closeReconnectConn(t *testing.T, conn interface {
 	io.Reader
 	io.Writer
 	io.Closer
-}) {
+},
+) {
 	t.Helper()
 	if conn == nil {
 		return
@@ -264,6 +266,246 @@ func TestReconnect_DrainExactOnceThenSuccessorResponse(t *testing.T) {
 	}
 	if generation != "successor-gen-1" {
 		t.Fatalf("successor generation = %q, want successor-gen-1; line=%q", generation, line)
+	}
+}
+
+func TestFinishReconnect_ModernWritesTokenWithoutLegacyReplay(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	rc := newReconnectClient(t, stdout, resilientTestLogger(t))
+	rc.cfg.ProtocolEra = era.EraModern20260728
+
+	const legacyInitialize = `{"jsonrpc":"2.0","id":71,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`
+	rc.initCache.request = []byte(legacyInitialize)
+	rc.initCache.requestID = "71"
+
+	path := tempReconnectSocketPath(t, "modern-token-only")
+	srv := startGenerationIPCServer(t, path, "modern-successor")
+	defer srv.closeAll()
+
+	conn, reason, err := rc.finishReconnect(path, "modern-token", &sync.Mutex{})
+	if err != nil {
+		t.Fatalf("finishReconnect() error = %v", err)
+	}
+	if reason != "" {
+		t.Fatalf("finishReconnect() reason = %q, want empty", reason)
+	}
+	defer closeReconnectConn(t, conn)
+
+	select {
+	case frame := <-srv.received:
+		if frame != "modern-token" {
+			t.Fatalf("first modern reconnect frame = %q, want token only", frame)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("modern reconnect did not write its token")
+	}
+	select {
+	case frame := <-srv.received:
+		t.Fatalf("modern reconnect wrote unexpected legacy frame %q", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := stdout.String(); got != "" {
+		t.Fatalf("modern reconnect emitted legacy list_changed traffic: %q", got)
+	}
+}
+
+func TestFinishReconnect_LegacyRetainsInitializeReplayAndListChanges(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	rc := newReconnectClient(t, stdout, resilientTestLogger(t))
+	if got := rc.cfg.ProtocolEra; got != era.EraLegacy {
+		t.Fatalf("zero ProtocolEra = %v, want legacy", got)
+	}
+
+	const legacyInitialize = `{"jsonrpc":"2.0","id":72,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`
+	rc.initCache.request = []byte(legacyInitialize)
+	rc.initCache.requestID = "72"
+
+	path := tempReconnectSocketPath(t, "legacy-replay")
+	srv := startGenerationIPCServer(t, path, "legacy-successor")
+	defer srv.closeAll()
+
+	conn, reason, err := rc.finishReconnect(path, "legacy-token", &sync.Mutex{})
+	if err != nil {
+		t.Fatalf("finishReconnect() error = %v", err)
+	}
+	if reason != "" {
+		t.Fatalf("finishReconnect() reason = %q, want empty", reason)
+	}
+	defer closeReconnectConn(t, conn)
+
+	for index, want := range []string{"legacy-token", legacyInitialize} {
+		select {
+		case frame := <-srv.received:
+			if frame != want {
+				t.Fatalf("legacy reconnect frame %d = %q, want %q", index, frame, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("legacy reconnect did not write frame %d (%q)", index, want)
+		}
+	}
+
+	out := stdout.String()
+	for _, method := range []string{
+		"notifications/tools/list_changed",
+		"notifications/prompts/list_changed",
+		"notifications/resources/list_changed",
+	} {
+		if got := strings.Count(out, method); got != 1 {
+			t.Fatalf("legacy reconnect %s count = %d, want 1; stdout=%q", method, got, out)
+		}
+	}
+	if got := strings.Count(out, "list_changed"); got != 3 {
+		t.Fatalf("legacy reconnect list_changed count = %d, want 3; stdout=%q", got, out)
+	}
+}
+
+func TestReconnect_ModernDrainsInflightAndForwardsFreshListenOnce(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	rc := newReconnectClient(t, stdout, resilientTestLogger(t))
+	rc.cfg.ProtocolEra = era.EraModern20260728
+
+	const legacyInitialize = `{"jsonrpc":"2.0","id":71,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}`
+	rc.initCache.request = []byte(legacyInitialize)
+	rc.initCache.requestID = "71"
+	rc.inflight.Store("41", true)
+
+	initialPath := tempReconnectSocketPath(t, "modern-loss-initial")
+	initialSrv, _ := startEchoIPCServer(t, initialPath)
+	defer initialSrv.closeAll()
+
+	successorPath := tempReconnectSocketPath(t, "modern-loss-successor")
+	successorSrv := startGenerationIPCServer(t, successorPath, "modern-successor")
+	defer successorSrv.closeAll()
+
+	initialConn, err := ipc.Dial(initialPath)
+	if err != nil {
+		t.Fatalf("dial initial IPC: %v", err)
+	}
+
+	stdinDone := make(chan error, 1)
+	reconnectStarted := make(chan struct{})
+	allowReconnect := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseReconnect := func() {
+		releaseOnce.Do(func() { close(allowReconnect) })
+	}
+	defer releaseReconnect()
+	rc.cfg.Reconnect = func() (string, string, error) {
+		close(reconnectStarted)
+		<-allowReconnect
+		return successorPath, "modern-token", nil
+	}
+
+	var stdoutMu sync.Mutex
+	proxyErr := make(chan error, 1)
+	proxyStopped := false
+	go func() {
+		proxyErr <- rc.runProxy(initialConn, &stdoutMu, stdinDone)
+	}()
+	defer func() {
+		if proxyStopped {
+			return
+		}
+		releaseReconnect()
+		select {
+		case stdinDone <- io.EOF:
+		default:
+		}
+		select {
+		case <-proxyErr:
+		case <-time.After(time.Second):
+		}
+	}()
+
+	initialSrv.closeAll()
+	select {
+	case <-reconnectStarted:
+	case <-time.After(time.Second):
+		t.Fatal("modern reconnect callback did not start after IPC loss")
+	}
+
+	const freshListen = `{"jsonrpc":"2.0","id":42,"method":"subscriptions/listen","params":{"uri":"file:///fresh"}}`
+	rc.localWork.Add(1)
+	rc.msgFromCC <- []byte(freshListen)
+	releaseReconnect()
+
+	frames := make([]string, 0, 2)
+	freshReceived := false
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for !freshReceived {
+		select {
+		case frame := <-successorSrv.received:
+			frames = append(frames, frame)
+			freshReceived = frame == freshListen
+		case <-deadline.C:
+			t.Fatalf("successor did not receive fresh subscriptions/listen; frames=%q", frames)
+		}
+	}
+	quiet := time.NewTimer(100 * time.Millisecond)
+	defer quiet.Stop()
+	for waiting := true; waiting; {
+		select {
+		case frame := <-successorSrv.received:
+			frames = append(frames, frame)
+		case <-quiet.C:
+			waiting = false
+		}
+	}
+
+	if len(frames) != 2 || frames[0] != "modern-token" || frames[1] != freshListen {
+		t.Fatalf("modern successor frames = %q, want token then one fresh listen without replay", frames)
+	}
+
+	stdinDone <- io.EOF
+	select {
+	case err := <-proxyErr:
+		proxyStopped = true
+		if err != nil {
+			t.Fatalf("runProxy() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runProxy did not exit after stdin EOF")
+	}
+
+	out := stdout.String()
+	responses := parseJSONRPCResponsesWithID(t, out)
+	if len(responses) != 1 {
+		t.Fatalf("modern reconnect drained response count = %d, want 1; stdout=%q", len(responses), out)
+	}
+	if got := string(responses[0].ID); got != "41" {
+		t.Fatalf("modern reconnect drained response ID = %s, want old ID 41; stdout=%q", got, out)
+	}
+	if responses[0].Error == nil || responses[0].Error.Code != -32603 ||
+		!strings.Contains(responses[0].Error.Message, "request lost during reconnect") {
+		t.Fatalf("modern reconnect did not emit the old-request loss error exactly once; response=%+v", responses[0])
+	}
+	if got := strings.Count(out, "request lost during reconnect"); got != 1 {
+		t.Fatalf("modern reconnect old-request loss count = %d, want 1; stdout=%q", got, out)
+	}
+	if strings.Contains(out, "list_changed") {
+		t.Fatalf("modern reconnect emitted legacy list_changed traffic: %q", out)
+	}
+	if _, stillInflight := rc.inflight.Load("41"); stillInflight {
+		t.Fatal("old in-flight request remained tracked after modern reconnect")
+	}
+}
+
+func TestRunResilientClient_RejectsUnsupportedProtocolEraBeforeInitialDial(t *testing.T) {
+	err := RunResilientClient(ResilientClientConfig{
+		ProtocolEra:    era.ProtocolEra(255),
+		Stdin:          strings.NewReader(""),
+		Stdout:         io.Discard,
+		InitialIPCPath: tempReconnectSocketPath(t, "unsupported-era"),
+	})
+	if err == nil {
+		t.Fatal("RunResilientClient() error = nil, want unsupported ProtocolEra rejection")
+	}
+	if strings.Contains(err.Error(), "initial dial") {
+		t.Fatalf("RunResilientClient() dialed before rejecting ProtocolEra: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("RunResilientClient() error = %v, want unsupported ProtocolEra rejection", err)
 	}
 }
 
