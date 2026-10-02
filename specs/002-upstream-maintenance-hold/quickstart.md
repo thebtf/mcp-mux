@@ -4,33 +4,32 @@ This guide is an implementation/release oracle. No commands below were run in th
 
 ## Prerequisites
 
-Use the exact integrated candidate after core and adapters land, Go compatible with repository `go.mod`, PowerShell 7 on Windows and Unix, and the existing critical-suite launcher prerequisite `MCP_LAUNCHER` or `-Launcher`. Use a dedicated current-user test namespace, private config/IPC storage, and a fresh `.t` proof directory. Do not target the operator's active namespace or delete a ledger to clear a failure. Root owns allocation, process cleanup, and acceptance.
+Use the exact integrated candidate after core and adapters land, Go 1.25.12 for the current production-playbook gate, PowerShell 7 on Windows and Unix, and the existing critical-suite launcher prerequisite `MCP_LAUNCHER` or `-Launcher`. Use a dedicated current-user test namespace and private config/IPC storage. Scratch and evidence belong under the primary checkout's `.agent/tmp`, never a linked checkout's inner `.agent`, `.t`, or OS temp. Root owns allocation, exact process cleanup, and acceptance.
 
 The smoke must reuse `scripts/lifecycle-smoke-upstream/main.go` and `testdata/mock_modern_server.go`. Extend only the lifecycle fixture with a link-time version string, opt-in shared mode while retaining its current isolated default, a bounded in-flight operation, and request/frame capture needed to prove no replay. No new supervisor or test framework. The runner is cross-platform pwsh with platform-specific exact PID/tree observations; it must not retain the Windows-only restriction in `smoke-process-lifecycle.ps1`.
 
 ## Run the actual candidate and replacement proof
 
-From the candidate root on Windows:
+From the integrated candidate, resolve the primary checkout through Git's common directory and use the root-owned scratch resource returned by the workspace allocator. The examples below show the layout; a run uses its exact allocated path rather than reusing another run's directory.
 
 ```powershell
-New-Item -ItemType Directory -Force .t/maintenance-build | Out-Null
-go build -o .t/maintenance-build/mcp-mux.exe ./cmd/mcp-mux
+$PrimaryRoot = Split-Path -Parent (git rev-parse --path-format=absolute --git-common-dir)
+$ScratchRoot = Join-Path $PrimaryRoot '.agent/tmp/maintenance-proof'
+$BuildDir = Join-Path $ScratchRoot 'build'
+New-Item -ItemType Directory -Force $BuildDir | Out-Null
+# Windows build. On Unix use the same command with output filename mcp-mux.
+$CandidateBinary = Join-Path $BuildDir 'mcp-mux.exe'
+go build -o $CandidateBinary ./cmd/mcp-mux
 if ($LASTEXITCODE -ne 0) { throw 'candidate build failed' }
-pwsh -NoProfile -File scripts/smoke-upstream-maintenance.ps1 -SourceRoot . -CandidateBinary .t/maintenance-build/mcp-mux.exe -OutputDir .t/maintenance-proof-windows -TimeoutSeconds 180
-if ($LASTEXITCODE -ne 0) { throw 'Windows maintenance proof failed' }
+$OutputDir = Join-Path $ScratchRoot 'windows'
+$EvidencePath = Join-Path $OutputDir 'summary.json'
+pwsh -NoProfile -File scripts/smoke-upstream-maintenance.ps1 -SourceRoot . -CandidateBinary $CandidateBinary -ScratchRoot $ScratchRoot -OutputDir $OutputDir -EvidencePath $EvidencePath -TimeoutSeconds 180
+if ($LASTEXITCODE -ne 0) { throw 'maintenance proof failed' }
 ```
 
-From a separate exact-head Unix checkout with PowerShell 7:
+On Unix, build the Unix binary from the same exact source head and select a fresh `unix` OutputDir beneath its allocated primary ScratchRoot. Do not reuse the Windows executable.
 
-```powershell
-New-Item -ItemType Directory -Force .t/maintenance-build | Out-Null
-go build -o .t/maintenance-build/mcp-mux ./cmd/mcp-mux
-if ($LASTEXITCODE -ne 0) { throw 'candidate build failed' }
-pwsh -NoProfile -File scripts/smoke-upstream-maintenance.ps1 -SourceRoot . -CandidateBinary .t/maintenance-build/mcp-mux -OutputDir .t/maintenance-proof-unix -TimeoutSeconds 180
-if ($LASTEXITCODE -ne 0) { throw 'Unix maintenance proof failed' }
-```
-
-The runner takes exactly `SourceRoot`, `CandidateBinary`, `OutputDir`, and `TimeoutSeconds`. OutputDir must be fresh. It builds two distinguishable fixture versions itself, runs actual CLI hold/resume/renew commands, and exits zero only when every applicable scenario below passes. It records source SHA, binary/fixture hashes, original host process and pipe identities, exact owner/generation and scoped PID observations, control responses, timestamped host frames/upstream captures, file hashes, platform, commands, and exit statuses in `summary.json` and `transcript.ndjson`. Missing source/tool/platform proof is a failure, not a skipped success.
+The runner's canonical parameters are `SourceRoot`, `CandidateBinary`, `ScratchRoot`, `OutputDir`, `EvidencePath`, and `TimeoutSeconds`. ScratchRoot must be root-owned primary `.agent` storage; OutputDir must be fresh and contained beneath it. The runner builds two distinguishable fixture versions, runs actual CLI hold/resume/renew commands, and exits zero only when the applicable scenarios pass. It records source SHA, binary/fixture hashes, unchanged host pipes, scoped PID/tree observations, control responses, timestamped frames, file hashes, platform and exit statuses. Missing proof is a failure, not a skipped success.
 
 ### Required live sequence
 
