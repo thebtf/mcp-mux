@@ -2,7 +2,9 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
@@ -78,4 +80,25 @@ func SendWithTimeout(socketPath string, req Request, timeout time.Duration) (*Re
 	}
 
 	return &resp, nil
+}
+
+// SendMaintenance performs one maintenance exchange without lifecycle fallback.
+// Untyped old endpoints are unsupported; malformed typed replies fail closed.
+func SendMaintenance(socketPath string, req Request, timeout time.Duration) (*MaintenanceResult, error) {
+	req, err := prepareMaintenanceRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := SendWithTimeout(socketPath, req, timeout)
+	if err != nil {
+		var syntaxErr *json.SyntaxError
+		var typeErr *json.UnmarshalTypeError
+		var timeErr *time.ParseError
+		if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) || errors.As(err, &timeErr) ||
+			errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, ErrMaintenanceInvalid
+		}
+		return nil, err
+	}
+	return maintenanceResponse(req, resp)
 }

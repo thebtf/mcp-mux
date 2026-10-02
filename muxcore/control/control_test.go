@@ -1243,3 +1243,515 @@ func TestProtocolEraUnknownJSONFieldsRemainTolerated(t *testing.T) {
 		t.Fatal("response OK = false, want true")
 	}
 }
+
+type maintenanceBoundaryHandler struct {
+	mockHandler
+	calls  int
+	handle func(Request) (MaintenanceResult, error)
+}
+
+func (m *maintenanceBoundaryHandler) HandleMaintenance(req Request) (MaintenanceResult, error) {
+	m.calls++
+	return m.handle(req)
+}
+
+func maintenanceTestResult() MaintenanceResult {
+	now := time.Now().UTC()
+	return MaintenanceResult{
+		HoldID:        "lease-exact",
+		ServerID:      "owner-exact",
+		State:         MaintenanceHeld,
+		ExpiresAt:     now.Add(5 * time.Minute),
+		DrainDeadline: now,
+		TreesRetired:  true,
+	}
+}
+
+func TestMaintenanceTypedErrors(t *testing.T) {
+	result := maintenanceTestResult()
+	for _, sentinel := range []*MaintenanceError{
+		ErrMaintenanceHeld, ErrMaintenanceConflict, ErrMaintenanceNotFound,
+		ErrMaintenanceRetirementBlocked, ErrMaintenanceUnsupported,
+		ErrMaintenancePersistenceFailed, ErrMaintenanceInvalid,
+	} {
+		t.Run(string(sentinel.Code), func(t *testing.T) {
+			wrapped := fmt.Errorf("private context secret: %w", &MaintenanceError{Code: sentinel.Code, Result: &result})
+			if !errors.Is(wrapped, sentinel) {
+				t.Fatalf("wrapped refusal does not match %v", sentinel)
+			}
+			resp := errorResponse("spawn", wrapped)
+			wire, err := json.Marshal(resp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(wire), "private") || strings.Contains(string(wire), "secret") {
+				t.Fatalf("internal reason escaped onto wire: %s", wire)
+			}
+			var decoded Response
+			if err := json.Unmarshal(wire, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			err = fmt.Errorf("consumer: %w", decoded.Err())
+			var typed *MaintenanceError
+			if !errors.Is(err, sentinel) || !errors.As(err, &typed) || typed.Result == nil || typed.Result.HoldID != result.HoldID {
+				t.Fatalf("typed refusal or safe lease lost: %v", err)
+			}
+			if errors.Is(err, &MaintenanceError{Code: "different"}) {
+				t.Fatal("different refusal code matched")
+			}
+		})
+	}
+	for _, resp := range []*Response{
+		nil,
+		{OK: true, ErrorCode: ErrMaintenanceHeld.Code},
+		{OK: true, ErrorCode: "future_secret_code"},
+		{ErrorCode: "future_secret_code", Message: "private context"},
+		{OK: true, Maintenance: &MaintenanceResult{HoldID: "lease-exact", State: MaintenanceHeld}},
+	} {
+		if err := resp.Err(); !errors.Is(err, ErrMaintenanceInvalid) {
+			t.Fatalf("malformed response accepted: %+v, err=%v", resp, err)
+		}
+	}
+	if err := (&Response{OK: true}).Err(); err != nil {
+		t.Fatalf("legacy success refused: %v", err)
+	}
+	if err := (&Response{Message: "ordinary failure"}).Err(); err == nil || err.Error() != "ordinary failure" {
+		t.Fatalf("legacy failure changed: %v", err)
+	}
+	if err := (&Response{}).Err(); err == nil {
+		t.Fatal("empty unsuccessful response accepted")
+	}
+}
+
+func TestMaintenanceInvalidInputsDoNotReachHandler(t *testing.T) {
+	zero, negative, tooLong := int64(0), int64(-1), int64(3600001)
+	requests := []Request{
+		{Cmd: "hold"},
+		{Cmd: "hold", Command: "owner-exact"},
+		{Cmd: "hold", ServerID: "owner-exact", Command: "different"},
+		{Cmd: "hold", ServerID: " owner-exact"},
+		{Cmd: "hold", ServerID: "owner-exact", HoldID: "lease-exact"},
+		{Cmd: "hold", ServerID: "owner-exact", HoldTTLMS: &zero},
+		{Cmd: "hold", ServerID: "owner-exact", HoldTTLMS: &negative},
+		{Cmd: "hold", ServerID: "owner-exact", HoldTTLMS: &tooLong},
+		{Cmd: "hold", ServerID: "owner-exact", DrainTimeoutMs: -1},
+		{Cmd: "resume"},
+		{Cmd: "resume", HoldID: " "},
+		{Cmd: "resume", HoldID: "lease-exact", ServerID: "owner-exact"},
+		{Cmd: "resume", HoldID: "lease-exact", Command: "owner-exact"},
+		{Cmd: "resume", HoldID: "lease-exact", DrainTimeoutMs: -1},
+		{Cmd: "renew", ServerID: "owner-exact"},
+		{Cmd: "renew", HoldID: "lease-exact", HoldTTLMS: &zero},
+		{Cmd: "renew", HoldID: "lease-exact", HoldTTLMS: &tooLong},
+	}
+	handler := &maintenanceBoundaryHandler{handle: func(Request) (MaintenanceResult, error) {
+		t.Fatal("invalid request reached maintenance mutation")
+		return MaintenanceResult{}, nil
+	}}
+	srv := &Server{handler: handler}
+	for i, req := range requests {
+		resp, after := srv.dispatch(req)
+		if !errors.Is(resp.Err(), ErrMaintenanceInvalid) || after != nil {
+			t.Fatalf("request %d did not fail before mutation: %+v", i, resp)
+		}
+		if _, err := SendMaintenance("unused-invalid-input-endpoint", req, time.Second); !errors.Is(err, ErrMaintenanceInvalid) {
+			t.Fatalf("request %d dialed before validation: %v", i, err)
+		}
+	}
+	if _, err := SendMaintenance("unused-invalid-input-endpoint", Request{Cmd: "shutdown"}, time.Second); !errors.Is(err, ErrMaintenanceInvalid) {
+		t.Fatalf("nonmaintenance command accepted: %v", err)
+	}
+	if handler.calls != 0 {
+		t.Fatalf("invalid inputs mutated handler %d times", handler.calls)
+	}
+}
+
+func TestMaintenanceDispatchAndCapabilityBoundary(t *testing.T) {
+	base := maintenanceTestResult()
+	accepted := time.Now().UTC()
+	handler := &maintenanceBoundaryHandler{handle: func(req Request) (MaintenanceResult, error) {
+		result := base
+		if req.Cmd == "hold" && req.ServerID != base.ServerID {
+			return MaintenanceResult{}, ErrMaintenanceNotFound
+		}
+		if req.Cmd != "hold" && req.HoldID != base.HoldID {
+			return MaintenanceResult{}, ErrMaintenanceNotFound
+		}
+		if req.Cmd == "resume" {
+			result.State = MaintenanceReleased
+			result.ServerID = "" // The lease remains actionable after recovery.
+		} else {
+			if req.HoldTTLMS == nil {
+				return MaintenanceResult{}, ErrMaintenanceInvalid
+			}
+			result.ExpiresAt = accepted.Add(time.Duration(*req.HoldTTLMS) * time.Millisecond)
+			if req.Cmd == "renew" {
+				result.State = MaintenanceRetirementBlocked
+				result.TreesRetired = false
+			}
+		}
+		return result, nil
+	}}
+	path := testSocketPath(t)
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	minTTL, maxTTL := int64(1), int64(3600000)
+	for _, tc := range []struct {
+		name       string
+		req        Request
+		wantState  MaintenanceState
+		wantExpiry time.Time
+		wantErr    *MaintenanceError
+	}{
+		{"hold default", Request{Cmd: "hold", ServerID: base.ServerID}, MaintenanceHeld, accepted.Add(5 * time.Minute), nil},
+		{"renew blocked", Request{Cmd: "renew", HoldID: base.HoldID, HoldTTLMS: &maxTTL}, MaintenanceRetirementBlocked, accepted.Add(time.Hour), nil},
+		{"resume recovered", Request{Cmd: "resume", HoldID: base.HoldID}, MaintenanceReleased, base.ExpiresAt, nil},
+		{"exact target only", Request{Cmd: "hold", ServerID: "owner"}, "", time.Time{}, ErrMaintenanceNotFound},
+		{"exact lease only", Request{Cmd: "renew", HoldID: "lease"}, "", time.Time{}, ErrMaintenanceNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := SendMaintenance(path, tc.req, time.Second)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) || result != nil {
+					t.Fatalf("exact lookup refusal lost: result=%+v err=%v", result, err)
+				}
+				return
+			}
+			if err != nil || result == nil || result.State != tc.wantState || !result.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("lease outcome = %+v, err=%v", result, err)
+			}
+		})
+	}
+	// The inclusive lower bound is validated without a wall-clock expiry race.
+	if _, err := prepareMaintenanceRequest(Request{Cmd: "hold", ServerID: base.ServerID, HoldTTLMS: &minTTL}); err != nil {
+		t.Fatalf("minimum TTL refused: %v", err)
+	}
+	legacy := &mockDaemonHandler{}
+	old := &Server{handler: legacy}
+	for _, req := range []Request{
+		{Cmd: "hold", ServerID: base.ServerID},
+		{Cmd: "resume", HoldID: base.HoldID},
+		{Cmd: "renew", HoldID: base.HoldID},
+		{Cmd: "restart_owner", ServerID: base.ServerID},
+	} {
+		resp, after := old.dispatch(req)
+		if !errors.Is(resp.Err(), ErrMaintenanceUnsupported) || after != nil {
+			t.Fatalf("missing capability accepted %s: %+v", req.Cmd, resp)
+		}
+	}
+	if legacy.shutdownCalled || legacy.spawnCalled || legacy.stopCalled || legacy.removeCalled {
+		t.Fatal("missing maintenance capability used destructive legacy fallback")
+	}
+	blocked := base
+	blocked.State, blocked.TreesRetired = MaintenanceRetirementBlocked, false
+	refusing := &Server{handler: &maintenanceBoundaryHandler{handle: func(Request) (MaintenanceResult, error) {
+		return blocked, fmt.Errorf("private context: %w", ErrMaintenanceRetirementBlocked)
+	}}}
+	resp, _ := refusing.dispatch(Request{Cmd: "hold", ServerID: base.ServerID})
+	var typed *MaintenanceError
+	if !errors.Is(resp.Err(), ErrMaintenanceRetirementBlocked) || !errors.As(resp.Err(), &typed) || typed.Result == nil || typed.Result.State != MaintenanceRetirementBlocked {
+		t.Fatalf("blocked safe readback lost: %+v", resp)
+	}
+	untyped := &Server{handler: &maintenanceBoundaryHandler{handle: func(Request) (MaintenanceResult, error) {
+		return MaintenanceResult{}, errors.New("upstream held for update; private context secret")
+	}}}
+	resp, _ = untyped.dispatch(Request{Cmd: "hold", ServerID: base.ServerID})
+	if !errors.Is(resp.Err(), ErrMaintenanceUnsupported) || strings.Contains(resp.Message, "secret") {
+		t.Fatalf("untyped handler classified by message or leaked reason: %+v", resp)
+	}
+}
+
+func TestMaintenancePeerResponsesFailClosed(t *testing.T) {
+	base := maintenanceTestResult()
+	for _, tc := range []struct {
+		name    string
+		cmd     string
+		change  func(*MaintenanceResult)
+		code    MaintenanceErrorCode
+		ok      bool
+		missing bool
+		raw     string
+		want    *MaintenanceError
+	}{
+		{name: "hold complete", cmd: "hold", ok: true},
+		{name: "resume complete", cmd: "resume", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceReleased; r.ServerID = "" }},
+		{name: "renew holding", cmd: "renew", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceHolding; r.TreesRetired = false }},
+		{name: "blocked typed", cmd: "hold", code: ErrMaintenanceRetirementBlocked.Code, change: func(r *MaintenanceResult) { r.State = MaintenanceRetirementBlocked; r.TreesRetired = false }, want: ErrMaintenanceRetirementBlocked},
+		{name: "old failure text is not a code", cmd: "hold", missing: true, want: ErrMaintenanceUnsupported},
+		{name: "success without capability result", cmd: "hold", ok: true, missing: true, want: ErrMaintenanceUnsupported},
+		{name: "unknown failure code", cmd: "hold", code: "new_code", want: ErrMaintenanceInvalid},
+		{name: "success plus refusal", cmd: "hold", ok: true, code: ErrMaintenanceHeld.Code, want: ErrMaintenanceInvalid},
+		{name: "hold still holding", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceHolding; r.TreesRetired = false }, want: ErrMaintenanceInvalid},
+		{name: "hold not retired", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.TreesRetired = false }, want: ErrMaintenanceInvalid},
+		{name: "hold expired", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.ExpiresAt = time.Now().Add(-time.Second) }, want: ErrMaintenanceInvalid},
+		{name: "hold different target", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.ServerID = "different-owner" }, want: ErrMaintenanceInvalid},
+		{name: "hold missing lease", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.HoldID = "" }, want: ErrMaintenanceInvalid},
+		{name: "hold missing expiry", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.ExpiresAt = time.Time{} }, want: ErrMaintenanceInvalid},
+		{name: "hold missing drain", cmd: "hold", ok: true, change: func(r *MaintenanceResult) { r.DrainDeadline = time.Time{} }, want: ErrMaintenanceInvalid},
+		{name: "unknown state", cmd: "renew", ok: true, change: func(r *MaintenanceResult) { r.State = "UNKNOWN" }, want: ErrMaintenanceInvalid},
+		{name: "resume held", cmd: "resume", ok: true, want: ErrMaintenanceInvalid},
+		{name: "resume not retired", cmd: "resume", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceReleased; r.TreesRetired = false }, want: ErrMaintenanceInvalid},
+		{name: "resume different lease", cmd: "resume", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceReleased; r.HoldID = "other-lease" }, want: ErrMaintenanceInvalid},
+		{name: "renew released", cmd: "renew", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceReleased }, want: ErrMaintenanceInvalid},
+		{name: "renew different lease", cmd: "renew", ok: true, change: func(r *MaintenanceResult) { r.HoldID = "other-lease" }, want: ErrMaintenanceInvalid},
+		{name: "renew expired", cmd: "renew", ok: true, change: func(r *MaintenanceResult) { r.ExpiresAt = time.Now().Add(-time.Second) }, want: ErrMaintenanceInvalid},
+		{name: "blocked claimed retired", cmd: "renew", ok: true, change: func(r *MaintenanceResult) { r.State = MaintenanceRetirementBlocked }, want: ErrMaintenanceInvalid},
+		{name: "malformed JSON", cmd: "hold", raw: "not json\n", want: ErrMaintenanceInvalid},
+		{name: "malformed timestamp", cmd: "hold", raw: `{"ok":true,"maintenance":{"expires_at":"not-a-time"}}`, want: ErrMaintenanceInvalid},
+		{name: "malformed result type", cmd: "hold", raw: `{"ok":true,"maintenance":[]}`, want: ErrMaintenanceInvalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := base
+			if tc.change != nil {
+				tc.change(&result)
+			}
+			resp := Response{OK: tc.ok, Message: "upstream held for update; private reason", ErrorCode: tc.code}
+			if !tc.missing {
+				resp.Maintenance = &result
+			}
+			wire := tc.raw
+			if wire == "" {
+				data, err := json.Marshal(resp)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wire = string(data) + "\n"
+			}
+			path := testSocketPath(t)
+			ln, err := ipc.Listen(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			done := make(chan []Request, 1)
+			go func() {
+				var requests []Request
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						done <- requests
+						return
+					}
+					_ = conn.SetDeadline(time.Now().Add(time.Second))
+					var req Request
+					if json.NewDecoder(conn).Decode(&req) == nil {
+						requests = append(requests, req)
+						_, _ = conn.Write([]byte(wire))
+					}
+					_ = conn.Close()
+				}
+			}()
+			req := Request{Cmd: tc.cmd, HoldID: base.HoldID}
+			if tc.cmd == "hold" {
+				req.HoldID, req.ServerID = "", base.ServerID
+			}
+			got, err := SendMaintenance(path, req, time.Second)
+			_ = ln.Close()
+			select {
+			case requests := <-done:
+				if len(requests) != 1 || requests[0].Cmd != req.Cmd {
+					t.Fatalf("maintenance attempted fallback: %+v", requests)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("peer did not finish")
+			}
+			if tc.want == nil {
+				if err != nil || got == nil || got.State != result.State {
+					t.Fatalf("valid outcome refused: result=%+v err=%v", got, err)
+				}
+			} else if !errors.Is(err, tc.want) {
+				t.Fatalf("peer classification = %v, want %v", err, tc.want)
+			} else if tc.want == ErrMaintenanceRetirementBlocked {
+				var typed *MaintenanceError
+				if got == nil || !errors.As(err, &typed) || typed.Result == nil || got.State != MaintenanceRetirementBlocked {
+					t.Fatalf("safe error result lost: result=%+v err=%v", got, err)
+				}
+			} else if got != nil {
+				t.Fatalf("malformed/unsupported peer yielded actionable result: %+v", got)
+			}
+		})
+	}
+}
+
+type maintenanceLifecycleHandler struct {
+	mockDaemonHandler
+	refusal             error
+	restartResponse     Response
+	restartStarted      chan struct{}
+	restartRelease      <-chan struct{}
+	shutdownAwareCalled bool
+	restartCalled       bool
+	gracefulCalled      bool
+}
+
+func (m *maintenanceLifecycleHandler) HandleShutdownWithError(int) (string, error) {
+	m.shutdownAwareCalled = true
+	return "shutdown initiated", m.refusal
+}
+
+func (m *maintenanceLifecycleHandler) HandleGracefulRestart(int) (string, func(), error) {
+	m.gracefulCalled = true
+	return "snapshot", func() {}, m.refusal
+}
+
+func (m *maintenanceLifecycleHandler) HandleRestartOwner(Request) (Response, error) {
+	m.restartCalled = true
+	if m.restartStarted != nil {
+		close(m.restartStarted)
+	}
+	if m.restartRelease != nil {
+		<-m.restartRelease
+	}
+	return m.restartResponse, m.refusal
+}
+
+func TestMaintenanceLifecycleRefusals(t *testing.T) {
+	result := maintenanceTestResult()
+	refusal := fmt.Errorf("private context secret: %w", &MaintenanceError{Code: ErrMaintenanceHeld.Code, Result: &result})
+	for _, req := range []Request{
+		{Cmd: "spawn", Command: "fixture"},
+		{Cmd: "refresh-token", PrevToken: "token"},
+		{Cmd: "graceful-restart"},
+		{Cmd: "shutdown"},
+		{Cmd: "restart_owner", ServerID: result.ServerID},
+	} {
+		t.Run(req.Cmd, func(t *testing.T) {
+			handler := &maintenanceLifecycleHandler{refusal: refusal}
+			handler.spawnErr, handler.refreshErr = refusal, refusal
+			resp, after := (&Server{handler: handler}).dispatch(req)
+			if !errors.Is(resp.Err(), ErrMaintenanceHeld) || after != nil || resp.Maintenance == nil || strings.Contains(resp.Message, "secret") {
+				t.Fatalf("lifecycle refusal lost or destructive callback retained: %+v, after=%v", resp, after != nil)
+			}
+			if handler.shutdownCalled {
+				t.Fatal("typed shutdown refusal fell back to legacy shutdown")
+			}
+		})
+	}
+	for _, req := range []Request{
+		{Cmd: "restart_owner"},
+		{Cmd: "restart_owner", Command: result.ServerID},
+		{Cmd: "restart_owner", ServerID: " "},
+		{Cmd: "restart_owner", ServerID: result.ServerID, HoldID: result.HoldID},
+		{Cmd: "restart_owner", ServerID: result.ServerID, DrainTimeoutMs: -1},
+		{Cmd: "shutdown", DrainTimeoutMs: -1},
+		{Cmd: "graceful-restart", DrainTimeoutMs: -1},
+	} {
+		handler := &maintenanceLifecycleHandler{}
+		resp, _ := (&Server{handler: handler}).dispatch(req)
+		if !errors.Is(resp.Err(), ErrMaintenanceInvalid) || handler.restartCalled || handler.shutdownAwareCalled || handler.gracefulCalled {
+			t.Fatalf("invalid lifecycle inputs reached mutation: req=%+v resp=%+v", req, resp)
+		}
+	}
+}
+
+func TestMaintenanceRestartOwnerUndeliveredReservation(t *testing.T) {
+	started, release, rolledBack := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	handler := &maintenanceLifecycleHandler{
+		mockDaemonHandler: mockDaemonHandler{rollbackCh: rolledBack},
+		restartResponse:   Response{OK: true, IPCPath: "/tmp/restarted.sock", ServerID: "owner-restarted", Token: "reservation", ProtocolEra: "2026-07-28"},
+		restartStarted:    started,
+		restartRelease:    release,
+	}
+	srv := &Server{handler: handler, logger: testLogger(t)}
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	srv.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		srv.handleConn(serverConn)
+		close(done)
+	}()
+	if err := json.NewEncoder(clientConn).Encode(Request{Cmd: "restart_owner", ServerID: "owner-exact"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("restart handler did not start")
+	}
+	_ = clientConn.Close()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("undelivered restart handler did not finish")
+	}
+	select {
+	case <-rolledBack:
+	default:
+		t.Fatal("restart reservation was not rolled back")
+	}
+	if handler.rollbackSID != "owner-restarted" || handler.rollbackToken != "reservation" || handler.spawnCalled || handler.stopCalled {
+		t.Fatalf("restart leaked reservation or used legacy fallback: %+v", handler)
+	}
+}
+
+func TestMaintenanceLegacyWireOmissionAndSafeProjection(t *testing.T) {
+	for _, tc := range []struct {
+		value any
+		want  string
+	}{
+		{Request{Cmd: "spawn"}, `{"cmd":"spawn"}`},
+		{Response{OK: true, Token: "token"}, `{"ok":true,"token":"token"}`},
+		{Response{Message: "ordinary failure"}, `{"ok":false,"message":"ordinary failure"}`},
+	} {
+		wire, err := json.Marshal(tc.value)
+		if err != nil || string(wire) != tc.want {
+			t.Fatalf("legacy wire changed: %s err=%v, want %s", wire, err, tc.want)
+		}
+	}
+	ownerWire, err := json.Marshal(OwnerInfo{})
+	if err != nil || strings.Contains(string(ownerWire), "maintenance") {
+		t.Fatalf("legacy owner gained maintenance field: %s err=%v", ownerWire, err)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(`{"ok":false,"error_code":"maintenance_held","maintenance":{"hold_id":"lease-exact","server_id":"owner-exact","state":"HELD","expires_at":"2099-01-01T00:05:00Z","drain_deadline":"2099-01-01T00:00:00Z","trees_retired":true,"context_keys":["secret"],"env":{"secret":"credential"}},"reason":"private context"}`), &resp); err != nil {
+		t.Fatal(err)
+	}
+	wire, err := json.Marshal(resp)
+	if err != nil || !errors.Is(resp.Err(), ErrMaintenanceHeld) || strings.Contains(string(wire), "secret") || strings.Contains(string(wire), "private") || strings.Contains(string(wire), "context_keys") {
+		t.Fatalf("unsafe fields entered maintenance projection: %s err=%v", wire, err)
+	}
+}
+
+func TestMaintenanceRestartOwnerResponseValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		resp     Response
+		want     *MaintenanceError
+		rollback bool
+	}{
+		{"legacy era", Response{OK: true, IPCPath: "/tmp/restarted.sock", ServerID: "owner-exact", Token: "reservation"}, nil, false},
+		{"modern era", Response{OK: true, IPCPath: "/tmp/restarted.sock", ServerID: "owner-exact", Token: "reservation", ProtocolEra: "2026-07-28"}, nil, false},
+		{"unknown era", Response{OK: true, IPCPath: "/tmp/restarted.sock", ServerID: "owner-exact", Token: "reservation", ProtocolEra: "unknown"}, ErrMaintenanceInvalid, true},
+		{"missing endpoint", Response{OK: true, ServerID: "owner-exact", Token: "reservation"}, ErrMaintenanceInvalid, true},
+		{"success plus refusal", Response{OK: true, IPCPath: "/tmp/restarted.sock", ServerID: "owner-exact", Token: "reservation", ErrorCode: ErrMaintenanceHeld.Code}, ErrMaintenanceInvalid, true},
+		{"unknown refusal", Response{ErrorCode: "future_code"}, ErrMaintenanceInvalid, false},
+		{"typed refusal", Response{ErrorCode: ErrMaintenanceHeld.Code}, ErrMaintenanceHeld, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &maintenanceLifecycleHandler{restartResponse: tc.resp}
+			resp, after := (&Server{handler: handler, logger: testLogger(t)}).dispatch(Request{Cmd: "restart_owner", ServerID: "owner-exact"})
+			if after != nil || handler.spawnCalled || handler.stopCalled || handler.shutdownCalled {
+				t.Fatal("managed restart used destructive legacy fallback")
+			}
+			if tc.want == nil {
+				if err := resp.Err(); err != nil || resp.ProtocolEra != tc.resp.ProtocolEra || resp.Token != tc.resp.Token {
+					t.Fatalf("daemon-selected restart reservation rejected: %+v, err=%v", resp, err)
+				}
+			} else if !errors.Is(resp.Err(), tc.want) {
+				t.Fatalf("restart result = %+v, want %v", resp, tc.want)
+			}
+			if tc.rollback {
+				if handler.rollbackSID != tc.resp.ServerID || handler.rollbackToken != tc.resp.Token {
+					t.Fatalf("malformed restart response leaked reservation: %+v", handler)
+				}
+			} else if handler.rollbackSID != "" || handler.rollbackToken != "" {
+				t.Fatal("delivered or refused restart incorrectly revoked a reservation")
+			}
+		})
+	}
+}

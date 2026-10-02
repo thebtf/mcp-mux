@@ -8,12 +8,14 @@ package control
 import "encoding/json"
 
 // Request is a control plane command sent by the CLI to an owner or daemon.
-// Supported daemon commands include "spawn", "remove", "graceful-restart",
-// and "refresh-token".
+// Supported daemon commands include spawn, maintenance hold/resume/renew,
+// restart_owner, remove, graceful-restart, and refresh-token.
 type Request struct {
 	Cmd            string `json:"cmd"`
 	DrainTimeoutMs int    `json:"drain_timeout_ms,omitempty"`
 	ServerID       string `json:"server_id,omitempty"`
+	HoldID         string `json:"hold_id,omitempty"`
+	HoldTTLMS      *int64 `json:"hold_ttl_ms,omitempty"`
 	// SuccessorExe optionally tells a graceful-restart capable daemon which
 	// executable should be launched as the successor. When empty, the daemon
 	// falls back to its environment-driven successor resolution.
@@ -37,13 +39,15 @@ type Request struct {
 
 // Response is the reply to a control command.
 type Response struct {
-	OK          bool            `json:"ok"`
-	Message     string          `json:"message,omitempty"`
-	Data        json.RawMessage `json:"data,omitempty"`
-	IPCPath     string          `json:"ipc_path,omitempty"`
-	ServerID    string          `json:"server_id,omitempty"`
-	Token       string          `json:"token,omitempty"` // handshake token for session binding
-	ProtocolEra string          `json:"protocol_era,omitempty"`
+	OK          bool                 `json:"ok"`
+	Message     string               `json:"message,omitempty"`
+	Data        json.RawMessage      `json:"data,omitempty"`
+	IPCPath     string               `json:"ipc_path,omitempty"`
+	ServerID    string               `json:"server_id,omitempty"`
+	Token       string               `json:"token,omitempty"` // handshake token for session binding
+	ProtocolEra string               `json:"protocol_era,omitempty"`
+	Maintenance *MaintenanceResult   `json:"maintenance,omitempty"`
+	ErrorCode   MaintenanceErrorCode `json:"error_code,omitempty"`
 }
 
 // CommandHandler is implemented by the Owner to handle control commands.
@@ -54,28 +58,29 @@ type CommandHandler interface {
 
 // OwnerInfo contains summary data for a single managed owner returned by list_owners.
 type OwnerInfo struct {
-	ServerID             string   `json:"server_id"`
-	EngineName           string   `json:"engine_name,omitempty"`
-	Command              string   `json:"command"`
-	Args                 []string `json:"args"`
-	Cwd                  string   `json:"cwd"`
-	CwdSet               []string `json:"cwd_set"`
-	Sessions             int      `json:"sessions"`
-	Pending              int      `json:"pending"`
-	UpstreamPID          int      `json:"upstream_pid,omitempty"`
-	Classification       string   `json:"classification"`
-	ClassificationSource string   `json:"classification_source,omitempty"`
-	ClassificationReason []string `json:"classification_reason,omitempty"`
-	MuxVersion           string   `json:"mux_version"`
-	Persistent           bool     `json:"persistent"`
-	CachedInit           bool     `json:"cached_init,omitempty"`
-	CachedTools          bool     `json:"cached_tools,omitempty"`
-	CachedPrompts        bool     `json:"cached_prompts,omitempty"`
-	CachedResources      bool     `json:"cached_resources,omitempty"`
-	ProtocolEra          string   `json:"protocol_era,omitempty"`
-	SharingPolicy        string   `json:"sharing_policy,omitempty"`
-	CachePolicy          string   `json:"cache_policy,omitempty"`
-	LifecyclePolicy      string   `json:"lifecycle_policy,omitempty"`
+	ServerID             string             `json:"server_id"`
+	EngineName           string             `json:"engine_name,omitempty"`
+	Command              string             `json:"command"`
+	Args                 []string           `json:"args"`
+	Cwd                  string             `json:"cwd"`
+	CwdSet               []string           `json:"cwd_set"`
+	Sessions             int                `json:"sessions"`
+	Pending              int                `json:"pending"`
+	UpstreamPID          int                `json:"upstream_pid,omitempty"`
+	Classification       string             `json:"classification"`
+	ClassificationSource string             `json:"classification_source,omitempty"`
+	ClassificationReason []string           `json:"classification_reason,omitempty"`
+	MuxVersion           string             `json:"mux_version"`
+	Persistent           bool               `json:"persistent"`
+	CachedInit           bool               `json:"cached_init,omitempty"`
+	CachedTools          bool               `json:"cached_tools,omitempty"`
+	CachedPrompts        bool               `json:"cached_prompts,omitempty"`
+	CachedResources      bool               `json:"cached_resources,omitempty"`
+	ProtocolEra          string             `json:"protocol_era,omitempty"`
+	SharingPolicy        string             `json:"sharing_policy,omitempty"`
+	CachePolicy          string             `json:"cache_policy,omitempty"`
+	LifecyclePolicy      string             `json:"lifecycle_policy,omitempty"`
+	Maintenance          *MaintenanceResult `json:"maintenance,omitempty"`
 }
 
 // ListOwnersResponse is the response payload for the "list_owners" daemon RPC.
@@ -103,10 +108,10 @@ type RefreshSessionTokenWithProtocolEraHandler interface {
 }
 
 // SpawnResponseFailureHandler is an optional daemon-side lifecycle hook. The
-// control server invokes it only when HandleSpawn succeeded but the response
-// could not be delivered to the requesting shim. Implementations should revoke
-// the exact unconsumed reservation so an abandoned startup cannot pin an owner
-// until the generic pending-token TTL expires.
+// control server invokes it when spawn or restart_owner succeeded but its
+// response could not be delivered. Implementations should revoke the exact
+// unconsumed reservation so abandoned startup cannot pin an owner until the
+// generic pending-token TTL expires.
 type SpawnResponseFailureHandler interface {
 	HandleSpawnResponseFailure(serverID, token string)
 }
