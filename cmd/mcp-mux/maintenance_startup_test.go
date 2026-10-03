@@ -104,6 +104,7 @@ func startMaintenanceStartupHost(t *testing.T, executable, dir, effects string) 
 		env = setEnv(env, key, value)
 	}
 	cmd.Env = env
+	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -181,9 +182,10 @@ func TestMaintenanceStartupHeldOpeningKeepsPipesAndResumesFresh(t *testing.T) {
 			for _, key := range []string{"TEMP", "TMP", "TMPDIR", "APPDATA", "XDG_CONFIG_HOME"} {
 				t.Setenv(key, dir)
 			}
+			// Private TEMP isolates this fixture; keep owner socket names within Unix limits.
 			d, err := daemon.New(daemon.Config{
 				ControlPath: serverid.DaemonControlPath(dir, engineName), Name: engineName,
-				Namespace: "startup-" + filepath.Base(dir), SkipSnapshot: true,
+				Namespace: "mh", SkipSnapshot: true,
 				ZeroSessionCleanupDelay: -1, Logger: log.New(io.Discard, "", 0),
 			})
 			if err != nil {
