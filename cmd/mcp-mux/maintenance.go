@@ -29,7 +29,7 @@ func standaloneAdmissionError(noDaemon, headless bool) error {
 	return nil
 }
 
-func parseMaintenanceCommand(cmd string, args []string) (control.Request, time.Duration, bool, error) {
+func parseMaintenanceCommand(cmd string, args []string) (control.Request, bool, error) {
 	flags := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	jsonOutput := flags.Bool("json", false, "Emit one JSON response")
@@ -43,7 +43,7 @@ func parseMaintenanceCommand(cmd string, args []string) (control.Request, time.D
 		flags.DurationVar(&ttl, "ttl", ttl, "Hold duration, at most one hour")
 	case "resume":
 	default:
-		return control.Request{}, 0, false, control.ErrMaintenanceInvalid
+		return control.Request{}, false, control.ErrMaintenanceInvalid
 	}
 	// Preserve JSON framing even when an earlier flag or duration is invalid.
 	for _, arg := range args {
@@ -56,44 +56,42 @@ func parseMaintenanceCommand(cmd string, args []string) (control.Request, time.D
 		identity, args = args[0], args[1:]
 	}
 	if err := flags.Parse(args); err != nil {
-		return control.Request{}, 0, *jsonOutput, control.ErrMaintenanceInvalid
+		return control.Request{}, *jsonOutput, control.ErrMaintenanceInvalid
 	}
 	if identity == "" && flags.NArg() == 1 {
 		identity = flags.Arg(0)
 	} else if flags.NArg() != 0 {
-		return control.Request{}, 0, *jsonOutput, control.ErrMaintenanceInvalid
+		return control.Request{}, *jsonOutput, control.ErrMaintenanceInvalid
 	}
 	if identity == "" || strings.TrimSpace(identity) != identity {
-		return control.Request{}, 0, *jsonOutput, control.ErrMaintenanceInvalid
+		return control.Request{}, *jsonOutput, control.ErrMaintenanceInvalid
 	}
 	req := control.Request{Cmd: cmd}
-	timeout := 5 * time.Second
 	if cmd == "hold" {
 		req.ServerID = identity
 		maxMillis := int64(^uint(0) >> 1)
-		if drain < 0 || drain%time.Millisecond != 0 || drain.Milliseconds() > maxMillis || drain > time.Duration(1<<63-1)-timeout {
-			return req, 0, *jsonOutput, control.ErrMaintenanceInvalid
+		if drain < 0 || drain%time.Millisecond != 0 || drain.Milliseconds() > maxMillis {
+			return req, *jsonOutput, control.ErrMaintenanceInvalid
 		}
 		req.DrainTimeoutMs = int(drain.Milliseconds())
-		timeout += drain
 	} else {
 		req.HoldID = identity
 	}
 	if cmd != "resume" {
 		if ttl <= 0 || ttl > time.Hour || ttl%time.Millisecond != 0 {
-			return req, 0, *jsonOutput, control.ErrMaintenanceInvalid
+			return req, *jsonOutput, control.ErrMaintenanceInvalid
 		}
 		milliseconds := ttl.Milliseconds()
 		req.HoldTTLMS = &milliseconds
 	}
-	return req, timeout, *jsonOutput, nil
+	return req, *jsonOutput, nil
 }
 
 func runMaintenanceCommand(cmd string, args []string, stdout, stderr io.Writer) int {
-	req, timeout, jsonOutput, err := parseMaintenanceCommand(cmd, args)
+	req, jsonOutput, err := parseMaintenanceCommand(cmd, args)
 	var result *control.MaintenanceResult
 	if err == nil {
-		result, err = control.SendMaintenance(serverid.DaemonControlPath("", engineName), req, timeout)
+		result, err = control.SendMaintenance(serverid.DaemonControlPath("", engineName), req, 0)
 	}
 	response := control.Response{OK: err == nil, Maintenance: result}
 	if err != nil {

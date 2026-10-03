@@ -1060,15 +1060,13 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 
 	// Force changes drain grace, never maintenance admission.
 	drainMs := 30000
-	timeout := 35 * time.Second
 	if params.Force {
 		drainMs = 0
-		timeout = 5 * time.Second
 	}
 
 	resp, err := control.SendWithTimeout(s.daemonCtlPath(), control.Request{
 		Cmd: "restart_owner", ServerID: owner.ServerID, DrainTimeoutMs: drainMs,
-	}, timeout)
+	}, 0)
 	if err == nil {
 		err = resp.Err()
 		if err != nil && resp != nil && resp.ErrorCode == "" && !errors.Is(err, control.ErrMaintenanceInvalid) {

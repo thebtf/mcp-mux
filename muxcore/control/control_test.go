@@ -1267,6 +1267,110 @@ func maintenanceTestResult() MaintenanceResult {
 	}
 }
 
+func TestControlTimeoutPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		req     Request
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{"hold forced", Request{Cmd: "hold"}, 0, 180 * time.Second},
+		{"hold default drain", Request{Cmd: "hold", DrainTimeoutMs: 10000}, 0, 190 * time.Second},
+		{"hold requested drain", Request{Cmd: "hold", DrainTimeoutMs: 12345}, 0, 180*time.Second + 12345*time.Millisecond},
+		{"restart forced", Request{Cmd: "restart_owner"}, 0, 180 * time.Second},
+		{"restart ordinary", Request{Cmd: "restart_owner", DrainTimeoutMs: 30000}, 0, 210 * time.Second},
+		{"hold nonpositive default", Request{Cmd: "hold", DrainTimeoutMs: 10000}, -1, 190 * time.Second},
+		{"explicit short hold", Request{Cmd: "hold", DrainTimeoutMs: 10000}, 50 * time.Millisecond, 50 * time.Millisecond},
+		{"explicit short restart", Request{Cmd: "restart_owner", DrainTimeoutMs: 30000}, time.Millisecond, time.Millisecond},
+		{"explicit long", Request{Cmd: "hold", DrainTimeoutMs: 10000}, time.Hour, time.Hour},
+		{"resume unchanged", Request{Cmd: "resume"}, 0, 5 * time.Second},
+		{"renew unchanged", Request{Cmd: "renew"}, 0, 5 * time.Second},
+		{"stop unchanged", Request{Cmd: "stop_owner", DrainTimeoutMs: 30000}, 0, 5 * time.Second},
+		{"shutdown unchanged", Request{Cmd: "shutdown", DrainTimeoutMs: 30000}, 0, 5 * time.Second},
+		{"graceful restart unchanged", Request{Cmd: "graceful-restart", DrainTimeoutMs: 30000}, 0, 5 * time.Second},
+		{"ping unchanged", Request{Cmd: "ping"}, 0, 5 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := controlTimeout(tc.req, tc.timeout)
+			if err != nil || got != tc.want {
+				t.Fatalf("effective timeout = %s, err=%v, want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestControlSendDefaultTimeoutReceivesDelayedHoldOutcome(t *testing.T) {
+	base := maintenanceTestResult()
+	handler := &maintenanceBoundaryHandler{handle: func(req Request) (MaintenanceResult, error) {
+		if req.Cmd != "hold" || req.ServerID != base.ServerID || req.DrainTimeoutMs != 0 {
+			return MaintenanceResult{}, ErrMaintenanceInvalid
+		}
+		time.Sleep(5200 * time.Millisecond)
+		return base, nil
+	}}
+	path := testSocketPath(t)
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	response, err := Send(path, Request{Cmd: "hold", ServerID: base.ServerID})
+	if err != nil || response == nil || !response.OK || response.Maintenance == nil || *response.Maintenance != base {
+		t.Fatalf("delayed original hold outcome lost: response=%+v err=%v", response, err)
+	}
+	srv.Close()
+	if handler.calls != 1 {
+		t.Fatalf("hold submitted %d times, want once", handler.calls)
+	}
+}
+
+func TestMaintenanceExplicitTimeoutDoesNotResubmitOrRelease(t *testing.T) {
+	base := maintenanceTestResult()
+	release := make(chan struct{})
+	requests := make(chan Request, 4)
+	handler := &maintenanceBoundaryHandler{handle: func(req Request) (MaintenanceResult, error) {
+		requests <- req
+		<-release
+		return base, nil
+	}}
+	path := testSocketPath(t)
+	srv, err := NewServer(path, handler, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		srv.Close()
+	})
+	result, err := SendMaintenance(path, Request{Cmd: "hold", ServerID: base.ServerID}, 50*time.Millisecond)
+	var timeoutErr net.Error
+	if result != nil || !errors.As(err, &timeoutErr) || !timeoutErr.Timeout() {
+		t.Fatalf("explicit short deadline was not honored: result=%+v err=%v", result, err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	srv.Close()
+	if len(requests) != 1 {
+		t.Fatalf("timeout submitted %d mutations, want exactly one", len(requests))
+	}
+	if req := <-requests; req.Cmd != "hold" || req.ServerID != base.ServerID {
+		t.Fatalf("timeout retried, fell back, or released the hold: %+v", req)
+	}
+}
+
+func TestOperationalDefaultTimeoutRejectsDrainOverflowBeforeDial(t *testing.T) {
+	maxDrain := int64((time.Duration(1<<63-1) - operationalTimeout) / time.Millisecond)
+	if maxDrain >= int64(^uint(0)>>1) {
+		t.Skip("int drain range cannot overflow the operational deadline")
+	}
+	for _, cmd := range []string{"hold", "restart_owner"} {
+		_, err := SendWithTimeout("unused-invalid-input-endpoint", Request{Cmd: cmd, DrainTimeoutMs: int(maxDrain + 1)}, 0)
+		if !errors.Is(err, ErrMaintenanceInvalid) {
+			t.Fatalf("%s overflow reached dial or wrapped its deadline: %v", cmd, err)
+		}
+	}
+}
+
 func TestMaintenanceTypedErrors(t *testing.T) {
 	result := maintenanceTestResult()
 	for _, sentinel := range []*MaintenanceError{

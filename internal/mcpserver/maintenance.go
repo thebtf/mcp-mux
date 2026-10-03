@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 )
@@ -44,41 +43,39 @@ func maintenanceTools() []map[string]any {
 	}
 }
 
-func parseMaintenanceArguments(cmd string, args json.RawMessage) (control.Request, time.Duration, error) {
+func parseMaintenanceArguments(cmd string, args json.RawMessage) (control.Request, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(args, &fields); err != nil || fields == nil {
-		return control.Request{}, 0, control.ErrMaintenanceInvalid
+		return control.Request{}, control.ErrMaintenanceInvalid
 	}
 	identityField := "hold_id"
 	if cmd == "hold" {
 		identityField = "server_id"
 	} else if cmd != "resume" && cmd != "renew" {
-		return control.Request{}, 0, control.ErrMaintenanceInvalid
+		return control.Request{}, control.ErrMaintenanceInvalid
 	}
 	for field := range fields {
 		if field != identityField && !(field == "hold_seconds" && cmd != "resume") && !(field == "drain_timeout_ms" && cmd == "hold") {
-			return control.Request{}, 0, control.ErrMaintenanceInvalid
+			return control.Request{}, control.ErrMaintenanceInvalid
 		}
 	}
 	var identity string
 	if err := json.Unmarshal(fields[identityField], &identity); err != nil || identity == "" || strings.TrimSpace(identity) != identity {
-		return control.Request{}, 0, control.ErrMaintenanceInvalid
+		return control.Request{}, control.ErrMaintenanceInvalid
 	}
 	req := control.Request{Cmd: cmd}
-	timeout := 5 * time.Second
 	if cmd == "hold" {
 		req.ServerID = identity
 		drain := int64(10000)
 		if raw, present := fields["drain_timeout_ms"]; present {
 			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &drain) != nil {
-				return req, 0, control.ErrMaintenanceInvalid
+				return req, control.ErrMaintenanceInvalid
 			}
 		}
-		if drain < 0 || drain > int64(^uint(0)>>1) || drain > int64((time.Duration(1<<63-1)-timeout)/time.Millisecond) {
-			return req, 0, control.ErrMaintenanceInvalid
+		if drain < 0 || drain > int64(^uint(0)>>1) {
+			return req, control.ErrMaintenanceInvalid
 		}
 		req.DrainTimeoutMs = int(drain)
-		timeout += time.Duration(drain) * time.Millisecond
 	} else {
 		req.HoldID = identity
 	}
@@ -86,25 +83,25 @@ func parseMaintenanceArguments(cmd string, args json.RawMessage) (control.Reques
 		seconds := int64(300)
 		if raw, present := fields["hold_seconds"]; present {
 			if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) || json.Unmarshal(raw, &seconds) != nil {
-				return req, 0, control.ErrMaintenanceInvalid
+				return req, control.ErrMaintenanceInvalid
 			}
 		}
 		if seconds < 1 || seconds > 3600 {
-			return req, 0, control.ErrMaintenanceInvalid
+			return req, control.ErrMaintenanceInvalid
 		}
 		milliseconds := seconds * 1000
 		req.HoldTTLMS = &milliseconds
 	}
-	return req, timeout, nil
+	return req, nil
 }
 
 func (s *Server) toolMuxMaintenance(id json.RawMessage, cmd string, args json.RawMessage) {
-	req, timeout, err := parseMaintenanceArguments(cmd, args)
+	req, err := parseMaintenanceArguments(cmd, args)
 	if err != nil {
 		s.sendControlToolError(id, err)
 		return
 	}
-	result, err := control.SendMaintenance(s.daemonCtlPath(), req, timeout)
+	result, err := control.SendMaintenance(s.daemonCtlPath(), req, 0)
 	if err != nil {
 		s.sendControlToolError(id, err)
 		return

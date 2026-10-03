@@ -98,6 +98,67 @@ func TestMaintenanceCLIUnsupportedPositionalFirst(t *testing.T) {
 	}
 }
 
+type maintenanceCLIExchangeHandler struct {
+	refreshTestHandler
+	result   control.MaintenanceResult
+	requests chan control.Request
+}
+
+func (h *maintenanceCLIExchangeHandler) HandleMaintenance(req control.Request) (control.MaintenanceResult, error) {
+	h.requests <- req
+	result := h.result
+	switch req.Cmd {
+	case "hold":
+		time.Sleep(5200 * time.Millisecond)
+	case "resume":
+		result.State = control.MaintenanceReleased
+	case "renew":
+		result.ExpiresAt = time.Now().UTC().Add(time.Duration(*req.HoldTTLMS) * time.Millisecond)
+	default:
+		return control.MaintenanceResult{}, control.ErrMaintenanceInvalid
+	}
+	return result, nil
+}
+
+func TestMaintenanceCLIDefaultBudgetReceivesDelayedHold(t *testing.T) {
+	dir := shortTempDir(t, "mbudget")
+	t.Setenv("TMPDIR", dir)
+	now := time.Now().UTC()
+	handler := &maintenanceCLIExchangeHandler{
+		result: control.MaintenanceResult{
+			HoldID: "exact-lease", ServerID: "exact-owner", State: control.MaintenanceHeld,
+			ExpiresAt: now.Add(5 * time.Minute), DrainDeadline: now, TreesRetired: true,
+		},
+		requests: make(chan control.Request, 4),
+	}
+	startFakeDaemon(t, dir, handler)
+	for _, tc := range []struct {
+		cmd   string
+		args  []string
+		state control.MaintenanceState
+	}{
+		{"hold", []string{"exact-owner", "--drain-timeout", "0", "--json"}, control.MaintenanceHeld},
+		{"renew", []string{"exact-lease", "--json"}, control.MaintenanceHeld},
+		{"resume", []string{"exact-lease", "--json"}, control.MaintenanceReleased},
+	} {
+		var stdout, stderr bytes.Buffer
+		if code := runMaintenanceCommand(tc.cmd, tc.args, &stdout, &stderr); code != 0 {
+			t.Fatalf("%s failed to receive its original outcome: code=%d stdout=%q stderr=%q", tc.cmd, code, stdout.String(), stderr.String())
+		}
+		response := maintenanceCLIResponse(t, &stdout)
+		if !response.OK || response.Maintenance == nil || response.Maintenance.HoldID != handler.result.HoldID || response.Maintenance.State != tc.state || !response.Maintenance.TreesRetired || stderr.Len() != 0 {
+			t.Fatalf("%s returned the wrong lease outcome: %+v stderr=%q", tc.cmd, response, stderr.String())
+		}
+		if len(handler.requests) != 1 {
+			t.Fatalf("%s submitted %d operations, want one", tc.cmd, len(handler.requests))
+		}
+		req := <-handler.requests
+		if req.Cmd != tc.cmd || (tc.cmd == "hold" && (req.ServerID != "exact-owner" || req.DrainTimeoutMs != 0)) || (tc.cmd != "hold" && req.HoldID != "exact-lease") {
+			t.Fatalf("%s changed the selected operation: %+v", tc.cmd, req)
+		}
+	}
+}
+
 func TestMaintenanceCLIEndpointLossIsNotHeld(t *testing.T) {
 	dir := shortTempDir(t, "ml")
 	t.Setenv("TMPDIR", dir)

@@ -109,19 +109,30 @@ func TestMaintenanceMCPUnsupportedEndpoint(t *testing.T) {
 
 type maintenanceRefusingDaemon struct {
 	fakeDaemonHandler
-	refusal     error
-	legacyCalls atomic.Int32
+	refusal         error
+	legacyCalls     atomic.Int32
+	delay           time.Duration
+	requests        chan control.Request
+	restartResponse control.Response
 }
 
-func (h *maintenanceRefusingDaemon) HandleRestartOwner(control.Request) (control.Response, error) {
-	return control.Response{}, h.refusal
+func (h *maintenanceRefusingDaemon) HandleRestartOwner(req control.Request) (control.Response, error) {
+	if h.requests != nil {
+		h.requests <- req
+	}
+	time.Sleep(h.delay)
+	return h.restartResponse, h.refusal
 }
 
 func (h *maintenanceRefusingDaemon) HandleStopOwner(control.Request) (string, error) {
 	return "", h.refusal
 }
 
-func (h *maintenanceRefusingDaemon) HandleMaintenance(control.Request) (control.MaintenanceResult, error) {
+func (h *maintenanceRefusingDaemon) HandleMaintenance(req control.Request) (control.MaintenanceResult, error) {
+	if h.requests != nil {
+		h.requests <- req
+	}
+	time.Sleep(h.delay)
 	return control.MaintenanceResult{}, h.refusal
 }
 
@@ -187,6 +198,68 @@ func TestMaintenanceMCPRestartUnsupportedWithoutDirectOwner(t *testing.T) {
 		if !isError || !errors.Is(response.Err(), control.ErrMaintenanceUnsupported) || legacy.shutdowns.Load() != 0 {
 			t.Fatalf("old endpoint used direct fallback: response=%+v isError=%v shutdowns=%d", response, isError, legacy.shutdowns.Load())
 		}
+	}
+}
+
+func TestMaintenanceMCPForceRestartDefaultBudgetReceivesDelayedOutcome(t *testing.T) {
+	dir := shortBaseDir(t, "mmrpc-")
+	endpoint := serverid.DaemonControlPath(dir, "mcp-mux")
+	const sid = "exact-local-owner"
+	h := &maintenanceRefusingDaemon{
+		fakeDaemonHandler: fakeDaemonHandler{listOwnersResp: control.ListOwnersResponse{Owners: []control.OwnerInfo{{ServerID: sid, ProtocolEra: "2026-07-28"}}}},
+		delay:             5200 * time.Millisecond,
+		requests:          make(chan control.Request, 4),
+		restartResponse:   control.Response{OK: true, ServerID: "restarted-owner", ProtocolEra: "2026-07-28", IPCPath: "restarted-endpoint", Token: "reservation"},
+	}
+	srv, err := control.NewServer(endpoint, h, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	legacy := &maintenanceLegacyTarget{}
+	ownerControl, err := control.NewServer(serverid.ControlPath(dir, "mcp-mux", sid), legacy, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ownerControl.Close)
+	response, isError := invokeMaintenanceTool(t, dir, endpoint, "mux_restart", `{"server_id":"`+sid+`","force":true}`)
+	if isError || !response.OK || response.ServerID != h.restartResponse.ServerID || response.ProtocolEra != h.restartResponse.ProtocolEra {
+		t.Fatalf("delayed original restart outcome lost: response=%+v isError=%v", response, isError)
+	}
+	if len(h.requests) != 1 || h.legacyCalls.Load() != 0 || legacy.shutdowns.Load() != 0 {
+		t.Fatalf("restart duplicated or fell back: requests=%d spawns=%d shutdowns=%d", len(h.requests), h.legacyCalls.Load(), legacy.shutdowns.Load())
+	}
+	if req := <-h.requests; req.Cmd != "restart_owner" || req.ServerID != sid || req.DrainTimeoutMs != 0 {
+		t.Fatalf("force restart changed its selected operation: %+v", req)
+	}
+}
+
+func TestMaintenanceMCPDefaultBudgetReceivesDelayedHoldRefusal(t *testing.T) {
+	dir := shortBaseDir(t, "mmholdrpc-")
+	endpoint := serverid.DaemonControlPath(dir, "mcp-mux")
+	result := &control.MaintenanceResult{
+		HoldID: "exact-lease", ServerID: "exact-owner", State: control.MaintenanceRetirementBlocked,
+		ExpiresAt: time.Now().Add(time.Minute).UTC(), DrainDeadline: time.Now().UTC(),
+	}
+	h := &maintenanceRefusingDaemon{
+		refusal:  &control.MaintenanceError{Code: control.ErrMaintenanceRetirementBlocked.Code, Result: result},
+		delay:    5200 * time.Millisecond,
+		requests: make(chan control.Request, 4),
+	}
+	srv, err := control.NewServer(endpoint, h, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	response, isError := invokeMaintenanceTool(t, dir, endpoint, "mux_hold", `{"server_id":"exact-owner","drain_timeout_ms":0}`)
+	if !isError || !errors.Is(response.Err(), control.ErrMaintenanceRetirementBlocked) || response.Maintenance == nil || response.Maintenance.HoldID != result.HoldID || response.Maintenance.State != result.State || response.Maintenance.TreesRetired {
+		t.Fatalf("delayed original blocked hold outcome lost: response=%+v isError=%v", response, isError)
+	}
+	if len(h.requests) != 1 || h.legacyCalls.Load() != 0 {
+		t.Fatalf("hold duplicated or fell back: requests=%d spawns=%d", len(h.requests), h.legacyCalls.Load())
+	}
+	if req := <-h.requests; req.Cmd != "hold" || req.ServerID != result.ServerID || req.DrainTimeoutMs != 0 {
+		t.Fatalf("hold retried, released, or changed its selection: %+v", req)
 	}
 }
 

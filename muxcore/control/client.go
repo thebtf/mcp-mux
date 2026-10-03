@@ -10,43 +10,24 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 )
 
-const clientDeadline = 5 * time.Second
+const (
+	clientDeadline     = 5 * time.Second
+	operationalTimeout = 180 * time.Second
+)
 
 // Send connects to the control socket, sends a Request, reads one Response, and closes.
 func Send(socketPath string, req Request) (*Response, error) {
-	conn, err := ipc.DialTimeout(socketPath, clientDeadline)
-	if err != nil {
-		return nil, fmt.Errorf("control: dial %s: %w", socketPath, err)
-	}
-	defer conn.Close()
-
-	// Set overall deadline for the entire exchange
-	if err := conn.SetDeadline(time.Now().Add(clientDeadline)); err != nil {
-		return nil, fmt.Errorf("control: set deadline: %w", err)
-	}
-
-	// Send request
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("control: marshal request: %w", err)
-	}
-	data = append(data, '\n')
-	if _, err := conn.Write(data); err != nil {
-		return nil, fmt.Errorf("control: write: %w", err)
-	}
-
-	// Read response
-	dec := json.NewDecoder(conn)
-	var resp Response
-	if err := dec.Decode(&resp); err != nil {
-		return nil, fmt.Errorf("control: read response: %w", err)
-	}
-
-	return &resp, nil
+	return SendWithTimeout(socketPath, req, 0)
 }
 
-// SendWithTimeout is like Send but uses a custom deadline for long operations like drain.
+// SendWithTimeout honors positive deadlines. Otherwise hold and restart_owner
+// use the operational completion allowance plus one requested drain; other
+// commands retain the short exchange deadline. This does not limit server work.
 func SendWithTimeout(socketPath string, req Request, timeout time.Duration) (*Response, error) {
+	timeout, err := controlTimeout(req, timeout)
+	if err != nil {
+		return nil, err
+	}
 	dialTimeout := clientDeadline
 	if timeout > 0 && timeout < dialTimeout {
 		dialTimeout = timeout
@@ -57,9 +38,6 @@ func SendWithTimeout(socketPath string, req Request, timeout time.Duration) (*Re
 	}
 	defer conn.Close()
 
-	if timeout <= 0 {
-		timeout = clientDeadline
-	}
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("control: set deadline: %w", err)
 	}
@@ -80,6 +58,19 @@ func SendWithTimeout(socketPath string, req Request, timeout time.Duration) (*Re
 	}
 
 	return &resp, nil
+}
+
+func controlTimeout(req Request, timeout time.Duration) (time.Duration, error) {
+	if timeout > 0 {
+		return timeout, nil
+	}
+	if req.Cmd != "hold" && req.Cmd != "restart_owner" {
+		return clientDeadline, nil
+	}
+	if req.DrainTimeoutMs < 0 || int64(req.DrainTimeoutMs) > int64((time.Duration(1<<63-1)-operationalTimeout)/time.Millisecond) {
+		return 0, ErrMaintenanceInvalid
+	}
+	return operationalTimeout + time.Duration(req.DrainTimeoutMs)*time.Millisecond, nil
 }
 
 // SendMaintenance performs one maintenance exchange without lifecycle fallback.
