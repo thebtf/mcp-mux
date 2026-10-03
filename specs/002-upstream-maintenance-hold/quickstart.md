@@ -1,6 +1,6 @@
 # Prove live upstream executable replacement
 
-This guide is the implementation/release oracle. The feature, fixtures, and cross-platform runner are implemented in candidate `1f3c119ef6841b219412e4e6a93f6a452b7339a8`, but technical acceptance and delivery remain pending. Observed live replacement proof at `45d4f93` passed on Windows with 1158/1158 assertions and Debian Linux with 1191/1191, including original host pipes, full-tree retirement, actual executable overwrite, and no replay. [Release evidence](release-evidence.md) binds those runs to their source and binary hashes and distinguishes unchanged product-source reuse from fresh exact-HEAD execution. Root full tests/vet and focused/integrated race receipts are recorded there. R1 parity, critical-suite recovery, Scenario 5b/8, final root review, and release/consumer delivery remain pending in that snapshot. This documentation update ran no tests or builds. The accepted scope retains ordinary release intent; no release version has been selected.
+This guide is the implementation/release oracle. The feature is implemented through `1f3c119`; current candidate `0b443b0ea51078814e76d12af0632fb9b5d52cc0` adds only milestone docs. Root admits T029 complete on focused core/adapter maintenance proof, Windows live 1158/1158 and Debian Linux live 1191/1191 replacement assertions, and selected Go 1.25.12 R1 parity on both platforms with 8/8 scenarios and 100/100 corpus frames each. [Release evidence](release-evidence.md) records exact source/binary bindings and unchanged-source reuse, not fresh full/runtime execution at every successor SHA. T030 critical aggregate and Scenario 5b/8, including native Unix coverage, and T031 final root acceptance remain pending. The feature is not delivered. This documentation update ran no tests or builds. Ordinary release intent remains; no release version has been selected.
 
 ## Prerequisites
 
@@ -89,6 +89,8 @@ pwsh -NoProfile -File scripts/smoke-native-sessionhandler-update.ps1 -RunDir (Jo
 ```
 
 The last command is production Scenario 5b. Run applicable Scenario 8 lifecycle/tree tests from `docs/PRODUCTION-TESTING-PLAYBOOK.md`, including Windows and Unix process-group/Job tests. Retain R1 native parity proof using the existing runners:
+
+Prepare an existing root-owned OutputDir before invoking the Windows R1 verifier. On Unix, use a fresh empty OutputDir and set and export `MCP_MUX_R1_GOMODCACHE` to an explicit existing module cache. Set and export `MCP_MUX_R1_GO` to the resolved actual Go 1.25.12 executable. The Unix verifier pins `GOTOOLCHAIN=local`; a 1.26 base executable with `GOTOOLCHAIN=go1.25.12` is not sufficient. Resolve the selected toolchain root with `GOTOOLCHAIN=go1.25.12 go env GOROOT` and use its `bin/go`, rather than hardcoding another run's Docker path. Confirm the resulting executable reports Go 1.25.12 before the verifier. Preserve setup failures and nonselected-toolchain runs as evidence, not selected gate passes.
 
 ```powershell
 pwsh -NoProfile -File scripts/verify-r1-native-isolation.ps1 -SourceRoot . -OutputDir (Join-Path $ScratchRoot 'r1-windows')

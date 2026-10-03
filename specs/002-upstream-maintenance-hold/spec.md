@@ -4,11 +4,11 @@
 
 **Created**: 2026-10-03
 
-**Status**: Implemented in candidate `1f3c119ef6841b219412e4e6a93f6a452b7339a8`; requirements reviewed against accepted ADR-015. Verification is partial, root technical acceptance is pending, and the feature is not delivered.
+**Status**: Implemented through `1f3c119ef6841b219412e4e6a93f6a452b7339a8`, with docs-only successor `0b443b0ea51078814e76d12af0632fb9b5d52cc0`; requirements reviewed against accepted ADR-015. Root admits T029 integrated proof complete. T030/T031 technical acceptance is pending, and the feature is not delivered.
 
 **Input**: [GitHub #135](https://github.com/thebtf/mcp-mux/issues/135): release a managed upstream for in-place executable replacement and suppress respawn until explicit resume or safe timeout. Existing stop is not a maintenance hold.
 
-Current milestone evidence is in [release evidence](release-evidence.md) and [tasks](tasks.md). Windows and Debian Linux live replacement passed at `45d4f93`; root full tests/vet, focused maintenance race, integrated five-package race, and the bounded seven-finding source closeout have recorded receipts. Those observations do not complete R1 parity, critical-suite recovery, Scenario 5b/8, or final root review. The accepted full-slice scope retains ordinary release intent, not a source-only exemption. No release version, PR, tags, current-module publication, or consumer delivery is recorded.
+Current milestone evidence is in [release evidence](release-evidence.md) and [tasks](tasks.md). Windows and Debian Linux live replacement passed at `45d4f93`; focused core/adapter proof and selected Go 1.25.12 R1 parity on both platforms complete T029, as admitted by root. Full tests/vet, integrated race, and the bounded seven-finding source closeout retain their exact-source limits. T030 critical aggregate and Scenario 5b/8, including native Unix coverage, and T031 final root acceptance remain pending. The accepted full-slice scope retains ordinary release intent, not a source-only exemption. No release version, PR, tags, current-module publication, or consumer delivery is recorded.
 
 ## User Scenarios & Testing *(mandatory)*
 

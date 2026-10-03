@@ -6,9 +6,9 @@ This is the T029 evidence artifact for GitHub #135. The accepted ADR-015 full-sl
 
 | State | Recorded outcome |
 | --- | --- |
-| Implemented | Core, optional public APIs, CLI/MCP adapters, consumer docs, fixtures, and cross-platform live runner are implemented in candidate `1f3c119ef6841b219412e4e6a93f6a452b7339a8`. |
-| Verified | Windows and Debian Linux live replacement at `45d4f93`, root/muxcore full tests and vet at `42ef546`, focused maintenance race on the subsequently committed TTL-fixture patch, integrated five-package race at exact `1f3c119`, and bounded seven-finding source closeout. |
-| Technically accepted | Not yet. T029 R1 parity, T030 critical/scenario outcomes, and T031 final root review remain pending in this snapshot. |
+| Implemented | Core, optional public APIs, CLI/MCP adapters, consumer docs, fixtures, and cross-platform live runner are implemented through `1f3c119ef6841b219412e4e6a93f6a452b7339a8`; current candidate `0b443b0ea51078814e76d12af0632fb9b5d52cc0` adds only the four owning milestone documents. |
+| Verified | Root admits T029 complete: focused core and adapter maintenance proof, Windows/Linux live replacement, and selected Go 1.25.12 R1 parity on both platforms. Full tests/vet, integrated race, and bounded seven-finding source closeout retain their recorded scope below. |
+| Technically accepted | Not yet. T030 critical aggregate and Scenario 5b/8, including native Unix coverage, remain pending; T031 final root acceptance awaits those outcomes. T029 completion is not feature acceptance. |
 | Delivered | No. No release version has been selected, no PR or release tags created, and no current-module publication or consumer delivery recorded. T032/T033 remain incomplete. |
 
 This documentation update inspected existing receipts only. It ran no tests, builds, vet, linters, formatters, or repeated gates and made no commit. The plan, acceptance scenarios, and required commands in [tasks](tasks.md), [specification](spec.md), and [quickstart](quickstart.md) remain authoritative. Later root gate outcomes must be appended before acceptance or delivery is claimed.
@@ -23,11 +23,12 @@ All local raw-evidence paths below are relative to the **primary** checkout `D:/
 | Candidate root | `D:/Dev/mcp-mux/.agent/worktrees/upstream-maintenance-01a0fb9a` |
 | Full tests/vet source | `42ef546d146b1e0bc9541f64e9c228d6ba5d3358` |
 | Live replacement source | `45d4f93ec7c2703db1a57dfa48efc477accb1386` |
-| Current source candidate | `1f3c119ef6841b219412e4e6a93f6a452b7339a8` |
+| Current source candidate | `0b443b0ea51078814e76d12af0632fb9b5d52cc0` |
 | `42ef546` to `45d4f93` | Known complete changed-path set is only `scripts/smoke-upstream-maintenance.ps1`. Go product and regression source are unchanged across this interval. |
 | `45d4f93` to `1f3c119` | Known complete changed-path set is only `muxcore/daemon/maintenance_test.go`, the TTL fixture repair, with 7 additions and 1 deletion. Go product source remains unchanged; the test corpus is not identical. |
+| `1f3c119` to `0b443b0` | Root committed only `specs/002-upstream-maintenance-hold/{release-evidence.md,tasks.md,quickstart.md,spec.md}`. Product and regression source are unchanged. |
 
-The changed-path relationships are recorded in `agent://MaintenanceReviewCloseout` and root's supplied commit-path evidence. This writer did not rerun Git comparison or rebuild the candidate. Reuse of the `42ef546` full-test/vet and `45d4f93` live receipts is bounded to unchanged source. It is **not** a claim that those commands ran freshly at exact `1f3c119`, nor a claim that independently built binaries at different SHAs have identical hashes. Only the integrated race receipt below is an exact committed-`1f3c119` execution.
+The changed-path relationships are recorded in `agent://MaintenanceReviewCloseout` and root's supplied commit-path evidence. This writer did not rerun Git comparison or rebuild the candidate. Root admits reuse of the `42ef546` full-test/vet and `45d4f93` live receipts within their unchanged-source scope, including the TTL-test-only `1f3c119` and docs-only `0b443b0` successors. This is **not** a claim that those commands ran freshly at exact `1f3c119` or `0b443b0`, nor that independently built binaries at different SHAs have identical hashes. The integrated race ran from exact committed `1f3c119`; the new focused adapter command ran from exact committed `0b443b0`.
 
 | Live artifact | SHA-256 |
 | --- | --- |
@@ -103,6 +104,7 @@ Root supplied the command/exit receipt titled `Binding exact declared full check
 | `42ef546`, candidate `muxcore` | `go vet ./...` | 0; no diagnostics | `P/muxcore-vet-42ef.log` |
 | `45d4f93` plus only the TTL-fixture patch later committed as `1f3c119`, candidate `muxcore` | `go test -race ./control ./daemon ./owner ./engine ./upstream -run ^TestMaintenance -count=1 -timeout=180s -v` | 0; 143 named PASS cases, including subcases, across 5 packages; 1 Windows SKIP | `P/race-maintenance-renew-green.log` |
 | Exact committed `1f3c119`, candidate `muxcore` | `go test -race ./control ./daemon ./owner ./engine ./upstream -count=1 -timeout=240s` | 0; 5/5 packages PASS | `P/race-integrated-1f3.log` |
+| Exact committed `0b443b0`, candidate root | `go test ./cmd/mcp-mux ./internal/mcpserver -run ^TestMaintenance -count=1 -timeout=120s -v` | 0; 66 named PASS rows across 2/2 packages, no named FAIL or SKIP | `P/maintenance-adapters-0b4.log` |
 
 The race commands' root receipt records `GOTOOLCHAIN=go1.25.12` and `TMP`, `TEMP`, `TMPDIR`, and `GOTMPDIR` bound to primary `P`. No unrecorded environment or timestamp is assigned to the older full-test/vet commands.
 
@@ -110,7 +112,37 @@ The focused log has 46 top-level maintenance PASS rows and 97 passing subcases, 
 
 The integrated exact-`1f3c119` race log records control 9.237s, daemon 117.000s, owner 70.791s, engine 11.487s, and upstream 14.370s. It supplies package results, not per-case denominators.
 
+Root's new focused adapter receipt records Go 1.25.12 and primary scratch environment. The raw log records command package 4.637s and MCP server package 0.133s. Its 66 named PASS rows include subcases, not 66 independent top-level tests. This supplies the adapter portion of the now-admitted T029 focused maintenance proof without changing historical RED task claims.
+
 The earlier preserved `P/race-maintenance.log` is RED for the 500ms acquisition fixture. Root's `MaintenanceRaceTTLRepair` source trace found that TTL begins before real race-built helper retirement, so acquisition correctly refused an already-expired usable lease. The fixture now acquires with the default TTL, proves HELD and retired trees, and renews the exact lease to 500ms before testing short expiry. Production code did not change. The subsequent focused GREEN is on those patched working-tree bytes before commit, not a test launched from committed `1f3c119`. This isolated observed RED/GREEN does not reconstruct every historical failing-before task clause.
+
+## Selected R1 parity and T029 completion
+
+Root read back both selected summaries and admits T029 complete. The selected runs use actual Go 1.25.12, not a newer base Go executable with an ineffective toolchain environment override.
+
+| Selected R1 proof | Windows | Unix |
+| --- | --- | --- |
+| Primary summary | `P/r1-windows-1f3/summary.json` | `P/docker/r1-unix-45d-go125-toolchain/summary.json` |
+| Source SHA | `1f3c119ef6841b219412e4e6a93f6a452b7339a8` | `45d4f93ec7c2703db1a57dfa48efc477accb1386` |
+| Reported Go | `go version go1.25.12 windows/amd64` | `go version go1.25.12 linux/amd64` |
+| Result and exit | PASS, exit 0 | PASS, exit 0 |
+| Scenario denominator | 8/8 PASS | 8/8 PASS |
+| Modern corpus denominator | 100/100 PASS | 100/100 PASS |
+| Candidate SHA-256 | `a35902e70aa406227334f9bb4acb413fc3a891972594414433a0ffa161068483` | `c0ebb16fb8de29799d4e3e1513aa40ebd10d803d4579de5d272b0254d8ac48fa` |
+| Modern fixture SHA-256 | `d87681e341df6903862e854f84bf5cf5454c899ba22ce4c49cf1ab6053346e16` | `ae7172808b45dd6317ee901055a471e187033d0685cdd668b04c9650ef96e56f` |
+| Corpus SHA-256 | `e616d970bde2282ca97dfe4db2acb434008baf75cecade002f190938ce22588a` | `b61ae9d4eef44d153b3b0e88f2ce717a811bf06bef4f1baf87dca428753514eb` |
+| Transcript SHA-256 | `5ee775a5841153e866e8dacdf2a49a5529a158952965c6cc7f7644fa53ed9786` | `bd22375492b36dc013cb1e687a7c8e6c10d5685f9507fa64875c39fbd8b060d4` |
+| Base directory readback | `base_dir_removed=true`, `base_dir_preserved=false` | `base_preserved=false`; no separate removed flag in this schema |
+
+The selected Windows command is `pwsh -NoProfile -File C/scripts/verify-r1-native-isolation.ps1 -SourceRoot C -OutputDir P/r1-windows-1f3`, with `GOTOOLCHAIN=go1.25.12`, `TMP=P`, and `TEMP=P`. The existing Windows output directory was prepared before the successful invocation. The receipt supplies exit 0 and retains `transcript.ndjson`, `artifacts/evidence-hashes.json`, and per-scenario artifacts beneath that output directory, plus primary stdout/stderr logs.
+
+The selected Unix command is `bash scripts/verify-r1-native-isolation.sh --source-root /repo/c45d --output-dir /repo/c45d/.agent/tmp/u/r1-unix-45d-go125-toolchain`, with `MCP_MUX_R1_GOMODCACHE=/repo/.agent/tmp/u/gomod` and `MCP_MUX_R1_GO=/repo/.agent/tmp/u/gomod/golang.org/toolchain@v0.0.1-go1.25.12.linux-amd64/bin/go`. Those are observed container paths, not portable quickstart defaults. The receipt supplies exit 0. Its selected primary directory also retains `transcript.ndjson`, six scenario artifacts, and `r1-unix-45d-go125-toolchain.stdout.log`.
+
+Earlier Unix runs in `P/docker/r1-unix-45d/summary.json` and `P/docker/r1-unix-45d-go125/summary.json` produced successful scenario/corpus results under **Go 1.26.6 and are NOT selected Go 1.25.12 evidence**. The verifier pins `GOTOOLCHAIN=local`, so selecting `/usr/local/go/bin/go` did not select the downloaded 1.25.12 toolchain. The final selected summary confirms the direct 1.25.12 binary.
+
+Setup failures remain preserved, not converted to passes: Windows initially exited 2 because OutputDir did not exist; Unix initially exited 2 for unset `MCP_MUX_R1_GOMODCACHE`, then exited 2 for nonempty OutputDir. Unix logs remain at `P/docker/r1-unix-45d/{setup-missing-cache.log,setup-nonempty-output.log}`; Windows initial stdout/stderr references remain in its worker receipt. These attempts are not selected gate evidence.
+
+T029 is now root-admitted complete on the focused core and adapter receipts, both live OS replacement receipts, and both selected R1 parity receipts, with source reuse bounded as declared above. R1's numbered Scenario 8 is modern-owner operator rollback. It does **not** establish the production playbook's Unix held-reaper/full-tree Scenario 8 coverage, which remains a T030 obligation. No T031 technical acceptance or T032/T033 delivery is inferred.
 
 ## Seven-finding source review closeout
 
@@ -134,13 +166,10 @@ These rows are factual pending outcomes at this milestone snapshot, not a generi
 
 | Task / gate | Current recorded state | Outcome still required |
 | --- | --- | --- |
-| T029 R1 Windows | Assigned parity run is in progress; no final result incorporated here. | Exact candidate command, nonzero denominator, exit/result and raw artifact readback from `verify-r1-native-isolation.ps1`. |
-| T029 R1 Unix | Assigned parity run is in progress; no final result incorporated here. | Exact candidate command, nonzero denominator, exit/result and raw artifact readback from `verify-r1-native-isolation.sh`. Linux maintenance live PASS is not R1 parity PASS. |
 | T030 critical suite | Prior child execution was interrupted/aborted after roughly 30 minutes. `CriticalExecutionRecovery` is recovering actual exit/hang evidence. No critical PASS is recorded. | Terminal outcome and exact raw evidence for `tests/critical/run-all.ps1 -TimeoutSeconds 120`, including required launcher configuration and any recovery disposition. |
 | T030 Scenario 5b | Evidence recovery is pending. No completed native-update scenario receipt is incorporated. | Observed native-sessionhandler update result, original connection/no-replay evidence, exact source/binary binding and exit. |
-| T030 Scenario 8 | Applicable lifecycle/tree evidence recovery is pending. Full suite and maintenance smoke receipts do not certify the whole scenario. | Applicable Windows and Unix process-group/Job/lifecycle evidence and its explicit scenario disposition. |
-| T030 exact-source reuse | Older full tests/vet ran at `42ef546`; current live proof ran at `45d4f93`; only integrated race ran from exact committed `1f3c119`. | Root must disposition the declared unchanged-source reuse and the test-only successor under its exact-candidate acceptance contract. No fresh-HEAD full/runtime run is fabricated here. |
-| T031 final root review | Seven source findings closed within their assigned scope. The complete candidate/frozen evidence is not technically accepted. | Root review of all requirements, public APIs, migration/rollback docs, remaining gate outcomes, and any residual findings. |
+| T030 Scenario 8 | Native Unix held-reaper/full-tree coverage remains pending. R1 Scenario 8 is operator rollback, not this coverage. Earlier `P/docker/linux-focused-valid.log` reports failed whole-tree death and a too-long engine socket path; `linux-full-fixture-green.log` has only package PASS rows without source SHA or named cases. | Applicable source/toolchain-bound Windows and Unix process-group/Job/lifecycle evidence and explicit scenario disposition, including named Unix held-reaper/full-tree proof. Stale failing or unbound package-only receipts do not establish it. |
+| T031 final root review | Seven source findings closed within their assigned scope; T029 admitted complete. The complete candidate/frozen evidence is not technically accepted while T030 remains pending. | Root review of all requirements, public APIs, migration/rollback docs, T030 outcomes, and any residual findings. |
 | T032 release | Ordinary release intent retained. No selected version, PR, merge, tags, current-module publication, or binary delivery recorded. | Post-acceptance version decision, changelog/release notes, authorized exact-SHA merge/tag-last flow, remote tag parity and module/binary delivery. |
 | T033 consumers and canary | Current-version handoffs, fresh-clone/module/binary canary, and fresh-session delivered hold/replace/resume proof are not recorded. Engram native issue capability is unmounted; no backend substitute is invented. | Target-authorized consumer handoff/readback through the owning capability, plus delivered-artifact and fresh-session proof. Record the exact missing capability boundary if it remains unavailable. |
 
