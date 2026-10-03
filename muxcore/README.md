@@ -663,6 +663,14 @@ tree death and durable release; blocked retirement never TTL-clears. Renew uses
 serialized acceptance without changing retirement state or reviving a released/
 expired lease. Stale identities cannot clear a replacement lease.
 
+Managed `SessionHandler` owners also require actual return of every admitted
+callback before retirement is proved. Callbacks still active after the accepted
+drain, including handlers that ignore cancellation, keep `RETIREMENT_BLOCKED`;
+TTL expiry and resume cannot release that fence. Existing exact-entry
+finalization retry can prove retirement after actual return, subject to the
+original lease clock. Neither retry nor callback completion resets TTL/drain.
+Keep the fence and inspect status; a cancelled context alone is not proof.
+
 A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
 TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.

@@ -58,6 +58,10 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 - Concurrent legacy `engine.New` cold starters wait for the winning daemon's
   bounded readiness check on namespace-lock contention instead of returning
   terminal `ErrFileLocked`; other lock errors remain unchanged.
+- Managed `SessionHandler` retirement requires actual return of admitted callbacks.
+  Active callbacks keep `RETIREMENT_BLOCKED`, even if cancellation is ignored;
+  TTL and resume cannot bypass them. Existing finalization retry can complete
+  after return without resetting the accepted lease clock.
 
 ### Compatibility
 
@@ -77,7 +81,9 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Go tests and vet, native Scenario 5b, Unix lifecycle coverage, R1 parity on both
   operating systems, and the complete critical suite. These checks do not prove
   publication, the final delivered binary, or consumer adoption.
-  Exact-source timing/RPC proofs are historical; cold-start correction checks remain pending.
+  Timing/RPC and cold-start proofs remain source-bound. The native callback
+  correction has Windows focused/race/full/vet proof on runtime bytes committed
+  as 8f09; new-source Linux/CI, final documentation freeze, and delivery are pending.
 
 ### Rollback
 

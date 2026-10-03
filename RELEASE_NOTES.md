@@ -69,6 +69,12 @@ the new control operations only when they need maintenance.
 - Drain defaults to 10s and uses the same `T` as TTL without restarting. Zero skips grace,
   not tree-death proof. CLI TTL and drain durations require whole milliseconds;
   sub-millisecond values are rejected rather than truncated.
+- Managed `SessionHandler` owners need actual return of admitted callbacks,
+  not merely a closed session or cancelled context. Callbacks active after the
+  drain keep `RETIREMENT_BLOCKED`, including handlers that ignore cancellation.
+  TTL and resume cannot release that fence. Existing exact-entry retry can
+  complete retirement after return, using the original accepted lease clock.
+  Keep the fence and inspect status; no native-handler topology is excluded.
 
 The durable `HOLDING` seed has provisional timing and never grants replacement.
 Sample `T` once after its first complete writer acknowledgment, then persist clocked `HOLDING` once.
@@ -87,6 +93,9 @@ JSON-RPC `-32005`, message `upstream held for update`, and
 ID. The fence wins over cached success. Unfinished work terminated by retirement
 gets one terminal error. Held and terminated work never replays, and
 notifications receive no invented response.
+Pre-fence unfinished work may receive the existing original-ID `-32603`
+reconnect error. `-32005` applies to requests received under the fence; this
+correction does not change that distinction or add replay.
 
 After durable release, fresh legacy demand reaches a new generation on the same
 pipes. Modern demand uses fresh exact-era isolated admission with required
@@ -141,8 +150,14 @@ Before the durable-clock and RPC-budget corrections, the release root recorded:
   the complete critical suite, 5/5 with exit zero. The seven known review
   corrections were closed in the accepted source.
 
-Latest durable-clock and RPC-budget correction checks remain pending. The prior
-results above do not verify the updated clock or transport-budget policy.
+Later timing/RPC and cold-start checks have source-bound receipts in
+[release evidence](specs/002-upstream-maintenance-hold/release-evidence.md).
+The native callback correction has actual Windows RED/GREEN: six blocking
+cases fail before the fix; all eight legacy/modern scenarios pass afterward,
+including race. Root/muxcore full tests and vet also pass on identical runtime
+bytes tested before commit `8f09dc08bf16fac511b1c43d94ce22c4ecf3f261`.
+Root accepts that bounded technical correction; new-source Linux/CI and final
+review/documentation freeze remain pending. No post-commit rerun inferred.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

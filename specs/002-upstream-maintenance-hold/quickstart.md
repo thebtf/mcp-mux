@@ -1,6 +1,6 @@
 # Prove live upstream executable replacement
 
-This guide is the implementation/release oracle. Source `28947dca06047bbb342600153f7c39c8868c00e8` is committed/pushed with cold-start and README/changelog corrections. Root records focused cold-start RED/GREEN/safety proof, full tests/vet exit 0, compatibility JSON Windows 1149/1149 and Linux 1173/1173 PASS with zero errors/cleanup errors, and CI 37142995133 all five jobs PASS. [Release evidence](release-evidence.md) preserves exact receipts and historical b5cb proof. Linux embeds clean exact 28947; Windows embedded revision begins `d3c5` with modified=true, an unexplained identity limit. The CLI does not link engine, so compatibility smoke is not engine proof. Ten earlier threads are resolved; the new eleventh [native `SessionHandler` retirement finding](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174287243) is under root disposition. T031 remains REPAIRING despite passing gates. The completed b5cb observer's `REVIEW_BUDGET_EXHAUSTED` limited observation, not root repair. No final freeze/acceptance or released canary is claimed. Binary/library `0.31.0` is prepared, PR #150 is open, and T032/T033 delivery remains pending. Later receipts stay primary-only; this update ran no checks or remote operations.
+This guide is the implementation/release oracle. Pushed source `8f09dc08bf16fac511b1c43d94ce22c4ecf3f261` contains the root-accepted bounded native retirement correction and fixture. Windows eight-scenario RED/GREEN, focused race, and root/muxcore full/vet PASS bind identical runtime bytes tested before commit. [Release evidence](release-evidence.md) preserves logs, historical scopes, and artifact limits. Active callbacks keep `RETIREMENT_BLOCKED` despite cancellation; TTL/resume cannot bypass actual return, and retry retains the original clock. Generic original-ID `-32603` on pre-fence orphaned work remains legal; newly fenced requests get `-32005`. No topology exclusion added. Root reports eleven known threads resolved after read-back reply 4174464694; fresh final bounded observer and exact-head Linux native/built Windows/Linux caller/CI proof remain pending before documentation freeze. T031/T032/T033 incomplete, binary/library `0.31.0` prepared, PR #150 open. No all-diff CLEAN, final freeze, or released canary claimed. Later receipts stay primary-only; this update ran no checks or remote operations.
 
 ## Prerequisites
 
@@ -57,6 +57,13 @@ go test ./cmd/mcp-mux ./internal/mcpserver -run '^TestMaintenance' -count=1
 ```
 
 Capture named cases and denominator, including failing-before/passing-after respawn suppression, start-through-install race, placeholder settlement, actual drain, all-tree death versus handoff, finite CWD/era/security/namespace context sets, stale generations/leases, durable commit failures, startup order, renewal/expiry/blocked retirement, terminal launcher/update refusal, unsupported standalone paths, and held queue/reconnect disposition.
+
+Managed `SessionHandler` proof distinguishes cancellation from actual callback
+return. Cover both eras with zero/short drain, expiry while blocked, and completion
+before deadline. Active callbacks retain `RETIREMENT_BLOCKED` without TTL/resume
+bypass; exact-entry retry after return uses the original clock. Verify one
+original-ID terminal result for pre-fence work, `-32005` for newly fenced requests,
+zero late duplicate/replay, and fresh work on the original host pipes.
 
 Include `TestMaintenanceSecurity002NoncanonicalKeyRefusesStartup`, `TestMaintenanceSecurity003DuplicateMembersRefuseStartup`, and the `TestMaintenanceSecurity004` cases for post-publication failure, all six PREPARE/PUBLISH/FINALIZE before/after faults, incomplete aggregates, and acknowledged release without predecessor resurrection. A finalize-after-publication fault must still return persistence failure while aggregate recovery may accept a matching COMMITTED certificate proving earlier acknowledged durable publication. Other uncertain pairs must preserve fencing or refuse startup/activation. Portable injected durability faults do not prove an actual Unix fsync failure or full Unix runtime.
 
