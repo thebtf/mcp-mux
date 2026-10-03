@@ -104,13 +104,21 @@ mcp-mux resume <hold-id> --json
 Only durable, unexpired `HELD` with `trees_retired=true` permits installer-owned
 replacement. `HOLDING` and `RETIREMENT_BLOCKED` stay fenced; blocked retirement
 never TTL-clears. TTL defaults to 5m, is positive, and is at most 1h. Drain
-defaults to 10s, starts once at fence commitment, and zero skips grace rather
-than tree-death proof. TTL starts at durable fence commitment. Resume/renew
+defaults to 10s; zero skips grace, not tree-death proof. Resume/renew
 affect only the exact current lease; renew sets expiry from serialized acceptance
 and cannot revive a released/expired lease. Resume/safe expiry require tree death
 and durable release.
 CLI TTL and drain durations must be whole milliseconds; reject sub-millisecond
 values instead of truncating a positive drain to zero-force retirement.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+Without a positive caller timeout, neutral `control.SendWithTimeout` allows 180s plus one drain for `hold`/`restart_owner`.
+Explicit positive budgets are honored; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
+A timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, with no automatic retry/resume or stop fallback.
 
 Scope is the selected owner's finite admitted CWD/era/security/configuration/
 namespace context set, not a host-wide executable lock. Aware shims preserve
@@ -193,9 +201,10 @@ full-tree HELD proof, original-ID errors/no replay, exact lease timing, terminal
 lifecycle refusal, and compatibility limits above are the consumer contract.
 Legacy stays the default and modern R1 stays explicitly same-era and isolated.
 
-Publication targets are `v0.31.0` and `muxcore/v0.31.0`. Accepted-source technical
-checks are recorded in `RELEASE_NOTES.md`; final version-baked/delivered-artifact
-proof, tags/module resolution, and Engram handoff remain release-root work.
+Publication targets are `v0.31.0` and `muxcore/v0.31.0`. Prior accepted-source
+checks are recorded in `RELEASE_NOTES.md`; latest durable-clock/RPC-budget checks
+remain pending. Final artifact proof, tags/module resolution, and Engram handoff
+remain release-root work.
 Do not report this prepared scope as shipped or `CONSUMER_HANDOFF_PASS`.
 
 Rollback to `muxcore/v0.30.0` or a compatible previous binary only after the

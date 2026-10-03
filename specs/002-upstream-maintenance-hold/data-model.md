@@ -13,12 +13,14 @@ One lease contains:
 - random opaque hold ID;
 - private finite context-key set and schema/key versions;
 - state `HOLDING`, `HELD`, or `RETIREMENT_BLOCKED`;
-- UTC accepted expiry and the one accepted drain deadline;
+- provisional timing for the incomplete durable seed, then UTC expiry and the one drain deadline derived from `T` after seed acknowledgment;
 - safe timing metadata needed for deterministic readback/recovery.
 
 The schema-2 logical ledger comprises mandatory `ledger.json` and `transaction.json`. The ledger member contains schema version, endpoint/namespace scope, transaction ID, and current leases. The transaction member contains the matching identity and target digest, plus predecessor leases only while PREPARED. Neither contains raw command/env/credentials, MCP frames, arbitrary reasons, public generation maps, or modern snapshot state. Public target server ID and pinned generations remain in daemon memory; after recovery, unavailable display metadata must not be reconstructed from private keys.
 
 Versioned ledger directory: current-user persistent configuration root, product subdirectory, and full canonical endpoint/namespace digest. Canonicalization resolves the endpoint parent, not the socket leaf. Aggregate lookup validates both members, canonical lowercase keys, and unambiguous JSON; missing, pending, mismatched, or invalid pairs fail closed. Each member uses restrictive same-directory temp write, flush, platform replacement, and required Unix directory durability, not atomic two-file replacement. PREPARE retains predecessor leases and the target digest; PUBLISH follows acknowledged durable preparation; FINALIZE writes COMMITTED only after acknowledged durable target publication. Errors never acknowledge the new state or open live admission. A finalize error can nevertheless leave a valid certificate that recovery verifies as proof of earlier durable publication. See [phase outcomes](contracts/maintenance.md#authority-and-lifecycle-boundaries). Do not erase authority or truncate in place. A committed HOLDING fence persists even if the caller disconnects.
+
+Acquisition first persists a complete durable `HOLDING` seed with provisional timing and incomplete retirement proof, never a usable grant. Sample `T` once after the first complete writer acknowledgment, then persist clocked `HOLDING` once with expiry `T + TTL` and drain deadline `T + drain`. The second write, retirement, HELD publication, and response consume the original window without resetting `T`. Any acquisition write failure retains the conservative seed fence; incomplete recovery is `RETIREMENT_BLOCKED` with no expiry/resume. Existing schema/states suffice; renewal still uses serialized exact-lease acceptance.
 
 ## In-memory process authority
 
@@ -30,17 +32,18 @@ Exact pinned OwnerEntry/OwnerGeneration and every matched process authority rema
 
 | Current state | Event | Result |
 | --- | --- | --- |
-| No fence | Valid exact-target hold, scope pinned, durable commitment | HOLDING; new requests/starts rejected, drain deadline begins once. |
+| No fence | Valid exact-target hold, scope pinned, durable seed acknowledged | HOLDING; admission fenced, provisional timing is not a grant. |
+| HOLDING seed | Sample `T` once after first complete writer acknowledgment, persist clocked HOLDING once | HOLDING; expiry/drain derive from `T`, later writes and retirement consume that window. |
 | HOLDING | In-flight work finishes or single drain deadline arrives; full tree death and durable usable lease confirmed | HELD. |
 | HOLDING | Retirement proof fails, incomplete authority/placeholder, or unplanned loss | RETIREMENT_BLOCKED; keep fence. |
 | HELD | Exact-ID valid renewal | HELD with durable expiry = renewal acceptance + TTL. |
-| HOLDING or RETIREMENT_BLOCKED | Exact-ID valid renewal before expiry | Same state, new durable expiry; no tree-proof substitution. |
+| Clocked HOLDING or RETIREMENT_BLOCKED | Exact-ID valid renewal before expiry | Same state, new durable expiry; no tree-proof substitution. |
 | HELD | Exact-ID resume, or accepted expiry | Durably remove/release lease, then open admission; return RELEASED for resume. |
-| HOLDING or RETIREMENT_BLOCKED | Resume or expiry without tree death proof | Refuse and stay fenced. |
+| Incomplete seed/recovery, or HOLDING/RETIREMENT_BLOCKED without tree death proof | Resume or expiry | Refuse and stay fenced; provisional elapsed timing never opens admission. |
 | RETIREMENT_BLOCKED | Original live authority later proves all trees dead | Durably HELD only with usable expiry, otherwise safely release after proof without issuing an expired installer grant. |
 | Any active fence | Controlled restart/handoff/shutdown/downgrade/idle exit | Terminal refusal, no state change/fallback. |
 | Persisted HELD | Unplanned aware startup | Load fence before admission; release only if safely expired and durable release succeeds. |
-| Persisted incomplete record | Unplanned aware startup | RETIREMENT_BLOCKED; no lost-tree authority reconstruction or automatic expiry. |
+| Persisted incomplete seed/record | Unplanned aware startup | RETIREMENT_BLOCKED; no lost-tree authority reconstruction, expiry, or resume. |
 | Unknown/corrupt/unreadable ledger | Startup or mutation | Fail closed in namespace; no claimed successful hold/start. |
 
 Resume/renew/expiry serialize against the exact current lease. Stale IDs never clear a replacement lease. Released leases need no history/tombstone subsystem; missing IDs return not-found unless a current conflicting lease is known. An elapsed acquisition window never returns HELD as a usable installer grant.

@@ -343,17 +343,26 @@ direct-owner fallback is supported. `mux_restart` uses daemon-owned
 ```
 
 The times and identifiers above are examples. Success requires durable HELD,
-future expiry, and proven full-tree death. `HOLDING` means drain/retirement is in
-progress; `RETIREMENT_BLOCKED` remains fenced and cannot expire into a start.
-`RELEASED` permits only fresh demand after durable release. TTL starts at durable
-fence commitment, defaults to 5m, and is positive and at most 1h. Renew sets expiry
+future expiry, and proven full-tree death. `HOLDING` includes provisional timing
+before clocked drain/retirement and never grants replacement. `RETIREMENT_BLOCKED`
+remains fenced and cannot expire into a start. `RELEASED` permits only fresh demand
+after durable release. TTL defaults to 5m, is positive, and is at most 1h. Renew sets expiry
 from serialized acceptance for the exact current unexpired lease without changing
 retirement state or reviving released/expired authority. Resume and safe HELD
 expiry require full tree death and a successful durable release commit. Stale
-identities cannot clear a replacement lease. Positive drain starts once at fence
-commitment; zero skips grace, not tree proof.
+identities cannot clear a replacement lease. Positive drain uses the same `T` as
+TTL and never restarts; zero skips grace, not tree proof.
 CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
 are rejected, not truncated to zero-force retirement.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+Neutral control's nonpositive timeout default gives `hold`/`restart_owner` 180s plus one drain; CLI/MCP use it.
+Explicit positive budgets are honored unchanged; other commands retain 5s. Finite exchange headroom is not full-pin/storage completion proof.
+Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status; never automatically retry/resume or substitute stop.
 
 Aware shims reject requests before cache or forwarding while preserving original
 host pipes. Numeric and string IDs receive exactly one product error:

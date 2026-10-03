@@ -638,26 +638,35 @@ ttlMS := int64(5 * time.Minute / time.Millisecond)
 held, err := control.SendMaintenance(controlPath, control.Request{
 	Cmd: "hold", ServerID: exactServerID,
 	HoldTTLMS: &ttlMS, DrainTimeoutMs: 10000,
-}, 20*time.Second)
+}, 0) // Use the neutral operation default.
 if err != nil {
 	return err // Do not substitute stop, kill, direct exec, or restart.
 }
 // Replace the upstream executable only after the validated HELD result.
 _, err = control.SendMaintenance(controlPath, control.Request{
 	Cmd: "resume", HoldID: held.HoldID,
-}, 10*time.Second)
+}, 0)
 ```
+
+`Send` and nonpositive `SendWithTimeout` budgets use 180s plus one drain for `hold`/`restart_owner`; `SendMaintenance(..., 0)` shares this policy.
+Explicit positive timeouts are honored unchanged; all other commands retain 5s. This is finite exchange headroom, not full-pin/storage completion.
+Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status; do not automatically retry, resume, or fall back to stop.
 
 `MaintenanceResult` contains `HoldID`, `ServerID`, `State`, `ExpiresAt`,
 `DrainDeadline`, and `TreesRetired`. States are `MaintenanceHolding`/`HOLDING`,
 `MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
 `MaintenanceReleased`/`RELEASED`. Successful hold requires durable, unexpired
-HELD and full scoped tree death, not handoff or detached live authority. Positive
-drain and TTL start once at durable fence commitment. Resume/safe expiry require
+HELD and full scoped tree death, not handoff or detached live authority.
+Resume/safe expiry require
 tree death and durable release; blocked retirement never TTL-clears. Renew uses
 `Cmd: "renew"`, the exact current `HoldID`, and `HoldTTLMS`, setting expiry from
 serialized acceptance without changing retirement state or reviving a released/
 expired lease. Stale identities cannot clear a replacement lease.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
 
 `Response` adds optional `Maintenance` and `ErrorCode`; `OwnerInfo` adds optional
 `Maintenance`. Daemon status retains a safe maintenance list after owner removal.

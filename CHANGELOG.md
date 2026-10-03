@@ -36,12 +36,22 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   changes serialize with hold-ledger mutation under the existing daemon namespace
   lock. Status and pure startup inspection remain read-only. Offline/old activation
   requires locked persisted-clear proof.
-- TTL starts at durable fence commitment, defaults to 5m, and is positive and at
+- TTL defaults to 5m and is positive and at
   most 1h. Exact-current-lease renewal sets expiry from serialized acceptance,
   without changing retirement state or reviving an expired/released lease.
   Resume and safe expiry require tree death and durable release. Blocked retirement
-  never TTL-clears. Drain defaults to 10s and starts once; zero skips grace, not
+  never TTL-clears. Drain defaults to 10s; zero skips grace, not
   tree proof. CLI durations require whole milliseconds.
+- Acquisition durably writes a provisional `HOLDING` seed, then samples `T` once
+  after the first complete writer acknowledgment and persists clocked `HOLDING`
+  once. Subsequent writes, retirement, HELD, and response consume that original
+  TTL/drain window. Write failure retains the seed fence; incomplete recovery
+  remains blocked without expiry/resume. No schema or state is added.
+- Neutral control defaults give `hold`/`restart_owner` 180s plus one drain;
+  explicit positive caller timeouts remain unchanged and other commands retain
+  5s. This is finite exchange headroom, not universal completion. On timeout,
+  inspect status for an unknown durable outcome, without automatic retry/resume
+  or stop fallback.
 
 ### Compatibility
 
@@ -56,11 +66,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 
 ### Validation
 
-- Accepted-source checks include actual Windows and Linux held executable
+- Prior accepted-source checks include actual Windows and Linux held executable
   replacement and cleanup, focused maintenance/race coverage, root and muxcore
   Go tests and vet, native Scenario 5b, Unix lifecycle coverage, R1 parity on both
   operating systems, and the complete critical suite. These checks do not prove
   publication, the final delivered binary, or consumer adoption.
+  Latest durable-clock and RPC-budget correction checks remain pending.
 
 ### Rollback
 

@@ -58,7 +58,7 @@ the new control operations only when they need maintenance.
   by daemon namespace, CWD, protocol era, and strict security/configuration
   identity. Other contexts and unmanaged processes can still lock the file.
   The lease is not a host-wide executable lock.
-- TTL starts at durable fence commitment, defaults to 5m, and must be positive
+- TTL defaults to 5m and must be positive
   and at most 1h. Renew changes only the exact current unexpired lease and sets
   expiry from serialized renewal acceptance plus TTL. It does not change the
   retirement state or revive released/expired authority. Stale identities cannot
@@ -66,9 +66,18 @@ the new control operations only when they need maintenance.
 - Resume requires full tree death and durable release. Safe HELD expiry also
   requires a successful durable release commit. Blocked retirement never clears
   merely because its TTL elapsed.
-- Drain defaults to 10s and starts once at fence commitment. Zero skips grace,
+- Drain defaults to 10s and uses the same `T` as TTL without restarting. Zero skips grace,
   not tree-death proof. CLI TTL and drain durations require whole milliseconds;
   sub-millisecond values are rejected rather than truncated.
+
+The durable `HOLDING` seed has provisional timing and never grants replacement.
+Sample `T` once after its first complete writer acknowledgment, then persist clocked `HOLDING` once.
+That write, retirement, HELD persistence, and response consume the original TTL/drain window; write failure retains the seed fence.
+Incomplete recovery remains `RETIREMENT_BLOCKED`, without expiry/resume. No schema or state is added.
+
+Neutral control's default for `hold`/`restart_owner` is 180s plus one drain; CLI/MCP request it with a zero caller timeout.
+Explicit positive budgets remain unchanged; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
+Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, without automatic retry/resume or stop fallback.
 
 ## Host transport and lifecycle
 
@@ -118,9 +127,9 @@ member or bypass admission. Stop new explicit-modern admissions and retire moder
 owners through their existing quarantine path; never transfer live modern work
 to legacy or replay unfinished work.
 
-## Accepted-source technical checks
+## Prior accepted-source technical checks
 
-The release root recorded the following completed checks for the accepted slice:
+Before the durable-clock and RPC-budget corrections, the release root recorded:
 
 - Actual held executable overwrite, resume/TTL recovery, and scoped cleanup on
   Windows and Linux, with 1,158 and 1,191 maintenance checks respectively.
@@ -131,6 +140,9 @@ The release root recorded the following completed checks for the accepted slice:
 - Native consumer Scenario 5b with two sessions, six Unix lifecycle cases, and
   the complete critical suite, 5/5 with exit zero. The seven known review
   corrections were closed in the accepted source.
+
+Latest durable-clock and RPC-budget correction checks remain pending. The prior
+results above do not verify the updated clock or transport-budget policy.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

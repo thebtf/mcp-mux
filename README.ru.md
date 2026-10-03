@@ -291,16 +291,16 @@ mcp-mux resume <returned-hold-id> --json
 Hold блокирует новые запросы и запуски до drain уже переданных запросов.
 Drain по умолчанию равен 10 секундам; `--drain-timeout 0s` пропускает grace,
 но всё равно требует доказанного завершения всего managed дерева. Положительный
-deadline начинается один раз при фиксации fence и не сбрасывается при retry.
+drain использует общий с TTL момент `T` и не сбрасывается при retry.
 Заменяйте файл самостоятельно только после успешного JSON-результата с
 `state: HELD`, `trees_retired: true` и будущим `expires_at`. Результат также
 содержит `hold_id`, `server_id` и `drain_deadline`.
 
-`HOLDING` означает drain или retirement при закрытом admission. `HELD` означает
+`HOLDING` закрывает admission; provisional timing предшествует clocked drain/retirement и не разрешает замену. `HELD` означает
 доказанную смерть всех scoped деревьев. `RETIREMENT_BLOCKED` сохраняет запрет
 запуска: замена небезопасна. `RELEASED` разрешает свежий спрос после durable release.
-TTL начинается при durable fence commitment, по умолчанию равен пяти минутам,
-должен быть положительным и не превышать один час. Renew меняет expiry только
+TTL по умолчанию равен пяти минутам, должен быть положительным и не превышать
+один час. Renew меняет expiry только
 точного текущего неистёкшего hold ID от момента serialized acceptance, не меняя
 retirement state и не восстанавливая released/expired lease.
 CLI принимает TTL и drain только в целых миллисекундах. Значения меньше
@@ -308,6 +308,15 @@ CLI принимает TTL и drain только в целых миллисек�
 Чужой или устаревший ID не заменяет lease. Resume и истечение TTL открывают
 admission только после доказанного retirement. Blocked retirement не очищается
 по таймеру, даже если TTL истёк.
+
+Durable seed в состоянии `HOLDING` содержит provisional timing и не разрешает замену.
+После первого полного writer acknowledgment момент `T` выбирается один раз; clocked `HOLDING` сохраняется один раз.
+TTL/drain отсчитываются от `T`; эта запись, retirement, сохранение HELD и ответ расходуют исходное окно, не сбрасывая его.
+Любая ошибка записи при acquisition сохраняет seed fence; incomplete recovery остаётся `RETIREMENT_BLOCKED`, без expiry/resume.
+
+Без положительного caller timeout neutral control даёт `hold`/`restart_owner` 180s плюс один drain; CLI/MCP используют этот default.
+Явный положительный library budget сохраняется; для остальных команд default равен 5s. Это конечный exchange allowance, не гарантия полного pin/storage completion.
+Timeout оставляет outcome неизвестным: durable lease/restart может сохраниться. Проверьте status, без автоматического retry/resume или stop fallback.
 
 Aware shim сохраняет исходные stdin/stdout host. Запрос во время fence получает
 JSON-RPC `-32005`, сообщение `upstream held for update` и

@@ -301,20 +301,20 @@ mcp-mux resume <returned-hold-id> --json
 
 Hold fences new demand before draining already-forwarded requests. The default
 drain is 10 seconds; `--drain-timeout 0s` skips grace but still requires complete
-managed tree death. Positive grace starts once at fence commitment, not again
-on each retirement retry. Replace the executable yourself only after a successful
+managed tree death. Positive grace uses the same `T` as TTL and never restarts
+on retirement retry. Replace the executable yourself only after a successful
 JSON result reports `state: HELD`, `trees_retired: true`, and a future `expires_at`.
 The result also contains `hold_id`, `server_id`, and `drain_deadline`.
 
 | State | Meaning |
 | --- | --- |
-| `HOLDING` | Admission is fenced; drain or tree retirement is in progress. |
+| `HOLDING` | Admission is fenced; provisional timing precedes clocked drain/retirement. No replacement grant. |
 | `HELD` | Every scoped managed tree is proven dead; the lease is usable until expiry. |
 | `RETIREMENT_BLOCKED` | Tree death is unproven; replacement is unsafe and admission stays fenced. |
 | `RELEASED` | Durable release permits fresh demand. |
 
-TTL starts at durable fence commitment, defaults to five minutes, must be
-positive, and cannot exceed one hour. Renewal uses the exact current unexpired
+TTL defaults to five minutes, must be positive, and cannot exceed one hour.
+Renewal uses the exact current unexpired
 hold ID and sets expiry from serialized renewal acceptance, without changing
 retirement state or reviving a released/expired lease.
 CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
@@ -322,6 +322,15 @@ are rejected rather than rounded down to zero-force retirement.
 Competing or stale identities cannot replace or clear a lease. Explicit resume
 and TTL recovery open admission only after proven retirement and durable release.
 Blocked retirement never clears because time elapsed.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+With no positive caller timeout, neutral control allows 180s plus one drain for `hold`/`restart_owner`; CLI/MCP use this default.
+Explicit positive library budgets are honored; other commands retain 5s. This finite exchange allowance does not guarantee full-pin/storage completion.
+A timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, with no automatic retry/resume or stop fallback.
 
 Aware shims keep the original host pipes open. Requests received while fenced
 return JSON-RPC `-32005`, message `upstream held for update`, and
