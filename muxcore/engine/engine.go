@@ -14,7 +14,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -26,6 +25,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -694,6 +694,9 @@ func (e *MuxEngine) startDaemon() error {
 	ctlPath := e.ControlSocketPath()
 	lock, err := engineAcquireDaemonLock(serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace))
 	if err != nil {
+		if errors.Is(err, ipc.ErrFileLocked) {
+			return waitForDaemon(ctlPath, daemonStartupTimeout)
+		}
 		return err
 	}
 	defer lock.Close()
@@ -705,21 +708,8 @@ func (e *MuxEngine) startDaemon() error {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
 
-	cmd := exec.Command(exe, e.cfg.DaemonFlag)
-	closeStdio, err := attachDetachedStdio(cmd)
-	if err != nil {
+	if err := engineStartDaemonExecutable(exe, e.cfg.DaemonFlag); err != nil {
 		return err
-	}
-	defer closeStdio()
-	setDetached(cmd)
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start daemon process: %w", err)
-	}
-
-	// Release: we don't wait for the daemon — it runs independently.
-	if err := cmd.Process.Release(); err != nil {
-		return fmt.Errorf("release daemon process: %w", err)
 	}
 
 	return waitForDaemon(ctlPath, daemonStartupTimeout)

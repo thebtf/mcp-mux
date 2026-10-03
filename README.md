@@ -590,12 +590,12 @@ transport but does not replay already-sent requests.
 
 ### The contract
 
-| Trigger | Pre-v0.21.0 | v0.27.0 contract |
+| Trigger | Pre-v0.21.0 | Current contract |
 |---|---|---|
 | `mcp-mux upgrade --restart` with live sessions | Upstream killed + respawned, in-flight requests dropped | Daemon restart deferred; existing stdio transports remain on the current daemon while new shims use the new engine pointer |
 | `mcp-mux upgrade --restart` with zero live sessions | Upstream killed + respawned, in-flight requests dropped | Same-v2 handoff retains the upstream tree; the first v1-to-v2 restart takes one snapshot-backed respawn |
 | Daemon/owner loss | Upstream lifecycle was leader-oriented | Recovery is demand-driven; abandoned generations are cleaned as full trees and already-sent requests receive explicit errors instead of replay |
-| `mux_restart <sid>` (operator-initiated) | Hard kill — unchanged | Hard kill — unchanged (explicit operator intent) |
+| `mux_restart <sid>` (operator-initiated) | Hard kill | Daemon-owned `restart_owner` preserves the exact launch context and era, with 30s drain by default. `force: true` skips drain only; maintenance-held targets refuse terminally without stop/spawn fallback. |
 | Reaper idle-eviction | Hard SIGKILL | Soft-close: 30s stdin drain → SIGTERM only after timeout |
 
 ### How it works
@@ -840,7 +840,7 @@ any other server:
 | `mux_prune_engines` | Dry-run by default. Lists or removes stale / invalid native muxcore registry descriptor files after the same verification used by `mux_engines`. This is registry garbage collection only: it never stops processes, owners, daemon control sockets, or live native muxcore products. |
 | `mux_list` | Returns running instances for the **current project** inside this `mcp-mux` daemon namespace (filtered by caller's cwd). Pass `all: true` to list this daemon's instances across all projects. Pass exact `engine_name` from `mux_engines` to query one verified native muxcore engine explicitly. Includes server ID, engine name, PID, downstream session count, pending requests, classification, and cache status. With `verbose: true`, includes classification source/reason and inflight request details when present. |
 | `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. CR-001 scope is current `mcp-mux` daemon namespace only; it does not stop native registered engines. |
-| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux if it was launched through this `mcp-mux` daemon, not a native `aimux` engine). CR-001 scope is current namespace only; cross-engine restart is a future opt-in management feature. |
+| `mux_restart` | Uses daemon-owned `restart_owner` with the original exact launch context and era. Drain defaults to 30s; `force: true` skips drain only and never bypasses maintenance-held terminal refusal or enables stop/spawn fallback. Without an explicit target, resolves to the caller's session instance (e.g. `mux_restart(name: "aimux")` targets this project's mux-managed aimux, not a native engine). CR-001 scope is the current namespace only; cross-engine restart is a future opt-in feature. |
 
 **Session-scoped control plane:**
 

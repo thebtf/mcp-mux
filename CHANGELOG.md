@@ -53,6 +53,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   inspect status for an unknown durable outcome, without automatic retry/resume
   or stop fallback.
 
+### Fixed
+
+- Concurrent legacy `engine.New` cold starters wait for the winning daemon's
+  bounded readiness check on namespace-lock contention instead of returning
+  terminal `ErrFileLocked`; other lock errors remain unchanged.
+
 ### Compatibility
 
 - Ordinary legacy `engine.New` consumers need no source changes. Maintenance
@@ -71,7 +77,7 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Go tests and vet, native Scenario 5b, Unix lifecycle coverage, R1 parity on both
   operating systems, and the complete critical suite. These checks do not prove
   publication, the final delivered binary, or consumer adoption.
-  Latest durable-clock and RPC-budget correction checks remain pending.
+  Exact-source timing/RPC proofs are historical; cold-start correction checks remain pending.
 
 ### Rollback
 
