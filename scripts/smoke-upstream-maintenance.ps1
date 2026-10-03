@@ -119,8 +119,8 @@ function Start-Native([string]$Executable, [string[]]$Arguments, $Context, [hash
     Write-Trace "command-start" $command
     return @{ process = $process; command = $command; stdout = $process.StandardOutput.ReadToEndAsync(); stderr = $process.StandardError.ReadToEndAsync() }
 }
-function Finish-Native($Job, [int]$WaitSeconds = 15, [bool]$KillOnTimeout = $true) {
-    $remaining = [Math]::Min($WaitSeconds * 1000, [Math]::Max(1, ($Deadline - [DateTime]::UtcNow).TotalMilliseconds))
+function Finish-Native($Job, [int]$WaitSeconds = 15, [bool]$KillOnTimeout = $true, [DateTime]$WaitDeadline = $Deadline) {
+    $remaining = [Math]::Min($WaitSeconds * 1000, [Math]::Max(1, ([Math]::Min($Deadline.Ticks, $WaitDeadline.Ticks) - [DateTime]::UtcNow.Ticks) / [TimeSpan]::TicksPerMillisecond))
     if (-not $Job.process.WaitForExit([int]$remaining)) {
         if ($KillOnTimeout) {
             $Job.process.Kill($true)
@@ -216,7 +216,7 @@ function Get-Owner($Context, [string]$Command) {
     Assert-Observation ($owners.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($owners[0]["server_id"])) "One exact managed target" @{ command = $Command; matches = $owners.Count }
     return $owners[0]
 }
-function Read-ProcessIdentity([Diagnostics.Process]$Process, [string]$Label, [switch]$Startup, [long]$ExpectedStartTicks = 0) {
+function Read-ProcessIdentity([Diagnostics.Process]$Process, [string]$Label, [switch]$Startup, [long]$ExpectedStartTicks = 0, [string]$ExpectedExecutable = "") {
     $until = [DateTime]::UtcNow.AddSeconds(1)
     $waiting = $false
     while ($true) {
@@ -224,25 +224,33 @@ function Read-ProcessIdentity([Diagnostics.Process]$Process, [string]$Label, [sw
         if ($Process.HasExited) { return $null }
         try {
             $ticks = $Process.StartTime.ToUniversalTime().Ticks
-            if ($ExpectedStartTicks -ne 0 -and $ticks -ne $ExpectedStartTicks) { return $null }
+            if ($ExpectedStartTicks -ne 0 -and $ticks -ne $ExpectedStartTicks) {
+                if ($Startup) { throw "Started process changed its original start time during identity capture" }
+                return $null
+            }
+            if ($Startup -and $ExpectedStartTicks -eq 0) { $ExpectedStartTicks = $ticks }
+            $sampleExecutable = $null
             $module = $Process.MainModule
             if ($null -ne $module) {
-                $executable = [IO.Path]::GetFullPath($module.FileName)
+                $sampleExecutable = [IO.Path]::GetFullPath($module.FileName)
                 if ($Process.HasExited) { return $null }
-                return @{ pid = $Process.Id; label = $Label; executable = $executable; start_ticks = $ticks }
+                if (-not $Startup -or $ExpectedExecutable -eq "" -or $sampleExecutable -eq $ExpectedExecutable) {
+                    return @{ pid = $Process.Id; label = $Label; executable = $sampleExecutable; start_ticks = $ticks }
+                }
             }
         } catch {
             if ($Process.HasExited) { return $null }
             throw "OS identity read failed for $Label (PID $($Process.Id), type $($Process.GetType().FullName)): $($_.Exception.GetType().FullName): $($_.Exception.Message)"
         }
         if (-not $waiting) {
-            Write-Trace "process-module-unavailable" @{ label = $Label; pid = $Process.Id; process_type = $Process.GetType().FullName; has_exited = $Process.HasExited; startup = $Startup.IsPresent }
+            $kind = if ($null -eq $sampleExecutable) { "process-module-unavailable" } else { "process-module-mismatch" }
+            Write-Trace $kind @{ label = $Label; pid = $Process.Id; start_ticks = $ticks; executable = $sampleExecutable; expected_executable = $ExpectedExecutable; process_type = $Process.GetType().FullName; has_exited = $Process.HasExited; startup = $Startup.IsPresent }
             $waiting = $true
         }
-        # Only a live, just-started host with a null OS module gets a bounded observation window.
+        # A just-started host must expose its exact OS executable within the same one-second window.
         if (-not $Startup -or [DateTime]::UtcNow -ge $until -or [DateTime]::UtcNow -ge $Deadline) {
             if ($Process.HasExited) { return $null }
-            throw "OS executable identity unavailable for live $Label (PID $($Process.Id)): MainModule remained null; no expected-path fallback used"
+            throw "OS executable identity unavailable for live $Label (PID $($Process.Id)): last observed module executable '$sampleExecutable', expected '$ExpectedExecutable'; no expected-path fallback used"
         }
         Start-Sleep -Milliseconds 25
     }
@@ -250,7 +258,7 @@ function Read-ProcessIdentity([Diagnostics.Process]$Process, [string]$Label, [sw
 function Get-Identity([int]$ProcessId, [string]$Label, [string]$ExpectedPath = "", [Diagnostics.Process]$StartedProcess = $null) {
     $process = if ($null -ne $StartedProcess) { $StartedProcess } else { [Diagnostics.Process]::GetProcessById($ProcessId) }
     try {
-        $identity = Read-ProcessIdentity $process $Label -Startup:($null -ne $StartedProcess)
+        $identity = Read-ProcessIdentity $process $Label -Startup:($null -ne $StartedProcess) -ExpectedExecutable $ExpectedPath
         if ($null -eq $identity) { throw "Process exited before OS identity capture: $Label (PID $ProcessId)" }
         if ($ExpectedPath -ne "") { Assert-Observation ($identity.executable -eq $ExpectedPath) "Exact executable identity: $Label" $identity }
         $Identities.Add($identity)
@@ -793,16 +801,19 @@ try {
     foreach ($session in $Sessions) {
         try { $session.input.Close() } catch { $cleanup.Add(@{ host = $session.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
     }
+    $shutdownAccepted = $Contexts.Count -gt 0
     foreach ($context in $Contexts) {
         try {
             $response = Invoke-Control $context @{ cmd = "shutdown"; drain_timeout_ms = 0 }
             if ($response["ok"] -ne $true) { throw "Owned daemon cleanup refused; retain resources, no PID cleanup" }
             $cleanup.Add(@{ namespace = $context.name; shutdown = $response })
-        } catch { $cleanup.Add(@{ namespace = $context.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
+        } catch { $shutdownAccepted = $false; $cleanup.Add(@{ namespace = $context.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
     }
+    $closeDeadline = [DateTime]::UtcNow.AddSeconds(10)
     foreach ($session in $Sessions) {
         try {
-            if (-not $session.process.WaitForExit(10000)) { throw "Owned host did not exit after stdin closure; no PID cleanup attempted" }
+            $remaining = [int][Math]::Max(1, ($closeDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $session.process.WaitForExit($remaining)) { throw "Owned host did not exit after stdin closure; no PID cleanup attempted" }
             $closed = @{ host = $session.name; exit_code = $session.process.ExitCode; stderr = Protect-Text $session.stderr.Result }
             if ($session.ContainsKey("identity_failure")) {
                 [void]$session.failure_stdout.Wait(1000)
@@ -814,15 +825,20 @@ try {
             Write-Trace "host-closed" $closed
         } catch { $cleanup.Add(@{ host = $session.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
     }
-    foreach ($identity in $Identities) {
-        try {
-            if (Test-IdentityAlive $identity) { throw "Captured owned process survived lifecycle cleanup: $($identity.label)" }
-        } catch { $cleanup.Add(@{ identity = $identity; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
-    }
     foreach ($context in $Contexts) {
         if ($context.ContainsKey("daemon_job")) {
-            try { [void](Finish-Native $context.daemon_job 10 $false) } catch { $cleanup.Add(@{ namespace = $context.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
+            try { [void](Finish-Native $context.daemon_job 10 $false $closeDeadline) } catch { $cleanup.Add(@{ namespace = $context.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
         }
+    }
+    foreach ($identity in $Identities) {
+        try {
+            while (Test-IdentityAlive $identity) {
+                if (-not $shutdownAccepted -or [DateTime]::UtcNow -ge $closeDeadline) { throw "Captured owned process survived lifecycle cleanup: $($identity.label)" }
+                $remaining = [int][Math]::Max(1, ($closeDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+                Start-Sleep -Milliseconds ([Math]::Min(25, $remaining))
+            }
+            Write-Trace "owned-process-closed" @{ identity = $identity; captured_identity_alive = $false; observed_utc = [DateTime]::UtcNow.ToString("o"); close_deadline_utc = $closeDeadline.ToString("o") }
+        } catch { $cleanup.Add(@{ identity = $identity; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
     }
     if ($ExitCode -ne 0) { $Evidence["verdict"] = "FAIL" }
     $Evidence["cleanup"] = $cleanup.ToArray()
