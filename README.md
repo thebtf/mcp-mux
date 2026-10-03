@@ -739,7 +739,7 @@ All configuration is via environment variables. No config file is required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_MUX_NO_DAEMON` | `0` | Set to `1` to disable daemon mode (legacy per-session owner) |
+| `MCP_MUX_NO_DAEMON` | `0` | Legacy setting; `1` is unsupported and fails closed with `maintenance_unsupported`. Keep daemon-managed admission enabled; this is not a daemon bypass. |
 | `MCP_MUX_ISOLATED` | `0` | Set to `1` to force isolated mode for this invocation |
 | `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global deduplication) |
 | `MCPMUX_SHIM_IDLE_TIMEOUT` | `10m` | Safe host-idle period before a non-persistent shim parks its daemon IPC session; zero or negative disables |
