@@ -582,7 +582,7 @@ func (d *Daemon) maintenanceForServer(serverID string) *control.MaintenanceResul
 }
 
 func (d *Daemon) HandleRestartOwner(req control.Request) (control.Response, error) {
-	if req.ServerID == "" || strings.TrimSpace(req.ServerID) != req.ServerID || req.Command != "" || req.DrainTimeoutMs < 0 {
+	if req.ServerID == "" || strings.TrimSpace(req.ServerID) != req.ServerID || req.Command != "" || req.DrainTimeoutMs < 0 || int64(req.DrainTimeoutMs) > int64((1<<63-1)/time.Millisecond) {
 		return control.Response{}, control.ErrMaintenanceInvalid
 	}
 	d.maintenanceGate.RLock()
