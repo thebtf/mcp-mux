@@ -80,6 +80,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 - Exact already-owned whole-daemon cleanup retains its private removal claim
   under persistence failure; new external stop/shutdown/restart still fail closed.
   No failure-latch clearing, wire flag, or admission-proof weakening is added.
+- Configured authorization callbacks are accounted through actual return and
+  registration/rejection in every owner mode, including subprocess and HandlerFunc.
+  Retirement/handoff cannot bypass their settlement; `PendingRequests` stays request-only.
+- Signal/context shutdown callers wait for daemon `Done` after refusal, retaining
+  reaper, daemon reference and control service. Clearing a lease does not retry the
+  refused request; a separately admitted explicit shutdown is required.
 
 ### Compatibility
 
@@ -104,9 +110,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   pass at their recorded source. Fixture-only 435bcfa closes the old owner-test
   failure with fresh full-muxcore PASS. Earlier timer/stop/family proof stays
   source-bound. New Unix-endpoint, managed-stop, and drain-validation commits have
-  scoped focused/race proof. Private shutdown correction d998 adds full-daemon
-  and all four fresh current root/module full-test/vet GREEN; caaba timeout stays
-  historical. New public Windows/Linux/Unix pipeline, CI and observer remain pending.
+  scoped focused/race proof; caaba timeout and the ace2 observer's two P1s stay
+  historical. Caller/auth repairs a68aa37/ab28d3d have Windows/native RED/GREEN,
+  race and bounded source PASS. All four full/vet gates ran on identical frozen
+  precommit bytes, not freshly after ab28. Ab28 CI37162331283 all5 PASS precedes
+  this doc successor; a new standalone frame-hook P1 still holds final artifact freeze.
 
 ### Rollback
 

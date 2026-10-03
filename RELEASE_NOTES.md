@@ -77,6 +77,10 @@ the new control operations only when they need maintenance.
   settlement. Active work remains blocked without TTL/resume bypass; existing
   retry uses the original clock. `PendingRequests` stays request-only; no public
   metric, state, schema, topology exclusion, or modern notification dispatch added.
+- Configured authorization is tracked in all owner modes through actual callback
+  return and registration/rejection. Late allow cannot cross closed admission;
+  retirement and handoff wait for settlement. No public callback counter or
+  `PendingRequests` change is added; nil-authorizer defaults stay unchanged.
 
 The durable `HOLDING` seed has provisional timing and never grants replacement.
 Sample `T` once after its first complete writer acknowledgment, then persist clocked `HOLDING` once.
@@ -104,6 +108,9 @@ Exact already-owned whole-daemon cleanup keeps its private claim, without failur
 latch clearing or a new public stop/shutdown/restart bypass. `restart_owner`
 rejects duration overflow before mutation on raw/
 explicit-timeout routes; zero replacement and 30s/0ms stop defaults are unchanged.
+Signal/context shutdown callers wait for daemon `Done` after refusal, retaining
+reaper/reference/control service. They do not retry automatically after lease
+release; a separate explicit admitted shutdown completes caller termination.
 
 ## Host transport and lifecycle
 
@@ -181,10 +188,13 @@ and both vet suites pass at their recorded source. Fixture-only successor
 with fresh whole-muxcore PASS, without production changes after 6fc7. Historical
 RED and closed family proof remain preserved. Three newer commits for Unix
 owned-endpoint cleanup, managed stop admission, and restart drain validation now
-have scoped focused/race proof. Private internal-shutdown correction d998 now
-has focused/race/full-daemon and all four fresh current root/module full-test/vet
-GREEN, preserving caaba timeout as historical RED. New public Windows/Linux/Unix
-pipeline, CI, observer and acceptance remain pending; old Linux685 FAIL/orphan retained.
+have scoped focused/race proof. Historical ace2 Windows/Linux/critical/CI PASS
+does not refute its two causal observer P1s. Caller/auth repairs a68aa37/ab28d3d
+now have Windows/native focused/race and bounded source proof plus all four
+full/vet gates on identical frozen precommit bytes. No post-ab28 rerun inferred;
+actual ab28 CI37162331283 all5 successful precedes this documentation successor.
+A new standalone configured-frame callback P1 still requires existing-path repair/
+proof before final artifact freeze; new Windows/Linux/frozen-head readback pending.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

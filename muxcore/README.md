@@ -695,6 +695,18 @@ Keep the fence and inspect status; notification cancellation on session/owner
 closure does not prove return. `PendingRequests` remains request-only; the
 private nonrequest accounting adds no public counter, status field, or schema.
 
+When `AuthorizeSession` is configured, every owner mode, including subprocess
+and `HandlerFunc`, retains private callback authority through actual return and
+the registration/rejection continuation. Admission closure prevents late allow
+from publishing a session; retirement and normal/error handoff retain blocked
+authority until settlement. This does not add authorization when none is
+configured, change ordinary defaults, or turn `PendingRequests` into a callback metric.
+
+Process-owning signal/context callers issue shutdown once and wait for daemon
+`Done` before returning. A refused shutdown keeps reaper, daemon reference and
+control serving authority alive. Lease release alone does not retry that request;
+resume when allowed, then issue an independently admitted explicit shutdown.
+
 A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
 TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.

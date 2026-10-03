@@ -118,6 +118,11 @@ before a later hold. Reuse blocked finalization/exact-entry retry, not a new wai
 or scheduler. `PendingRequests` is request-only, not complete native-work proof;
 private nonrequest accounting adds no public metric, state, API, or schema.
 
+Configured authorization must retain private callback authority through return
+and registration/rejection in every owner mode, not only `SessionHandler`.
+Serialize late admission against listener closure; handoff/retirement must join
+that settlement without changing public `PendingRequests` or nil-authorizer defaults.
+
 A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
 TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
@@ -142,6 +147,11 @@ a failure-latch clear or external bypass. Preserve admitted retry and maintenanc
 removal. Reject restart drain overflow before
 mutation regardless of raw transport or explicit timeout. Unix cleanup skips
 only the exact canonical owned bound control path, without early serving.
+
+Process-owning signal/context callers must wait for daemon `Done` after a refused
+shutdown, keeping reaper/reference/control authority alive. Request shutdown once;
+do not infer a retry from lease clearance. A separately explicit admitted shutdown
+is needed before caller return. A direct-method refusal test is not signal/context proof.
 
 Scope is the selected owner's finite admitted CWD/era/security/configuration/
 namespace context set, not a host-wide executable lock. Aware shims preserve
