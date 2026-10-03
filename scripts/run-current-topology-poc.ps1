@@ -1,6 +1,8 @@
 param(
     [string]$Launcher = $env:MCP_LAUNCHER,
     [int]$WatchSeconds = 2,
+    [ValidateRange(1, 2147483)]
+    [int]$TimeoutSeconds = 60,
     [string]$RuntimeDir = $env:MCP_MUX_CURRENT_TOPOLOGY_DIR
 )
 
@@ -35,28 +37,74 @@ function Invoke-NativeStep {
 }
 
 function Stop-PocDaemon {
-    if (Test-Path -LiteralPath $Binary) {
-        try {
-            $Output = & $Binary --poc-control shutdown 2>$null
-            if ($LASTEXITCODE -eq 0 -and $Output) {
-                $Output | Out-Host
-            }
-        } catch {
-        }
+    if (-not (Test-Path -LiteralPath $Binary)) {
+        return
     }
-    Start-Sleep -Milliseconds 300
     if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
-        $binaryPath = (Resolve-Path -LiteralPath $Binary -ErrorAction SilentlyContinue).Path
-        if ($binaryPath) {
-            Get-CimInstance Win32_Process -Filter "name = 'current-topology-poc.exe'" -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -like "*$binaryPath*" -and $_.CommandLine -like "*--muxcore-daemon*" } |
-                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $escapedBinary = $Binary.Replace('\', '\\').Replace("'", "\'")
+        $owned = @(Get-CimInstance Win32_Process -Filter "ExecutablePath = '$escapedBinary'" |
+            Where-Object { $_.CommandLine -eq "$Binary --muxcore-daemon" -or $_.CommandLine -eq "`"$Binary`" --muxcore-daemon" })
+        if ($owned.Count -eq 0) {
+            return
         }
+        if ($owned.Count -ne 1) {
+            throw "multiple daemon identities at exact private binary path; resources retained: $Binary"
+        }
+        $Status = Get-PocStatus
+        if ($Status.pid -ne $owned[0].ProcessId) {
+            throw "private control PID does not match exact executable identity; resources retained: $Binary"
+        }
+    } else {
+        if (-not (Test-Path -LiteralPath $ControlSocket)) {
+            return
+        }
+        $Status = Get-PocStatus
+    }
+
+    $Daemon = [System.Diagnostics.Process]::GetProcessById([int]$Status.pid)
+    $Control = [System.Diagnostics.Process]::new()
+    try {
+        if ([System.IO.Path]::GetFullPath($Daemon.Path) -ne $Binary) {
+            throw "private daemon executable mismatch; resources retained: pid=$($Status.pid)"
+        }
+        $startUtc = $Daemon.StartTime.ToUniversalTime().ToString('o')
+        Write-Host "  shutdown daemon pid=$($Daemon.Id) start_utc=$startUtc path=$Binary generation=$($Status.daemon_generation)"
+        $Control.StartInfo.FileName = $Binary
+        $Control.StartInfo.Arguments = '--poc-control shutdown'
+        $Control.StartInfo.UseShellExecute = $false
+        $Control.StartInfo.RedirectStandardOutput = $true
+        $Control.StartInfo.RedirectStandardError = $true
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $timeoutMs = $TimeoutSeconds * 1000
+        [void]$Control.Start()
+        $stdout = $Control.StandardOutput.ReadToEndAsync()
+        $stderr = $Control.StandardError.ReadToEndAsync()
+        if (-not $Control.WaitForExit($timeoutMs)) {
+            throw "private shutdown timed out after ${TimeoutSeconds}s; control_pid=$($Control.Id), daemon_pid=$($Daemon.Id); process authority and resources retained"
+        }
+        $stdoutClosed = $stdout.Wait([int][Math]::Max(1, $timeoutMs - $clock.ElapsedMilliseconds))
+        $stderrClosed = $stderr.Wait([int][Math]::Max(1, $timeoutMs - $clock.ElapsedMilliseconds))
+        Write-Host "  shutdown control pid=$($Control.Id) exit=$($Control.ExitCode) stdout_closed=$stdoutClosed stderr_closed=$stderrClosed"
+        if (-not $stdoutClosed -or -not $stderrClosed) {
+            throw "private shutdown output did not close within ${TimeoutSeconds}s; process authority and resources retained"
+        }
+        if ($stdout.Result) { $stdout.Result | Out-Host }
+        if ($stderr.Result) { $stderr.Result | Out-Host }
+        if ($Control.ExitCode -ne 0 -or ($stdout.Result | ConvertFrom-Json).ok -ne $true) {
+            throw "private shutdown failed with exit code $($Control.ExitCode); process authority and resources retained"
+        }
+        if (-not $Daemon.WaitForExit([int][Math]::Max(1, $timeoutMs - $clock.ElapsedMilliseconds))) {
+            throw "captured private daemon survived shutdown deadline; pid=$($Daemon.Id) start_utc=$startUtc path=$Binary; resources retained"
+        }
+        Write-Host "  shutdown OS exit observed pid=$($Daemon.Id) elapsed_ms=$($clock.ElapsedMilliseconds)"
+    } finally {
+        $Control.Dispose()
+        $Daemon.Dispose()
     }
     Remove-Item -LiteralPath $ControlSocket -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $RuntimeDir "owners.snapshot.json") -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath $RuntimeDir -Filter "*.owner.sock" -ErrorAction SilentlyContinue |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $RuntimeDir 'owners.snapshot.json') -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $RuntimeDir -Filter '*.owner.sock' -ErrorAction SilentlyContinue |
+        Remove-Item -ErrorAction SilentlyContinue
     $global:LASTEXITCODE = 0
 }
 
@@ -198,6 +246,7 @@ if (-not (Test-Path -LiteralPath $Launcher)) {
     throw "mcp-launcher not found: $Launcher"
 }
 
+$pocFailed = $false
 Push-Location $RepoRoot
 try {
     Invoke-NativeStep "build dummy topology binary" {
@@ -300,11 +349,20 @@ try {
         & $Binary --poc-probe-idle-reaper
     }
 
-    Stop-PocDaemon
-
-    Write-Host ""
-    Write-Host "PASS current-topology PoC"
-    $global:LASTEXITCODE = 0
+} catch {
+    $pocFailed = $true
+    throw
 } finally {
-    Pop-Location
+    try {
+        Stop-PocDaemon
+    } catch {
+        if (-not $pocFailed) { throw }
+        Write-Warning "PoC cleanup failed; original failure preserved and resources retained: $($_.Exception.Message)"
+    } finally {
+        Pop-Location
+    }
 }
+
+Write-Host ''
+Write-Host 'PASS current-topology PoC'
+$global:LASTEXITCODE = 0

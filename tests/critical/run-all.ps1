@@ -111,7 +111,7 @@ try {
     }
 
     Invoke-CriticalStep "current topology proofing oracle" {
-        & .\scripts\run-current-topology-poc.ps1 -Launcher $Launcher -WatchSeconds $WatchSeconds -RuntimeDir (Join-Path $RunDir "current-topology")
+        & .\scripts\run-current-topology-poc.ps1 -Launcher $Launcher -WatchSeconds $WatchSeconds -TimeoutSeconds $TimeoutSeconds -RuntimeDir (Join-Path $RunDir "current-topology")
         if ($LASTEXITCODE -ne 0) {
             throw "run-current-topology-poc exited with code $LASTEXITCODE"
         }

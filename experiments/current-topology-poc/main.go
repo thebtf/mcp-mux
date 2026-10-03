@@ -1308,7 +1308,17 @@ func startDaemonProcess(successor bool) error {
 	if successor {
 		cmd.Env = append(cmd.Env, envSuccessor+"=1")
 	}
-	cmd.Stderr = os.Stderr
+	runtime := runtimeDir()
+	if err := os.MkdirAll(runtime, 0o700); err != nil {
+		return err
+	}
+	// The daemon outlives its launcher, so it must not inherit a host capture pipe.
+	stderr, err := os.OpenFile(filepath.Join(runtime, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open daemon log: %w", err)
+	}
+	defer stderr.Close()
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -2094,10 +2104,7 @@ func probeIdleReaper() error {
 	oldRuntime, hadRuntime := os.LookupEnv(envRuntime)
 	oldControl, hadControl := os.LookupEnv(envCtlPath)
 	oldIdleTTL, hadIdleTTL := os.LookupEnv(envIdleTTLMS)
-	runtimeParent, err := filepath.Abs(filepath.Join(".", ".agent"))
-	if err != nil {
-		return err
-	}
+	runtimeParent := runtimeDir()
 	if err := os.MkdirAll(runtimeParent, 0o755); err != nil {
 		return err
 	}
@@ -2294,6 +2301,7 @@ func probeIdleReaper() error {
 	return writeJSONLine(os.Stdout, map[string]any{
 		"ok":                        true,
 		"probe":                     "idle_reaper",
+		"runtime_dir":               tempRuntime,
 		"phase":                     "phase9",
 		"break_observed":            false,
 		"idle_ms":                   idleWindow.Milliseconds(),
