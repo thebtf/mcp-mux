@@ -202,11 +202,6 @@ func TestMaintenanceStopOwnerPersistenceFailureAdmission(t *testing.T) {
 			d.maintenanceGate.Lock()
 			d.maintenanceCommit = func([]byte) error { return errors.New("authority writer unavailable") }
 			d.maintenanceGate.Unlock()
-			t.Cleanup(func() {
-				d.maintenanceGate.Lock()
-				d.maintenanceCommit, d.maintenanceFailed = nil, false
-				d.maintenanceGate.Unlock()
-			})
 			if _, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: entry.ServerID}); !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
 				t.Fatalf("real failed hold did not latch persistence failure: %v", err)
 			}
@@ -220,6 +215,42 @@ func TestMaintenanceStopOwnerPersistenceFailureAdmission(t *testing.T) {
 			}
 			if d.Entry(entry.ServerID) != entry || !entry.Owner.IsAccepting() || !daemonTestProcessAlive(pid) {
 				t.Fatal("failed-persistence stop tore down actual owner authority")
+			}
+			if _, err := d.HandleShutdownWithError(0); !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+				t.Fatalf("public shutdown bypassed failed maintenance admission: %v", err)
+			}
+			d.Shutdown()
+			if d.shuttingDown.Load() || !entry.Owner.IsAccepting() || !daemonTestProcessAlive(pid) {
+				t.Fatal("refused public shutdown acquired internal retirement authority")
+			}
+			// Exercise the same already-owned private cleanup as the reported
+			// failing fixture, without clearing the durable-failure latch.
+			go d.shutdown(nil)
+			select {
+			case <-d.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("owned daemon cleanup remained stuck behind operator admission")
+			}
+			if d.Entry(entry.ServerID) != nil || daemonTestProcessAlive(pid) {
+				t.Fatal("owned daemon cleanup released its namespace before actual retirement")
+			}
+			select {
+			case <-entry.Owner.Done():
+			default:
+				t.Fatal("owned daemon cleanup did not complete the exact owner")
+			}
+			if d.HandleStatus()["maintenance_error_code"] != control.ErrMaintenancePersistenceFailed.Code {
+				t.Fatal("internal cleanup cleared the failed-persistence admission latch")
+			}
+			for _, drain := range []int{0, 30000} {
+				if _, err := d.HandleStopOwner(control.Request{ServerID: entry.ServerID, DrainTimeoutMs: drain}); !errors.Is(err, ErrDaemonShuttingDown) {
+					t.Fatalf("public stop inherited internal shutdown authority: %v", err)
+				}
+			}
+			for _, remove := range []func(string) error{d.Remove, d.SoftRemove} {
+				if err := remove(entry.ServerID); !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+					t.Fatalf("new public removal bypassed failed latch during shutdown: %v", err)
+				}
 			}
 		})
 	}

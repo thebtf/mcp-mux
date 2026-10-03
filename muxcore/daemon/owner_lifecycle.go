@@ -233,7 +233,12 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 		// An existing exact-entry retry continues an already-admitted teardown.
 		// New claims must remain atomic with a hold's durable commit and pinning.
 		admittedRetry := expected != nil && current == expected && current.removalRetrying && !scheduleRetry
-		if operatorRemoval && !admittedRetry {
+		// Whole-daemon retirement already owns this exact entry. Public stops
+		// have no expected entry and cannot acquire this shutdown authority.
+		admittedShutdown := expected != nil && current == expected &&
+			reason == ownerRemovalReasonOperatorHard && !soft && eligible == nil &&
+			!scheduleRetry && d.shuttingDown.Load()
+		if operatorRemoval && !admittedRetry && !admittedShutdown {
 			if err := d.checkOperatorRemovalLocked(serverID, current); err != nil {
 				unlockClaim()
 				return result, err
