@@ -56,7 +56,13 @@ var (
 // Version is the mcp-mux build version, included in status output.
 // Auto-detected from Go build info (vcs.revision + vcs.modified).
 // Override at build time via: -ldflags "-X github.com/thebtf/mcp-mux/muxcore/owner.Version=..."
-var Version = initVersion()
+var Version string
+
+func init() {
+	if Version == "" {
+		Version = initVersion()
+	}
+}
 
 func initVersion() string {
 	info, ok := debug.ReadBuildInfo()
