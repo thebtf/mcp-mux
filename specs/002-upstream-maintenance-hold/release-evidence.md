@@ -6,12 +6,12 @@ This is the T029 evidence artifact for GitHub #135. The accepted ADR-015 full-sl
 
 | State | Recorded outcome |
 | --- | --- |
-| Implemented | Core, optional public APIs, CLI/MCP adapters, consumer docs, fixtures, and cross-platform live runner are implemented through `1f3c119ef6841b219412e4e6a93f6a452b7339a8`; current candidate `0b443b0ea51078814e76d12af0632fb9b5d52cc0` adds only the four owning milestone documents. |
-| Verified | Root admits T029 complete: focused core and adapter maintenance proof, Windows/Linux live replacement, and selected Go 1.25.12 R1 parity on both platforms. Full tests/vet, integrated race, and bounded seven-finding source closeout retain their recorded scope below. |
-| Technically accepted | Not yet. T030 critical aggregate and Scenario 5b/8, including native Unix coverage, remain pending; T031 final root acceptance awaits those outcomes. T029 completion is not feature acceptance. |
-| Delivered | No. No release version has been selected, no PR or release tags created, and no current-module publication or consumer delivery recorded. T032/T033 remain incomplete. |
+| Implemented | Complete maintenance behavior is implemented. Source milestone `5b07ecd8f531891fbb7a42353200850baef7d274` commits the three owned critical-oracle fixes on `7cd4b2d`; the earlier maintenance product source and recorded source relationships remain unchanged. |
+| Verified | T029 and T030 are root-admitted complete. The corrected overall critical suite exits 0 with 5/5 PASS and no failures, skips, or errors, supplementing the focused, race, live Windows/Unix, R1, Scenario 5b/8, and seven-finding receipts below. |
+| Technically accepted | Yes. Root admits T031 complete and accepts the complete technical implementation, named behavior/proof, and 7/7 known source corrections. Historical receipt limits remain explicit; acceptance does not turn old aborted or setup-failed attempts into passes. |
+| Delivered | No. Root selects additive minor `0.31.0` for both binary and muxcore library through the normal direct release flow. T032 is in progress, not complete; no PR, merge, release tags, publication, or post-merge consumer delivery is recorded. T033 remains pending. |
 
-This documentation update inspected existing receipts only. It ran no tests, builds, vet, linters, formatters, or repeated gates and made no commit. The plan, acceptance scenarios, and required commands in [tasks](tasks.md), [specification](spec.md), and [quickstart](quickstart.md) remain authoritative. Later root gate outcomes must be appended before acceptance or delivery is claimed.
+This documentation update inspected existing receipts only. It ran no tests, builds, vet, linters, formatters, or repeated gates and made no commit. The plan, acceptance scenarios, and required commands in [tasks](tasks.md), [specification](spec.md), and [quickstart](quickstart.md) remain authoritative. Root has accepted T029-T031; subsequent release and consumer evidence must be appended before delivery is claimed.
 
 ## Source and artifact identity
 
@@ -23,12 +23,16 @@ All local raw-evidence paths below are relative to the **primary** checkout `D:/
 | Candidate root | `D:/Dev/mcp-mux/.agent/worktrees/upstream-maintenance-01a0fb9a` |
 | Full tests/vet source | `42ef546d146b1e0bc9541f64e9c228d6ba5d3358` |
 | Live replacement source | `45d4f93ec7c2703db1a57dfa48efc477accb1386` |
-| Current source candidate | `0b443b0ea51078814e76d12af0632fb9b5d52cc0` |
+| Accepted source milestone | `5b07ecd8f531891fbb7a42353200850baef7d274` |
 | `42ef546` to `45d4f93` | Known complete changed-path set is only `scripts/smoke-upstream-maintenance.ps1`. Go product and regression source are unchanged across this interval. |
 | `45d4f93` to `1f3c119` | Known complete changed-path set is only `muxcore/daemon/maintenance_test.go`, the TTL fixture repair, with 7 additions and 1 deletion. Go product source remains unchanged; the test corpus is not identical. |
 | `1f3c119` to `0b443b0` | Root committed only `specs/002-upstream-maintenance-hold/{release-evidence.md,tasks.md,quickstart.md,spec.md}`. Product and regression source are unchanged. |
+| `0b443b0` to `7cd4b2d` | Root's owning-milestone documentation commit only. Product and regression source are unchanged. |
+| `7cd4b2d` to `5b07ecd` | Exactly `experiments/current-topology-poc/main.go`, `scripts/run-current-topology-poc.ps1`, and `tests/critical/run-all.ps1` commit the owned oracle repair. Root ran the corrected suite on `7cd4b2d` plus those exact working-tree bytes before committing them as `5b07ecd`; this is tested-source equality, not a gate launched after that commit. |
 
 The changed-path relationships are recorded in `agent://MaintenanceReviewCloseout` and root's supplied commit-path evidence. This writer did not rerun Git comparison or rebuild the candidate. Root admits reuse of the `42ef546` full-test/vet and `45d4f93` live receipts within their unchanged-source scope, including the TTL-test-only `1f3c119` and docs-only `0b443b0` successors. This is **not** a claim that those commands ran freshly at exact `1f3c119` or `0b443b0`, nor that independently built binaries at different SHAs have identical hashes. The integrated race ran from exact committed `1f3c119`; the new focused adapter command ran from exact committed `0b443b0`.
+
+The accepted runtime criterion is bound to the tested working-tree oracle repair now committed as `5b07ecd`. The separate release workflow's one-line version-embedding correction and owning-document updates do not imply a fresh runtime run or completed release-artifact delivery. Root reports private-owner `v0.31.0` artifact proof, which is not a post-merge release canary or consumer handoff.
 
 | Live artifact | SHA-256 |
 | --- | --- |
@@ -160,17 +164,73 @@ T029 is now root-admitted complete on the focused core and adapter receipts, bot
 
 The closeout is only the seven-finding source portion of T031. It is not final root review of frozen evidence, implementation acceptance, or release approval. Reviewer model family is unknown; cross-family independence is not claimed. Its prior assertion-count limitation is not silently upgraded into reviewer execution: this documentation writer separately read the complete live JSON arrays for the counts above.
 
-## Pending gates and exact remaining outcomes
+Root's later T031 acceptance below incorporates this bounded source closeout together with completed T029/T030 evidence. The reviewer's source-only receipt is not relabeled as independent execution of the new critical suite or final release approval.
 
-These rows are factual pending outcomes at this milestone snapshot, not a generic blocked verdict. Existing GREEN receipts remain valid within their recorded bounds. Root retains the full release outcome and adds later observations through the same evidence writer.
+## Recorded Scenario 5b and Scenario 8 outcomes
+
+Root supplied these new observed receipts without asking this writer to rerun any check. They close the scenario evidence gaps in T030, not its overall critical-suite gate.
+
+### Scenario 5b direct native update
+
+The direct command ran from exact candidate `0b443b0ea51078814e76d12af0632fb9b5d52cc0` with Go 1.25.12 and primary `P` scratch settings for `TMP`, `TEMP`, and `GOTMPDIR`:
+
+```text
+pwsh -NoProfile -File C/scripts/smoke-native-sessionhandler-update.ps1 -RunDir P/native-update-0b4 -EvidencePath P/native-update-0b4.json -TimeoutSeconds 120
+```
+
+The worker and root receipts record exit 0 and PASS. `P/native-update-0b4.json` records runtime 16.919s, old daemon generation `daemon_267e71a65e4d` and new generation `daemon_05f53523a13a`. The original open session and a fresh session both report `new`, for 2/2 post-update sessions. Restored owners are 1, reconnect refreshed is 1, fallback spawned is 0, and give-up is 0. Graceful restart, replacement started, and replacement ready are true; fallback shutdown is false. This is the native SessionHandler fixture's update behavior, not transparent modern MCP protocol restoration or a delivered-consumer canary.
+
+The evidence JSON SHA-256 is `89d88d38f77466f615e59db2ff79e97a1406428706e6a7e7c34df26179dcf745`. The old/new fixture binary hashes are `b7ab9a21aa8a81a838980e664d00e6c29dad878a85bd2a5b6b4f2f8758e4a1ca` and `c2cca07a60adc972f40850a8c688bfb06047000ebbbf99f2991e8f5a22b25a88`, not the CLI/R1 binary hashes. Raw companions are `P/native-update-0b4/{fixture.log}`, `P/native-update-0b4.stdout.log`, and `P/native-update-0b4.stderr.log`.
+
+The worker's cleanup receipt reports no matching process for private fixture PIDs 113064, 115388, 97636, and 115440, and fixture-log shutdown completion. The supplementary `P/native-update-0b4-process-check.json`, SHA-256 `456990ddfa00ebad7bc237d603ef2a9069f16e1c8642af2dc0c03dbda5b0355f`, labels each query `ABSENT_OR_UNREADABLE`. That label alone is not an independent process-exit proof; the cleanup claim is bounded to the worker's exact-PID receipt and fixture log. No unrelated process cleanup is implied.
+
+### Scenario 8 native Unix held-reaper and full-tree cases
+
+The selected gate ran at source `7cd4b2dcaab4f626f2b6868f491085ee604b3e64`, working directory `/repo/c7cd/muxcore`, using the direct cached Go 1.25.12 executable. Its recorded command is:
+
+```text
+/repo/.agent/tmp/u/gomod/golang.org/toolchain@v0.0.1-go1.25.12.linux-amd64/bin/go test ./daemon ./upstream ./procgroup -run '^(TestMaintenanceSafeTTLReleasesDurablyWithoutIdleExitBypass|TestMaintenanceBlockedTTLDoesNotReleaseUnprovenTree|TestMaintenanceIncompleteLedgerRecoveryCannotInventTreeDeath|TestMaintenanceTreeDeathExcludesCommittedTransfer|TestConcurrentTreeFinalizationIsIdempotent|TestGracefulKill_KillsTree)$' -count=1 -timeout=120s -v
+```
+
+The receipt records `GOTOOLCHAIN=local`, `TMPDIR=/repo/c7cd/.agent/tmp/u`, `GOTMPDIR=/repo/c7cd/.agent/tmp/u/go-tmp`, `GOCACHE=/repo/c7cd/.agent/tmp/u/go-cache`, and `GOMODCACHE=/repo/.agent/tmp/u/gomod`. These are observed container paths, not portable defaults. Exit is 0: 6/6 selected top-level tests, 2/2 incomplete-recovery subcases, and 3/3 packages PASS. The incomplete-recovery states are HOLDING and RETIREMENT_BLOCKED. Raw `P/docker/unix-lifecycle-7cd.log` has SHA-256 `793cf620bff598b69bae1a5e1ba02cc648770816a493e30e7acde47bb8ab4958`. Its package durations are daemon 2.076s, upstream 0.019s, and procgroup 0.006s.
+
+The initial attempt exited 1 before any test because GOTMPDIR did not exist. `P/docker/unix-lifecycle-7cd-setup.log` remains preserved and is not a zero-test success. The completed selected run supplies the previously missing named/source/toolchain-bound Unix coverage. Older `linux-focused-valid.log` remains a failing historical receipt; `linux-full-fixture-green.log` remains package-only and source-unbound. Neither is upgraded by the new run.
+
+### Scenario 8 retained Windows lifecycle child
+
+The independently completed child report is primary `.agent/reports/critical-process-lifecycle-20261003-064612.json`, not a file beneath `P`. It records PASS for 8 parallel isolated host transports with initial, wake, and post-upgrade observations of 8 trees each, 3 launcher-only convergences, and zero stale descendants or scoped/captured survivors before and after cleanup. Its candidate SHA-256 is `b5f847deb5bf13ee3d991a3a14b6347611ebc0b867076a60cbd47e0d2447acc7`, distinct from the parity and live-maintenance binaries. The JSON contains no source-SHA field; this writer does not label it a fresh `7cd4b2d` execution. Root retains it as historical bounded Windows Scenario 8 evidence from the interrupted critical run. This child report alone did not establish the original aggregate suite exit or verdict; the corrected complete suite below supplies a new terminal result.
+
+## Corrected critical suite and root technical acceptance
+
+Root executed the existing complete critical command from the candidate root with Go 1.25.12 and primary scratch environment:
+
+```text
+pwsh -NoProfile -File tests/critical/run-all.ps1 -TimeoutSeconds 120 -Launcher D:/Dev/mcp-launcher/mcp-launcher.exe -ArtifactRoot D:/Dev/mcp-mux/.agent
+```
+
+The root receipt records **exit 0**. Raw output is `P/critical-topology-repaired.log`; the aggregate is primary `.agent/reports/critical-suite-20261003-080036.json`, run ID `94c18a13-0c44-43a8-abe4-62be8e844bbb`. It records PASS, total 5, passed 5, failed 0, skipped 0, errored 0, runtime 282.405s, empty error and missing-coverage arrays, and successful isolated-process teardown. Start/finish timestamps are `2026-10-03T05:00:36.2901549Z` and `2026-10-03T05:05:18.6948835Z`.
+
+| Critical step | Verdict | Duration ms |
+| --- | --- | --- |
+| Build isolated mcp-mux binary | PASS | 1121 |
+| Process lifecycle convergence smoke | PASS | 168541 |
+| Real time upstream reconnect smoke | PASS | 79871 |
+| Current topology proofing oracle | PASS | 21224 |
+| Native SessionHandler update smoke | PASS | 11628 |
+
+Companion reports are `.agent/reports/critical-process-lifecycle-20261003-080036.json`, `critical-smoke-time-upstream-20261003-080036.json`, and `critical-native-sessionhandler-update-20261003-080036.json`. The aggregate identifies isolated binary `.agent/tmp/critical-suite-20261003-080036/mcp-mux.exe`; its lifecycle companion records SHA-256 `a35902e70aa406227334f9bb4acb413fc3a891972594414433a0ffa161068483`. This matches the recorded Windows candidate hash, not the older interrupted critical run's `b5f847...` hash.
+
+Root binds the executed source to `7cd4b2d` plus exactly the three owned oracle-fix files committed as `5b07ecd8f531891fbb7a42353200850baef7d274`. No post-commit rerun is fabricated. The original roughly 30-minute aborted critical attempt remains preserved without terminal exit or aggregate verdict. Its scout initially could not distinguish launcher capture from shutdown. Later exact-PID evidence showed control shutdown exit 0 and daemon PID 43148 OS exit in 160ms; source established inherited detached-daemon stderr keeping launcher capture EOF open. The fixture's stderr lifetime, timeout propagation, and typed cleanup were repaired. The new complete suite closes that pending gate; it does not rewrite the original attempt as PASS.
+
+Root now admits T030 complete and T031 technical implementation acceptance, including all named behavior/proof and 7/7 known review corrections. T029 remains complete. Release selection is additive minor **0.31.0 for both binary and muxcore library**, using the normal direct release flow, not a compare-and-swap release route. Selection and private versioned-artifact proof do not complete T032 or T033.
+
+## Remaining release and consumer outcomes
+
+Technical acceptance is complete. The remaining rows describe delivery effects, not pending runtime gates or a generic blocked verdict. Root retains the ordinary full release outcome and appends exact delivery/readback evidence before completion.
 
 | Task / gate | Current recorded state | Outcome still required |
 | --- | --- | --- |
-| T030 critical suite | Prior child execution was interrupted/aborted after roughly 30 minutes. `CriticalExecutionRecovery` is recovering actual exit/hang evidence. No critical PASS is recorded. | Terminal outcome and exact raw evidence for `tests/critical/run-all.ps1 -TimeoutSeconds 120`, including required launcher configuration and any recovery disposition. |
-| T030 Scenario 5b | Evidence recovery is pending. No completed native-update scenario receipt is incorporated. | Observed native-sessionhandler update result, original connection/no-replay evidence, exact source/binary binding and exit. |
-| T030 Scenario 8 | Native Unix held-reaper/full-tree coverage remains pending. R1 Scenario 8 is operator rollback, not this coverage. Earlier `P/docker/linux-focused-valid.log` reports failed whole-tree death and a too-long engine socket path; `linux-full-fixture-green.log` has only package PASS rows without source SHA or named cases. | Applicable source/toolchain-bound Windows and Unix process-group/Job/lifecycle evidence and explicit scenario disposition, including named Unix held-reaper/full-tree proof. Stale failing or unbound package-only receipts do not establish it. |
-| T031 final root review | Seven source findings closed within their assigned scope; T029 admitted complete. The complete candidate/frozen evidence is not technically accepted while T030 remains pending. | Root review of all requirements, public APIs, migration/rollback docs, T030 outcomes, and any residual findings. |
-| T032 release | Ordinary release intent retained. No selected version, PR, merge, tags, current-module publication, or binary delivery recorded. | Post-acceptance version decision, changelog/release notes, authorized exact-SHA merge/tag-last flow, remote tag parity and module/binary delivery. |
-| T033 consumers and canary | Current-version handoffs, fresh-clone/module/binary canary, and fresh-session delivered hold/replace/resume proof are not recorded. Engram native issue capability is unmounted; no backend substitute is invented. | Target-authorized consumer handoff/readback through the owning capability, plus delivered-artifact and fresh-session proof. Record the exact missing capability boundary if it remains unavailable. |
+| T032 release | In progress. Root selects binary/library `0.31.0` and is preparing version/docs/artifact delivery through the normal direct release flow. No PR, merge, tags, current-module publication, or delivered binary is recorded. Root reports private-owner `v0.31.0` proof, not a release canary. | Complete owning release-version docs and correct artifact version embedding, authorized exact-SHA merge/tag-last flow, remote parity, and module/binary delivery. Root's fresh GitHub API read works; HTTPS Git ls-remote encountered a connection timeout, which is transport evidence, not publication success. |
+| T033 consumers and canary | Pending external handoffs and post-merge fresh-clone/module/binary/fresh-session proof. Engram native issue capability remains unmounted; only that handoff effect is held, not the completed technical work or other reachable delivery effects. | Target-authorized handoff/readback and post-merge delivered-artifact canaries, including fresh-session hold/replace/resume. Record `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` only after their actual criteria pass. Do not invent an Engram backend substitute. |
 
 Neither `PROJECT_RELEASE_PROTOCOL_PASS` nor `CONSUMER_HANDOFF_PASS` is claimed. Source implementation, bounded verification, technical acceptance, and consumer delivery remain separate states.

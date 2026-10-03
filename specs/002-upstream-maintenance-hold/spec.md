@@ -4,11 +4,11 @@
 
 **Created**: 2026-10-03
 
-**Status**: Implemented through `1f3c119ef6841b219412e4e6a93f6a452b7339a8`, with docs-only successor `0b443b0ea51078814e76d12af0632fb9b5d52cc0`; requirements reviewed against accepted ADR-015. Root admits T029 integrated proof complete. T030/T031 technical acceptance is pending, and the feature is not delivered.
+**Status**: Implemented and technically accepted by root through T029-T031. Accepted source milestone `5b07ecd8f531891fbb7a42353200850baef7d274` commits the exact three oracle-fix files exercised in the completed critical suite. Binary/library additive minor `0.31.0` is selected; T032 release is in progress and T033 consumer delivery remains pending. The feature is not yet delivered.
 
 **Input**: [GitHub #135](https://github.com/thebtf/mcp-mux/issues/135): release a managed upstream for in-place executable replacement and suppress respawn until explicit resume or safe timeout. Existing stop is not a maintenance hold.
 
-Current milestone evidence is in [release evidence](release-evidence.md) and [tasks](tasks.md). Windows and Debian Linux live replacement passed at `45d4f93`; focused core/adapter proof and selected Go 1.25.12 R1 parity on both platforms complete T029, as admitted by root. Full tests/vet, integrated race, and the bounded seven-finding source closeout retain their exact-source limits. T030 critical aggregate and Scenario 5b/8, including native Unix coverage, and T031 final root acceptance remain pending. The accepted full-slice scope retains ordinary release intent, not a source-only exemption. No release version, PR, tags, current-module publication, or consumer delivery is recorded.
+Current milestone evidence is in [release evidence](release-evidence.md) and [tasks](tasks.md). Root accepts the complete named behavior/proof and all 7 known source corrections. T029 Windows/Unix live replacement, focused maintenance and R1 parity, T030 complete critical/scenario gates, and T031 technical review are admitted complete with their recorded source/hash limits. The original aborted and setup-failed attempts remain historical failures, not pending gates or retroactive passes. Root selects binary/library `0.31.0` through the normal direct release flow. T032 version/docs/artifact work is in progress; no PR, merge, tags, current-module publication, post-merge canary, or consumer delivery is recorded. The accepted full-slice scope retains ordinary release intent, not a source-only exemption.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -138,4 +138,4 @@ An operator can inspect the exact maintenance state and trust that a daemon rest
 - Original-ID immediate-error and no-replay guarantees apply to maintenance-aware shims. Older shims retain only the start fence enforced by the aware daemon; unmanaged old binaries cannot be fenced by this feature.
 - Active-lease transfer is excluded. Controlled restart, handoff, shutdown, downgrade, and empty-daemon idle exit stay blocked until safe release. Incomplete retirement after unplanned loss stays blocked; metadata does not recreate lost process-tree authority.
 - Released modern lifecycle quarantine remains in force. Same-host transparent modern restoration is not promised where existing native admission requires a new launch.
-- Acceptance and release require the repository's existing cross-platform regression, production, and consumer-delivery gates. These artifacts record implemented source and bounded verification, not technical acceptance or release completion.
+- Acceptance and release require the repository's existing cross-platform regression, production, and consumer-delivery gates. These artifacts now record root technical acceptance separately from release and consumer completion.
