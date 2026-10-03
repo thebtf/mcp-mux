@@ -206,22 +206,54 @@ function Get-Owner($Context, [string]$Command) {
     Assert-Observation ($owners.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($owners[0]["server_id"])) "One exact managed target" @{ command = $Command; matches = $owners.Count }
     return $owners[0]
 }
-function Get-Identity([int]$ProcessId, [string]$Label, [string]$ExpectedPath = "") {
-    $process = [Diagnostics.Process]::GetProcessById($ProcessId)
+function Read-ProcessIdentity([Diagnostics.Process]$Process, [string]$Label, [switch]$Startup, [long]$ExpectedStartTicks = 0) {
+    $until = [DateTime]::UtcNow.AddSeconds(1)
+    $waiting = $false
+    while ($true) {
+        $Process.Refresh()
+        if ($Process.HasExited) { return $null }
+        try {
+            $ticks = $Process.StartTime.ToUniversalTime().Ticks
+            if ($ExpectedStartTicks -ne 0 -and $ticks -ne $ExpectedStartTicks) { return $null }
+            $module = $Process.MainModule
+            if ($null -ne $module) {
+                $executable = [IO.Path]::GetFullPath($module.FileName)
+                if ($Process.HasExited) { return $null }
+                return @{ pid = $Process.Id; label = $Label; executable = $executable; start_ticks = $ticks }
+            }
+        } catch {
+            if ($Process.HasExited) { return $null }
+            throw "OS identity read failed for $Label (PID $($Process.Id), type $($Process.GetType().FullName)): $($_.Exception.GetType().FullName): $($_.Exception.Message)"
+        }
+        if (-not $waiting) {
+            Write-Trace "process-module-unavailable" @{ label = $Label; pid = $Process.Id; process_type = $Process.GetType().FullName; has_exited = $Process.HasExited; startup = $Startup.IsPresent }
+            $waiting = $true
+        }
+        # Only a live, just-started host with a null OS module gets a bounded observation window.
+        if (-not $Startup -or [DateTime]::UtcNow -ge $until -or [DateTime]::UtcNow -ge $Deadline) {
+            if ($Process.HasExited) { return $null }
+            throw "OS executable identity unavailable for live $Label (PID $($Process.Id)): MainModule remained null; no expected-path fallback used"
+        }
+        Start-Sleep -Milliseconds 25
+    }
+}
+function Get-Identity([int]$ProcessId, [string]$Label, [string]$ExpectedPath = "", [Diagnostics.Process]$StartedProcess = $null) {
+    $process = if ($null -ne $StartedProcess) { $StartedProcess } else { [Diagnostics.Process]::GetProcessById($ProcessId) }
     try {
-        $identity = @{ pid = $ProcessId; label = $Label; executable = [IO.Path]::GetFullPath($process.MainModule.FileName); start_ticks = $process.StartTime.ToUniversalTime().Ticks }
+        $identity = Read-ProcessIdentity $process $Label -Startup:($null -ne $StartedProcess)
+        if ($null -eq $identity) { throw "Process exited before OS identity capture: $Label (PID $ProcessId)" }
         if ($ExpectedPath -ne "") { Assert-Observation ($identity.executable -eq $ExpectedPath) "Exact executable identity: $Label" $identity }
         $Identities.Add($identity)
         Write-Trace "process-identity" $identity
         return $identity
-    } finally { $process.Dispose() }
+    } finally { if ($null -eq $StartedProcess) { $process.Dispose() } }
 }
 function Test-IdentityAlive($Identity) {
     try { $process = [Diagnostics.Process]::GetProcessById([int]$Identity.pid) } catch [ArgumentException] { return $false }
     try {
-        if ($process.HasExited) { return $false }
-        if ($process.StartTime.ToUniversalTime().Ticks -ne $Identity.start_ticks) { return $false }
-        if ([IO.Path]::GetFullPath($process.MainModule.FileName) -ne $Identity.executable) { throw "Captured process changed executable without exiting" }
+        $current = Read-ProcessIdentity $process $Identity.label -ExpectedStartTicks $Identity.start_ticks
+        if ($null -eq $current) { return $false }
+        if ($current.executable -ne $Identity.executable) { throw "Captured process changed executable without exiting" }
         return $true
     } finally { $process.Dispose() }
 }
@@ -278,7 +310,22 @@ function Start-Host($Context, [string]$Fixture, [string]$Name, [switch]$Modern) 
     if (-not $process.Start()) { throw "Host failed to start" }
     $session = @{ name = $Name; process = $process; context = $Context; pending = $null; frames = [System.Collections.Generic.List[object]]::new(); sent = @{}; received = @{}; stderr = $process.StandardError.ReadToEndAsync(); input = $process.StandardInput; output = $process.StandardOutput; modern = $Modern.IsPresent; identity = $null; input_handle = $null; output_handle = $null }
     $Sessions.Add($session)
-    $session["identity"] = Get-Identity $process.Id $Name $Launcher
+    try {
+        $session["identity"] = Get-Identity $process.Id $Name $Launcher $process
+    } catch {
+        $failure = Protect-Text $_.Exception.Message
+        $session["identity_failure"] = $failure
+        $session["failure_stdout"] = $session.output.ReadToEndAsync()
+        $exited = $process.HasExited
+        if ($exited) {
+            [void]$session.failure_stdout.Wait(1000)
+            [void]$session.stderr.Wait(1000)
+        }
+        $diagnostic = @{ host = $Name; pid = $process.Id; error = $failure; has_exited = $exited; exit_code = if ($exited) { $process.ExitCode } else { $null }; stdout_complete = $session.failure_stdout.IsCompleted; stderr_complete = $session.stderr.IsCompleted; stdout = if ($session.failure_stdout.IsCompletedSuccessfully) { Protect-Text $session.failure_stdout.Result } else { $null }; stderr = if ($session.stderr.IsCompletedSuccessfully) { Protect-Text $session.stderr.Result } else { $null } }
+        $Evidence["host_identity_failure"] = $diagnostic
+        Write-Trace "host-identity-failure" $diagnostic
+        throw
+    }
     $session["input_handle"] = Get-PipeHandle $session.input.BaseStream
     $session["output_handle"] = Get-PipeHandle $session.output.BaseStream
     Write-Trace "host-open" @{ name = $Name; pid = $process.Id; arguments = $arguments; stdin_handle = $session.input_handle; stdout_handle = $session.output_handle }
@@ -731,7 +778,15 @@ try {
     foreach ($session in $Sessions) {
         try {
             if (-not $session.process.WaitForExit(10000)) { throw "Owned host did not exit after stdin closure; no PID cleanup attempted" }
-            Write-Trace "host-closed" @{ host = $session.name; exit_code = $session.process.ExitCode; stderr = Protect-Text $session.stderr.Result }
+            $closed = @{ host = $session.name; exit_code = $session.process.ExitCode; stderr = Protect-Text $session.stderr.Result }
+            if ($session.ContainsKey("identity_failure")) {
+                [void]$session.failure_stdout.Wait(1000)
+                $closed["identity_failure"] = $session.identity_failure
+                $closed["stdout_complete"] = $session.failure_stdout.IsCompleted
+                $closed["stdout"] = if ($session.failure_stdout.IsCompletedSuccessfully) { Protect-Text $session.failure_stdout.Result } else { $null }
+                $Evidence["host_identity_failure_cleanup"] = $closed
+            }
+            Write-Trace "host-closed" $closed
         } catch { $cleanup.Add(@{ host = $session.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
     }
     foreach ($identity in $Identities) {

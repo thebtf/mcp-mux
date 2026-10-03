@@ -66,6 +66,13 @@ func TestMaintenanceDurableFencePrecedesSwapAndSuccessor(t *testing.T) {
 	t.Setenv("APPDATA", config)
 	t.Setenv("XDG_CONFIG_HOME", config)
 	eng := newUpdateTestEngine(t)
+	// Avoid t.TempDir's long test-name component while retaining the owned TMP root.
+	baseDir, err := os.MkdirTemp(os.TempDir(), "mu*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(baseDir) })
+	eng.cfg.BaseDir = baseDir
 	d, err := daemon.New(daemon.Config{ControlPath: eng.ControlSocketPath(), Namespace: eng.cfg.Namespace, SkipSnapshot: true, SessionHandler: updateDummySessionHandler{}})
 	if err != nil {
 		t.Fatal(err)

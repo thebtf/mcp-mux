@@ -1822,22 +1822,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
 	d.unlockMaintenanceRegistry()
-	if !fromTemplate {
-		if startErr := o.StartInitialMaterialization(); startErr != nil {
-			_, removalErr := d.removeOwnerIfCurrent(sid, placeholder, ownerRemovalReasonRestoreFailed, false)
-			return "", "", "", errors.Join(fmt.Errorf("spawn %s: start upstream: %w", req.Command, startErr), removalErr)
-		}
-	}
-
-	if fromTemplate && templatePersistent {
-		o.SpawnUpstreamBackground()
-	}
 
 	// PreRegisterInitial with the MERGED env (not raw req.Env) so the creating
 	// session sees daemon-filled credentials even if proactive initialization
 	// classifies this owner as isolated before Spawn returns. Reuse paths call
 	// ordinary PreRegister and therefore cannot claim a classified-isolated
 	// owner's reconnect-only listener.
+	// Reserve before starting discovery: cache publication holds admissionMu,
+	// and the creating shim must not wait for its own background cache commit.
 	// owner.go:~815 gates muxEnv injection on `len(s.Env) > 0` and sends s.Env
 	// as _meta.muxEnv; session-aware upstreams (pr-review-mcp etc.) look up
 	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
@@ -1852,6 +1844,16 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
 		}
 		return "", "", "", errSpawnRetry
+	}
+	if !fromTemplate {
+		if startErr := o.StartInitialMaterialization(); startErr != nil {
+			_, removalErr := d.removeOwnerIfCurrent(sid, placeholder, ownerRemovalReasonRestoreFailed, false)
+			return "", "", "", errors.Join(fmt.Errorf("spawn %s: start upstream: %w", req.Command, startErr), removalErr)
+		}
+	}
+
+	if fromTemplate && templatePersistent {
+		o.SpawnUpstreamBackground()
 	}
 	return ipcPath, sid, token, nil
 }
