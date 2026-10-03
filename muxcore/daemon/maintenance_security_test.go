@@ -242,90 +242,150 @@ func TestMaintenanceSecurity004FailedReleaseAfterPublicationKeepsRecoveryFence(t
 }
 
 func TestMaintenanceSecurity004TransactionBoundaries(t *testing.T) {
-	for _, test := range []struct {
-		phase string
-		after bool
-	}{
-		{phase: "prepare"},
-		{phase: "prepare", after: true},
-		{phase: "publish"},
-		{phase: "publish", after: true},
-		{phase: "finalize"},
-		{phase: "finalize", after: true},
-	} {
-		t.Run(fmt.Sprintf("%s_after_%t", test.phase, test.after), func(t *testing.T) {
-			d, req, _ := maintenanceSecurityHeld(t)
-			endpoint, namespace := d.ctlSrv.SocketPath(), d.namespace
-			data, err := os.ReadFile(d.maintenancePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var previous maintenanceLedger
-			if err := json.Unmarshal(data, &previous); err != nil {
-				t.Fatal(err)
-			}
-			d.shutdown(nil)
-			next := maintenanceLedger{Version: maintenanceSchema, Scope: previous.Scope, Transaction: maintenanceDigest("security-transaction", t.Name()), Leases: []maintenanceRecord{}}
-			faulted := false
-			err = commitMaintenanceStore(d.maintenancePath, next, previous.Leases, func(path string, data []byte) error {
-				phase := "publish"
-				if path == maintenanceTransactionPath(d.maintenancePath) {
-					var transaction maintenanceTransaction
-					if err := json.Unmarshal(data, &transaction); err != nil {
-						return err
+	for _, operation := range []string{"release", "initial_hold", "clocked_hold"} {
+		t.Run(operation, func(t *testing.T) {
+			for _, test := range []struct {
+				phase string
+				after bool
+			}{
+				{phase: "prepare"},
+				{phase: "prepare", after: true},
+				{phase: "publish"},
+				{phase: "publish", after: true},
+				{phase: "finalize"},
+				{phase: "finalize", after: true},
+			} {
+				t.Run(fmt.Sprintf("%s_after_%t", test.phase, test.after), func(t *testing.T) {
+					d, req, result := maintenanceSecurityHeld(t)
+					endpoint, namespace := d.ctlSrv.SocketPath(), d.namespace
+					data, err := os.ReadFile(d.maintenancePath)
+					if err != nil {
+						t.Fatal(err)
 					}
-					phase = "prepare"
-					if transaction.State == "committed" {
-						phase = "finalize"
+					var previous maintenanceLedger
+					if err := json.Unmarshal(data, &previous); err != nil {
+						t.Fatal(err)
 					}
-				}
-				if phase == test.phase && !test.after {
-					faulted = true
-					return errors.New("injected before publication")
-				}
-				if err := writeMaintenanceLedger(path, data); err != nil {
-					return err
-				}
-				if phase == test.phase {
-					faulted = true
-					return errors.New("injected after publication")
-				}
-				return nil
-			})
-			if !faulted || !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
-				t.Fatalf("fault boundary was not returned: reached=%t err=%v", faulted, err)
-			}
-			_, _, authority, readErr := readMaintenanceAuthority(namespace, endpoint)
-			completed := test.phase == "finalize" && test.after
-			if completed {
-				// Finalization is only attempted after the target writer returned
-				// success. This certificate proves that earlier durable commit;
-				// it does not turn the injected finalize error into API success.
-				if readErr != nil || authority == nil || len(authority.Leases) != 0 {
-					t.Fatalf("lost acknowledged target commit: %+v %v", authority, readErr)
-				}
-			} else if readErr == nil && (authority == nil || len(authority.Leases) == 0) {
-				t.Fatalf("uncertain transaction lost predecessor fencing: %+v", authority)
-			}
-			activationErr := CheckMaintenanceForActivation(namespace, endpoint)
-			if completed && activationErr != nil || !completed && !errors.Is(activationErr, control.ErrMaintenanceHeld) && !errors.Is(activationErr, control.ErrMaintenancePersistenceFailed) {
-				t.Fatalf("activation did not apply aggregate authority: %v", activationErr)
-			}
-			recovered, startupErr := New(Config{ControlPath: endpoint, Namespace: namespace, SkipSnapshot: true, Logger: testLogger(t)})
-			if errors.Is(startupErr, control.ErrMaintenancePersistenceFailed) {
-				if completed || ipc.IsAvailable(endpoint) {
-					t.Fatalf("incorrect startup refusal/listener: completed=%t available=%t", completed, ipc.IsAvailable(endpoint))
-				}
-				return
-			}
-			if startupErr != nil {
-				t.Fatal(startupErr)
-			}
-			t.Cleanup(func() { recovered.shutdown(nil) })
-			recovered.updateTemplate(req.Command, req.Args, daemonMaterializationSnapshot(false))
-			_, _, _, admissionErr := recovered.Spawn(req)
-			if completed && admissionErr != nil || !completed && !errors.Is(admissionErr, control.ErrMaintenanceHeld) {
-				t.Fatalf("recovery admission did not apply transaction outcome: completed=%t err=%v", completed, admissionErr)
+					d.shutdown(nil)
+					holding := previous.Leases[0]
+					holding.State = control.MaintenanceHolding
+					holding.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+					holding.DrainDeadline = holding.ExpiresAt.Add(-time.Minute)
+					if operation != "release" {
+						predecessor := previous.Leases
+						previous.Transaction = maintenanceDigest("security-predecessor", t.Name())
+						previous.Leases = []maintenanceRecord{}
+						if operation == "clocked_hold" {
+							previous.Leases = []maintenanceRecord{holding}
+						}
+						if err := commitMaintenanceStore(d.maintenancePath, previous, predecessor, writeMaintenanceLedger); err != nil {
+							t.Fatal(err)
+						}
+					}
+					next := maintenanceLedger{Version: maintenanceSchema, Scope: previous.Scope, Transaction: maintenanceDigest("security-transaction", t.Name()), Leases: []maintenanceRecord{}}
+					if operation != "release" {
+						if operation == "clocked_hold" {
+							holding.ExpiresAt = holding.ExpiresAt.Add(time.Second)
+							holding.DrainDeadline = holding.DrainDeadline.Add(time.Second)
+						}
+						next.Leases = []maintenanceRecord{holding}
+					}
+					faulted := false
+					err = commitMaintenanceStore(d.maintenancePath, next, previous.Leases, func(path string, data []byte) error {
+						phase := "publish"
+						if path == maintenanceTransactionPath(d.maintenancePath) {
+							var transaction maintenanceTransaction
+							if err := json.Unmarshal(data, &transaction); err != nil {
+								return err
+							}
+							phase = "prepare"
+							if transaction.State == "committed" {
+								phase = "finalize"
+							}
+						}
+						if phase == test.phase && !test.after {
+							faulted = true
+							return errors.New("injected before publication")
+						}
+						if err := writeMaintenanceLedger(path, data); err != nil {
+							return err
+						}
+						if phase == test.phase {
+							faulted = true
+							return errors.New("injected after publication")
+						}
+						return nil
+					})
+					if !faulted || !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+						t.Fatalf("fault boundary was not returned: reached=%t err=%v", faulted, err)
+					}
+					// A published FINALIZE certificate proves the earlier acknowledged
+					// target commit, never API success or tree death for HOLDING.
+					completed := test.phase == "finalize" && test.after
+					unchanged := test.phase == "prepare" && !test.after
+					valid := completed || unchanged
+					want := previous.Leases
+					if completed {
+						want = next.Leases
+					}
+					_, _, authority, readErr := readMaintenanceAuthority(namespace, endpoint)
+					if valid {
+						if readErr != nil || authority == nil || len(authority.Leases) != len(want) {
+							t.Fatalf("lost acknowledged authority: %+v %v", authority, readErr)
+						}
+						if len(want) == 1 && (authority.Leases[0].State != want[0].State || !authority.Leases[0].ExpiresAt.Equal(want[0].ExpiresAt) || !authority.Leases[0].DrainDeadline.Equal(want[0].DrainDeadline)) {
+							t.Fatalf("recovery changed acknowledged fence timing/state: %+v want %+v", authority.Leases[0], want[0])
+						}
+					} else if !errors.Is(readErr, control.ErrMaintenancePersistenceFailed) {
+						t.Fatalf("pending transaction became usable authority: %+v %v", authority, readErr)
+					}
+					activationErr := CheckMaintenanceForActivation(namespace, endpoint)
+					if !valid {
+						if !errors.Is(activationErr, control.ErrMaintenancePersistenceFailed) {
+							t.Fatalf("pending authority permitted activation: %v", activationErr)
+						}
+					} else if len(want) == 0 {
+						if activationErr != nil {
+							t.Fatalf("acknowledged empty authority retained a fence: %v", activationErr)
+						}
+					} else {
+						code := control.ErrMaintenanceHeld
+						if want[0].State != control.MaintenanceHeld {
+							code = control.ErrMaintenanceRetirementBlocked
+						}
+						if !errors.Is(activationErr, code) {
+							t.Fatalf("acknowledged fence permitted activation: %v", activationErr)
+						}
+					}
+					recovered, startupErr := New(Config{ControlPath: endpoint, Namespace: namespace, SkipSnapshot: true, Logger: testLogger(t)})
+					if recovered != nil {
+						t.Cleanup(func() { recovered.shutdown(nil) })
+					}
+					if !valid {
+						if !errors.Is(startupErr, control.ErrMaintenancePersistenceFailed) || ipc.IsAvailable(endpoint) {
+							t.Fatalf("pending recovery opened control admission: err=%v available=%t", startupErr, ipc.IsAvailable(endpoint))
+						}
+						return
+					}
+					if startupErr != nil {
+						t.Fatal(startupErr)
+					}
+					recovered.updateTemplate(req.Command, req.Args, daemonMaterializationSnapshot(false))
+					_, _, _, admissionErr := recovered.Spawn(req)
+					if len(want) == 0 && admissionErr != nil || len(want) > 0 && !errors.Is(admissionErr, control.ErrMaintenanceHeld) {
+						t.Fatalf("recovery admission did not apply transaction outcome: leases=%d err=%v", len(want), admissionErr)
+					}
+					if len(want) > 0 && want[0].State == control.MaintenanceHolding {
+						recovered.reconcileMaintenance()
+						states := recovered.maintenanceResults()
+						if len(states) != 1 || states[0].State != control.MaintenanceRetirementBlocked || states[0].TreesRetired || !states[0].ExpiresAt.Equal(want[0].ExpiresAt) || !states[0].DrainDeadline.Equal(want[0].DrainDeadline) {
+							t.Fatalf("incomplete clock recovery invented tree death or reset time: %+v", states)
+						}
+						if _, err := control.SendMaintenance(endpoint, control.Request{Cmd: "resume", HoldID: result.HoldID}, time.Second); !errors.Is(err, control.ErrMaintenanceRetirementBlocked) {
+							t.Fatalf("incomplete clock recovery permitted resume: %v", err)
+						}
+					}
+				})
 			}
 		})
 	}

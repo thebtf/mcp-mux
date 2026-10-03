@@ -288,11 +288,25 @@ func (d *Daemon) acquireMaintenance(req control.Request, ttl time.Duration) (con
 		d.maintenanceGate.Unlock()
 		return control.MaintenanceResult{}, control.ErrMaintenancePersistenceFailed
 	}
+	// Incomplete HOLDING seed times are provisional, never a usable grant.
 	now := time.Now().UTC()
 	lease := &maintenanceLease{record: maintenanceRecord{HoldID: id, Keys: keys}, pins: pins, result: control.MaintenanceResult{HoldID: id, ServerID: req.ServerID, State: control.MaintenanceHolding, ExpiresAt: now.Add(ttl), DrainDeadline: now.Add(time.Duration(req.DrainTimeoutMs) * time.Millisecond)}}
 	next := copyMaintenanceLeases(d.maintenanceLeases)
 	next[id] = lease
-	if err := d.persistMaintenanceLocked(next); err != nil {
+	err = d.persistMaintenanceLocked(next)
+	if err == nil {
+		// The second transaction must retain the acknowledged seed as predecessor.
+		d.maintenanceLeases = next
+		committedAt := time.Now().UTC()
+		clocked := *lease
+		clocked.result.ExpiresAt = committedAt.Add(ttl)
+		clocked.result.DrainDeadline = committedAt.Add(time.Duration(req.DrainTimeoutMs) * time.Millisecond)
+		err = d.commitMaintenanceLeaseLocked(lease, &clocked)
+		if err == nil {
+			lease = &clocked
+		}
+	}
+	if err != nil {
 		d.maintenanceFailed = true
 		d.mu.RLock()
 		for _, entry := range d.owners {
@@ -304,13 +318,6 @@ func (d *Daemon) acquireMaintenance(req control.Request, ttl time.Duration) (con
 		d.maintenanceGate.Unlock()
 		return lease.result, maintenanceFailure(control.ErrMaintenancePersistenceFailed, lease)
 	}
-	d.maintenanceLeases = next
-	for _, pin := range pins {
-		if pin.entry.Owner != nil {
-			pin.entry.Owner.SetMaintenance(&lease.result)
-		}
-	}
-	d.scheduleMaintenanceExpiryLocked(lease)
 	d.maintenanceGate.Unlock()
 
 	// A placeholder has no process before promotion. Promotion rechecks the fence,
@@ -467,6 +474,9 @@ func (d *Daemon) maintenanceRetirementChanged(entry *OwnerEntry) {
 	defer lock.Close()
 	d.maintenanceGate.Lock()
 	defer d.maintenanceGate.Unlock()
+	if d.maintenanceFailed {
+		return
+	}
 	for _, lease := range d.maintenanceLeases {
 		matched := false
 		for _, pin := range lease.pins {
