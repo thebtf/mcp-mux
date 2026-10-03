@@ -21,6 +21,7 @@ const (
 	ownerRemovalReasonHandoff       ownerRemovalReason = "handoff"
 	ownerRemovalReasonRestoreFailed ownerRemovalReason = "restore_failed"
 	ownerRemovalReasonUpstreamExit  ownerRemovalReason = "upstream_exit"
+	ownerRemovalReasonMaintenance   ownerRemovalReason = "maintenance"
 )
 
 const (
@@ -272,7 +273,9 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 	prepared.exitCode = exitCode
 	prepared.finalizationErr = finalizationErr
 	d.mu.Unlock()
-	return prepared.result, errors.Join(finalizationErr, d.finishOwnerRemoval(prepared))
+	err := errors.Join(finalizationErr, d.finishOwnerRemoval(prepared))
+	d.maintenanceRetirementChanged(entry)
+	return prepared.result, err
 }
 
 func finishOwnerRemovalAttemptLocked(entry *OwnerEntry) {

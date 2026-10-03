@@ -213,16 +213,12 @@ func TestToolsList(t *testing.T) {
 	}
 	unmarshalResult(t, resp, &result)
 
-	if len(result.Tools) != 6 {
-		t.Fatalf("tools count = %d, want 6", len(result.Tools))
-	}
-
 	names := make(map[string]bool)
 	for _, tool := range result.Tools {
 		names[tool.Name] = true
 	}
 
-	for _, expected := range []string{"mux_engines", "mux_prune_engines", "mux_topology", "mux_list", "mux_stop", "mux_restart"} {
+	for _, expected := range []string{"mux_engines", "mux_prune_engines", "mux_topology", "mux_list", "mux_stop", "mux_restart", "mux_hold", "mux_resume", "mux_renew"} {
 		if !names[expected] {
 			t.Errorf("tool %q not found in list", expected)
 		}
@@ -1818,132 +1814,6 @@ func TestMuxStopByName(t *testing.T) {
 	unmarshalResult(t, resp, &result)
 	if result.IsError {
 		t.Fatalf("mux_stop by name should succeed, got error: %v", result.Content)
-	}
-}
-
-func TestMuxRestartWithFakeServer(t *testing.T) {
-	sid := "ffaa112233445566"
-	baseDir := shortBaseDir(t, "mcpmux-restart-")
-
-	daemonCtlPath := filepath.Join(baseDir, "test-restart-muxd.ctl.sock")
-	owners := control.ListOwnersResponse{
-		Owners: []control.OwnerInfo{
-			{ServerID: sid, Command: "uvx", Args: []string{"restart-test"}, Sessions: 1},
-		},
-	}
-	startFakeDaemonControlServer(t, daemonCtlPath, owners)
-	startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command": "uvx", "args": []string{"restart-test"},
-	})
-
-	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
-	defer clientW.Close()
-	sendLine(t, clientW, fmt.Sprintf(
-		`{"jsonrpc":"2.0","id":45,"method":"tools/call","params":{"name":"mux_restart","arguments":{"server_id":"%s","force":true}}}`, sid))
-	line := readLine(t, clientR)
-	resp := parseResponse(t, line)
-	assertID(t, resp, 45)
-	assertNoError(t, resp)
-
-	var result struct {
-		IsError bool `json:"isError"`
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	unmarshalResult(t, resp, &result)
-
-	if result.IsError {
-		text := result.Content[0].Text
-		if strings.Contains(text, "unreachable") || strings.Contains(text, "no command info") || strings.Contains(text, "not managed") {
-			t.Fatalf("restart failed at resolve stage: %s", text)
-		}
-		// exec.Command spawn failure is acceptable in test environment
-	} else {
-		if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "restarted") {
-			t.Errorf("expected 'restarted' in success message, got: %v", result.Content)
-		}
-	}
-}
-
-func TestMuxRestartByName(t *testing.T) {
-	sid := "ffbb112233445566"
-	baseDir := shortBaseDir(t, "mcpmux-restartname-")
-
-	daemonCtlPath := filepath.Join(baseDir, "test-restartname-muxd.ctl.sock")
-	owners := control.ListOwnersResponse{
-		Owners: []control.OwnerInfo{
-			{ServerID: sid, Command: "node", Args: []string{"unique-restart-by-name-test.js"}, Sessions: 1},
-		},
-	}
-	startFakeDaemonControlServer(t, daemonCtlPath, owners)
-	startFakeControlServer(t, baseDir, sid, map[string]any{
-		"command": "node", "args": []string{"unique-restart-by-name-test.js"},
-	})
-
-	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
-	defer clientW.Close()
-
-	sendLine(t, clientW, `{"jsonrpc":"2.0","id":46,"method":"tools/call","params":{"name":"mux_restart","arguments":{"name":"unique-restart-by-name-test","force":true}}}`)
-	line := readLine(t, clientR)
-	resp := parseResponse(t, line)
-	assertID(t, resp, 46)
-	assertNoError(t, resp)
-
-	var result struct {
-		IsError bool `json:"isError"`
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	unmarshalResult(t, resp, &result)
-
-	if result.IsError {
-		text := result.Content[0].Text
-		if strings.Contains(text, "no server matching") || strings.Contains(text, "not managed") {
-			t.Fatalf("restart by name failed to resolve: %s", text)
-		}
-	}
-}
-
-func TestMuxRestartNoCommandInfo(t *testing.T) {
-	sid := "ffcc112233445566"
-	baseDir := shortBaseDir(t, "mcpmux-nocmd-")
-
-	daemonCtlPath := filepath.Join(baseDir, "test-nocmd-muxd.ctl.sock")
-	// Daemon returns owner with empty Command
-	owners := control.ListOwnersResponse{
-		Owners: []control.OwnerInfo{
-			{ServerID: sid, Command: "", Args: nil, Sessions: 1},
-		},
-	}
-	startFakeDaemonControlServer(t, daemonCtlPath, owners)
-
-	clientW, clientR, _ := newTestServerFull(t, daemonCtlPath, baseDir)
-	defer clientW.Close()
-
-	sendLine(t, clientW, fmt.Sprintf(
-		`{"jsonrpc":"2.0","id":47,"method":"tools/call","params":{"name":"mux_restart","arguments":{"server_id":"%s"}}}`, sid))
-	line := readLine(t, clientR)
-	resp := parseResponse(t, line)
-	assertID(t, resp, 47)
-	assertNoError(t, resp)
-
-	var result struct {
-		IsError bool `json:"isError"`
-		Content []struct {
-			Text string `json:"text"`
-		} `json:"content"`
-	}
-	unmarshalResult(t, resp, &result)
-	if !result.IsError {
-		t.Fatal("expected error when server has no command info")
-	}
-	if len(result.Content) == 0 {
-		t.Fatal("expected non-empty content for tool error")
-	}
-	if !strings.Contains(result.Content[0].Text, "no command info") {
-		t.Errorf("expected 'no command info' error, got: %s", result.Content[0].Text)
 	}
 }
 

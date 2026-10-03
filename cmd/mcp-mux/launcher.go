@@ -111,7 +111,7 @@ func shouldRunOperatorCommandInLauncher(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "status", "stop":
+	case "status", "stop", "hold", "resume", "renew":
 		return true
 	default:
 		return false
@@ -311,15 +311,27 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 			return 1
 		}
 		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, *forceDaemonRestart); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %s\n", lifecycleErrorText(err))
+			if !isMaintenanceError(err) {
+				fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+			}
 			return 1
 		}
 		return 0
 	}
 
+	mutationLock, err := acquireMaintenanceMutation()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: upgrade refused: %s\n", lifecycleErrorText(err))
+		return 1
+	}
+	defer func() {
+		if mutationLock != nil {
+			_ = mutationLock.Close()
+		}
+	}()
 	pendingPath := launcherPath + "~"
-	enginePath, installed, launcherUpdated, err := installVersionedEngineWithOptions(launcherPath, pendingPath, versionedEngineInstallOptions{
+	enginePath, installed, launcherUpdated, err := installVersionedEngineUnderLock(launcherPath, pendingPath, versionedEngineInstallOptions{
 		UpdateLauncher: *updateLauncher,
 	})
 	if err != nil {
@@ -346,11 +358,18 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 
 	if *restart {
 		if launcherUpdated {
+			if err := mutationLock.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "error: release update namespace lock: %v\n", err)
+				return 1
+			}
+			mutationLock = nil
 			return launcherRunRestartActive(launcherPath, enginePath, *forceDaemonRestart)
 		}
-		if err := restartDaemonAfterEngineSwitch(launcherPath, enginePath, *forceDaemonRestart); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+		if err := restartDaemonAfterEngineSwitchUnderLock(launcherPath, enginePath, *forceDaemonRestart); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: daemon restart incomplete: %s\n", lifecycleErrorText(err))
+			if !isMaintenanceError(err) {
+				fmt.Fprintln(os.Stderr, "Shims will start the active engine on next reconnect.")
+			}
 			return 1
 		}
 	}
@@ -388,6 +407,17 @@ func installVersionedEngine(launcherPath, pendingPath string) (enginePath string
 }
 
 func installVersionedEngineWithOptions(launcherPath, pendingPath string, opts versionedEngineInstallOptions) (enginePath string, installed bool, launcherUpdated bool, err error) {
+	mutationLock, err := acquireMaintenanceMutation()
+	if err != nil {
+		return "", false, false, err
+	}
+	defer mutationLock.Close()
+	return installVersionedEngineUnderLock(launcherPath, pendingPath, opts)
+}
+
+// installVersionedEngineUnderLock requires the admitted namespace lock through
+// every layout, launcher binary, and active-pointer mutation.
+func installVersionedEngineUnderLock(launcherPath, pendingPath string, opts versionedEngineInstallOptions) (enginePath string, installed bool, launcherUpdated bool, err error) {
 	if _, err := os.Stat(pendingPath); err != nil {
 		if os.IsNotExist(err) {
 			return "", false, false, fmt.Errorf("no pending update found at %s", pendingPath)
@@ -437,7 +467,7 @@ func installVersionedEngineWithOptions(launcherPath, pendingPath string, opts ve
 		launcherUpdated = true
 	}
 
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		return "", installed, launcherUpdated, err
 	}
 	return enginePath, installed, launcherUpdated, nil
@@ -486,6 +516,16 @@ func removeWithRetry(path string, attempts int, delay time.Duration) error {
 }
 
 func restartDaemonAfterEngineSwitch(launcherPath, enginePath string, force bool) error {
+	mutationLock, err := acquireMaintenanceMutation()
+	if err != nil {
+		return err
+	}
+	defer mutationLock.Close()
+	return restartDaemonAfterEngineSwitchUnderLock(launcherPath, enginePath, force)
+}
+
+// restartDaemonAfterEngineSwitchUnderLock never reacquires the updater's lock.
+func restartDaemonAfterEngineSwitchUnderLock(launcherPath, enginePath string, force bool) error {
 	ctlPath := serverid.DaemonControlPath("", engineName)
 	if !launcherIsDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "No daemon running; active engine will be used by the next shim reconnect.")
@@ -495,6 +535,9 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string, force bool)
 	if !force {
 		liveSessions, err := launcherDaemonLiveSessionCount(ctlPath)
 		if err != nil {
+			if isMaintenanceError(err) {
+				return err
+			}
 			fmt.Fprintf(os.Stderr, "Daemon restart deferred: could not prove zero live sessions: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Active engine updated; existing host transports are preserved.")
 			fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
@@ -508,44 +551,27 @@ func restartDaemonAfterEngineSwitch(launcherPath, enginePath string, force bool)
 		}
 	}
 
-	lockPath := serverid.DaemonLockPath("", engineName)
-	lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
-	if lockErr == nil {
-		if flockErr := lockFile(lock); flockErr == nil {
-			defer func() {
-				if err := unlockFile(lock); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: could not release daemon lock %s: %v\n", lockPath, err)
-				}
-				if err := lock.Close(); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: could not close daemon lock %s: %v\n", lockPath, err)
-				}
-			}()
-			fmt.Fprintln(os.Stderr, "Acquired daemon lock (shims blocked from respawning).")
-		} else {
-			if err := lock.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not close daemon lock %s: %v\n", lockPath, err)
-			}
-			fmt.Fprintf(os.Stderr, "Warning: could not acquire daemon lock: %v (proceeding anyway)\n", flockErr)
-		}
-	} else {
-		fmt.Fprintf(os.Stderr, "Warning: could not open daemon lock %s: %v (proceeding anyway)\n", lockPath, lockErr)
-	}
-
 	fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
 	resp, err := launcherControlSendWithTimeout(ctlPath, control.Request{
 		Cmd:            "graceful-restart",
 		DrainTimeoutMs: 30000,
 		SuccessorExe:   enginePath,
 	}, 60*time.Second)
+	if err == nil {
+		err = resp.Err()
+	}
+	if isMaintenanceError(err) {
+		return fmt.Errorf("daemon restart refused: %w", err)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "  graceful-restart not available: %v, falling back to shutdown\n", err)
-		_, _ = control.Send(ctlPath, control.Request{Cmd: "shutdown"})
-		launcherWaitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
-		return startDaemonAndWait(launcherPath, enginePath, ctlPath)
-	}
-	if !resp.OK {
-		fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
-		_, _ = control.Send(ctlPath, control.Request{Cmd: "shutdown"})
+		shutdownResp, shutdownErr := launcherControlSendWithTimeout(ctlPath, control.Request{Cmd: "shutdown"}, 5*time.Second)
+		if shutdownErr == nil {
+			shutdownErr = shutdownResp.Err()
+		}
+		if shutdownErr != nil {
+			return fmt.Errorf("daemon shutdown refused or incomplete: %w", shutdownErr)
+		}
 		launcherWaitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
 		return startDaemonAndWait(launcherPath, enginePath, ctlPath)
 	}
@@ -571,8 +597,8 @@ func launcherDaemonLiveSessionCount(ctlPath string) (int, error) {
 	if resp == nil {
 		return 0, errors.New("nil status response")
 	}
-	if !resp.OK {
-		return 0, fmt.Errorf("status: %s", resp.Message)
+	if err := resp.Err(); err != nil {
+		return 0, fmt.Errorf("status: %w", err)
 	}
 
 	var payload struct {
@@ -715,7 +741,7 @@ func resolveActiveEnginePointer(pointerPath string) (string, bool) {
 	return filepath.Clean(filepath.Join(filepath.Dir(pointerPath), raw)), true
 }
 
-func writeActiveEngine(launcherPath, enginePath string) error {
+func writeActiveEngineUnderLock(launcherPath, enginePath string) error {
 	activeFile := activeEngineFile(launcherPath)
 	if err := os.MkdirAll(filepath.Dir(activeFile), 0o755); err != nil {
 		return fmt.Errorf("create version store: %w", err)

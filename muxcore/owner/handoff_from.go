@@ -95,6 +95,8 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               srvID,
 		protocolEra:            cfg.ProtocolEra,
+		maintenanceGate:        cfg.MaintenanceGate,
+		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,

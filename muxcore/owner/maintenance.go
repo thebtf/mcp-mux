@@ -1,0 +1,139 @@
+package owner
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
+	"github.com/thebtf/mcp-mux/muxcore/upstream"
+)
+
+// SetMaintenance publishes an immutable fence while the daemon holds its gate.
+// It does no transport I/O and never reacquires the gate.
+func (o *Owner) SetMaintenance(result *control.MaintenanceResult) {
+	if result == nil {
+		o.maintenance.Store(nil)
+		return
+	}
+	if result.State == control.MaintenanceReleased {
+		o.maintenance.Store(nil)
+		return
+	}
+	copy := *result
+	o.maintenance.Store(&copy)
+}
+
+// MaintenanceRetired is stronger than handoff-capable owner completion.
+func (o *Owner) MaintenanceRetired() bool { return o.maintenanceRetired.Load() }
+
+// CurrentLaunchContext returns the exact last elected process context.
+func (o *Owner) CurrentLaunchContext() LaunchContext {
+	o.materializationMu.Lock()
+	defer o.materializationMu.Unlock()
+	launch := o.lastMaintenanceLaunch
+	if launch.Env == nil && launch.Cwd == "" {
+		return o.launchContextForSession(nil)
+	}
+	return LaunchContext{Cwd: launch.Cwd, Env: cloneLaunchEnv(launch.Env)}
+}
+
+func maintenanceErrorBytes(id json.RawMessage, result *control.MaintenanceResult) []byte {
+	data := struct {
+		ErrorCode   string                     `json:"error_code"`
+		Maintenance *control.MaintenanceResult `json:"maintenance,omitempty"`
+	}{"maintenance_held", result}
+	payload, _ := json.Marshal(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+			Data    any    `json:"data"`
+		} `json:"error"`
+	}{JSONRPC: "2.0", ID: id, Error: struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    any    `json:"data"`
+	}{-32005, "upstream held for update", data}})
+	return payload
+}
+
+func (o *Owner) rejectMaintenance(s *Session, msg *jsonrpc.Message, held *control.MaintenanceResult) error {
+	if !msg.IsRequest() {
+		return nil
+	}
+	return s.WriteRaw(maintenanceErrorBytes(msg.ID, held))
+}
+
+// DrainForMaintenance gives only work already delivered to the upstream its
+// accepted deadline. Queued demand is never replayed across the fence.
+func (o *Owner) DrainForMaintenance(deadline time.Time) {
+	demands := o.detachAllLocalDemands()
+	for _, demand := range demands {
+		_ = demand.session.WriteRaw(maintenanceErrorBytes(demand.message.ID, o.maintenance.Load()))
+	}
+	o.DrainRequestsUntil(deadline)
+	o.drainInflightRequests()
+}
+
+// DrainRequestsUntil waits for delivered requests without resetting a deadline.
+func (o *Owner) DrainRequestsUntil(deadline time.Time) {
+	for o.PendingRequests() > 0 && time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining > 10*time.Millisecond {
+			remaining = 10 * time.Millisecond
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-timer.C:
+		case <-o.done:
+			timer.Stop()
+			return
+		}
+	}
+}
+
+// startAdmittedMaterialization holds the managed admission lease across final
+// election, physical start and installation, including a partial failed start.
+func (o *Owner) startAdmittedMaterialization(a *materializationAttempt) (*upstream.Process, *materializationSignals, error) {
+	if o.maintenanceGate != nil {
+		o.maintenanceGate.RLock()
+		defer o.maintenanceGate.RUnlock()
+	}
+	if held := o.maintenance.Load(); held != nil {
+		return nil, nil, &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held}
+	}
+	o.launchContextMu.Lock()
+	defer o.launchContextMu.Unlock()
+	o.materializationMu.Lock()
+	if !a.launchFrozen {
+		if !o.launchSessionEligible(a.launch) {
+			if a.launchRequiresSession {
+				if replacement, ok := o.oldestEligibleLaunchContext(); ok {
+					a.launch = replacement
+				}
+			} else {
+				a.launch = o.electLaunchContextLocked()
+			}
+		}
+		a.launchFrozen = true
+	}
+	if !o.materializationEraMatches(a) {
+		o.materializationMu.Unlock()
+		return nil, nil, errMaterializationEraChanged
+	}
+	launch := LaunchContext{SessionID: a.launch.SessionID, Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
+	o.materializationMu.Unlock()
+	if o.admitMaterialization != nil {
+		if err := o.admitMaterialization(o, launch); err != nil {
+			return nil, nil, err
+		}
+	}
+	proc, err := o.spawnReplacementUpstream(launch)
+	var signals *materializationSignals
+	if proc != nil {
+		signals = o.installMaterializationProcess(a, proc)
+	}
+	return proc, signals, err
+}

@@ -88,6 +88,60 @@ To roll back, stop callers from selecting `era.PolicyModern20260728` or `--mcp-p
 
 R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
 
+## Upstream maintenance hold consumer contract
+
+This change requires maintenance-aware managed binary/daemon/shim cooperation;
+it does not assign a new released consumer target. Use the exact local status
+`server_id`, then the returned opaque `hold_id`:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <hold-id> --ttl 5m --json
+mcp-mux resume <hold-id> --json
+```
+
+Only durable, unexpired `HELD` with `trees_retired=true` permits installer-owned
+replacement. `HOLDING` and `RETIREMENT_BLOCKED` stay fenced; blocked retirement
+never TTL-clears. TTL defaults to 5m, is positive, and is at most 1h. Drain
+defaults to 10s, starts once at fence commitment, and zero skips grace rather
+than tree-death proof. Resume/renew affect only the exact current lease.
+CLI TTL and drain durations must be whole milliseconds; reject sub-millisecond
+values instead of truncating a positive drain to zero-force retirement.
+
+Scope is the selected owner's finite admitted CWD/era/security/configuration/
+namespace context set, not a host-wide executable lock. Aware shims preserve
+host pipes, return original numeric/string ID `-32005` maintenance errors before
+cache or forwarding, and never replay held or terminated work. Notifications
+have no invented replies. Modern resumed demand uses fresh same-era isolated
+admission without legacy bootstrap, cache, or subscription restoration.
+
+Controlled restart/handoff/shutdown/downgrade and idle exit refuse terminally
+under any fence, including launcher/library update fallback paths. Aware
+unplanned recovery reads durable authority before admission. Old daemons and
+uncoordinated standalone paths are `maintenance_unsupported`; never substitute
+stop, PID cleanup, or direct exec. Old shims receive physical start fencing only,
+not immediate-error/non-replay guarantees. Arbitrary old binaries, foreign
+engines, and manual active-pointer changes are unsupported. Clear safely proven
+holds through the current aware binary before downgrade; preserve blocked ledgers.
+
+Controlled update/install/swap, layout/bootstrap mutation, and active-pointer
+changes serialize with hold-ledger mutation under the existing daemon namespace
+file lock. `daemon.CheckMaintenanceForActivation` is read-only. Status and pure
+startup reads do not acquire/write that lock or proactively start a daemon.
+Activation also checks live aware status; offline/old endpoints are allowed only
+after locked persisted-clear proof. Do not introduce a separate updater lease
+or treat namespace coordination as host-wide file-lock authority.
+
+`mux_hold`, `mux_resume`, and `mux_renew` use the local daemon; `mux_restart` uses
+daemon-owned `restart_owner`, not ambient-context reconstruction. See
+[`muxcore/README.md`](muxcore/README.md#upstream-maintenance-control-this-change)
+for additive optional APIs and typed errors. Root owns the live cross-platform
+proof in production Scenario 11, focused maintenance regressions, existing
+Scenario 5b/8 and R1 parity gates, integration, and release. Smoke scratch/output/
+evidence must be explicitly supplied beneath PRIMARY `.agent`, never a linked
+inner `.agent` or OS temp. No maintenance smoke is implicitly enrolled in the
+critical suite.
+
 ## CONVENTIONS
 
 - Investigation reports: `.agent/reports/YYYY-MM-DD-topic.md`

@@ -276,11 +276,89 @@ it opening automatically, pass `--open-web-dashboard false` to Serena's
 `web_dashboard: false` only when the dashboard itself must be disabled; see the
 [Serena dashboard documentation](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
-**Disable daemon mode** (legacy per-session owner behavior):
+Standalone upstream launches through `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON`, or
+the direct-owner `--daemon` path are explicitly `maintenance_unsupported` in
+this change. Keep managed daemon admission enabled; direct execution is not a
+maintenance bypass.
 
-```sh
-MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
+## Hold an upstream for executable replacement
+
+This change adds maintenance-aware managed hold, resume, and renew operations.
+Use an aware binary, daemon, and shim together. This section does not assign a
+release version or claim that older installed tags support maintenance.
+
+Read the exact `server_id` from local `mcp-mux status`. Flags follow the identifier:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <returned-hold-id> --ttl 5m --json
+mcp-mux resume <returned-hold-id> --json
 ```
+
+Hold fences new demand before draining already-forwarded requests. The default
+drain is 10 seconds; `--drain-timeout 0s` skips grace but still requires complete
+managed tree death. Positive grace starts once at fence commitment, not again
+on each retirement retry. Replace the executable yourself only after a successful
+JSON result reports `state: HELD`, `trees_retired: true`, and a future `expires_at`.
+The result also contains `hold_id`, `server_id`, and `drain_deadline`.
+
+| State | Meaning |
+| --- | --- |
+| `HOLDING` | Admission is fenced; drain or tree retirement is in progress. |
+| `HELD` | Every scoped managed tree is proven dead; the lease is usable until expiry. |
+| `RETIREMENT_BLOCKED` | Tree death is unproven; replacement is unsafe and admission stays fenced. |
+| `RELEASED` | Durable release permits fresh demand. |
+
+TTL defaults to five minutes, must be positive, and cannot exceed one hour.
+Renewal uses the exact current hold ID and sets expiry from renewal acceptance.
+CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
+are rejected rather than rounded down to zero-force retirement.
+Competing or stale identities cannot replace or clear a lease. Explicit resume
+and TTL recovery open admission only after proven retirement and durable release.
+Blocked retirement never clears because time elapsed.
+
+Aware shims keep the original host pipes open. Requests received while fenced
+return JSON-RPC `-32005`, message `upstream held for update`, and
+`data.error_code: maintenance_held` with the original numeric or string ID.
+Maintenance wins over cached success. Rejected requests and unfinished work
+ended by retirement are not replayed; notifications receive no invented ID.
+Fresh legacy demand after release can reach a replacement on the same pipes.
+Modern demand uses fresh same-era isolated admission with required per-request
+metadata, without legacy bootstrap, cache, or request/subscription restoration.
+
+Scope is the selected owner's finite already-admitted context set, not a
+host-wide executable lock. Different CWDs, protocol eras, credentials/configuration
+contexts, engine namespaces, and unmanaged processes are outside that set unless
+already admitted explicitly. An unrelated process can still lock the file.
+
+MCP `mux_hold`, `mux_resume`, and `mux_renew` use the same local daemon operation.
+`mux_restart` uses daemon-owned `restart_owner` with the original exact context
+and era, not an adapter's ambient credentials. Controlled restart, handoff,
+shutdown, downgrade, and idle daemon exit refuse terminally while a fence remains;
+launcher and library update helpers cannot substitute shutdown or a successor.
+After unplanned daemon loss, aware startup reloads held authority before admission.
+Incomplete or unreadable authority fails closed.
+
+Controlled engine installation, launcher swap, layout/bootstrap mutation, and
+active-pointer updates use the existing daemon namespace file lock. Hold-ledger
+mutations use the same lock, so a hold cannot race past an activation check.
+`daemon.CheckMaintenanceForActivation` reads persisted authority without changing
+it. Status and pure startup inspection neither acquire nor write that lock and
+never proactively start a daemon. Activation checks also consult live aware
+status; an offline or old endpoint is allowed only when persisted authority is
+proven clear under the lock. This is namespace coordination, not a host-wide
+file lock or a separate updater lease.
+
+Old daemons return `maintenance_unsupported`, never a stop/kill/restart fallback.
+An aware daemon fences old managed shims' starts, but those shims have no promised
+immediate-error or non-replay semantics. Arbitrary old binaries, foreign engines,
+manual active-pointer replacement, and direct standalone bypass are unsupported.
+Before downgrade, use the current aware binary to resume every safely proven
+hold. Preserve blocked authority; do not delete ledgers or perform PID cleanup.
+
+Run the [live Windows and Unix replacement proof](docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
+before release. Its private primary-checkout scratch and actual overwrite evidence
+supplement focused regressions; a fixture build or unit test is not that proof.
 
 ## Resilient Shim
 

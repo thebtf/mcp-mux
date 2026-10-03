@@ -314,3 +314,79 @@ Existing readiness fields retain their established meaning. R1 readback does not
 To roll back, stop new explicit-modern admissions and drain or remove existing modern owners through the existing lifecycle path. Rollback never converts live modern work to legacy or replays unfinished work.
 
 R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
+
+## Managed upstream maintenance (this change)
+
+Maintenance is local authenticated control NDJSON, not an MCP method or a new
+protocol version. CLI flags follow the exact local identifier:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <hold-id> --ttl 5m --json
+mcp-mux resume <hold-id> --json
+```
+
+MCP adapters expose `mux_hold(server_id, hold_seconds=300,
+drain_timeout_ms=10000)`, `mux_resume(hold_id)`, and
+`mux_renew(hold_id, hold_seconds=300)`. Hold seconds are integer 1..3600; drain
+milliseconds are nonnegative. No substring, PID, foreign-engine selector, or
+direct-owner fallback is supported. `mux_restart` uses daemon-owned
+`restart_owner` with its exact original launch context and era.
+
+```json
+{"cmd":"hold","server_id":"exact-local-owner-id","hold_ttl_ms":300000,"drain_timeout_ms":10000}
+{"ok":true,"maintenance":{"hold_id":"opaque-lease","server_id":"exact-local-owner-id","state":"HELD","expires_at":"2026-10-03T12:05:00Z","drain_deadline":"2026-10-03T12:00:10Z","trees_retired":true}}
+{"cmd":"resume","hold_id":"opaque-lease"}
+```
+
+The times and identifiers above are examples. Success requires durable HELD,
+future expiry, and proven full-tree death. `HOLDING` means drain/retirement is in
+progress; `RETIREMENT_BLOCKED` remains fenced and cannot expire into a start.
+`RELEASED` permits only fresh demand. Default TTL is 5m and maximum TTL is 1h.
+Renew calculates expiry from acceptance and affects only the exact current lease.
+Positive drain starts once at fence commitment; zero skips grace, not tree proof.
+CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
+are rejected, not truncated to zero-force retirement.
+
+Aware shims reject requests before cache or forwarding while preserving original
+host pipes. Numeric and string IDs receive exactly one product error:
+
+```json
+{"jsonrpc":"2.0","id":"original-host-id","error":{"code":-32005,"message":"upstream held for update","data":{"error_code":"maintenance_held"}}}
+```
+
+Safe state/expiry may accompany the error. No invented response is sent for
+notifications. Held requests and unfinished work ended by retirement never
+replay. Fresh modern demand after resume uses required native metadata and fresh
+same-era isolated admission, without legacy initialize, cache, progress, or
+subscription restoration. R1 snapshot/handoff quarantine remains unchanged.
+
+Scope is the selected owner's finite already-admitted CWD/era/security/configuration/
+namespace context set, not a host-wide executable lock. Control readbacks expose
+only safe lease/timing/retirement fields. Wire failures use `maintenance_held`,
+`maintenance_conflict`, `maintenance_not_found`, `maintenance_retirement_blocked`,
+`maintenance_unsupported`, `maintenance_persistence_failed`, or
+`maintenance_invalid`; see [typed library control](../muxcore/README.md#upstream-maintenance-control-this-change).
+
+Controlled restart, handoff, shutdown, downgrade, and idle exit refuse terminally
+under a fence, including launcher/library fallback paths. Aware unplanned startup
+loads durable holds before admission and keeps incomplete authority blocked.
+Old daemons and uncoordinated standalone paths are unsupported, never stop/kill/
+restart substitutes. Old shims get physical start fencing only, not promised
+immediate errors or non-replay. Arbitrary old binaries, foreign engines, manual
+active-pointer replacement, unmanaged processes, and PID cleanup are outside
+the supported flow. Before downgrade, clear safely proven holds using the current
+aware binary and retain blocked authority. Do not delete the ledger to open admission.
+
+Controlled engine install, launcher swap, layout/bootstrap mutation, and active
+pointer updates hold the existing daemon namespace file lock across activation
+checks and mutation. Hold-ledger mutation uses the same lock. The shared
+`daemon.CheckMaintenanceForActivation` helper is read-only; status and pure
+startup inspection do not acquire/write the lock or proactively start a daemon.
+Activation also checks live aware status. Offline/old endpoints allow activation
+only when persisted authority is proven clear under the lock. This is neither
+a host-wide executable lock nor a separate updater lease.
+
+This contract adds no release tag. Actual Windows/Unix overwrite evidence and
+separate focused race/recovery proofs are required by [production Scenario 11](PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement).
+

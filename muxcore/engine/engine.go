@@ -544,7 +544,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
 	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, protocolWire, e.logger)
-	if err != nil {
+	if err != nil && !isMaintenanceFence(err) {
 		if errors.Is(err, era.AdmissionControlEraMismatch) {
 			admission := selection.AdmissionError(era.AdmissionControlEraMismatch)
 			writeEngineAdmissionError(os.Stdout, admission)
@@ -595,6 +595,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		Stdin:            clientStdin,
 		Stdout:           os.Stdout,
 		InitialIPCPath:   ipcPath,
+		InitialError:     err,
 		Token:            token,
 		ProtocolEra:      protocolEra,
 		OnInject:         e.cfg.OnInject,
@@ -690,6 +691,15 @@ func (e *MuxEngine) runProxy(ctx context.Context) error {
 // process, then polls until the daemon control socket responds (up to
 // daemonStartupTimeout).
 func (e *MuxEngine) startDaemon() error {
+	ctlPath := e.ControlSocketPath()
+	lock, err := engineAcquireDaemonLock(serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace))
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if isDaemonRunning(ctlPath) {
+		return nil
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
@@ -712,7 +722,6 @@ func (e *MuxEngine) startDaemon() error {
 		return fmt.Errorf("release daemon process: %w", err)
 	}
 
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 	return waitForDaemon(ctlPath, daemonStartupTimeout)
 }
 
@@ -859,8 +868,8 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
-	if !resp.OK {
-		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+	if err := resp.Err(); err != nil {
+		return "", "", "", fmt.Errorf("daemon spawn failed: %w", err)
 	}
 	if protocolEra != "" && resp.ProtocolEra != protocolEra {
 		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
@@ -924,6 +933,9 @@ func refreshTokenViaDaemon(ctlPath, prevToken, protocolEra string, logger *log.L
 	}, refreshRPCTimeout)
 	if err != nil {
 		return "", fmt.Errorf("refresh token via daemon: %w", err)
+	}
+	if err := resp.Err(); isMaintenanceError(err) {
+		return "", err
 	}
 	if !resp.OK {
 		switch resp.Message {

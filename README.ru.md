@@ -265,11 +265,86 @@ Daemon включён по умолчанию. Он запускается ав�
 `web_dashboard: false`. Подробнее — в
 [документации Serena](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
-**Отключить daemon-режим** (устаревшее поведение с владельцем на уровне сессии):
+Standalone-запуск upstream через `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON` или
+direct-owner путь `--daemon` в этом изменении явно возвращает
+`maintenance_unsupported`. Сохраняйте managed admission через daemon;
+прямой запуск не обходит maintenance.
 
-```sh
-MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
+## Удержать upstream для замены исполняемого файла
+
+Это изменение добавляет maintenance-aware managed операции hold, resume и renew.
+Используйте aware binary, daemon и shim вместе. Здесь не выбран номер релиза и
+не заявлена поддержка maintenance в ранее установленных тегах.
+
+Возьмите точный `server_id` из локального `mcp-mux status`. Флаги идут после ID:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <returned-hold-id> --ttl 5m --json
+mcp-mux resume <returned-hold-id> --json
 ```
+
+Hold блокирует новые запросы и запуски до drain уже переданных запросов.
+Drain по умолчанию равен 10 секундам; `--drain-timeout 0s` пропускает grace,
+но всё равно требует доказанного завершения всего managed дерева. Положительный
+deadline начинается один раз при фиксации fence и не сбрасывается при retry.
+Заменяйте файл самостоятельно только после успешного JSON-результата с
+`state: HELD`, `trees_retired: true` и будущим `expires_at`. Результат также
+содержит `hold_id`, `server_id` и `drain_deadline`.
+
+`HOLDING` означает drain или retirement при закрытом admission. `HELD` означает
+доказанную смерть всех scoped деревьев. `RETIREMENT_BLOCKED` сохраняет запрет
+запуска: замена небезопасна. `RELEASED` разрешает свежий спрос после durable release.
+TTL по умолчанию равен пяти минутам, должен быть положительным и не превышать
+один час. Renew продлевает только точный текущий hold ID от момента принятия.
+CLI принимает TTL и drain только в целых миллисекундах. Значения меньше
+миллисекунды отклоняются, а не округляются до zero-force retirement.
+Чужой или устаревший ID не заменяет lease. Resume и истечение TTL открывают
+admission только после доказанного retirement. Blocked retirement не очищается
+по таймеру, даже если TTL истёк.
+
+Aware shim сохраняет исходные stdin/stdout host. Запрос во время fence получает
+JSON-RPC `-32005`, сообщение `upstream held for update` и
+`data.error_code: maintenance_held` с исходным числовым или строковым ID, а не
+кешированный успех. Отклонённые и завершённые ошибкой in-flight запросы не
+воспроизводятся; notification не получает выдуманный ID. После release свежий
+legacy-запрос достигает новой версии на тех же pipes. Modern использует свежий
+same-era isolated admission с обязательными per-request metadata, без legacy
+bootstrap, cache и восстановления запросов или subscriptions.
+
+Scope включает конечный набор уже admitted контекстов выбранного owner, а не
+host-wide блокировку файла. Другой CWD, protocol era, credential/configuration
+context, engine namespace или unmanaged процесс не включается автоматически и
+может продолжать удерживать файл.
+
+MCP `mux_hold`, `mux_resume` и `mux_renew` используют тот же локальный daemon.
+`mux_restart` вызывает daemon-owned `restart_owner` с исходными точными context
+и era, без реконструкции через ambient credentials адаптера. При активном fence
+controlled restart, handoff, shutdown, downgrade и idle exit получают terminal
+refusal. Launcher и library update helpers не делают shutdown fallback и не
+запускают successor. После unplanned loss aware daemon загружает hold до admission;
+неполное или нечитаемое authority остаётся fail closed.
+
+Controlled install engine, swap launcher, изменения layout/bootstrap и active
+pointer используют существующий file lock namespace daemon. Изменения hold
+ledger используют тот же lock, поэтому hold не может пройти между проверкой
+и активацией. `daemon.CheckMaintenanceForActivation` только читает сохранённое
+authority. Status и чистые startup-проверки не захватывают и не создают этот
+lock и не запускают daemon заранее. Activation также проверяет live aware
+status. Offline или old endpoint допускается только при доказанно пустом
+сохранённом authority под lock. Это координация namespace, а не host-wide
+file lock или отдельный updater lease.
+
+Old daemon возвращает `maintenance_unsupported`, без stop/kill/restart fallback.
+Aware daemon физически блокирует старые managed shim, но не обещает им immediate
+errors и non-replay. Arbitrary old binary, foreign engine, ручная замена active
+pointer и standalone bypass не поддерживаются. Перед downgrade текущим aware
+binary освободите все безопасно доказанные hold. Сохраняйте blocked authority;
+не удаляйте ledger и не делайте PID cleanup.
+
+Перед релизом выполните [live replacement proof на Windows и Unix](docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement).
+Он использует private scratch primary checkout и реальную перезапись файла;
+сборка fixture или unit test не заменяет это доказательство.
 
 ## Устойчивый shim
 

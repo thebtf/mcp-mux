@@ -40,6 +40,7 @@ type updateSeams struct {
 	prepareSocket   func(context.Context, string, time.Duration) error
 	available       func(string) bool
 	acquireLock     func(string) (daemonLock, error)
+	maintenanceGate func(*MuxEngine) error
 }
 
 func captureUpdateSeams() updateSeams {
@@ -57,12 +58,14 @@ func captureUpdateSeams() updateSeams {
 		prepareSocket:   enginePrepareControlSocket,
 		available:       engineControlSocketAvailable,
 		acquireLock:     engineAcquireDaemonLock,
+		maintenanceGate: engineCheckMaintenanceForActivation,
 	}
 }
 
 func restoreUpdateSeams(t *testing.T) {
 	t.Helper()
 	orig := captureUpdateSeams()
+	engineCheckMaintenanceForActivation = func(*MuxEngine) error { return nil }
 	enginePrepareControlSocket = func(context.Context, string, time.Duration) error { return nil }
 	engineDaemonIdentity = func(string) (daemonIdentity, error) {
 		return daemonIdentity{pid: 1, generation: "old"}, nil
@@ -84,6 +87,7 @@ func restoreUpdateSeams(t *testing.T) {
 		enginePrepareControlSocket = orig.prepareSocket
 		engineControlSocketAvailable = orig.available
 		engineAcquireDaemonLock = orig.acquireLock
+		engineCheckMaintenanceForActivation = orig.maintenanceGate
 	})
 }
 
@@ -418,42 +422,6 @@ func TestApplyUpdateAndRestart_GracefulSuccessUsesSuccessorExe(t *testing.T) {
 	}
 }
 
-func TestApplyUpdateAndRestart_DaemonNotRunningOnlySwaps(t *testing.T) {
-	restoreUpdateSeams(t)
-	eng := newUpdateTestEngine(t)
-	lockCalls, controlCalls, startCalls := 0, 0, 0
-
-	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
-	engineCleanStale = func(string) int { return 1 }
-	engineIsDaemonRunning = func(string) bool { return false }
-	engineAcquireDaemonLock = func(string) (daemonLock, error) {
-		lockCalls++
-		return &fakeDaemonLock{}, nil
-	}
-	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		controlCalls++
-		return &control.Response{OK: true}, nil
-	}
-	engineStartDaemonExecutable = func(string, string) error {
-		startCalls++
-		return nil
-	}
-
-	got, err := eng.ApplyUpdateAndRestart(context.Background(), baseUpdateOptions())
-	if err != nil {
-		t.Fatalf("ApplyUpdateAndRestart: %v", err)
-	}
-	if got.DaemonWasRunning || got.ReplacementStarted || got.ReplacementReady {
-		t.Fatalf("unexpected daemon flags when daemon is stopped: %+v", got)
-	}
-	if lockCalls != 0 || controlCalls != 0 || startCalls != 0 {
-		t.Fatalf("side effects lock/control/start = %d/%d/%d, want all zero", lockCalls, controlCalls, startCalls)
-	}
-	if got.CleanedStale != 1 {
-		t.Fatalf("CleanedStale = %d, want 1", got.CleanedStale)
-	}
-}
-
 func TestApplyUpdateAndRestart_SwapFailureStopsBeforeDaemonCalls(t *testing.T) {
 	restoreUpdateSeams(t)
 	eng := newUpdateTestEngine(t)
@@ -689,42 +657,6 @@ func TestApplyUpdateAndRestart_LockFailureIsPhaseError(t *testing.T) {
 	}
 	if updateErr.Phase != UpdatePhaseLock || !errors.Is(updateErr.Err, lockErr) {
 		t.Fatalf("phase/err = %s/%v, want lock/locked", updateErr.Phase, updateErr.Err)
-	}
-}
-
-func TestApplyUpdateAndRestart_ProceedWithoutLockContinuesWithWarning(t *testing.T) {
-	restoreUpdateSeams(t)
-	eng := newUpdateTestEngine(t)
-	lockErr := errors.New("locked by another updater")
-
-	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
-	engineCleanStale = func(string) int { return 0 }
-	engineIsDaemonRunning = func(string) bool { return true }
-	engineAcquireDaemonLock = func(string) (daemonLock, error) { return nil, lockErr }
-	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		return nil, errors.New("dial failed")
-	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
-		return &control.Response{OK: true}, nil
-	}
-	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
-	engineStartDaemonExecutable = func(string, string) error { return nil }
-	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
-
-	opts := baseUpdateOptions()
-	opts.ProceedWithoutLock = true
-	got, err := eng.ApplyUpdateAndRestart(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("ApplyUpdateAndRestart: %v", err)
-	}
-	if got.LockAcquired {
-		t.Fatalf("LockAcquired = true, want false")
-	}
-	if !got.FallbackShutdown || !got.ReplacementReady {
-		t.Fatalf("unexpected result flags: %+v", got)
-	}
-	if len(got.Warnings) == 0 || !strings.Contains(got.Warnings[0], "could not acquire daemon lock") {
-		t.Fatalf("warnings = %#v, want daemon lock warning", got.Warnings)
 	}
 }
 

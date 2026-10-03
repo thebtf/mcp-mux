@@ -66,6 +66,66 @@ Before tagging or publishing:
    go list -m -json github.com/thebtf/mcp-mux/muxcore@vX.Y.Z
    ```
 
+## Upstream maintenance release gate
+
+For the upstream maintenance hold change, run production Scenario 11 on the
+exact integrated head on both Windows and Unix. Use the actual candidate binary,
+the canonical `SourceRoot`/`CandidateBinary`/`OutputDir`/`TimeoutSeconds` inputs,
+and explicit PRIMARY `.agent` `ScratchRoot`/`EvidencePath` inputs from
+[`PRODUCTION-TESTING-PLAYBOOK.md`](PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement).
+Do not auto-enroll this long live smoke in unrelated test runs.
+
+Release evidence must retain:
+
+- Source SHA, candidate and fixture hashes, command/exit records, and nonzero
+  live/focused denominators. Fixture compilation is not live replacement proof.
+- Two unchanged legacy host process/pipe identities, managed leader/descendant
+  death, actual overwrite of the executed file path, and zero held starts.
+- Original numeric/string held errors, no notification reply, no cache success
+  or replay, and one new-version generation after exact resume and safe TTL.
+- Durable HELD readback after owned unplanned aware-daemon loss, terminal
+  controlled restart/handoff/shutdown and staged activation refusal, unchanged
+  launcher/pending/layout/pointer files, redaction, and unrelated-context
+  continuity. The live runner does not fake blocked/corrupt authority.
+- Fresh same-era modern admission with valid metadata and the unchanged modern
+  fixture after resume, with zero injected legacy or replay frames. A generic
+  reconnect error or EOF is not a successful modern continuation.
+- Named focused queue/reconnect, start/install, and hold-versus-activation races,
+  blocked retirement that never TTL-clears, corrupt/incomplete/persistence
+  failures, finite exact context partitions, stale callbacks/leases, unsupported
+  old endpoints, whole-millisecond CLI boundaries, and terminal library
+  update-helper refusal. Prove read-only status/startup behavior and locked
+  persisted-clear activation with offline/old endpoints. No zero-case or
+  timing-only substitute is accepted.
+- Scoped lifecycle cleanup and retained failed evidence/blocked authority.
+  No production namespace, broad PID cleanup, ledger deletion, or direct
+  standalone bypass is part of acceptance.
+
+The existing root/muxcore tests and vet, applicable race/tree tests, critical
+suite, native consumer Scenario 5b, Scenario 8 on Windows and Unix, and R1 native
+parity runners remain required. A maintenance smoke PASS is one gate, not
+`PROJECT_RELEASE_PROTOCOL_PASS` or consumer delivery.
+
+Root selects actual binary/module versions only after acceptance, updates
+version/changelog/release targets, integrates the exact accepted SHA, and tags
+last. Check remote tag parity and module resolution for that selected version,
+then prove a fresh-clone binary/module canary and delivered-artifact same-host
+hold/overwrite/resume behavior in a fresh session. Current-version handoffs to
+aimux, engram, and other affected consumers must be read back before closeout.
+
+The handoff must name maintenance-aware managed shim semantics, the finite
+admitted context scope rather than host-wide executable locking, old-daemon
+unsupported behavior, old-shim physical-fence-only limits, fresh native modern
+admission, and terminal lifecycle refusal under any fence. Clear all safely
+proven holds using the current aware binary before downgrade. Blocked authority
+must remain intact, even after TTL; unsupported rollback is an exact held
+boundary, not permission to delete the ledger or run the upstream directly.
+Controlled installation, launcher swap, layout/bootstrap mutation, and active
+pointer updates serialize with hold-ledger mutation under the existing daemon
+namespace file lock. Status/pure startup checks remain read-only and do not start
+a daemon. Offline/old activation needs locked persisted-clear proof. This is not
+a separate updater lease or host-wide executable-lock guarantee.
+
 ## Critical Muxcore Consumer Handoff Gate
 
 This gate is required when a release contains a critical or consumer-impacting
@@ -167,3 +227,7 @@ Record this checklist in the release report:
 - [ ] `CONSUMER_HANDOFF_PASS` or `CONSUMER_HANDOFF_NOT_REQUIRED`.
 - [ ] Engram issue IDs/comments are listed for all impacted consumers when the
       consumer handoff gate was required.
+- [ ] Maintenance releases have Scenario 11 Windows/Unix live evidence and
+      positive named focused maintenance proof, alongside existing 5b/8/R1 gates.
+- [ ] Delivered-artifact and fresh-session maintenance proof use the root-selected
+      version; consumer handoffs state aware/old-shim/old-daemon/rollback limits.

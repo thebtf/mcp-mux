@@ -605,6 +605,100 @@ force a mixed-version live supervisor handoff or forward an old attestation
 advertisement. Old/new combinations run as ordinary MCP without private
 dormancy and should restart through the product's bounded replacement path.
 
+## Upstream maintenance control (this change)
+
+Maintenance holds an exact managed upstream for installer-owned executable
+replacement. It does not select a new module tag. Existing `DaemonHandler`,
+`CommandHandler`, `Send`, and `SendWithTimeout` signatures remain unchanged.
+`control.Request` adds `HoldID string` and `HoldTTLMS *int64`; it reuses exact
+`ServerID` and `DrainTimeoutMs`. Omitted TTL is 300000ms; explicit TTL must be
+positive and at most 3600000ms. CLI drain defaults to 10000ms; zero skips grace.
+CLI TTL and drain durations must be whole milliseconds. Sub-millisecond values
+are invalid, never silently truncated to a zero-force drain.
+
+```go
+ttlMS := int64(5 * time.Minute / time.Millisecond)
+held, err := control.SendMaintenance(controlPath, control.Request{
+	Cmd: "hold", ServerID: exactServerID,
+	HoldTTLMS: &ttlMS, DrainTimeoutMs: 10000,
+}, 20*time.Second)
+if err != nil {
+	return err // Do not substitute stop, kill, direct exec, or restart.
+}
+// Replace the upstream executable only after the validated HELD result.
+_, err = control.SendMaintenance(controlPath, control.Request{
+	Cmd: "resume", HoldID: held.HoldID,
+}, 10*time.Second)
+```
+
+`MaintenanceResult` contains `HoldID`, `ServerID`, `State`, `ExpiresAt`,
+`DrainDeadline`, and `TreesRetired`. States are `MaintenanceHolding`/`HOLDING`,
+`MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
+`MaintenanceReleased`/`RELEASED`. Successful hold requires durable, unexpired
+HELD and full scoped tree death, not handoff or detached live authority. Positive
+drain starts once at fence commitment. Only proven held state can safely expire
+or resume into admission; blocked retirement never TTL-clears. Renew uses
+`Cmd: "renew"`, the exact `HoldID`, and `HoldTTLMS` from acceptance time.
+
+`Response` adds optional `Maintenance` and `ErrorCode`; `OwnerInfo` adds optional
+`Maintenance`. Daemon status retains a safe maintenance list after owner removal.
+After unplanned recovery, its `ServerID` may be empty; never reconstruct a target
+from that field. Optional `MaintenanceHandler`, `ShutdownWithErrorHandler`, and
+`OwnerRestartHandler` preserve existing consumer interfaces. The managed
+`restart_owner` operation chooses the original context and ProtocolEra in the
+daemon, rather than rebuilding a command with adapter credentials.
+
+`Response.Err()` and `SendMaintenance` preserve typed classification through
+`errors.Is` and `errors.As` with `*control.MaintenanceError`:
+
+| Wire code | Sentinel |
+| --- | --- |
+| `maintenance_held` | `ErrMaintenanceHeld` |
+| `maintenance_conflict` | `ErrMaintenanceConflict` |
+| `maintenance_not_found` | `ErrMaintenanceNotFound` |
+| `maintenance_retirement_blocked` | `ErrMaintenanceRetirementBlocked` |
+| `maintenance_unsupported` | `ErrMaintenanceUnsupported` |
+| `maintenance_persistence_failed` | `ErrMaintenancePersistenceFailed` |
+| `maintenance_invalid` | `ErrMaintenanceInvalid` |
+
+Unknown nonempty codes fail closed as invalid. Missing optional support, an
+untyped old endpoint refusal, or a missing maintenance result is unsupported.
+No raw credentials, environment values, request bodies, or private context keys
+belong in public readbacks or persisted matching records.
+
+Scope is the exact selected owner's finite admitted context set, partitioned by
+engine namespace, CWD, protocol era, and strict security/configuration identity.
+It is not host-wide file-lock authority. Admission is fenced before cache,
+materialization, or forwarding. Aware managed shims return `-32005`, message
+`upstream held for update`, and `data.error_code=maintenance_held` by original ID
+without closing host pipes. Held or terminated requests do not replay; modern
+fresh demand re-enters same-era isolated admission without legacy bootstrap,
+cache, progress, or subscription restoration.
+
+All controlled restart/handoff/shutdown/downgrade and idle-exit paths refuse
+terminally while fences remain. `RestartWithSuccessor` and
+`ApplyUpdateAndRestart` must preserve typed refusal, never fall back to shutdown
+or start a successor. Aware startup loads authority before admission after
+unplanned loss; incomplete/corrupt state stays blocked. Old managed shims receive
+physical fencing only, not immediate-error/non-replay guarantees. Old daemons,
+uncoordinated standalone/direct-owner paths, foreign engines, arbitrary old
+binaries, and manual active-pointer replacement are unsupported. Clear all
+safely proven holds with the current aware binary before downgrade. Keep blocked
+authority intact; neither ledger deletion nor PID cleanup is a recovery API.
+
+Controlled installation, launcher swap, layout/bootstrap mutation, and active
+pointer changes serialize with hold-ledger mutation using the existing daemon
+namespace file lock. The shared `daemon.CheckMaintenanceForActivation` helper
+reads persisted authority without mutation. Status and pure startup inspection
+do not acquire/write that lock or proactively start a daemon. Activation also
+checks live aware status; offline/old endpoints permit it only when persisted
+authority is proven clear under the lock. This does not add an updater lease or
+host-wide executable-lock authority.
+
+Run [production Scenario 11](../docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
+on Windows and Unix with the actual integrated binary. Focused maintenance
+regressions and existing native Scenario 5b/8 and R1 parity remain separate gates.
+
 ## Upgrade and Restart Contract
 
 Muxcore has two related but separate responsibilities:
@@ -715,7 +809,8 @@ The helper:
 2. Acquires the daemon namespace lock for the resolved `engine.Config.Namespace`
    and `BaseDir`.
 3. Sends `graceful-restart` with `successor_exe` set to `CurrentExe`.
-4. Falls back to `shutdown` if graceful restart is unavailable or rejected.
+4. Falls back to `shutdown` if graceful restart is unavailable or rejected,
+   except typed maintenance refusal, which is terminal with no fallback/start.
 5. Starts the replacement daemon from `CurrentExe` when a successor is not
    already ready.
 6. Waits for the replacement daemon to answer `ping` before releasing the lock.

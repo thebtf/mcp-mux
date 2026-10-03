@@ -418,6 +418,8 @@ func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) sn
 		ServerID:              ownerSnap.ServerID,
 		TokenHandshake:        true,
 		MaterializationPolicy: owner.MaterializationOnDemand,
+		MaintenanceGate:       &d.maintenanceGate,
+		AdmitMaterialization:  d.admitMaterialization,
 		PersistentPending:     ownerSnap.Persistent,
 		PersistentRequired:    d.persistent,
 		HandlerFunc:           d.handlerFunc,
@@ -442,6 +444,11 @@ func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) sn
 
 func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffUpstream, restoreSource string, eager, publishTemplate bool) (*OwnerEntry, bool, error) {
 	snap := plan.snapshot
+	d.maintenanceGate.RLock()
+	defer d.maintenanceGate.RUnlock()
+	if err := d.checkMaintenanceRestoreLocked(snap); err != nil {
+		return nil, false, err
+	}
 	if isModernSnapshotRecord(snap) {
 		return nil, false, unsafeLifecycleBoundaryError()
 	}
@@ -496,7 +503,10 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 		serviceToken = d.supervisor.Add(restoredOwner)
 	}
 	effectivePersistent := d.persistent || snap.Persistent
+	contexts, complete := d.maintenanceRestoreContexts(snap)
 	entry := &OwnerEntry{
+		maintenanceContexts:         contexts,
+		maintenanceIncomplete:       !complete,
 		Owner:                       restoredOwner,
 		ServerID:                    snap.ServerID,
 		Command:                     snap.Command,
@@ -668,6 +678,12 @@ func (d *Daemon) loadSnapshot() int {
 				shortServerID(ownerSnap.ServerID), ownerSnap.CwdSet, ownerSnap.Cwd)
 			ownerSnap.CwdSet = []string{ownerSnap.Cwd}
 		}
+		d.maintenanceGate.RLock()
+		maintenanceErr := d.checkMaintenanceRestoreLocked(ownerSnap)
+		d.maintenanceGate.RUnlock()
+		if maintenanceErr != nil {
+			continue
+		}
 		plan := d.makeSnapshotRestorePlan(ownerSnap)
 
 		if restartMode {
@@ -773,6 +789,12 @@ func (d *Daemon) loadSnapshotMetadataOnly(reason string) int {
 	eligible := 0
 	for _, ownerSnap := range snap.Owners {
 		if isModernSnapshotRecord(ownerSnap) {
+			continue
+		}
+		d.maintenanceGate.RLock()
+		maintenanceErr := d.checkMaintenanceRestoreLocked(ownerSnap)
+		d.maintenanceGate.RUnlock()
+		if maintenanceErr != nil {
 			continue
 		}
 		eligible++

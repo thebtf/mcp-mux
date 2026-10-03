@@ -36,6 +36,7 @@ func writeContentAddressedTestEngine(t *testing.T, launcherPath, content string)
 }
 
 func TestInstallVersionedEngineKeepsLauncherStableByDefault(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -81,6 +82,7 @@ func TestInstallVersionedEngineKeepsLauncherStableByDefault(t *testing.T) {
 }
 
 func TestInstallVersionedEngineSwitchesPointerAndKeepsOldVersion(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -118,7 +120,7 @@ func TestWriteActiveEngineStoresRelativePointer(t *testing.T) {
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
 	writeTestFile(t, enginePath, "engine")
 
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 
@@ -188,7 +190,7 @@ func TestDaemonExecutableForSpawnUsesActiveEnginePointer(t *testing.T) {
 	activeEnginePath := filepath.Join(versionStoreDir(launcherPath), "new456", engineFileName())
 	writeTestFile(t, oldEnginePath, "old engine")
 	writeTestFile(t, activeEnginePath, "new engine")
-	if err := writeActiveEngine(launcherPath, activeEnginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, activeEnginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 	t.Setenv(envActiveEngineFile, activeEngineFile(launcherPath))
@@ -205,7 +207,7 @@ func TestDaemonExecutableForSpawnIgnoresMissingActiveEnginePointer(t *testing.T)
 	currentEnginePath := filepath.Join(versionStoreDir(launcherPath), "old123", engineFileName())
 	missingActiveEnginePath := filepath.Join(versionStoreDir(launcherPath), "missing", engineFileName())
 	writeTestFile(t, currentEnginePath, "old engine")
-	if err := writeActiveEngine(launcherPath, missingActiveEnginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, missingActiveEnginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 	t.Setenv(envActiveEngineFile, activeEngineFile(launcherPath))
@@ -268,6 +270,7 @@ func TestDaemonStartReportsActiveAndFallbackStartFailures(t *testing.T) {
 }
 
 func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
@@ -305,6 +308,7 @@ func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
 }
 
 func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	t.Setenv("TEMP", dir)
 	t.Setenv("TMP", dir)
@@ -333,6 +337,9 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 		return path == serverid.DaemonControlPath("", engineName)
 	}
 	launcherControlSendWithTimeout = func(path string, req control.Request, timeout time.Duration) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+		}
 		sendCalled = true
 		gotReq = req
 		if path != serverid.DaemonControlPath("", engineName) {
@@ -385,6 +392,7 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 }
 
 func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	t.Setenv("TEMP", dir)
 	t.Setenv("TMP", dir)
@@ -416,7 +424,7 @@ func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T)
 		case "status":
 			return &control.Response{
 				OK:   true,
-				Data: []byte(`{"servers":[{"session_count":1}]}`),
+				Data: []byte(`{"maintenance":[],"servers":[{"session_count":1}]}`),
 			}, nil
 		case "graceful-restart":
 			gracefulCalled = true
@@ -447,6 +455,7 @@ func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T)
 }
 
 func TestRunLauncherUpgradeRestartNoDaemonSucceeds(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -491,6 +500,7 @@ func TestRunLauncherUpgradeRestartNoDaemonSucceeds(t *testing.T) {
 }
 
 func TestRunLauncherUpgradeRestartReexecsExplicitLauncherUpdate(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -532,6 +542,7 @@ func TestRunLauncherUpgradeRestartReexecsExplicitLauncherUpdate(t *testing.T) {
 }
 
 func TestRunLauncherUpgradeRestartActiveDoesNotRequirePendingUpdate(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
@@ -563,6 +574,7 @@ func TestRunLauncherUpgradeRestartActiveDoesNotRequirePendingUpdate(t *testing.T
 }
 
 func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(dir, "relative-engine", engineFileName())
@@ -603,6 +615,9 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 	})
 	launcherIsDaemonRunning = func(string) bool { return true }
 	launcherControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+		}
 		gotEnginePath = req.SuccessorExe
 		return &control.Response{OK: true}, nil
 	}
@@ -630,6 +645,7 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 }
 
 func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -641,7 +657,7 @@ func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *t
 	}
 	enginePath := filepath.Join(versionStoreDir(launcherPath), hash[:12], engineFileName())
 	writeTestFile(t, enginePath, "new engine")
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 

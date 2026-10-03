@@ -63,7 +63,7 @@ func shouldSuperviseEngineProcess(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "status", "stop", "daemon", "upgrade":
+	case "status", "stop", "hold", "resume", "renew", "daemon", "upgrade":
 		return false
 	default:
 		return true

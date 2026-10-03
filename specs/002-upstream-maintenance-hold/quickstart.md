@@ -83,18 +83,20 @@ go vet ./...
 go test -race ./control ./daemon ./owner ./engine ./upstream -count=1
 Pop-Location
 pwsh -NoProfile -File tests/critical/run-all.ps1 -TimeoutSeconds 120
-pwsh -NoProfile -File scripts/smoke-native-sessionhandler-update.ps1 -RunDir .t/maintenance-native-update -TimeoutSeconds 120
+pwsh -NoProfile -File scripts/smoke-native-sessionhandler-update.ps1 -RunDir (Join-Path $ScratchRoot 'native-update') -EvidencePath (Join-Path $ScratchRoot 'native-update.json') -TimeoutSeconds 120
 ```
 
 The last command is production Scenario 5b. Run applicable Scenario 8 lifecycle/tree tests from `docs/PRODUCTION-TESTING-PLAYBOOK.md`, including Windows and Unix process-group/Job tests. Retain R1 native parity proof using the existing runners:
 
 ```powershell
-pwsh -NoProfile -File scripts/verify-r1-native-isolation.ps1 -SourceRoot . -OutputDir .t/maintenance-r1-windows
+pwsh -NoProfile -File scripts/verify-r1-native-isolation.ps1 -SourceRoot . -OutputDir (Join-Path $ScratchRoot 'r1-windows')
 ```
 
 ```sh
-bash scripts/verify-r1-native-isolation.sh --source-root . --output-dir .t/maintenance-r1-unix
+bash scripts/verify-r1-native-isolation.sh --source-root . --output-dir "$SCRATCH_ROOT/r1-unix"
 ```
+
+On Unix, set `SCRATCH_ROOT` to that host's exact allocated primary scratch path. The critical runner already resolves Git's common directory to primary `.agent`; pass its supported `-ArtifactRoot` explicitly when selecting another root-owned evidence directory. Controlled activation additionally uses the existing namespace file lock and the shared read-only ledger check from ADR-015's implementation amendment; a status preflight by itself is not race proof.
 
 Follow `docs/RELEASE-PROTOCOL.md` after exact-head review, root release authorization, and accepted version selection. Bump binary/library versions, update CHANGELOG/RELEASE_NOTES and consumer docs, merge exact SHA, then tag last. Verify remote tag parity and module resolution using the actual root-selected `$ReleaseVersion`:
 

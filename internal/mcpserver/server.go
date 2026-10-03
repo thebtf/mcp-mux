@@ -7,19 +7,19 @@ package mcpserver
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
-	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
@@ -38,7 +38,10 @@ Available tools:
 - mux_topology: Show owners, registered engines, local mcp-mux processes, and read-only cleanup plan.
 - mux_list: Show all running MCP server instances (PID, sessions, classification, caches).
 - mux_stop: Gracefully stop an instance by server_id (with optional drain or force).
-- mux_restart: Restart an instance — stops the old one, spawns a new daemon, clients auto-reconnect.
+- mux_restart: Restart one exact managed owner using its daemon-owned context and protocol era.
+- mux_hold: Hold one exact local server for replacement after full managed-tree retirement.
+- mux_resume: Release one exact hold ID after proven retirement.
+- mux_renew: Extend one exact active hold ID, at most one hour.
 
 Available prompts:
 - mux-guide: Full reference on mcp-mux architecture, classification, and management.
@@ -235,8 +238,8 @@ When you configure an MCP server with mcp-mux as a wrapper:
 { "command": "mcp-mux", "args": ["uvx", "engram-mcp-server"] }
 ` + "```" + `
 
-The first invocation becomes the "owner" — it spawns the real upstream server and listens
-for IPC connections. Subsequent invocations connect as clients through the same upstream.
+Every invocation uses local daemon-managed admission. The daemon retains the upstream's
+launch context and protocol era; standalone direct owners are explicitly unsupported.
 
 ` + "```" + `
 CC Session 1 ──stdio──> mcp-mux (client) ──IPC──┐
@@ -261,7 +264,8 @@ mcp-mux automatically classifies servers by two methods (priority order):
 
 ## Response Caching
 
-mcp-mux caches these responses from the first session and replays them instantly to later sessions:
+Legacy owners cache these responses for later sessions; native modern owners keep caches off.
+Held requests never receive cached success or become replay after release:
 - ` + "`" + `initialize` + "`" + ` (with protocolVersion fingerprint matching)
 - ` + "`" + `tools/list` + "`" + `
 - ` + "`" + `prompts/list` + "`" + `
@@ -270,14 +274,13 @@ mcp-mux caches these responses from the first session and replays them instantly
 
 Caches auto-invalidate on ` + "`" + `notifications/**/list_changed` + "`" + `.
 
-## Global Daemon (experimental)
+## Global Daemon
 
-Set ` + "`" + `MCP_MUX_GLOBAL_DAEMON=1` + "`" + ` to enable a single daemon process that manages ALL upstreams:
+The local daemon manages upstream starts and reconnects by default:
 
-- Upstreams survive CC session disconnects (30s grace period by default)
-- Persistent servers (x-mux.persistent: true) survive indefinitely
-- Auto-respawn of crashed persistent servers
-- Daemon auto-exits after 5min idle (no owners, no sessions)
+- Persistent servers (x-mux.persistent: true) survive host disconnects
+- Automatic starts and respawn are fenced during maintenance
+- Active maintenance also blocks controlled restart, shutdown, activation, and idle exit
 
 Control: ` + "`" + `mcp-mux daemon` + "`" + ` (start), ` + "`" + `mcp-mux stop` + "`" + ` (stop all), ` + "`" + `mcp-mux status` + "`" + ` (inspect).
 
@@ -301,9 +304,24 @@ Gracefully drain and stop an instance:
 - ` + "`" + `force` + "`" + ` (optional): skip drain, kill immediately
 
 ### mux_restart
-Stop + re-spawn as daemon. Existing CC clients reconnect on next tool call:
-- ` + "`" + `server_id` + "`" + ` (required): from mux_list output
-- ` + "`" + `force` + "`" + ` (optional): force-stop before restart
+Restart through the daemon's exact retained launch context and protocol era, without
+reconstructing command arguments or credentials in this control adapter:
+- ` + "`" + `server_id` + "`" + ` or ` + "`" + `name` + "`" + `: resolved to one exact local managed owner
+- ` + "`" + `force` + "`" + ` (optional): skip drain grace, never bypass maintenance
+
+### mux_hold / mux_resume / mux_renew
+Hold one exact full local ` + "`" + `server_id` + "`" + ` for executable replacement.
+` + "`" + `hold_seconds` + "`" + ` defaults to 300, with integer range 1..3600;
+` + "`" + `drain_timeout_ms` + "`" + ` defaults to 10000 and zero skips drain grace.
+Successful hold confirms retired managed trees and returns an opaque ` + "`" + `hold_id` + "`" + `.
+Resume and renew use only that exact hold ID. Errors carry stable ` + "`" + `error_code` + "`" + `
+and safe maintenance readback; unsupported endpoints never fall back to stop or execution.
+CLI equivalents accept flags after the ID: ` + "`" + `mcp-mux hold <exact-id> --ttl 5m --drain-timeout 10s --json` + "`" + `,
+` + "`" + `mcp-mux resume <hold-id> --json` + "`" + `, and ` + "`" + `mcp-mux renew <hold-id> --ttl 5m --json` + "`" + `.
+Use ` + "`" + `mcp-mux status` + "`" + ` for leases retained after owners retire.
+Aware hosts keep their pipes open and receive original-ID held errors without replay.
+Modern continuation uses fresh same-era admission, never legacy bootstrap or subscription replay.
+Standalone, foreign-engine, and arbitrary old-binary control is outside this feature.
 
 ## Environment Variables
 
@@ -311,7 +329,6 @@ Stop + re-spawn as daemon. Existing CC clients reconnect on next tool call:
 |----------|---------|-------------|
 | MCP_MUX_ISOLATED | 0 | Force isolated mode for this server |
 | MCP_MUX_STATELESS | 0 | Ignore cwd in server identity hash |
-| MCP_MUX_GLOBAL_DAEMON | 0 | Enable global daemon mode |
 | MCP_MUX_GRACE | 30s | Grace period before reaping idle owners (daemon mode) |
 | MCP_MUX_IDLE_TIMEOUT | 5m | Daemon auto-exit after this idle period |
 
@@ -437,13 +454,12 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 		},
 		{
 			"name": "mux_restart",
-			"description": "Restart an MCP server: stop the current upstream process and spawn a fresh one " +
-				"with the same command and args. All connected CC sessions share the new upstream — " +
-				"the next request from any session goes to the new process. " +
-				"Use after updating server code (git pull, npm install, pip upgrade) or when a server is stuck. " +
-				"Identify by server_id or name (substring match, e.g. 'aimux', 'tavily').",
+			"description": "Restart one locally managed MCP owner from its daemon-retained context and protocol era. " +
+				"Identify by server_id or name (resolved to an exact local server_id). " +
+				"Maintenance and unsupported endpoints refuse without direct execution or stop fallback.",
 			"inputSchema": map[string]any{
-				"type": "object",
+				"type":                 "object",
+				"additionalProperties": false,
 				"properties": map[string]any{
 					"server_id": map[string]any{
 						"type":        "string",
@@ -455,7 +471,7 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 					},
 					"force": map[string]any{
 						"type":        "boolean",
-						"description": "Force-stop before restart (no drain).",
+						"description": "Skip drain grace; does not bypass a maintenance hold.",
 						"default":     false,
 					},
 				},
@@ -463,6 +479,7 @@ func (s *Server) handleToolsList(id json.RawMessage) {
 		},
 	}
 
+	tools = append(tools, maintenanceTools()...)
 	s.sendResult(id, map[string]any{"tools": tools})
 }
 
@@ -489,6 +506,12 @@ func (s *Server) handleToolsCall(id json.RawMessage, params json.RawMessage) {
 		s.toolMuxStop(id, call.Arguments)
 	case "mux_restart":
 		s.toolMuxRestart(id, call.Arguments)
+	case "mux_hold":
+		s.toolMuxMaintenance(id, "hold", call.Arguments)
+	case "mux_resume":
+		s.toolMuxMaintenance(id, "resume", call.Arguments)
+	case "mux_renew":
+		s.toolMuxMaintenance(id, "renew", call.Arguments)
 	default:
 		s.sendToolError(id, fmt.Sprintf("unknown tool: %s", call.Name))
 	}
@@ -792,6 +815,9 @@ func (s *Server) formatOwnerList(owners []control.OwnerInfo, verbose, all bool, 
 			}
 		}
 		addOwnerPolicyFields(server, owner)
+		if owner.Maintenance != nil {
+			server["maintenance"] = owner.Maintenance
+		}
 		servers = append(servers, server)
 	}
 	if servers == nil {
@@ -965,7 +991,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 
 	resp, err := s.stopOwner(owner, drainMs, timeout, params.Force || (owner.Sessions == 0 && owner.Pending == 0))
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
+		s.sendControlToolError(id, err)
 		return
 	}
 
@@ -980,11 +1006,18 @@ func (s *Server) stopOwner(owner control.OwnerInfo, drainMs int, timeout time.Du
 			Command:        owner.ServerID,
 			DrainTimeoutMs: drainMs,
 		}, timeout)
-		if err == nil && resp.OK {
+		if err == nil {
+			err = resp.Err()
+		}
+		if err == nil {
 			return resp, nil
 		}
-		if err == nil && !stopOwnerUnsupported(resp.Message) {
-			return resp, fmt.Errorf("%s", resp.Message)
+		var maintenanceErr *control.MaintenanceError
+		if errors.As(err, &maintenanceErr) {
+			return resp, err
+		}
+		if resp != nil && !stopOwnerUnsupported(resp.Message) {
+			return resp, err
 		}
 	}
 
@@ -996,7 +1029,7 @@ func (s *Server) stopOwner(owner control.OwnerInfo, drainMs int, timeout time.Du
 	if err != nil {
 		return resp, err
 	}
-	return resp, nil
+	return resp, resp.Err()
 }
 
 func stopOwnerUnsupported(message string) bool {
@@ -1005,15 +1038,17 @@ func stopOwnerUnsupported(message string) bool {
 		strings.Contains(lower, "stop_owner not supported")
 }
 
-// toolMuxRestart stops a server and spawns a new daemon owner.
+// toolMuxRestart delegates replacement to the daemon's retained launch authority.
 func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 	var params struct {
 		ServerID string `json:"server_id"`
 		Name     string `json:"name"`
 		Force    bool   `json:"force"`
 	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		s.sendToolError(id, fmt.Sprintf("invalid arguments: %v", err))
+	decoder := json.NewDecoder(bytes.NewReader(args))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&params); err != nil {
+		s.sendControlToolError(id, control.ErrMaintenanceInvalid)
 		return
 	}
 
@@ -1023,18 +1058,7 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		return
 	}
 
-	if owner.Command == "" {
-		s.sendToolError(id, fmt.Sprintf("server %s has no command info", owner.ServerID))
-		return
-	}
-
-	// Reject restart when requests are in-flight unless force is set
-	if owner.Pending > 0 && !params.Force {
-		s.sendToolError(id, fmt.Sprintf("server %.8s has %d pending requests. Use force=true to kill them, or wait for completion.", owner.ServerID, owner.Pending))
-		return
-	}
-
-	// Stop the server
+	// Force changes drain grace, never maintenance admission.
 	drainMs := 30000
 	timeout := 35 * time.Second
 	if params.Force {
@@ -1042,55 +1066,24 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		timeout = 5 * time.Second
 	}
 
-	stopResp, err := s.stopOwner(owner, drainMs, timeout, params.Force || (owner.Sessions == 0 && owner.Pending == 0))
+	resp, err := control.SendWithTimeout(s.daemonCtlPath(), control.Request{
+		Cmd: "restart_owner", ServerID: owner.ServerID, DrainTimeoutMs: drainMs,
+	}, timeout)
+	if err == nil {
+		err = resp.Err()
+		if err != nil && resp != nil && resp.ErrorCode == "" && !errors.Is(err, control.ErrMaintenanceInvalid) {
+			err = control.ErrMaintenanceUnsupported
+		}
+	}
 	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to stop %s: %v", owner.ServerID, err))
+		s.sendControlToolError(id, err)
 		return
 	}
-
-	// Wait briefly for shutdown to complete
-	time.Sleep(500 * time.Millisecond)
-
-	// Verify the old owner is gone
-	if ipc.IsAvailable(serverid.IPCPath(s.socketDir(), s.engineName(), owner.ServerID)) {
-		// Still alive — drain might be in progress, wait more
-		time.Sleep(2 * time.Second)
-	}
-
-	// Spawn new daemon owner
-	exe, err := os.Executable()
-	if err != nil {
-		s.sendToolError(id, fmt.Sprintf("cannot find mcp-mux binary: %v", err))
+	if resp.ServerID == "" || resp.IPCPath == "" || resp.Token == "" || resp.ProtocolEra != owner.ProtocolEra {
+		s.sendControlToolError(id, control.ErrMaintenanceInvalid)
 		return
 	}
-
-	daemonArgs := []string{"--daemon"}
-	daemonArgs = append(daemonArgs, owner.Command)
-	daemonArgs = append(daemonArgs, owner.Args...)
-
-	cmd := exec.Command(exe, daemonArgs...)
-	// Preserve the original owner's cwd so the respawn lands in the same project
-	// directory. Critical for servers with relative config paths or per-project
-	// state. Empty owner.Cwd → fall through to control-server's default cwd.
-	if owner.Cwd != "" {
-		cmd.Dir = owner.Cwd
-	}
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		s.sendToolError(id, fmt.Sprintf("failed to spawn daemon: %v", err))
-		return
-	}
-
-	// Detach — don't wait for the daemon
-	go cmd.Wait()
-
-	warning := ""
-	if params.Force && owner.Pending > 0 {
-		warning = fmt.Sprintf("WARNING: force restart killed %d pending requests. ", owner.Pending)
-	}
-	s.sendToolResult(id, fmt.Sprintf("%srestarted: stopped (%s), new daemon PID %d", warning, stopResp.Message, cmd.Process.Pid))
+	s.sendJSONToolResult(id, map[string]any{"ok": true, "server_id": resp.ServerID, "protocol_era": resp.ProtocolEra})
 }
 
 // --- JSON-RPC response helpers ---

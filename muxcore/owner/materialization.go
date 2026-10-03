@@ -451,32 +451,7 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			return
 		}
 
-		o.launchContextMu.Lock()
-		o.materializationMu.Lock()
-		if !a.launchFrozen {
-			if !o.launchSessionEligible(a.launch) {
-				if a.launchRequiresSession {
-					if replacement, ok := o.oldestEligibleLaunchContext(); ok {
-						a.launch = replacement
-					}
-				} else {
-					a.launch = o.electLaunchContextLocked()
-				}
-			}
-			a.launchFrozen = true
-		}
-		if !o.materializationEraMatches(a) {
-			o.materializationMu.Unlock()
-			o.launchContextMu.Unlock()
-			a.signalStarted(errMaterializationEraChanged)
-			o.finishMaterializationFailure(a, errMaterializationEraChanged)
-			return
-		}
-		launch := LaunchContext{SessionID: a.launch.SessionID, Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
-		o.materializationMu.Unlock()
-
-		proc, err := o.spawnReplacementUpstream(launch)
-		o.launchContextMu.Unlock()
+		proc, signals, err := o.startAdmittedMaterialization(a)
 		if !o.materializationEraMatches(a) {
 			driftErr := error(errMaterializationEraChanged)
 			if err != nil {
@@ -521,7 +496,11 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			continue
 		}
 
-		signals := o.installMaterializationProcess(a, proc)
+		if signals == nil {
+			a.signalStarted(errors.New("upstream start returned no process"))
+			o.finishMaterializationFailure(a, errors.New("upstream start returned no process"))
+			return
+		}
 		a.signalStarted(nil)
 		o.logger.Printf("upstream materialization started generation=%d attempt=%d trigger=%s", a.generation, attemptNumber, a.trigger)
 		if a.cancelled() {
@@ -631,6 +610,9 @@ func (o *Owner) shouldRetryMaterialization(trigger MaterializationTrigger) bool 
 }
 
 func (o *Owner) shouldRetryMaterializationLocked(trigger MaterializationTrigger) bool {
+	if o.maintenance.Load() != nil {
+		return false
+	}
 	select {
 	case <-o.materializationStop:
 		return false
@@ -660,6 +642,7 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 	o.upstreamEventMu.Lock()
 	o.materializationMu.Lock()
 	a.process = proc
+	o.lastMaintenanceLaunch = LaunchContext{Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
 	a.signals = signals
 	if a.protocolEra == era.EraModern20260728 {
 		o.cacheStage = nil
@@ -676,7 +659,6 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 }
 
 func (o *Owner) retireFailedMaterializationStart(a *materializationAttempt, proc *upstream.Process) error {
-	o.installMaterializationProcess(a, proc)
 	return o.retireMaterializationProcess(a, proc)
 }
 
@@ -1473,6 +1455,10 @@ func (o *Owner) writeFailedLocalDemands(demands []*localDemand, err error) {
 		err = errors.New("upstream materialization failed")
 	}
 	for _, demand := range demands {
+		if held := o.maintenance.Load(); held != nil {
+			_ = o.rejectMaintenance(demand.session, demand.message, held)
+			continue
+		}
 		_ = o.writeDemandError(demand.session, demand.message.ID, err.Error())
 	}
 }
@@ -1482,10 +1468,22 @@ func (o *Owner) failAllLocalDemands(err error) {
 }
 
 func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch LaunchContext) {
+	if o.maintenanceGate != nil {
+		o.maintenanceGate.RLock()
+		defer o.maintenanceGate.RUnlock()
+	}
 	o.materializationMu.Lock()
 	demand := o.pendingDemands[key]
 	if demand == nil || demand.state != localDemandWaiting || demand.generation != generation {
 		o.materializationMu.Unlock()
+		return
+	}
+	if held := o.maintenance.Load(); held != nil {
+		demand, claimed := o.transitionLocalDemandLocked(key, localDemandRejected)
+		o.materializationMu.Unlock()
+		if claimed {
+			_ = o.rejectMaintenance(demand.session, demand.message, held)
+		}
 		return
 	}
 

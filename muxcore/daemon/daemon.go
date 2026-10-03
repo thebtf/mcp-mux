@@ -105,6 +105,8 @@ type OwnerEntry struct {
 	Mode                        string
 	ProtocolEra                 era.ProtocolEra
 	Env                         map[string]string
+	maintenanceContexts         map[string]bool
+	maintenanceIncomplete       bool
 	Persistent                  bool
 	LastSession                 time.Time
 	OwnerGeneration             string
@@ -199,13 +201,20 @@ type templateMatch struct {
 
 // Daemon manages N owners, handles spawn/remove, and implements control.DaemonHandler.
 type Daemon struct {
-	mu             sync.RWMutex
-	owners         map[string]*OwnerEntry
-	logger         *log.Logger
-	ctlSrv         *control.Server
-	done           chan struct{}
-	handlerFunc    func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
-	sessionHandler muxcore.SessionHandler
+	mu                  sync.RWMutex
+	maintenanceGate     sync.RWMutex
+	maintenanceScope    string
+	maintenancePath     string
+	maintenanceLockPath string
+	maintenanceLeases   map[string]*maintenanceLease
+	maintenanceCommit   func([]byte) error
+	maintenanceFailed   bool
+	owners              map[string]*OwnerEntry
+	logger              *log.Logger
+	ctlSrv              *control.Server
+	done                chan struct{}
+	handlerFunc         func(ctx context.Context, stdin io.Reader, stdout io.Writer) error
+	sessionHandler      muxcore.SessionHandler
 	// lookupReconnectHistory is a narrow test seam; nil uses SessionMgr directly.
 	lookupReconnectHistory func(*owner.Owner, string) (string, string, map[string]string, bool)
 
@@ -573,6 +582,14 @@ func New(cfg Config) (*Daemon, error) {
 		authorizeSession:        cfg.AuthorizeSession,
 		onFrameReceived:         cfg.OnFrameReceived,
 		ownerRemoval:            newOwnerRemovalStats(),
+	}
+	if err := d.loadMaintenance(cfg.ControlPath); err != nil {
+		supCancel()
+		return nil, err
+	}
+	if isRestartRestoreMode() && d.maintenanceFenced() {
+		supCancel()
+		return nil, control.ErrMaintenanceHeld
 	}
 
 	// Create supervisor with exponential backoff on restart storms.
@@ -1265,6 +1282,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		return "", "", "", fmt.Errorf("spawn: %w", err)
 	}
 	effectiveEnv := mergeEnv(req.Env)
+	contextKey := d.maintenanceContext(protocolEra, req.Command, req.Args, req.Cwd, effectiveEnv)
+	if err := d.maintenanceAdmission(contextKey); err != nil {
+		return "", "", "", err
+	}
 
 	// Circuit breaker: reject spawn if the upstream has been crash-looping.
 	// This prevents infinite respawn loops (shim reconnect → spawn → crash → repeat)
@@ -1317,10 +1338,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		sid = d.deriveEnvBucketedSid(sid, req.Env)
 	}
 
-	d.mu.Lock()
+	if err := d.lockMaintenanceRegistry(contextKey); err != nil {
+		return "", "", "", err
+	}
 	if protocolEra == era.EraModern20260728 {
 		if _, occupied := d.owners[sid]; occupied {
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 			return "", "", "", fmt.Errorf("spawn: modern identity collision")
 		}
 	}
@@ -1343,7 +1366,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		if entry.creating != nil {
 			// Another goroutine is creating this owner — wait with timeout.
 			creating := entry.creating
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 			select {
 			case <-creating:
 			case <-time.After(concurrentCreateWaitTimeout):
@@ -1355,11 +1378,13 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				d.logger.Printf("timeout waiting for placeholder %s (creator stuck)", sid[:8])
 				return "", "", "", fmt.Errorf("spawn %s: timeout waiting for concurrent creation of %s", req.Command, sid[:8])
 			}
-			d.mu.Lock()
+			if err := d.lockMaintenanceRegistry(contextKey); err != nil {
+				return "", "", "", err
+			}
 			// Re-check: creation may have succeeded or failed.
 			if e, still := d.owners[sid]; still && e.Owner != nil && e.Owner.AdmissionFrozen() {
 				frozenOwner := e.Owner
-				d.mu.Unlock()
+				d.unlockMaintenanceRegistry()
 				if waitErr := d.waitForOwnerAdmissionThaw(frozenOwner); waitErr != nil && !errors.Is(waitErr, ErrOwnerGone) {
 					return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, waitErr)
 				}
@@ -1376,11 +1401,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				// so envCompatible compares like-for-like across create waiters.
 				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, effectiveEnv) {
 					d.logger.Printf("env-incompat after create-wait: owner %s — retrying with bucketed sid", shortServerID(sid))
-					d.mu.Unlock()
+					d.unlockMaintenanceRegistry()
 					return "", "", "", errSpawnRetry
 				}
 				e.LastSession = time.Now()
-				d.mu.Unlock()
+				d.unlockMaintenanceRegistry()
 				// CR-002 admission gate: a fresh global Spawn waits for an
 				// existing owner's classification before binding. Isolated
 				// classification forces fall-through to a fresh isolated-seeded
@@ -1397,11 +1422,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 						reqPtr.Mode = "isolated"
 						return "", "", "", errSpawnRetry
 					}
-					if req.Cwd != "" {
-						e.Owner.AddCwd(req.Cwd)
-					}
 				}
-				if !e.Owner.PreRegister(token, req.Cwd, effectiveEnv) {
+				admitted, admissionErr := d.admitOwner(e, token, req.Cwd, effectiveEnv, false)
+				if admissionErr != nil {
+					return "", "", "", admissionErr
+				}
+				if !admitted {
 					if e.Owner.IsClassifiedIsolated() {
 						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, e)
 					}
@@ -1418,7 +1444,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			// Creation failed or entry was removed — signal retry so Spawn's
 			// retry loop can start fresh. Previously recursed directly into
 			// d.Spawn(req); see errSpawnRetry / Spawn comment for rationale.
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 			if retryEntry != nil && retryOwner != nil && retryOwner.IsClassifiedIsolated() {
 				*isolatedRetry = d.promoteIsolatedRetry(reqPtr, retryEntry)
 			}
@@ -1426,7 +1452,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		}
 		if entry.Owner.AdmissionFrozen() {
 			frozenOwner := entry.Owner
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 			if waitErr := d.waitForOwnerAdmissionThaw(frozenOwner); waitErr != nil && !errors.Is(waitErr, ErrOwnerGone) {
 				return "", "", "", fmt.Errorf("spawn %s: %w", req.Command, waitErr)
 			}
@@ -1447,17 +1473,19 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		if entry.Owner.IsAccepting() {
 			probeOwner := entry.Owner
 			probeSID := sid
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 
 			if probeOwner.IsReachable() {
 				// Healthy — re-acquire to update LastSession (cheap), then
 				// return the path. Re-check that the entry is still the same
 				// pointer; if a concurrent path replaced it, retry from the
 				// top so the new entry goes through its own probe.
-				d.mu.Lock()
+				if err := d.lockMaintenanceRegistry(contextKey); err != nil {
+					return "", "", "", err
+				}
 				current, still := d.owners[probeSID]
 				if !still || current.Owner != probeOwner {
-					d.mu.Unlock()
+					d.unlockMaintenanceRegistry()
 					return "", "", "", errSpawnRetry
 				}
 				// CR-002 AC8 race fix (codex PR #121): between
@@ -1472,11 +1500,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				// storms, defeating the credentials-boundary guarantee.
 				if mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, effectiveEnv) {
 					d.logger.Printf("env-incompat after CAS on fast path: owner %s — retrying with bucketed sid", shortServerID(probeSID))
-					d.mu.Unlock()
+					d.unlockMaintenanceRegistry()
 					return "", "", "", errSpawnRetry
 				}
 				current.LastSession = time.Now()
-				d.mu.Unlock()
+				d.unlockMaintenanceRegistry()
 				// CR-002 admission gate: same fresh-global logic as the
 				// placeholder-wait path. An unclassified owner waits for
 				// Classified(); an isolated verdict forces fall-through.
@@ -1492,11 +1520,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 						reqPtr.Mode = "isolated"
 						return "", "", "", errSpawnRetry
 					}
-					if req.Cwd != "" {
-						probeOwner.AddCwd(req.Cwd)
-					}
 				}
-				if !probeOwner.PreRegister(token, req.Cwd, effectiveEnv) {
+				admitted, admissionErr := d.admitOwner(current, token, req.Cwd, effectiveEnv, false)
+				if admissionErr != nil {
+					return "", "", "", admissionErr
+				}
+				if !admitted {
 					if probeOwner.IsClassifiedIsolated() {
 						*isolatedRetry = d.promoteIsolatedRetry(reqPtr, current)
 					}
@@ -1511,12 +1540,14 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			// Zombie. Re-acquire, CAS, delete + bump counter, then Shutdown
 			// OUTSIDE the lock (Shutdown is heavy — closes sockets, tears
 			// down upstream, may fire callbacks back into the daemon).
-			d.mu.Lock()
+			if err := d.lockMaintenanceRegistry(contextKey); err != nil {
+				return "", "", "", err
+			}
 			current, still := d.owners[probeSID]
 			if !still || current.Owner != probeOwner {
 				// Some other path already replaced the zombie; defer to
 				// its replacement and retry.
-				d.mu.Unlock()
+				d.unlockMaintenanceRegistry()
 				return "", "", "", errSpawnRetry
 			}
 			d.zombieDetectedSpawn++
@@ -1528,7 +1559,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				"zombie-listener detected: path=spawn server=%s ipc=%q cmd=%q action=tear-down-and-respawn",
 				shortSID, probeOwner.IPCPath(), current.Command,
 			)
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 			if _, err := d.removeOwnerIfCurrent(probeSID, current, ownerRemovalReasonZombie, false); err != nil {
 				d.logger.Printf("zombie-listener cleanup failed for %s: %v", shortServerID(probeSID), err)
 			}
@@ -1545,11 +1576,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				shortServerID(sid), entry.Owner.SessionCount())
 			// DON'T delete or shutdown the old entry. Fall through — the retry
 			// will compute a unique sid via the counter suffix.
-			d.mu.Unlock()
+			d.unlockMaintenanceRegistry()
 			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, entry)
 			return "", "", "", errSpawnRetry
 		}
-		d.mu.Unlock()
+		d.unlockMaintenanceRegistry()
 		if _, err := d.removeOwnerIfCurrent(sid, entry, ownerRemovalReasonZombie, false); err != nil {
 			d.logger.Printf("owner %s not accepting cleanup failed: %v", shortServerID(sid), err)
 		}
@@ -1563,16 +1594,15 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	//    across different CWDs — every process has exactly one CWD, so sharing an
 	//    unclassified server with a different CWD risks context leaks.
 	if protocolEra == era.EraLegacy && mode == serverid.ModeCwd {
-		if existing := d.findSharedOwnerLocked(req.Command, req.Args, effectiveEnv, req.Cwd); existing != nil {
+		if existing := d.findSharedOwnerLocked(req.Command, req.Args, effectiveEnv, req.Cwd, true); existing != nil {
 			existing.LastSession = time.Now()
 			existingSID := existing.ServerID
-			d.mu.Unlock()
-			if req.Cwd != "" {
-				// AddCwd itself logs only when a new canonical cwd is added.
-				// Dedup hot path is silent — logging every reuse produced 500+ lines/minute.
-				existing.Owner.AddCwd(req.Cwd)
+			d.unlockMaintenanceRegistry()
+			admitted, admissionErr := d.admitOwner(existing, token, req.Cwd, effectiveEnv, false)
+			if admissionErr != nil {
+				return "", "", "", admissionErr
 			}
-			if !existing.Owner.PreRegister(token, req.Cwd, effectiveEnv) {
+			if !admitted {
 				if existing.Owner.IsClassifiedIsolated() {
 					*isolatedRetry = d.promoteIsolatedRetry(reqPtr, existing)
 				}
@@ -1582,26 +1612,32 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		}
 	}
 
+	if err := d.checkMaintenanceKeyLocked(contextKey); err != nil {
+		d.unlockMaintenanceRegistry()
+		return "", "", "", err
+	}
 	// Reserve the slot with a placeholder before releasing d.mu.
 	// Any concurrent goroutine that arrives for the same sid will wait on the
 	// creating channel instead of racing to spawn a duplicate owner.
 	ownerGeneration, err := generateGeneration("owner")
 	if err != nil {
-		d.mu.Unlock()
+		d.unlockMaintenanceRegistry()
 		return "", "", "", err
 	}
 	placeholder := &OwnerEntry{
-		ServerID:        sid,
-		Command:         req.Command,
-		Args:            req.Args,
-		Cwd:             req.Cwd,
-		ProtocolEra:     protocolEra,
-		OwnerGeneration: ownerGeneration,
-		RestoreSource:   "fresh",
-		creating:        make(chan struct{}),
+		ServerID:            sid,
+		Command:             req.Command,
+		Args:                req.Args,
+		Cwd:                 req.Cwd,
+		ProtocolEra:         protocolEra,
+		OwnerGeneration:     ownerGeneration,
+		Env:                 effectiveEnv,
+		maintenanceContexts: map[string]bool{d.maintenanceContext(protocolEra, req.Command, req.Args, req.Cwd, effectiveEnv): true},
+		RestoreSource:       "fresh",
+		creating:            make(chan struct{}),
 	}
 	d.owners[sid] = placeholder
-	d.mu.Unlock()
+	d.unlockMaintenanceRegistry()
 
 	ipcPath := serverid.IPCPath("", d.namespace, sid)
 
@@ -1645,6 +1681,8 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
 		MaterializationPolicy:       materializationPolicy,
 		DeferInitialMaterialization: true,
+		MaintenanceGate:             &d.maintenanceGate,
+		AdmitMaterialization:        d.admitMaterialization,
 		PersistentRequired:          d.persistent,
 		HandlerFunc:                 d.handlerFunc,
 		SessionHandler:              d.sessionHandler,
@@ -1738,7 +1776,20 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// session already got. Otherwise a daemon restart would round-trip
 	// trimmed env through the snapshot and re-surface the original bug.
 	effectivePersistent := d.persistent || templatePersistent
-	d.mu.Lock()
+	if err := d.lockMaintenanceRegistry(contextKey); err != nil {
+		d.mu.Lock()
+		if d.owners[sid] == placeholder {
+			d.deleteOwnerEntryLocked(sid)
+		}
+		if placeholder.creating != nil {
+			close(placeholder.creating)
+			placeholder.creating = nil
+		}
+		d.mu.Unlock()
+		d.supervisor.Remove(serviceToken)
+		o.Shutdown()
+		return "", "", "", err
+	}
 	if d.owners[sid] != placeholder || (fromTemplate && !d.templateMatchCurrentLocked(selectedTemplate)) {
 		staleTemplate := fromTemplate && !d.templateMatchCurrentLocked(selectedTemplate)
 		if d.owners[sid] == placeholder {
@@ -1748,7 +1799,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				placeholder.creating = nil
 			}
 		}
-		d.mu.Unlock()
+		d.unlockMaintenanceRegistry()
 		d.supervisor.Remove(serviceToken)
 		o.Shutdown()
 		if staleTemplate {
@@ -1770,7 +1821,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	placeholder.Persistent = effectivePersistent
 	close(placeholder.creating)
 	placeholder.creating = nil // no longer a placeholder
-	d.mu.Unlock()
+	d.unlockMaintenanceRegistry()
 	if !fromTemplate {
 		if startErr := o.StartInitialMaterialization(); startErr != nil {
 			_, removalErr := d.removeOwnerIfCurrent(sid, placeholder, ownerRemovalReasonRestoreFailed, false)
@@ -1792,7 +1843,11 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// GITHUB_PERSONAL_ACCESS_TOKEN here. Without the merge, a trimmed shim
 	// env would leave muxEnv missing the token even though the owner/upstream
 	// process has it via mergeEnv above.
-	if !o.PreRegisterInitial(token, req.Cwd, sessionEnv) {
+	admitted, admissionErr := d.admitOwner(placeholder, token, req.Cwd, sessionEnv, true)
+	if admissionErr != nil {
+		return "", "", "", admissionErr
+	}
+	if !admitted {
 		if protocolEra == era.EraLegacy && o.IsClassifiedIsolated() {
 			*isolatedRetry = d.promoteIsolatedRetry(reqPtr, placeholder)
 		}
@@ -1914,9 +1969,11 @@ func stopOwnerResultMessage(msg string, result ownerRemovalResult, err error) (s
 
 // HandleShutdown implements control.CommandHandler.
 func (d *Daemon) HandleShutdown(drainTimeoutMs int) string {
-	d.shuttingDown.Store(true)
-	go d.Shutdown()
-	return "daemon shutting down"
+	message, err := d.HandleShutdownWithError(drainTimeoutMs)
+	if err != nil {
+		return err.Error()
+	}
+	return message
 }
 
 // HandleReconnectGiveUp records that a shim exhausted its reconnect budget and
@@ -2306,7 +2363,9 @@ func (d *Daemon) HandleGracefulRestart(drainTimeoutMs int) (string, func(), erro
 
 // HandleGracefulRestartWithOptions implements control.GracefulRestartOptionsHandler.
 func (d *Daemon) HandleGracefulRestartWithOptions(opts control.GracefulRestartOptions) (string, func(), error) {
-	d.shuttingDown.Store(true)
+	if err := d.beginMaintenanceLifecycle(); err != nil {
+		return "", nil, err
+	}
 	if successorExe := strings.TrimSpace(opts.SuccessorExe); successorExe != "" {
 		d.logger.Printf("graceful-restart: successor_exe=%q", successorExe)
 	}
@@ -2374,6 +2433,8 @@ func (d *Daemon) afterGracefulRestart(restartLease *snapshotRestartLease) func()
 
 // HandleRefreshSessionToken implements control.DaemonHandler.
 func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
+	d.maintenanceGate.RLock()
+	defer d.maintenanceGate.RUnlock()
 	if d.shuttingDown.Load() {
 		d.logger.Printf("shim.reconnect.refresh_fail reason=daemon_shutting_down")
 		return "", ErrDaemonShuttingDown
@@ -2389,6 +2450,9 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 		return "", ErrUnknownToken
 	}
 
+	if err := d.checkMaintenanceEntryLocked(entry); err != nil {
+		return "", err
+	}
 	newToken, err := entry.Owner.SessionMgr().RegisterReconnect(prevToken, d.ownerIsAccepting)
 	if err != nil {
 		switch {
@@ -2412,6 +2476,8 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 // HandleRefreshSessionTokenWithProtocolEra validates a modern refresh against
 // the exact live owner before minting a replacement token.
 func (d *Daemon) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra string) (string, error) {
+	d.maintenanceGate.RLock()
+	defer d.maintenanceGate.RUnlock()
 	requestedEra, err := era.ParseProtocolEra(protocolEra)
 	if err != nil || requestedEra != era.EraModern20260728 {
 		d.logger.Printf("shim.reconnect.refresh_fail reason=protocol_era_mismatch")
@@ -2443,6 +2509,9 @@ func (d *Daemon) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra
 		return "", ErrProtocolEraMismatch
 	}
 
+	if err := d.checkMaintenanceEntryLocked(current); err != nil {
+		return "", err
+	}
 	newToken, err := current.Owner.SessionMgr().RegisterReconnect(prevToken, d.ownerIsAccepting)
 	if err != nil {
 		switch {
@@ -2549,6 +2618,9 @@ func (d *Daemon) HandleStatus() map[string]any {
 	for _, view := range ownerViews {
 		s := view.owner.Status()
 		s["server_id"] = view.serverID
+		if maintenance := d.maintenanceForServer(view.serverID); maintenance != nil {
+			s["maintenance"] = maintenance
+		}
 		s["persistent"] = view.persistent
 		if protocolEra, _ := s["protocol_era"].(string); protocolEra != "2026-07-28" {
 			s["owner_generation"] = view.ownerGeneration
@@ -2577,6 +2649,8 @@ func (d *Daemon) HandleStatus() map[string]any {
 
 	return map[string]any{
 		"daemon":                          true,
+		"maintenance":                     d.maintenanceResults(),
+		"maintenance_error_code":          d.maintenanceStatusCode(),
 		"engine_name":                     d.name,
 		"shutting_down":                   d.shuttingDown.Load(),
 		"pid":                             os.Getpid(),
@@ -2682,6 +2756,7 @@ func (d *Daemon) HandleListOwners(req control.Request) (control.ListOwnersRespon
 		lifecyclePolicy, _ := s["lifecycle_policy"].(string)
 		owners = append(owners, control.OwnerInfo{
 			ServerID:             view.serverID,
+			Maintenance:          d.maintenanceForServer(view.serverID),
 			EngineName:           d.name,
 			Command:              view.command,
 			Args:                 view.args,
@@ -2909,7 +2984,13 @@ func (d *Daemon) invalidateOwnerTemplate(expected *owner.Owner) {
 // of wait cycles (at most one — placeholders only exist while someone is
 // actively creating an owner; after a full wait-and-resolve cycle, either a
 // live entry exists or no placeholder remains).
-func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[string]string, reqCwd string) *OwnerEntry {
+func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[string]string, reqCwd string, managed ...bool) *OwnerEntry {
+	unlock := d.mu.Unlock
+	lock := d.mu.Lock
+	if len(managed) > 0 && managed[0] {
+		unlock = d.unlockMaintenanceRegistry
+		lock = func() { d.maintenanceGate.RLock(); d.mu.Lock() }
+	}
 	canonReqCwd := serverid.CanonicalizePath(reqCwd)
 
 	// envCompatible must compare like-for-like: owner.Env is post-mergeEnv
@@ -3030,10 +3111,10 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 		}
 		waitsDone++
 
-		d.mu.Unlock()
+		unlock()
 		if admissionWait != nil {
 			if err := d.waitForOwnerAdmissionThaw(admissionWait); err != nil && !errors.Is(err, ErrOwnerGone) {
-				d.mu.Lock()
+				lock()
 				return nil
 			}
 		} else {
@@ -3046,11 +3127,11 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 				// Classification resolved — rescan; owner may now be shareable.
 			case <-time.After(concurrentCreateWaitTimeout):
 				// Timed out. Re-acquire and return — caller will create new.
-				d.mu.Lock()
+				lock()
 				return nil
 			}
 		}
-		d.mu.Lock()
+		lock()
 		// Loop: fresh scan on the now-mutated map.
 	}
 }
@@ -3243,6 +3324,10 @@ func envTransient(key string) bool {
 
 // Shutdown gracefully stops all owners and the daemon.
 func (d *Daemon) Shutdown() {
+	if err := d.beginMaintenanceLifecycle(); err != nil {
+		d.logger.Printf("daemon shutdown refused: %v", err)
+		return
+	}
 	d.shutdown(nil)
 }
 

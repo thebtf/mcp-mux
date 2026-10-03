@@ -6,9 +6,9 @@
 //	mcp-mux status
 //	mcp-mux stop [--drain-timeout 30s] [--force]
 //
-// mcp-mux wraps any MCP server command. The first instance for a given server
-// becomes the "owner" (spawns the real process, listens on IPC). Subsequent
-// instances connect as clients, sharing the single upstream process.
+// mcp-mux wraps any MCP server command. Its local daemon admits and owns the
+// upstream process; shim sessions connect through managed IPC. Standalone
+// owners cannot bypass daemon maintenance admission.
 //
 // Example:
 //
@@ -27,12 +27,10 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
@@ -42,7 +40,6 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
-	"github.com/thebtf/mcp-mux/muxcore/session"
 	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 	"github.com/thebtf/mcp-mux/muxcore/upgrade"
 )
@@ -83,13 +80,14 @@ func main() {
 		case "status":
 			runStatus()
 			return
+		case "hold", "resume", "renew":
+			os.Exit(runMaintenanceCommand(os.Args[1], os.Args[2:], os.Stdout, os.Stderr))
 		case "stop":
 			stopFlags := flag.NewFlagSet("stop", flag.ExitOnError)
 			drainTimeout := stopFlags.Duration("drain-timeout", 30*time.Second, "Drain timeout before force kill")
 			force := stopFlags.Bool("force", false, "Force immediate shutdown (no drain)")
 			stopFlags.Parse(os.Args[2:])
-			runStop(*drainTimeout, *force)
-			return
+			os.Exit(runStop(*drainTimeout, *force))
 		case "upgrade":
 			if os.Getenv(envEngineMode) == "1" {
 				fmt.Fprintln(os.Stderr, "error: upgrade command is only supported through the stable launcher.")
@@ -112,7 +110,7 @@ func main() {
 
 	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
-	daemon := flag.Bool("daemon", false, "Run as headless owner (no stdio session, for restart)")
+	standalone := flag.Bool("daemon", false, "Unsupported: direct headless owners require managed admission")
 	mcpProtocol := flag.String("mcp-protocol", "", "MCP protocol era (2026-07-28)")
 	flag.Parse()
 
@@ -121,6 +119,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: mcp-mux [flags] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux stop [--drain-timeout 30s] [--force]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux status")
+		fmt.Fprintln(os.Stderr, "       mcp-mux hold <exact-server-id> [--ttl 5m] [--drain-timeout 10s] [--json]")
+		fmt.Fprintln(os.Stderr, "       mcp-mux resume <hold-id> [--json]")
+		fmt.Fprintln(os.Stderr, "       mcp-mux renew <hold-id> [--ttl 5m] [--json]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
 		os.Exit(1)
 	}
@@ -172,12 +173,12 @@ func main() {
 		*isolated = true
 	}
 	if os.Getenv("MCP_MUX_DAEMON") == "1" {
-		*daemon = true
+		*standalone = true
 	}
 
 	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
-	if protocolEra == era.EraModern20260728 && (noDaemon || *daemon) {
-		fmt.Fprintln(os.Stderr, "error: --mcp-protocol=2026-07-28 requires daemon control routing")
+	if err := standaloneAdmissionError(noDaemon, *standalone); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s: standalone owners require daemon-managed admission\n", lifecycleErrorText(err))
 		os.Exit(1)
 	}
 	policy := era.PolicyLegacyOnly
@@ -211,8 +212,6 @@ func main() {
 	command := args[0]
 	cmdArgs := args[1:]
 	sid := serverid.GenerateContextKey(mode, command, cmdArgs, nil, cwd)
-	ipcPath := serverid.IPCPath("", engineName, sid)
-	controlPath := serverid.ControlPath("", engineName, sid)
 
 	// Log to stderr (CC captures) + optionally to file for debugging shim issues.
 	// Set MCP_MUX_SHIM_LOG to a file path to enable shim file logging.
@@ -233,8 +232,7 @@ func main() {
 	// per-server jsonl can show slow/hung sessions at a glance.
 	shimStart := time.Now()
 
-	// Daemon mode (default): shim → daemon → spawn → connect
-	// Disable with MCP_MUX_NO_DAEMON=1 to fall back to legacy per-session owner.
+	// Managed daemon admission is mandatory for every upstream launch.
 	//
 	// Important: daemon mode MUST run before any direct IPC shortcut. A reused
 	// daemon-managed owner requires a one-time handshake token, and only the
@@ -387,123 +385,6 @@ func main() {
 			}
 		}
 	}
-
-	// Legacy compatibility fallback: connect directly only after daemon mode is
-	// explicitly disabled. This path has no handshake token, so it is only safe
-	// for legacy owners.
-	ipcProbeStart := time.Now()
-	ipcAvail := ipc.IsAvailable(ipcPath)
-	logger.Printf("shim startup step=ipc_probe result=%v duration=%v path=%q",
-		ipcAvail, time.Since(ipcProbeStart), ipcPath)
-	if ipcAvail {
-		runClientStart := time.Now()
-		logger.Printf("shim startup step=run_client_begin target=existing_owner path=%q", ipcPath)
-		if err := owner.RunClient(ipcPath, os.Stdin, os.Stdout); err != nil {
-			logger.Printf("shim startup step=run_client_end status=error duration=%v err=%q total=%v",
-				time.Since(runClientStart), err.Error(), time.Since(shimStart))
-			os.Exit(1)
-		}
-		logger.Printf("shim startup step=run_client_end status=ok duration=%v total=%v reason=stdin_closed",
-			time.Since(runClientStart), time.Since(shimStart))
-		return
-	}
-
-	// Legacy fallback: become owner directly (MCP_MUX_NO_DAEMON=1)
-	logger.Printf("becoming owner for %s (cwd: %s, mode: %s)", serverid.DescribeArgs(args), cwd, mode)
-	if *daemon {
-		runLegacyDaemon(args, cwd, ipcPath, controlPath, sid, logger)
-	} else {
-		runOwner(args, cwd, ipcPath, controlPath, sid, logger, *isolated)
-	}
-}
-
-func runOwner(args []string, cwd, ipcPath, controlPath, sid string, logger *log.Logger, isolated bool) {
-	command := args[0]
-	cmdArgs := args[1:]
-
-	// Collect environment variables that were passed to us
-	env := make(map[string]string)
-	// MCP servers receive env from their config — those are passed through
-	// our environment. We don't filter here; the upstream inherits our full env
-	// via upstream.Start which uses os.Environ().
-
-	effectiveIPCPath := ipcPath
-	effectiveControlPath := controlPath
-	if isolated {
-		// In isolated mode, embed PID into the server ID portion (before extension)
-		// so suffix matching (.sock, .ctl.sock) still works for stop/status commands.
-		pidSuffix := fmt.Sprintf("-%d", os.Getpid())
-		effectiveIPCPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s%s%s.sock", ownSocketPrefix, sid, pidSuffix))
-		effectiveControlPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s%s%s.ctl.sock", ownSocketPrefix, sid, pidSuffix))
-	}
-
-	o, err := owner.NewOwner(owner.OwnerConfig{
-		Command:     command,
-		Args:        cmdArgs,
-		Env:         env,
-		Cwd:         cwd,
-		IPCPath:     effectiveIPCPath,
-		ControlPath: effectiveControlPath,
-		Logger:      logger,
-	})
-	if err != nil {
-		logger.Fatalf("failed to start owner: %v", err)
-	}
-
-	// Add our own stdio as the first session
-	sess := session.NewSession(os.Stdin, os.Stdout)
-	o.AddSession(sess)
-
-	// Handle shutdown signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-sigCh:
-		logger.Printf("received signal %v, shutting down", sig)
-		o.Shutdown()
-	case <-o.Done():
-		// Owner shut down (upstream exited)
-	case <-sess.Done():
-		// Our own session ended (stdin closed)
-		logger.Printf("stdin closed, shutting down")
-		o.Shutdown()
-	}
-}
-
-// runLegacyDaemon starts an owner without a stdio session (headless).
-// Used by mux_restart to spawn a new owner in the background.
-func runLegacyDaemon(args []string, cwd, ipcPath, controlPath, _ string, logger *log.Logger) {
-	command := args[0]
-	cmdArgs := args[1:]
-
-	env := make(map[string]string)
-
-	o, err := owner.NewOwner(owner.OwnerConfig{
-		Command:     command,
-		Args:        cmdArgs,
-		Env:         env,
-		Cwd:         cwd,
-		IPCPath:     ipcPath,
-		ControlPath: controlPath,
-		Logger:      logger,
-	})
-	if err != nil {
-		logger.Fatalf("failed to start daemon owner: %v", err)
-	}
-
-	logger.Printf("daemon owner started (no stdio session)")
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-sigCh:
-		logger.Printf("received signal %v, shutting down", sig)
-		o.Shutdown()
-	case <-o.Done():
-		// Owner shut down (upstream exited)
-	}
 }
 
 // runServe starts as an MCP server on stdio, providing control plane tools.
@@ -515,7 +396,7 @@ func runServe() {
 	}
 }
 
-func runStop(drainTimeout time.Duration, force bool) {
+func runStop(drainTimeout time.Duration, force bool) int {
 	// Try stopping daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
 	if isDaemonRunning(ctlPath) {
@@ -532,10 +413,16 @@ func runStop(drainTimeout time.Duration, force bool) {
 			Cmd:            "shutdown",
 			DrainTimeoutMs: drainMs,
 		}, clientTimeout)
-		if err == nil && resp.OK {
+		if err == nil {
+			err = resp.Err()
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  daemon: error: %s\n", lifecycleErrorText(err))
+			if isMaintenanceError(err) {
+				return 1
+			}
+		} else {
 			fmt.Fprintf(os.Stderr, "  daemon: %s\n", resp.Message)
-		} else if err != nil {
-			fmt.Fprintf(os.Stderr, "  daemon: error: %v\n", err)
 		}
 	}
 
@@ -598,11 +485,14 @@ func runStop(drainTimeout time.Duration, force bool) {
 		}
 
 		handled[id] = true
-		if resp.OK {
+		if err := resp.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] shutdown failed: %s\n", shortID, lifecycleErrorText(err))
+			if isMaintenanceError(err) {
+				return 1
+			}
+		} else {
 			fmt.Fprintf(os.Stderr, "  [%s] %s\n", shortID, resp.Message)
 			stopped++
-		} else {
-			fmt.Fprintf(os.Stderr, "  [%s] shutdown failed: %s\n", shortID, resp.Message)
 		}
 	}
 
@@ -656,6 +546,7 @@ func runStop(drainTimeout time.Duration, force bool) {
 	} else {
 		fmt.Fprintf(os.Stderr, "Done: %d stopped, %d stale cleaned.\n", stopped, stale)
 	}
+	return 0
 }
 
 func runUpgrade(restart bool, forceDaemonRestart bool) {
@@ -695,6 +586,12 @@ func runUpgrade(restart bool, forceDaemonRestart bool) {
 	// Daemon gets new code on next natural restart (idle timeout, CC restart, or explicit stop).
 	//
 	// NEVER call runStop here — it kills daemon, owners, upstreams, and all sessions.
+	mutationLock, err := acquireMaintenanceMutation()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: upgrade refused: %s\n", lifecycleErrorText(err))
+		os.Exit(1)
+	}
+	defer mutationLock.Close()
 
 	oldPath, swapErr := upgrade.Swap(exe, pendingPath)
 	if swapErr != nil {
@@ -719,87 +616,10 @@ func runUpgrade(restart bool, forceDaemonRestart bool) {
 	fmt.Fprintf(os.Stderr, "Upgrade complete: %s swapped.\n", filepath.Base(exe))
 
 	if restart && isDaemonRunning(ctlPath) {
-		if !forceDaemonRestart {
-			liveSessions, err := launcherDaemonLiveSessionCount(ctlPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Daemon restart deferred: could not prove zero live sessions: %v\n", err)
-				fmt.Fprintln(os.Stderr, "Existing host transports are preserved.")
-				fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
-				return
-			}
-			if liveSessions > 0 {
-				fmt.Fprintf(os.Stderr, "Daemon restart deferred: %d live session(s) attached; preserving host transports.\n", liveSessions)
-				fmt.Fprintln(os.Stderr, "Daemon can be restarted after sessions drain.")
-				fmt.Fprintln(os.Stderr, "Run with --force-daemon-restart only during an explicit maintenance window.")
-				return
-			}
+		if err := restartDaemonAfterEngineSwitchUnderLock(exe, exe, forceDaemonRestart); err != nil {
+			fmt.Fprintf(os.Stderr, "error: daemon restart refused or incomplete: %s\n", lifecycleErrorText(err))
+			os.Exit(1)
 		}
-
-		// Acquire daemon lock BEFORE sending graceful-restart.
-		// This prevents shims from spawning a competing daemon during the restart window.
-		// Shims that detect IPC loss will call ensureDaemon → lockFile → block until we release.
-		lockPath := serverid.DaemonLockPath("", engineName)
-		lock, lockErr := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
-		if lockErr == nil {
-			if flockErr := lockFile(lock); flockErr == nil {
-				defer func() {
-					unlockFile(lock)
-					lock.Close()
-				}()
-				fmt.Fprintln(os.Stderr, "Acquired daemon lock (shims blocked from respawning).")
-			} else {
-				lock.Close()
-				fmt.Fprintf(os.Stderr, "Warning: could not acquire daemon lock: %v (proceeding anyway)\n", flockErr)
-			}
-		}
-
-		// Graceful restart: serialize state snapshot, then shutdown.
-		// New daemon loads snapshot → owners restored with cached state → instant reconnect.
-		fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
-		resp, err := control.SendWithTimeout(ctlPath, control.Request{
-			Cmd:            "graceful-restart",
-			DrainTimeoutMs: 30000,
-		}, 60*time.Second)
-		if err != nil {
-			// Fallback to plain shutdown if graceful-restart not supported (old daemon)
-			fmt.Fprintf(os.Stderr, "  graceful-restart not available: %v, falling back to shutdown\n", err)
-			resp, err = control.Send(ctlPath, control.Request{Cmd: "shutdown"})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  warning: shutdown failed: %v\n", err)
-			}
-			waitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
-		} else if !resp.OK {
-			fmt.Fprintf(os.Stderr, "  graceful-restart failed: %s, falling back to shutdown\n", resp.Message)
-			control.Send(ctlPath, control.Request{Cmd: "shutdown"})
-			waitForDaemonExit(ctlPath, "  Waiting for old daemon to exit...")
-		} else {
-			waitForDaemonExit(ctlPath, "  snapshot written. Waiting for daemon to exit...")
-		}
-
-		// Clean up stale daemon control socket — old daemon may not have removed it.
-		if _, statErr := os.Stat(ctlPath); statErr == nil {
-			if !isDaemonRunning(ctlPath) {
-				_ = os.Remove(ctlPath)
-				fmt.Fprintln(os.Stderr, "Cleaned stale daemon control socket.")
-			}
-		}
-
-		// Clean up stale old binary files from previous upgrades.
-		upgrade.CleanStale(exe)
-
-		// Start new daemon while holding lock — shims will connect to it.
-		fmt.Fprintln(os.Stderr, "Starting new daemon...")
-		if startErr := startDaemonProcess(); startErr != nil {
-			fmt.Fprintf(os.Stderr, "  warning: failed to start new daemon: %v\n", startErr)
-			fmt.Fprintln(os.Stderr, "  Shims will start it on next reconnect.")
-		} else {
-			if waitErr := waitForDaemon(ctlPath, 10*time.Second); waitErr != nil {
-				fmt.Fprintf(os.Stderr, "  warning: new daemon not ready: %v\n", waitErr)
-			} else {
-				fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
-			}
-		}
-		// Lock released by defer — shims unblock and connect to new daemon.
 	} else if isDaemonRunning(ctlPath) {
 		fmt.Fprintln(os.Stderr, "Daemon running (old code) — all connections preserved.")
 		fmt.Fprintln(os.Stderr, "New shims use new binary. Daemon updates on next restart.")
@@ -868,7 +688,7 @@ func collectEnv() map[string]string {
 }
 
 func isTransientDaemonReconnectErr(err error) bool {
-	if err == nil {
+	if err == nil || isMaintenanceError(err) {
 		return false
 	}
 	if errors.Is(err, daemon.ErrDaemonShuttingDown) {

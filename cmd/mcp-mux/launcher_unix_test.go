@@ -25,7 +25,7 @@ func TestResolveActiveEngineAcceptsSymlinkedTempAncestor(t *testing.T) {
 
 	launcherPath := filepath.Join(os.TempDir(), "mcp-mux-test", launcherFileName())
 	enginePath := writeContentAddressedTestEngine(t, launcherPath, "active engine")
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatal(err)
 	}
 	resolved, ok := resolveActiveEngine(launcherPath)
@@ -48,7 +48,7 @@ func TestResolveActiveEngineRejectsControlledSymlinks(t *testing.T) {
 			t.Fatal(err)
 		}
 		advertised := filepath.Join(versionStoreDir(launcherPath), "version", engineFileName())
-		if err := writeActiveEngine(launcherPath, advertised); err != nil {
+		if err := writeActiveEngineUnderLock(launcherPath, advertised); err != nil {
 			t.Fatal(err)
 		}
 		if resolved, ok := resolveActiveEngine(launcherPath); ok || resolved != "" {
@@ -69,7 +69,7 @@ func TestResolveActiveEngineRejectsControlledSymlinks(t *testing.T) {
 			t.Fatal(err)
 		}
 		advertised := filepath.Join(store, "version", engineFileName())
-		if err := writeActiveEngine(launcherPath, advertised); err != nil {
+		if err := writeActiveEngineUnderLock(launcherPath, advertised); err != nil {
 			t.Fatal(err)
 		}
 		if resolved, ok := resolveActiveEngine(launcherPath); ok || resolved != "" {
@@ -89,7 +89,7 @@ func TestResolveActiveEngineRejectsControlledSymlinks(t *testing.T) {
 		if err := os.Symlink(realEngine, enginePath); err != nil {
 			t.Fatal(err)
 		}
-		if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+		if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 			t.Fatal(err)
 		}
 		if resolved, ok := resolveActiveEngine(launcherPath); ok || resolved != "" {

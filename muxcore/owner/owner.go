@@ -170,6 +170,11 @@ type Owner struct {
 	upstreamWriter              io.Writer // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID                    string    // server identity hash
 	protocolEra                 era.ProtocolEra
+	maintenanceGate             *sync.RWMutex
+	admitMaterialization        func(*Owner, LaunchContext) error
+	maintenance                 atomic.Pointer[control.MaintenanceResult]
+	maintenanceRetired          atomic.Bool
+	lastMaintenanceLaunch       LaunchContext
 	listener                    net.Listener
 	logger                      *log.Logger
 
@@ -306,6 +311,13 @@ type OwnerConfig struct {
 	// ProtocolEra is immutable for the owner lifetime. Its zero value preserves
 	// legacy routing and cache behavior.
 	ProtocolEra era.ProtocolEra
+
+	// MaintenanceGate coordinates managed starts and frame admission with the
+	// daemon fence. AdmitMaterialization runs under its read lease, before start,
+	// after context election; it must not acquire this gate or owner locks.
+	// Nil preserves standalone library behavior.
+	MaintenanceGate      *sync.RWMutex
+	AdmitMaterialization func(*Owner, LaunchContext) error
 
 	// OnZeroSessions is called with the exact owner whose last session left.
 	// If nil, the owner does not auto-shutdown on zero sessions.
@@ -450,6 +462,8 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		protocolEra:            cfg.ProtocolEra,
+		maintenanceGate:        cfg.MaintenanceGate,
+		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
@@ -625,6 +639,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		protocolEra:            cfg.ProtocolEra,
+		maintenanceGate:        cfg.MaintenanceGate,
+		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
@@ -909,6 +925,13 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
+	if o.maintenanceGate != nil {
+		o.maintenanceGate.RLock()
+		defer o.maintenanceGate.RUnlock()
+	}
+	if held := o.maintenance.Load(); held != nil {
+		return o.rejectMaintenance(s, msg, held)
+	}
 	// OnFrameReceived hook (FR-4 / NFR-2) — invoked synchronously on the
 	// reader goroutine for every inbound frame, AFTER IsNotification /
 	// IsRequest classification but BEFORE any dispatch / cache replay /
@@ -1338,6 +1361,8 @@ func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
 	return true
 }
 
+var materializationStartProcess = upstream.Start
+
 func (o *Owner) spawnReplacementUpstream(launch LaunchContext) (*upstream.Process, error) {
 	if o.handlerFunc != nil {
 		o.logger.Printf("upstream respawn: in-process handler")
@@ -1346,7 +1371,7 @@ func (o *Owner) spawnReplacementUpstream(launch LaunchContext) (*upstream.Proces
 	if o.command == "" {
 		return nil, errors.New("upstream command is empty")
 	}
-	return upstream.Start(o.command, o.args, launch.Env, launch.Cwd, o.logger)
+	return materializationStartProcess(o.command, o.args, launch.Env, launch.Cwd, o.logger)
 }
 
 // isProactiveID identifies only this Owner's proactive namespace. A response
@@ -2510,13 +2535,14 @@ func (o *Owner) claimInflightRequests(proc *upstream.Process) []drainedInflightR
 		s, ok := o.sessions[result.SessionID]
 		o.mu.RUnlock()
 		if ok {
+			payload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(result.OriginalID)))
+			if held := o.maintenance.Load(); held != nil {
+				payload = maintenanceErrorBytes(result.OriginalID, held)
+			}
 			responses = append(responses, drainedInflightResponse{
 				session:   s,
 				sessionID: result.SessionID,
-				payload: []byte(fmt.Sprintf(
-					`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
-					string(result.OriginalID),
-				)),
+				payload:   payload,
 			})
 		}
 
@@ -2545,7 +2571,11 @@ func (o *Owner) claimModernInflightRequests(proc *upstream.Process) []drainedInf
 		var payload []byte
 		if session != nil {
 			var err error
-			payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
+			if held := o.maintenance.Load(); held != nil {
+				payload = maintenanceErrorBytes(json.RawMessage(requestID), held)
+			} else {
+				payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
+			}
 			if err != nil {
 				o.logger.Printf("drainInflight: build error for %s: %v", requestID, err)
 				return true
@@ -2633,18 +2663,30 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	defer o.removalMu.Unlock()
 	select {
 	case <-o.done:
+		if o.maintenance.Load() != nil && !o.maintenanceRetired.Load() {
+			return 0, false, control.ErrMaintenanceRetirementBlocked
+		}
 		return 0, true, nil
 	default:
 	}
 	abortPreparedHandoff := o.handoffPrepared && o.handoffAbortRequested
+	if o.maintenance.Load() != nil && o.handoffPrepared {
+		return 0, false, control.ErrMaintenanceRetirementBlocked
+	}
 	if o.handoffPrepared && !abortPreparedHandoff {
 		return 0, false, ErrHandoffAlreadyPrepared
+	}
+	if held := o.maintenance.Load(); held != nil {
+		o.DrainForMaintenance(held.DrainDeadline)
 	}
 	if timeout <= 0 {
 		timeout = materializationFinalizeTimeout
 	}
 
 	o.stopMaterialization()
+	if o.maintenance.Load() != nil {
+		o.drainInflightRequests()
+	}
 	o.teardownExceptUpstream()
 
 	o.materializationMu.Lock()
@@ -2682,7 +2724,9 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	exitCode := 0
 	var closeErr error
 	if proc != nil {
-		if abortPreparedHandoff {
+		if o.maintenance.Load() != nil {
+			exitCode, closeErr = proc.SoftClose(0)
+		} else if abortPreparedHandoff {
 			closeErr = proc.AbortDetach()
 		} else if soft {
 			exitCode, closeErr = proc.SoftClose(timeout)
@@ -2692,9 +2736,15 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	}
 	proofErr := error(nil)
 	proven := proc == nil || proc.RetirementProven()
+	if o.maintenance.Load() != nil && proc != nil {
+		proven = proc.TreesDead()
+	}
 	if proc != nil && o.materializationFinalizationProbe != nil {
 		proofErr = o.materializationFinalizationProbe(proc)
 		proven = proofErr == nil
+	}
+	if o.maintenance.Load() != nil && proc != nil {
+		proven = proven && proc.TreesDead()
 	}
 	if !proven {
 		if proofErr == nil {
@@ -2735,6 +2785,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		o.handoffPrepared = false
 		o.handoffAbortRequested = false
 	}
+	o.maintenanceRetired.Store(proc == nil || proc.TreesDead())
 	o.completeShutdown("owner shut down")
 	return exitCode, true, closeErr
 }

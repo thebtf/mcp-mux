@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
@@ -211,6 +212,13 @@ func (o *Owner) abortPreparedHandoff(proc *upstream.Process, pid int) error {
 //   - wrapped detach errors — cleanup is attempted and completion occurs only
 //     when process-tree retirement is proven.
 func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
+	if o.maintenanceGate != nil {
+		o.maintenanceGate.RLock()
+		defer o.maintenanceGate.RUnlock()
+	}
+	if o.maintenance.Load() != nil {
+		return HandoffPayload{}, control.ErrMaintenanceHeld
+	}
 	o.removalMu.Lock()
 	defer o.removalMu.Unlock()
 	select {

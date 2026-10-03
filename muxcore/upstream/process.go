@@ -641,6 +641,23 @@ func (p *Process) RetirementProven() bool {
 	}
 }
 
+// TreesDead excludes transferred authority and requires actual handler/leader
+// completion as well as the OS tree finalizer's proof.
+func (p *Process) TreesDead() bool {
+	p.mu.Lock()
+	detach := p.detach
+	p.mu.Unlock()
+	if detach == detachCommitted || detach == detachLegacy || detach == detachPrepared {
+		return false
+	}
+	select {
+	case <-p.Done:
+		return p.RetirementProven()
+	default:
+		return false
+	}
+}
+
 // Detach releases ownership of the upstream process without terminating it.
 // It returns the process PID and the raw OS file descriptors for stdin and
 // stdout, so that a successor daemon can reattach to the running process via
