@@ -342,7 +342,7 @@ func (e *MuxEngine) isProxyMode() bool {
 //   - If MCP_MUX_SESSION_ID env var is set → proxy mode (pass-through, T025)
 //   - Otherwise → client/shim mode (find/start daemon, connect via IPC, T024)
 //
-// Blocks until ctx is cancelled or the engine exits naturally.
+// Cancellation requests shutdown; daemon mode retains authority until Done.
 func (e *MuxEngine) Run(ctx context.Context) error {
 	if e.isDaemonMode() {
 		return e.runDaemon(ctx)
@@ -456,14 +456,15 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 	}()
 
 	reaper := daemon.NewReaper(d, defaultReaperInterval)
+	defer reaper.Stop()
 
 	select {
 	case <-ctx.Done():
-		reaper.Stop()
 		d.Shutdown()
+		// Shutdown may refuse; retain the daemon reference and reaper until Done.
+		<-d.Done()
 		return ctx.Err()
 	case <-d.Done():
-		reaper.Stop()
 		return nil
 	}
 }

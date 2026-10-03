@@ -110,19 +110,21 @@ func runGlobalDaemon() {
 
 	// Start reaper
 	reaper := daemon.NewReaper(d, 10*time.Second)
+	defer reaper.Stop()
 
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	select {
 	case sig := <-sigCh:
 		logger.Printf("received signal %v, shutting down", sig)
-		reaper.Stop()
 		d.Shutdown()
+		// Shutdown may refuse; retain service authority until actual completion.
+		<-d.Done()
 	case <-d.Done():
 		// Daemon shut down (idle auto-exit or control command)
-		reaper.Stop()
 	}
 }
 
