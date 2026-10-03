@@ -315,6 +315,7 @@ func (d *Daemon) acquireMaintenance(req control.Request, ttl time.Duration) (con
 
 	// A placeholder has no process before promotion. Promotion rechecks the fence,
 	// settles its channel and discards the inert owner before any start is admitted.
+	blocked := false
 	for _, pin := range pins {
 		if pin.creating != nil {
 			timer := time.NewTimer(time.Until(lease.result.DrainDeadline))
@@ -322,7 +323,7 @@ func (d *Daemon) acquireMaintenance(req control.Request, ttl time.Duration) (con
 			case <-pin.creating:
 				timer.Stop()
 			case <-timer.C:
-				return d.blockMaintenance(lease)
+				blocked = true
 			}
 		}
 	}
@@ -336,8 +337,12 @@ func (d *Daemon) acquireMaintenance(req control.Request, ttl time.Duration) (con
 			continue
 		}
 		if _, err := d.removeOwnerIfCurrent(pin.identity.serverID, pin.entry, ownerRemovalReasonMaintenance, false); err != nil && !pin.entry.Owner.MaintenanceRetired() {
-			return d.blockMaintenance(lease)
+			d.scheduleOwnerFinalizationRetry(pin.identity.serverID, pin.entry, ownerRemovalReasonMaintenance, false)
+			blocked = true
 		}
+	}
+	if blocked {
+		return d.blockMaintenance(lease)
 	}
 	d.maintenanceGate.Lock()
 	defer d.maintenanceGate.Unlock()
@@ -604,8 +609,18 @@ func (d *Daemon) HandleRestartOwner(req control.Request) (control.Response, erro
 	if req.DrainTimeoutMs > 0 {
 		entry.Owner.DrainRequestsUntil(time.Now().Add(time.Duration(req.DrainTimeoutMs) * time.Millisecond))
 	}
-	if _, err := d.removeOwnerIfCurrent(req.ServerID, entry, ownerRemovalReasonOperatorHard, false); err != nil {
+	removed, err := d.removeOwnerIfCurrent(req.ServerID, entry, ownerRemovalReasonOperatorHard, false)
+	if err != nil {
 		return control.Response{}, err
+	}
+	if !removed.Removed {
+		d.mu.RLock()
+		current := d.owners[req.ServerID]
+		d.mu.RUnlock()
+		if current == nil {
+			return control.Response{}, control.ErrMaintenanceNotFound
+		}
+		return control.Response{}, control.ErrMaintenanceConflict
 	}
 	path, sid, token, err := d.Spawn(spawn)
 	if err != nil {
