@@ -23,10 +23,13 @@ import (
 func maintenanceDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	config := t.TempDir()
+	t.Setenv("HOME", config)
+	t.Setenv("USERPROFILE", config)
 	t.Setenv("APPDATA", config)
 	t.Setenv("XDG_CONFIG_HOME", config)
 	path := shortSocketPath(t, "maintenance.ctl.sock")
-	d, err := New(Config{ControlPath: path, Namespace: "maintenance-" + strings.TrimSuffix(filepath.Base(path), ".sock"), SkipSnapshot: true, Logger: testLogger(t)})
+	namespace := "m-" + strings.TrimPrefix(strings.TrimSuffix(filepath.Base(path), ".sock"), "mux-test-")
+	d, err := New(Config{ControlPath: path, Namespace: namespace, SkipSnapshot: true, Logger: testLogger(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,11 +380,13 @@ func TestMaintenanceBlockedTTLDoesNotReleaseUnprovenTree(t *testing.T) {
 		return original(o, soft)
 	}
 	t.Cleanup(func() { allow.Store(true); finalizeOwnerForRemoval = original })
-	result, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(500)})
+	// Advance durable fixture time below instead of racing renew against an expiry
+	// timer that acquires the same nonblocking namespace lock.
+	result, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid})
 	if !errors.Is(err, control.ErrMaintenanceRetirementBlocked) || result.State != control.MaintenanceRetirementBlocked || result.TreesRetired {
 		t.Fatalf("unproven tree hold: %+v %v", result, err)
 	}
-	renewed, renewErr := d.HandleMaintenance(control.Request{Cmd: "renew", HoldID: result.HoldID, HoldTTLMS: maintenanceTTL(1000)})
+	renewed, renewErr := d.HandleMaintenance(control.Request{Cmd: "renew", HoldID: result.HoldID, HoldTTLMS: maintenanceTTL(600000)})
 	if renewErr != nil || renewed.State != control.MaintenanceRetirementBlocked || !renewed.ExpiresAt.After(result.ExpiresAt) {
 		t.Fatalf("exact blocked renewal: %+v %v", renewed, renewErr)
 	}
@@ -391,11 +396,28 @@ func TestMaintenanceBlockedTTLDoesNotReleaseUnprovenTree(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.maintenanceGate.Lock()
-	err = d.expireMaintenanceLocked(result.ExpiresAt.Add(time.Second))
+	lease := d.maintenanceLeases[result.HoldID]
+	updated := *lease
+	updated.result.ExpiresAt = time.Now().Add(-time.Second)
+	next := copyMaintenanceLeases(d.maintenanceLeases)
+	next[result.HoldID] = &updated
+	err = d.persistMaintenanceLocked(next)
+	if err == nil {
+		// Keep the exact pins and fence, without scheduling an immediate competing
+		// timer; blocked expiry is released only after the existing retirement retry.
+		d.maintenanceLeases = next
+		result = updated.result
+		for _, pin := range updated.pins {
+			if pin.entry.Owner != nil {
+				pin.entry.Owner.SetMaintenance(&updated.result)
+			}
+		}
+		err = d.expireMaintenanceLocked(time.Now())
+	}
 	d.maintenanceGate.Unlock()
 	_ = lock.Close()
 	if err != nil || len(d.maintenanceResults()) != 1 {
-		t.Fatal("TTL released an unproven tree")
+		t.Fatalf("TTL released an unproven tree: %v", err)
 	}
 	if _, err := d.HandleMaintenance(control.Request{Cmd: "resume", HoldID: result.HoldID}); !errors.Is(err, control.ErrMaintenanceRetirementBlocked) {
 		t.Fatalf("resume unproven tree: %v", err)
@@ -403,7 +425,9 @@ func TestMaintenanceBlockedTTLDoesNotReleaseUnprovenTree(t *testing.T) {
 	if _, _, _, err := d.Spawn(req); !errors.Is(err, control.ErrMaintenanceHeld) {
 		t.Fatalf("TTL bypassed admission: %v", err)
 	}
-	waitForDaemonCondition(t, 2*time.Second, func() bool { return !time.Now().Before(result.ExpiresAt) }, "lease did not reach TTL")
+	if time.Now().Before(result.ExpiresAt) {
+		t.Fatal("fixture lease did not reach TTL")
+	}
 	if _, err := d.HandleMaintenance(control.Request{Cmd: "renew", HoldID: result.HoldID}); !errors.Is(err, control.ErrMaintenanceConflict) {
 		t.Fatalf("expired blocked lease renewed: %v", err)
 	}
