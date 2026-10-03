@@ -179,7 +179,7 @@ func TestMaintenanceStartupHeldOpeningKeepsPipesAndResumesFresh(t *testing.T) {
 	for _, id := range []string{"41", `"opening-string"`} {
 		t.Run(id, func(t *testing.T) {
 			dir := shortTempDir(t, "mh")
-			for _, key := range []string{"TEMP", "TMP", "TMPDIR", "APPDATA", "XDG_CONFIG_HOME"} {
+			for _, key := range []string{"TEMP", "TMP", "TMPDIR", "APPDATA", "XDG_CONFIG_HOME", "HOME", "USERPROFILE"} {
 				t.Setenv(key, dir)
 			}
 			// Private TEMP isolates this fixture; keep owner socket names within Unix limits.
