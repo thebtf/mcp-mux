@@ -1790,7 +1790,7 @@ func TestCleanStaleSockets(t *testing.T) {
 		paths = append(paths, path)
 	}
 
-	cleaned := cleanStaleSockets("mcp-mux", testLogger(t))
+	cleaned := cleanStaleSockets("mcp-mux", "", testLogger(t))
 	if cleaned != staleSocketCount {
 		t.Fatalf("cleanStaleSockets() = %d, want %d", cleaned, staleSocketCount)
 	}
@@ -1826,7 +1826,7 @@ func TestCleanStaleSocketsNameScope(t *testing.T) {
 		t.Fatalf("seed mcp-mux socket: %v", err)
 	}
 
-	cleanStaleSockets("aimux-test", testLogger(t))
+	cleanStaleSockets("aimux-test", "", testLogger(t))
 
 	// The mcp-mux socket MUST NOT be removed — it belongs to a different engine.
 	if _, err := os.Stat(mcpMuxSocket); os.IsNotExist(err) {
@@ -1836,6 +1836,92 @@ func TestCleanStaleSocketsNameScope(t *testing.T) {
 		_, err := os.Stat(mcpMuxSocket)
 		return err == nil
 	}())
+}
+
+func TestDaemonStartupPreservesPausedControlEndpoint(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix socket unlinking regression; Windows control endpoints use named pipes")
+	}
+	for _, customPath := range []bool{false, true} {
+		t.Run(fmt.Sprintf("custom_path_%t", customPath), func(t *testing.T) {
+			baseDir, err := os.MkdirTemp("", "cs*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(baseDir) })
+			configDir := t.TempDir()
+			t.Setenv("HOME", configDir)
+			t.Setenv("USERPROFILE", configDir)
+			t.Setenv("APPDATA", configDir)
+			t.Setenv("XDG_CONFIG_HOME", configDir)
+			previousScanDir := cleanStaleSocketsDir
+			cleanStaleSocketsDir = baseDir
+			t.Cleanup(func() { cleanStaleSocketsDir = previousScanDir })
+
+			const namespace = "scan"
+			endpoint := serverid.DaemonControlPath(baseDir, namespace)
+			if customPath {
+				endpoint = serverid.ControlPath(baseDir, namespace, "x")
+			}
+			staleControl := serverid.ControlPath(baseDir, namespace, "stale")
+			staleData := serverid.IPCPath(baseDir, namespace, "stale")
+			foreignControl := serverid.ControlPath(baseDir, "foreign", "stale")
+			aliveControl := serverid.ControlPath(baseDir, namespace, "alive")
+			aliveData := serverid.IPCPath(baseDir, namespace, "alive")
+			for _, path := range []string{staleControl, staleData, foreignControl, aliveData} {
+				if err := os.WriteFile(path, []byte("socket fixture"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			alive, err := control.NewServer(aliveControl, nil, testLogger(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(alive.Close)
+
+			// The real constructor binds its endpoint paused, scans this same
+			// directory, and starts admission only after successful publication.
+			// No mocked availability or timer assertion can mask self-unlinking.
+			d, err := New(Config{Name: "display", Namespace: namespace, ControlPath: endpoint, SessionHandler: noopSessionHandler{}, SkipSnapshot: true, Logger: testLogger(t)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { d.shutdown(nil) })
+			info, err := os.Stat(endpoint)
+			if err != nil || info.Mode()&os.ModeSocket == 0 {
+				t.Fatalf("constructor removed its owned Unix endpoint: %v", err)
+			}
+			response, err := control.SendWithTimeout(endpoint, control.Request{Cmd: "ping"}, 2*time.Second)
+			if err != nil || response == nil || !response.OK {
+				t.Fatalf("published constructor endpoint cannot serve ping: %+v %v", response, err)
+			}
+			for _, path := range []string{staleControl, staleData} {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("startup did not remove stale owner socket %s: %v", path, err)
+				}
+			}
+			for _, path := range []string{foreignControl, aliveControl, aliveData} {
+				if _, err := os.Stat(path); err != nil {
+					t.Fatalf("startup removed foreign or live owner authority %s: %v", path, err)
+				}
+			}
+
+			// Cold-start shim admission must use the same public endpoint,
+			// return a usable IPC route, and serve actual native owner work.
+			spawned, err := control.SendWithTimeout(endpoint, control.Request{Cmd: "spawn", Command: "constructor-public-owner", Mode: "isolated", Cwd: t.TempDir()}, 5*time.Second)
+			if err != nil || spawned == nil || !spawned.OK || spawned.IPCPath == "" || spawned.Token == "" || spawned.ServerID == "" {
+				t.Fatalf("public cold-start spawn failed: %+v %v", spawned, err)
+			}
+			conn, scanner := connectSpawnedOwner(t, spawned.IPCPath, spawned.Token)
+			defer conn.Close()
+			if _, err := fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":1,"method":"constructor/ping","params":{}}`); err != nil {
+				t.Fatal(err)
+			}
+			if result := readDaemonResponseID(t, scanner, "1"); !strings.Contains(string(result), `"ok":true`) {
+				t.Fatalf("public constructor route did not serve owner work: %s", result)
+			}
+		})
+	}
 }
 
 func findSharedOwnerLocked(d *Daemon, command string, args []string, env map[string]string) *OwnerEntry {

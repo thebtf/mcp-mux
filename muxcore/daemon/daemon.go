@@ -673,7 +673,7 @@ func New(cfg Config) (*Daemon, error) {
 	}
 
 	// Clean up stale socket files from previous daemon crashes/kills.
-	cleaned := cleanStaleSockets(d.namespace, logger)
+	cleaned := cleanStaleSockets(d.namespace, d.ctlSrv.SocketPath(), logger)
 	if cleaned > 0 {
 		logger.Printf("startup: cleaned %d stale socket files", cleaned)
 	}
@@ -862,8 +862,8 @@ var cleanStaleSocketsDir = ""
 // cleanStaleSockets removes engine-scoped *.ctl.sock and *.sock files from the
 // temp directory that are not reachable (leftover from daemon crash/kill).
 // Only files whose names start with engineName+"-" are considered; sockets
-// belonging to other engines are left untouched.
-func cleanStaleSockets(engineName string, logger *log.Logger) int {
+// belonging to other engines and the exact caller-owned path are left untouched.
+func cleanStaleSockets(engineName, preservedPath string, logger *log.Logger) int {
 	prefix := engineName + "-"
 	tmpDir := cleanStaleSocketsDir
 	if tmpDir == "" {
@@ -872,6 +872,10 @@ func cleanStaleSockets(engineName string, logger *log.Logger) int {
 	entries, err := os.ReadDir(tmpDir)
 	if err != nil {
 		return 0
+	}
+	canonicalPreservedPath := ""
+	if preservedPath != "" {
+		canonicalPreservedPath = serverid.CanonicalizePath(preservedPath)
 	}
 	cleaned := 0
 	for _, entry := range entries {
@@ -888,6 +892,10 @@ func cleanStaleSockets(engineName string, logger *log.Logger) int {
 			continue
 		}
 		path := filepath.Join(tmpDir, name)
+		if canonicalPreservedPath != "" && serverid.CanonicalizePath(path) == canonicalPreservedPath {
+			// Bound-but-paused control admission is owned, not stale.
+			continue
+		}
 		// Try to connect — if unreachable, it's stale
 		if strings.HasSuffix(name, ".ctl.sock") {
 			if _, err := control.Send(path, control.Request{Cmd: "ping"}); err != nil {
