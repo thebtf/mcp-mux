@@ -989,7 +989,7 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 		timeout = 5 * time.Second
 	}
 
-	resp, err := s.stopOwner(owner, drainMs, timeout, params.Force || (owner.Sessions == 0 && owner.Pending == 0))
+	resp, err := s.stopOwner(owner, drainMs, timeout)
 	if err != nil {
 		s.sendControlToolError(id, err)
 		return
@@ -998,31 +998,23 @@ func (s *Server) toolMuxStop(id json.RawMessage, args json.RawMessage) {
 	s.sendToolResult(id, resp.Message)
 }
 
-func (s *Server) stopOwner(owner control.OwnerInfo, drainMs int, timeout time.Duration, preferDaemon bool) (*control.Response, error) {
-	if preferDaemon {
-		resp, err := control.SendWithTimeout(s.daemonCtlPath(), control.Request{
-			Cmd:            "stop_owner",
-			ServerID:       owner.ServerID,
-			Command:        owner.ServerID,
-			DrainTimeoutMs: drainMs,
-		}, timeout)
-		if err == nil {
-			err = resp.Err()
-		}
-		if err == nil {
-			return resp, nil
-		}
-		var maintenanceErr *control.MaintenanceError
-		if errors.As(err, &maintenanceErr) {
-			return resp, err
-		}
-		if resp != nil && !stopOwnerUnsupported(resp.Message) {
-			return resp, err
-		}
+func (s *Server) stopOwner(owner control.OwnerInfo, drainMs int, timeout time.Duration) (*control.Response, error) {
+	resp, err := control.SendWithTimeout(s.daemonCtlPath(), control.Request{
+		Cmd:            "stop_owner",
+		ServerID:       owner.ServerID,
+		Command:        owner.ServerID,
+		DrainTimeoutMs: drainMs,
+	}, timeout)
+	if err != nil {
+		return resp, err
+	}
+	err = resp.Err()
+	if err == nil || resp.ErrorCode != "" || resp.Maintenance != nil || !stopOwnerUnsupported(resp.Message) {
+		return resp, err
 	}
 
 	ctlPath := serverid.ControlPath(s.socketDir(), s.engineName(), owner.ServerID)
-	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+	resp, err = control.SendWithTimeout(ctlPath, control.Request{
 		Cmd:            "shutdown",
 		DrainTimeoutMs: drainMs,
 	}, timeout)
@@ -1033,9 +1025,8 @@ func (s *Server) stopOwner(owner control.OwnerInfo, drainMs int, timeout time.Du
 }
 
 func stopOwnerUnsupported(message string) bool {
-	lower := strings.ToLower(message)
-	return strings.Contains(lower, "unknown command: stop_owner") ||
-		strings.Contains(lower, "stop_owner not supported")
+	return message == "unknown command: stop_owner" ||
+		message == "stop_owner not supported (not a daemon)"
 }
 
 // toolMuxRestart delegates replacement to the daemon's retained launch authority.

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thejerf/suture/v4"
@@ -192,34 +193,74 @@ func (d *Daemon) removeOwnerIfCurrentAndZeroIdle(serverID string, expected *Owne
 	return removed, removed.Removed, err
 }
 
+// checkOperatorRemovalLocked runs with maintenanceGate before mu. Registry
+// claims, not list snapshots or owner-local fences, arbitrate operator stops.
+func (d *Daemon) checkOperatorRemovalLocked(serverID string, entry *OwnerEntry) error {
+	if d.maintenanceFailed {
+		return control.ErrMaintenancePersistenceFailed
+	}
+	for _, lease := range d.maintenanceLeases {
+		if lease.result.ServerID == serverID {
+			return maintenanceFailure(control.ErrMaintenanceHeld, lease)
+		}
+	}
+	if entry != nil {
+		for key := range entry.maintenanceContexts {
+			if err := d.checkMaintenanceKeyLocked(key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, reason ownerRemovalReason, soft bool, eligible func(*OwnerEntry) bool, scheduleRetry bool) (ownerRemovalResult, error) {
 	result := ownerRemovalResult{ServerID: serverID, Reason: reason, Soft: soft}
 	var entry *OwnerEntry
+	operatorRemoval := reason == ownerRemovalReasonOperatorSoft || reason == ownerRemovalReasonOperatorHard
+	unlockClaim := func() {
+		d.mu.Unlock()
+		if operatorRemoval {
+			d.maintenanceGate.RUnlock()
+		}
+	}
 	for {
+		if operatorRemoval {
+			d.maintenanceGate.RLock()
+		}
 		d.mu.Lock()
 		current, ok := d.owners[serverID]
+		// An existing exact-entry retry continues an already-admitted teardown.
+		// New claims must remain atomic with a hold's durable commit and pinning.
+		admittedRetry := expected != nil && current == expected && current.removalRetrying && !scheduleRetry
+		if operatorRemoval && !admittedRetry {
+			if err := d.checkOperatorRemovalLocked(serverID, current); err != nil {
+				unlockClaim()
+				return result, err
+			}
+		}
 		if !ok {
-			d.mu.Unlock()
+			unlockClaim()
 			if expected == nil {
 				return result, fmt.Errorf("server %s not found", serverID)
 			}
 			return result, nil
 		}
 		if expected != nil && current != expected {
-			d.mu.Unlock()
+			unlockClaim()
 			return result, nil
 		}
 		if current.Owner == nil {
-			d.mu.Unlock()
+			unlockClaim()
 			return result, fmt.Errorf("server %s is still being created", serverID)
 		}
 		if eligible != nil && !eligible(current) {
-			d.mu.Unlock()
+			unlockClaim()
 			return result, nil
 		}
 		if current.removalInProgress {
 			settled := current.removalDone
-			d.mu.Unlock()
+			unlockClaim()
 			if err := waitForOwnerRemovalAttempt(serverID, settled); err != nil {
 				return result, err
 			}
@@ -227,7 +268,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 		}
 		if current.snapshotPins > 0 {
 			unpinned := current.snapshotUnpinned
-			d.mu.Unlock()
+			unlockClaim()
 			if err := waitForSnapshotUnpin(serverID, unpinned); err != nil {
 				return result, err
 			}
@@ -237,7 +278,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 		current.removalDone = make(chan struct{})
 		current.terminationHint = terminationHintForRemoval(reason)
 		entry = current
-		d.mu.Unlock()
+		unlockClaim()
 		break
 	}
 

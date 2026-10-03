@@ -1715,8 +1715,8 @@ func TestMuxStopWithFakeServer(t *testing.T) {
 	if result.IsError {
 		t.Fatalf("mux_stop should succeed, got error: %v", result.Content)
 	}
-	if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "draining") {
-		t.Errorf("expected draining message, got: %v", result.Content)
+	if len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "stopped via daemon") {
+		t.Errorf("expected daemon stop message, got: %v", result.Content)
 	}
 }
 
