@@ -2771,6 +2771,9 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	if o.maintenance.Load() != nil && proc != nil {
 		proven = proven && proc.TreesDead()
 	}
+	if maintenance && o.sessionHandler != nil {
+		proven = proven && o.PendingRequests() == 0
+	}
 	if !proven {
 		if proofErr == nil {
 			proofErr = errFinalizationUnproven
