@@ -237,6 +237,7 @@ type Owner struct {
 	inflightTracker         sync.Map          // remapped request ID (string) -> *InflightRequest
 	timedOutIDs             sync.Map          // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests         atomic.Int64
+	nativeWork              atomic.Int64  // owner-dispatched non-request callbacks; never part of PendingRequests
 	drainTimeout            time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs           atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
 	idleTimeoutNs           atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
@@ -869,9 +870,22 @@ func extractToolName(raw []byte) string {
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
+	native := o.sessionHandler != nil
+	if native {
+		o.lockRequestAdmission()
+	}
 	o.admissionMu.Lock()
+	if native && o.nativeAdmissionClosed() {
+		o.admissionMu.Unlock()
+		o.unlockRequestAdmission()
+		s.Close()
+		return
+	}
 	o.addSessionLocked(s)
 	o.admissionMu.Unlock()
+	if native {
+		o.unlockRequestAdmission()
+	}
 	o.startRegisteredSession(s)
 }
 
@@ -881,6 +895,11 @@ func (o *Owner) AddSession(s *Session) {
 func (o *Owner) addSessionLocked(s *Session) {
 	o.mu.Lock()
 	o.sessions[s.ID] = s
+	if o.sessionHandler != nil {
+		if _, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
+			o.nativeWork.Add(1)
+		}
+	}
 	o.mu.Unlock()
 	o.sessionMgr.RegisterSession(s, s.Cwd)
 }
@@ -896,7 +915,10 @@ func (o *Owner) startRegisteredSession(s *Session) {
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
-			go lc.OnProjectConnect(project)
+			go func() {
+				defer o.nativeWork.Add(-1)
+				lc.OnProjectConnect(project)
+			}()
 		}
 	}
 
@@ -995,8 +1017,11 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		// Cached at owner construction (cacheHandlerInterfaces) so the
 		// per-frame hot path skips a type assertion (CodeRabbit nitpick).
 		if o.sessionHandler != nil {
-			if held := o.lockRequestAdmission(); held != nil {
-				o.unlockRequestAdmission()
+			nh, ordinary := o.sessionHandler.(muxcore.NotificationHandler)
+			if o.notificationHandlerWithMeta == nil && !ordinary {
+				return nil
+			}
+			if !o.reserveNativeWork() {
 				return nil
 			}
 			project := muxcore.ProjectContext{
@@ -1004,13 +1029,29 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
+			var meta muxcore.SessionMeta
 			if o.notificationHandlerWithMeta != nil {
-				meta := s.Meta()
-				go o.notificationHandlerWithMeta.HandleNotificationWithSessionMeta(context.Background(), project, meta, msg.Raw)
-			} else if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
-				go nh.HandleNotification(context.Background(), project, msg.Raw)
+				meta = s.Meta()
 			}
-			o.unlockRequestAdmission()
+			go func() {
+				defer o.nativeWork.Add(-1)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go func() {
+					select {
+					case <-s.Done():
+						cancel()
+					case <-o.done:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+				if o.notificationHandlerWithMeta != nil {
+					o.notificationHandlerWithMeta.HandleNotificationWithSessionMeta(ctx, project, meta, msg.Raw)
+				} else {
+					nh.HandleNotification(ctx, project, msg.Raw)
+				}
+			}()
 			return nil // notifications don't need forwarding to upstream
 		}
 		// Forward other notifications as-is to upstream.
@@ -2051,6 +2092,14 @@ func (n *ownerNotifier) Broadcast(notification []byte) {
 func (o *Owner) removeSession(s *Session) {
 	o.launchContextMu.Lock()
 	o.mu.Lock()
+	var lifecycle muxcore.ProjectLifecycle
+	if o.sessionHandler != nil {
+		lifecycle, _ = o.sessionHandler.(muxcore.ProjectLifecycle)
+		if lifecycle != nil {
+			// Transfer the retained reader's producer authority before unlinking.
+			o.nativeWork.Add(1)
+		}
+	}
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
 	var removedTokens []string
@@ -2082,10 +2131,11 @@ func (o *Owner) removeSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
 
-	if o.sessionHandler != nil {
-		if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
-			go lc.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
-		}
+	if lifecycle != nil {
+		go func() {
+			defer o.nativeWork.Add(-1)
+			lifecycle.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
+		}()
 	}
 
 	if remaining > 0 {
@@ -2195,13 +2245,23 @@ func (o *Owner) acceptLoop() {
 				continue
 			default:
 			}
+			if o.sessionHandler != nil && !o.reserveNativeWork() {
+				o.revokePendingAdmission(token)
+				s.Close()
+				continue
+			}
 
 			project := muxcore.ProjectContext{
 				ID:  muxcore.ProjectContextID(s.Cwd),
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
-			verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+			verdict := func() muxcore.SessionAuth {
+				if o.sessionHandler != nil {
+					defer o.nativeWork.Add(-1)
+				}
+				return invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+			}()
 
 			// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
 			// MAJOR review on PR #113). The pre-callback check at the top
@@ -2256,10 +2316,23 @@ func (o *Owner) acceptLoop() {
 			o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
 		}
 
+		if o.sessionHandler != nil {
+			o.lockRequestAdmission()
+		}
 		o.admissionMu.Lock()
+		if o.sessionHandler != nil && o.nativeAdmissionClosed() {
+			o.admissionMu.Unlock()
+			o.unlockRequestAdmission()
+			o.revokePendingAdmission(token)
+			s.Close()
+			continue
+		}
 		select {
 		case <-o.done:
 			o.admissionMu.Unlock()
+			if o.sessionHandler != nil {
+				o.unlockRequestAdmission()
+			}
 			o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
 			o.revokePendingAdmission(token)
 			s.Close()
@@ -2268,6 +2341,9 @@ func (o *Owner) acceptLoop() {
 		}
 		if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
 			o.admissionMu.Unlock()
+			if o.sessionHandler != nil {
+				o.unlockRequestAdmission()
+			}
 			peerPID := readPeerPID(conn)
 			o.rejectionLogger.Log(o.logger, peerPID)
 			s.Close()
@@ -2275,14 +2351,17 @@ func (o *Owner) acceptLoop() {
 		}
 		o.addSessionLocked(s)
 		o.admissionMu.Unlock()
+		if o.sessionHandler != nil {
+			o.unlockRequestAdmission()
+		}
 		o.startRegisteredSession(s)
 	}
 }
 
 // invokeAuthorize calls cb under a defer/recover guard with an owner-bound
-// context. Cancellation propagates from o.done, so a long-running callback
-// (external RPC, slow tenant lookup) can observe shutdown via ctx.Done()
-// and abort early instead of running to completion against a teardown.
+// context. Native authorization also watches listenerDone because finalization
+// withholds Done until the callback returns. Other owners retain Done-only
+// cancellation; a callback can observe teardown via ctx.Done().
 // Panic is logged with the panic value and converted to
 // AuthDeny{Reason: "authorize panic"}; the daemon continues accepting
 // subsequent connections.
@@ -2302,9 +2381,15 @@ func invokeAuthorize(
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var listenerDone <-chan struct{}
+	if o.sessionHandler != nil {
+		listenerDone = o.listenerDone
+	}
 	go func() {
 		select {
 		case <-o.done:
+			cancel()
+		case <-listenerDone:
 			cancel()
 		case <-ctx.Done():
 		}
@@ -2361,12 +2446,18 @@ func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameA
 	if o.onFrameReceived == nil {
 		return muxcore.FramePass
 	}
+	if o.sessionHandler != nil && !o.reserveNativeWork() {
+		return muxcore.FramePass
+	}
 	sid := strconv.Itoa(s.ID)
 	method := msg.Method
 	frameSize := len(msg.Raw)
 
 	done := make(chan muxcore.FrameAction, 1) // buffered so a late return never blocks the goroutine
 	go func() {
+		if o.sessionHandler != nil {
+			defer o.nativeWork.Add(-1)
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				o.logger.Printf("frame_hook_panic sid=%s method=%s recovered=%v", sid, method, r)
@@ -2675,7 +2766,14 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	defer o.removalMu.Unlock()
 	select {
 	case <-o.done:
-		if o.maintenance.Load() != nil && !o.maintenanceRetired.Load() {
+		if o.sessionHandler != nil && !o.nativeQuiescent() {
+			o.materializationMu.Lock()
+			o.materializationState = MaterializationFinalizeBlocked
+			o.materializationBlockedErr = errFinalizationUnproven
+			o.materializationMu.Unlock()
+			return 0, false, errFinalizationUnproven
+		}
+		if o.maintenance.Load() != nil && !o.MaintenanceRetired() {
 			return 0, false, control.ErrMaintenanceRetirementBlocked
 		}
 		return 0, true, nil
@@ -2771,8 +2869,8 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	if o.maintenance.Load() != nil && proc != nil {
 		proven = proven && proc.TreesDead()
 	}
-	if maintenance && o.sessionHandler != nil {
-		proven = proven && o.PendingRequests() == 0
+	if o.sessionHandler != nil {
+		proven = proven && o.nativeQuiescent()
 	}
 	if !proven {
 		if proofErr == nil {

@@ -85,7 +85,9 @@ func (o *Owner) teardownExceptUpstream() {
 		for _, s := range o.sessions {
 			s.Close()
 		}
-		o.sessions = make(map[int]*Session)
+		if o.sessionHandler == nil {
+			o.sessions = make(map[int]*Session)
+		}
 		o.mu.Unlock()
 
 		if o.rejectionLogger != nil {

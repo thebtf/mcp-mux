@@ -25,7 +25,45 @@ func (o *Owner) SetMaintenance(result *control.MaintenanceResult) {
 }
 
 // MaintenanceRetired is stronger than handoff-capable owner completion.
-func (o *Owner) MaintenanceRetired() bool { return o.maintenanceRetired.Load() }
+func (o *Owner) MaintenanceRetired() bool {
+	return o.maintenanceRetired.Load() && (o.sessionHandler == nil || o.nativeQuiescent())
+}
+
+// nativeAdmissionClosed is checked while admission is serialized with listener
+// teardown. A maintenance read lease precedes admissionMu and mu, never user code.
+func (o *Owner) nativeAdmissionClosed() bool {
+	if o.maintenance.Load() != nil {
+		return true
+	}
+	select {
+	case <-o.listenerDone:
+		return true
+	case <-o.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (o *Owner) reserveNativeWork() bool {
+	o.lockRequestAdmission()
+	defer o.unlockRequestAdmission()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.nativeAdmissionClosed() {
+		return false
+	}
+	o.nativeWork.Add(1)
+	return true
+}
+
+// Readers remain in sessions through teardown. Disconnect reserves under mu
+// before unlinking, so this snapshot cannot miss a not-yet-dispatched producer.
+func (o *Owner) nativeQuiescent() bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.nativeAdmissionClosed() && len(o.sessions) == 0 && o.nativeWork.Load() == 0 && o.PendingRequests() == 0
+}
 
 // CurrentLaunchContext returns the exact last elected process context.
 func (o *Owner) CurrentLaunchContext() LaunchContext {
@@ -92,9 +130,10 @@ func (o *Owner) DrainForMaintenance(deadline time.Time) {
 	o.drainInflightRequests()
 }
 
-// DrainRequestsUntil waits for admitted requests without resetting a deadline.
+// DrainRequestsUntil keeps the original deadline. Only maintenance also drains
+// native non-request callbacks; ordinary restart remains request-only.
 func (o *Owner) DrainRequestsUntil(deadline time.Time) {
-	for o.PendingRequests() > 0 && time.Now().Before(deadline) {
+	for (o.PendingRequests() > 0 || (o.maintenance.Load() != nil && o.sessionHandler != nil && o.nativeWork.Load() > 0)) && time.Now().Before(deadline) {
 		remaining := time.Until(deadline)
 		if remaining > 10*time.Millisecond {
 			remaining = 10 * time.Millisecond

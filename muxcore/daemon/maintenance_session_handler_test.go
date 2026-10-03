@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 )
 
@@ -375,5 +377,541 @@ func TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn(t *test
 				}
 			})
 		}
+	}
+}
+
+type maintenanceNativeBarrier struct {
+	started   chan struct{}
+	cancelled chan struct{}
+	release   chan struct{}
+	entered   atomic.Int32
+	returned  atomic.Int32
+	once      sync.Once
+}
+
+func newMaintenanceNativeBarrier(t *testing.T) *maintenanceNativeBarrier {
+	t.Helper()
+	b := &maintenanceNativeBarrier{started: make(chan struct{}), cancelled: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(b.open)
+	return b
+}
+
+func (b *maintenanceNativeBarrier) open() { b.once.Do(func() { close(b.release) }) }
+
+func (b *maintenanceNativeBarrier) wait(ctx context.Context) {
+	b.entered.Add(1)
+	close(b.started)
+	if ctx == nil {
+		<-b.release
+	} else {
+		select {
+		case <-ctx.Done():
+			close(b.cancelled)
+			<-b.release // deliberately ignore cancellation until actual cleanup
+		case <-b.release:
+		}
+	}
+	b.returned.Add(1)
+}
+
+type maintenanceNotificationWork struct {
+	maintenanceCallbackBarrier
+	barrier    *maintenanceNativeBarrier
+	ordinary   atomic.Int32
+	metadata   atomic.Int32
+	badMeta    atomic.Bool
+	badContext atomic.Bool
+}
+
+func (h *maintenanceNotificationWork) HandleNotification(ctx context.Context, _ muxcore.ProjectContext, _ []byte) {
+	h.ordinary.Add(1)
+	if _, deadline := ctx.Deadline(); deadline {
+		h.badContext.Store(true)
+	}
+	h.barrier.wait(ctx)
+}
+
+type maintenanceMetadataNotificationWork struct{ *maintenanceNotificationWork }
+
+func (h *maintenanceMetadataNotificationWork) HandleNotificationWithSessionMeta(ctx context.Context, project muxcore.ProjectContext, meta muxcore.SessionMeta, _ []byte) {
+	h.metadata.Add(1)
+	if _, deadline := ctx.Deadline(); deadline {
+		h.badContext.Store(true)
+	}
+	if project.Cwd == "" || project.ID != muxcore.ProjectContextID(project.Cwd) || meta.Conn.Platform == "" {
+		h.badMeta.Store(true)
+	}
+	h.barrier.wait(ctx)
+}
+
+type maintenanceLifecycleWork struct {
+	maintenanceCallbackBarrier
+	barrier      *maintenanceNativeBarrier
+	blockConnect bool
+	connects     atomic.Int32
+	disconnects  atomic.Int32
+}
+
+func (h *maintenanceLifecycleWork) OnProjectConnect(muxcore.ProjectContext) {
+	h.connects.Add(1)
+	if h.blockConnect {
+		h.barrier.wait(nil)
+	}
+}
+
+func (h *maintenanceLifecycleWork) OnProjectDisconnect(string) {
+	h.disconnects.Add(1)
+	if !h.blockConnect {
+		h.barrier.wait(nil)
+	}
+}
+
+func maintenanceNativeIPC(t *testing.T, d *Daemon, protocol era.ProtocolEra) (*control.Response, *OwnerEntry, net.Conn, <-chan []byte) {
+	t.Helper()
+	wire, _ := protocol.Wire()
+	response, err := control.SendWithTimeout(d.ctlSrv.SocketPath(), control.Request{Cmd: "spawn", Command: "native-nonrequest-maintenance", Mode: "isolated", Cwd: t.TempDir(), ProtocolEra: wire}, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Err(); err != nil {
+		t.Fatal(err)
+	}
+	entry := d.Entry(response.ServerID)
+	if entry == nil || entry.Owner == nil || entry.ProtocolEra != protocol || response.ProtocolEra != wire {
+		t.Fatal("native fixture did not retain exact era and entry")
+	}
+	conn, err := ipc.Dial(response.IPCPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	frames := make(chan []byte, 16)
+	go func() {
+		defer close(frames)
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			frames <- append([]byte(nil), scanner.Bytes()...)
+		}
+	}()
+	if _, err := fmt.Fprintf(conn, "%s\n", response.Token); err != nil {
+		t.Fatal(err)
+	}
+	return response, entry, conn, frames
+}
+
+func maintenanceNativeSend(t *testing.T, conn net.Conn, protocol era.ProtocolEra, id, method string) {
+	t.Helper()
+	params := map[string]any{}
+	if protocol == era.EraModern20260728 {
+		wire, _ := protocol.Wire()
+		params["_meta"] = map[string]any{"io.modelcontextprotocol/protocolVersion": wire, "io.modelcontextprotocol/clientCapabilities": map[string]any{}}
+	} else if method == "initialize" {
+		params = map[string]any{"protocolVersion": "2025-11-25", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "native-notification", "version": "1"}}
+	}
+	frame := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
+	if id != "" {
+		frame["id"] = json.RawMessage(id)
+	}
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(conn, "%s\n", raw); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func maintenanceNativeRead(t *testing.T, frames <-chan []byte, id string) []byte {
+	t.Helper()
+	select {
+	case raw, ok := <-frames:
+		var response struct {
+			ID     json.RawMessage `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  json.RawMessage `json:"error"`
+		}
+		if !ok || json.Unmarshal(raw, &response) != nil || string(response.ID) != id || response.Result == nil || response.Error != nil {
+			t.Fatalf("original-ID native result changed: wanted=%s raw=%s", id, raw)
+		}
+		return raw
+	case <-time.After(5 * time.Second):
+		t.Fatalf("missing original-ID response %s", id)
+		return nil
+	}
+}
+
+func maintenanceNativeNoReply(t *testing.T, frames <-chan []byte) {
+	t.Helper()
+	select {
+	case raw, ok := <-frames:
+		if ok {
+			t.Fatalf("native notification acquired a reply or consumed work replayed: %s", raw)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("retired native IPC reader did not close")
+	}
+}
+
+func maintenanceNativeEntered(t *testing.T, b *maintenanceNativeBarrier) {
+	t.Helper()
+	select {
+	case <-b.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("actual native callback did not enter")
+	}
+}
+
+func maintenanceNativeRetained(t *testing.T, d *Daemon, entry *OwnerEntry) {
+	t.Helper()
+	d.mu.RLock()
+	retrying := entry.removalRetrying
+	d.mu.RUnlock()
+	if d.Entry(entry.ServerID) != entry || !retrying || entry.Owner.MaintenanceRetired() || entry.Owner.PendingRequests() != 0 || entry.Owner.MaterializationState() != owner.MaterializationFinalizeBlocked {
+		t.Fatal("unsettled non-request work lost exact-entry retry or polluted public request metrics")
+	}
+	select {
+	case <-entry.Owner.Done():
+		t.Fatal("native Done closed while user code was running")
+	default:
+	}
+}
+
+func maintenanceNativeSettled(t *testing.T, d *Daemon, entry *OwnerEntry, result *control.MaintenanceResult, b *maintenanceNativeBarrier) {
+	t.Helper()
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		return d.Entry(entry.ServerID) == nil && entry.Owner.MaintenanceRetired() && entry.Owner.PendingRequests() == 0
+	}, "actual native return did not settle through the existing exact-entry retry")
+	waitMaintenanceState(t, d, control.MaintenanceHeld)
+	current := d.maintenanceResults()[0]
+	if !current.TreesRetired || current.HoldID != result.HoldID || !current.DrainDeadline.Equal(result.DrainDeadline) || !current.ExpiresAt.Equal(result.ExpiresAt) || b.entered.Load() != 1 || b.returned.Load() != 1 {
+		t.Fatalf("settlement replayed work or reclocked the original lease: %+v", current)
+	}
+	select {
+	case <-entry.Owner.Done():
+	default:
+		t.Fatal("settled owner Done remained open")
+	}
+}
+
+func TestMaintenanceNativeNonRequestWorkRetainsAuthority(t *testing.T) {
+	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+		for _, kind := range []string{"notification", "metadata_notification", "connect", "disconnect", "authorize", "frame_hook"} {
+			if protocol == era.EraModern20260728 && (kind == "notification" || kind == "metadata_notification") {
+				continue
+			}
+			for _, completes := range []bool{false, true} {
+				if completes && kind != "notification" && kind != "metadata_notification" {
+					continue
+				}
+				t.Run(fmt.Sprintf("era_%d/%s/completes_%t", protocol, kind, completes), func(t *testing.T) {
+					d := maintenanceDaemon(t)
+					b := newMaintenanceNativeBarrier(t)
+					var notification *maintenanceNotificationWork
+					var lifecycle *maintenanceLifecycleWork
+					d.sessionHandler = &maintenanceCallbackBarrier{}
+					switch kind {
+					case "notification", "metadata_notification":
+						notification = &maintenanceNotificationWork{barrier: b}
+						d.sessionHandler = notification
+						if kind == "metadata_notification" {
+							d.sessionHandler = &maintenanceMetadataNotificationWork{notification}
+						}
+					case "connect", "disconnect":
+						lifecycle = &maintenanceLifecycleWork{barrier: b, blockConnect: kind == "connect"}
+						d.sessionHandler = lifecycle
+					case "authorize":
+						d.authorizeSession = func(ctx context.Context, _ muxcore.ConnInfo, _ muxcore.ProjectContext) muxcore.SessionAuth {
+							b.wait(ctx)
+							return muxcore.SessionAuth{Decision: muxcore.AuthAllow, TenantID: "native-tenant"}
+						}
+					case "frame_hook":
+						d.onFrameReceived = func(_ string, _ int, method string) muxcore.FrameAction {
+							if method == "maintenance/native-write" {
+								b.wait(nil)
+								return muxcore.FrameError // late verdict must remain discarded
+							}
+							return muxcore.FramePass
+						}
+					}
+					initial, entry, conn, frames := maintenanceNativeIPC(t, d, protocol)
+					identity := captureOwnerEntryIdentity(entry)
+					if kind != "authorize" {
+						opening := "initialize"
+						if protocol == era.EraModern20260728 {
+							opening = "server/discover"
+						}
+						maintenanceNativeSend(t, conn, protocol, "1", opening)
+						maintenanceNativeRead(t, frames, "1")
+					}
+					switch kind {
+					case "notification", "metadata_notification":
+						maintenanceNativeSend(t, conn, protocol, "", "notifications/cancelled")
+						maintenanceNativeSend(t, conn, protocol, "", "maintenance/native-notification")
+					case "disconnect":
+						_ = conn.Close()
+					case "frame_hook":
+						maintenanceNativeSend(t, conn, protocol, `"hook-string"`, "maintenance/native-write")
+						maintenanceNativeRead(t, frames, `"hook-string"`)
+					}
+					maintenanceNativeEntered(t, b)
+					waitForDaemonCondition(t, time.Second, func() bool { return entry.Owner.PendingRequests() == 0 }, "non-request callback polluted PendingRequests")
+					type holdResponse struct {
+						result *control.MaintenanceResult
+						err    error
+					}
+					response := make(chan holdResponse, 1)
+					drainMS := 0
+					if completes {
+						drainMS = 3000
+					}
+					go func() {
+						result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: initial.ServerID, DrainTimeoutMs: drainMS, HoldTTLMS: maintenanceTTL(60000)}, 10*time.Second)
+						response <- holdResponse{result, err}
+					}()
+					if completes {
+						waitMaintenanceState(t, d, control.MaintenanceHolding)
+						select {
+						case early := <-response:
+							t.Fatalf("positive-grace hold finished before actual native return: %+v %v", early.result, early.err)
+						default:
+						}
+						// The fence cannot dispatch a second notification or invent a reply.
+						maintenanceNativeSend(t, conn, protocol, "", "maintenance/fenced-notification")
+						b.open()
+					}
+					var held holdResponse
+					select {
+					case held = <-response:
+					case <-time.After(10 * time.Second):
+						t.Fatal("native hold did not return its bounded verdict")
+					}
+					if completes {
+						if held.err != nil || held.result == nil || held.result.State != control.MaintenanceHeld || !held.result.TreesRetired {
+							t.Fatalf("positive-grace native completion failed: %+v %v", held.result, held.err)
+						}
+					} else {
+						if !errors.Is(held.err, control.ErrMaintenanceRetirementBlocked) || held.result == nil || held.result.State != control.MaintenanceRetirementBlocked || held.result.TreesRetired {
+							t.Fatalf("active non-request work falsely retired: %+v %v", held.result, held.err)
+						}
+						maintenanceNativeRetained(t, d, entry)
+						if !identity.matches(entry) || b.returned.Load() != 0 {
+							t.Fatal("active native generation identity changed")
+						}
+						if kind == "notification" || kind == "metadata_notification" || kind == "authorize" {
+							select {
+							case <-b.cancelled:
+							case <-time.After(5 * time.Second):
+								t.Fatal("native context did not observe teardown while Done was withheld")
+							}
+						}
+						// No resume/renew/second hold: only actual callback return may settle it.
+						b.open()
+					}
+					maintenanceNativeSettled(t, d, entry, held.result, b)
+					maintenanceNativeNoReply(t, frames)
+					if notification != nil {
+						ordinary, metadata := int32(1), int32(0)
+						if kind == "metadata_notification" {
+							ordinary, metadata = 0, 1
+						}
+						if notification.ordinary.Load() != ordinary || notification.metadata.Load() != metadata || notification.badMeta.Load() || notification.badContext.Load() {
+							t.Fatal("notification interface precedence or session metadata changed")
+						}
+					}
+					if lifecycle != nil && (lifecycle.connects.Load() != 1 || lifecycle.disconnects.Load() != 1) {
+						t.Fatal("native lifecycle dispatch was dropped or replayed")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMaintenanceModernNativeNotificationRemainsNonDispatch(t *testing.T) {
+	for _, metadata := range []bool{false, true} {
+		t.Run(fmt.Sprintf("metadata_%t", metadata), func(t *testing.T) {
+			d := maintenanceDaemon(t)
+			b := newMaintenanceNativeBarrier(t)
+			h := &maintenanceNotificationWork{barrier: b}
+			d.sessionHandler = h
+			if metadata {
+				d.sessionHandler = &maintenanceMetadataNotificationWork{h}
+			}
+			initial, entry, conn, frames := maintenanceNativeIPC(t, d, era.EraModern20260728)
+			maintenanceNativeSend(t, conn, era.EraModern20260728, "", "maintenance/native-notification")
+			maintenanceNativeSend(t, conn, era.EraModern20260728, "", "notifications/cancelled")
+			maintenanceNativeSend(t, conn, era.EraModern20260728, "7", "server/discover")
+			maintenanceNativeRead(t, frames, "7") // same reader has passed both notifications
+			result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: initial.ServerID, HoldTTLMS: maintenanceTTL(60000)}, 5*time.Second)
+			if err != nil || result == nil || result.State != control.MaintenanceHeld || !entry.Owner.MaintenanceRetired() || h.ordinary.Load() != 0 || h.metadata.Load() != 0 || b.entered.Load() != 0 {
+				t.Fatalf("modern native notification gained dispatch: %+v %v", result, err)
+			}
+			maintenanceNativeNoReply(t, frames)
+		})
+	}
+}
+
+func TestMaintenancePinsOrdinaryNativeRetirementBeforeRegistryDeletion(t *testing.T) {
+	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+		t.Run(fmt.Sprintf("era_%d", protocol), func(t *testing.T) {
+			d := maintenanceDaemon(t)
+			b := newMaintenanceNativeBarrier(t)
+			if protocol == era.EraLegacy {
+				d.sessionHandler = &maintenanceNotificationWork{barrier: b}
+			} else {
+				d.sessionHandler = &maintenanceLifecycleWork{barrier: b, blockConnect: true}
+			}
+			initial, entry, conn, frames := maintenanceNativeIPC(t, d, protocol)
+			if protocol == era.EraLegacy {
+				maintenanceNativeSend(t, conn, protocol, "1", "initialize")
+				maintenanceNativeRead(t, frames, "1")
+				maintenanceNativeSend(t, conn, protocol, "", "maintenance/native-notification")
+			}
+			maintenanceNativeEntered(t, b)
+			original := finalizeOwnerForRemoval
+			paused, proceed := make(chan struct{}), make(chan struct{})
+			var pausedOnce atomic.Bool
+			var proceedOnce sync.Once
+			unpause := func() { proceedOnce.Do(func() { close(proceed) }) }
+			finalizeOwnerForRemoval = func(o *owner.Owner, soft bool) (int, bool, error) {
+				code, finalized, err := original(o, soft) // REAL finalization, never an invented result
+				if o == entry.Owner && pausedOnce.CompareAndSwap(false, true) {
+					close(paused)
+					<-proceed // transaction has not reacquired d.mu for deletion
+				}
+				return code, finalized, err
+			}
+			t.Cleanup(func() {
+				unpause()
+				b.open()
+				waitForDaemonCondition(t, 5*time.Second, func() bool { return d.Entry(initial.ServerID) == nil }, "ordinary remover did not settle during cleanup")
+				finalizeOwnerForRemoval = original
+			})
+			removed := make(chan error, 1)
+			go func() { removed <- d.Remove(initial.ServerID) }()
+			select {
+			case <-paused:
+			case <-time.After(5 * time.Second):
+				t.Fatal("ordinary remover did not reach post-real-finalizer seam")
+			}
+			type holdResponse struct {
+				result *control.MaintenanceResult
+				err    error
+			}
+			held := make(chan holdResponse, 1)
+			go func() {
+				result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: initial.ServerID, HoldTTLMS: maintenanceTTL(60000)}, 10*time.Second)
+				held <- holdResponse{result, err}
+			}()
+			waitMaintenanceState(t, d, control.MaintenanceHolding)
+			d.maintenanceGate.RLock()
+			pinned := false
+			for _, lease := range d.maintenanceLeases {
+				for _, pin := range lease.pins {
+					pinned = pinned || pin.entry == entry
+				}
+			}
+			d.maintenanceGate.RUnlock()
+			if !pinned {
+				t.Fatal("hold did not pin the exact ordinary-removal entry")
+			}
+			unpause()
+			select {
+			case err := <-removed:
+				if err == nil {
+					t.Error("ordinary removal reported completion while native user code remained")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("ordinary removal did not return a bounded blocked verdict")
+			}
+			var result holdResponse
+			select {
+			case result = <-held:
+			case <-time.After(10 * time.Second):
+				t.Fatal("pinned hold did not settle its removal attempt")
+			}
+			if !errors.Is(result.err, control.ErrMaintenanceRetirementBlocked) || result.result == nil || result.result.State != control.MaintenanceRetirementBlocked || result.result.TreesRetired {
+				t.Fatalf("ordinary-removal gap falsely granted HELD: %+v %v", result.result, result.err)
+			}
+			maintenanceNativeRetained(t, d, entry)
+			b.open()
+			maintenanceNativeSettled(t, d, entry, result.result, b)
+			maintenanceNativeNoReply(t, frames)
+		})
+	}
+}
+
+type maintenanceNotifierConstructor struct {
+	maintenanceCallbackBarrier
+	barrier  *maintenanceNativeBarrier
+	notifier muxcore.Notifier
+}
+
+func (h *maintenanceNotifierConstructor) SetNotifier(n muxcore.Notifier) {
+	h.notifier = n
+	h.barrier.wait(nil)
+}
+
+func TestMaintenanceNativeSetNotifierUsesExistingCreatingBarrier(t *testing.T) {
+	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+		t.Run(fmt.Sprintf("era_%d", protocol), func(t *testing.T) {
+			d := maintenanceDaemon(t)
+			b := newMaintenanceNativeBarrier(t)
+			h := &maintenanceNotifierConstructor{barrier: b}
+			d.sessionHandler = h
+			wire, _ := protocol.Wire()
+			spawned := make(chan error, 1)
+			cwd := t.TempDir()
+			go func() {
+				_, _, _, err := d.Spawn(control.Request{Command: "native-constructor", Mode: "isolated", Cwd: cwd, ProtocolEra: wire})
+				spawned <- err
+			}()
+			maintenanceNativeEntered(t, b)
+			d.mu.RLock()
+			var sid string
+			for id := range d.owners {
+				sid = id
+			}
+			d.mu.RUnlock()
+			type holdResponse struct {
+				result *control.MaintenanceResult
+				err    error
+			}
+			held := make(chan holdResponse, 1)
+			go func() {
+				result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: sid, DrainTimeoutMs: 3000, HoldTTLMS: maintenanceTTL(60000)}, 5*time.Second)
+				held <- holdResponse{result, err}
+			}()
+			waitMaintenanceState(t, d, control.MaintenanceHolding)
+			select {
+			case response := <-held:
+				t.Fatalf("constructor escaped existing creating barrier: %+v %v", response.result, response.err)
+			default:
+			}
+			b.open()
+			select {
+			case err := <-spawned:
+				if !errors.Is(err, control.ErrMaintenanceHeld) {
+					t.Fatalf("late native construction was published: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("native constructor did not return")
+			}
+			var response holdResponse
+			select {
+			case response = <-held:
+			case <-time.After(5 * time.Second):
+				t.Fatal("hold did not observe native constructor settlement")
+			}
+			result := response.result
+			if response.err != nil || result == nil || result.State != control.MaintenanceHeld || !result.TreesRetired {
+				t.Fatalf("settled native constructor hold = %+v %v", result, response.err)
+			}
+			waitMaintenanceState(t, d, control.MaintenanceHeld)
+			current := d.maintenanceResults()[0]
+			if !current.TreesRetired || !current.DrainDeadline.Equal(result.DrainDeadline) || !current.ExpiresAt.Equal(result.ExpiresAt) || h.notifier == nil || b.entered.Load() != 1 || b.returned.Load() != 1 {
+				t.Fatal("existing constructor settlement replayed construction or reclocked lease")
+			}
+		})
 	}
 }

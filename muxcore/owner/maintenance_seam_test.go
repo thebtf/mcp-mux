@@ -2,6 +2,7 @@ package owner
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
@@ -236,6 +239,245 @@ func TestMaintenanceEOFDequeuedFrameHasOneDisposition(t *testing.T) {
 					t.Fatal("old EOF demand survived for replay")
 				}
 			})
+		}
+	}
+}
+
+type maintenanceLifecycleBarrier struct {
+	blockConnect bool
+	entered      chan struct{}
+	release      chan struct{}
+	connects     atomic.Int32
+	disconnects  atomic.Int32
+	returned     atomic.Int32
+}
+
+func (h *maintenanceLifecycleBarrier) HandleRequest(context.Context, muxcore.ProjectContext, []byte) ([]byte, error) {
+	return nil, errors.New("unexpected request in lifecycle fixture")
+}
+
+func (h *maintenanceLifecycleBarrier) OnProjectConnect(muxcore.ProjectContext) {
+	h.connects.Add(1)
+	if h.blockConnect {
+		close(h.entered)
+		<-h.release
+		h.returned.Add(1)
+	}
+}
+
+func (h *maintenanceLifecycleBarrier) OnProjectDisconnect(string) {
+	h.disconnects.Add(1)
+	if !h.blockConnect {
+		close(h.entered)
+		<-h.release
+		h.returned.Add(1)
+	}
+}
+
+type maintenanceReaderExit struct {
+	io.ReadCloser
+	exited chan struct{}
+	once   sync.Once
+}
+
+func (r *maintenanceReaderExit) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil {
+		r.once.Do(func() { close(r.exited) })
+	}
+	return n, err
+}
+
+func maintenanceNativeBlocked(t *testing.T, o *Owner) {
+	t.Helper()
+	_, finalized, err := o.FinalizeForRemoval(false, time.Second)
+	if finalized || err == nil || o.MaintenanceRetired() || o.PendingRequests() != 0 || o.MaterializationState() != MaterializationFinalizeBlocked {
+		t.Fatalf("native work falsely finalized: completed=%t err=%v pending=%d state=%s", finalized, err, o.PendingRequests(), o.MaterializationState())
+	}
+	select {
+	case <-o.Done():
+		t.Fatal("Done closed before the actual native producer settled")
+	default:
+	}
+}
+
+func TestMaintenanceNativeDisconnectProducerTransfer(t *testing.T) {
+	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+		for _, held := range []bool{false, true} {
+			t.Run(fmt.Sprintf("era_%d_held_%t", protocol, held), func(t *testing.T) {
+				var gate sync.RWMutex
+				h := &maintenanceLifecycleBarrier{entered: make(chan struct{}), release: make(chan struct{})}
+				o, err := NewOwner(OwnerConfig{SessionHandler: h, IPCPath: testIPCPath(t), ProtocolEra: protocol, MaintenanceGate: &gate, Logger: testLogger(t)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var releaseOnce sync.Once
+				t.Cleanup(func() { releaseOnce.Do(func() { close(h.release) }); o.Shutdown() })
+				reader, writer := io.Pipe()
+				exit := &maintenanceReaderExit{ReadCloser: reader, exited: make(chan struct{})}
+				s := NewSession(exit, &safeBuf{})
+				s.Cwd = t.TempDir()
+				o.AddSession(s)
+				waitForCondition(t, time.Second, func() bool { return h.connects.Load() == 1 }, "connect did not run")
+				// The real reader has reached removal but cannot reserve disconnect.
+				o.launchContextMu.Lock()
+				var unlockOnce sync.Once
+				unlock := func() { unlockOnce.Do(o.launchContextMu.Unlock) }
+				defer unlock()
+				_ = writer.Close()
+				select {
+				case <-exit.exited:
+				case <-time.After(time.Second):
+					t.Fatal("real reader did not exit into removal")
+				}
+				if held {
+					gate.Lock()
+					o.SetMaintenance(&control.MaintenanceResult{State: control.MaintenanceHolding, DrainDeadline: time.Now()})
+					gate.Unlock()
+				}
+				maintenanceNativeBlocked(t, o)
+				if o.SessionCount() != 1 || h.disconnects.Load() != 0 {
+					t.Fatal("teardown erased a retained producer before atomic disconnect reservation")
+				}
+				unlock()
+				select {
+				case <-h.entered:
+				case <-time.After(time.Second):
+					t.Fatal("disconnect was dropped after the fence")
+				}
+				if o.SessionCount() != 0 {
+					t.Fatal("disconnect callback started before unlink")
+				}
+				maintenanceNativeBlocked(t, o)
+				releaseOnce.Do(func() { close(h.release) })
+				waitForCondition(t, time.Second, func() bool {
+					_, finalized, _ := o.FinalizeForRemoval(false, time.Second)
+					return finalized
+				}, "actual disconnect return did not permit existing finalization")
+				if !o.MaintenanceRetired() || h.returned.Load() != 1 || h.disconnects.Load() != 1 {
+					t.Fatal("disconnect retirement or exactly-once dispatch was lost")
+				}
+			})
+		}
+	}
+}
+
+func TestMaintenanceNativeRegistrationLinearizesWithFence(t *testing.T) {
+	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+		for _, ipcSession := range []bool{false, true} {
+			for _, admitted := range []bool{false, true} {
+				t.Run(fmt.Sprintf("era_%d_ipc_%t_admitted_%t", protocol, ipcSession, admitted), func(t *testing.T) {
+					var gate sync.RWMutex
+					h := &maintenanceLifecycleBarrier{blockConnect: true, entered: make(chan struct{}), release: make(chan struct{})}
+					o, err := NewOwner(OwnerConfig{SessionHandler: h, IPCPath: testIPCPath(t), ProtocolEra: protocol, MaintenanceGate: &gate, TokenHandshake: ipcSession, ServerID: "native-registration", Logger: testLogger(t)})
+					if err != nil {
+						t.Fatal(err)
+					}
+					var releaseOnce sync.Once
+					t.Cleanup(func() { releaseOnce.Do(func() { close(h.release) }); o.Shutdown() })
+					if admitted {
+						o.admissionMu.Lock()
+					} else {
+						gate.Lock()
+					}
+					var unlockOnce sync.Once
+					unlock := func() {
+						unlockOnce.Do(func() {
+							if admitted {
+								o.admissionMu.Unlock()
+							} else {
+								gate.Unlock()
+							}
+						})
+					}
+					defer unlock()
+					var conn net.Conn
+					var s *Session
+					added := make(chan struct{})
+					if ipcSession {
+						o.SessionMgr().PreRegister("cafebabe", t.TempDir(), nil)
+						conn = connectWithToken(t, o.IPCPath(), "cafebabe")
+						defer conn.Close()
+					} else {
+						reader, writer := io.Pipe()
+						defer writer.Close()
+						s = NewSession(reader, &safeBuf{})
+						s.Cwd = t.TempDir()
+						go func() { o.AddSession(s); close(added) }()
+					}
+					fenced := make(chan struct{})
+					if admitted {
+						// An actual registration owns the read lease while waiting to
+						// publish; the writer must wait for its connect reservation.
+						waitForCondition(t, time.Second, func() bool {
+							if gate.TryLock() {
+								gate.Unlock()
+								return false
+							}
+							return true
+						}, "registration never acquired maintenance admission")
+						go func() {
+							gate.Lock()
+							o.SetMaintenance(&control.MaintenanceResult{State: control.MaintenanceHolding, DrainDeadline: time.Now()})
+							gate.Unlock()
+							close(fenced)
+						}()
+						unlock()
+					} else {
+						o.SetMaintenance(&control.MaintenanceResult{State: control.MaintenanceHolding, DrainDeadline: time.Now()})
+						unlock()
+						close(fenced)
+					}
+					select {
+					case <-fenced:
+					case <-time.After(time.Second):
+						t.Fatal("registration retained the admission gate across user code")
+					}
+					if admitted {
+						select {
+						case <-h.entered:
+						case <-time.After(time.Second):
+							t.Fatal("admitted connect was dropped after fence")
+						}
+						maintenanceNativeBlocked(t, o)
+					} else {
+						if ipcSession {
+							_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+							var byte [1]byte
+							if n, err := conn.Read(byte[:]); n != 0 || err == nil {
+								t.Fatalf("fenced IPC session was published: n=%d err=%v", n, err)
+							} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+								t.Fatal("fenced IPC registration did not reject")
+							}
+						} else {
+							select {
+							case <-added:
+							case <-time.After(time.Second):
+								t.Fatal("fenced AddSession did not reject")
+							}
+							if !s.IsClosed() {
+								t.Fatal("rejected AddSession remained open")
+							}
+						}
+						if o.SessionCount() != 0 || h.connects.Load() != 0 || h.disconnects.Load() != 0 {
+							t.Fatal("rejected registration produced lifecycle work")
+						}
+					}
+					releaseOnce.Do(func() { close(h.release) })
+					waitForCondition(t, time.Second, func() bool {
+						_, finalized, _ := o.FinalizeForRemoval(false, time.Second)
+						return finalized
+					}, "registration did not settle through real reader removal")
+					lateReader, lateWriter := io.Pipe()
+					defer lateWriter.Close()
+					late := NewSession(lateReader, &safeBuf{})
+					o.SetMaintenance(nil)
+					o.AddSession(late)
+					if !late.IsClosed() || o.SessionCount() != 0 {
+						t.Fatal("closed listener/Done permitted late native publication")
+					}
+				})
+			}
 		}
 	}
 }
