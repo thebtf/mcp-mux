@@ -6,12 +6,12 @@ This is the T029 evidence artifact for GitHub #135. The accepted ADR-015 full-sl
 
 | State | Recorded outcome |
 | --- | --- |
-| Implemented | Complete maintenance behavior is implemented. Source milestone `5b07ecd8f531891fbb7a42353200850baef7d274` commits the three owned critical-oracle fixes on `7cd4b2d`; the earlier maintenance product source and recorded source relationships remain unchanged. |
-| Verified | T029 and T030 are root-admitted complete. The corrected overall critical suite exits 0 with 5/5 PASS and no failures, skips, or errors, supplementing the focused, race, live Windows/Unix, R1, Scenario 5b/8, and seven-finding receipts below. |
-| Technically accepted | Yes. Root admits T031 complete and accepts the complete technical implementation, named behavior/proof, and 7/7 known source corrections. Historical receipt limits remain explicit; acceptance does not turn old aborted or setup-failed attempts into passes. |
-| Delivered | No. Root selects additive minor `0.31.0` for both binary and muxcore library through the normal direct release flow. T032 is in progress, not complete; no PR, merge, release tags, publication, or post-merge consumer delivery is recorded. T033 remains pending. |
+| Implemented | Release candidate `d72b7127f7996e1eb6793553dfae11daf791cb96` includes the complete feature, version-linking repair, prepared `0.31.0` docs, two production review repairs, and subsequent platform/test-fixture corrections. |
+| Verified | T029/T030 local proof remains PASS within the updated source scopes below: latest root/muxcore full tests and vet at `da7e3f8`, retirement regressions/race, and actual version-baked Windows 1149/1149 and Linux 1182/1182 caller assertions with zero errors. Historical R1/critical/scenario receipts retain their stated source limits. |
+| Current-head acceptance | REPAIRING. Earlier `5b07ecd` technical acceptance is historical, not final PR freeze approval for `d72b712`. The bounded current-head source checker passes the original two production guarantees and disputed latch assertion, but latest CI and newly recorded external review findings remain unresolved. The installed one-pass reviewer did not perform a second configured invocation. |
+| Delivered | No. Binary/library `0.31.0` is prepared and normal release [PR #150](https://github.com/thebtf/mcp-mux/pull/150) is open with the branch pushed. T032 is in progress; no merge, new release tags, publication, post-merge fresh-clone canary, or consumer delivery is recorded. T033 remains pending. |
 
-This documentation update inspected existing receipts only. It ran no tests, builds, vet, linters, formatters, or repeated gates and made no commit. The plan, acceptance scenarios, and required commands in [tasks](tasks.md), [specification](spec.md), and [quickstart](quickstart.md) remain authoritative. Root has accepted T029-T031; subsequent release and consumer evidence must be appended before delivery is claimed.
+This documentation update inspected existing receipts only. It ran no tests, builds, vet, linters, formatters, repeated gates, remote operations, or commits. Historical acceptance and latest premerge repair are distinguished below. Root will commit these four owning documents before final PR freeze. Later post-merge/tag/canary evidence belongs in primary-checkout evidence, without editing merged source to record delivery.
 
 ## Source and artifact identity
 
@@ -21,18 +21,19 @@ All local raw-evidence paths below are relative to the **primary** checkout `D:/
 | --- | --- |
 | Source base | `3881f27b931f6b9d0467c0a15dd4e1824969e125` |
 | Candidate root | `D:/Dev/mcp-mux/.agent/worktrees/upstream-maintenance-01a0fb9a` |
-| Full tests/vet source | `42ef546d146b1e0bc9541f64e9c228d6ba5d3358` |
-| Live replacement source | `45d4f93ec7c2703db1a57dfa48efc477accb1386` |
-| Accepted source milestone | `5b07ecd8f531891fbb7a42353200850baef7d274` |
+| Historical full tests/vet source | `42ef546d146b1e0bc9541f64e9c228d6ba5d3358` |
+| Historical live replacement source | `45d4f93ec7c2703db1a57dfa48efc477accb1386` |
+| Earlier accepted source milestone | `5b07ecd8f531891fbb7a42353200850baef7d274` |
 | `42ef546` to `45d4f93` | Known complete changed-path set is only `scripts/smoke-upstream-maintenance.ps1`. Go product and regression source are unchanged across this interval. |
 | `45d4f93` to `1f3c119` | Known complete changed-path set is only `muxcore/daemon/maintenance_test.go`, the TTL fixture repair, with 7 additions and 1 deletion. Go product source remains unchanged; the test corpus is not identical. |
 | `1f3c119` to `0b443b0` | Root committed only `specs/002-upstream-maintenance-hold/{release-evidence.md,tasks.md,quickstart.md,spec.md}`. Product and regression source are unchanged. |
 | `0b443b0` to `7cd4b2d` | Root's owning-milestone documentation commit only. Product and regression source are unchanged. |
 | `7cd4b2d` to `5b07ecd` | Exactly `experiments/current-topology-poc/main.go`, `scripts/run-current-topology-poc.ps1`, and `tests/critical/run-all.ps1` commit the owned oracle repair. Root ran the corrected suite on `7cd4b2d` plus those exact working-tree bytes before committing them as `5b07ecd`; this is tested-source equality, not a gate launched after that commit. |
+| Current premerge HEAD | `d72b7127f7996e1eb6793553dfae11daf791cb96`; authoritative remote master remains the source base `3881f27b931f6b9d0467c0a15dd4e1824969e125`. Latest full-test/live evidence is source-bound to `da7e3f85e4e6ccef9108012857a07f7f93810198`, not freshly executed at `d72b712`. |
 
 The changed-path relationships are recorded in `agent://MaintenanceReviewCloseout` and root's supplied commit-path evidence. This writer did not rerun Git comparison or rebuild the candidate. Root admits reuse of the `42ef546` full-test/vet and `45d4f93` live receipts within their unchanged-source scope, including the TTL-test-only `1f3c119` and docs-only `0b443b0` successors. This is **not** a claim that those commands ran freshly at exact `1f3c119` or `0b443b0`, nor that independently built binaries at different SHAs have identical hashes. The integrated race ran from exact committed `1f3c119`; the new focused adapter command ran from exact committed `0b443b0`.
 
-The accepted runtime criterion is bound to the tested working-tree oracle repair now committed as `5b07ecd`. The separate release workflow's one-line version-embedding correction and owning-document updates do not imply a fresh runtime run or completed release-artifact delivery. Root reports private-owner `v0.31.0` artifact proof, which is not a post-merge release canary or consumer handoff.
+The earlier runtime criterion was bound to the oracle repair committed as `5b07ecd`. That does not cover later production review changes or a delivered release artifact. Subsequent private-owner version and actual caller receipts below prove `mux_version=v0.31.0` in their private artifact namespaces; they are not post-merge release canaries or consumer handoffs.
 
 | Live artifact | SHA-256 |
 | --- | --- |
@@ -222,15 +223,79 @@ Companion reports are `.agent/reports/critical-process-lifecycle-20261003-080036
 
 Root binds the executed source to `7cd4b2d` plus exactly the three owned oracle-fix files committed as `5b07ecd8f531891fbb7a42353200850baef7d274`. No post-commit rerun is fabricated. The original roughly 30-minute aborted critical attempt remains preserved without terminal exit or aggregate verdict. Its scout initially could not distinguish launcher capture from shutdown. Later exact-PID evidence showed control shutdown exit 0 and daemon PID 43148 OS exit in 160ms; source established inherited detached-daemon stderr keeping launcher capture EOF open. The fixture's stderr lifetime, timeout propagation, and typed cleanup were repaired. The new complete suite closes that pending gate; it does not rewrite the original attempt as PASS.
 
-Root now admits T030 complete and T031 technical implementation acceptance, including all named behavior/proof and 7/7 known review corrections. T029 remains complete. Release selection is additive minor **0.31.0 for both binary and muxcore library**, using the normal direct release flow, not a compare-and-swap release route. Selection and private versioned-artifact proof do not complete T032 or T033.
+At the `5b07ecd` milestone, root admitted T030 complete and T031 technical implementation acceptance, including named behavior/proof and 7/7 original review corrections. That historical acceptance and its receipt limits remain preserved. Later PR review found additional production issues; current-head freeze acceptance is reopened as REPAIRING below. Additive minor `0.31.0` remains selected for binary and muxcore library through the normal direct release flow.
+
+## Final premerge snapshot: PR #150
+
+This snapshot covers pushed HEAD `d72b7127f7996e1eb6793553dfae11daf791cb96` before the final four-document freeze commit. PR #150 is open, not merged. The earlier HTTPS Git connection timeout was transient: the existing route succeeded on retry for ls-remote and push, without new credentials or global configuration. This is source publication, not release-tag/module/binary delivery.
+
+### Version linking and production review repairs
+
+Root records the workflow-linker/owner-initialization fix as `c599`, followed by prepared release-version docs in `c645f9417257f42b13dbe5245ca222a6c5bcf200`. The initial fixed baked-owner run used source `334cdc801e4b59bf6a858af5c4a2449288fdcc59` plus the two owned patches committed as `c599`; it was not launched after that commit. `P/version-proof-031-fixed/summary.json` records PASS, 1149/1149 assertions, empty error, zero cleanup errors, and artifact SHA-256 `C9C3ECC42B275AACDE6F988666D285500F57364E678B34B93DC345AC191F9C0C`. Its actual modern-owner observation reports `mux_version=v0.31.0`, protocol era `2026-07-28`, and cache off. Earlier unversioned or incorrectly linked artifacts are not relabeled as `v0.31.0` proof.
+
+The configured external review at `c645f941` used Codex and CodeRabbit. Two causal production groups were repaired in `a4aa42e7313514ad68eaf40c526e2b89980b2d49`:
+
+| Group | Repair and recorded regression |
+| --- | --- |
+| Restart after exact-entry loss | `Removed=false` returns typed not-found/conflict before Spawn, preserving the replacement and avoiding stale-context admission. Both absent/replaced real-helper cases fail before and pass after. |
+| Retirement of all captured live pins | Placeholder timeout or one blocked removal no longer returns before all remaining captured live generations receive retirement attempts. One absolute drain deadline, aggregate latches, durable fencing, and existing deduplicated retry remain. Both multi-owner cases, with and without paused creators, fail before and pass after. |
+
+Before evidence uses `P/maintenance-before-overlay.json` to replace only `maintenance.go` with preserved `f3dd69b` bytes while running the new regression source. The source checker independently binds overlay blob `ae3e629c182b086d986c6d60474a923c50b46c7d` to that baseline. `P/pr-retirement-before.log` has 4/4 failing leaf cases; `P/pr-retirement-after.log` has 4/4 passing leaf cases under two parent tests. This is actual isolated RED/GREEN for these repairs, not a claim that all regression files existed at the historical baseline.
+
+`agent://MaintenanceFinalSourceCheck` now reports bounded source PASS at exact `d72b712`, no findings in its assigned scope, and unchanged production repair/regression source from `a4aa42e` through `d72b712`. It also source-challenges the disputed ordinary-finalization latch allegation: the retained Owner pointer observes unconditional latch publication before ordinary shutdown completion, while committed handoff is deliberately not tree death. This does not prove every handoff schedule or close the remote disputed thread by itself. No latch bypass was added. The checker ran no new tests, builds, CI, or release verification; model-family independence is unknown.
+
+### Latest actual version-baked caller proof
+
+Both latest builds target `github.com/thebtf/mcp-mux/muxcore/owner.Version=v0.31.0` with `-trimpath`, and both report actual modern owner version `v0.31.0`, era `2026-07-28`, cache off, original-pipe continuation, full-tree retirement, actual overwrite, and no held-frame replay.
+
+| Latest live observation | Windows | Debian Linux |
+| --- | --- | --- |
+| JSON source SHA | `da7e3f85e4e6ccef9108012857a07f7f93810198` | `da7e3f85e4e6ccef9108012857a07f7f93810198` |
+| Candidate SHA-256 | `578D151E09F58ED28CD15F3E14AD9F3D8E12558DEDBE25AE005FEA35C910065C` | `D824F2CC2129C702C34A8740E9282FD46EA1EA4B926835374EFCE5472A1FE2A4` |
+| Actual assertions | 1149/1149 PASS, 0 failed | 1182/1182 PASS, 0 failed |
+| Error / cleanup errors | Empty / 0 | Empty / 0 |
+| Namespace shutdowns | 3 successful | 3 successful |
+| Primary authoritative JSON | `P/windows-live-da7.json` | `P/docker/linux-live-da7/linux-live-da7.json` |
+| Finished UTC | `2026-10-03T13:51:52.7830693Z` | `2026-10-03T13:53:16.6546179Z` |
+
+The assertion totals were parsed from complete JSON arrays. They count repeated assertions, not independent scenarios. Latest Linux executed fixture overwrite changes SHA-256 `C9A32E93551AB39B1D98F3B630AAC35DD738C7033D299208646211BA4E26601B` to `99168BBF34841E84731C195FE95FDF3041FC8AA4866E4B7BFA1EA3C6AAC09105`; Windows uses the recorded v1/v2 hashes above.
+
+The Windows worker records exit 0 for `go build -trimpath -ldflags '-X github.com/thebtf/mcp-mux/muxcore/owner.Version=v0.31.0' -o P/build/mcp-mux-da7.exe ./cmd/mcp-mux`, then the maintenance runner with `SourceRoot=C`, `CandidateBinary=P/build/mcp-mux-da7.exe`, `ScratchRoot=P`, `OutputDir=P/windows-live-da7`, `EvidencePath=P/windows-live-da7.json`, and `TimeoutSeconds=180`. It records Go 1.25.12 and primary TMP/TEMP/GOTMPDIR. The actual-owner companion is `P/windows-live-da7-observed-owner-status.json`, SHA-256 `a7fd5dd7e2854ad2c54b068bc285b25b926523b22d6abbd22fe8badd980eb0c6`. Worker cleanup records 23/23 owned identities closed and 5/5 host exits 0.
+
+The Linux worker records exit 0 for the direct Go 1.25.12 toolchain build under `/repo/cda7` with the same linker target, producing `/repo/cda7/.agent/tmp/u/mcp-mux-da7`. Its runner uses `SourceRoot=/repo/cda7`, that CandidateBinary, `ScratchRoot=/repo/cda7/.agent/tmp/u`, `OutputDir=/repo/cda7/.agent/tmp/u/linux-live-da7`, `EvidencePath=/repo/cda7/.agent/tmp/u/linux-live-da7.json`, and `TimeoutSeconds=180`. Raw build/stdout/transcript/fixture files remain under `P/docker/linux-live-da7/`. The Linux JSON SHA-256 is `74bb69dbe5828d0245c71bf0089dc423c5fdc376a9e020f69520270a72800810`; transcript SHA-256 is `ee98f6a9b5ce008a02f4abc3db7a951f25961e316ae76d38ca19badf439c56cf`.
+
+These are private built-artifact customer journeys, not released binaries. Windows labels its candidate externally built and its worker reports a dirty working tree with preserved root-owned changes; its JSON source field is not a clean-tree attestation. Root retains build/source binding authority. Linux labels a candidate-root binary but does not claim a verified clean tree. Neither receipt establishes fresh full/live execution at `d72b712`, final CI acceptance, or delivered-consumer proof.
+
+### Latest local gates and external boundaries
+
+| Gate | Observed scope and limit |
+| --- | --- |
+| Full root/muxcore tests at `da7e3f8` | Root reports PASS. `P/root-full-da7.log` has 2 tested packages PASS and 3 without test files; `P/muxcore-full-da7.log` has 24 tested packages PASS and 1 without test files. No per-case denominator is inferred from nonverbose output. |
+| Root/muxcore vet at `da7e3f8` | Root reports PASS. `P/root-vet-da7.log` and `P/muxcore-vet-da7.log` have no diagnostics; success is attributed to the root receipt, not inferred from silence. |
+| Retirement race | Root reports race PASS; `P/race-retirement-da7.log` records daemon package PASS in 7.637s. The file alone does not encode flags, source SHA, or individual case counts. |
+| Windows startup | `P/startup-private-home-after.log` records both numeric/string opening cases PASS, command package 3.646s. Short namespace and retained stderr preceded separate private HOME/USERPROFILE isolation; HOME is not asserted as the cause of the earlier EOF. |
+| Platform compile gates | Root reports FreeBSD and Darwin compilation PASS; raw refs are `P/upstream-freebsd-compile.log`, `P/upstream-darwin-compile.log`, and `P/startup-darwin-arm64-compile.log`. Compilation is not native macOS runtime acceptance. |
+| Latest fixture/source continuity | Root records BSD guard `c2`, macOS short namespace `f3dd69b` and private HOME `0e72c53`, README unsupported-environment correction `da7e3f8`, and `d72b712` shared-daemon short unique nonce plus deterministic expired-blocked semantics. Root reports daemon-prefix race/blocked-TTL coverage PASS. The bounded source checker confirms the original production repair carries unchanged into `d72b712`; latest fixtures still require their actual CI outcome. |
+| Actual CI | At `da7e3f8`, BSD and Ubuntu PASS; coverage/macOS fixture failures were preserved and repaired for `d72b712`. Windows was matrix-cancelled, not a Windows test failure. Latest `d72b712` CI is pending in root's snapshot. No all-matrix or latest-head CI PASS is claimed. |
+
+Four native repair comment readbacks are retained in `P/pr150-repair-comment-readbacks.json`: [restart repair](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490097), [all-pin retirement](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490175), [startup fixture repair](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490220), and [environment guidance](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490276). They prove posted/read-back replies, not blanket final acceptance.
+
+The subsequently retained `P/pr150-review-successor-d72b712.json` is terminal **REVIEW_UNAVAILABLE**, not a successful second configured pass: the installed reviewer has a one-pass role boundary and performed only its original invocation. This is not a provider outage, billing pause, or invented second invocation. Actual automatic review exists: CodeRabbit's recent no-actionable result selects only `maintenance_test.go`; Codex's current d72 review is COMMENTED with new findings. Its native snapshot records 9 threads, 5 resolved, 4 unresolved, and merge readiness false. The source-challenged latch thread remains remotely unresolved; no safety latch was weakened to silence it.
+
+| Current unresolved review group | Recorded claim and next disposition |
+| --- | --- |
+| Hold clocks before durable fence commitment | The external source review classifies [the timing finding](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173425241) as VALID at d72: persistence delay consumes requested drain grace and TTL. Root must disposition/repair it against the accepted timing contract; the local PASS receipts do not answer that specific source claim. |
+| Lifecycle RPC budget omits finalization/durable-response phases | The external source review classifies [hold](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173618827) and [restart](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173618833) budgets as valid source-traced defects, not experimentally rerun findings. Root owns the full-operation bound and disposition. |
+
+Thus T029/T030 local evidence is retained, while current-head T031 freeze acceptance is REPAIRING. The older seven-finding closeout and bounded current source PASS are not relabeled as a clean second all-diff review. Root must incorporate remaining CI and review outcomes before merge.
 
 ## Remaining release and consumer outcomes
 
-Technical acceptance is complete. The remaining rows describe delivery effects, not pending runtime gates or a generic blocked verdict. Root retains the ordinary full release outcome and appends exact delivery/readback evidence before completion.
+Earlier technical acceptance and current-head local PASS evidence remain recorded, but latest PR freeze acceptance is REPAIRING. Remaining effects include review/CI disposition, merge/release delivery, and consumer readback. This is not release completion or a generic global block.
 
 | Task / gate | Current recorded state | Outcome still required |
 | --- | --- | --- |
-| T032 release | In progress. Root selects binary/library `0.31.0` and is preparing version/docs/artifact delivery through the normal direct release flow. No PR, merge, tags, current-module publication, or delivered binary is recorded. Root reports private-owner `v0.31.0` proof, not a release canary. | Complete owning release-version docs and correct artifact version embedding, authorized exact-SHA merge/tag-last flow, remote parity, and module/binary delivery. Root's fresh GitHub API read works; HTTPS Git ls-remote encountered a connection timeout, which is transport evidence, not publication success. |
-| T033 consumers and canary | Pending external handoffs and post-merge fresh-clone/module/binary/fresh-session proof. Engram native issue capability remains unmounted; only that handoff effect is held, not the completed technical work or other reachable delivery effects. | Target-authorized handoff/readback and post-merge delivered-artifact canaries, including fresh-session hold/replace/resume. Record `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` only after their actual criteria pass. Do not invent an Engram backend substitute. |
+| T032 release | In progress. Binary/library `0.31.0` is prepared; PR #150 is open and HEAD `d72b712` is pushed. Existing HTTPS Git succeeded on retry without new credentials/configuration. No merge, release tags, module publication, released binary, or post-merge canary is recorded. | Finish current-head review/CI acceptance, freeze the source after these four docs, then execute the authorized exact-SHA normal merge/tag-last and module/binary delivery flow. Post-merge/tag/canary evidence is retained in primary evidence, not later source edits. |
+| T033 consumers and canary | External handoffs and post-merge fresh-clone/module/binary/fresh-session proof remain pending. Root's native capability readback confirms Engram issue capability is unmounted; only that handoff effect is held. No proxy backend is invented. | Target-authorized handoff/readback and delivered-artifact canaries, including fresh-session hold/replace/resume. Claim `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` only after their actual criteria pass. |
 
 Neither `PROJECT_RELEASE_PROTOCOL_PASS` nor `CONSUMER_HANDOFF_PASS` is claimed. Source implementation, bounded verification, technical acceptance, and consumer delivery remain separate states.
