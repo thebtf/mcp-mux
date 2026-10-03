@@ -633,7 +633,13 @@ func TestMaintenanceSafeTTLReleasesDurablyWithoutIdleExitBypass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(500)})
+	// Start the short expiry interval after actual helper retirement; a race-built
+	// helper can outlive it while process-exit finalization is still running.
+	result, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid})
+	if err != nil || result.State != control.MaintenanceHeld || !result.TreesRetired {
+		t.Fatalf("acquire retired fixture lease: %+v %v", result, err)
+	}
+	result, err = d.HandleMaintenance(control.Request{Cmd: "renew", HoldID: result.HoldID, HoldTTLMS: maintenanceTTL(500)})
 	if err != nil {
 		t.Fatal(err)
 	}
