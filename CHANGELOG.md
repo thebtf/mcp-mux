@@ -7,6 +7,69 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-10-03
+
+Prepared for publication as `v0.31.0` and `muxcore/v0.31.0`; tag publication,
+delivered-artifact proof, and the required Engram consumer handoff remain pending.
+
+### Added
+
+- Added optional managed upstream maintenance for #135 through CLI `hold`,
+  `resume`, and `renew`, MCP tools `mux_hold`, `mux_resume`, and `mux_renew`,
+  and `control.SendMaintenance`. Existing control interfaces retain their
+  signatures, with optional handlers, typed errors, and redacted lease readback.
+- Added a durable finite-context admission fence for the selected owner's
+  already-admitted namespace, CWD, era, and security/configuration contexts.
+  A usable hold requires durable, unexpired `HELD` and proven death of every
+  scoped managed process tree. This is not a host-wide executable lock.
+
+### Changed
+
+- Aware managed shims preserve host pipes and reject held requests before cache
+  or forwarding with original numeric/string-ID `-32005` maintenance errors.
+  Held and unfinished retired work never replays; notifications get no invented
+  replies. Fresh demand after durable release can start one replacement generation.
+- Controlled restart, handoff, shutdown, downgrade, idle exit, and update-helper
+  fallback refuse terminally under a fence. Unplanned aware-daemon recovery loads
+  durable authority before admission. Incomplete or blocked authority fails closed.
+- Controlled install, launcher swap, layout/bootstrap mutation, and active-pointer
+  changes serialize with hold-ledger mutation under the existing daemon namespace
+  lock. Status and pure startup inspection remain read-only. Offline/old activation
+  requires locked persisted-clear proof.
+- TTL starts at durable fence commitment, defaults to 5m, and is positive and at
+  most 1h. Exact-current-lease renewal sets expiry from serialized acceptance,
+  without changing retirement state or reviving an expired/released lease.
+  Resume and safe expiry require tree death and durable release. Blocked retirement
+  never TTL-clears. Drain defaults to 10s and starts once; zero skips grace, not
+  tree proof. CLI durations require whole milliseconds.
+
+### Compatibility
+
+- Ordinary legacy `engine.New` consumers need no source changes. Maintenance
+  adoption is optional and requires aware managed binary/daemon/shim cooperation.
+  Legacy remains the default; modern R1 remains explicit, same-era, forced-isolated,
+  cache-off, and replay-off, with fresh admission after release.
+- Old daemons and uncoordinated standalone paths are `maintenance_unsupported`,
+  without stop/kill/direct-exec fallback. Old managed shims receive physical start
+  fencing only, not immediate-error/non-replay guarantees. Arbitrary old binaries,
+  foreign engines, unmanaged processes, and manual pointer swaps are not controlled.
+
+### Validation
+
+- Accepted-source checks include actual Windows and Linux held executable
+  replacement and cleanup, focused maintenance/race coverage, root and muxcore
+  Go tests and vet, native Scenario 5b, Unix lifecycle coverage, R1 parity on both
+  operating systems, and the complete critical suite. These checks do not prove
+  publication, the final delivered binary, or consumer adoption.
+
+### Rollback
+
+- Before pinning `muxcore/v0.30.0` or restoring a prior compatible binary, use the
+  current aware version to durably resume each exact retired lease or observe its
+  safely committed expiry. Preserve incomplete/blocked authority, even after TTL.
+  Do not downgrade, delete authority, force PID cleanup, or bypass admission to
+  escape a fence. Keep modern-owner quarantine and no-replay rules intact.
+
 ## [0.30.0] - 2026-08-31
 
 ### Added
@@ -290,7 +353,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/thebtf/mcp-mux/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/thebtf/mcp-mux/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/thebtf/mcp-mux/compare/v0.29.0...v0.29.1
 [0.29.0]: https://github.com/thebtf/mcp-mux/compare/v0.28.0...v0.29.0

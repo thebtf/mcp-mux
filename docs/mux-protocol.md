@@ -3,7 +3,8 @@
 **Document version:** 1.1
 **Legacy MCP reference:** 2025-11-25
 **Native R1 route:** MCP 2026-07-28
-**Updated:** 2026-08-31
+**Prepared binary/library target:** v0.31.0
+**Updated:** 2026-10-03
 
 ## Overview
 
@@ -315,10 +316,12 @@ To roll back, stop new explicit-modern admissions and drain or remove existing m
 
 R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
 
-## Managed upstream maintenance (this change)
+## Managed upstream maintenance in v0.31.0
 
-Maintenance is local authenticated control NDJSON, not an MCP method or a new
-protocol version. CLI flags follow the exact local identifier:
+The prepared v0.31.0 target adds optional local authenticated control NDJSON,
+not an upstream MCP method or a new protocol version. Legacy remains the default
+and modern R1 remains explicitly same-era and isolated. CLI flags follow the exact
+local identifier:
 
 ```text
 mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
@@ -342,9 +345,13 @@ direct-owner fallback is supported. `mux_restart` uses daemon-owned
 The times and identifiers above are examples. Success requires durable HELD,
 future expiry, and proven full-tree death. `HOLDING` means drain/retirement is in
 progress; `RETIREMENT_BLOCKED` remains fenced and cannot expire into a start.
-`RELEASED` permits only fresh demand. Default TTL is 5m and maximum TTL is 1h.
-Renew calculates expiry from acceptance and affects only the exact current lease.
-Positive drain starts once at fence commitment; zero skips grace, not tree proof.
+`RELEASED` permits only fresh demand after durable release. TTL starts at durable
+fence commitment, defaults to 5m, and is positive and at most 1h. Renew sets expiry
+from serialized acceptance for the exact current unexpired lease without changing
+retirement state or reviving released/expired authority. Resume and safe HELD
+expiry require full tree death and a successful durable release commit. Stale
+identities cannot clear a replacement lease. Positive drain starts once at fence
+commitment; zero skips grace, not tree proof.
 CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
 are rejected, not truncated to zero-force retirement.
 
@@ -366,7 +373,7 @@ namespace context set, not a host-wide executable lock. Control readbacks expose
 only safe lease/timing/retirement fields. Wire failures use `maintenance_held`,
 `maintenance_conflict`, `maintenance_not_found`, `maintenance_retirement_blocked`,
 `maintenance_unsupported`, `maintenance_persistence_failed`, or
-`maintenance_invalid`; see [typed library control](../muxcore/README.md#upstream-maintenance-control-this-change).
+`maintenance_invalid`; see [typed library control](../muxcore/README.md#upstream-maintenance-control).
 
 Controlled restart, handoff, shutdown, downgrade, and idle exit refuse terminally
 under a fence, including launcher/library fallback paths. Aware unplanned startup
@@ -375,8 +382,10 @@ Old daemons and uncoordinated standalone paths are unsupported, never stop/kill/
 restart substitutes. Old shims get physical start fencing only, not promised
 immediate errors or non-replay. Arbitrary old binaries, foreign engines, manual
 active-pointer replacement, unmanaged processes, and PID cleanup are outside
-the supported flow. Before downgrade, clear safely proven holds using the current
-aware binary and retain blocked authority. Do not delete the ledger to open admission.
+the supported flow. Before downgrade, durably resume each exact retired lease or
+observe safely committed expiry through the current aware binary. Incomplete/
+blocked authority prevents downgrade and must remain intact, even after TTL.
+Never delete either authority member to open admission.
 
 Maintenance storage is one schema-2 logical authority with mandatory
 `ledger.json` and `transaction.json`. Aggregate recovery rejects missing,
@@ -398,6 +407,12 @@ Activation also checks live aware status. Offline/old endpoints allow activation
 only when persisted authority is proven clear under the lock. This is neither
 a host-wide executable lock nor a separate updater lease.
 
-This contract adds no release tag. Actual Windows/Unix overwrite evidence and
-separate focused race/recovery proofs are required by [production Scenario 11](PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement).
+Publication targets are `v0.31.0` and `muxcore/v0.31.0`, not a new MCP protocol
+version. Ordinary legacy `engine.New` consumers need no maintenance-specific
+source changes. Accepted-source actual Windows/Linux overwrite and separate
+focused race/recovery checks are recorded in [release notes](../RELEASE_NOTES.md).
+Final version-baked/delivered-artifact proof, tag/module resolution, and Engram
+consumer handoff remain pending under the [release protocol](RELEASE-PROTOCOL.md).
+See [production Scenario 11](PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
+for the live replacement oracle.
 

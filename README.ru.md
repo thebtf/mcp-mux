@@ -53,6 +53,10 @@ graph TB
 
 ## Быстрый старт
 
+Подготовленная версия бинарника — **v0.31.0**. После публикации используйте
+[релиз v0.31.0](https://github.com/thebtf/mcp-mux/releases/tag/v0.31.0).
+Команды ниже собирают исходники, а не доказывают работу доставленного артефакта.
+
 **1. Сборка**
 
 ```sh
@@ -266,15 +270,15 @@ Daemon включён по умолчанию. Он запускается ав�
 [документации Serena](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
 Standalone-запуск upstream через `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON` или
-direct-owner путь `--daemon` в этом изменении явно возвращает
+direct-owner путь `--daemon` в v0.31.0 явно возвращает
 `maintenance_unsupported`. Сохраняйте managed admission через daemon;
 прямой запуск не обходит maintenance.
 
 ## Удержать upstream для замены исполняемого файла
 
-Это изменение добавляет maintenance-aware managed операции hold, resume и renew.
-Используйте aware binary, daemon и shim вместе. Здесь не выбран номер релиза и
-не заявлена поддержка maintenance в ранее установленных тегах.
+v0.31.0 добавляет необязательные managed операции hold, resume и renew.
+Используйте maintenance-aware binary, daemon и shim вместе. Публикация и
+consumer handoff ещё не завершены; старые установленные теги не получают эту поддержку.
 
 Возьмите точный `server_id` из локального `mcp-mux status`. Флаги идут после ID:
 
@@ -295,8 +299,10 @@ deadline начинается один раз при фиксации fence и �
 `HOLDING` означает drain или retirement при закрытом admission. `HELD` означает
 доказанную смерть всех scoped деревьев. `RETIREMENT_BLOCKED` сохраняет запрет
 запуска: замена небезопасна. `RELEASED` разрешает свежий спрос после durable release.
-TTL по умолчанию равен пяти минутам, должен быть положительным и не превышать
-один час. Renew продлевает только точный текущий hold ID от момента принятия.
+TTL начинается при durable fence commitment, по умолчанию равен пяти минутам,
+должен быть положительным и не превышать один час. Renew меняет expiry только
+точного текущего неистёкшего hold ID от момента serialized acceptance, не меняя
+retirement state и не восстанавливая released/expired lease.
 CLI принимает TTL и drain только в целых миллисекундах. Значения меньше
 миллисекунды отклоняются, а не округляются до zero-force retirement.
 Чужой или устаревший ID не заменяет lease. Resume и истечение TTL открывают
@@ -347,8 +353,10 @@ Old daemon возвращает `maintenance_unsupported`, без stop/kill/rest
 Aware daemon физически блокирует старые managed shim, но не обещает им immediate
 errors и non-replay. Arbitrary old binary, foreign engine, ручная замена active
 pointer и standalone bypass не поддерживаются. Перед downgrade текущим aware
-binary освободите все безопасно доказанные hold. Сохраняйте blocked authority;
-не удаляйте ledger и не делайте PID cleanup.
+binary выполните durable resume каждого точного retired lease либо подтвердите
+его безопасно зафиксированное истечение. Incomplete/blocked authority запрещает
+downgrade и сохраняется даже после TTL. Не удаляйте ни один член authority и не
+делайте PID cleanup для открытия admission.
 
 Перед релизом выполните [live replacement proof на Windows и Unix](docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement).
 Он использует private scratch primary checkout и реальную перезапись файла;
@@ -356,7 +364,8 @@ binary освободите все безопасно доказанные hold.
 
 ## Устойчивый shim
 
-Shim-ы mcp-mux автоматически переподключаются при перезапуске daemon. Это означает:
+Вне maintenance fence legacy shim автоматически переподключается при рестарте
+daemon. Modern R1 не воспроизводит legacy handshake, описанный ниже. Это означает:
 
 - `mcp-mux upgrade` переключает active versioned engine без разрыва соединений
 - `mcp-mux stop --force` вызывает автоматическое переподключение в течение нескольких секунд
@@ -681,6 +690,22 @@ scripts\verify-handoff.ps1
 если безопасное поведение можно вывести внутри `engine`, muxcore должен делать
 это сам; если конфигурация неоднозначна, он должен падать рано и с понятной
 ошибкой.
+
+Подготовленный текущий library target — `muxcore/v0.31.0`. После публикации
+и разрешения тега через Go proxy закрепите зависимость:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+```
+
+Обычным legacy-потребителям `engine.New` менять исходники не требуется.
+`control.SendMaintenance` нужен только при принятии необязательных операций
+maintenance. Legacy остаётся zero-value default; modern R1 требует явного
+same-era admission и сохраняет isolation/cache-off/replay-off.
+Откат на `muxcore/v0.30.0` или совместимый предыдущий binary возможен только
+после durable resume каждого точного retired lease либо безопасного committed
+expiry через текущую aware-версию. Incomplete/blocked authority запрещает downgrade
+и не удаляется. Modern owner завершается через quarantine, без live-перехода в legacy.
 
 ### Ссылки
 

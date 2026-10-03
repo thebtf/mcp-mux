@@ -90,9 +90,10 @@ R1 excludes modern sharing or reuse, shared causal correlation, semantic transla
 
 ## Upstream maintenance hold consumer contract
 
-This change requires maintenance-aware managed binary/daemon/shim cooperation;
-it does not assign a new released consumer target. Use the exact local status
-`server_id`, then the returned opaque `hold_id`:
+The prepared binary/library consumer target is v0.31.0. Maintenance requires
+aware managed binary/daemon/shim cooperation and is optional for ordinary legacy
+`engine.New` consumers. Use the exact local status `server_id`, then the returned
+opaque `hold_id`:
 
 ```text
 mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
@@ -104,7 +105,10 @@ Only durable, unexpired `HELD` with `trees_retired=true` permits installer-owned
 replacement. `HOLDING` and `RETIREMENT_BLOCKED` stay fenced; blocked retirement
 never TTL-clears. TTL defaults to 5m, is positive, and is at most 1h. Drain
 defaults to 10s, starts once at fence commitment, and zero skips grace rather
-than tree-death proof. Resume/renew affect only the exact current lease.
+than tree-death proof. TTL starts at durable fence commitment. Resume/renew
+affect only the exact current lease; renew sets expiry from serialized acceptance
+and cannot revive a released/expired lease. Resume/safe expiry require tree death
+and durable release.
 CLI TTL and drain durations must be whole milliseconds; reject sub-millisecond
 values instead of truncating a positive drain to zero-force retirement.
 
@@ -121,8 +125,10 @@ unplanned recovery reads durable authority before admission. Old daemons and
 uncoordinated standalone paths are `maintenance_unsupported`; never substitute
 stop, PID cleanup, or direct exec. Old shims receive physical start fencing only,
 not immediate-error/non-replay guarantees. Arbitrary old binaries, foreign
-engines, and manual active-pointer changes are unsupported. Clear safely proven
-holds through the current aware binary before downgrade; preserve blocked ledgers.
+engines, and manual active-pointer changes are unsupported. Before downgrade,
+durably resume each exact retired lease through the current aware binary or
+observe safely committed expiry. Incomplete/blocked authority prevents downgrade;
+preserve both authority members even after TTL. Never delete them to open admission.
 
 Controlled update/install/swap, layout/bootstrap mutation, and active-pointer
 changes serialize with hold-ledger mutation under the existing daemon namespace
@@ -134,7 +140,7 @@ or treat namespace coordination as host-wide file-lock authority.
 
 `mux_hold`, `mux_resume`, and `mux_renew` use the local daemon; `mux_restart` uses
 daemon-owned `restart_owner`, not ambient-context reconstruction. See
-[`muxcore/README.md`](muxcore/README.md#upstream-maintenance-control-this-change)
+[`muxcore/README.md`](muxcore/README.md#upstream-maintenance-control)
 for additive optional APIs and typed errors. Root owns the live cross-platform
 proof in production Scenario 11, focused maintenance regressions, existing
 Scenario 5b/8 and R1 parity gates, integration, and release. Smoke scratch/output/
@@ -168,13 +174,34 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.30.x)
+## muxcore Library API (v0.31.x)
 
 ### Upgrade
 
+Prepared consumer target, usable after publication and Go proxy tag resolution:
+
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
 ```
+
+### v0.31.0 - optional managed upstream maintenance
+
+**No required source changes for ordinary legacy `engine.New` users.** Optional
+`control.SendMaintenance`, typed errors, and handlers provide hold/resume/renew
+without changing existing interface signatures. The finite durable context fence,
+full-tree HELD proof, original-ID errors/no replay, exact lease timing, terminal
+lifecycle refusal, and compatibility limits above are the consumer contract.
+Legacy stays the default and modern R1 stays explicitly same-era and isolated.
+
+Publication targets are `v0.31.0` and `muxcore/v0.31.0`. Accepted-source technical
+checks are recorded in `RELEASE_NOTES.md`; final version-baked/delivered-artifact
+proof, tags/module resolution, and Engram handoff remain release-root work.
+Do not report this prepared scope as shipped or `CONSUMER_HANDOFF_PASS`.
+
+Rollback to `muxcore/v0.30.0` or a compatible previous binary only after the
+current aware version durably resumes every exact retired lease or proves safe
+expiry. Incomplete/blocked authority prevents downgrade and must not be deleted.
+Modern owners still require quarantine rather than live legacy conversion.
 
 ### v0.30.0 - explicit native MCP 2026-07-28 route
 

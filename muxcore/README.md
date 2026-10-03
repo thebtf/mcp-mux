@@ -12,16 +12,31 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-Install the current release after its tag resolves through the Go proxy:
+Install the prepared v0.31.0 target after publication and Go proxy tag resolution:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
 ```
 
-v0.30.0 adds an explicit native MCP `2026-07-28` route while retaining the
-released legacy path as the zero-value default. Existing consumers require no
-source or configuration change. A known same-era consumer opts in before
-admission with `engine.Config.ProtocolPolicy = era.PolicyModern20260728`.
+v0.31.0 adds optional managed upstream maintenance while retaining the released
+legacy path as the zero-value default and modern R1 as an explicit isolated route.
+Ordinary legacy `engine.New` users need no source or configuration changes.
+Publication, delivered-artifact proof, and Engram consumer handoff remain pending.
+
+### v0.31.0 - optional managed upstream maintenance
+
+Adopt `control.SendMaintenance` and its typed errors only when a product needs
+hold/resume/renew. Existing control interface signatures remain unchanged, with
+optional handlers and lease readback. See [maintenance control](#upstream-maintenance-control)
+for finite context scope, durable HELD/full-tree proof, original-ID errors/no replay,
+terminal lifecycle refusal, exact lease timing, and old-version/standalone limits.
+
+Current rollback: use the current aware version to durably resume each exact
+retired lease or observe safely committed expiry before pinning `muxcore/v0.30.0`
+or restoring a compatible previous binary. Incomplete/blocked authority prevents
+downgrade and must be retained, even after TTL. Never delete authority to reopen
+admission. Modern owners still retire through R1 quarantine, without live legacy
+conversion or replay.
 
 ### v0.30.0 - explicit native MCP 2026-07-28 route
 
@@ -32,7 +47,7 @@ authoritative; unsafe transitions preserve the exact era or quarantine the
 route rather than restoring it as legacy. Status exposes only the minimal
 redacted protocol, sharing, cache, and lifecycle policy facts.
 
-Current rollback: stop new modern admissions, retire active modern owners
+v0.30.0 rollback: stop new modern admissions, retire active modern owners
 through the existing lifecycle path, then pin `muxcore/v0.29.1` or restore the
 prior product binary. Do not transfer live modern state into a legacy owner.
 
@@ -51,7 +66,7 @@ callbacks mutate the daemon registry only through its exact-current-generation
 transaction. Stale owner generations are no-ops, while process-generation
 authority stays in `muxcore/owner`.
 
-Current rollback: pin `muxcore/v0.29.0` or restore the prior product binary;
+v0.29.1 rollback: pin `muxcore/v0.29.0` or restore the prior product binary;
 do not force a mixed-version live handoff.
 
 ### v0.29.0 - public stable-stdio supervisor
@@ -489,11 +504,11 @@ network calls, database writes, or heavy policy evaluation in this hook.
 
 `muxcore/supervisor` is the public boundary for products whose MCP host keeps
 one stdio transport open while the product replaces a child engine executable.
-Introduced in `muxcore/v0.29.0`. After the current tag resolves through the Go
-proxy, pin `muxcore/v0.29.1` with:
+Introduced in `muxcore/v0.29.0`. For the current prepared release, after
+publication and Go proxy tag resolution, pin `muxcore/v0.31.0` with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
 ```
 
 Minimal ordinary-supervision shape:
@@ -599,17 +614,19 @@ Use the public APIs `supervisor.ProtocolV2()`, `supervisor.Run`,
 `supervisor.StartCommand`, `supervisor.StartWithFallback`, and
 `supervisor/attest`.
 
-To roll back the current v0.29.1 patch, pin `muxcore/v0.29.0` or restore the
-prior product binary. Do not
-force a mixed-version live supervisor handoff or forward an old attestation
-advertisement. Old/new combinations run as ordinary MCP without private
-dormancy and should restart through the product's bounded replacement path.
+The v0.29.1 patch rollback pinned `muxcore/v0.29.0` or restored the prior product
+binary without a mixed-version live supervisor handoff or an old attestation
+advertisement. Old/new combinations run as ordinary MCP without private dormancy.
+For current v0.31.0 rollback, first durably release exact retired maintenance
+leases or prove safe expiry through the aware version. Incomplete/blocked
+authority prevents downgrade. Use the product's bounded replacement path.
 
-## Upstream maintenance control (this change)
+## Upstream maintenance control
 
-Maintenance holds an exact managed upstream for installer-owned executable
-replacement. It does not select a new module tag. Existing `DaemonHandler`,
-`CommandHandler`, `Send`, and `SendWithTimeout` signatures remain unchanged.
+v0.31.0 adds optional maintenance for exact managed upstreams and installer-owned
+executable replacement. Ordinary legacy `engine.New` consumers need no source
+changes. Existing `DaemonHandler`, `CommandHandler`, `Send`, and `SendWithTimeout`
+signatures remain unchanged.
 `control.Request` adds `HoldID string` and `HoldTTLMS *int64`; it reuses exact
 `ServerID` and `DrainTimeoutMs`. Omitted TTL is 300000ms; explicit TTL must be
 positive and at most 3600000ms. CLI drain defaults to 10000ms; zero skips grace.
@@ -636,9 +653,11 @@ _, err = control.SendMaintenance(controlPath, control.Request{
 `MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
 `MaintenanceReleased`/`RELEASED`. Successful hold requires durable, unexpired
 HELD and full scoped tree death, not handoff or detached live authority. Positive
-drain starts once at fence commitment. Only proven held state can safely expire
-or resume into admission; blocked retirement never TTL-clears. Renew uses
-`Cmd: "renew"`, the exact `HoldID`, and `HoldTTLMS` from acceptance time.
+drain and TTL start once at durable fence commitment. Resume/safe expiry require
+tree death and durable release; blocked retirement never TTL-clears. Renew uses
+`Cmd: "renew"`, the exact current `HoldID`, and `HoldTTLMS`, setting expiry from
+serialized acceptance without changing retirement state or reviving a released/
+expired lease. Stale identities cannot clear a replacement lease.
 
 `Response` adds optional `Maintenance` and `ErrorCode`; `OwnerInfo` adds optional
 `Maintenance`. Daemon status retains a safe maintenance list after owner removal.
@@ -682,9 +701,11 @@ or start a successor. Aware startup loads authority before admission after
 unplanned loss; incomplete/corrupt state stays blocked. Old managed shims receive
 physical fencing only, not immediate-error/non-replay guarantees. Old daemons,
 uncoordinated standalone/direct-owner paths, foreign engines, arbitrary old
-binaries, and manual active-pointer replacement are unsupported. Clear all
-safely proven holds with the current aware binary before downgrade. Keep blocked
-authority intact; neither ledger deletion nor PID cleanup is a recovery API.
+binaries, and manual active-pointer replacement are unsupported. Before downgrade,
+durably resume every exact retired lease or observe safely committed expiry using
+the current aware binary. Incomplete/blocked authority prevents downgrade and
+must remain intact, even after TTL. Neither authority deletion nor PID cleanup
+is a recovery API.
 
 Schema-2 maintenance authority requires both `ledger.json` and `transaction.json`.
 Startup and activation validate the aggregate, not the ledger member alone.

@@ -58,6 +58,10 @@ Result: one upstream process per server instead of N — approximately 3x memory
 
 ## Quick Start
 
+The prepared binary target is **v0.31.0**. After publication, use the
+[v0.31.0 release](https://github.com/thebtf/mcp-mux/releases/tag/v0.31.0).
+The build commands below are source builds, not delivered-artifact proof.
+
 **1. Build**
 
 ```sh
@@ -278,14 +282,14 @@ it opening automatically, pass `--open-web-dashboard false` to Serena's
 
 Standalone upstream launches through `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON`, or
 the direct-owner `--daemon` path are explicitly `maintenance_unsupported` in
-this change. Keep managed daemon admission enabled; direct execution is not a
+v0.31.0. Keep managed daemon admission enabled; direct execution is not a
 maintenance bypass.
 
 ## Hold an upstream for executable replacement
 
-This change adds maintenance-aware managed hold, resume, and renew operations.
-Use an aware binary, daemon, and shim together. This section does not assign a
-release version or claim that older installed tags support maintenance.
+v0.31.0 adds optional maintenance-aware managed hold, resume, and renew operations.
+Use an aware binary, daemon, and shim together. Publication and consumer handoff
+remain pending; older installed tags do not acquire maintenance support.
 
 Read the exact `server_id` from local `mcp-mux status`. Flags follow the identifier:
 
@@ -309,8 +313,10 @@ The result also contains `hold_id`, `server_id`, and `drain_deadline`.
 | `RETIREMENT_BLOCKED` | Tree death is unproven; replacement is unsafe and admission stays fenced. |
 | `RELEASED` | Durable release permits fresh demand. |
 
-TTL defaults to five minutes, must be positive, and cannot exceed one hour.
-Renewal uses the exact current hold ID and sets expiry from renewal acceptance.
+TTL starts at durable fence commitment, defaults to five minutes, must be
+positive, and cannot exceed one hour. Renewal uses the exact current unexpired
+hold ID and sets expiry from serialized renewal acceptance, without changing
+retirement state or reviving a released/expired lease.
 CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
 are rejected rather than rounded down to zero-force retirement.
 Competing or stale identities cannot replace or clear a lease. Explicit resume
@@ -361,8 +367,10 @@ Old daemons return `maintenance_unsupported`, never a stop/kill/restart fallback
 An aware daemon fences old managed shims' starts, but those shims have no promised
 immediate-error or non-replay semantics. Arbitrary old binaries, foreign engines,
 manual active-pointer replacement, and direct standalone bypass are unsupported.
-Before downgrade, use the current aware binary to resume every safely proven
-hold. Preserve blocked authority; do not delete ledgers or perform PID cleanup.
+Before downgrade, use the current aware binary to durably resume every exact
+retired lease or observe its safely committed expiry. Incomplete/blocked authority
+prevents downgrade and must be retained, even after TTL. Do not delete either
+authority member or perform PID cleanup to reopen admission.
 
 Run the [live Windows and Unix replacement proof](docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 before release. Its private primary-checkout scratch and actual overwrite evidence
@@ -370,7 +378,8 @@ supplement focused regressions; a fixture build or unit test is not that proof.
 
 ## Resilient Shim
 
-mcp-mux shims automatically reconnect when the daemon restarts. This means:
+Outside maintenance fences, legacy mcp-mux shims automatically reconnect when
+the daemon restarts. Modern R1 does not replay the legacy handshake below. This means:
 
 - `mcp-mux upgrade` switches the active versioned engine without dropping connections
 - `mcp-mux stop --force` triggers automatic reconnect within seconds
@@ -777,17 +786,24 @@ executable swapping. Windows verifies the named-pipe server with
 including BSD targets without both proofs, fail closed and never emit private
 dormant frames.
 
-The stable stdio loop, strict MCP correlation, shared protocol-v2 codec,
-process-tree finalization, generic peer-PID attestation, and the explicit native
-MCP `2026-07-28` route are public in `muxcore/v0.30.0`. Native consumers should
-pin that tag and use `engine.Config.ProtocolPolicy` for an explicit known
-same-era modern route; legacy remains the zero-value default. Supervisor users
-should continue to use `supervisor.Run`, `supervisor.StartCommand`,
-`supervisor.StartWithFallback`, `supervisor.ProtocolV2`, and the attestation
-package rather than copying the `mcp-mux` product adapter, private wire
-constants, parser, replay loop, or exit code. To roll back, pin
-`muxcore/v0.29.1` or restore the prior product binary after stopping new modern
-admissions and retiring active modern owners through the quarantine path.
+The prepared current library target is `muxcore/v0.31.0`, which adds optional
+managed maintenance to the existing stable stdio supervisor and explicit native
+MCP `2026-07-28` route. After publication and Go proxy tag resolution, pin:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+```
+
+Ordinary legacy `engine.New` consumers require no source changes. Use
+`control.SendMaintenance` only when adopting maintenance. Select
+`engine.Config.ProtocolPolicy` explicitly for a known same-era modern route;
+legacy remains the zero-value default. Supervisor users should keep using
+`supervisor.Run`, `supervisor.StartCommand`, `supervisor.StartWithFallback`,
+`supervisor.ProtocolV2`, and the attestation package rather than copying the
+product adapter or private wire codec. Roll back to `muxcore/v0.30.0` or a
+compatible prior binary only after exact retired leases are durably resumed or
+safely expired through the current aware version. Preserve incomplete/blocked
+authority and retire modern owners through quarantine, never live conversion.
 
 The shared daemon is owned by the stable launcher rather than by any supervised engine generation. The launcher prepares it before starting a child; on Windows the daemon therefore remains outside the child's KillOnJobClose Job Object. A supervised child never spawns that daemon inside its own process tree and exits back to the stable launcher if the daemon must be recreated, preserving the host-facing stdio pipe.
 
