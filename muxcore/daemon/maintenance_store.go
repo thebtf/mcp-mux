@@ -141,11 +141,6 @@ func (d *Daemon) loadMaintenance(endpoint string) error {
 		}
 		d.maintenanceLeases[result.HoldID] = &maintenanceLease{record: record, result: result, recovered: true}
 	}
-	// The starter may own the namespace lock through readiness: never mutate
-	// authority here. Expired HELD remains fenced until lock-first release.
-	for _, lease := range d.maintenanceLeases {
-		d.scheduleMaintenanceExpiryLocked(lease)
-	}
 	return nil
 }
 

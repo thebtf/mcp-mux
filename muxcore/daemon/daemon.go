@@ -637,13 +637,12 @@ func New(cfg Config) (*Daemon, error) {
 			}
 			return nil, activationErr
 		}
-		d.ctlSrv.Start()
 		if planned > 0 {
 			logger.Printf("startup: restored %d owners from snapshot (%s)", d.OwnerCount(), modeLabel)
 		}
 		logger.Printf("daemon started, control socket: %s (%s)", cfg.ControlPath, modeLabel)
 	} else {
-		ctlSrv, err := control.NewServer(cfg.ControlPath, d, logger)
+		ctlSrv, err := control.NewPausedServer(cfg.ControlPath, d, logger)
 		if err != nil {
 			// Cancel supervisor context to prevent leak of the context goroutine.
 			supCancel()
@@ -683,6 +682,16 @@ func New(cfg Config) (*Daemon, error) {
 	// ServeBackground returns a channel that will receive the final error when
 	// the supervisor exits (via context cancel or root termination).
 	d.supervisorErr = d.supervisor.ServeBackground(d.supervisorCtx)
+
+	// No constructor failure may leave a timer or control request mutating
+	// recovered authority. The starter may still own the namespace lock;
+	// expired HELD remains fenced until the existing lock-first release.
+	d.maintenanceGate.Lock()
+	for _, lease := range d.maintenanceLeases {
+		d.scheduleMaintenanceExpiryLocked(lease)
+	}
+	d.maintenanceGate.Unlock()
+	d.ctlSrv.Start()
 
 	return d, nil
 }
