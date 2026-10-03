@@ -111,6 +111,13 @@ and durable release.
 CLI TTL and drain durations must be whole milliseconds; reject sub-millisecond
 values instead of truncating a positive drain to zero-force retirement.
 
+Native finalization, including ordinary removal, must retain the owner/session
+producers until reader/disconnect settlement and actual callback return. Closing
+or cancelling is not quiescence; losing the registry entry early can orphan work
+before a later hold. Reuse blocked finalization/exact-entry retry, not a new waiter
+or scheduler. `PendingRequests` is request-only, not complete native-work proof;
+private nonrequest accounting adds no public metric, state, API, or schema.
+
 A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
 TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.

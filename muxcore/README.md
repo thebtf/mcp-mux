@@ -663,13 +663,21 @@ tree death and durable release; blocked retirement never TTL-clears. Renew uses
 serialized acceptance without changing retirement state or reviving a released/
 expired lease. Stale identities cannot clear a replacement lease.
 
-Managed `SessionHandler` owners also require actual return of every admitted
-callback before retirement is proved. Callbacks still active after the accepted
-drain, including handlers that ignore cancellation, keep `RETIREMENT_BLOCKED`;
-TTL expiry and resume cannot release that fence. Existing exact-entry
-finalization retry can prove retirement after actual return, subject to the
-original lease clock. Neither retry nor callback completion resets TTL/drain.
-Keep the fence and inspect status; a cancelled context alone is not proof.
+Managed `SessionHandler` retirement requires native callback quiescence, not
+merely cancelled contexts or closed transports. Request callbacks and admitted
+notification, connect/disconnect lifecycle, authentication, and frame-hook
+callbacks remain accounted until actual return. Native sessions stay retained
+as teardown producers until reader/disconnect settlement. Existing modern native
+notification non-dispatch behavior is unchanged.
+
+Both ordinary removal and maintenance require this settlement before `Done` or
+retirement proof. Otherwise ordinary removal could lose the registry entry
+before a later hold could pin its still-active callbacks. Existing blocked
+finalization/exact-entry retry retains authority; maintenance remains
+`RETIREMENT_BLOCKED` without TTL/resume bypass, using the original lease clock.
+Keep the fence and inspect status; notification cancellation on session/owner
+closure does not prove return. `PendingRequests` remains request-only; the
+private nonrequest accounting adds no public counter, status field, or schema.
 
 A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.

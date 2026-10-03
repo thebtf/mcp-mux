@@ -58,10 +58,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 - Concurrent legacy `engine.New` cold starters wait for the winning daemon's
   bounded readiness check on namespace-lock contention instead of returning
   terminal `ErrFileLocked`; other lock errors remain unchanged.
-- Managed `SessionHandler` retirement requires actual return of admitted callbacks.
-  Active callbacks keep `RETIREMENT_BLOCKED`, even if cancellation is ignored;
-  TTL and resume cannot bypass them. Existing finalization retry can complete
-  after return without resetting the accepted lease clock.
+- Native retirement now accounts for notification, connect/disconnect lifecycle,
+  authentication, and frame-hook callbacks through actual return, while retaining
+  native sessions as teardown producers. Ordinary removal and maintenance both
+  require quiescence. Cancellation is not settlement; active work keeps retirement
+  blocked without TTL/resume bypass. Public `PendingRequests` remains request-only.
 
 ### Compatibility
 
@@ -81,9 +82,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Go tests and vet, native Scenario 5b, Unix lifecycle coverage, R1 parity on both
   operating systems, and the complete critical suite. These checks do not prove
   publication, the final delivered binary, or consumer adoption.
-  Timing/RPC and cold-start proofs remain source-bound. The native callback
-  correction has Windows focused/race/full/vet proof on runtime bytes committed
-  as 8f09; new-source Linux/CI, final documentation freeze, and delivery are pending.
+  Native-family proof at 6fc7 records seven top-level tests and 45 named PASS
+  rows, including parents, in normal and race runs. Root tests and both vet suites
+  pass at their recorded source. Fixture-only 435bcfa closes the old owner-test
+  failure with fresh full-muxcore PASS, without production changes. New-source
+  Linux/caller/CI and final acceptance remain pending; historical failures retained.
 
 ### Rollback
 

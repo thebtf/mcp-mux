@@ -1,6 +1,6 @@
 # Prove live upstream executable replacement
 
-This guide is the implementation/release oracle. Pushed source `8f09dc08bf16fac511b1c43d94ce22c4ecf3f261` contains the root-accepted bounded native retirement correction and fixture. Windows eight-scenario RED/GREEN, focused race, and root/muxcore full/vet PASS bind identical runtime bytes tested before commit. [Release evidence](release-evidence.md) preserves logs, historical scopes, and artifact limits. Active callbacks keep `RETIREMENT_BLOCKED` despite cancellation; TTL/resume cannot bypass actual return, and retry retains the original clock. Generic original-ID `-32603` on pre-fence orphaned work remains legal; newly fenced requests get `-32005`. No topology exclusion added. Root reports eleven known threads resolved after read-back reply 4174464694; fresh final bounded observer and exact-head Linux native/built Windows/Linux caller/CI proof remain pending before documentation freeze. T031/T032/T033 incomplete, binary/library `0.31.0` prepared, PR #150 open. No all-diff CLEAN, final freeze, or released canary claimed. Later receipts stay primary-only; this update ran no checks or remote operations.
+Pushed source `435bcfa70da85f3763f1ddbc861016f2e18b07c4` closes the old owner fixture atop unchanged native-family production 6fc7. Corrected focus PASS 0.409s, full owner PASS 54.973s, and whole-muxcore exit 0/all 24 tested packages PASS; earlier scoped proofs and historical RED stay in [release evidence](release-evidence.md), without invented reruns. Family finding is repaired/dispositioned after root reply/readback 4174748321 and native resolution; all twelve known threads root-resolved. T031 now awaits Linux native-family/built Windows/Linux caller/CI and fresh final observer, not unfixed family code or fixture. Modern native notification non-dispatch unchanged. No all-diff CLEAN/final acceptance/freeze/production-ready/released canary claimed; `0.31.0` prepared, PR #150 open, delivery incomplete. This update ran no checks, Git, or external effects.
 
 ## Prerequisites
 
@@ -58,12 +58,16 @@ go test ./cmd/mcp-mux ./internal/mcpserver -run '^TestMaintenance' -count=1
 
 Capture named cases and denominator, including failing-before/passing-after respawn suppression, start-through-install race, placeholder settlement, actual drain, all-tree death versus handoff, finite CWD/era/security/namespace context sets, stale generations/leases, durable commit failures, startup order, renewal/expiry/blocked retirement, terminal launcher/update refusal, unsupported standalone paths, and held queue/reconnect disposition.
 
-Managed `SessionHandler` proof distinguishes cancellation from actual callback
-return. Cover both eras with zero/short drain, expiry while blocked, and completion
-before deadline. Active callbacks retain `RETIREMENT_BLOCKED` without TTL/resume
-bypass; exact-entry retry after return uses the original clock. Verify one
-original-ID terminal result for pre-fence work, `-32005` for newly fenced requests,
-zero late duplicate/replay, and fresh work on the original host pipes.
+Managed native proof distinguishes cancellation from actual callback return and
+reader/disconnect settlement. Cover both notification interfaces, registration,
+lifecycle connect/disconnect, authentication, delayed frame hooks, and ordinary
+removal versus later hold pinning, retaining existing `SetNotifier` creation
+barriers. Both ordinary and maintenance completion must preserve producer/owner
+authority until quiescence; ignored cancellation must not yield fake completion.
+Maintenance TTL/resume cannot bypass active work; exact-entry retry keeps the
+original clock. Public `PendingRequests` remains request-only. Preserve modern
+notification non-dispatch, one original-ID pre-fence terminal result, post-fence
+`-32005`, no late duplicate/replay, and fresh work on the original pipes.
 
 Include `TestMaintenanceSecurity002NoncanonicalKeyRefusesStartup`, `TestMaintenanceSecurity003DuplicateMembersRefuseStartup`, and the `TestMaintenanceSecurity004` cases for post-publication failure, all six PREPARE/PUBLISH/FINALIZE before/after faults, incomplete aggregates, and acknowledged release without predecessor resurrection. A finalize-after-publication fault must still return persistence failure while aggregate recovery may accept a matching COMMITTED certificate proving earlier acknowledged durable publication. Other uncertain pairs must preserve fencing or refuse startup/activation. Portable injected durability faults do not prove an actual Unix fsync failure or full Unix runtime.
 

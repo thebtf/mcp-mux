@@ -69,12 +69,14 @@ the new control operations only when they need maintenance.
 - Drain defaults to 10s and uses the same `T` as TTL without restarting. Zero skips grace,
   not tree-death proof. CLI TTL and drain durations require whole milliseconds;
   sub-millisecond values are rejected rather than truncated.
-- Managed `SessionHandler` owners need actual return of admitted callbacks,
-  not merely a closed session or cancelled context. Callbacks active after the
-  drain keep `RETIREMENT_BLOCKED`, including handlers that ignore cancellation.
-  TTL and resume cannot release that fence. Existing exact-entry retry can
-  complete retirement after return, using the original accepted lease clock.
-  Keep the fence and inspect status; no native-handler topology is excluded.
+- Native retirement accounts for notifications, connect/disconnect lifecycle,
+  authentication, and frame hooks through actual return, retaining sessions as
+  teardown producers. Ordinary removal and maintenance require quiescence before
+  completion, so a later hold cannot miss callbacks whose owner entry disappeared.
+  Notification cancellation follows session/owner closure but does not prove
+  settlement. Active work remains blocked without TTL/resume bypass; existing
+  retry uses the original clock. `PendingRequests` stays request-only; no public
+  metric, state, schema, topology exclusion, or modern notification dispatch added.
 
 The durable `HOLDING` seed has provisional timing and never grants replacement.
 Sample `T` once after its first complete writer acknowledgment, then persist clocked `HOLDING` once.
@@ -152,12 +154,14 @@ Before the durable-clock and RPC-budget corrections, the release root recorded:
 
 Later timing/RPC and cold-start checks have source-bound receipts in
 [release evidence](specs/002-upstream-maintenance-hold/release-evidence.md).
-The native callback correction has actual Windows RED/GREEN: six blocking
-cases fail before the fix; all eight legacy/modern scenarios pass afterward,
-including race. Root/muxcore full tests and vet also pass on identical runtime
-bytes tested before commit `8f09dc08bf16fac511b1c43d94ce22c4ecf3f261`.
-Root accepts that bounded technical correction; new-source Linux/CI and final
-review/documentation freeze remain pending. No post-commit rerun inferred.
+Native-family source `6fc7eb44853a6446283dc1c1fad7ab4db874f4f5` has actual
+Windows original-overlay RED and normal/race GREEN: four top-level tests and
+28 named rows fail before repair; seven top-level tests and 45 named rows pass
+afterward. Named totals include parents, not independent scenarios. Root tests
+and both vet suites pass at their recorded source. Fixture-only successor
+`435bcfa70da85f3763f1ddbc861016f2e18b07c4` closes the old owner-test failure
+with fresh whole-muxcore PASS, without production changes after 6fc7. Historical
+RED remains preserved; Linux/caller/CI and final review/acceptance are pending.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote
