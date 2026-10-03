@@ -241,6 +241,9 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 			closeErr = up.Close()
 			proven = up.RetirementProven()
 		}
+		if o.authorizeSession != nil {
+			proven = proven && o.nativeQuiescent()
+		}
 		retErr := errors.Join(fmt.Errorf("owner: quiesce materialization for handoff: %w", err), closeErr)
 		o.recordFailedHandoffTransition(up, retErr, proven)
 		if proven {
@@ -251,6 +254,10 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 
 	up := o.beginHandoffTransition()
 	o.teardownExceptUpstream()
+	if o.authorizeSession != nil && !o.nativeQuiescent() {
+		o.recordFailedHandoffTransition(up, errFinalizationUnproven, false)
+		return HandoffPayload{}, errFinalizationUnproven
+	}
 	if up == nil {
 		o.completeShutdown("owner handoff completed without upstream")
 		return HandoffPayload{}, ErrNoUpstream

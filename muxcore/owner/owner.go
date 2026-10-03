@@ -237,7 +237,7 @@ type Owner struct {
 	inflightTracker         sync.Map          // remapped request ID (string) -> *InflightRequest
 	timedOutIDs             sync.Map          // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests         atomic.Int64
-	nativeWork              atomic.Int64  // owner-dispatched non-request callbacks; never part of PendingRequests
+	nativeWork              atomic.Int64  // non-request callbacks and authorization admission producers; never part of PendingRequests
 	drainTimeout            time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs           atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
 	idleTimeoutNs           atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
@@ -870,7 +870,7 @@ func extractToolName(raw []byte) string {
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
-	native := o.sessionHandler != nil
+	native := o.sessionHandler != nil || o.authorizeSession != nil
 	if native {
 		o.lockRequestAdmission()
 	}
@@ -880,6 +880,10 @@ func (o *Owner) AddSession(s *Session) {
 		o.unlockRequestAdmission()
 		s.Close()
 		return
+	}
+	if o.authorizeSession != nil {
+		o.nativeWork.Add(1)
+		defer o.nativeWork.Add(-1)
 	}
 	o.addSessionLocked(s)
 	o.admissionMu.Unlock()
@@ -2226,142 +2230,142 @@ func (o *Owner) acceptLoop() {
 		o.logger.Printf("peer_creds_extracted sid=%d pid=%d uid=%d platform=%s",
 			s.ID, info.PeerPid, info.PeerUid, info.Platform)
 
-		// AuthorizeSession gate (FR-3). Single-shot per session; runs after
-		// peer-creds extraction and BEFORE AddSession. nil = no gate
-		// (byte-identical to v0.23 dispatch path).
-		//
-		// Shutdown handling (CHK015 / EC-11): if owner.done fires before
-		// the callback runs, refuse the session without invoking.
-		// Panic guard: any panic inside the callback is recovered and
-		// treated as AuthDeny{Reason: "authorize panic"} — the daemon
-		// continues accepting subsequent connections.
-		if o.authorizeSession != nil {
+		// Keep authorization and its registration/rejection continuation reserved
+		// together; callback return alone does not settle the admission producer.
+		func() {
+			// AuthorizeSession gate (FR-3). Single-shot per session; runs after
+			// peer-creds extraction and BEFORE AddSession. nil = no gate
+			// (byte-identical to v0.23 dispatch path).
+			//
+			// Shutdown handling (CHK015 / EC-11): if owner.done fires before
+			// the callback runs, refuse the session without invoking.
+			// Panic guard: any panic inside the callback is recovered and
+			// treated as AuthDeny{Reason: "authorize panic"} — the daemon
+			// continues accepting subsequent connections.
+			if o.authorizeSession != nil {
+				select {
+				case <-o.done:
+					o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+					o.revokePendingAdmission(token)
+					conn.Close()
+					s.Close()
+					return
+				default:
+				}
+				if !o.reserveNativeWork() {
+					o.revokePendingAdmission(token)
+					s.Close()
+					return
+				}
+				defer o.nativeWork.Add(-1)
+
+				project := muxcore.ProjectContext{
+					ID:  muxcore.ProjectContextID(s.Cwd),
+					Cwd: s.Cwd,
+					Env: s.Env,
+				}
+				verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+
+				// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
+				// MAJOR review on PR #113). The pre-callback check at the top
+				// of the authorize block closes the gap up to the call, but a
+				// long-running callback (external RPC, slow tenant lookup) can
+				// outlast o.done. Without this re-check, AuthAllow would still
+				// reach AddSession during teardown, registering a session in a
+				// shutting-down owner.
+				select {
+				case <-o.done:
+					o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
+					o.revokePendingAdmission(token)
+					conn.Close()
+					s.Close()
+					return
+				default:
+				}
+
+				if verdict.Decision == muxcore.AuthDeny {
+					// Apply the documented "empty Reason → stable fallback"
+					// contract from session_auth.go SessionAuth godoc. Without
+					// this fallback the JSON-RPC error.message would be an
+					// empty string and consumers' deny-categorisation logic
+					// (which keys off Reason) would silently bucket every
+					// such denial together. CodeRabbit MINOR on PR #113.
+					reason := verdict.Reason
+					if reason == "" {
+						reason = "session not authorized"
+					}
+					if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, reason); marshalErr == nil {
+						// Write the JSON-RPC -32000 error directly to the conn
+						// (not through s.WriteRaw — the session is being torn
+						// down, no need for the buffered-writer/bufio path).
+						_, _ = conn.Write(append(errBytes, '\n'))
+					} else {
+						o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
+					}
+					o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
+					o.revokePendingAdmission(token)
+					conn.Close()
+					s.Close()
+					return
+				}
+
+				// AuthAllow: stamp tenant + authorized timestamp on cached meta.
+				// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
+				s.SetMeta(muxcore.SessionMeta{
+					Conn:         info,
+					TenantID:     verdict.TenantID,
+					AuthorizedAt: time.Now(),
+				})
+				o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
+			}
+
+			trackedAdmission := o.sessionHandler != nil || o.authorizeSession != nil
+			if trackedAdmission {
+				o.lockRequestAdmission()
+			}
+			o.admissionMu.Lock()
+			if trackedAdmission && o.nativeAdmissionClosed() {
+				o.admissionMu.Unlock()
+				o.unlockRequestAdmission()
+				o.revokePendingAdmission(token)
+				s.Close()
+				return
+			}
 			select {
 			case <-o.done:
-				o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+				o.admissionMu.Unlock()
+				if trackedAdmission {
+					o.unlockRequestAdmission()
+				}
+				o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
 				o.revokePendingAdmission(token)
-				conn.Close()
 				s.Close()
-				continue
+				return
 			default:
 			}
-			if o.sessionHandler != nil && !o.reserveNativeWork() {
-				o.revokePendingAdmission(token)
-				s.Close()
-				continue
-			}
-
-			project := muxcore.ProjectContext{
-				ID:  muxcore.ProjectContextID(s.Cwd),
-				Cwd: s.Cwd,
-				Env: s.Env,
-			}
-			verdict := func() muxcore.SessionAuth {
-				if o.sessionHandler != nil {
-					defer o.nativeWork.Add(-1)
+			if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
+				o.admissionMu.Unlock()
+				if trackedAdmission {
+					o.unlockRequestAdmission()
 				}
-				return invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
-			}()
-
-			// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
-			// MAJOR review on PR #113). The pre-callback check at the top
-			// of the authorize block closes the gap up to the call, but a
-			// long-running callback (external RPC, slow tenant lookup) can
-			// outlast o.done. Without this re-check, AuthAllow would still
-			// reach AddSession during teardown, registering a session in a
-			// shutting-down owner.
-			select {
-			case <-o.done:
-				o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
-				o.revokePendingAdmission(token)
-				conn.Close()
+				peerPID := readPeerPID(conn)
+				o.rejectionLogger.Log(o.logger, peerPID)
 				s.Close()
-				continue
-			default:
+				return
 			}
-
-			if verdict.Decision == muxcore.AuthDeny {
-				// Apply the documented "empty Reason → stable fallback"
-				// contract from session_auth.go SessionAuth godoc. Without
-				// this fallback the JSON-RPC error.message would be an
-				// empty string and consumers' deny-categorisation logic
-				// (which keys off Reason) would silently bucket every
-				// such denial together. CodeRabbit MINOR on PR #113.
-				reason := verdict.Reason
-				if reason == "" {
-					reason = "session not authorized"
-				}
-				if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, reason); marshalErr == nil {
-					// Write the JSON-RPC -32000 error directly to the conn
-					// (not through s.WriteRaw — the session is being torn
-					// down, no need for the buffered-writer/bufio path).
-					_, _ = conn.Write(append(errBytes, '\n'))
-				} else {
-					o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
-				}
-				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
-				o.revokePendingAdmission(token)
-				conn.Close()
-				s.Close()
-				continue
-			}
-
-			// AuthAllow: stamp tenant + authorized timestamp on cached meta.
-			// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
-			s.SetMeta(muxcore.SessionMeta{
-				Conn:         info,
-				TenantID:     verdict.TenantID,
-				AuthorizedAt: time.Now(),
-			})
-			o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
-		}
-
-		if o.sessionHandler != nil {
-			o.lockRequestAdmission()
-		}
-		o.admissionMu.Lock()
-		if o.sessionHandler != nil && o.nativeAdmissionClosed() {
+			o.addSessionLocked(s)
 			o.admissionMu.Unlock()
-			o.unlockRequestAdmission()
-			o.revokePendingAdmission(token)
-			s.Close()
-			continue
-		}
-		select {
-		case <-o.done:
-			o.admissionMu.Unlock()
-			if o.sessionHandler != nil {
+			if trackedAdmission {
 				o.unlockRequestAdmission()
 			}
-			o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
-			o.revokePendingAdmission(token)
-			s.Close()
-			continue
-		default:
-		}
-		if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
-			o.admissionMu.Unlock()
-			if o.sessionHandler != nil {
-				o.unlockRequestAdmission()
-			}
-			peerPID := readPeerPID(conn)
-			o.rejectionLogger.Log(o.logger, peerPID)
-			s.Close()
-			continue
-		}
-		o.addSessionLocked(s)
-		o.admissionMu.Unlock()
-		if o.sessionHandler != nil {
-			o.unlockRequestAdmission()
-		}
-		o.startRegisteredSession(s)
+			o.startRegisteredSession(s)
+		}()
 	}
 }
 
 // invokeAuthorize calls cb under a defer/recover guard with an owner-bound
-// context. Native authorization also watches listenerDone because finalization
-// withholds Done until the callback returns. Other owners retain Done-only
-// cancellation; a callback can observe teardown via ctx.Done().
+// context. Listener teardown cancels authorization while finalization withholds
+// Done until the callback and its admission continuation actually return.
 // Panic is logged with the panic value and converted to
 // AuthDeny{Reason: "authorize panic"}; the daemon continues accepting
 // subsequent connections.
@@ -2381,10 +2385,7 @@ func invokeAuthorize(
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var listenerDone <-chan struct{}
-	if o.sessionHandler != nil {
-		listenerDone = o.listenerDone
-	}
+	listenerDone := o.listenerDone
 	go func() {
 		select {
 		case <-o.done:
@@ -2766,7 +2767,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	defer o.removalMu.Unlock()
 	select {
 	case <-o.done:
-		if o.sessionHandler != nil && !o.nativeQuiescent() {
+		if (o.sessionHandler != nil || o.authorizeSession != nil) && !o.nativeQuiescent() {
 			o.materializationMu.Lock()
 			o.materializationState = MaterializationFinalizeBlocked
 			o.materializationBlockedErr = errFinalizationUnproven
@@ -2869,7 +2870,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	if o.maintenance.Load() != nil && proc != nil {
 		proven = proven && proc.TreesDead()
 	}
-	if o.sessionHandler != nil {
+	if o.sessionHandler != nil || o.authorizeSession != nil {
 		proven = proven && o.nativeQuiescent()
 	}
 	if !proven {
