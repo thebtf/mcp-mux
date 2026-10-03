@@ -6,12 +6,12 @@ This is the T029 evidence artifact for GitHub #135. The accepted ADR-015 full-sl
 
 | State | Recorded outcome |
 | --- | --- |
-| Implemented | Release candidate `d72b7127f7996e1eb6793553dfae11daf791cb96` includes the complete feature, version-linking repair, prepared `0.31.0` docs, two production review repairs, and subsequent platform/test-fixture corrections. |
-| Verified | T029/T030 local proof remains PASS within the updated source scopes below: latest root/muxcore full tests and vet at `da7e3f8`, retirement regressions/race, and actual version-baked Windows 1149/1149 and Linux 1182/1182 caller assertions with zero errors. Historical R1/critical/scenario receipts retain their stated source limits. |
-| Current-head acceptance | REPAIRING. Earlier `5b07ecd` technical acceptance is historical, not final PR freeze approval for `d72b712`. The bounded current-head source checker passes the original two production guarantees and disputed latch assertion, but latest CI and newly recorded external review findings remain unresolved. The installed one-pass reviewer did not perform a second configured invocation. |
-| Delivered | No. Binary/library `0.31.0` is prepared and normal release [PR #150](https://github.com/thebtf/mcp-mux/pull/150) is open with the branch pushed. T032 is in progress; no merge, new release tags, publication, post-merge fresh-clone canary, or consumer delivery is recorded. T033 remains pending. |
+| Implemented | Source `28947dca06047bbb342600153f7c39c8868c00e8` is committed/pushed with the cooperative cold-start correction and scoped README/changelog repairs. Earlier retirement, durable-clock, and RPC repairs remain implemented. Binary/library `0.31.0` is prepared. |
+| Verified | Root records exact-28947 full tests/vet exit 0, focused cold-start RED/GREEN and safety proof, compatibility caller PASS on Windows 1149/1149 and Linux 1173/1173 with zero errors/cleanup errors, and all five CI jobs PASS in run 37142995133. Windows embedded-source identity has the explicit limit below; the CLI smoke does not exercise `muxcore/engine`. Historical b5cb receipts retain their scope. |
+| Current-head acceptance | T031 remains REPAIRING. The cold-start P1 is replied/read back and resolved, leaving ten earlier threads resolved. A new eleventh Codex finding about native `SessionHandler` retirement is under root disposition. Passing gates do not refute it. No final freeze or acceptance is claimed before that disposition. |
+| Delivered | No. Binary/library `0.31.0` is prepared and PR #150 remains open, not merged. T032 is in progress; no new release tags, module/binary publication, post-merge fresh-clone canary, or consumer handoff completion is recorded. T033 remains pending. |
 
-This documentation update inspected existing receipts only. It ran no tests, builds, vet, linters, formatters, repeated gates, remote operations, or commits. Historical acceptance and latest premerge repair are distinguished below. Root will commit these four owning documents before final PR freeze. Later post-merge/tag/canary evidence belongs in primary-checkout evidence, without editing merged source to record delivery.
+This documentation update inspected receipts and root-provided observations only. It ran no tests, builds, vet, linters, formatters, repeated gates, remote operations, or commits. Exact-source proof, finding disposition, technical acceptance, and delivery remain separate. Root owns the new native-handler finding and later final freeze. Post-merge/tag/canary evidence belongs in primary-checkout evidence, without editing merged source to record delivery.
 
 ## Source and artifact identity
 
@@ -29,7 +29,7 @@ All local raw-evidence paths below are relative to the **primary** checkout `D:/
 | `1f3c119` to `0b443b0` | Root committed only `specs/002-upstream-maintenance-hold/{release-evidence.md,tasks.md,quickstart.md,spec.md}`. Product and regression source are unchanged. |
 | `0b443b0` to `7cd4b2d` | Root's owning-milestone documentation commit only. Product and regression source are unchanged. |
 | `7cd4b2d` to `5b07ecd` | Exactly `experiments/current-topology-poc/main.go`, `scripts/run-current-topology-poc.ps1`, and `tests/critical/run-all.ps1` commit the owned oracle repair. Root ran the corrected suite on `7cd4b2d` plus those exact working-tree bytes before committing them as `5b07ecd`; this is tested-source equality, not a gate launched after that commit. |
-| Current premerge HEAD | `d72b7127f7996e1eb6793553dfae11daf791cb96`; authoritative remote master remains the source base `3881f27b931f6b9d0467c0a15dd4e1824969e125`. Latest full-test/live evidence is source-bound to `da7e3f85e4e6ccef9108012857a07f7f93810198`, not freshly executed at `d72b712`. |
+| Latest reviewed production source | `28947dca06047bbb342600153f7c39c8868c00e8`, committed/pushed by root. Focused engine, full-test/vet, Linux embedded-build, and current CI receipts below bind this successor. Windows CLI artifact identity is limited as recorded below. Exact b5cb/da7/d72 signatures remain historical, not successor proof. |
 
 The changed-path relationships are recorded in `agent://MaintenanceReviewCloseout` and root's supplied commit-path evidence. This writer did not rerun Git comparison or rebuild the candidate. Root admits reuse of the `42ef546` full-test/vet and `45d4f93` live receipts within their unchanged-source scope, including the TTL-test-only `1f3c119` and docs-only `0b443b0` successors. This is **not** a claim that those commands ran freshly at exact `1f3c119` or `0b443b0`, nor that independently built binaries at different SHAs have identical hashes. The integrated race ran from exact committed `1f3c119`; the new focused adapter command ran from exact committed `0b443b0`.
 
@@ -165,7 +165,7 @@ T029 is now root-admitted complete on the focused core and adapter receipts, bot
 
 The closeout is only the seven-finding source portion of T031. It is not final root review of frozen evidence, implementation acceptance, or release approval. Reviewer model family is unknown; cross-family independence is not claimed. Its prior assertion-count limitation is not silently upgraded into reviewer execution: this documentation writer separately read the complete live JSON arrays for the counts above.
 
-Root's later T031 acceptance below incorporates this bounded source closeout together with completed T029/T030 evidence. The reviewer's source-only receipt is not relabeled as independent execution of the new critical suite or final release approval.
+Root's historical T031 acceptance below incorporated this bounded source closeout together with completed T029/T030 evidence. Later review reopened T031 for admitted production defects. The reviewer's source-only receipt is not independent execution of the critical suite or final release approval.
 
 ## Recorded Scenario 5b and Scenario 8 outcomes
 
@@ -225,9 +225,9 @@ Root binds the executed source to `7cd4b2d` plus exactly the three owned oracle-
 
 At the `5b07ecd` milestone, root admitted T030 complete and T031 technical implementation acceptance, including named behavior/proof and 7/7 original review corrections. That historical acceptance and its receipt limits remain preserved. Later PR review found additional production issues; current-head freeze acceptance is reopened as REPAIRING below. Additive minor `0.31.0` remains selected for binary and muxcore library through the normal direct release flow.
 
-## Final premerge snapshot: PR #150
+## Earlier premerge snapshot: d72
 
-This snapshot covers pushed HEAD `d72b7127f7996e1eb6793553dfae11daf791cb96` before the final four-document freeze commit. PR #150 is open, not merged. The earlier HTTPS Git connection timeout was transient: the existing route succeeded on retry for ls-remote and push, without new credentials or global configuration. This is source publication, not release-tag/module/binary delivery.
+The following historical snapshot covered pushed HEAD `d72b7127f7996e1eb6793553dfae11daf791cb96`. It records the repaired first two production groups and the subsequent timing/RPC findings before their fixes. The later b5cb snapshot below supersedes its pending gate/finding state, without rewriting its failures as passes. PR #150 was open, not merged. The existing HTTPS route succeeded on retry for ls-remote and push without new credentials or global configuration; this was source publication, not release delivery.
 
 ### Version linking and production review repairs
 
@@ -244,7 +244,7 @@ Before evidence uses `P/maintenance-before-overlay.json` to replace only `mainte
 
 `agent://MaintenanceFinalSourceCheck` now reports bounded source PASS at exact `d72b712`, no findings in its assigned scope, and unchanged production repair/regression source from `a4aa42e` through `d72b712`. It also source-challenges the disputed ordinary-finalization latch allegation: the retained Owner pointer observes unconditional latch publication before ordinary shutdown completion, while committed handoff is deliberately not tree death. This does not prove every handoff schedule or close the remote disputed thread by itself. No latch bypass was added. The checker ran no new tests, builds, CI, or release verification; model-family independence is unknown.
 
-### Latest actual version-baked caller proof
+### Earlier da7 version-baked caller proof
 
 Both latest builds target `github.com/thebtf/mcp-mux/muxcore/owner.Version=v0.31.0` with `-trimpath`, and both report actual modern owner version `v0.31.0`, era `2026-07-28`, cache off, original-pipe continuation, full-tree retirement, actual overwrite, and no held-frame replay.
 
@@ -266,7 +266,7 @@ The Linux worker records exit 0 for the direct Go 1.25.12 toolchain build under 
 
 These are private built-artifact customer journeys, not released binaries. Windows labels its candidate externally built and its worker reports a dirty working tree with preserved root-owned changes; its JSON source field is not a clean-tree attestation. Root retains build/source binding authority. Linux labels a candidate-root binary but does not claim a verified clean tree. Neither receipt establishes fresh full/live execution at `d72b712`, final CI acceptance, or delivered-consumer proof.
 
-### Latest local gates and external boundaries
+### Earlier local gates and external boundaries
 
 | Gate | Observed scope and limit |
 | --- | --- |
@@ -280,22 +280,99 @@ These are private built-artifact customer journeys, not released binaries. Windo
 
 Four native repair comment readbacks are retained in `P/pr150-repair-comment-readbacks.json`: [restart repair](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490097), [all-pin retirement](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490175), [startup fixture repair](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490220), and [environment guidance](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173490276). They prove posted/read-back replies, not blanket final acceptance.
 
-The subsequently retained `P/pr150-review-successor-d72b712.json` is terminal **REVIEW_UNAVAILABLE**, not a successful second configured pass: the installed reviewer has a one-pass role boundary and performed only its original invocation. This is not a provider outage, billing pause, or invented second invocation. Actual automatic review exists: CodeRabbit's recent no-actionable result selects only `maintenance_test.go`; Codex's current d72 review is COMMENTED with new findings. Its native snapshot records 9 threads, 5 resolved, 4 unresolved, and merge readiness false. The source-challenged latch thread remains remotely unresolved; no safety latch was weakened to silence it.
+At the d72 snapshot, `P/pr150-review-successor-d72b712.json` was terminal **REVIEW_UNAVAILABLE**, not a successful second configured pass: the installed reviewer had a one-pass role boundary and performed only its original invocation. This was not a provider outage or billing pause. CodeRabbit's automatic no-actionable result selected only `maintenance_test.go`; Codex's d72 review was COMMENTED with new findings. That historical native snapshot had 9 threads, 5 resolved, 4 unresolved, and merge readiness false. The latch thread was remotely unresolved then; its source challenge did not bypass a safety latch. These counts are not asserted as the final b5cb thread state.
 
-| Current unresolved review group | Recorded claim and next disposition |
+| Review group unresolved at d72 | Historical claim and later disposition |
 | --- | --- |
-| Hold clocks before durable fence commitment | The external source review classifies [the timing finding](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173425241) as VALID at d72: persistence delay consumes requested drain grace and TTL. Root must disposition/repair it against the accepted timing contract; the local PASS receipts do not answer that specific source claim. |
-| Lifecycle RPC budget omits finalization/durable-response phases | The external source review classifies [hold](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173618827) and [restart](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173618833) budgets as valid source-traced defects, not experimentally rerun findings. Root owns the full-operation bound and disposition. |
+| Hold clocks before durable fence commitment | [The timing finding](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173425241) was source-classified VALID: persistence delay consumed requested grace/TTL. It is now repaired in `5d5a599` with controlled delayed-writer and publication-fault proof below. |
+| Lifecycle RPC budget omits finalization/durable-response phases | [Hold](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173618827) and [restart](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4173618833) budget findings were valid source-traced defects. They are now repaired in `0e573dd` with real delayed-exchange and explicit-timeout proof below. |
 
-Thus T029/T030 local evidence is retained, while current-head T031 freeze acceptance is REPAIRING. The older seven-finding closeout and bounded current source PASS are not relabeled as a clean second all-diff review. Root must incorporate remaining CI and review outcomes before merge.
+At d72, T031 freeze acceptance was REPAIRING. The b5cb timing repairs and completed CI below close those earlier named defects and gate failures. The completed b5cb observer then admitted a new cold-start P1, so T031 remains REPAIRING. Earlier bounded source PASS receipts are not a clean second all-diff review.
+
+## Historical production-source premerge snapshot: b5cb
+
+This exact-source snapshot records `b5cb84157e86787f6e119771e062efbd98aa9b5f` before the newly admitted concurrent cold-start repair. PR #150 is open, not merged. Its timing, full-test, CI, and private live proofs remain valid within that source scope, not proof of a successor or permission to freeze. Later merge/tag/module/binary/canary receipts must stay in primary `.agent` evidence.
+
+### Durable clock and publication repair
+
+`5d5a599f880950eff5b330e97a36795234f23023` establishes a provisional durable HOLDING fence with the first complete aggregate acknowledgement. T is sampled once after that acknowledgement, retained in a copied clocked HOLDING lease, and persisted once. Later clocked-write, retirement, HELD, and response latency consumes that same window; no later stage resamples T. Either acquisition-write failure retains conservative authority, and the internal maintenance-failed guard prevents retirement callbacks from promoting it. The conservative seed remains retained. This changes no public API, state, or schema.
+
+`P/clock-before.log` preserves actual failed clock and publication regressions using the old-source overlay. `P/clock-after-corrected.log` records both top-level tests PASS: three delayed-writer cases and all four first/second-publication before/after-failure cases, seven passing leaf cases in total. Its package exit result is daemon PASS in 6.033s. The related fixture assertion was corrected to treat Removed=true plus authoritative tree proof as retirement even when finalization carries a warning, rather than inventing blocked retirement from the warning alone.
+
+Expanded `P/clock-transaction-boundaries.log` records `TestMaintenanceSecurity004TransactionBoundaries` PASS across initial_hold, clocked_hold, and release. Each covers PREPARE/PUBLISH/FINALIZE before/after faults: 18 passing leaf fault cases, plus three phase parents and one top-level PASS row. The matching valid COMMITTED-recovery allowance and conservative live-memory error semantics remain as specified. `P/clock-security-retirement-race.log` records daemon PASS in 18.013s; root's receipt reports the selected ten-case race gate PASS. The nonverbose raw file itself supplies only package result, not ten individual PASS rows.
+
+### Neutral lifecycle RPC policy and real exchanges
+
+`0e573dd79ad53d68282b5123e9bc399a61fc346e` selects one command-aware default completion allowance of **180 seconds plus exactly one requested drain interval** for hold and restart_owner. Forced restart selects 180s, ordinary 30s drain selects 210s. Positive explicit library timeouts remain unchanged, and other commands keep their existing 5s policy. This finite operational allowance is **not a universal bound** on arbitrary pin counts, stalled storage, or all upstream behavior. Timeout remains an unknown outcome requiring status inspection, not authority to resubmit a mutation, release a lease, cancel server work, or use a fallback. No new flag/API, automatic retry, state, or schema was added.
+
+`P/rpc-default-neutral-after.log` records five top-level PASS tests and twenty named PASS rows including policy subcases. It covers a real control exchange delayed 5200ms, explicit 50ms timeout with no resubmission/release, unchanged other-command policy, and overflow refusal before dial. `P/rpc-default-adapters-after.log` records three top-level PASS cases: delayed CLI hold, real tools/call forced restart, and delayed MCP hold typed refusal, each delayed beyond the former 5s budget while retaining its original outcome/ID. Command package PASS is 5.296s; MCP server package PASS is 10.493s. The nine owning timing docs are committed in b5cb; this writer did not change those external surfaces.
+
+### Exact b5cb artifacts and full gates
+
+Both final live builds use Go 1.25.12, `-trimpath`, and `-X github.com/thebtf/mcp-mux/muxcore/owner.Version=v0.31.0`. Both actual modern owners report `mux_version=v0.31.0`, era `2026-07-28`, and cache off. Complete JSON arrays, not previews, supply the counts below.
+
+| Exact b5cb live proof | Windows | Debian Linux |
+| --- | --- | --- |
+| Source SHA | `b5cb84157e86787f6e119771e062efbd98aa9b5f` | `b5cb84157e86787f6e119771e062efbd98aa9b5f` |
+| Binary SHA-256 | `8F696862FF7ACA144DE93E97108A889C1D170DE829E9E09DA9AAB0F4B1760C17` | `3A458ABC3FDAC7E0E98F25040EAF6EC44115CCF8DF6C5326284B8911BECCE14E` |
+| Assertions / failed | 1172/1172 PASS / 0 | 1191/1191 PASS / 0 |
+| Error / cleanup errors | Empty / 0 | Empty / 0 |
+| Private namespace shutdowns | 3 successful | 3 successful |
+| Primary JSON | `P/windows-live-b5cb.json` | `P/docker/linux-live-b5cb/linux-live-b5cb.json` |
+| Finished UTC | `2026-10-03T17:03:34.8547489Z` | `2026-10-03T17:04:25.9161562Z` |
+
+The Windows worker records build and smoke exit 0, reports a clean worktree, and binds its externally built candidate to the above source/hash. Its exact build is `go build -trimpath -ldflags '-X github.com/thebtf/mcp-mux/muxcore/owner.Version=v0.31.0' -o P/build/mcp-mux-b5cb.exe ./cmd/mcp-mux`; the runner selects C, that CandidateBinary, P scratch, `P/windows-live-b5cb` output, `P/windows-live-b5cb.json` evidence, and 180s timeout. Go 1.25.12 and primary TMP/TEMP/GOTMPDIR are recorded. Actual owner status is `P/windows-live-b5cb-observed-owner-status.json`, SHA-256 `be619fe8c61b5caf3034ec5e741715986c448040c1f4ca0469382bd2ab5d4a5c`. Cleanup records 23/23 owned identities closed and 5/5 host exits 0.
+
+The Linux worker records build and smoke exit 0 from `/repo/cb5cb`, using the direct cached Go 1.25.12 toolchain and the same linker target. Candidate is `/repo/cb5cb/.agent/tmp/u/mcp-mux-b5cb`; scratch is `/repo/cb5cb/.agent/tmp/u`, output `/repo/cb5cb/.agent/tmp/u/linux-live-b5cb`, evidence that output's sibling `linux-live-b5cb.json`, timeout 180s. Primary build/stdout/transcript/fixture records are under `P/docker/linux-live-b5cb/`. JSON SHA-256 is `9cbd45b80694ccf0a7191e055a9ca12da5075332aae6fe0294a4f60d36673b1f`; transcript SHA-256 is `a42bd19b3006fe3898a67ab901e4af7103fecf3273126f5b5cb3dbc29e6d5afb`. Linux worktree cleanliness is not independently claimed by its receipt.
+
+These b5cb binary signatures supersede the older da7/d72 signatures only within the recorded source scope. Original pipes, hold/drain/renew/resume/short TTL, actual overwrite, fresh same-era generation, and no replay pass on both platforms. Assertion totals include repeated observations, not independent scenario counts. These private artifacts do not prove the cold-start correction, a successor head, released binaries, or delivered-consumer canaries.
+
+| Exact b5cb root gate | Observed result and primary log |
+| --- | --- |
+| Root full tests at b5cb | Root command receipt exit 0; 2 tested packages PASS, 3 without test files. `P/root-full-b5cb.log`. |
+| Muxcore full tests at b5cb | Root command receipt exit 0; 24 tested packages PASS, 1 without test files. `P/muxcore-full-b5cb.log`. |
+| Root and muxcore vet at b5cb | Root command receipts exit 0, no diagnostics. `P/root-vet-b5cb.log` and `P/muxcore-vet-b5cb.log`; silence alone is not the exit proof. |
+| Native CI at b5cb | Root readback records all 5 jobs PASS: coverage, BSD, Ubuntu, Windows, macOS. [Run 37138998740](https://github.com/thebtf/mcp-mux/actions/runs/37138998740). Earlier matrix cancellations, compile/setup failures, and coverage/macOS fixture failures remain historical, not current pending gates or retroactive passes. |
+
+Root admits required T029/T030 premerge gates PASS at b5cb, retaining historical R1/critical/scenario signatures rather than claiming every older runner was repeated there. Those results remain recorded historical proof. A repaired successor requires root-provided exact-head receipts before final freeze; a later docs-only commit is not new runtime execution or a released canary.
+
+### Completed observer and reopened T031
+
+Three native posted/read-back replies in `P/pr150-timing-comment-readbacks.json` cover [clock repair](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174070866), [hold RPC policy](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174071036), and [restart RPC policy](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174071155). The final observer confirms all nine earlier threads resolved. Their admitted valid groups are repaired; the false ordinary-finalization latch claim remains source-challenged without weakening tree/latch proof.
+
+`P/pr150-review-final-b5cb841.json` records the final observer as COMPLETED with terminal `REVIEW_BUDGET_EXHAUSTED`. Both automatic b5cb reviews completed. The closing readback has ten threads: nine resolved and one unresolved MAJOR/P1, [PRRT_kwDORq0kOM6opvtg](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174063941). Concurrent ordinary legacy `engine.New` cold starters can return terminal `ErrFileLocked` while the winning starter holds the namespace lock until daemon readiness. This is a source-backed finding, not a rerun reproduction or intentional maintenance refusal.
+
+At b5cb, T031 was REPAIRING under root and `CooperativeColdStartFix`. The observer's one-pass observation budget limited that observer, not root repair or new-head proof. CodeRabbit's bounded maintenance assessment did not refute the Codex engine finding. No all-diff `REVIEW_CLEAN`, optional second configured invocation, current-head acceptance, source freeze, or released canary was claimed.
+
+The initial correction changed only cooperative `ipc.ErrFileLocked` to use the existing bounded exact-control readiness wait, while other lock errors propagated. It added no lock retry, competing spawn, or maintenance/era bypass. At that documentation snapshot, checks and P1 disposition were pending; the successor receipts below now close those specific cold-start obligations.
+
+## Current successor proof: 28947
+
+Root records committed/pushed source `28947dca06047bbb342600153f7c39c8868c00e8`. README restart tables and the prepared `0.31.0` changelog are committed there. The four owning specification documents remain uncommitted pending final root disposition/freeze. This section adds successor proof without extending or duplicating older receipts.
+
+| Proof | Recorded result and primary evidence |
+| --- | --- |
+| Windows actual cold-start RED/GREEN | Corrected real `engine.New`/`Run` fixture with old-source overlay fails both legacy and modern losers with `namespace file locked`, exit 1 in `P/coldstart-before-corrected-fixture.log`. Both pass after repair, exit 0, package 0.746s in `P/coldstart-after-corrected-fixture.log`. Earlier fixture-failure logs remain preserved, not selected GREEN. |
+| Cold-start safety | Root records occupied-but-unresponsive readiness failing closed after the existing 10s bound without a competing daemon, HELD refusal preserved in both eras, and non-contention lock errors terminal. Linux exact-28947 `P/docker/linux-live-28947/linux-live-28947.focused.log` independently records 4/4 top-level tests and 8 named PASS rows, 0 SKIP, exit 0, package 11.638s. |
+| Root and muxcore full tests | Exact-28947 logs `P/root-full-28947.log` and `P/muxcore-full-28947.log` explicitly record `EXIT_CODE=0`: root 2 tested packages PASS plus 3 without tests; muxcore 24 tested packages PASS plus 1 without tests. |
+| Root and muxcore vet | `P/root-vet-28947.log` and `P/muxcore-vet-28947.log` explicitly record `EXIT_CODE=0`, with no diagnostics. |
+| Current CI | Root's exact-SHA API query and native `run_watch` readback record run [37142995133](https://github.com/thebtf/mcp-mux/actions/runs/37142995133) completed SUCCESS, all five jobs PASS: coverage, Ubuntu, macOS, BSD, Windows. The initial `gh run list` timeout was a lookup failure, not a CI failure; the narrowed exact-SHA query supplied fresh facts. Historical b5cb CI is not substituted for this result. |
+
+Root parsed the complete compatibility-smoke JSON arrays: `P/windows-live-28947.json` has 1149/1149 assertions PASS; `P/docker/linux-live-28947/linux-live-28947.json` has 1173/1173 PASS. Both have zero errors and zero cleanup errors. These counts include repeated observations, not independent scenarios. They are private compatibility proofs, not release canaries or substitutes for the separate engine regression.
+
+The Windows JSON declares source 28947 and SHA-256 `8F696862FF7ACA144DE93E97108A889C1D170DE829E9E09DA9AAB0F4B1760C17`, matching b5cb. Root reports all 23 linked muxcore dependencies are candidate-rooted, but the CLI does not link `muxcore/engine`; that smoke cannot prove the cold-start correction. Embedded VCS identifies an older revision beginning `d3c5` with `vcs.modified=true`. That unexplained discrepancy remains an explicit artifact-identity limit, not exact embedded-28947 proof or a manufactured failure of the separately exercised engine regression.
+
+Linux `P/docker/linux-live-28947/linux-proof-receipt.json` binds a clean independent clone at `/repo/.agent/tmp/c28947`, Go 1.25.12, and version-baked owner `v0.31.0`. SHA-256 is `81f7fcf134966745d8b9c16884cf7322050628b9a4c3eb13b7d07a48b22421c2`; `linux-live-28947.build-metadata.log` records exact embedded revision 28947 and `vcs.modified=false`. The build and selected caller exit 0. Two earlier Linux preflights exited 1 with zero checks/commands/process observations for scratch ownership and output-containment configuration. Their retained `linux-live-28947.preflight.json` and `linux-live-28947.output-preflight.stdout.log` are setup failures before runtime, not product failures or zero-case passes.
+
+Root posted and read back [cold-start reply 4174265488](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174265488) in `P/pr150-coldstart-comment-readback.json`, then resolved the tenth thread through the native route. The nine earlier resolutions remain intact. A new eleventh [Codex native `SessionHandler` retirement finding](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4174287243) is under read-only investigation by `NativeHandlerRetirementFacts` and root disposition. No validity outcome or source repair is inferred from passing tests/CI. T031 stays REPAIRING; final freeze, technical acceptance, merge, and release remain unclaimed.
 
 ## Remaining release and consumer outcomes
 
-Earlier technical acceptance and current-head local PASS evidence remain recorded, but latest PR freeze acceptance is REPAIRING. Remaining effects include review/CI disposition, merge/release delivery, and consumer readback. This is not release completion or a generic global block.
+All recorded 28947 source gates and compatibility observations are PASS within the limits above. Root must disposition the new native-handler retirement finding before final freeze and T031 acceptance; passing gates do not refute that finding. Historical timing/CI/live receipts remain preserved within their exact scopes. Merge, tags, publication, and delivered-consumer canaries remain separate later outcomes.
 
 | Task / gate | Current recorded state | Outcome still required |
 | --- | --- | --- |
-| T032 release | In progress. Binary/library `0.31.0` is prepared; PR #150 is open and HEAD `d72b712` is pushed. Existing HTTPS Git succeeded on retry without new credentials/configuration. No merge, release tags, module publication, released binary, or post-merge canary is recorded. | Finish current-head review/CI acceptance, freeze the source after these four docs, then execute the authorized exact-SHA normal merge/tag-last and module/binary delivery flow. Post-merge/tag/canary evidence is retained in primary evidence, not later source edits. |
-| T033 consumers and canary | External handoffs and post-merge fresh-clone/module/binary/fresh-session proof remain pending. Root's native capability readback confirms Engram issue capability is unmounted; only that handoff effect is held. No proxy backend is invented. | Target-authorized handoff/readback and delivered-artifact canaries, including fresh-session hold/replace/resume. Claim `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` only after their actual criteria pass. |
+| T032 release | Binary/library `0.31.0` prepared; source 28947 committed/pushed and PR #150 open. Cold-start repair/proof and ten earlier thread resolutions are recorded. Current CI all five jobs PASS; the eleventh native-handler finding remains under disposition, and Windows embedded-source identity has a stated limit. No final freeze, merge, tags, publication, or released canary is recorded. | Disposition the new finding, admit any required successor proof, and accept/freeze these four docs before exact-head integration and authorized tag-last/module/binary delivery. Later delivery receipts are primary-only. |
+| T033 consumers and canary | Post-merge fresh-clone/tag/module/binary and fresh-session delivered hold/replace/resume proof remain pending. Engram native issue capability is unmounted with no proxy backend; its concrete handoff boundary becomes active after the delivered version/tag target is resolved, not as a global premerge hold. | Perform real target-bound consumer handoffs and delivered-artifact canaries after release-version/tag resolution. Claim `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` only on actual completed criteria. |
 
 Neither `PROJECT_RELEASE_PROTOCOL_PASS` nor `CONSUMER_HANDOFF_PASS` is claimed. Source implementation, bounded verification, technical acceptance, and consumer delivery remain separate states.
