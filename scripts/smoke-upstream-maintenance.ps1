@@ -142,12 +142,22 @@ function Finish-Native($Job, [int]$WaitSeconds = 15, [bool]$KillOnTimeout = $tru
 function Invoke-Native([string]$Executable, [string[]]$Arguments, $Context, [int]$WaitSeconds = 15) {
     return Finish-Native (Start-Native $Executable $Arguments $Context) $WaitSeconds
 }
+function Remember-Lease($Context, $Lease) {
+    if ($null -eq $Lease -or -not $Lease.ContainsKey("hold_id") -or -not $Lease.ContainsKey("server_id") -or [string]::IsNullOrWhiteSpace($Lease.hold_id) -or [string]::IsNullOrWhiteSpace($Lease.server_id)) { return }
+    for ($i = 0; $i -lt $Context.holds.Count; $i++) {
+        if ($Context.holds[$i].hold_id -ceq $Lease.hold_id) { $Context.holds[$i] = $Lease; return }
+    }
+    $Context.holds.Add($Lease)
+    Write-Trace "lease-owned" @{ namespace = $Context.name; control_path = $Context.control_path; lease = $Lease }
+}
 function Invoke-CLI($Context, [string[]]$Arguments, [switch]$Refusal) {
     $result = Invoke-Native $Launcher $Arguments $Context
+    if (-not $result.stdout.Trim().StartsWith("{")) { throw "CLI $($Arguments[0]) did not return one JSON object" }
+    $decoded = $result.stdout | ConvertFrom-Json -AsHashtable
+    if ($Arguments[0] -in @("hold", "renew") -and $decoded.ContainsKey("maintenance")) { Remember-Lease $Context $decoded.maintenance }
     Assert-PrivateReadback ($result.stdout + $result.stderr)
     Assert-Observation (($result.exit_code -ne 0) -eq $Refusal.IsPresent) "CLI exit: $($Arguments[0])" $result.exit_code
-    if (-not $result.stdout.Trim().StartsWith("{")) { throw "CLI $($Arguments[0]) did not return one JSON object" }
-    return ($result.stdout | ConvertFrom-Json -AsHashtable)
+    return $decoded
 }
 function New-Context([string]$Name) {
     $root = Join-Path $OutputDir $Name
@@ -397,10 +407,25 @@ function Assert-HeldReply($Session, $ID) {
     Assert-Observation ($reply.ContainsKey("error") -and $reply["error"]["code"] -eq -32005 -and $reply["error"]["message"] -ceq "upstream held for update" -and $reply["error"]["data"]["error_code"] -ceq "maintenance_held") "Immediate typed maintenance reply" $reply
     Assert-OpenPipes $Session
 }
+function Get-UtcInstant($Value) {
+    if ($Value -is [DateTimeOffset]) { return $Value.ToUniversalTime() }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Unspecified) { throw "Timestamp has no authoritative timezone" }
+        return [DateTimeOffset]::new($Value).ToUniversalTime()
+    }
+    if ($Value -is [string] -and $Value -match '(?:[zZ]|[+-]\d{2}:\d{2})$') {
+        return [DateTimeOffset]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
+    }
+    throw "Timestamp must carry an explicit timezone as a string, DateTime, or DateTimeOffset"
+}
 function Assert-Held($Result, [string]$ServerID) {
     Assert-Observation ($Result["ok"] -eq $true -and $Result.ContainsKey("maintenance")) "Hold succeeds with a maintenance result" $Result
     $lease = $Result["maintenance"]
-    Assert-Observation ($lease["state"] -ceq "HELD" -and $lease["trees_retired"] -eq $true -and $lease["server_id"] -ceq $ServerID -and -not [string]::IsNullOrWhiteSpace($lease["hold_id"]) -and [DateTimeOffset]::Parse($lease["expires_at"]) -gt [DateTimeOffset]::UtcNow) "Usable HELD requires retired trees and future expiry" $lease
+    $expiry = Get-UtcInstant $lease["expires_at"]
+    $now = [DateTimeOffset]::UtcNow
+    $predicate = @{ state_held = ($lease["state"] -ceq "HELD"); trees_retired = ($lease["trees_retired"] -eq $true); server_matches = ($lease["server_id"] -ceq $ServerID); hold_id_present = (-not [string]::IsNullOrWhiteSpace($lease["hold_id"])); expiry_future = ($expiry -gt $now) }
+    $observed = @{ lease = $lease; predicate = $predicate; expected_server_id = $ServerID; state_type = $lease["state"].GetType().FullName; trees_retired_type = $lease["trees_retired"].GetType().FullName; server_id_type = $lease["server_id"].GetType().FullName; hold_id_type = $lease["hold_id"].GetType().FullName; expiry_type = $lease["expires_at"].GetType().FullName; expiry_utc = $expiry.ToString("o"); expiry_utc_ticks = $expiry.UtcTicks; now_utc = $now.ToString("o"); now_utc_ticks = $now.UtcTicks }
+    Assert-Observation ($predicate.state_held -and $predicate.trees_retired -and $predicate.server_matches -and $predicate.hold_id_present -and $predicate.expiry_future) "Usable HELD requires retired trees and future expiry" $observed
     return $lease
 }
 function Wait-Fence($Context, $Job) {
@@ -408,7 +433,7 @@ function Wait-Fence($Context, $Job) {
     while ([DateTime]::UtcNow -lt $until) {
         $status = Get-Status $Context
         $leases = @($status["maintenance"] | Where-Object { $_["state"] -in @("HOLDING", "HELD") })
-        if ($leases.Count -eq 1) { Write-Trace "fence-observed" $leases[0]; return $leases[0] }
+        if ($leases.Count -eq 1) { Remember-Lease $Context $leases[0]; Write-Trace "fence-observed" $leases[0]; return $leases[0] }
         if ($Job.process.HasExited) { throw "Hold command exited before its fence could be observed" }
         Start-Sleep -Milliseconds 25
     }
@@ -558,13 +583,14 @@ try {
     $drained = Wait-Reply $a 100
     Assert-Observation ($drained.ContainsKey("result")) "Already-forwarded short work completes during drain" $drained
     $holdResult = Finish-Native $holdJob
+    $holdResponse = $holdResult.stdout | ConvertFrom-Json -AsHashtable
+    if ($holdResponse.ContainsKey("maintenance")) { Remember-Lease $ctx $holdResponse.maintenance }
     Assert-PrivateReadback ($holdResult.stdout + $holdResult.stderr)
     Assert-Observation ($holdResult.exit_code -eq 0) "Actual hold CLI succeeds" $holdResult.exit_code
-    $lease = Assert-Held ($holdResult.stdout | ConvertFrom-Json -AsHashtable) $owner.server_id
-    $ctx.holds.Add($lease)
+    $lease = Assert-Held $holdResponse $owner.server_id
     $completion = @(Get-Capture $ctx | Where-Object { $_["kind"] -eq "completed" -and (Get-FrameMarker $_["frame"]) -ceq "drain-finish" })
-    Assert-Observation ($completion.Count -eq 1 -and [DateTimeOffset]::Parse($completion[0].utc) -le [DateTimeOffset]::Parse($lease.drain_deadline)) "Drain completion precedes the accepted single deadline" $completion
-    Assert-Observation ([Math]::Abs(([DateTimeOffset]::Parse($lease.drain_deadline) - [DateTimeOffset]::Parse($lease.expires_at).AddSeconds(-30)).TotalSeconds - 2) -lt 0.1) "Hold reports the requested single two-second drain bound" $lease
+    Assert-Observation ($completion.Count -eq 1 -and (Get-UtcInstant $completion[0].utc) -le (Get-UtcInstant $lease.drain_deadline)) "Drain completion precedes the accepted single deadline" $completion
+    Assert-Observation ([Math]::Abs(((Get-UtcInstant $lease.drain_deadline) - (Get-UtcInstant $lease.expires_at).AddSeconds(-30)).TotalSeconds - 2) -lt 0.1) "Hold reports the requested single two-second drain bound" $lease
     Assert-TreeRetired $ctx $Fixture 1
     Overwrite-Executable $Fixture $V2
     Assert-TreeRetired $ctx $Fixture 1
@@ -577,8 +603,8 @@ try {
     $renew = Invoke-CLI $ctx @("renew", $lease.hold_id, "--ttl", "30s", "--json")
     $renewAfter = [DateTimeOffset]::UtcNow
     $renewed = Assert-Held $renew $owner.server_id
-    $expiry = [DateTimeOffset]::Parse($renewed.expires_at)
-    Assert-Observation ($renewed.hold_id -ceq $lease.hold_id -and $expiry -gt [DateTimeOffset]::Parse($lease.expires_at) -and $expiry -ge $renewBefore.AddSeconds(30).AddMilliseconds(-100) -and $expiry -le $renewAfter.AddSeconds(30).AddMilliseconds(100)) "Renew expiry is calculated from acceptance" $renewed
+    $expiry = Get-UtcInstant $renewed.expires_at
+    Assert-Observation ($renewed.hold_id -ceq $lease.hold_id -and $expiry -gt (Get-UtcInstant $lease.expires_at) -and $expiry -ge $renewBefore.AddSeconds(30).AddMilliseconds(-100) -and $expiry -le $renewAfter.AddSeconds(30).AddMilliseconds(100)) "Renew expiry is calculated from acceptance" $renewed
     $lease = $renewed
     $conflict = Invoke-CLI $ctx @("hold", $owner.server_id, "--ttl", "30s", "--drain-timeout", "0s", "--json") -Refusal
     Assert-Observation ($conflict["error_code"] -ceq "maintenance_conflict") "Competing acquisition cannot replace the lease" $conflict
@@ -603,7 +629,7 @@ try {
         $after = Get-Status $ctx
         Assert-Observation ($after.pid -eq $beforeStatus.pid -and $after.daemon_generation -ceq $beforeStatus.daemon_generation -and (Test-IdentityAlive $daemon)) "Refusal retains the original daemon" @{ pid = $after.pid; generation = $after.daemon_generation }
         $active = @($after["maintenance"] | Where-Object { $_.hold_id -ceq $lease.hold_id })
-        Assert-Observation ($active.Count -eq 1 -and $active[0].state -ceq "HELD" -and $active[0].expires_at -eq $lease.expires_at) "Refusal leaves the current lease unchanged" $active
+        Assert-Observation ($active.Count -eq 1 -and $active[0].state -ceq "HELD" -and (Get-UtcInstant $active[0].expires_at) -eq (Get-UtcInstant $lease.expires_at)) "Refusal leaves the current lease unchanged" $active
         Assert-TreeRetired $ctx $Fixture 1
         $activationAfter = @(Get-ChildItem -LiteralPath (Join-Path $OutputDir "bin") -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_.PSIsContainer) { "directory:" + $_.FullName } else { "file:" + $_.FullName + ":" + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash } })
         Assert-Observation ($activationAfter.Count -gt 0 -and @(Compare-Object $activationBefore $activationAfter).Count -eq 0) "Refusal leaves launcher, pending binary, layout, and active pointer untouched" $activationAfter
@@ -628,11 +654,12 @@ try {
     $terminated = Wait-Reply $a 400
     Assert-Observation ($terminated.ContainsKey("error") -and -not $terminated.ContainsKey("result")) "Unfinished work ends once with a terminal error" $terminated
     $heldResult = Finish-Native $holdJob
+    $heldResponse = $heldResult.stdout | ConvertFrom-Json -AsHashtable
+    if ($heldResponse.ContainsKey("maintenance")) { Remember-Lease $ctx $heldResponse.maintenance }
     Assert-Observation ($heldResult.exit_code -eq 0) "Short TTL hold succeeds before expiry" $heldResult.exit_code
-    $ttlLease = Assert-Held ($heldResult.stdout | ConvertFrom-Json -AsHashtable) $ttlServerID
-    $ctx.holds.Add($ttlLease)
+    $ttlLease = Assert-Held $heldResponse $ttlServerID
     Assert-TreeRetired $ctx $Fixture 2
-    $until = [DateTimeOffset]::Parse($ttlLease.expires_at)
+    $until = Get-UtcInstant $ttlLease.expires_at
     while ([DateTimeOffset]::UtcNow -lt $until) {
         Assert-TreeRetired $ctx $Fixture 2
         Start-Sleep -Milliseconds 100
@@ -655,7 +682,6 @@ try {
     Observe-Tree $rp $RecoveryFixture $recovery
     $ro = Get-Owner $recovery $RecoveryFixture
     $rl = Assert-Held (Invoke-CLI $recovery @("hold", $ro.server_id, "--ttl", "30s", "--drain-timeout", "0s", "--json")) $ro.server_id
-    $recovery.holds.Add($rl)
     Assert-TreeRetired $recovery $RecoveryFixture 1
     Overwrite-Executable $RecoveryFixture $V2
     $oldStatus = Get-Status $recovery
@@ -685,7 +711,7 @@ try {
     Assert-Observation ($null -ne $reloaded) "Aware replacement daemon comes up after unplanned loss" $reloaded
     [void](Get-Identity ([int]$reloaded.pid) "recovery-successor")
     $saved = @($reloaded["maintenance"] | Where-Object { $_.hold_id -ceq $rl.hold_id })
-    Assert-Observation ($saved.Count -eq 1 -and $saved[0].state -ceq "HELD" -and $saved[0].trees_retired -eq $true -and $saved[0].expires_at -eq $rl.expires_at) "Durable HELD was restored before fresh admission" $saved
+    Assert-Observation ($saved.Count -eq 1 -and $saved[0].state -ceq "HELD" -and $saved[0].trees_retired -eq $true -and (Get-UtcInstant $saved[0].expires_at) -eq (Get-UtcInstant $rl.expires_at)) "Durable HELD was restored before fresh admission" $saved
     Assert-TreeRetired $recovery $RecoveryFixture 1
     Resume-Lease $recovery $rl
     $recovered = Invoke-Probe $r 602 "aware-recovered" "2"
@@ -707,7 +733,6 @@ try {
     Assert-Observation ($modernPID -gt 0) "Modern real upstream PID is observable" $modernPID
     $modernIdentity = Get-Identity $modernPID "modern-upstream" $Modern
     $ml = Assert-Held (Invoke-CLI $modernCtx @("hold", $mo.server_id, "--ttl", "30s", "--drain-timeout", "0s", "--json")) $mo.server_id
-    $modernCtx.holds.Add($ml)
     Assert-Observation (-not (Test-IdentityAlive $modernIdentity)) "Modern managed upstream is dead while held" $modernIdentity
     $preholdCapture = @(Read-CaptureLines $modernCtx.modern_capture)
     Assert-Observation ($preholdCapture.Count -eq 1 -and $preholdCapture[0] -ceq $opening) "Modern opening was forwarded unchanged without legacy bootstrap" $preholdCapture
@@ -757,12 +782,12 @@ try {
         foreach ($lease in $context.holds) {
             try {
                 $status = Get-Status $context
-                $current = @($status["maintenance"] | Where-Object { $_.hold_id -ceq $lease.hold_id -and $_.state -ne "RELEASED" })
+                $current = @($status["maintenance"] | Where-Object { $_.hold_id -ceq $lease.hold_id -and $_.server_id -ceq $lease.server_id -and $_.state -ne "RELEASED" })
                 if ($current.Count -gt 0) {
                     if ($current[0].state -ne "HELD" -or $current[0].trees_retired -ne $true) { throw "Retirement is blocked; retain authority and owned resources for root recovery" }
                     Resume-Lease $context $current[0]
                 }
-            } catch { $cleanup.Add(@{ namespace = $context.name; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
+            } catch { $cleanup.Add(@{ namespace = $context.name; control_path = $context.control_path; hold_id = $lease.hold_id; server_id = $lease.server_id; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
         }
     }
     foreach ($session in $Sessions) {

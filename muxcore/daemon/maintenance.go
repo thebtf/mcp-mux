@@ -232,6 +232,13 @@ func (d *Daemon) acquireMaintenance(req control.Request, ttl time.Duration) (con
 		d.maintenanceGate.Unlock()
 		return control.MaintenanceResult{}, control.ErrMaintenanceHeld
 	}
+	for _, lease := range d.maintenanceLeases {
+		if lease.result.ServerID == req.ServerID {
+			result := lease.result
+			d.maintenanceGate.Unlock()
+			return result, maintenanceFailure(control.ErrMaintenanceConflict, lease)
+		}
+	}
 	d.mu.RLock()
 	selected := d.owners[req.ServerID]
 	if selected == nil {

@@ -206,7 +206,7 @@ func TestHandoffUnix_FinalAckDisconnectClosesTransferredFDsAndStartsOneFallback(
 	if err := os.WriteFile(tokenPath, []byte(token), 0o600); err != nil {
 		t.Fatalf("write token: %v", err)
 	}
-	socketPath := filepath.Join(t.TempDir(), "handoff.sock")
+	socketPath := shortSocketPath(t, "handoff.sock")
 	serverErr := make(chan error, 1)
 	go func() {
 		conn, err := listenHandoffUnix(socketPath, 5*time.Second)
@@ -280,7 +280,7 @@ func TestHandoffIntegration_FinalAckWriteFailureAbortsPreparedTreeUnix(t *testin
 	}
 	const sid = "unix-final-ack-platform"
 	const token = "unix-final-ack-platform-token"
-	socketPath := filepath.Join(t.TempDir(), "handoff.sock")
+	socketPath := shortSocketPath(t, "handoff.sock")
 	serverDone := make(chan error, 1)
 	go func() {
 		conn, listenErr := listenHandoffUnix(socketPath, 5*time.Second)
@@ -394,7 +394,7 @@ func TestMixedRestartActivatesCacheOnlyOnlyAfterPredecessorBarrier(t *testing.T)
 			t.Cleanup(func() { _ = os.Remove(SnapshotPath()) })
 			tmp := t.TempDir()
 			pidPath := filepath.Join(tmp, "pids")
-			controlPath := filepath.Join(tmp, "control.sock")
+			controlPath := shortSocketPath(t, "control.sock")
 			predecessor, err := New(Config{
 				Name:         "mixed-barrier-predecessor",
 				ControlPath:  controlPath,
@@ -450,7 +450,7 @@ func TestMixedRestartActivatesCacheOnlyOnlyAfterPredecessorBarrier(t *testing.T)
 			if err := os.WriteFile(tokenPath, []byte(token), 0o600); err != nil {
 				t.Fatalf("write token: %v", err)
 			}
-			handoffPath := filepath.Join(tmp, "handoff.sock")
+			handoffPath := shortSocketPath(t, "handoff.sock")
 			handoffDone := make(chan error, 1)
 			go func() {
 				conn, listenErr := listenHandoffUnix(handoffPath, 5*time.Second)

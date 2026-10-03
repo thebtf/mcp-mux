@@ -340,6 +340,9 @@ func TestMaintenanceLedgerRenewReleaseRecoveryAndReadOnlyStatus(t *testing.T) {
 	if len(states) != 1 || states[0].HoldID != result.HoldID || states[0].ServerID != "" || states[0].State != control.MaintenanceHeld {
 		t.Fatalf("recovered authority: %+v", states)
 	}
+	if _, err := recovered.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid}); !errors.Is(err, control.ErrMaintenanceNotFound) {
+		t.Fatalf("recovered private context invented stale display-target authority: %v", err)
+	}
 	if _, err := recovered.HandleMaintenance(control.Request{Cmd: "resume", HoldID: "stale"}); !errors.Is(err, control.ErrMaintenanceConflict) {
 		t.Fatalf("stale release: %v", err)
 	}
@@ -404,6 +407,9 @@ func TestMaintenanceBlockedTTLDoesNotReleaseUnprovenTree(t *testing.T) {
 	if _, err := d.HandleMaintenance(control.Request{Cmd: "renew", HoldID: result.HoldID}); !errors.Is(err, control.ErrMaintenanceConflict) {
 		t.Fatalf("expired blocked lease renewed: %v", err)
 	}
+	if competing, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(600000)}); !errors.Is(err, control.ErrMaintenanceConflict) || competing.HoldID != result.HoldID || competing.State != control.MaintenanceRetirementBlocked || !competing.ExpiresAt.Equal(result.ExpiresAt) {
+		t.Fatalf("expired incomplete lease was replaced/extended by competing hold: %+v %v", competing, err)
+	}
 	allow.Store(true)
 	waitForDaemonCondition(t, 5*time.Second, func() bool { return len(d.maintenanceResults()) == 0 }, "exact retirement retry did not durably release expired fence")
 	if _, _, _, err := d.Spawn(req); err != nil {
@@ -429,6 +435,9 @@ func TestMaintenancePersistenceFailureRemainsFencedUntilDurableRetry(t *testing.
 	result, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(5000)})
 	if !errors.Is(err, control.ErrMaintenancePersistenceFailed) || result.State == control.MaintenanceHeld {
 		t.Fatalf("uncommitted HELD acknowledged: %+v %v", result, err)
+	}
+	if competing, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(600000)}); !errors.Is(err, control.ErrMaintenanceConflict) || competing.HoldID != result.HoldID || competing.State != result.State || !competing.ExpiresAt.Equal(result.ExpiresAt) {
+		t.Fatalf("uncommitted retirement lease lost its original target conflict: %+v %v", competing, err)
 	}
 	if _, _, _, err := d.Spawn(req); !errors.Is(err, control.ErrMaintenanceHeld) {
 		t.Fatalf("failed commit opened admission: %v", err)
@@ -752,5 +761,81 @@ func TestMaintenanceOverlappingContextSupersetRefusesBeforeFence(t *testing.T) {
 	}
 	if len(d.maintenanceResults()) != 0 || d.OwnerCount() != 2 {
 		t.Fatal("ambiguous hold mutated owners or ledger")
+	}
+}
+
+func TestMaintenanceCompetingHoldPreservesRetiredTargetLease(t *testing.T) {
+	d := maintenanceDaemon(t)
+	req, _, _, _ := maintenanceHelperRequest(t)
+	_, sid, _, err := d.Spawn(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := d.Entry(sid)
+	held, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(600000)})
+	if err != nil || held.State != control.MaintenanceHeld || !entry.Owner.MaintenanceRetired() || d.Entry(sid) != nil {
+		t.Fatalf("original target was not retired under its lease: %+v %v", held, err)
+	}
+	before, err := os.ReadFile(d.maintenancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionBefore, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ttl := range []int64{5000, 600000, 3600000} {
+		result, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, DrainTimeoutMs: 1000, HoldTTLMS: maintenanceTTL(ttl)})
+		var failure *control.MaintenanceError
+		if !errors.Is(err, control.ErrMaintenanceConflict) || !errors.As(err, &failure) || failure.Result == nil || result.HoldID != held.HoldID || result.ServerID != sid || result.State != held.State || !result.ExpiresAt.Equal(held.ExpiresAt) || !result.DrainDeadline.Equal(held.DrainDeadline) || result.TreesRetired != held.TreesRetired || failure.Result.HoldID != held.HoldID {
+			t.Fatalf("competing hold replaced/renewed the original authority: %+v %v", result, err)
+		}
+	}
+	after, err := os.ReadFile(d.maintenancePath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("competing hold changed durable lease authority: %v", err)
+	}
+	transactionAfter, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+	if err != nil || !bytes.Equal(transactionBefore, transactionAfter) {
+		t.Fatalf("competing hold changed durable transaction authority: %v", err)
+	}
+	states := d.maintenanceResults()
+	if len(states) != 1 || states[0].HoldID != held.HoldID || !states[0].ExpiresAt.Equal(held.ExpiresAt) {
+		t.Fatalf("competing hold changed live lease authority: %+v", states)
+	}
+	if _, _, _, err := d.Spawn(req); !errors.Is(err, control.ErrMaintenanceHeld) {
+		t.Fatalf("competing hold reopened the original launch context: %v", err)
+	}
+	if _, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid + "-other"}); !errors.Is(err, control.ErrMaintenanceNotFound) {
+		t.Fatalf("exact display-target conflict widened to a different selector: %v", err)
+	}
+
+	other, _, _, effects := maintenanceHelperRequest(t)
+	path, otherSID, token, err := d.Spawn(other)
+	if err != nil || otherSID == sid {
+		t.Fatalf("unrelated context could not obtain its own owner: %q %v", otherSID, err)
+	}
+	conn, scanner := connectSpawnedOwner(t, path, token)
+	defer conn.Close()
+	fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"maintenance-competitor","version":"1"}}}`)
+	readDaemonResponseID(t, scanner, "1")
+	fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":2,"method":"maintenance/write","params":{"marker":"outside-active-lease"}}`)
+	readDaemonResponseID(t, scanner, "2")
+	data, err := os.ReadFile(effects)
+	if err != nil || string(data) != "outside-active-lease\n" {
+		t.Fatalf("unrelated context was not runnable during the lease: %q %v", data, err)
+	}
+	otherHeld, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: otherSID, HoldTTLMS: maintenanceTTL(600000)})
+	if err != nil || otherHeld.State != control.MaintenanceHeld || otherHeld.HoldID == held.HoldID {
+		t.Fatalf("different selector could not acquire its unrelated lease: %+v %v", otherHeld, err)
+	}
+	if _, err := d.HandleMaintenance(control.Request{Cmd: "resume", HoldID: otherHeld.HoldID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.HandleMaintenance(control.Request{Cmd: "resume", HoldID: held.HoldID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid}); !errors.Is(err, control.ErrMaintenanceNotFound) {
+		t.Fatalf("released target retained stale conflict authority: %v", err)
 	}
 }
