@@ -127,6 +127,12 @@ Without a positive caller timeout, neutral `control.SendWithTimeout` allows 180s
 Explicit positive budgets are honored; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
 A timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, with no automatic retry/resume or stop fallback.
 
+CLI `stop` must terminate with status 1 after a contacted-daemon error or invalid/
+untyped failure response, never continuing into per-owner/data fallback. Genuine
+daemon absence retains its existing path. Keep recovered timers and control
+request serving paused until every fallible daemon-construction step succeeds;
+failed construction must not retain a stale expiry mutation or admit control work.
+
 Scope is the selected owner's finite admitted CWD/era/security/configuration/
 namespace context set, not a host-wide executable lock. Aware shims preserve
 host pipes, return original numeric/string ID `-32005` maintenance errors before

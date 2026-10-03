@@ -652,6 +652,11 @@ _, err = control.SendMaintenance(controlPath, control.Request{
 Explicit positive timeouts are honored unchanged; all other commands retain 5s. This is finite exchange headroom, not full-pin/storage completion.
 Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status; do not automatically retry, resume, or fall back to stop.
 
+CLI `stop` treats a contacted-daemon error, including an untyped failure or invalid
+response, as terminal status 1 without per-owner or legacy data-channel fallback.
+Successful shutdown and the genuinely absent-daemon path are unchanged; an
+unknown contacted outcome is not permission to bypass daemon authority.
+
 `MaintenanceResult` contains `HoldID`, `ServerID`, `State`, `ExpiresAt`,
 `DrainDeadline`, and `TreesRetired`. States are `MaintenanceHolding`/`HOLDING`,
 `MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
@@ -683,6 +688,12 @@ A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
 TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
 Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+Recovered lease expiry timers and control request serving activate only after
+successful daemon construction. Failed registry publication or control setup
+leaves no recovered timer or control mutation admission. Successful recovery
+keeps the original accepted expiry and blocked `HOLDING`/`RETIREMENT_BLOCKED`
+fences; startup still uses the existing namespace lock.
 
 `Response` adds optional `Maintenance` and `ErrorCode`; `OwnerInfo` adds optional
 `Maintenance`. Daemon status retains a safe maintenance list after owner removal.

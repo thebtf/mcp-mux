@@ -83,9 +83,17 @@ Sample `T` once after its first complete writer acknowledgment, then persist clo
 That write, retirement, HELD persistence, and response consume the original TTL/drain window; write failure retains the seed fence.
 Incomplete recovery remains `RETIREMENT_BLOCKED`, without expiry/resume. No schema or state is added.
 
+Recovered lease timers and control request serving stay paused through fallible
+daemon construction. Only successful construction activates them; failed registry
+publication/control setup cannot leave a stale timer overwriting a renewed lease.
+Recovery retains original expiry and blocked fences, without new API/state/schema.
+
 Neutral control's default for `hold`/`restart_owner` is 180s plus one drain; CLI/MCP request it with a zero caller timeout.
 Explicit positive budgets remain unchanged; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
 Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, without automatic retry/resume or stop fallback.
+CLI `stop` returns status 1 when a contacted daemon yields an error or invalid/
+untyped failure response, with no per-owner or legacy data-channel fallback.
+Successful shutdown and genuinely absent-daemon behavior remain unchanged.
 
 ## Host transport and lifecycle
 
@@ -161,7 +169,9 @@ afterward. Named totals include parents, not independent scenarios. Root tests
 and both vet suites pass at their recorded source. Fixture-only successor
 `435bcfa70da85f3763f1ddbc861016f2e18b07c4` closes the old owner-test failure
 with fresh whole-muxcore PASS, without production changes after 6fc7. Historical
-RED remains preserved; Linux/caller/CI and final review/acceptance are pending.
+RED and completed family proof remain preserved. New timer/uncertain-stop fixes
+have focused RED/GREEN and race proof; their new-head full/caller/CI and final
+review/acceptance remain pending, not the closed native callback family.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

@@ -63,6 +63,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   native sessions as teardown producers. Ordinary removal and maintenance both
   require quiescence. Cancellation is not settlement; active work keeps retirement
   blocked without TTL/resume bypass. Public `PendingRequests` remains request-only.
+- Recovered lease timers and control request serving activate only after daemon
+  construction succeeds. Failed registry/control setup cannot leave a stale
+  expiry timer that later overwrites renewed authority; accepted expiry is unchanged.
+- CLI `stop` returns status 1 on a contacted-daemon error or invalid/untyped
+  failure response, without per-owner or legacy data-channel fallback. Successful
+  shutdown and the genuinely absent-daemon path retain their existing behavior.
 
 ### Compatibility
 
@@ -85,8 +91,9 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Native-family proof at 6fc7 records seven top-level tests and 45 named PASS
   rows, including parents, in normal and race runs. Root tests and both vet suites
   pass at their recorded source. Fixture-only 435bcfa closes the old owner-test
-  failure with fresh full-muxcore PASS, without production changes. New-source
-  Linux/caller/CI and final acceptance remain pending; historical failures retained.
+  failure with fresh full-muxcore PASS. Timer and uncertain-stop corrections now
+  have focused RED/GREEN and race proof; their new-head full/caller/CI and final
+  acceptance remain pending. Older family proof stays source-bound and closed.
 
 ### Rollback
 
