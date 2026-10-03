@@ -425,9 +425,7 @@ func runStop(drainTimeout time.Duration, force bool) int {
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  daemon: error: %s\n", lifecycleErrorText(err))
-			if isMaintenanceError(err) {
-				return 1
-			}
+			return 1
 		} else {
 			fmt.Fprintf(os.Stderr, "  daemon: %s\n", resp.Message)
 		}
