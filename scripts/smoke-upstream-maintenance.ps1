@@ -266,9 +266,20 @@ function Get-Identity([int]$ProcessId, [string]$Label, [string]$ExpectedPath = "
         return $identity
     } finally { if ($null -eq $StartedProcess) { $process.Dispose() } }
 }
-function Test-IdentityAlive($Identity) {
+function Test-IdentityAlive($Identity, [switch]$WaitForExit, [DateTime]$ExitDeadline = $Deadline) {
     try { $process = [Diagnostics.Process]::GetProcessById([int]$Identity.pid) } catch [ArgumentException] { return $false }
     try {
+        if ($WaitForExit) {
+            try {
+                if ($process.HasExited) { return $false }
+                if ($process.StartTime.ToUniversalTime().Ticks -ne $Identity.start_ticks) { return $false }
+                $remaining = [int][Math]::Max(1, ($ExitDeadline - [DateTime]::UtcNow).TotalMilliseconds)
+                if (-not $process.WaitForExit($remaining)) { throw "Captured owned process survived lifecycle cleanup: $($Identity.label); OS exit was not observed within the close budget" }
+            } catch [InvalidOperationException] {
+                if ($process.HasExited) { return $false }
+                throw
+            }
+        }
         $current = Read-ProcessIdentity $process $Identity.label -ExpectedStartTicks $Identity.start_ticks
         if ($null -eq $current) { return $false }
         if ($current.executable -ne $Identity.executable) { throw "Captured process changed executable without exiting" }
@@ -832,11 +843,7 @@ try {
     }
     foreach ($identity in $Identities) {
         try {
-            while (Test-IdentityAlive $identity) {
-                if (-not $shutdownAccepted -or [DateTime]::UtcNow -ge $closeDeadline) { throw "Captured owned process survived lifecycle cleanup: $($identity.label)" }
-                $remaining = [int][Math]::Max(1, ($closeDeadline - [DateTime]::UtcNow).TotalMilliseconds)
-                Start-Sleep -Milliseconds ([Math]::Min(25, $remaining))
-            }
+            if (Test-IdentityAlive $identity -WaitForExit:$shutdownAccepted -ExitDeadline $closeDeadline) { throw "Captured owned process survived lifecycle cleanup: $($identity.label)" }
             Write-Trace "owned-process-closed" @{ identity = $identity; captured_identity_alive = $false; observed_utc = [DateTime]::UtcNow.ToString("o"); close_deadline_utc = $closeDeadline.ToString("o") }
         } catch { $cleanup.Add(@{ identity = $identity; error = Protect-Text $_.Exception.Message }); $ExitCode = 1 }
     }
