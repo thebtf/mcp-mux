@@ -4,9 +4,11 @@
 
 **Created**: 2026-10-03
 
-**Status**: Draft, requirements reviewed against accepted ADR-015; implementation not started.
+**Status**: Implemented in candidate `1f3c119ef6841b219412e4e6a93f6a452b7339a8`; requirements reviewed against accepted ADR-015. Verification is partial, root technical acceptance is pending, and the feature is not delivered.
 
 **Input**: [GitHub #135](https://github.com/thebtf/mcp-mux/issues/135): release a managed upstream for in-place executable replacement and suppress respawn until explicit resume or safe timeout. Existing stop is not a maintenance hold.
+
+Current milestone evidence is in [release evidence](release-evidence.md) and [tasks](tasks.md). Windows and Debian Linux live replacement passed at `45d4f93`; root full tests/vet, focused maintenance race, integrated five-package race, and the bounded seven-finding source closeout have recorded receipts. Those observations do not complete R1 parity, critical-suite recovery, Scenario 5b/8, or final root review. The accepted full-slice scope retains ordinary release intent, not a source-only exemption. No release version, PR, tags, current-module publication, or consumer delivery is recorded.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -136,4 +138,4 @@ An operator can inspect the exact maintenance state and trust that a daemon rest
 - Original-ID immediate-error and no-replay guarantees apply to maintenance-aware shims. Older shims retain only the start fence enforced by the aware daemon; unmanaged old binaries cannot be fenced by this feature.
 - Active-lease transfer is excluded. Controlled restart, handoff, shutdown, downgrade, and empty-daemon idle exit stay blocked until safe release. Incomplete retirement after unplanned loss stays blocked; metadata does not recreate lost process-tree authority.
 - Released modern lifecycle quarantine remains in force. Same-host transparent modern restoration is not promised where existing native admission requires a new launch.
-- Acceptance and release require the repository's existing cross-platform regression, production, and consumer-delivery gates. This SpecKit artifact does not claim implementation or release completion.
+- Acceptance and release require the repository's existing cross-platform regression, production, and consumer-delivery gates. These artifacts record implemented source and bounded verification, not technical acceptance or release completion.

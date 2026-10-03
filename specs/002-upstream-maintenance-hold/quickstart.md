@@ -1,6 +1,6 @@
 # Prove live upstream executable replacement
 
-This guide is an implementation/release oracle. This documentation correction ran no commands. Root reports Windows security cases 002/003/004 and transaction-fault/acknowledged-release regressions GREEN; those reports are not Unix full-runtime proof or consumer-delivery acceptance. Full Unix runtime remains unexercised in the supplied evidence. Source writes are not release completion. Root owns exact-head evidence and the remaining cross-platform/release gates below.
+This guide is the implementation/release oracle. The feature, fixtures, and cross-platform runner are implemented in candidate `1f3c119ef6841b219412e4e6a93f6a452b7339a8`, but technical acceptance and delivery remain pending. Observed live replacement proof at `45d4f93` passed on Windows with 1158/1158 assertions and Debian Linux with 1191/1191, including original host pipes, full-tree retirement, actual executable overwrite, and no replay. [Release evidence](release-evidence.md) binds those runs to their source and binary hashes and distinguishes unchanged product-source reuse from fresh exact-HEAD execution. Root full tests/vet and focused/integrated race receipts are recorded there. R1 parity, critical-suite recovery, Scenario 5b/8, final root review, and release/consumer delivery remain pending in that snapshot. This documentation update ran no tests or builds. The accepted scope retains ordinary release intent; no release version has been selected.
 
 ## Prerequisites
 
@@ -46,7 +46,7 @@ The runner's canonical parameters are `SourceRoot`, `CandidateBinary`, `ScratchR
 
 ## Focused regression commands
 
-Planned maintenance tests use the `TestMaintenance` prefix. Run only after those tests exist; an empty matching denominator is not proof.
+Maintenance tests use the `TestMaintenance` prefix and are present in the candidate. Capture named cases and skips; an empty matching denominator is not proof.
 
 ```powershell
 Push-Location muxcore

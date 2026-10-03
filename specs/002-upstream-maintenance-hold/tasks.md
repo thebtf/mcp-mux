@@ -6,11 +6,28 @@ description: "Accepted ADR-015 implementation tasks for GitHub #135"
 
 **Input**: `specs/002-upstream-maintenance-hold/{spec.md,plan.md,research.md,data-model.md,contracts/maintenance.md,quickstart.md}`.
 
-**Prerequisites**: Accepted root ADR-015, requirements/plan quality reviews, source base `3881f27b931f6b9d0467c0a15dd4e1824969e125`, and the exact candidate branch. All tasks are unimplemented. Core/adapter proof is not root acceptance.
+**Prerequisites**: Accepted root ADR-015, requirements/plan quality reviews, source base `3881f27b931f6b9d0467c0a15dd4e1824969e125`, and the exact candidate branch. Core, adapters, optional APIs, consumer docs, fixture, and live runner are implemented in candidate `1f3c119ef6841b219412e4e6a93f6a452b7339a8`. Implementation is not technical acceptance or delivery. Core/adapter proof is not root acceptance.
 
 **Tests**: Required by FR-016 and constitution. Use existing package conventions and `TestMaintenance` names for new behavior cases. Demonstrate the focused regression fails without its fix and passes with it. Keep permanent tests for observable safety/edges, not forwarding mocks, source text, or copied DTOs. Each owned focused-proven slice is committed before the next slice; do not run global gates while sibling changes are incomplete.
 
 **Path conventions and ownership**: Paths are candidate-root-relative. Core owns `muxcore/control`, `muxcore/daemon`, `muxcore/owner`, `muxcore/upstream`, and `muxcore/engine`. Adapter owns `cmd/mcp-mux`, `internal/mcpserver`, consumer docs, fixture, and new live-smoke runner. Root owns integration, evidence, review, and release. Do not write linked-worktree `.agent`, mutate other specs/config, or perform foreign-repo implementation. Public exported changes require source reference analysis before editing.
+
+## Current milestone status
+
+This snapshot records implemented source and observed verification, not completion of every historical task clause. The original task checkboxes below retain the work order and its full acceptance conditions. An unchecked implementation task does not mean its source is absent. No checkbox is advanced by inferring failing-before history, commit sequencing, root acceptance, or delivery from a later green run. Exact commands, source relationships, binary hashes, and limits are in [release evidence](release-evidence.md).
+
+| Tasks | Implemented | Verified in this snapshot | Accepted / delivered |
+| --- | --- | --- | --- |
+| T001 and RED clauses in T002/T005/T007/T014/T017/T022 | Regression source is present. | Complete historical failing-before receipts are not reconstructed here. Later GREEN does not establish that history. | No additional acceptance claim. |
+| T003/T006/T008-T012/T015/T018-T020/T023-T027 | Core, control and optional public APIs, CLI/MCP adapters, consumer docs, lifecycle fixture, and cross-platform live runner are implemented. | Root and muxcore full tests/vet at `42ef546`, Windows/Linux live proof at `45d4f93`, and the focused/integrated race receipts cover their recorded scope. | Root technical acceptance and delivery remain pending. |
+| T002/T004/T005/T007/T013/T014/T016/T017/T021/T022/T028 | Focused regression and adapter proof work is implemented. | Current focused race log records 143 named PASS cases and one Windows SKIP across five muxcore packages. Full root tests include command/MCP packages. This does not certify every historical RED or slice-commit clause. | No task-wide acceptance inferred from package results. |
+| T029 | Integrated implementation and this required evidence artifact exist. | Windows live 1158/1158 and Linux live 1191/1191 assertions pass at `45d4f93`. R1 Windows/Unix final outcomes are pending incorporation. | Not complete or technically accepted. |
+| T030 | Required runners exist. | Root/muxcore full tests and vet have exit-zero receipts at `42ef546`; focused race passes on `45d4f93` plus the TTL-fixture patch committed as `1f3c119`; integrated five-package race passes at exact `1f3c119`. Critical-suite recovery and Scenario 5b/8 outcomes remain pending. | Not complete or technically accepted. |
+| T031 | Seven previously admitted source findings have been dispositioned. | `MaintenanceReviewCloseout` reports 7/7 fixed with source evidence at `1f3c119`, with bounded proof limits. Exact-candidate/frozen-evidence root review is not complete. | No implementation acceptance or release approval. |
+| T032 | Ordinary release intent is inherited from the accepted full-slice scope. | No release version selected, PR created, merge/tag/publication, or current-module resolution/delivery proof recorded. | Not delivered. |
+| T033 | Current-version consumer handoffs remain required. | Fresh-clone/module/binary canary and fresh-session delivered hold/replace/resume proof are pending. Engram native issue capability is unmounted; no substitute backend is claimed. | Neither `PROJECT_RELEASE_PROTOCOL_PASS` nor `CONSUMER_HANDOFF_PASS` is claimed. |
+
+The scope remains the complete hold/replace/resume release, not source-only work. Root adds later gate outcomes to the same evidence artifact before T031 acceptance and T032/T033 delivery.
 
 ## Phase 1: Setup, exact failing behavior
 
