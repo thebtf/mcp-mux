@@ -69,6 +69,17 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 - CLI `stop` returns status 1 on a contacted-daemon error or invalid/untyped
   failure response, without per-owner or legacy data-channel fallback. Successful
   shutdown and the genuinely absent-daemon path retain their existing behavior.
+- Unix stale-socket cleanup excludes the daemon's exact canonical bound control
+  path before ping/unlink, preserving paused publication without early serving.
+- Resolved MCP `mux_stop` always uses daemon authority. Soft/forced owner claims
+  check maintenance atomically; uncertainty is terminal, and only the exact known
+  old unsupported-stop response permits legacy compatibility fallback.
+- `restart_owner` rejects drain milliseconds that overflow `time.Duration` before
+  mutation, including raw control and explicit-timeout callers. Zero drain remains
+  a real replacement; stop defaults remain 30s soft and 0ms forced.
+- Exact already-owned whole-daemon cleanup retains its private removal claim
+  under persistence failure; new external stop/shutdown/restart still fail closed.
+  No failure-latch clearing, wire flag, or admission-proof weakening is added.
 
 ### Compatibility
 
@@ -91,9 +102,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Native-family proof at 6fc7 records seven top-level tests and 45 named PASS
   rows, including parents, in normal and race runs. Root tests and both vet suites
   pass at their recorded source. Fixture-only 435bcfa closes the old owner-test
-  failure with fresh full-muxcore PASS. Timer and uncertain-stop corrections now
-  have focused RED/GREEN and race proof; their new-head full/caller/CI and final
-  acceptance remain pending. Older family proof stays source-bound and closed.
+  failure with fresh full-muxcore PASS. Earlier timer/stop/family proof stays
+  source-bound. New Unix-endpoint, managed-stop, and drain-validation commits have
+  scoped focused/race proof. Private shutdown correction d998 adds full-daemon
+  and all four fresh current root/module full-test/vet GREEN; caaba timeout stays
+  historical. New public Windows/Linux/Unix pipeline, CI and observer remain pending.
 
 ### Rollback
 

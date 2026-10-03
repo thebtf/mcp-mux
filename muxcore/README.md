@@ -657,6 +657,17 @@ response, as terminal status 1 without per-owner or legacy data-channel fallback
 Successful shutdown and the genuinely absent-daemon path are unchanged; an
 unknown contacted outcome is not permission to bypass daemon authority.
 
+Resolved MCP `mux_stop` also delegates first to daemon authority, not stale owner
+snapshots or a direct-owner preference. Transport/malformed/typed uncertainty is
+terminal; only the exact known old unsupported-stop response allows legacy
+compatibility fallback. New external soft/forced removal claims atomically check
+lease, persistent authority, and target context before finalization; waits do not
+hold those admission locks. Exact admitted retry, maintenance-owned removal, and
+exact already-owned whole-daemon cleanup keep their existing authority, without
+clearing a failure latch or creating a new external bypass. Soft drain stays 30s,
+forced drain 0ms. `restart_owner` validates that drain milliseconds fit
+`time.Duration` before mutation, even on raw control or positive explicit timeout.
+
 `MaintenanceResult` contains `HoldID`, `ServerID`, `State`, `ExpiresAt`,
 `DrainDeadline`, and `TreesRetired`. States are `MaintenanceHolding`/`HOLDING`,
 `MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
@@ -694,6 +705,9 @@ successful daemon construction. Failed registry publication or control setup
 leaves no recovered timer or control mutation admission. Successful recovery
 keeps the original accepted expiry and blocked `HOLDING`/`RETIREMENT_BLOCKED`
 fences; startup still uses the existing namespace lock.
+Unix stale cleanup excludes the exact canonical bound `ctlSrv.SocketPath()`
+before ping/unlink. It still cleans genuinely stale siblings and preserves live/
+foreign endpoints; it never enables control serving early to make self-ping pass.
 
 `Response` adds optional `Maintenance` and `ErrorCode`; `OwnerInfo` adds optional
 `Maintenance`. Daemon status retains a safe maintenance list after owner removal.

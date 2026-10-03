@@ -87,6 +87,8 @@ Recovered lease timers and control request serving stay paused through fallible
 daemon construction. Only successful construction activates them; failed registry
 publication/control setup cannot leave a stale timer overwriting a renewed lease.
 Recovery retains original expiry and blocked fences, without new API/state/schema.
+Unix stale cleanup excludes the exact canonical bound control path before
+ping/unlink, retaining the paused publication barrier and stale sibling cleanup.
 
 Neutral control's default for `hold`/`restart_owner` is 180s plus one drain; CLI/MCP request it with a zero caller timeout.
 Explicit positive budgets remain unchanged; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
@@ -94,6 +96,14 @@ Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect stat
 CLI `stop` returns status 1 when a contacted daemon yields an error or invalid/
 untyped failure response, with no per-owner or legacy data-channel fallback.
 Successful shutdown and genuinely absent-daemon behavior remain unchanged.
+Resolved MCP `mux_stop` always uses daemon authority; transport/malformed/typed
+uncertainty never selects owner fallback. Only the exact known old unsupported-
+stop response retains legacy compatibility. New external soft/forced admission
+checks authority before finalization without holding admission locks through waits.
+Exact already-owned whole-daemon cleanup keeps its private claim, without failure-
+latch clearing or a new public stop/shutdown/restart bypass. `restart_owner`
+rejects duration overflow before mutation on raw/
+explicit-timeout routes; zero replacement and 30s/0ms stop defaults are unchanged.
 
 ## Host transport and lifecycle
 
@@ -169,9 +179,12 @@ afterward. Named totals include parents, not independent scenarios. Root tests
 and both vet suites pass at their recorded source. Fixture-only successor
 `435bcfa70da85f3763f1ddbc861016f2e18b07c4` closes the old owner-test failure
 with fresh whole-muxcore PASS, without production changes after 6fc7. Historical
-RED and completed family proof remain preserved. New timer/uncertain-stop fixes
-have focused RED/GREEN and race proof; their new-head full/caller/CI and final
-review/acceptance remain pending, not the closed native callback family.
+RED and closed family proof remain preserved. Three newer commits for Unix
+owned-endpoint cleanup, managed stop admission, and restart drain validation now
+have scoped focused/race proof. Private internal-shutdown correction d998 now
+has focused/race/full-daemon and all four fresh current root/module full-test/vet
+GREEN, preserving caaba timeout as historical RED. New public Windows/Linux/Unix
+pipeline, CI, observer and acceptance remain pending; old Linux685 FAIL/orphan retained.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

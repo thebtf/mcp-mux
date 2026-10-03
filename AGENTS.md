@@ -133,6 +133,16 @@ daemon absence retains its existing path. Keep recovered timers and control
 request serving paused until every fallible daemon-construction step succeeds;
 failed construction must not retain a stale expiry mutation or admit control work.
 
+All resolved MCP stops use daemon authority; accept legacy owner fallback only
+for the exact known old unsupported-stop response, never transport/malformed/
+typed uncertainty. New external operator claims take maintenance read admission
+before the daemon mutex; release both before finalization/waits. Existing exact
+entry already-owned whole-daemon cleanup remains a distinct private claim, not
+a failure-latch clear or external bypass. Preserve admitted retry and maintenance
+removal. Reject restart drain overflow before
+mutation regardless of raw transport or explicit timeout. Unix cleanup skips
+only the exact canonical owned bound control path, without early serving.
+
 Scope is the selected owner's finite admitted CWD/era/security/configuration/
 namespace context set, not a host-wide executable lock. Aware shims preserve
 host pipes, return original numeric/string ID `-32005` maintenance errors before
