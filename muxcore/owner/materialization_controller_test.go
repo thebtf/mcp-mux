@@ -968,20 +968,57 @@ func TestAcquireRestartPinCancelsMaterializationAndFreezesSnapshot(t *testing.T)
 	}
 
 	sendReq(t, s.write, 2, "custom/during-restart", `{}`)
-	first := scanControllerResponseWithID(s.read, 1)
-	if first.err != nil || !strings.Contains(string(first.response), "cancelled for restart") {
-		t.Fatalf("cancelled demand result: response=%s err=%v", first.response, first.err)
+	responses := make(chan controllerResponseResult, 3)
+	go func() {
+		scanner := bufio.NewScanner(s.read)
+		for range cap(responses) {
+			if !scanner.Scan() {
+				err := scanner.Err()
+				if err == nil {
+					err = io.EOF
+				}
+				responses <- controllerResponseResult{err: err}
+				return
+			}
+			responses <- controllerResponseResult{response: append([]byte(nil), scanner.Bytes()...)}
+		}
+	}()
+	want := map[string]string{
+		"1": "upstream materialization cancelled for restart",
+		"2": "restart snapshot in progress",
 	}
-	second := scanControllerResponseWithID(s.read, 2)
-	if second.err != nil || !strings.Contains(string(second.response), "restart snapshot in progress") {
-		t.Fatalf("pinned demand result: response=%s err=%v", second.response, second.err)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for range 2 {
+		select {
+		case result := <-responses:
+			if result.err != nil {
+				t.Fatalf("restart demand response: %v", result.err)
+			}
+			response := parseJSONRPCResponseLine(t, string(result.response))
+			id := string(response.ID)
+			message, ok := want[id]
+			if !ok {
+				t.Fatalf("unexpected or duplicate restart demand response: %s", result.response)
+			}
+			if response.Error == nil || response.Error.Code != -32603 || response.Error.Message != message || response.Result != nil {
+				t.Fatalf("restart demand %s: got %s, want explicit -32603 error %q", id, result.response, message)
+			}
+			delete(want, id)
+		case <-deadline.C:
+			t.Fatalf("restart demand responses timed out; missing %v", want)
+		}
 	}
 	pin.Release()
 	if o.Status()["restart_pin_count"] != int64(0) {
 		t.Fatalf("restart pin leaked: %#v", o.Status())
 	}
 	waitForCondition(t, time.Second, func() bool { return starts.Load() == 2 }, "pin release did not resume the cancelled materialization obligation")
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case result := <-responses:
+		t.Fatalf("extra restart demand response: response=%s err=%v", result.response, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if got := starts.Load(); got != 2 {
 		t.Fatalf("pin release started %d generations, want exactly 2 total", got)
 	}
