@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	maintenanceSchema     = 1
+	maintenanceSchema     = 2
 	maintenanceKeyVersion = "v1:"
 )
 
@@ -34,9 +34,30 @@ type maintenanceRecord struct {
 	DrainDeadline time.Time                `json:"drain_deadline"`
 }
 type maintenanceLedger struct {
-	Version int                 `json:"version"`
-	Scope   string              `json:"scope"`
-	Leases  []maintenanceRecord `json:"leases"`
+	Version     int                 `json:"version"`
+	Scope       string              `json:"scope"`
+	Transaction string              `json:"transaction"`
+	Leases      []maintenanceRecord `json:"leases"`
+}
+
+// transaction.json is a mandatory member of the same private ledger authority,
+// not an advisory sidecar. A prepared transaction always refuses recovery.
+type maintenanceTransaction struct {
+	Version     int                 `json:"version"`
+	Scope       string              `json:"scope"`
+	Transaction string              `json:"transaction"`
+	Target      string              `json:"target"`
+	State       string              `json:"state"`
+	Predecessor []maintenanceRecord `json:"predecessor,omitempty"`
+}
+
+func maintenanceTransactionPath(path string) string {
+	return filepath.Join(filepath.Dir(path), "transaction.json")
+}
+
+func maintenanceLedgerDigest(data []byte) string {
+	digest := sha256.Sum256(data)
+	return maintenanceKeyVersion + hex.EncodeToString(digest[:])
 }
 
 func maintenanceDigest(fields ...string) string {
@@ -50,14 +71,22 @@ func maintenanceDigest(fields ...string) string {
 	return maintenanceKeyVersion + hex.EncodeToString(h.Sum(nil))
 }
 
+// The endpoint leaf is identity, not a symlink-resolution input: a socket can
+// appear or disappear while its namespace authority must remain unchanged.
 func canonicalMaintenancePath(path string) string {
-	if path == "" {
-		path, _ = os.Getwd()
+	absolute, err := filepath.Abs(path)
+	if err != nil || path == "" {
+		return ""
 	}
-	if absolute, err := filepath.Abs(path); err == nil {
-		path = absolute
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return ""
 	}
-	return serverid.CanonicalizePath(path)
+	canonical := filepath.Join(parent, filepath.Base(absolute))
+	if runtime.GOOS == "windows" {
+		canonical = strings.ToLower(canonical)
+	}
+	return canonical
 }
 
 func (d *Daemon) maintenanceContext(protocolEra era.ProtocolEra, command string, args []string, cwd string, env map[string]string) string {
@@ -78,7 +107,7 @@ func (d *Daemon) maintenanceContext(protocolEra era.ProtocolEra, command string,
 	// Include argv count as well as field lengths, so trailing CWD cannot alias argv.
 	fields = append(fields, string(binary.BigEndian.AppendUint64(nil, uint64(len(args)))))
 	fields = append(fields, args...)
-	fields = append(fields, canonicalMaintenancePath(cwd), envidentity.Build(normalized).Fingerprint)
+	fields = append(fields, serverid.CanonicalizePath(cwd), envidentity.Build(normalized).Fingerprint)
 	return maintenanceDigest(fields...)
 }
 
@@ -86,8 +115,12 @@ func validMaintenanceDigest(key string) bool {
 	if len(key) != 67 || !strings.HasPrefix(key, maintenanceKeyVersion) {
 		return false
 	}
-	_, err := hex.DecodeString(key[3:])
-	return err == nil
+	for _, char := range key[3:] {
+		if !(char >= '0' && char <= '9' || char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Daemon) loadMaintenance(endpoint string) error {
@@ -117,23 +150,40 @@ func (d *Daemon) loadMaintenance(endpoint string) error {
 }
 
 func readMaintenanceAuthority(namespace, endpoint string) (string, string, *maintenanceLedger, error) {
-	scope := maintenanceDigest("mcp-mux-maintenance-scope-v1", namespace, canonicalMaintenancePath(endpoint))
+	canonical := canonicalMaintenancePath(endpoint)
+	if canonical == "" {
+		return "", "", nil, control.ErrMaintenancePersistenceFailed
+	}
+	scope := maintenanceDigest("mcp-mux-maintenance-scope-v1", namespace, canonical)
 	root, err := os.UserConfigDir()
 	if err != nil {
 		return "", scope, nil, control.ErrMaintenancePersistenceFailed
 	}
 	path := filepath.Join(root, "mcp-mux", "maintenance", scope[3:], "ledger.json")
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return path, scope, nil, nil
+	data, ledgerErr := os.ReadFile(path)
+	transactionData, transactionErr := os.ReadFile(maintenanceTransactionPath(path))
+	if errors.Is(ledgerErr, os.ErrNotExist) && errors.Is(transactionErr, os.ErrNotExist) {
+		// An existing namespace directory without its complete authority is not
+		// a cold start (including a crash during the first preparation).
+		if _, err := os.Stat(filepath.Dir(path)); errors.Is(err, os.ErrNotExist) {
+			return path, scope, nil, nil
+		}
+		return path, scope, nil, control.ErrMaintenancePersistenceFailed
 	}
+	if ledgerErr != nil || transactionErr != nil {
+		return path, scope, nil, control.ErrMaintenancePersistenceFailed
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
 	if err != nil {
 		return path, scope, nil, control.ErrMaintenancePersistenceFailed
 	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Name() != "ledger.json" && entry.Name() != "transaction.json" && !strings.HasPrefix(entry.Name(), ".ledger-") {
+			return path, scope, nil, control.ErrMaintenancePersistenceFailed
+		}
+	}
 	var ledger maintenanceLedger
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&ledger) != nil || decoder.Decode(new(any)) != io.EOF || ledger.Version != maintenanceSchema || ledger.Scope != scope || ledger.Leases == nil {
+	if !decodeMaintenanceJSON(data, &ledger) || ledger.Version != maintenanceSchema || ledger.Scope != scope || !validMaintenanceDigest(ledger.Transaction) || ledger.Leases == nil {
 		return path, scope, nil, control.ErrMaintenancePersistenceFailed
 	}
 	used := make(map[string]bool)
@@ -155,11 +205,83 @@ func readMaintenanceAuthority(namespace, endpoint string) (string, string, *main
 			used[key] = true
 		}
 	}
+	var transaction maintenanceTransaction
+	if !decodeMaintenanceJSON(transactionData, &transaction) || transaction.Version != maintenanceSchema || transaction.Scope != scope || transaction.Transaction != ledger.Transaction || transaction.Target != maintenanceLedgerDigest(data) || transaction.State != "committed" || transaction.Predecessor != nil {
+		return path, scope, nil, control.ErrMaintenancePersistenceFailed
+	}
 	return path, scope, &ledger, nil
 }
 
-func (d *Daemon) persistMaintenanceLocked(leases map[string]*maintenanceLease) error {
-	ledger := maintenanceLedger{Version: maintenanceSchema, Scope: d.maintenanceScope, Leases: make([]maintenanceRecord, 0, len(leases))}
+func decodeMaintenanceJSON(data []byte, target any) bool {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return unambiguousMaintenanceJSON(data) && decoder.Decode(target) == nil && decoder.Decode(new(any)) == io.EOF
+}
+
+// encoding/json accepts duplicate and case-equivalent struct members. Authority
+// cannot use that last-member-wins rule. The ledger schema has at most four
+// container levels and six members per object; unknown fields are checked by
+// the typed decoder after this bounded token pass.
+func unambiguousMaintenanceJSON(data []byte) bool {
+	type frame struct {
+		object bool
+		key    bool
+		names  [6]string
+		count  int
+	}
+	var stack [4]frame
+	depth := 0
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return depth == 0
+		}
+		if err != nil {
+			return false
+		}
+		if depth > 0 && stack[depth-1].object && stack[depth-1].key {
+			if name, ok := token.(string); ok {
+				current := &stack[depth-1]
+				if current.count == len(current.names) {
+					return false
+				}
+				for _, previous := range current.names[:current.count] {
+					if strings.EqualFold(previous, name) {
+						return false
+					}
+				}
+				current.names[current.count] = name
+				current.count++
+				current.key = false
+				continue
+			}
+		}
+		if delimiter, ok := token.(json.Delim); ok {
+			switch delimiter {
+			case '{', '[':
+				if depth == len(stack) {
+					return false
+				}
+				stack[depth] = frame{object: delimiter == '{', key: delimiter == '{'}
+				depth++
+				continue
+			case '}', ']':
+				if depth == 0 {
+					return false
+				}
+				depth--
+			}
+		}
+		if depth > 0 && stack[depth-1].object {
+			stack[depth-1].key = true
+		}
+	}
+}
+
+func maintenanceRecords(leases map[string]*maintenanceLease) []maintenanceRecord {
+	records := make([]maintenanceRecord, 0, len(leases))
 	ids := make([]string, 0, len(leases))
 	for id := range leases {
 		ids = append(ids, id)
@@ -171,18 +293,59 @@ func (d *Daemon) persistMaintenanceLocked(leases map[string]*maintenanceLease) e
 		record.State = lease.result.State
 		record.ExpiresAt = lease.result.ExpiresAt
 		record.DrainDeadline = lease.result.DrainDeadline
-		ledger.Leases = append(ledger.Leases, record)
+		records = append(records, record)
 	}
+	return records
+}
+
+func (d *Daemon) persistMaintenanceLocked(leases map[string]*maintenanceLease) error {
+	token, err := generateToken()
+	if err != nil {
+		return control.ErrMaintenancePersistenceFailed
+	}
+	ledger := maintenanceLedger{Version: maintenanceSchema, Scope: d.maintenanceScope, Transaction: maintenanceDigest("mcp-mux-maintenance-transaction-v2", token), Leases: maintenanceRecords(leases)}
+	return commitMaintenanceStore(d.maintenancePath, ledger, maintenanceRecords(d.maintenanceLeases), func(path string, data []byte) error {
+		if path == d.maintenancePath && d.maintenanceCommit != nil {
+			return d.maintenanceCommit(data)
+		}
+		return writeMaintenanceLedger(path, data)
+	})
+}
+
+// All mutations run under the existing namespace file lock, before admission
+// and registry locks. Preparation must be acknowledged durable before the main
+// ledger can change. A publish error leaves the prepared predecessor in place,
+// even when rename succeeded. Recovery reads both members and refuses pending,
+// missing, mismatched, or unknown authority without performing repair writes.
+//
+// Finalization is a certificate that the target publication was ACKNOWLEDGED
+// durable, and is attempted only after that acknowledgment. Its own write may
+// fail after publication: recovery then either fences on prepared/invalid bytes,
+// or verifies the certificate and proves the earlier target commit completed.
+// The error is still returned and live admission retains its predecessor. No
+// authority file is removed; acknowledged successful finalization cannot later
+// resurrect a predecessor. This does not claim atomic replacement of two files.
+func commitMaintenanceStore(path string, ledger maintenanceLedger, predecessor []maintenanceRecord, writer func(string, []byte) error) error {
 	data, err := json.Marshal(ledger)
 	if err != nil {
 		return control.ErrMaintenancePersistenceFailed
 	}
-	if d.maintenanceCommit != nil {
-		err = d.maintenanceCommit(data)
-	} else {
-		err = writeMaintenanceLedger(d.maintenancePath, data)
-	}
+	transaction := maintenanceTransaction{Version: maintenanceSchema, Scope: ledger.Scope, Transaction: ledger.Transaction, Target: maintenanceLedgerDigest(data), State: "prepared", Predecessor: predecessor}
+	prepared, err := json.Marshal(transaction)
 	if err != nil {
+		return control.ErrMaintenancePersistenceFailed
+	}
+	transactionPath := maintenanceTransactionPath(path)
+	if err := writer(transactionPath, prepared); err != nil {
+		return control.ErrMaintenancePersistenceFailed
+	}
+	if err := writer(path, data); err != nil {
+		return control.ErrMaintenancePersistenceFailed
+	}
+	transaction.State = "committed"
+	transaction.Predecessor = nil
+	committed, err := json.Marshal(transaction)
+	if err != nil || writer(transactionPath, committed) != nil {
 		return control.ErrMaintenancePersistenceFailed
 	}
 	return nil

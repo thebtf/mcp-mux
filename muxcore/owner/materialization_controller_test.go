@@ -1306,10 +1306,20 @@ func TestFinishMaterializationSuccessPreservesFinalizeBlocked(t *testing.T) {
 func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.T) {
 	o := newMinimalOwner()
 	defer close(o.materializationStop)
+	o.materializationPolicy = MaterializationPersistent
 	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
 		_, err := io.Copy(io.Discard, stdin)
 		return err
 	})
+	t.Cleanup(func() { _ = proc.Close() })
+	startErr := errors.New("synthetic start failed after authority install")
+	var starts atomic.Int32
+	originalStart := materializationStartProcess
+	materializationStartProcess = func(string, []string, map[string]string, string, *log.Logger) (*upstream.Process, error) {
+		starts.Add(1)
+		return proc, startErr
+	}
+	t.Cleanup(func() { materializationStartProcess = originalStart })
 	a := newMaterializationAttempt(1, MaterializationTriggerUpstreamExit)
 	o.materializationAttempt = a
 	o.materializationState = MaterializationMaterializing
@@ -1319,12 +1329,10 @@ func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.
 		sawExactAuthority.Store(got == proc)
 		return errors.New("synthetic failed-start authority remains")
 	}
-	retireErr := o.retireFailedMaterializationStart(a, proc)
-	if retireErr == nil || !strings.Contains(retireErr.Error(), "authority remains") {
-		t.Fatalf("failed-start retirement = %v, want unproven authority", retireErr)
+	o.runMaterialization(a)
+	if !errors.Is(a.err, startErr) || !strings.Contains(a.err.Error(), "authority remains") {
+		t.Fatalf("failed-start result = %v, want start failure and unproven authority", a.err)
 	}
-	startErr := errors.New("synthetic start failed after authority install")
-	o.finishMaterializationFailure(a, errors.Join(startErr, retireErr))
 
 	if !sawExactAuthority.Load() {
 		t.Fatal("failed-start finalization did not receive the installed process authority")
@@ -1335,9 +1343,15 @@ func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.
 	if a.process != proc || o.retiringProcess != proc || o.MaterializationState() != MaterializationFinalizeBlocked {
 		t.Fatalf("failed-start authority was not retained: attempt=%p retiring=%p status=%#v", a.process, o.retiringProcess, o.Status())
 	}
+	if !o.MaterializationBlocksEviction() {
+		t.Fatal("unproven failed-start authority allowed owner eviction")
+	}
 	blocked := o.startMaterialization(MaterializationTriggerUpstreamExit)
 	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "authority remains") {
 		t.Fatalf("replacement start while failed-start authority remained = %v", blocked.err)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("failed-start replacement started %d upstreams, want 1", got)
 	}
 }
 

@@ -255,7 +255,8 @@ func main() {
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
 			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonForEra(command, cmdArgs, cwd, modeStr, shimEnv, protocolWire, logger)
-			if err != nil {
+			held := errors.Is(err, control.ErrMaintenanceHeld) || errors.Is(err, control.ErrMaintenanceRetirementBlocked) || errors.Is(err, control.ErrMaintenancePersistenceFailed)
+			if err != nil && !held {
 				if errors.Is(err, era.AdmissionControlEraMismatch) {
 					writeCLIAdmissionError(os.Stdout, selection.AdmissionError(era.AdmissionControlEraMismatch))
 				}
@@ -263,8 +264,13 @@ func main() {
 					time.Since(spawnStart), err.Error())
 				os.Exit(1)
 			} else {
-				logger.Printf("shim startup step=daemon_spawn status=ok duration=%v ipc=%q",
-					time.Since(spawnStart), daemonIPC)
+				if held {
+					logger.Printf("shim startup step=daemon_spawn status=held duration=%v err=%q",
+						time.Since(spawnStart), err.Error())
+				} else {
+					logger.Printf("shim startup step=daemon_spawn status=ok duration=%v ipc=%q",
+						time.Since(spawnStart), daemonIPC)
+				}
 				logger.Printf("shim startup step=resilient_begin path=%q total_before_client=%v",
 					daemonIPC, time.Since(shimStart))
 				// currentIPC/currentToken track the latest successful bind target.
@@ -355,6 +361,7 @@ func main() {
 					Stdin:             clientStdin,
 					Stdout:            os.Stdout,
 					InitialIPCPath:    daemonIPC,
+					InitialError:      err,
 					Token:             daemonToken,
 					ProtocolEra:       protocolEra,
 					RefreshToken:      refreshFn,

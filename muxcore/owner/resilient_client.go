@@ -333,6 +333,9 @@ func (rc *resilientClient) runProxy(conn interface {
 		rc.suspendMu.Lock()
 		rc.suspending = false
 		rc.suspendMu.Unlock()
+		rc.ingressMu.Lock()
+		connectionSequence := rc.maintenanceSequence
+		rc.ingressMu.Unlock()
 
 		ipcEOF := make(chan struct{})
 		go rc.runIPCReader(conn, ipcEOF)
@@ -432,10 +435,26 @@ func (rc *resilientClient) runProxy(conn interface {
 					idleTicker.Stop()
 				}
 				conn.Close()
-				<-writerDone
+				deferred := <-writerDone
 				rc.log.Printf("resilient: IPC connection lost, reconnecting...")
 
-				newConn, err := rc.reconnect(stdoutMu, stdinDone)
+				newConn, err := rc.reconnect(stdoutMu, stdinDone, &deferred)
+				if deferred != nil {
+					// An old connection's dequeued frame cannot cross a fence,
+					// even if fresh demand already observed resume. Never replay
+					// it; retain maintenance precedence by connection sequence.
+					rc.ingressMu.Lock()
+					fenced := connectionSequence != rc.maintenanceSequence
+					if fenced {
+						_ = rc.failMaintenanceFrameLocked(deferred)
+					}
+					rc.ingressMu.Unlock()
+					if id := extractRequestID(deferred); !fenced && id != "" {
+						rc.inflight.Store(id, true)
+						rc.drainOrphanedInflight(stdoutMu)
+					}
+					rc.noteDequeued()
+				}
 				if err != nil {
 					if errors.Is(err, io.EOF) {
 						return nil
@@ -772,7 +791,7 @@ func (rc *resilientClient) observeIPCResponse(data []byte) {
 
 // runIPCWriter reads from rc.msgFromCC and writes to the IPC connection.
 // Stops when ipcEOF is closed (preventing writes to a dead connection).
-// Closes writerDone when it exits.
+// Returns any dequeued unsent frame through writerDone when it exits.
 // Tracks request IDs so orphaned in-flight requests can get error responses on reconnect.
 func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, writerDone chan<- []byte) {
 	var deferred []byte
@@ -795,7 +814,7 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 			}
 			select {
 			case <-ipcEOF:
-				rc.noteDequeued()
+				deferred = data
 				return
 			default:
 			}

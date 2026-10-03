@@ -1,6 +1,6 @@
 # Prove live upstream executable replacement
 
-This guide is an implementation/release oracle. No commands below were run in the SpecKit assignment. `scripts/smoke-upstream-maintenance.ps1` is a planned deliverable in tasks.md, not an existing runnable script at the source base. Complete its implementation before running the commands.
+This guide is an implementation/release oracle. This documentation correction ran no commands. Root reports Windows security cases 002/003/004 and transaction-fault/acknowledged-release regressions GREEN; those reports are not Unix full-runtime proof or consumer-delivery acceptance. Full Unix runtime remains unexercised in the supplied evidence. Source writes are not release completion. Root owns exact-head evidence and the remaining cross-platform/release gates below.
 
 ## Prerequisites
 
@@ -57,6 +57,8 @@ go test ./cmd/mcp-mux ./internal/mcpserver -run '^TestMaintenance' -count=1
 ```
 
 Capture named cases and denominator, including failing-before/passing-after respawn suppression, start-through-install race, placeholder settlement, actual drain, all-tree death versus handoff, finite CWD/era/security/namespace context sets, stale generations/leases, durable commit failures, startup order, renewal/expiry/blocked retirement, terminal launcher/update refusal, unsupported standalone paths, and held queue/reconnect disposition.
+
+Include `TestMaintenanceSecurity002NoncanonicalKeyRefusesStartup`, `TestMaintenanceSecurity003DuplicateMembersRefuseStartup`, and the `TestMaintenanceSecurity004` cases for post-publication failure, all six PREPARE/PUBLISH/FINALIZE before/after faults, incomplete aggregates, and acknowledged release without predecessor resurrection. A finalize-after-publication fault must still return persistence failure while aggregate recovery may accept a matching COMMITTED certificate proving earlier acknowledged durable publication. Other uncertain pairs must preserve fencing or refuse startup/activation. Portable injected durability faults do not prove an actual Unix fsync failure or full Unix runtime.
 
 ## Scenario-to-success-criterion map
 

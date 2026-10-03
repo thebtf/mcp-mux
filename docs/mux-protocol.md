@@ -378,6 +378,17 @@ active-pointer replacement, unmanaged processes, and PID cleanup are outside
 the supported flow. Before downgrade, clear safely proven holds using the current
 aware binary and retain blocked authority. Do not delete the ledger to open admission.
 
+Maintenance storage is one schema-2 logical authority with mandatory
+`ledger.json` and `transaction.json`. Aggregate recovery rejects missing,
+pending, invalid, or mismatched pairs. FINALIZE writes COMMITTED only after
+the target publication is acknowledged durable by the local storage writer.
+A finalize error remains a typed failure with conservative live admission;
+recovery may verify a matching certificate as proof of that earlier publication.
+This is neither atomic two-file replacement nor a promise that every error
+rolls back storage effects. Successfully acknowledged release cannot resurrect
+the predecessor lease. Caller fields and wire types are unchanged; see the
+[storage phase contract](../specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
 Controlled engine install, launcher swap, layout/bootstrap mutation, and active
 pointer updates hold the existing daemon namespace file lock across activation
 checks and mutation. Hold-ledger mutation uses the same lock. The shared

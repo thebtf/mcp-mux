@@ -18,7 +18,7 @@ The accepted root D2 authority is primary-checkout `.agent/arch/decisions/015-up
 
 **Primary Dependencies**: Existing local muxcore module, `golang.org/x/sys`, `go-winio`, and suture. Reuse `muxcore/internal/envidentity.Build`, current owner/materialization and upstream tree authority, OS IPC, and product platform replace-file patterns. No new dependency or process supervisor.
 
-**Storage**: Versioned lease ledger under `os.UserConfigDir()`, scoped by the full digest of canonical daemon endpoint and namespace. Same-directory restrictive temporary file, full flush, and atomic replace; no truncation fallback. Persist only opaque context keys, lease ID, state, expiry, and safe timing metadata. Load independently of snapshots and `SkipSnapshot` before listeners, restore, or starts.
+**Storage**: Schema-2 logical lease authority under `os.UserConfigDir()`, scoped by the full digest of canonical daemon endpoint and namespace. Mandatory `ledger.json` and `transaction.json` use restrictive same-directory temporary writes, flush, and platform replacement, not atomic two-file replacement. PREPARE stores predecessor leases and target digest; PUBLISH requires durable preparation; FINALIZE certifies only acknowledged durable target publication. Aggregate lookup rejects missing, pending, invalid, or mismatched pairs. A finalize error remains a typed failure with conservative live memory, even when recovery can verify a matching committed certificate. Persist only opaque identities and safe lease/timing metadata. Load independently of snapshots and `SkipSnapshot` before listeners, restore, or starts. See the [storage contract](contracts/maintenance.md#authority-and-lifecycle-boundaries).
 
 **Testing**: Existing Go package conventions plus focused failing-before/passing-after lifecycle regressions and one live-process executable-replacement smoke. Root runs integrated/full release validation once after both maker surfaces land. This plan stage runs no Go code, tests, builds, or formatters.
 
@@ -30,7 +30,7 @@ The accepted root D2 authority is primary-checkout `.agent/arch/decisions/015-up
 
 **Constraints**: Gate before `d.mu` or owner locks, no gate acquisition from an owner-held lock, no finalization under `d.mu`, and no gate retained across drain/retirement waits. Reject ambiguous context sets before mutation. Tree death excludes committed handoff even if `RetirementProven` is true. No snapshots of modern live work, secret readbacks, cross-engine writes, old-binary control claim, request replay, or stop/exec fallback.
 
-**Scale/Scope**: One current-user engine namespace, finite admitted context sets, existing owner registry and tree authority. Atomic durable mutations serialize lease acquisition/renewal/release. Active-lease transfer and reconstruction of lost tree authority are out of scope.
+**Scale/Scope**: One current-user engine namespace, finite admitted context sets, existing owner registry and tree authority. Serialized paired-authority mutations govern lease acquisition/renewal/release. Active-lease transfer and reconstruction of lost tree authority are out of scope.
 
 ## Constitution Check
 

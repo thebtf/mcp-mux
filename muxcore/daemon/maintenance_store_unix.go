@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 )
@@ -23,6 +24,6 @@ func replaceMaintenanceLedger(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
-	return dir.Sync()
+	syncErr := dir.Sync()
+	return errors.Join(syncErr, dir.Close())
 }

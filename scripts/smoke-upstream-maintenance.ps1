@@ -156,7 +156,7 @@ function New-Context([string]$Name) {
     $ctx["control_path"] = Join-Path $ctx.runtime "mcp-mux-muxd.ctl.sock"
     if (-not $IsWindows -and $Utf8.GetByteCount($ctx.control_path) -gt 103) { throw "Scratch path is too long for a Unix control socket; choose a shorter primary scratch directory" }
     if (-not $IsWindows) {
-        $result = Invoke-Native (Get-Command chmod -CommandType Application).Source (@("700", $root, $ctx.runtime, $ctx.config, $ctx.home, $ctx.records)) $ctx
+        $result = Invoke-Native $Chmod (@("700", $root, $ctx.runtime, $ctx.config, $ctx.home, $ctx.records)) $ctx
         if ($result.exit_code -ne 0) { throw "Cannot restrict owned Unix runtime/config directories" }
     }
     $Contexts.Add($ctx)
@@ -385,7 +385,7 @@ function Observe-Tree($Payload, [string]$Fixture, $Context) {
         $row = Get-CimInstance Win32_Process -Filter "ProcessId = $($child.pid)"
         $parentID = [int]$row.ParentProcessId
     } else {
-        $result = Invoke-Native (Get-Command ps -CommandType Application).Source @("-p", [string]$child.pid, "-o", "ppid=") $Context
+        $result = Invoke-Native $Ps @("-p", [string]$child.pid, "-o", "ppid=") $Context
         Assert-Observation ($result.exit_code -eq 0 -and $result.stdout.Trim() -match '^\d+$') "Unix descendant parent is observable" $result
         $parentID = [int]$result.stdout.Trim()
     }
@@ -431,10 +431,12 @@ try {
     if (Test-Beneath $ScratchRoot ([IO.Path]::GetFullPath([IO.Path]::GetTempPath()))) { throw "OS temporary storage is not an authorized primary scratch root" }
     $OutputDir = [IO.Path]::GetFullPath($OutputDir)
     $EvidencePath = [IO.Path]::GetFullPath($EvidencePath)
-    $Git = (Get-Command git -CommandType Application).Source
-    $Go = (Get-Command go -CommandType Application).Source
-    if (-not $IsWindows) { [void](Get-Command ps -CommandType Application) }
-    if (-not $IsWindows) { [void](Get-Command chmod -CommandType Application) }
+    $Git = (Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    $Go = (Get-Command go -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    if (-not $IsWindows) {
+        $Ps = (Get-Command ps -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        $Chmod = (Get-Command chmod -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+    }
     $common = & $Git -C $SourceRoot rev-parse --path-format=absolute --git-common-dir
     if ($LASTEXITCODE -ne 0) { throw "Cannot resolve primary repository identity" }
     $PrimaryRoot = Split-Path -Parent ([IO.Path]::GetFullPath($common.Trim()))
@@ -451,7 +453,7 @@ try {
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $EvidencePath))
     foreach ($directory in @("bin", "go-cache", "go-tmp", "go-modcache")) { [void][IO.Directory]::CreateDirectory((Join-Path $OutputDir $directory)) }
     if (-not $IsWindows) {
-        & (Get-Command chmod -CommandType Application).Source 700 $OutputDir
+        & $Chmod 700 $OutputDir
         if ($LASTEXITCODE -ne 0) { throw "Cannot restrict owned output directory" }
     }
     $Transcript = [IO.StreamWriter]::new((Join-Path $OutputDir "transcript.ndjson"), $false, $Utf8)

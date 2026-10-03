@@ -58,6 +58,16 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 		_ = p.stdin.Close()
 	}
 
+	// Completion wins even when a zero-grace timer is also ready.
+	select {
+	case <-p.Done:
+	default:
+		select {
+		case <-p.Done:
+		case <-time.After(timeout):
+		}
+	}
+
 	select {
 	case <-p.Done:
 		if err := p.finalizeOwnedTree(); err != nil {
@@ -65,7 +75,7 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 		}
 		p.markClosed()
 		return softCloseExitCode(p.ExitErr), nil
-	case <-time.After(timeout):
+	default:
 	}
 
 	if p.proc != nil || p.pid > 0 {
@@ -215,6 +225,7 @@ type Process struct {
 	lineBuf *lineBuffer
 
 	mu            sync.Mutex
+	writeMu       sync.Mutex // line serialization; retirement never waits for stdin I/O
 	closeMu       sync.Mutex
 	finalizeMu    sync.Mutex
 	closed        bool
@@ -515,18 +526,22 @@ func finalizeFailedStart(p *Process, proc *procgroup.Process, pipes ...*os.File)
 
 // WriteLine sends a line of data to the upstream process stdin, followed by newline.
 func (p *Process) WriteLine(data []byte) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed || p.retiring {
+	unavailable := p.closed || p.retiring
+	stdin := p.stdin
+	p.mu.Unlock()
+	if unavailable {
 		return fmt.Errorf("upstream: process closed")
 	}
 
-	_, err := p.stdin.Write(data)
+	_, err := stdin.Write(data)
 	if err != nil {
 		return fmt.Errorf("upstream: write: %w", err)
 	}
 
-	_, err = p.stdin.Write([]byte("\n"))
+	_, err = stdin.Write([]byte("\n"))
 	if err != nil {
 		return fmt.Errorf("upstream: write newline: %w", err)
 	}
@@ -670,6 +685,8 @@ func (p *Process) TreesDead() bool {
 // Returns ErrAlreadyClosed if the process has been closed.
 // Returns ErrAlreadyDetached if Detach has already been called.
 func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -699,6 +716,8 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 // DetachWithAuthority prepares a handoff while retaining the predecessor's
 // authority until the successor receives a duplicated handle.
 func (p *Process) DetachWithAuthority() (pid int, stdinFD, stdoutFD, stderrFD, authorityFD uintptr, err error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
 	if p.closed || p.retiring {
 		p.mu.Unlock()

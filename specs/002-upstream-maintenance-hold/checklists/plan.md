@@ -10,7 +10,7 @@
 - [x] CHK001 F1 finite admitted context set includes exact CWD, era, namespace/endpoint, argv boundaries, and strict full environment identity, without nonce/version/retry suffix or wildcard.
 - [x] CHK002 F2 shared start gate begins before owner locks and ends after all nonnil Process authority installation, including failed starts and placeholders.
 - [x] CHK003 F3 actual request drain begins once at durable commitment; HELD requires dead trees, no detach, durable state, and usable TTL.
-- [x] CHK004 F4 persistent atomic ledger loads before listener/restore/start independently of SkipSnapshot; incomplete/invalid authority stays fail closed.
+- [x] CHK004 F4 one logical schema-2 authority with mandatory `ledger.json` and `transaction.json` loads before listener/restore/start independently of SkipSnapshot. Missing, pending, or invalid pairs fail closed. COMMITTED certifies only earlier acknowledged durable target publication; a finalize error remains an error with conservative live fencing, while recovery either refuses uncertainty or verifies that completed certificate. No atomic two-file replacement or unchanged-storage-on-every-error guarantee.
 - [x] CHK005 Controlled restart/handoff/shutdown/downgrade and idle daemon exit refuse while fenced; update/launcher fallbacks cannot bypass refusal.
 - [x] CHK006 F5 typed engine/CLI adapters and ingress-to-connected disposition prevent held queue replay and silent request loss.
 

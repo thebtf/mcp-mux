@@ -325,6 +325,14 @@ refusal. Launcher и library update helpers не делают shutdown fallback 
 запускают successor. После unplanned loss aware daemon загружает hold до admission;
 неполное или нечитаемое authority остаётся fail closed.
 
+Durable authority состоит из обязательной пары schema-2 `ledger.json` и
+`transaction.json`. Неполная, pending или невалидная пара запрещает admission.
+Persistence error сохраняет консервативное live-состояние, но не гарантирует
+откат записей. После ошибки FINALIZE recovery может принять только совпадающий
+COMMITTED certificate как доказательство ранее подтверждённой durable publication.
+Ответ caller остаётся ошибкой. Успешный release не восстанавливает старый lease.
+Подробности в [контракте фаз записи](specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
 Controlled install engine, swap launcher, изменения layout/bootstrap и active
 pointer используют существующий file lock namespace daemon. Изменения hold
 ledger используют тот же lock, поэтому hold не может пройти между проверкой

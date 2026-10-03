@@ -686,6 +686,15 @@ binaries, and manual active-pointer replacement are unsupported. Clear all
 safely proven holds with the current aware binary before downgrade. Keep blocked
 authority intact; neither ledger deletion nor PID cleanup is a recovery API.
 
+Schema-2 maintenance authority requires both `ledger.json` and `transaction.json`.
+Startup and activation validate the aggregate, not the ledger member alone.
+PREPARE retains predecessor leases and target digest; FINALIZE certifies only
+previously acknowledged durable publication. Pending, missing, or invalid pairs
+fail closed. A finalize error remains `ErrMaintenancePersistenceFailed` with
+conservative live admission, even if recovery verifies a matching COMMITTED
+certificate. It is not API success or a guarantee of storage rollback. Successful
+release cannot resurrect the old lease. See the [phase contract](../specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
 Controlled installation, launcher swap, layout/bootstrap mutation, and active
 pointer changes serialize with hold-ledger mutation using the existing daemon
 namespace file lock. The shared `daemon.CheckMaintenanceForActivation` helper

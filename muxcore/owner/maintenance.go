@@ -66,8 +66,23 @@ func (o *Owner) rejectMaintenance(s *Session, msg *jsonrpc.Message, held *contro
 	return s.WriteRaw(maintenanceErrorBytes(msg.ID, held))
 }
 
-// DrainForMaintenance gives only work already delivered to the upstream its
-// accepted deadline. Queued demand is never replayed across the fence.
+// Request admission ends after local reservation and generation binding, before
+// transport I/O. Retirement can then interrupt an already-admitted writer.
+func (o *Owner) lockRequestAdmission() *control.MaintenanceResult {
+	if o.maintenanceGate != nil {
+		o.maintenanceGate.RLock()
+	}
+	return o.maintenance.Load()
+}
+
+func (o *Owner) unlockRequestAdmission() {
+	if o.maintenanceGate != nil {
+		o.maintenanceGate.RUnlock()
+	}
+}
+
+// DrainForMaintenance gives already-reserved generation work its accepted
+// deadline, including a blocked write. Unreserved queued demand is never replayed.
 func (o *Owner) DrainForMaintenance(deadline time.Time) {
 	demands := o.detachAllLocalDemands()
 	for _, demand := range demands {
@@ -77,7 +92,7 @@ func (o *Owner) DrainForMaintenance(deadline time.Time) {
 	o.drainInflightRequests()
 }
 
-// DrainRequestsUntil waits for delivered requests without resetting a deadline.
+// DrainRequestsUntil waits for admitted requests without resetting a deadline.
 func (o *Owner) DrainRequestsUntil(deadline time.Time) {
 	for o.PendingRequests() > 0 && time.Now().Before(deadline) {
 		remaining := time.Until(deadline)

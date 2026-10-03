@@ -339,6 +339,14 @@ launcher and library update helpers cannot substitute shutdown or a successor.
 After unplanned daemon loss, aware startup reloads held authority before admission.
 Incomplete or unreadable authority fails closed.
 
+Durable authority is the mandatory schema-2 pair `ledger.json` and
+`transaction.json`, not either file alone. Pending, missing, or invalid pairs
+fail closed. A persistence error keeps live admission conservative but does not
+guarantee storage rollback. After a finalize error, recovery can accept only a
+matching COMMITTED certificate proving earlier acknowledged durable publication;
+the failed caller response remains an error. Successful release cannot resurrect
+the old lease. See the [storage phase contract](specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
 Controlled engine installation, launcher swap, layout/bootstrap mutation, and
 active-pointer updates use the existing daemon namespace file lock. Hold-ledger
 mutations use the same lock, so a hold cannot race past an activation check.

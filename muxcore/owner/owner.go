@@ -925,10 +925,6 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
-	if o.maintenanceGate != nil {
-		o.maintenanceGate.RLock()
-		defer o.maintenanceGate.RUnlock()
-	}
 	if held := o.maintenance.Load(); held != nil {
 		return o.rejectMaintenance(s, msg, held)
 	}
@@ -993,6 +989,10 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		// Cached at owner construction (cacheHandlerInterfaces) so the
 		// per-frame hot path skips a type assertion (CodeRabbit nitpick).
 		if o.sessionHandler != nil {
+			if held := o.lockRequestAdmission(); held != nil {
+				o.unlockRequestAdmission()
+				return nil
+			}
 			project := muxcore.ProjectContext{
 				ID:  muxcore.ProjectContextID(s.Cwd),
 				Cwd: s.Cwd,
@@ -1004,6 +1004,7 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			} else if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
 				go nh.HandleNotification(context.Background(), project, msg.Raw)
 			}
+			o.unlockRequestAdmission()
 			return nil // notifications don't need forwarding to upstream
 		}
 		// Forward other notifications as-is to upstream.
@@ -1116,6 +1117,10 @@ func (o *Owner) forwardModernCancelledNotification(s *Session, msg *jsonrpc.Mess
 // dispatchToSessionHandler calls the SessionHandler directly instead of writing
 // to the pipe. Runs in a goroutine for concurrent request handling.
 func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return o.rejectMaintenance(s, msg, held)
+	}
 	project := muxcore.ProjectContext{
 		ID:  muxcore.ProjectContextID(s.Cwd),
 		Cwd: s.Cwd,
@@ -1123,6 +1128,7 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 	}
 
 	o.pendingRequests.Add(1)
+	o.unlockRequestAdmission()
 
 	go func() {
 		defer o.decrementPending()
@@ -2695,7 +2701,8 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		attempt.cancelMaterialization()
 	}
 	o.materializationMu.Unlock()
-	if attempt != nil {
+	maintenance := o.maintenance.Load() != nil
+	if attempt != nil && !maintenance {
 		timer := time.NewTimer(timeout)
 		select {
 		case <-attempt.done:
@@ -2732,6 +2739,18 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 			exitCode, closeErr = proc.SoftClose(timeout)
 		} else {
 			closeErr = proc.Close()
+		}
+	}
+	if attempt != nil && maintenance {
+		// A queued demand or bootstrap can be blocked in this generation's
+		// stdin. Interrupt it before joining; the fence already covers the
+		// complete start-through-install interval.
+		timer := time.NewTimer(timeout)
+		select {
+		case <-attempt.done:
+			timer.Stop()
+		case <-timer.C:
+			return exitCode, false, fmt.Errorf("owner finalization: materialization did not settle after %s", timeout)
 		}
 	}
 	proofErr := error(nil)
@@ -3130,19 +3149,31 @@ func (o *Owner) writeUpstream(data []byte) error {
 	return err
 }
 
-// writeUpstreamFromCurrent returns the exact process generation used for the
-// write so a failure cannot retire a replacement generation. bind runs after
-// generation selection and before the write begins.
+// writeUpstreamFromCurrent binds the exact process generation and reserves the
+// request under the admission lease, then releases it before transport I/O.
+// A write failure cannot retire a replacement generation.
 func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Process)) (*upstream.Process, error) {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return nil, &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held}
+	}
 	o.touchActivity()
 	o.mu.RLock()
 	writer := o.upstreamWriter
 	up := o.upstream
 	o.mu.RUnlock()
+	if writer == nil && up == nil {
+		o.unlockRequestAdmission()
+		return nil, errors.New("upstream writer unavailable")
+	}
 	if writer != nil {
-		if bind != nil {
-			bind(nil)
-		}
+		up = nil
+	}
+	if bind != nil {
+		bind(up)
+	}
+	o.unlockRequestAdmission()
+	if writer != nil {
 		if _, err := writer.Write(data); err != nil {
 			return nil, fmt.Errorf("upstream writer: write: %w", err)
 		}
@@ -3151,12 +3182,6 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 		}
 		return nil, nil
 	}
-	if up == nil {
-		return nil, errors.New("upstream writer unavailable")
-	}
-	if bind != nil {
-		bind(up)
-	}
 	if o.beforeCurrentUpstreamWrite != nil {
 		o.beforeCurrentUpstreamWrite(up)
 	}
@@ -3164,10 +3189,16 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 }
 
 func (o *Owner) writeUpstreamToProcess(proc *upstream.Process, data []byte) error {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held}
+	}
 	if proc == nil {
+		o.unlockRequestAdmission()
 		return errors.New("upstream writer unavailable")
 	}
 	o.touchActivity()
+	o.unlockRequestAdmission()
 	return proc.WriteLine(data)
 }
 
@@ -3530,8 +3561,13 @@ func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte)
 	if o.isModern() {
 		return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
 	}
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return o.rejectMaintenance(s, msg, held)
+	}
 	replaced, err := jsonrpc.ReplaceID(cached, msg.ID)
 	if err != nil {
+		o.unlockRequestAdmission()
 		return fmt.Errorf("replay %s: replace id: %w", msg.Method, err)
 	}
 
@@ -3542,6 +3578,7 @@ func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte)
 		o.cachedInitSessions[s.ID] = true
 		o.mu.Unlock()
 	}
+	o.unlockRequestAdmission()
 
 	o.logger.Printf("session %d: replaying cached %s response", s.ID, msg.Method)
 	return s.WriteRaw(replaced)
