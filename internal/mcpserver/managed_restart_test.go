@@ -188,8 +188,16 @@ func managedRestartHostCheck(t *testing.T, conn net.Conn, scanner *bufio.Scanner
 			} `json:"result"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &response) == nil && response.ID == "actual-host" {
-			if response.Result.PID <= 0 || filepath.Clean(response.Result.Cwd) != filepath.Clean(cwd) || response.Result.Context != "retained-native-context" {
+			if response.Result.PID <= 0 || response.Result.Context != "retained-native-context" {
 				t.Fatalf("actual upstream lost selected launch context: %s", scanner.Bytes())
+			}
+			selectedDir, selectedErr := os.Stat(cwd)
+			actualDir, actualErr := os.Stat(response.Result.Cwd)
+			if selectedErr != nil || actualErr != nil {
+				t.Fatalf("cannot verify actual upstream working directory identity: selected=%v actual=%v", selectedErr, actualErr)
+			}
+			if !selectedDir.IsDir() || !actualDir.IsDir() || !os.SameFile(selectedDir, actualDir) {
+				t.Fatal("actual upstream lost selected working directory identity")
 			}
 			_ = conn.SetDeadline(time.Time{})
 			return
