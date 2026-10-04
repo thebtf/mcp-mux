@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -412,8 +413,10 @@ func runStop(drainTimeout time.Duration, force bool) int {
 		pingErr = pingResponse.Err()
 	}
 	if pingErr != nil {
-		// Only a missing or refused endpoint permits legacy fallback.
-		if !errors.Is(pingErr, os.ErrNotExist) && !errors.Is(pingErr, syscall.ECONNREFUSED) {
+		// Only a missing, refused, or non-socket endpoint permits legacy fallback.
+		var dialErr *net.OpError
+		nonSocketEndpoint := errors.As(pingErr, &dialErr) && dialErr.Op == "dial" && errors.Is(dialErr, syscall.ENOTSOCK)
+		if !errors.Is(pingErr, os.ErrNotExist) && !errors.Is(pingErr, syscall.ECONNREFUSED) && !nonSocketEndpoint {
 			fmt.Fprintf(os.Stderr, "  daemon: error: %s\n", lifecycleErrorText(pingErr))
 			return 1
 		}
