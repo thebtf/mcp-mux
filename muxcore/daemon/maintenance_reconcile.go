@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
@@ -10,25 +11,26 @@ import (
 // Reuse the existing reaper and lease timer; never invent process authority.
 func (d *Daemon) reconcileMaintenance() {
 	d.maintenanceGate.RLock()
-	active := len(d.maintenanceLeases) > 0
+	active := len(d.maintenanceLeases) > 0 && !d.maintenanceFailed && !d.maintenanceTimerStoppedLocked()
 	d.maintenanceGate.RUnlock()
 	if !active || d.maintenanceLockPath == "" {
 		return
 	}
 	lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
 	if err != nil {
-		select {
-		case <-d.done:
-			return
-		default:
+		if !errors.Is(err, ipc.ErrFileLocked) {
+			d.maintenanceGate.Lock()
+			if len(d.maintenanceLeases) > 0 && !d.maintenanceTimerStoppedLocked() {
+				d.maintenanceFailed = true
+			}
+			d.maintenanceGate.Unlock()
 		}
-		time.AfterFunc(100*time.Millisecond, d.reconcileMaintenance)
 		return
 	}
 	defer lock.Close()
 	d.maintenanceGate.Lock()
 	defer d.maintenanceGate.Unlock()
-	if d.maintenanceFailed {
+	if d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
 		return
 	}
 	for _, lease := range d.maintenanceLeases {
