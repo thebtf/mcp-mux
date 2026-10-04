@@ -26,6 +26,130 @@ jobs:
           # Serialize packages because daemon and snapshot tests share the
           # TEMP-based snapshot path; coverage already uses the same guard.
           go test -race -count=1 -timeout 180s -p=1 ./...
+      - name: Select opt-in Windows maintenance proof
+        id: maintenance-selection
+        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request'
+        shell: pwsh
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $labels = @(ConvertFrom-Json -InputObject $env:PR_LABELS)
+          $selected = @($labels | Where-Object { $_.name.StartsWith('maintenance-proof-v', [StringComparison]::Ordinal) })
+          if ($selected.Count -eq 0) { return }
+          if ($selected.Count -ne 1) { throw 'Exactly one maintenance proof label is required' }
+          $match = [regex]::Match($selected[0].name, '\Amaintenance-proof-v(?<version>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\z')
+          if (-not $match.Success) { throw 'Maintenance proof label must be maintenance-proof-vX.Y.Z with strict semantic version digits' }
+          "version=$($match.Groups['version'].Value)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Check out selected maintenance proof source
+        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.maintenance-selection.outputs.version != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: .agent/tmp/maintenance-proof-source
+          clean: false
+          persist-credentials: false
+      - name: Windows Scenario 11 maintenance replacement
+        id: maintenance-proof
+        if: matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.maintenance-selection.outputs.version != ''
+        shell: pwsh
+        timeout-minutes: 10
+        env:
+          PROOF_VERSION: ${{ steps.maintenance-selection.outputs.version }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_RUN_ID -cnotmatch '\A[0-9]+\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[0-9]+\z') { throw 'Invalid proof resource identity' }
+          $profileRoot = (Resolve-Path -LiteralPath $env:LOCALAPPDATA).Path
+          $sourceRoot = Join-Path $profileRoot "mcp-mux-maintenance-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $sourceRoot) { throw 'Proof clone must be a fresh owned path' }
+          $proofCheckout = Join-Path $env:GITHUB_WORKSPACE '.agent/tmp/maintenance-proof-source'
+          $sourceBytes = (Get-ChildItem -LiteralPath $proofCheckout -Recurse -Force -File | Measure-Object -Property Length -Sum).Sum
+          $freeBytes = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($profileRoot)).AvailableFreeSpace
+          if ($freeBytes -lt (2 * $sourceBytes + 4GB)) { throw 'Insufficient profile volume capacity for clone, Go caches and reserve' }
+          $sourceSHA = & git -C $proofCheckout rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the exact proof checkout' }
+          $sourceSHA = $sourceSHA.Trim()
+          if ($sourceSHA -cne $env:PR_HEAD_SHA) { throw 'Proof checkout does not match the event PR head' }
+          & git clone --no-hardlinks --no-checkout --config core.autocrlf=false --config core.eol=lf -- $proofCheckout $sourceRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Private primary clone failed' }
+          $scratch = Join-Path $sourceRoot '.agent/tmp/maintenance-proof'
+          [void][IO.Directory]::CreateDirectory($scratch)
+          "scratch=$scratch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $candidateBinary = Join-Path $scratch 'mcp-mux.exe'
+          $evidencePath = Join-Path $scratch 'windows.json'
+          $receipt = [ordered]@{
+            verdict = 'FAIL'; expected_version = $env:PROOF_VERSION
+            source_sha = $sourceSHA; pr_head_sha = $env:PR_HEAD_SHA; github_sha = $env:GITHUB_SHA
+            clone_sha = ''; source_clone_equal = $false; workflow_sha256 = ''
+            candidate_sha256 = ''; go_version_info = ''; owner_versions = @(); owner_version_observations = 0
+            evidence_path = $evidencePath; smoke_exit_code = $null; check_count = 0
+            run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+            free_bytes_before = $freeBytes; required_bytes = 2 * $sourceBytes + 4GB
+          }
+          try {
+            & git -C $sourceRoot checkout --detach $sourceSHA
+            if ($LASTEXITCODE -ne 0) { throw 'Exact CI source checkout failed' }
+            $cloneSHA = & git -C $sourceRoot rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the private clone' }
+            $receipt.clone_sha = $cloneSHA.Trim()
+            $receipt.source_clone_equal = $receipt.clone_sha -ceq $sourceSHA
+            if (-not $receipt.source_clone_equal) { throw 'Private clone does not match the actual CI source' }
+            $receipt.workflow_sha256 = (Get-FileHash -LiteralPath (Join-Path $sourceRoot '.github/workflows/ci.yml') -Algorithm SHA256).Hash
+            foreach ($name in @('GOCACHE', 'GOMODCACHE', 'GOTMPDIR')) {
+              $directory = Join-Path $scratch ($name.ToLowerInvariant())
+              [void][IO.Directory]::CreateDirectory($directory)
+              [Environment]::SetEnvironmentVariable($name, $directory, 'Process')
+            }
+            Push-Location $sourceRoot
+            try {
+              & go build -trimpath -ldflags "-X github.com/thebtf/mcp-mux/muxcore/owner.Version=$env:PROOF_VERSION" -o $candidateBinary ./cmd/mcp-mux
+              if ($LASTEXITCODE -ne 0) { throw 'Version-baked release candidate build failed' }
+            } finally { Pop-Location }
+            $receipt.candidate_sha256 = (Get-FileHash -LiteralPath $candidateBinary -Algorithm SHA256).Hash
+            $versionInfo = & go version -m $candidateBinary
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot read candidate Go build metadata' }
+            $receipt.go_version_info = $versionInfo -join "`n"
+            & pwsh -NoProfile -File (Join-Path $sourceRoot 'scripts/smoke-upstream-maintenance.ps1') `
+              -SourceRoot $sourceRoot -CandidateBinary $candidateBinary `
+              -ScratchRoot $scratch -OutputDir (Join-Path $scratch 'w') `
+              -EvidencePath $evidencePath -TimeoutSeconds 180
+            $receipt.smoke_exit_code = $LASTEXITCODE
+            if ($receipt.smoke_exit_code -ne 0) { throw 'Windows maintenance replacement proof failed; retain its redacted evidence' }
+            if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) { throw 'Required Windows evidence is missing' }
+            $proof = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json -AsHashtable
+            $receipt.check_count = @($proof.checks).Count
+            if ($proof.verdict -cne 'PASS' -or $receipt.check_count -eq 0 -or @($proof.checks | Where-Object { $_.passed -ne $true }).Count -ne 0) { throw 'Windows evidence lacks a positive all-passed observation denominator' }
+            if ($proof.source_sha -cne $sourceSHA -or $proof.candidate_sha256 -ne $receipt.candidate_sha256) { throw 'Windows evidence does not match the selected source and binary' }
+            $versions = @(
+              foreach ($command in $proof.commands) {
+                if ($command.arguments.Count -eq 1 -and $command.arguments[0] -ceq 'status' -and $command.exit_code -eq 0) {
+                  $status = ConvertFrom-Json -InputObject $command.stdout -AsHashtable
+                  foreach ($owner in $status.servers) { $owner.mux_version }
+                }
+              }
+            )
+            $receipt.owner_version_observations = $versions.Count
+            $receipt.owner_versions = @($versions | Sort-Object -Unique)
+            if ($versions.Count -eq 0 -or @($versions | Where-Object { $_ -cne $env:PROOF_VERSION }).Count -ne 0) { throw 'Actual owner versions do not prove the selected release version' }
+            $receipt.verdict = 'PASS'
+          } finally {
+            $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $scratch 'build-receipt.json') -Encoding utf8
+          }
+      - name: Retain Windows maintenance proof evidence
+        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.maintenance-selection.outputs.version != '' && steps.maintenance-proof.outputs.scratch != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintenance-proof-windows-v${{ steps.maintenance-selection.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.maintenance-proof.outputs.scratch }}/windows.json
+            ${{ steps.maintenance-proof.outputs.scratch }}/build-receipt.json
+          include-hidden-files: true
+          if-no-files-found: error
 
   coverage:
     runs-on: ubuntu-latest
