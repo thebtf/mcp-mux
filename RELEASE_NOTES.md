@@ -166,10 +166,25 @@ same admitted successor for connected and parked shims. The parked path consumes
 the existing private IPC-EOF wake, without a new transport/controller, era
 fallback, or held/unfinished-work replay.
 
+First post-resume `OnInject` demand uses that same admission/activation path,
+outside ingress/dormant/suspend locks. Healthy injection retains one-pass lock
+admission and nonblocking queue-capacity behavior; its callback remains single-fire.
+Caller bytes are copied before unlocked revalidation; closed/dormant state and
+maintenance sequence are rechecked before enqueue. Closed/full sentinels, FIFO and
+suspend accounting remain, without a new queue, goroutine, API, or replay.
+
 Controlled restart, handoff, shutdown, downgrade, and idle daemon exit refuse
 terminally while any fence remains. Launcher and library update helpers retain
 typed refusal instead of falling back to shutdown or starting a successor.
 Aware unplanned recovery loads durable authority before listener/restore/spawn.
+
+Era-less snapshot/handoff payloads do not prove every historical environment:
+`CwdSet` lacks associated environments and retained `BoundTokens` are observations,
+not a complete inventory. Ordinary no-lease restore remains available, but hold
+acquisition for an incomplete restored owner and restoration under an active lease
+fail closed with existing `maintenance_invalid`. No payload schema/version, API,
+or expiry seam is added. The causal case loses an admitted environment before token
+consumption; it does not execute elapsed-TTL expiry.
 
 Maintenance storage is one schema-2 authority with mandatory `ledger.json` and
 `transaction.json`. Missing, pending, corrupt, or mismatched authority fails
@@ -279,9 +294,12 @@ passed all5 jobs; doc44's evidence check is bounded SOURCE-facts PASS.
 Committed c183 reaper repair has causal failure-latch RED→two normal PASS and
 race3 top-level/5 named PASS rows including parents, zero skips/races. Independent
 timer scheduling removal is SOURCE-only, not a runtime multiplicity assertion.
-Earlier reaper/owner disposition closed29 known threads. Fresh26f enumeration has
-31 total/29 resolved/2 unresolved P2s: restore-environment completeness and first-
-fresh OnInject revalidation. Their repair/proof remains pending; no clean verdict.
+Earlier29 closure and26f enumeration31/29/2 are historical. Restore-environment
+completeness and first-fresh OnInject repairs are committed/focused-proven.
+Actual [restore reply4179041769](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179041769)
+and [injection reply4179041932](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179041932)
+have exact UTF8/in-reply-to readback and native resolutions. All31 known threads
+are root-resolved, not a fresh final-head/all-PR CLEAN verdict.
 Prior owner source is committed/frozen/pushed26f. Initial966d
 proof retains original both-era RED→first-fix connected GREEN/race; discovered
 parked SOURCE deadlock and actual first-fix parked RED→final3 leaves plain/race
@@ -296,10 +314,84 @@ each pass once:27 tested packages PASS/3 no-test,2333 leaf PASS/5 named SKIP,
 0 failures/races. Clean CGO0/trimpath26f artifact/owner0.31.0 gives Scenario11
 1191/1191 PASS; separate CGO1 R1 binary gives100/100+8/8 PASS, not release-version
 evidence. Supplemental R1 ELF version read failed/UNKNOWN, retained without retry;
-not an owning gate. This does not certify new P2 WIP, Windows or delivery.
-Root's complete3-record runtime-grant recheck finds no mcp-mux project grant;
-only that local Windows positive effect is held, with task approval retained.
-No final all-PR CLEAN or release completion is claimed.
+not an owning gate. Restore947e and injection1e45 are committed/frozen at
+`1e45a13f176e8322c2f6530ded433a1cbfa2df9e`. Each focused receipt proves
+immutable26f plus only its two overlays, not a full integrated1e gate. Actual
+restore unsafe HELD/tree retirement/forgotten-environment spawn RED becomes typed
+invalid/no new lease/same live owner GREEN and race,1 leaf each, plus9 complement
+leaves under race. Environment loss precedes token consumption; TTL extension is
+SOURCE-only, with no expiry probe. Injection connected both-era/parked RED4 named
+records becomes GREEN4; race12 top-level/18 named PASS records include parents,
+not18 leaves,0 SKIP/races. Integrated1e source is pushed to the PR branch;
+Actual immutable1e Linux normal root/module tests, both vets and full-race suites
+each once exit0:27 tested packages/3 no-test;2339 positive race leaves/5 named SKIP,
+0 failed/races. Clean CGO0/trimpath1e owner0.31.0 binary gives Scenario11 1191/1191;
+separate unstamped CGO1 R1 100+8 PASS reports1e45a13f, not0.31.0. Old CI RED remains.
+[Exact1e CI37229280285](https://github.com/thebtf/mcp-mux/actions/runs/37229280285)
+FAILED: coverage/Ubuntu/BSD PASS; macOS daemon and Windows daemon component fail
+`TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed` at line924,
+`actual snapshot unexpectedly preserved the optional admitted environment`.
+Windows job was canceled after the observed daemon failure, not a failed job verdict.
+Parent's SOURCE trace distinguishes the four-assertion guard from its error text:
+AddCwd logs show2 roots from raw/canonical spelling (Darwin `/var`→`/private/var`,
+Windows case normalization), violating the cardinality assumption, not proving
+optional environment retention. Fixture-only `91dc293afb71059097fcdb65c6a07cf8feadb0b3`
+removes cardinality/env-slot assumptions: original26 production/new fixture actual
+unsafe HELD/retirement/forgotten-spawn RED→current plain/race1 leaf PASS each+9
+guard race leaves,0 SKIP/races. Production/proof11 inputs match1e,460 excluded
+files unchanged; no build/public repeat/full91/Windows/macOS PASS. Workflow later
+committedc18; old1e/c18 CI RED retained, exact344 CI SUCCESS below. No production/new deadline/
+OS skip; old error verbatim. Historical8142
+receipts/failures are preserved, not Windows/delivery
+acceptance. Root's complete3-record recheck finds no project runtime grant; only
+the optional local Windows effect is held, task approval retained. Bootstrap finds
+approved target absent: CREATE that exact non-reparse directory, then re-enter:
+`/writable-root add C:/Users/btf/AppData/Local/mcp-mux-verification-01a0fb9a`, then
+`/writable-root status`, confirming root/origin/project/expiry/writer coverage.
+The missing grant holds only that optional local route, not release globally:
+FR-016/SC-001 require OS-native Windows+Unix proof, not this workstation. Root's
+selected explicit maintenance-proof-v0.31.0 hosted Windows opt-in is committed/
+pushed as workflow-only `c18bfc7619f42d5fc9330ea5c0c5a31634abacaf` after91. Root label
+readback preceded push; actionlint/YAML/P7 AST both steps PASS, STATIC only.
+[CI37234225216](https://github.com/thebtf/mcp-mux/actions/runs/37234225216) boundc18
+FAILED: macOS daemon `TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn/0/short_drain`,
+line231, `actual callback reservations were not counted` (0.02s leaf), retained verbatim.
+Old restore line924 failure is absent. Windows/Ubuntu daemon components PASS
+(127.325s/101.865s), both jobs CANCELED by fail-fast before hosted steps; BSD/
+coverage PASS. Atc18 no actual Windows Scenario11/artifact/PASS or aggregate GREEN.
+SOURCE cause is fixture ordering, not a production defect: opening reply flush
+precedes deferred Pending decrement; receiving it does not join cleanup. Two
+callbacks can coexist with that reservation. CI's !=2 guard logged no count;
+3 is SOURCE-possible, not observed or a Mac-specific cause. Frozen one-file a93c3b6
+removes exact-two snapshots and asserts positive-grace hold waits for real callback
+return after original-ID errors, preserving drains/clocks/BLOCKED/Done/cancel-
+without-return/resume refusal/same-pipe successor. Actual one-invocation native
+race8/8 original subtests PASS,0 SKIP/errors/warnings/stderr on immutablec18+onlya93.
+Root committed/pushed test-only `34410430507ef771cf8d88598bb7ede7afcdfb5d`;
+110 selected production and broader production/proof11 inputs equal1e. Live
+excluded equality REFUSED4 concurrent docs drift, no WIP import/staging claim;
+root must bind final doc hashes. Exact344 CI and hosted Windows proof succeeded
+below; no fresh344 Linux full run or prod/schema/helper-clock/deadline/OS skip/
+extra SubprocessTreeDone case is inferred. Workflow/label unchanged.
+Conditional second checkout uses exact event
+PR head, not synthetic merge; fresh full LOCALAPPDATA PRIMARY LF/no-hardlinks
+clone uses `.agent/tmp`,0.31.0 build/existing Scenario11. Only redacted windows.json/
+build-receipt.json upload; ordinary triggers/tests unchanged. Actual
+[CI37236880161](https://github.com/thebtf/mcp-mux/actions/runs/37236880161) bound344
+completed SUCCESS, all5 jobs. Selected Windows job111537660496's opt-in,
+checkout, Scenario11 and evidence-retention steps all SUCCESS. Retained/downloaded
+artifact11315977986 is `maintenance-proof-windows-v0.31.0-37236880161-1`.
+Actual Windows JSON/build receipt PASS: source/pr-head/clone344 equal, clean
+embedded344 Go1.25.12 CGO0/trimpath binary SHA256
+`cf6ab1afa0c3cf41a59caf97ffc0620be7d76aac0bbebaf44d64350d2be23cde`;
+smoke exit0,1158/1158 checks,0 cleanup errors, actual owner0.31.0 in23 observations.
+Full retained receipt hashes and proof limits are in
+[release evidence](specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact344-hosted-windows-proof).
+Windows premerge proof is closed, not the optional local granted-root route,
+final review disposition/source-plus-docs acceptance or postmerge fresh delivery.
+Linux full/artifact evidence remains1e-bound, not fresh344 Linux full execution.
+Other release/consumer gates remain pending; no local profile/ACL/bypass effects.
+No all-PR CLEAN or release completion is claimed.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

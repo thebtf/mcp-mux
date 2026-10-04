@@ -197,6 +197,21 @@ cache or forwarding, and never replay held or terminated work. Notifications
 have no invented replies. Modern resumed demand uses fresh same-era isolated
 admission without legacy bootstrap, cache, or subscription restoration.
 
+Era-less snapshot/handoff payloads do not prove the complete historical environment
+inventory: `CwdSet` lacks associated environments and retained `BoundTokens` are
+only observations. Ordinary no-lease restore remains available, but hold acquisition
+for an incomplete restored owner and restoration under an active lease fail closed
+with existing `maintenance_invalid`. Do not add a payload schema/version, API, or
+expiry seam. The causal case loses an admitted environment before token consumption;
+elapsed TTL is not its runtime oracle.
+
+First post-resume `OnInject` demand uses the same admission/activation path as stdin,
+waiting outside ingress/dormant/suspend locks. Healthy injection retains one-pass
+lock admission and nonblocking queue-capacity behavior; the callback remains single-fire.
+Copy caller bytes before unlocked revalidation, then recheck closed/dormant state and
+maintenance sequence before enqueue. Preserve `ErrInjectClosed`, `ErrInjectFull`,
+FIFO and suspend accounting; no new queue, goroutine, API, or replay.
+
 Controlled restart/handoff/shutdown/downgrade and idle exit refuse terminally
 under any fence, including launcher/library update fallback paths. Aware
 unplanned recovery reads durable authority before admission. Old daemons and
@@ -284,10 +299,16 @@ full-tree HELD proof, original-ID errors/no replay, exact lease timing, terminal
 lifecycle refusal, and compatibility limits above are the consumer contract.
 Legacy stays the default and modern R1 stays explicitly same-era and isolated.
 
-Publication targets are `v0.31.0` and `muxcore/v0.31.0`. Prior accepted-source
-checks are recorded in `RELEASE_NOTES.md`; latest durable-clock/RPC-budget checks
-remain pending. Final artifact proof, tags/module resolution, and Engram handoff
-remain release-root work.
+Publication targets are `v0.31.0` and `muxcore/v0.31.0`. Source-bound checks are
+recorded in `RELEASE_NOTES.md` and the maintenance release evidence. Exact344
+[CI37236880161](https://github.com/thebtf/mcp-mux/actions/runs/37236880161) passed
+all five jobs. Its selected Windows Scenario 11 executed successfully: 1158/1158
+checks, smoke exit0, no cleanup errors, actual owner0.31.0 in23 observations.
+The retained build/JSON receipts bind source, PR head and clone to344 and the
+CGO0/trimpath binary to SHA256 `cf6ab1afa0c3cf41a59caf97ffc0620be7d76aac0bbebaf44d64350d2be23cde`.
+This closes the Windows premerge proof requirement, not a fresh344 Linux full
+run or delivered-artifact canary. Final source-plus-docs acceptance, review
+disposition, merge, tags/module resolution and Engram handoff remain root-owned.
 Do not report this prepared scope as shipped or `CONSUMER_HANDOFF_PASS`.
 
 Rollback to `muxcore/v0.30.0` or a compatible previous binary only after the

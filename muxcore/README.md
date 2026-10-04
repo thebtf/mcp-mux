@@ -808,6 +808,22 @@ without closing host pipes. Held or terminated requests do not replay; modern
 fresh demand re-enters same-era isolated admission without legacy bootstrap,
 cache, progress, or subscription restoration.
 
+Era-less snapshot/handoff payloads retain CWD/environment observations, not the
+complete historical environment inventory. `CwdSet` has no associated environments
+and retained `BoundTokens` cannot certify every admitted context. Ordinary no-lease
+restore remains available. Hold acquisition for an incomplete restored owner and
+restoration under an active lease fail closed with existing `maintenance_invalid`;
+no payload schema/version, public API, or expiry seam is added. The causal regression
+uses admitted environment loss before token consumption, not elapsed TTL.
+
+The first post-resume frame from `OnInject` revalidates admission and waits for the
+same successor activation as stdin, outside ingress/dormant/suspend locks. Healthy
+injection retains one-pass lock admission and nonblocking queue-capacity behavior;
+`OnInject` itself still fires once. Caller bytes are copied before unlocked revalidation,
+then closed/dormant state and maintenance sequence are checked again before enqueue.
+`ErrInjectClosed`/`ErrInjectFull`, FIFO and suspend accounting remain unchanged.
+No new queue, goroutine, API, or held/unfinished-work replay is added.
+
 All controlled restart/handoff/shutdown/downgrade and idle-exit paths refuse
 terminally while fences remain. `RestartWithSuccessor` and
 `ApplyUpdateAndRestart` must preserve typed refusal, never fall back to shutdown
@@ -867,6 +883,17 @@ host-wide executable-lock authority.
 Run [production Scenario 11](../docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 on Windows and Unix with the actual integrated binary. Focused maintenance
 regressions and existing native Scenario 5b/8 and R1 parity remain separate gates.
+
+Recorded premerge proof: exact344
+[CI37236880161](https://github.com/thebtf/mcp-mux/actions/runs/37236880161) passed
+all five jobs; its selected Windows Scenario 11 passed1158/1158 checks, exit0,
+with no cleanup errors and actual owner0.31.0 in23 observations. Source/PR-head/
+clone binding and full binary/receipt hashes are in the
+[release evidence](../specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact344-hosted-windows-proof).
+Linux full/artifact proof remains source-bound to1e, not a fresh344 full run.
+These are premerge facts, not final acceptance, publication, a fresh-session
+delivered-artifact canary or consumer handoff. Maintenance safety limits and
+the separate focused/native/R1 gates above remain unchanged.
 
 ## Upgrade and Restart Contract
 
