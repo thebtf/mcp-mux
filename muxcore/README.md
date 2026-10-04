@@ -718,6 +718,23 @@ Keep the fence and inspect status; notification cancellation on session/owner
 closure does not prove return. `PendingRequests` remains request-only; the
 private nonrequest accounting adds no public counter, status field, or schema.
 
+This also covers plain sessions without hooks and accepted connections still
+waiting for their native token. Private accept completion is reserved before
+launch in all three owner constructors; reader startup is serialized with
+admission closure. Readers complete only after full deferred close/remove
+cleanup, and the accept producer closes admission before joining readers and
+publishing completion. Transport completion is distinct from request/native
+work grace; actual process proof follows the bounded existing-budget join.
+No public counter/schema/state, manager, new timeout, replay or fake Done is added.
+
+If proven retirement cannot publish because the namespace lock is contended,
+retry through the existing exact-lease timer; no reaper is required. Successful
+`RETIREMENT_BLOCKED` renewal retains pending retry intent on the replacement
+lease's guarded timer. Renewal changes only accepted expiry, never the original
+drain deadline; publication preserves both. Stale lease/timer callbacks cannot
+overwrite renewed, released, or replacement authority. Other errors do not gain
+a new automatic retry policy.
+
 When `AuthorizeSession` is configured, every owner mode, including subprocess
 and `HandlerFunc`, retains private callback authority through actual return and
 the registration/rejection continuation. Admission closure prevents late allow

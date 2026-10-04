@@ -63,6 +63,14 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   native sessions as teardown producers. Ordinary removal and maintenance both
   require quiescence. Cancellation is not settlement; active work keeps retirement
   blocked without TTL/resume bypass. Public `PendingRequests` remains request-only.
+- Plain sessions and accepted pre-token connections remain owned through actual
+  reader/remove cleanup. Accept completion is reserved before launch; reader
+  startup is serialized with admission closure and full join precedes process
+  proof within the existing budget, without new public state/counter or timeout.
+- Retirement publication retries namespace-lock contention through the existing
+  exact-lease timer without a reaper. Successful blocked renewal preserves pending
+  retry intent on the replacement lease's guarded timer, retaining the original
+  drain deadline and legitimately accepted expiry; stale callbacks stay fenced.
 - Recovered lease timers and control request serving activate only after daemon
   construction succeeds. Failed registry/control setup cannot leave a stale
   expiry timer that later overwrites renewed authority; accepted expiry is unchanged.
@@ -146,11 +154,22 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   vet/public1182/R1 8+100 preserve old module RED. Later test-only engine/owner
   fixes have consumer-visible proof and native5ea module-race25/25 PASS, skips explicit.
   Alias/control focused proof and exact4e CI37199675520 all5 success are scoped;
-  exact4e Linux/CI stays historical. Exactbaa Linux full-race/both vet and actual
-  0.31.0 Scenario11 1173/R1 8+100 now PASS. Baa CI's macOS lexical-CWD fixture
-  failed (coverage/BSD passed, Windows/Ubuntu canceled); test-only SameFile oracle
-  proof/successor CI and three native dispositions still precede final acceptance.
-  Local Windows public positive separately awaits its exact runtime grant.
+  earlier baa full Linux/public1173/R1 and f902 CIall5 retain historical scopes.
+  Ceb transport focused43/race43/callback58/preservation23 and final SOURCEPASS
+  remain valid. Clean ceb root/vet/actual0.31.0/public1191/R1 PASS, module24/25
+  and coverage reserved-write FAIL retained. Historical fixture-only c0 full-module
+  race now passed25/25 packages/2021 positive leaves/4 explicit skips and both vet;
+  its root/public1191/R1 artifact reuse was byte-bound to unchanged ceb production,
+  not a newly built c0 binary. Current pushed b86a998 adds retirement publication/
+  blocked-renewal retry: native Linux original+renewed_blocked2 normal/race, async12
+  and expiry8 race PASS with zero skips/data races. Initial c0 RED and first-fix
+  renewal RED remain distinct; the exact-hash checker is SOURCE-only. Exact b86
+  [CI37221621672](https://github.com/thebtf/mcp-mux/actions/runs/37221621672) passed
+  all5 jobs. Parent read back the retirement reply and resolved the last thread:
+  all27 known threads are now resolved, not a fresh all-PR CLEAN verdict. Current
+  Linux full gates/artifact and final-head enumeration remain pending; prior
+  artifacts do not certify changed production. Local Windows public positive and
+  release acceptance remain unproved.
 
 ### Rollback
 

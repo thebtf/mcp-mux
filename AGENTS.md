@@ -118,6 +118,20 @@ before a later hold. Reuse blocked finalization/exact-entry retry, not a new wai
 or scheduler. `PendingRequests` is request-only, not complete native-work proof;
 private nonrequest accounting adds no public metric, state, API, or schema.
 
+Retain every session through actual reader removal, including plain/no-hook and
+accepted pre-token connections. Publish private acceptDone before launch in all
+three constructors; serialize ReaderWG Add/launch with admission closure. Reader
+Done follows full deferred close/remove cleanup; accept closes admission before
+Wait and acceptDone. Transport completion is separate from request/nativeWork
+grace; sample actual process proof after the bounded existing-budget join. Reuse
+real reader cleanup, not a redundant cleanup counter, new timeout or fake Done.
+
+Retirement publication retries namespace-lock contention through the existing
+exact-lease timer, without a reaper. Successful blocked renewal preserves pending
+retry intent on the replacement lease's guarded timer; it changes only accepted
+expiry, not the original drain deadline. Publication preserves accepted expiry
+and drain authority; stale lease/timer callbacks cannot mutate replacement authority.
+
 Configured authorization must retain private callback authority through return
 and registration/rejection in every owner mode, not only `SessionHandler`.
 Serialize late admission against listener closure; handoff/retirement must join
