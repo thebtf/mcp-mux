@@ -424,4 +424,3 @@ Final version-baked/delivered-artifact proof, tag/module resolution, and Engram
 consumer handoff remain pending under the [release protocol](RELEASE-PROTOCOL.md).
 See [production Scenario 11](PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 for the live replacement oracle.
-
