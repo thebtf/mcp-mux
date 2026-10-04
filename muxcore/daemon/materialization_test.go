@@ -1788,7 +1788,10 @@ func TestRestartCaptureZeroSessionMaterializationBarrier(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New daemon: %v", err)
 			}
-			t.Cleanup(d.Shutdown)
+			t.Cleanup(func() {
+				releaseToolsOnce.Do(func() { close(releaseTools) })
+				d.Shutdown()
+			})
 			command := "restart-capture-upstream"
 			template := daemonMaterializationSnapshot(false)
 			template.Cwd = "/cached/restart"

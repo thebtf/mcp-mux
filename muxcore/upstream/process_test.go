@@ -142,6 +142,127 @@ func TestRetirementProvenRejectsUnobservedHandlerCompletion(t *testing.T) {
 	}
 }
 
+func TestHandlerForcedRetirementCancelsOwnedContextAfterGrace(t *testing.T) {
+	for _, method := range []string{"Close", "SoftClose"} {
+		t.Run(method, func(t *testing.T) {
+			const grace = 30 * time.Millisecond
+			stdinClosed := make(chan error, 1)
+			cancelled := make(chan time.Time, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			p := NewProcessFromHandler(context.Background(), func(ctx context.Context, stdin io.Reader, _ io.Writer) error {
+				_, err := io.Copy(io.Discard, stdin)
+				stdinClosed <- err
+				select {
+				case <-ctx.Done():
+					cancelled <- time.Now()
+					<-release
+					return ctx.Err()
+				case <-release:
+					return err
+				}
+			})
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				_ = p.stdin.Close()
+				select {
+				case <-p.Done:
+					_ = p.Close()
+				case <-time.After(2 * time.Second):
+					t.Error("released handler did not complete during cleanup")
+				}
+			})
+			p.SetDrainTimeout(grace)
+			type closeResult struct {
+				code int
+				err  error
+			}
+			result := make(chan closeResult, 1)
+			started := time.Now()
+			go func() {
+				if method == "Close" {
+					result <- closeResult{err: p.Close()}
+				} else {
+					code, err := p.SoftClose(grace)
+					result <- closeResult{code: code, err: err}
+				}
+			}()
+			select {
+			case err := <-stdinClosed:
+				if err != nil {
+					t.Fatalf("stdin EOF: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("retirement did not close stdin before escalation")
+			}
+			select {
+			case when := <-cancelled:
+				if elapsed := when.Sub(started); elapsed < grace {
+					t.Fatalf("owned context cancelled after %v, before grace %v", elapsed, grace)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("forced retirement did not cancel the Background-backed handler context")
+			}
+			select {
+			case got := <-result:
+				if method == "Close" && got.err != nil {
+					t.Fatalf("Close: %v", got.err)
+				}
+				if method == "SoftClose" && (got.code != -1 || got.err == nil) {
+					t.Fatalf("SoftClose = (%d, %v), want timeout escalation", got.code, got.err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("retirement did not return after cancellation escalation")
+			}
+			select {
+			case <-p.Done:
+				t.Fatal("owned cancellation manufactured completion before handler return")
+			default:
+			}
+			if p.RetirementProven() || p.TreesDead() {
+				t.Fatal("owned cancellation proved retirement before handler return")
+			}
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case <-p.Done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("cancelled handler did not complete after body release")
+			}
+			if !errors.Is(p.ExitErr, context.Canceled) || !p.RetirementProven() || !p.TreesDead() {
+				t.Fatalf("actual completion exit=%v retirement=%t treesDead=%t", p.ExitErr, p.RetirementProven(), p.TreesDead())
+			}
+		})
+	}
+}
+
+func TestHandlerRetirementPreservesVoluntaryEOFCompletion(t *testing.T) {
+	for _, method := range []string{"Close", "SoftClose"} {
+		t.Run(method, func(t *testing.T) {
+			contextAtEOF := make(chan error, 1)
+			p := NewProcessFromHandler(context.Background(), func(ctx context.Context, stdin io.Reader, _ io.Writer) error {
+				_, err := io.Copy(io.Discard, stdin)
+				contextAtEOF <- ctx.Err()
+				return err
+			})
+			t.Cleanup(func() { _ = p.Close() })
+			p.SetDrainTimeout(2 * time.Second)
+			if method == "Close" {
+				if err := p.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			} else if code, err := p.SoftClose(2 * time.Second); code != 0 || err != nil {
+				t.Fatalf("SoftClose = (%d, %v), want clean voluntary completion", code, err)
+			}
+			if err := <-contextAtEOF; err != nil {
+				t.Fatalf("handler context cancelled before voluntary EOF completion: %v", err)
+			}
+			if p.ExitErr != nil || !p.RetirementProven() || !p.TreesDead() {
+				t.Fatalf("voluntary completion exit=%v retirement=%t treesDead=%t", p.ExitErr, p.RetirementProven(), p.TreesDead())
+			}
+		})
+	}
+}
+
 func TestStartAndClose(t *testing.T) {
 	// Use a simple process that exits immediately
 	var cmd string

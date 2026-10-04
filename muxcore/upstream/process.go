@@ -90,6 +90,9 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 		}
 		return softCloseExitCode(p.ExitErr), fmt.Errorf("upstream: forced kill after soft-close timeout")
 	}
+	if p.handlerCancel != nil {
+		p.handlerCancel()
+	}
 	return -1, fmt.Errorf("upstream: handler did not exit after %v", timeout)
 }
 
@@ -232,7 +235,8 @@ type Process struct {
 	retiring      bool
 	treeFinalized bool
 	detach        detachState
-	drainTimeout  time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
+	drainTimeout  time.Duration      // from x-mux.drainTimeout; overrides default 5s stdin-close wait
+	handlerCancel context.CancelFunc // owned handler lifetime; nil for OS processes
 
 	// Done is closed when the process exits.
 	Done chan struct{}
@@ -610,6 +614,9 @@ func (p *Process) Close() error {
 		return err
 	}
 	if p.proc == nil && p.pid <= 0 {
+		if p.handlerCancel != nil {
+			p.handlerCancel()
+		}
 		p.markClosed()
 		return nil
 	}
@@ -848,8 +855,8 @@ func (p *Process) AbortDetach() error {
 // the handler goroutine returns.
 //
 // The returned Process has PID() == 0 and no procgroup backing; Close() closes
-// the stdin pipe (EOF signal) and waits up to the drain timeout for the handler
-// to exit; Done proves actual handler completion.
+// the stdin pipe (EOF signal), waits up to the drain timeout, then cancels the
+// handler's child context if still running. Done proves actual handler completion.
 func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context, stdin io.Reader, stdout io.Writer) error) *Process {
 	// stdinR → handler reads its "stdin" from here
 	// stdinW → process.WriteLine writes here
@@ -859,11 +866,14 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 	// stdoutW → handler writes its responses here
 	stdoutR, stdoutW := io.Pipe()
 
+	handlerCtx, cancel := context.WithCancel(ctx)
+
 	p := &Process{
-		stdin:   stdinW,
-		stdout:  stdoutR,
-		Done:    make(chan struct{}),
-		lineBuf: newLineBuffer(),
+		stdin:         stdinW,
+		stdout:        stdoutR,
+		Done:          make(chan struct{}),
+		lineBuf:       newLineBuffer(),
+		handlerCancel: cancel,
 	}
 
 	go func() {
@@ -887,8 +897,9 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 	}()
 
 	go func() {
-		// handler runs until it returns or ctx is cancelled.
-		err := handler(ctx, stdinR, stdoutW)
+		// Cancellation requests shutdown; Done still follows actual return.
+		err := handler(handlerCtx, stdinR, stdoutW)
+		cancel()
 		// Signal EOF on stdout so ReadLine returns io.EOF.
 		stdoutW.CloseWithError(err)
 		// Drain stdin pipe (in case handler exited before reading all input).
