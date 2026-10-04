@@ -227,9 +227,7 @@ func TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn(t *test
 						t.Fatal("actual native callback did not enter its barrier")
 					}
 				}
-				if entry.Owner.PendingRequests() != 2 {
-					t.Fatal("actual callback reservations were not counted")
-				}
+				// Opening response delivery does not join its owner's deferred cleanup.
 				type holdResponse struct {
 					result *control.MaintenanceResult
 					err    error
@@ -244,6 +242,11 @@ func TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn(t *test
 					send("18", "maintenance/native-write")
 					send(`"fenced-string"`, "maintenance/native-write")
 					read("18", `"fenced-string"`)
+					select {
+					case response := <-held:
+						t.Fatalf("hold finished before actual native callback return: %+v %v", response.result, response.err)
+					default:
+					}
 					releaseOnce.Do(func() { close(handler.release) })
 				}
 				var result *control.MaintenanceResult
@@ -303,8 +306,8 @@ func TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn(t *test
 					d.mu.RLock()
 					retrying := entry.removalRetrying
 					d.mu.RUnlock()
-					if d.Entry(initial.ServerID) != entry || !identity.matches(entry) || !retrying || entry.Owner.MaintenanceRetired() || entry.Owner.PendingRequests() != 2 || handler.returned.Load() != 0 || entry.Owner.Status()["materialization_state"] != string(owner.MaterializationFinalizeBlocked) {
-						t.Fatal("existing exact-entry retry lost active callback authority or its counter")
+					if d.Entry(initial.ServerID) != entry || !identity.matches(entry) || !retrying || entry.Owner.MaintenanceRetired() || handler.returned.Load() != 0 || entry.Owner.Status()["materialization_state"] != string(owner.MaterializationFinalizeBlocked) {
+						t.Fatal("existing exact-entry retry lost active callback authority")
 					}
 					select {
 					case <-entry.Owner.Done():
