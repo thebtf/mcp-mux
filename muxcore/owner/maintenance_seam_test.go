@@ -79,13 +79,20 @@ func TestMaintenanceFenceRetiresReservedWrite(t *testing.T) {
 				if !queued {
 					waitForCondition(t, 5*time.Second, func() bool { return o.MaterializationState() == MaterializationReady }, "helper did not initialize")
 				}
-				s, output := addModernOwnerSession(t, o, t.TempDir())
-				s.Env = env
+				// Retirement needs a real reader's deferred removal, not a manually
+				// registered routing-only session that can never leave the owner.
+				reader, input := io.Pipe()
+				exit := &maintenanceReaderExit{ReadCloser: reader, exited: make(chan struct{})}
+				output := &safeBuf{}
+				s := NewSession(exit, output)
+				s.Cwd, s.Env = t.TempDir(), env
+				t.Cleanup(func() { _ = input.Close(); s.Close() })
+				o.AddSession(s)
 				selected := make(chan *upstream.Process, 1)
 				o.beforeCurrentUpstreamWrite = func(proc *upstream.Process) { selected <- proc; <-release }
 				request := parseMessage([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":301,"method":"maintenance/block","params":{"payload":"%s","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`, strings.Repeat("x", 512*1024))))
-				forwardDone := make(chan error, 1)
-				go func() { forwardDone <- o.handleDownstreamMessage(s, request) }()
+				inputDone := make(chan error, 1)
+				go func() { _, err := io.WriteString(input, string(request.Raw)+"\n"); inputDone <- err }()
 				var proc *upstream.Process
 				select {
 				case proc = <-selected:
@@ -94,6 +101,14 @@ func TestMaintenanceFenceRetiresReservedWrite(t *testing.T) {
 				}
 				if o.PendingRequests() != 1 || proc != o.currentUpstream() {
 					t.Fatal("admitted writer was not existing work on the exact generation")
+				}
+				select {
+				case err := <-inputDone:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("real reader did not consume the reserved request")
 				}
 				if !gate.TryLock() {
 					t.Fatal("admitted writer retained the fence admission lease")
@@ -116,13 +131,29 @@ func TestMaintenanceFenceRetiresReservedWrite(t *testing.T) {
 				if !finalized || !o.MaintenanceRetired() || !proc.TreesDead() {
 					t.Fatalf("force retirement could not interrupt the reserved generation: finalized=%t err=%v", finalized, err)
 				}
-				select {
-				case err := <-forwardDone:
-					if err != nil {
-						t.Fatal(err)
+				// Closed bookkeeping and the forced-kill warning are not proofs.
+				// Observe actual Read return and the full deferred reader/accept join.
+				for name, done := range map[string]<-chan struct{}{
+					"session read": exit.exited, "reader/accept join": o.acceptDone,
+					"captured process": proc.Done, "owner": o.Done(),
+				} {
+					select {
+					case <-done:
+					default:
+						t.Fatalf("%s did not settle before proven retirement", name)
 					}
-				case <-time.After(time.Second):
-					t.Fatal("reserved request did not finish after tree retirement")
+				}
+				o.materializationMu.Lock()
+				queuedRemaining := len(o.pendingDemands)
+				o.materializationMu.Unlock()
+				if !proc.RetirementProven() || o.currentUpstream() != nil || o.SessionCount() != 0 || o.nativeWork.Load() != 0 || queuedRemaining != 0 {
+					t.Fatal("retirement retained old generation, reader, or queued replay authority")
+				}
+				if err := proc.WriteLine([]byte("late")); err == nil {
+					t.Fatal("the captured retired generation accepted replay")
+				}
+				if err != nil {
+					t.Logf("retirement preserved upstream warning: %v", err)
 				}
 				responses := parseJSONRPCResponsesWithID(t, output.String())
 				ids := map[string]int{}
