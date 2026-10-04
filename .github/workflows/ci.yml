@@ -57,12 +57,14 @@ jobs:
         env:
           PROOF_VERSION: ${{ steps.maintenance-selection.outputs.version }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROOF_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: "0"
         run: |
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_OS -cne 'Windows' -or $env:PROOF_RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Maintenance proof requires a disposable GitHub-hosted Windows runner' }
           if ($env:GITHUB_RUN_ID -cnotmatch '\A[0-9]+\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[0-9]+\z') { throw 'Invalid proof resource identity' }
           $profileRoot = (Resolve-Path -LiteralPath $env:LOCALAPPDATA).Path
           $sourceRoot = Join-Path $profileRoot "mcp-mux-maintenance-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
@@ -70,7 +72,7 @@ jobs:
           $proofCheckout = Join-Path $env:GITHUB_WORKSPACE '.agent/tmp/maintenance-proof-source'
           $sourceBytes = (Get-ChildItem -LiteralPath $proofCheckout -Recurse -Force -File | Measure-Object -Property Length -Sum).Sum
           $freeBytes = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($profileRoot)).AvailableFreeSpace
-          if ($freeBytes -lt (2 * $sourceBytes + 4GB)) { throw 'Insufficient profile volume capacity for clone, Go caches and reserve' }
+          if ($freeBytes -lt (2 * $sourceBytes + 8GB)) { throw 'Insufficient profile volume capacity for clone, proof dependencies, caches and reserve' }
           $sourceSHA = & git -C $proofCheckout rev-parse HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the exact proof checkout' }
           $sourceSHA = $sourceSHA.Trim()
@@ -80,6 +82,7 @@ jobs:
           $scratch = Join-Path $sourceRoot '.agent/tmp/maintenance-proof'
           [void][IO.Directory]::CreateDirectory($scratch)
           "scratch=$scratch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "source=$sourceRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           $candidateBinary = Join-Path $scratch 'mcp-mux.exe'
           $evidencePath = Join-Path $scratch 'windows.json'
           $receipt = [ordered]@{
@@ -89,7 +92,7 @@ jobs:
             candidate_sha256 = ''; go_version_info = ''; owner_versions = @(); owner_version_observations = 0
             evidence_path = $evidencePath; smoke_exit_code = $null; check_count = 0
             run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
-            free_bytes_before = $freeBytes; required_bytes = 2 * $sourceBytes + 4GB
+            free_bytes_before = $freeBytes; required_bytes = 2 * $sourceBytes + 8GB
           }
           try {
             & git -C $sourceRoot checkout --detach $sourceSHA
@@ -140,6 +143,160 @@ jobs:
           } finally {
             $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $scratch 'build-receipt.json') -Encoding utf8
           }
+      - name: Windows selected maintenance critical suite
+        id: maintenance-critical
+        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.maintenance-selection.outputs.version != '' && steps.maintenance-proof.outputs.source != ''
+        shell: pwsh
+        timeout-minutes: 30
+        env:
+          PROOF_SOURCE: ${{ steps.maintenance-proof.outputs.source }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROOF_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -cne 'true' -or $env:RUNNER_OS -cne 'Windows' -or $env:PROOF_RUNNER_ENVIRONMENT -cne 'github-hosted') { throw 'Critical proof requires a disposable GitHub-hosted Windows runner' }
+          if ($env:GITHUB_RUN_ID -cnotmatch '\A[0-9]+\z' -or $env:GITHUB_RUN_ATTEMPT -cnotmatch '\A[0-9]+\z') { throw 'Invalid critical proof resource identity' }
+          $profileRoot = (Resolve-Path -LiteralPath $env:LOCALAPPDATA).Path
+          $sourceRoot = (Resolve-Path -LiteralPath $env:PROOF_SOURCE).Path
+          $expectedRoot = Join-Path $profileRoot "mcp-mux-maintenance-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (-not $sourceRoot.Equals($expectedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Critical proof must use the same private primary clone' }
+          for ($ancestor = Get-Item -LiteralPath (Join-Path $sourceRoot '.agent/tmp'); $null -ne $ancestor; $ancestor = $ancestor.Parent) {
+            if (($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Critical proof ancestry must not contain reparse points' }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $sourceRoot '.git') -PathType Container)) { throw 'Critical proof requires a primary clone, not a linked worktree' }
+          $artifactRoot = Join-Path $sourceRoot ".agent/tmp/critical-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $artifactRoot) { throw 'Critical proof artifacts must use a fresh owned path' }
+          [void][IO.Directory]::CreateDirectory($artifactRoot)
+          "root=$artifactRoot" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $receiptPath = Join-Path $artifactRoot 'critical-receipt.json'
+          $receipt = [ordered]@{
+            verdict = 'FAIL'; error = ''; pr_head_sha = $env:PR_HEAD_SHA; github_sha = $env:GITHUB_SHA
+            source_root = $sourceRoot; source_sha = ''; source_sha_after = ''; source_clone_equal = $false
+            workflow_sha256 = ''; wrapper_sha256 = ''; run_id = $env:GITHUB_RUN_ID; run_attempt = $env:GITHUB_RUN_ATTEMPT
+            free_bytes_before = 0; required_bytes = 8GB; launcher_module = 'github.com/thebtf/mcp-launcher@v0.3.0'
+            launcher_tag_commit = 'da09f5ca3b6d191c59fe9493b203a3b27ec75be2'; launcher_sha256 = ''; launcher_build_info = ''
+            uv_expected_version = '0.8.15'; uv_version = ''; uvx_sha256 = ''; time_expected_version = '2026.8.18'; time_version = ''
+            candidate_sha256 = ''; candidate_build_info = ''
+            wrapper_exit_code = $null; aggregate_path = ''; aggregate_verdict = ''; counts = $null; report_hashes = @()
+          }
+          $receipt | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          try {
+            $sourceSHA = & git -C $sourceRoot rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the critical source clone' }
+            $receipt.source_sha = $sourceSHA.Trim()
+            $receipt.source_clone_equal = $receipt.source_sha -ceq $env:PR_HEAD_SHA
+            if (-not $receipt.source_clone_equal) { throw 'Critical source clone does not match the event PR head' }
+            $wrapper = Join-Path $sourceRoot 'tests/critical/run-all.ps1'
+            $receipt.workflow_sha256 = (Get-FileHash -LiteralPath (Join-Path $sourceRoot '.github/workflows/ci.yml') -Algorithm SHA256).Hash
+            $receipt.wrapper_sha256 = (Get-FileHash -LiteralPath $wrapper -Algorithm SHA256).Hash
+            $receipt.free_bytes_before = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($artifactRoot)).AvailableFreeSpace
+            if ($receipt.free_bytes_before -lt $receipt.required_bytes) { throw 'Insufficient private volume capacity for critical dependencies, caches and reserve' }
+            foreach ($name in @('GOBIN', 'GOCACHE', 'GOMODCACHE', 'GOTMPDIR', 'TEMP', 'TMP', 'UV_CACHE_DIR', 'UV_TOOL_DIR', 'UV_TOOL_BIN_DIR', 'UV_PYTHON_INSTALL_DIR', 'UV_CREDENTIALS_DIR')) {
+              $directory = Join-Path $artifactRoot ($name.ToLowerInvariant())
+              [void][IO.Directory]::CreateDirectory($directory)
+              [Environment]::SetEnvironmentVariable($name, $directory, 'Process')
+            }
+            $env:MCP_MUX_UV_CACHE_DIR = $env:UV_CACHE_DIR
+            $env:UV_NO_CONFIG = 'true'
+            $env:UV_DEFAULT_INDEX = 'https://pypi.org/simple'
+            $env:UV_PYTHON_DOWNLOADS = 'automatic'
+            $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+            $env:UV_PYTHON = '3.12.11'
+            $uvPrefix = Join-Path $artifactRoot 'uv-prefix'
+            & $python -m pip --isolated install --disable-pip-version-check --ignore-installed --no-deps --only-binary=:all: `
+              --index-url https://pypi.org/simple --cache-dir (Join-Path $artifactRoot 'pip-cache') `
+              --prefix $uvPrefix --report (Join-Path $artifactRoot 'uv-install.json') 'uv==0.8.15'
+            if ($LASTEXITCODE -ne 0) { throw 'Private pinned uv installation failed' }
+            $uvxFiles = @(Get-ChildItem -LiteralPath $uvPrefix -Recurse -File -Filter 'uvx.exe')
+            if ($uvxFiles.Count -ne 1) { throw 'Private uv installation must provide exactly one uvx executable' }
+            $uvx = $uvxFiles[0].FullName
+            $env:PATH = "$($uvxFiles[0].DirectoryName);$env:GOBIN;$env:PATH"
+            $uvVersion = & $uvx --version
+            if ($LASTEXITCODE -ne 0 -or ($uvVersion -join "`n") -notmatch '\Auvx 0\.8\.15(?:\s|\z)') { throw 'Installed uvx does not prove the pinned version' }
+            $receipt.uv_version = $uvVersion -join "`n"
+            $receipt.uvx_sha256 = (Get-FileHash -LiteralPath $uvx -Algorithm SHA256).Hash
+            $env:UV_CONSTRAINT = Join-Path $artifactRoot 'time-constraints.txt'
+            'mcp-server-time==2026.8.18' | Set-Content -LiteralPath $env:UV_CONSTRAINT -Encoding utf8
+            $metadata = & $uvx --from 'mcp-server-time==2026.8.18' python -c "import json,sys; from importlib.metadata import distribution,distributions; d=distribution('mcp-server-time'); print(json.dumps({'version':d.version,'python':sys.executable,'python_version':sys.version,'location':str(d.locate_file('')),'metadata':d.read_text('METADATA'),'distributions':{p.metadata['Name']:p.version for p in distributions()}}))"
+            if ($LASTEXITCODE -ne 0) { throw 'Pinned time upstream dependency provisioning failed' }
+            $metadata | Set-Content -LiteralPath (Join-Path $artifactRoot 'time-distribution.json') -Encoding utf8
+            $distribution = ($metadata -join "`n") | ConvertFrom-Json -AsHashtable
+            $receipt.time_version = $distribution.version
+            if ($receipt.time_version -cne $receipt.time_expected_version -or [string]::IsNullOrWhiteSpace($distribution.metadata)) { throw 'Installed time distribution metadata does not prove the pin' }
+            Push-Location $sourceRoot
+            try {
+              & go install github.com/thebtf/mcp-launcher@v0.3.0
+              if ($LASTEXITCODE -ne 0) { throw 'Private pinned launcher installation failed' }
+              $launcher = Join-Path $env:GOBIN 'mcp-launcher.exe'
+              $buildInfo = & go version -m $launcher
+              if ($LASTEXITCODE -ne 0 -or ($buildInfo -join "`n") -notmatch 'mod\s+github\.com/thebtf/mcp-launcher\s+v0\.3\.0\s') { throw 'Installed launcher build metadata does not prove the pinned module' }
+              $receipt.launcher_build_info = $buildInfo -join "`n"
+              $receipt.launcher_sha256 = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash
+              $receipt | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $receiptPath -Encoding utf8
+              & pwsh -NoProfile -File $wrapper -TimeoutSeconds 120 -Launcher $launcher -ArtifactRoot $artifactRoot *>&1 |
+                Tee-Object -FilePath (Join-Path $artifactRoot 'critical-console.log')
+              $receipt.wrapper_exit_code = $LASTEXITCODE
+            } finally { Pop-Location }
+            $aggregates = @(Get-ChildItem -LiteralPath (Join-Path $artifactRoot 'reports') -File -Filter 'critical-suite-*.json')
+            if ($aggregates.Count -ne 1) { throw 'Critical wrapper must retain exactly one aggregate JSON report' }
+            $receipt.aggregate_path = $aggregates[0].FullName
+            $aggregate = Get-Content -LiteralPath $receipt.aggregate_path -Raw | ConvertFrom-Json -AsHashtable
+            $receipt.aggregate_verdict = $aggregate.verdict
+            $receipt.counts = $aggregate.counts
+            if (Test-Path -LiteralPath $aggregate.binary -PathType Leaf) {
+              $receipt.candidate_sha256 = (Get-FileHash -LiteralPath $aggregate.binary -Algorithm SHA256).Hash
+              $candidateBuildInfo = & go version -m $aggregate.binary
+              if ($LASTEXITCODE -ne 0) { throw 'Cannot retain critical candidate build metadata' }
+              $receipt.candidate_build_info = $candidateBuildInfo -join "`n"
+            }
+            if ($receipt.wrapper_exit_code -ne 0 -or $aggregate.verdict -cne 'PASS' -or $aggregate.counts.total -ne 5 -or $aggregate.counts.passed -ne 5 -or $aggregate.counts.failed -ne 0 -or $aggregate.counts.skipped -ne 0 -or $aggregate.counts.errored -ne 0 -or @($aggregate.results).Count -ne 5 -or @($aggregate.results | Where-Object { $_.verdict -cne 'PASS' }).Count -ne 0 -or -not [string]::IsNullOrWhiteSpace($aggregate.error)) { throw 'Critical wrapper lacks a positive all-five-step PASS verdict' }
+            if ([string]::IsNullOrWhiteSpace($receipt.candidate_sha256) -or $aggregate.launcher -cne $launcher) { throw 'Critical aggregate does not identify the selected binaries' }
+            foreach ($path in @([IO.Path]::ChangeExtension($receipt.aggregate_path, '.md'), (Join-Path $artifactRoot 'reports/critical-suite-history.jsonl'), $aggregate.lifecycle_evidence, $aggregate.smoke_evidence, $aggregate.native_update_evidence)) {
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required critical wrapper report is missing: $path" }
+            }
+            foreach ($path in @($aggregate.lifecycle_evidence, $aggregate.smoke_evidence, $aggregate.native_update_evidence)) {
+              $step = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+              if ($step.verdict -cne 'PASS') { throw 'Critical step JSON lacks a PASS verdict' }
+            }
+            $lifecycle = Get-Content -LiteralPath $aggregate.lifecycle_evidence -Raw | ConvertFrom-Json -AsHashtable
+            $time = Get-Content -LiteralPath $aggregate.smoke_evidence -Raw | ConvertFrom-Json -AsHashtable
+            if ($lifecycle.candidate_sha256 -ine $receipt.candidate_sha256 -or $time.binary_hash_sha256 -ine $receipt.candidate_sha256) { throw 'Critical step evidence does not match the built candidate' }
+            $sourceAfter = & git -C $sourceRoot rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot bind completed critical results to the source clone' }
+            $receipt.source_sha_after = $sourceAfter.Trim()
+            if ($receipt.source_sha_after -cne $receipt.source_sha) { throw 'Critical source identity changed during proof' }
+            $receipt.verdict = 'PASS'
+          } catch {
+            $receipt.error = $_.Exception.Message
+            throw
+          } finally {
+            $receipt.report_hashes = @(
+              Get-ChildItem -LiteralPath (Join-Path $artifactRoot 'reports') -File -ErrorAction SilentlyContinue | ForEach-Object {
+                @{ path = $_.FullName; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
+              }
+            )
+            $receipt | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $receiptPath -Encoding utf8
+          }
+      - name: Retain Windows critical proof evidence
+        if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.maintenance-selection.outputs.version != '' && steps.maintenance-critical.outputs.root != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: maintenance-critical-windows-v${{ steps.maintenance-selection.outputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.maintenance-critical.outputs.root }}/critical-receipt.json
+            ${{ steps.maintenance-critical.outputs.root }}/critical-console.log
+            ${{ steps.maintenance-critical.outputs.root }}/uv-install.json
+            ${{ steps.maintenance-critical.outputs.root }}/time-distribution.json
+            ${{ steps.maintenance-critical.outputs.root }}/time-constraints.txt
+            ${{ steps.maintenance-critical.outputs.root }}/reports/*.json
+            ${{ steps.maintenance-critical.outputs.root }}/reports/*.jsonl
+            ${{ steps.maintenance-critical.outputs.root }}/reports/*.md
+          include-hidden-files: true
+          if-no-files-found: error
       - name: Retain Windows maintenance proof evidence
         if: always() && matrix.os == 'windows-latest' && github.event_name == 'pull_request' && steps.maintenance-selection.outputs.version != '' && steps.maintenance-proof.outputs.scratch != ''
         uses: actions/upload-artifact@v4
