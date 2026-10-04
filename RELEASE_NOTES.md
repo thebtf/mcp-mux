@@ -117,6 +117,11 @@ Signal/context shutdown callers wait for daemon `Done` after refusal, retaining
 reaper/reference/control service. They do not retry automatically after lease
 release; a separate explicit admitted shutdown completes caller termination.
 
+Darwin's regular-file endpoint ENOTSOCK is absence only in native dial, not a
+contacted read error. Control Start reserves its accept producer under the
+existing Close mutex before launch, closing Add/Wait without new protocol/retry
+or forced handler-cancellation behavior.
+
 ## Host transport and lifecycle
 
 Aware managed shims keep the original host pipes open. Held requests receive
@@ -221,9 +226,12 @@ with earlier root/vet0 reused only in their declared scopes. Later ping/ledger
 fixes896a/5e49 now have scoped focused/native/source proof, not final successor
 artifacts. Prior932 complete Windows/Linux/critical/R1/CI stays historical;
 clean Linux root-race/vet and release-equivalent public1182/R1 8+100 PASS do not
-relabel original module engine/owner RED. Corrected actual-anchor engine fixture
-has four-leaf focused race PASS; two bounded owner-test helper/cause repairs and
-safe Windows/current aggregate/CI/readback remain pending, PR21/19/2.
+relabel original module RED. Later test-only engine/owner corrections have actual
+consumer-visible stdio/no-replay proof and native5ea module-race25/25 PASS, skips
+explicit. Alias/control focused proof and exact4e CI37199675520 all5 success are
+scoped; exact4e Linux final full/public/R1 now PASS. Three new native review
+findings(PR24/21 resolved/3 pending) still hold source/artifact freeze until repair/
+proof; local Windows public positive remains independently runtime-grant-bound.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

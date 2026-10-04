@@ -657,6 +657,11 @@ response, as terminal status 1 without per-owner or legacy data-channel fallback
 Successful shutdown and the genuinely absent-daemon path are unchanged; an
 unknown contacted outcome is not permission to bypass daemon authority.
 
+On Darwin, ENOTSOCK is native absence only for the wrapped `dial` operation;
+read-phase/contacted uncertainty cannot select fallback. Control Start reserves
+the accept producer under the existing Close mutex before its goroutine, retaining
+accepted handlers through response, connection closure, and after-callback return.
+
 Resolved MCP `mux_stop` also delegates first to daemon authority, not stale owner
 snapshots or a direct-owner preference. Transport/malformed/typed uncertainty is
 terminal; only the exact known old unsupported-stop response allows legacy

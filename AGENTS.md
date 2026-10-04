@@ -145,6 +145,13 @@ daemon absence retains its existing path. Keep recovered timers and control
 request serving paused until every fallible daemon-construction step succeeds;
 failed construction must not retain a stale expiry mutation or admit control work.
 
+Reserve acceptLoop producer synchronously under the existing Start/Close mutex
+before launch; accepted handlers remain counted through response/connection/
+after-callback completion. ENOTSOCK absence is dial-only, never contacted error.
+Alias positives must prove os.SameFile parent identity/canonical scope/member bytes;
+absolute/relative aliases execute on both platforms without skips, while owned
+inner-link-before-.. traversal is Unix-specific, not a guard relaxation.
+
 All resolved MCP stops use daemon authority; accept legacy owner fallback only
 for the exact known old unsupported-stop response, never transport/malformed/
 typed uncertainty. New external operator claims take maintenance read admission

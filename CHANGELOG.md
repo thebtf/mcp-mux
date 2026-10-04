@@ -98,6 +98,10 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   `.maintenance/<scope digest>`, not mutable UserConfig. Native path/owner/ACL
   guards reject unsafe ancestry and foreign alias retargeting before canonicalizing.
   Existing scope/schema/state/protocol unchanged; endpoint/lock directory must persist.
+- A stale regular-file endpoint is absence only for native Darwin dial ENOTSOCK;
+  contacted ping/read uncertainty remains terminal. Control Start reserves the
+  accept producer under the existing Close mutex before launching it, so Close
+  waits for real accepted-handler settlement rather than racing Add/Wait.
 
 ### Compatibility
 
@@ -132,9 +136,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   earlier root/vet retain their scopes. Ping896a and stable-ledger5e49 add focused
   Windows/Linux ping and Linux authority RED/GREEN/race plus source-only assurance.
   Windows unsafe-parent refusals are not healthy positive PASS. Clean Linux root/
-  vet PASS and public1182/R1 8+100 PASS do not relabel module-race RED. Engine
-  actual-anchor fixture is focused GREEN; two owner test-helper/cause corrections
-  and safe Windows/current full/CI/readback proof remain pending, no guard weakening.
+  vet/public1182/R1 8+100 preserve old module RED. Later test-only engine/owner
+  fixes have consumer-visible proof and native5ea module-race25/25 PASS, skips explicit.
+  Alias/control focused proof and exact4e CI37199675520 all5 success are scoped;
+  exact4e Linux final gates/public/R1 now PASS, but three new admitted source
+  findings still require correction/proof before final freeze; local Windows
+  public positive separately awaits runtime grant. No future-source success inferred.
 
 ### Rollback
 
