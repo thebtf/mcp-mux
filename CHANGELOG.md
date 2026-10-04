@@ -117,6 +117,10 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   IPC connection, confirms exact current owner/token history before success, then
   closes only that connection. Library `restart_owner` token semantics are unchanged;
   no MCP bootstrap, new wire command/token, or eviction permission is added.
+- Fresh demand after durable release rechecks admission before writing to retired
+  IPC and activates the admitted successor for connected and parked shims. The
+  parked path consumes the existing private IPC-EOF wake; no new transport,
+  controller, era fallback, or held/unfinished-work replay is added.
 
 ### Compatibility
 
@@ -176,11 +180,27 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Committed c183 reaper repair has causal non-contention failure-latch RED→two
   normal PASS and race3 top-level/5 named PASS rows including parents, zero skips/
   races. Removed independent timer scheduling is SOURCE-only, not a runtime count.
-  Its actual reply/readback/native resolution leaves29 known threads/28 resolved;
-  prior27 all-resolved is historical. Owner P1 remains pending: frozen first-fix
-  connected-path two-era GREEN/race and8 complement PASS do not prove parked-idle
-  repair or final live source. No fresh final all-PR CLEAN, local Windows public
-  positive, freeze or release acceptance; b86 artifacts do not certify c183/WIP.
+  Earlier reaper/owner disposition closed29 known threads; fresh26f enumeration
+  has31 total/29 resolved/2 unresolved P2s: restore-environment completeness and
+  first-fresh OnInject revalidation. Their repair/proof remains pending.
+  Prior owner repair is committed/frozen at26f:
+  original both-era RED→first-fix connected GREEN/race remains scoped to966d.
+  Parked SOURCE deadlock and actual first-fix parked RED→final3 leaves plain/race
+  (connected legacy/modern, parked legacy) plus8 complement race PASS bindf29,
+  zero SKIP/data races. ParkedOwnerSeamRecheck closes F1 with bounded SOURCE-only
+  PASS at exact e5/3da5 production hashes, not broad runtime assurance. Actual
+  [owner reply4178899382](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4178899382)
+  has exact UTF8 readback/native resolution;26f source is pushed to the PR branch.
+  [Exact26f CI37226616613](https://github.com/thebtf/mcp-mux/actions/runs/37226616613)
+  completed SUCCESS, all5 jobs. Actual immutable26f Linux full root/module race
+  and both vets each pass once:27 tested packages PASS/3 no-test,2333 leaf PASS/
+  5 named SKIP,0 failures/races. Clean CGO0/trimpath26f artifact/owner0.31.0 gives
+  Scenario11 1191/1191 PASS; separate CGO1 R1 binary gives100/100+8/8 PASS, not
+  release-version evidence. Supplemental R1 ELF version read failed/UNKNOWN;
+  retained without retry, not an owning gate. These receipts do not certify new
+  P2 WIP, Windows or delivery. Root's complete3-record runtime-grant recheck finds
+  no mcp-mux project grant; only that local Windows positive effect is held,
+  with task approval retained. No final all-PR CLEAN or release acceptance.
 
 ### Rollback
 
