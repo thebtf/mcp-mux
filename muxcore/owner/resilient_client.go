@@ -1246,8 +1246,8 @@ func (rc *resilientClient) replayInit(conn interface {
 
 func (rc *resilientClient) injectFrame(b []byte) error {
 	rc.dormantMu.Lock()
-	defer rc.dormantMu.Unlock()
 	if rc.closed.Load() || rc.dormantCommitted {
+		rc.dormantMu.Unlock()
 		rc.log.Printf("proxy.inject.dropped reason=closed")
 		return ErrInjectClosed
 	}
@@ -1255,8 +1255,26 @@ func (rc *resilientClient) injectFrame(b []byte) error {
 	data := make([]byte, len(b))
 	copy(data, b)
 	rc.ingressMu.Lock()
-	defer rc.ingressMu.Unlock()
+	sequence := rc.maintenanceSequence
 	if rc.held {
+		rc.ingressMu.Unlock()
+		rc.dormantMu.Unlock()
+		// Activation joins the old transport; never wait while holding ingress
+		// or the dormant/suspend barriers needed by that same proxy lifecycle.
+		if admittedSequence, admitted := rc.recheckMaintenance(); admitted {
+			sequence = admittedSequence
+		}
+		rc.dormantMu.Lock()
+		if rc.closed.Load() || rc.dormantCommitted {
+			rc.dormantMu.Unlock()
+			rc.log.Printf("proxy.inject.dropped reason=closed")
+			return ErrInjectClosed
+		}
+		rc.ingressMu.Lock()
+	}
+	defer rc.dormantMu.Unlock()
+	defer rc.ingressMu.Unlock()
+	if rc.held || sequence != rc.maintenanceSequence {
 		return rc.failMaintenanceFrameLocked(data)
 	}
 	rc.suspendMu.Lock()

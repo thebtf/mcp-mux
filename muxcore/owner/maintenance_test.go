@@ -82,6 +82,14 @@ func TestMaintenanceIngressRejectsCapacityWaiterAcrossRelease(t *testing.T) {
 }
 
 func TestMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing.T) {
+	testMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t, false)
+}
+
+func TestMaintenanceOnInjectFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing.T) {
+	testMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t, true)
+}
+
+func testMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing.T, injected bool) {
 	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
 		t.Run(fmt.Sprintf("era_%d", protocol), func(t *testing.T) {
 			paths := [2]string{newTestIPCPath(t), newTestIPCPath(t)}
@@ -125,11 +133,17 @@ func TestMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing
 			}()
 			var resumed atomic.Bool
 			var refusals, generations atomic.Int32
+			injectCallbacks := make(chan func([]byte) error, 2)
+			var onInject func(func([]byte) error)
+			if injected {
+				onInject = func(inject func([]byte) error) { injectCallbacks <- inject }
+			}
 			clientDone := make(chan error, 1)
 			go func() {
 				clientDone <- RunResilientClient(ResilientClientConfig{
 					Stdin: stdin, Stdout: stdout, InitialIPCPath: paths[0], Token: "old-token",
 					ProtocolEra: protocol, ProbeGracePeriod: time.Nanosecond, Logger: resilientTestLogger(t),
+					OnInject: onInject,
 					Reconnect: func() (string, string, error) {
 						if !resumed.Load() {
 							refusals.Add(1)
@@ -169,8 +183,22 @@ func TestMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing
 					t.Fatalf("IPC did not receive %q", want)
 				}
 			}
+			var inject func([]byte) error
+			if injected {
+				select {
+				case inject = <-injectCallbacks:
+				case <-time.After(3 * time.Second):
+					t.Fatal("OnInject did not arm")
+				}
+			}
 			send := func(raw string) {
 				t.Helper()
+				if injected {
+					if err := inject([]byte(raw)); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
 				if _, err := fmt.Fprintln(hostInput, raw); err != nil {
 					t.Fatal(err)
 				}
@@ -214,7 +242,14 @@ func TestMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing
 			} {
 				send(raw)
 			}
-			waitForCondition(t, 3*time.Second, func() bool { return refusals.Load() == 3 }, "held input was not locally disposed")
+			if injected {
+				waitForCondition(t, 3*time.Second, func() bool {
+					text := output.String()
+					return strings.Contains(text, `"id":2`) && strings.Contains(text, `"id":"held-string"`)
+				}, "held injections were not locally disposed")
+			} else {
+				waitForCondition(t, 3*time.Second, func() bool { return refusals.Load() == 3 }, "held input was not locally disposed")
+			}
 			resumed.Store(true)
 			fresh := fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":%q,"params":{%s}}`, listenMethod, meta)
 			send(fresh)
@@ -284,11 +319,29 @@ func TestMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing
 			if len(ids) != 7 || len(responses) != 7 || generations.Load() != 1 || strings.Contains(output.String(), "list_changed") {
 				t.Fatalf("lost/duplicate IDs, duplicate successor, or replay bootstrap: ids=%v generations=%d stdout=%s", ids, generations.Load(), output.String())
 			}
+			if injected {
+				if err := inject([]byte(fresh)); !errors.Is(err, ErrInjectClosed) {
+					t.Fatalf("injection after proxy exit = %v, want ErrInjectClosed", err)
+				}
+				select {
+				case <-injectCallbacks:
+					t.Fatal("OnInject fired more than once across maintenance activation")
+				default:
+				}
+			}
 		})
 	}
 }
 
 func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
+	testMaintenanceParkedDemandActivatesSuccessor(t, false)
+}
+
+func TestMaintenanceOnInjectParkedDemandActivatesSuccessor(t *testing.T) {
+	testMaintenanceParkedDemandActivatesSuccessor(t, true)
+}
+
+func testMaintenanceParkedDemandActivatesSuccessor(t *testing.T, injected bool) {
 	paths := [2]string{newTestIPCPath(t), newTestIPCPath(t)}
 	var servers [2]*echoServer
 	var frames [2]chan string
@@ -326,12 +379,18 @@ func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
 	var resumed atomic.Bool
 	var refusals, admissions atomic.Int32
 	admitted := make(chan struct{}, 1)
+	injectCallbacks := make(chan func([]byte) error, 2)
+	var onInject func(func([]byte) error)
+	if injected {
+		onInject = func(inject func([]byte) error) { injectCallbacks <- inject }
+	}
 	clientDone := make(chan error, 1)
 	go func() {
 		clientDone <- RunResilientClient(ResilientClientConfig{
 			Stdin: stdin, Stdout: output, InitialIPCPath: paths[0], Token: "old-token",
 			ProtocolEra: era.EraLegacy, ProbeGracePeriod: time.Nanosecond,
 			IdleSuspendDelay: 10 * time.Millisecond, Logger: log.New(logs, "", 0),
+			OnInject: onInject,
 			IdleSuspendGate: func() (bool, string, error) {
 				gateOnce.Do(func() { close(gateEntered) })
 				<-allowPark
@@ -375,8 +434,22 @@ func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
 			t.Fatalf("IPC did not receive %q", want)
 		}
 	}
+	var inject func([]byte) error
+	if injected {
+		select {
+		case inject = <-injectCallbacks:
+		case <-time.After(time.Second):
+			t.Fatal("OnInject did not arm before parking")
+		}
+	}
 	send := func(raw string) {
 		t.Helper()
+		if injected {
+			if err := inject([]byte(raw)); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
 		if _, err := fmt.Fprintln(hostInput, raw); err != nil {
 			t.Fatal(err)
 		}
@@ -389,7 +462,11 @@ func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
 	}
 	readFrame(frames[0], "old-token")
 	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
-	send(initialize)
+	// Initialize via stdin so the existing public idle lifecycle can park. No
+	// stdin demand is sent after this setup in the injected-consumer case.
+	if _, err := fmt.Fprintln(hostInput, initialize); err != nil {
+		t.Fatal(err)
+	}
 	readFrame(frames[0], initialize)
 	if _, err := fmt.Fprintln(old, `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}`); err != nil {
 		t.Fatal(err)
@@ -415,7 +492,14 @@ func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
 	} {
 		send(raw)
 	}
-	waitForCondition(t, time.Second, func() bool { return refusals.Load() == 3 }, "held input was not disposed before parking")
+	if injected {
+		waitForCondition(t, time.Second, func() bool {
+			text := output.String()
+			return strings.Contains(text, `"id":2`) && strings.Contains(text, `"id":"held-string"`)
+		}, "held injections were not disposed before parking")
+	} else {
+		waitForCondition(t, time.Second, func() bool { return refusals.Load() == 3 }, "held input was not disposed before parking")
+	}
 	releasePark()
 	select {
 	case line, open := <-frames[0]:
@@ -487,6 +571,74 @@ func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
 	if len(ids) != 5 || len(responses) != 5 || admissions.Load() != 1 || strings.Contains(output.String(), "list_changed") {
 		t.Fatalf("parked lost/duplicate ID, admission, or bootstrap: ids=%v admissions=%d stdout=%s", ids, admissions.Load(), output.String())
 	}
+	if injected {
+		if err := inject([]byte(fresh)); !errors.Is(err, ErrInjectClosed) {
+			t.Fatalf("parked injection after proxy exit = %v, want ErrInjectClosed", err)
+		}
+		select {
+		case <-injectCallbacks:
+			t.Fatal("OnInject fired more than once across parked activation")
+		default:
+		}
+	}
+}
+
+func TestMaintenanceOnInjectRejectsNewFenceDuringRecheck(t *testing.T) {
+	var output bytes.Buffer
+	rc := maintenanceTestClient(t, &output)
+	rc.ipcEOF = make(chan struct{}, 1)
+	rc.cfg.Reconnect = func() (string, string, error) {
+		for _, lock := range []*sync.Mutex{&rc.dormantMu, &rc.ingressMu, &rc.suspendMu} {
+			if !lock.TryLock() {
+				return "", "", errors.New("maintenance recheck retained an ingress lifecycle lock")
+			}
+			lock.Unlock()
+		}
+		return "successor", "token", nil
+	}
+	rc.enterMaintenance(control.ErrMaintenanceHeld)
+	done := make(chan error, 1)
+	go func() { done <- rc.injectFrame([]byte(`{"jsonrpc":"2.0","id":"stale-inject","method":"tools/call"}`)) }()
+	select {
+	case <-rc.ipcEOF:
+	case <-time.After(time.Second):
+		close(rc.transportDone)
+		t.Fatal("injected demand did not reach unlocked maintenance revalidation")
+	}
+	// Revalidation captured the old sequence and now waits for activation. A
+	// second fence/release must reject that demand even though held is false.
+	rc.enterMaintenance(control.ErrMaintenanceHeld)
+	rc.leaveMaintenance()
+	close(rc.pendingReconnect.Load().ready)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		close(rc.transportDone)
+		t.Fatal("stale injection did not settle")
+	}
+	responses := parseJSONRPCResponsesWithID(t, output.String())
+	if len(responses) != 1 || string(responses[0].ID) != `"stale-inject"` || responses[0].Error == nil || responses[0].Error.Code != -32005 || len(rc.msgFromCC) != 0 || rc.localWork.Load() != 0 {
+		t.Fatalf("new fence admitted or lost stale injection: stdout=%s queued=%d work=%d", output.String(), len(rc.msgFromCC), rc.localWork.Load())
+	}
+}
+
+func TestMaintenanceOnInjectCopiesCallerBuffer(t *testing.T) {
+	rc := maintenanceTestClient(t, io.Discard)
+	frame := []byte(`{"jsonrpc":"2.0","id":91,"method":"tools/call"}`)
+	want := string(frame)
+	if err := rc.injectFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	for index := range frame {
+		frame[index] = 'x'
+	}
+	if got := string(<-rc.msgFromCC); got != want {
+		t.Fatalf("queued injection retained caller buffer: got %q, want %q", got, want)
+	}
+	rc.noteDequeued()
 }
 
 func TestMaintenanceReconnectDisposesEscapedWakeBeforeRecovery(t *testing.T) {
