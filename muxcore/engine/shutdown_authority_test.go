@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
 const engineShutdownAuthorityCase = "MCPMUX_ENGINE_SHUTDOWN_AUTHORITY_CASE"
@@ -109,15 +110,9 @@ func TestEngineRunShutdownAuthorityHelper(t *testing.T) {
 		}
 		entry := d.Entry(sid)
 		if scenario == "failed-admission" {
-			// Fail the first real store write, without deleting any authority member.
-			config, err := os.UserConfigDir()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.MkdirAll(filepath.Join(config, "mcp-mux"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(config, "mcp-mux", "maintenance"), []byte("unavailable store directory"), 0o600); err != nil {
+			// Fail the first real store write at this daemon's actual endpoint-bound anchor.
+			lockPath := serverid.DaemonLockPath(filepath.Dir(eng.ControlSocketPath()), eng.cfg.Namespace)
+			if err := os.WriteFile(lockPath+".maintenance", []byte("unavailable store directory"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 		}
