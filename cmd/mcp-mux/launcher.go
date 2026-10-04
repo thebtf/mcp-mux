@@ -551,19 +551,28 @@ func restartDaemonAfterEngineSwitchUnderLock(launcherPath, enginePath string, fo
 		}
 	}
 
+	beforeGeneration, identityErr := launcherDaemonRestartGeneration(ctlPath)
 	fmt.Fprintln(os.Stderr, "Graceful restart: serializing state...")
 	resp, err := launcherControlSendWithTimeout(ctlPath, control.Request{
 		Cmd:            "graceful-restart",
 		DrainTimeoutMs: 30000,
 		SuccessorExe:   enginePath,
 	}, 60*time.Second)
-	if err == nil {
-		err = resp.Err()
+	if err != nil {
+		return fmt.Errorf("daemon restart outcome unknown: %w", err)
 	}
+	err = resp.Err()
 	if isMaintenanceError(err) {
 		return fmt.Errorf("daemon restart refused: %w", err)
 	}
 	if err != nil {
+		generation, statusErr := launcherDaemonRestartGeneration(ctlPath)
+		if statusErr != nil {
+			return fmt.Errorf("daemon restart refused: %w", errors.Join(err, statusErr))
+		}
+		if identityErr != nil || generation != beforeGeneration {
+			return fmt.Errorf("daemon restart refused: %w", errors.Join(err, control.ErrMaintenanceInvalid, identityErr))
+		}
 		fmt.Fprintf(os.Stderr, "  graceful-restart not available: %v, falling back to shutdown\n", err)
 		shutdownResp, shutdownErr := launcherControlSendWithTimeout(ctlPath, control.Request{Cmd: "shutdown"}, 5*time.Second)
 		if shutdownErr == nil {
@@ -587,6 +596,52 @@ func restartDaemonAfterEngineSwitchUnderLock(launcherPath, enginePath string, fo
 	}
 	fmt.Fprintln(os.Stderr, "  New daemon ready. Releasing lock — shims will reconnect.")
 	return nil
+}
+
+func launcherDaemonRestartGeneration(ctlPath string) (string, error) {
+	resp, err := launcherControlSendWithTimeout(ctlPath, control.Request{Cmd: "status"}, 5*time.Second)
+	if err != nil {
+		return "", err
+	}
+	if err := resp.Err(); err != nil {
+		return "", err
+	}
+	var data struct {
+		Generation           string          `json:"daemon_generation"`
+		Maintenance          json.RawMessage `json:"maintenance"`
+		MaintenanceErrorCode json.RawMessage `json:"maintenance_error_code"`
+	}
+	if json.Unmarshal(resp.Data, &data) != nil {
+		return "", control.ErrMaintenanceInvalid
+	}
+	if data.MaintenanceErrorCode != nil {
+		var code control.MaintenanceErrorCode
+		if string(data.MaintenanceErrorCode) == "null" || json.Unmarshal(data.MaintenanceErrorCode, &code) != nil {
+			return "", control.ErrMaintenanceInvalid
+		}
+		if code != "" {
+			return "", (&control.Response{ErrorCode: code}).Err()
+		}
+	}
+	if data.Maintenance == nil {
+		return "", control.ErrMaintenanceUnsupported
+	}
+	var leases []control.MaintenanceResult
+	if json.Unmarshal(data.Maintenance, &leases) != nil || leases == nil {
+		return "", control.ErrMaintenanceInvalid
+	}
+	for i := range leases {
+		if err := (&control.Response{OK: true, Maintenance: &leases[i]}).Err(); err != nil || leases[i].State == control.MaintenanceReleased {
+			return "", control.ErrMaintenanceInvalid
+		}
+	}
+	if len(leases) > 0 {
+		return "", &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: &leases[0]}
+	}
+	if data.Generation == "" {
+		return "", control.ErrMaintenanceInvalid
+	}
+	return data.Generation, nil
 }
 
 func launcherDaemonLiveSessionCount(ctlPath string) (int, error) {

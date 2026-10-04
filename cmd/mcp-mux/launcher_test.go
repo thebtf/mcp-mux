@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -683,5 +685,78 @@ func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *t
 	}
 	if string(gotLauncher) != "old launcher" {
 		t.Fatalf("launcher content = %q, want old launcher", gotLauncher)
+	}
+}
+
+func TestRestartDaemonAfterEngineSwitchFallbackRequiresSameAwareGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		before    string
+		after     string
+		transport error
+		want      error
+	}{
+		{"aware-clear", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old"}`, nil, nil},
+		{"old-endpoint", `{"daemon_generation":"old"}`, `{"daemon_generation":"old"}`, nil, control.ErrMaintenanceUnsupported},
+		{"changed-generation", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"new"}`, nil, control.ErrMaintenanceInvalid},
+		{"unknown-transport", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old"}`, io.EOF, io.EOF},
+		{"unknown-deadline", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old"}`, os.ErrDeadlineExceeded, os.ErrDeadlineExceeded},
+		{"invalid-status", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":null,"daemon_generation":"old"}`, nil, control.ErrMaintenanceInvalid},
+		{"writer-failed", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old","maintenance_error_code":"maintenance_persistence_failed"}`, nil, control.ErrMaintenancePersistenceFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			oldRunning, oldSend := launcherIsDaemonRunning, launcherControlSendWithTimeout
+			oldExit, oldWait, oldStart := launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom
+			t.Cleanup(func() {
+				launcherIsDaemonRunning, launcherControlSendWithTimeout = oldRunning, oldSend
+				launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom = oldExit, oldWait, oldStart
+			})
+			statusCalls, graceful, shutdown, starts, exits := 0, 0, 0, 0, 0
+			launcherIsDaemonRunning = func(string) bool { return true }
+			launcherWaitForDaemonExit = func(string, string) { exits++ }
+			launcherWaitForDaemon = func(string, time.Duration) error { return nil }
+			launcherStartDaemonProcessFrom = func(string, string) error { starts++; return nil }
+			launcherControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
+				switch req.Cmd {
+				case "status":
+					statusCalls++
+					data := tc.before
+					if statusCalls > 2 {
+						data = tc.after
+					}
+					return &control.Response{OK: true, Data: []byte(data)}, nil
+				case "graceful-restart":
+					graceful++
+					if tc.transport != nil {
+						return nil, tc.transport
+					}
+					return &control.Response{Message: "graceful restart rejected"}, nil
+				case "shutdown":
+					shutdown++
+					return &control.Response{OK: true}, nil
+				default:
+					t.Fatalf("unexpected control command: %s", req.Cmd)
+					return nil, nil
+				}
+			}
+			err := restartDaemonAfterEngineSwitch("launcher", "engine", true)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("fallback cause lost: %v, want %v", err, tc.want)
+			}
+			if graceful != 1 {
+				t.Fatalf("graceful requests=%d, want 1", graceful)
+			}
+			if tc.want == nil {
+				if shutdown != 1 || starts != 1 || exits != 1 {
+					t.Fatalf("aware clean fallback lost: shutdown=%d starts=%d exits=%d", shutdown, starts, exits)
+				}
+			} else if shutdown != 0 || starts != 0 || exits != 0 {
+				t.Fatalf("unproven fallback mutated live daemon: shutdown=%d starts=%d exits=%d", shutdown, starts, exits)
+			}
+			if tc.transport != nil && statusCalls != 2 {
+				t.Fatalf("unknown transport retried status/lifecycle: statuses=%d", statusCalls)
+			}
+		})
 	}
 }

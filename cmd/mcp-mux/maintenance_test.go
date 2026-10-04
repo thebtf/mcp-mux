@@ -262,7 +262,7 @@ func TestMaintenanceLauncherRestartRefusalIsTerminal(t *testing.T) {
 			launcherStartDaemonProcessFrom = func(string, string) error { t.Fatal("refusal started successor"); return nil }
 			launcherControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
 				if req.Cmd == "status" {
-					return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+					return &control.Response{OK: true, Data: []byte(`{"maintenance":[],"daemon_generation":"old"}`)}, nil
 				}
 				if req.Cmd == "shutdown" && !tc.shutdownRefusal {
 					t.Fatal("maintenance refusal fell back to shutdown")

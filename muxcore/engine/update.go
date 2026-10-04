@@ -117,8 +117,9 @@ type daemonLock interface {
 }
 
 type daemonIdentity struct {
-	pid        int
-	generation string
+	pid              int
+	generation       string
+	maintenanceAware bool
 }
 
 func (id daemonIdentity) isZero() bool {
@@ -262,13 +263,24 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 		DrainTimeoutMs: durationMillis(opts.DrainTimeout),
 		SuccessorExe:   opts.SuccessorExe,
 	}, opts.RestartTimeout)
-	if err == nil {
-		err = resp.Err()
+	if err != nil {
+		return result, phaseError(UpdatePhaseRestart, result, err)
 	}
+	err = resp.Err()
 	if isMaintenanceError(err) {
 		return result, phaseError(UpdatePhaseRestart, result, err)
 	}
 	if err != nil {
+		current, statusErr := engineDaemonIdentity(ctlPath)
+		if statusErr != nil {
+			return result, phaseError(UpdatePhaseRestart, result, errors.Join(err, statusErr))
+		}
+		if !current.maintenanceAware {
+			return result, phaseError(UpdatePhaseRestart, result, errors.Join(err, control.ErrMaintenanceUnsupported))
+		}
+		if identityErr != nil || beforeRestart.generation == "" || current.generation != beforeRestart.generation {
+			return result, phaseError(UpdatePhaseRestart, result, errors.Join(err, control.ErrMaintenanceInvalid, identityErr))
+		}
 		result.Warnings = append(result.Warnings, fmt.Sprintf("graceful-restart unavailable: %v", err))
 		result.FallbackShutdown = true
 	} else {
@@ -280,11 +292,8 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 		if shutdownErr == nil {
 			shutdownErr = shutdownResp.Err()
 		}
-		if isMaintenanceError(shutdownErr) {
-			return result, phaseError(UpdatePhaseRestart, result, shutdownErr)
-		}
 		if shutdownErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("shutdown fallback failed: %v", shutdownErr))
+			return result, phaseError(UpdatePhaseRestart, result, shutdownErr)
 		}
 	}
 
@@ -504,20 +513,43 @@ func daemonIdentityFromStatus(ctlPath string) (daemonIdentity, error) {
 	if err != nil {
 		return daemonIdentity{}, err
 	}
-	if resp == nil {
-		return daemonIdentity{}, errors.New("status returned nil response")
-	}
-	if !resp.OK {
-		return daemonIdentity{}, fmt.Errorf("status failed: %s", resp.Message)
+	if err := resp.Err(); err != nil {
+		return daemonIdentity{}, err
 	}
 	var data struct {
-		PID        int    `json:"pid"`
-		Generation string `json:"daemon_generation"`
+		PID                  int             `json:"pid"`
+		Generation           string          `json:"daemon_generation"`
+		Maintenance          json.RawMessage `json:"maintenance"`
+		MaintenanceErrorCode json.RawMessage `json:"maintenance_error_code"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
 		return daemonIdentity{}, fmt.Errorf("decode status identity: %w", err)
 	}
+	if data.MaintenanceErrorCode != nil {
+		var code control.MaintenanceErrorCode
+		if string(data.MaintenanceErrorCode) == "null" || json.Unmarshal(data.MaintenanceErrorCode, &code) != nil {
+			return daemonIdentity{}, control.ErrMaintenanceInvalid
+		}
+		if code != "" {
+			return daemonIdentity{}, (&control.Response{ErrorCode: code}).Err()
+		}
+	}
 	id := daemonIdentity{pid: data.PID, generation: data.Generation}
+	if data.Maintenance != nil {
+		var leases []control.MaintenanceResult
+		if json.Unmarshal(data.Maintenance, &leases) != nil || leases == nil {
+			return daemonIdentity{}, control.ErrMaintenanceInvalid
+		}
+		for i := range leases {
+			if err := (&control.Response{OK: true, Maintenance: &leases[i]}).Err(); err != nil || leases[i].State == control.MaintenanceReleased {
+				return daemonIdentity{}, control.ErrMaintenanceInvalid
+			}
+		}
+		if len(leases) > 0 {
+			return daemonIdentity{}, &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: &leases[0]}
+		}
+		id.maintenanceAware = true
+	}
 	if id.isZero() {
 		return daemonIdentity{}, errors.New("status missing pid and daemon_generation")
 	}

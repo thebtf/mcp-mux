@@ -76,6 +76,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   authority. Direct consumers without a reaper fail closed instead of silently
   losing publication intent. Contention and renewed-blocked retry remain unchanged;
   no new state, scheduler, clock reset or authority-deletion bypass is added.
+- Library `ApplyUpdateAndRestart`/`RestartWithSuccessor` and launcher engine-switch
+  restart keep contacted graceful-restart transport uncertainty terminal with its
+  original cause. Unaware or invalid endpoints cannot select shutdown fallback.
+  An explicit ordinary rejection permits fallback only after fresh validated
+  maintenance-aware/clear status for the same nonempty daemon generation; failed
+  shutdown is terminal. Existing old-daemon read-only startup compatibility stays.
 - Recovered lease timers and control request serving activate only after daemon
   construction succeeds. Failed registry/control setup cannot leave a stale
   expiry timer that later overwrites renewed authority; accepted expiry is unchanged.
@@ -293,9 +299,19 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   artifact or release proof. Receipt/full hashes are in release evidence.
   Fresh exact344 root enumeration artifact1349 records33 threads,31 resolved,
   2 unresolved,hasNextPage=false: daemon P2 comment4179066572 and update-fallback
-  P1 comment4179436225. Daemon scoped acceptance is not remote resolution; engine/
-  cmd correction proof and critical CI workflow remain in progress,not proven.
-  No all33-resolved,merge-ready or final acceptance claim.
+  P1 comment4179436225. Daemon repair is committed atomically as ae21825 with its
+  two docs; scoped acceptance/commit is not remote resolution. Root now accepts
+  the focused six-file engine/cmd fallback repair on immutable315+only frozen
+  overlays. New tests with old344 production give4 causal engine RED leaves
+  (both public helpers:old/uncertain endpoint,shutdown1/starts1) and cmd6 RED/
+  1 known-aware-clear PASS. Final normal/race each prove engine38+cmd13 positive
+  leaves,51 distinct/102 total,0 SKIP/data races/unsettled; each family runs once.
+  Real same owner and same authenticated host IPC survive refusals. Retained
+  engine110-byte socket setup failure is not causal RED; approved short private
+  root max85-byte sockets supply actual proof. LF archive rejection is retained.
+  Full six source hashes/receipt10b290 limits are in release evidence. Critical
+  CI workflow runtime,successor full gates/artifact and remote resolutions are
+  not proven; no all33-resolved,merge-ready or final acceptance claim.
   Historical8142 proofs/failures remain scoped. No all-PR CLEAN or delivery claim.
 
 ### Rollback

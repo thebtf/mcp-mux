@@ -162,11 +162,14 @@ func TestMaintenanceTypedLifecycleRefusalNeverFallsBack(t *testing.T) {
 			engineControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
 				sent = append(sent, req.Cmd)
 				if atShutdown {
-					return nil, errors.New("legacy graceful endpoint unavailable")
+					return &control.Response{Message: "graceful restart rejected"}, nil
 				}
 				return &control.Response{ErrorCode: control.ErrMaintenanceHeld.Code}, nil
 			}
 			engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+				if req.Cmd == "status" {
+					return updateAwareStatus(), nil
+				}
 				sent = append(sent, req.Cmd)
 				return &control.Response{ErrorCode: control.ErrMaintenanceRetirementBlocked.Code}, nil
 			}
