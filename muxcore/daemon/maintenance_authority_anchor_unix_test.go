@@ -196,3 +196,25 @@ func TestMaintenanceAuthorityRejectsForeignAliasRetarget(t *testing.T) {
 		})
 	}
 }
+
+func TestMaintenanceAuthorityPreservesTrustedEndpointAliasUnix(t *testing.T) {
+	t.Run("owned_inner_pre_dotdot", func(t *testing.T) {
+		d, endpoint := maintenanceAnchorGuardFixture(t)
+		base := maintenanceAnchorTempDir(t, "mux-alias-")
+		child := filepath.Join(filepath.Dir(filepath.Dir(endpoint)), "child")
+		if err := os.Mkdir(child, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		inner := filepath.Join(base, "owned-inner")
+		if err := os.Symlink(child, inner); err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(base, "trusted")
+		// Unix traverses the inner symlink before ..; Windows normalizes this
+		// payload lexically, so it does not name the same endpoint there.
+		if err := os.Symlink(inner+"/../endpoint", alias); err != nil {
+			t.Fatal(err)
+		}
+		maintenanceAnchorTrustedAliasPreserves(t, d, endpoint, filepath.Join(alias, filepath.Base(endpoint)))
+	})
+}

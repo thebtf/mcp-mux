@@ -257,7 +257,7 @@ func maintenanceAnchorTempDir(t *testing.T, prefix string) string {
 }
 
 func TestMaintenanceAuthorityPreservesTrustedEndpointAlias(t *testing.T) {
-	for _, variant := range []string{"absolute", "relative_dotdot", "owned_inner_pre_dotdot"} {
+	for _, variant := range []string{"absolute", "relative_dotdot"} {
 		t.Run(variant, func(t *testing.T) {
 			d, endpoint := maintenanceAnchorGuardFixture(t)
 			base := maintenanceAnchorTempDir(t, "mux-alias-")
@@ -270,39 +270,56 @@ func TestMaintenanceAuthorityPreservesTrustedEndpointAlias(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if variant == "owned_inner_pre_dotdot" {
-				child := filepath.Join(filepath.Dir(filepath.Dir(endpoint)), "child")
-				if err := os.Mkdir(child, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				inner := filepath.Join(base, "owned-inner")
-				if err := os.Symlink(child, inner); err != nil {
-					if runtime.GOOS == "windows" {
-						t.Skipf("Windows symlink creation unavailable: %v", err)
-					}
-					t.Fatal(err)
-				}
-				target = inner + string(os.PathSeparator) + ".." + string(os.PathSeparator) + "endpoint"
-			}
 			if err := os.Symlink(target, alias); err != nil {
-				if runtime.GOOS == "windows" {
-					t.Skipf("Windows symlink creation unavailable: %v", err)
-				}
 				t.Fatal(err)
 			}
-			aliasedEndpoint := filepath.Join(alias, filepath.Base(endpoint))
-			lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath(alias, d.namespace))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer lock.Close()
-			path, scope, ledger, err := readMaintenanceAuthority(d.namespace, aliasedEndpoint)
-			if err != nil || path != d.maintenancePath || scope != d.maintenanceScope || ledger == nil || len(ledger.Leases) != 1 {
-				t.Fatalf("trusted original traversal changed authority: path=%s scope=%s ledger=%+v err=%v", path, scope, ledger, err)
-			}
-			if err := CheckMaintenanceForActivation(d.namespace, aliasedEndpoint); !errors.Is(err, control.ErrMaintenanceHeld) {
-				t.Fatalf("trusted alias lost durable fence: %v", err)
-			}
+			maintenanceAnchorTrustedAliasPreserves(t, d, endpoint, filepath.Join(alias, filepath.Base(endpoint)))
 		})
+	}
+}
+
+func maintenanceAnchorTrustedAliasPreserves(t *testing.T, d *Daemon, endpoint, aliasedEndpoint string) {
+	t.Helper()
+	aliasParent, err := os.Stat(filepath.Dir(aliasedEndpoint))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Stat(filepath.Dir(endpoint))
+	if err != nil || !os.SameFile(aliasParent, parent) {
+		t.Fatalf("alias did not reach the actual endpoint directory: %v", err)
+	}
+	if canonicalMaintenancePath(aliasedEndpoint) != canonicalMaintenancePath(endpoint) {
+		t.Fatal("alias did not preserve canonical endpoint identity")
+	}
+	ledgerBefore, err := os.ReadFile(d.maintenancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionBefore, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath(filepath.Dir(aliasedEndpoint), d.namespace))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	path, scope, ledger, err := readMaintenanceAuthority(d.namespace, aliasedEndpoint)
+	if err != nil || path != d.maintenancePath || scope != d.maintenanceScope || ledger == nil || len(ledger.Leases) != 1 {
+		t.Fatalf("trusted original traversal changed authority: path=%s scope=%s ledger=%+v err=%v", path, scope, ledger, err)
+	}
+	if lease := ledger.Leases[0]; lease.HoldID != "guard-fixture" || lease.State != control.MaintenanceHeld || len(lease.Keys) != 1 || lease.Keys[0] != maintenanceDigest("guard-context") {
+		t.Fatalf("trusted alias did not recover the known held authority: %+v", lease)
+	}
+	if err := CheckMaintenanceForActivation(d.namespace, aliasedEndpoint); !errors.Is(err, control.ErrMaintenanceHeld) {
+		t.Fatalf("trusted alias lost durable fence: %v", err)
+	}
+	ledgerAfter, err := os.ReadFile(d.maintenancePath)
+	if err != nil || !bytes.Equal(ledgerBefore, ledgerAfter) {
+		t.Fatalf("trusted alias read/activation changed ledger: %v", err)
+	}
+	transactionAfter, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+	if err != nil || !bytes.Equal(transactionBefore, transactionAfter) {
+		t.Fatalf("trusted alias read/activation changed transaction certificate: %v", err)
 	}
 }
