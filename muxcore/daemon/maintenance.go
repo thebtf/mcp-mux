@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -16,10 +17,12 @@ type maintenancePin struct {
 	creating <-chan struct{}
 }
 type maintenanceLease struct {
-	record    maintenanceRecord
-	result    control.MaintenanceResult
-	pins      []maintenancePin
-	recovered bool
+	record          maintenanceRecord
+	result          control.MaintenanceResult
+	pins            []maintenancePin
+	recovered       bool
+	timer           *time.Timer
+	retirementRetry bool
 }
 
 func maintenanceFailure(code *control.MaintenanceError, lease *maintenanceLease) error {
@@ -439,6 +442,12 @@ func (d *Daemon) commitMaintenanceLeaseLocked(current, updated *maintenanceLease
 	if err := d.persistMaintenanceLocked(next); err != nil {
 		return err
 	}
+	retirementRetry := current.retirementRetry && updated.result.State == control.MaintenanceRetirementBlocked
+	if current.timer != nil {
+		current.timer.Stop()
+	}
+	updated.timer = nil
+	updated.retirementRetry = false
 	d.maintenanceLeases = next
 	for _, pin := range updated.pins {
 		if pin.entry.Owner != nil {
@@ -446,7 +455,11 @@ func (d *Daemon) commitMaintenanceLeaseLocked(current, updated *maintenanceLease
 		}
 	}
 	if updated.result.State != control.MaintenanceReleased {
-		d.scheduleMaintenanceExpiryLocked(updated)
+		if retirementRetry {
+			d.scheduleMaintenanceTimerLocked(updated, 100*time.Millisecond, true)
+		} else {
+			d.scheduleMaintenanceExpiryLocked(updated)
+		}
 	}
 	return nil
 }
@@ -469,12 +482,30 @@ func (d *Daemon) finishMaintenanceRetirementLocked(lease *maintenanceLease) erro
 func (d *Daemon) maintenanceRetirementChanged(entry *OwnerEntry) {
 	lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
 	if err != nil {
+		if errors.Is(err, ipc.ErrFileLocked) {
+			d.maintenanceGate.Lock()
+			defer d.maintenanceGate.Unlock()
+			if d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
+				return
+			}
+			for _, lease := range d.maintenanceLeases {
+				if lease.result.State != control.MaintenanceRetirementBlocked || lease.retirementRetry {
+					continue
+				}
+				for _, pin := range lease.pins {
+					if pin.entry == entry && pin.identity.matches(entry) {
+						d.scheduleMaintenanceTimerLocked(lease, 100*time.Millisecond, true)
+						break
+					}
+				}
+			}
+		}
 		return
 	}
 	defer lock.Close()
 	d.maintenanceGate.Lock()
 	defer d.maintenanceGate.Unlock()
-	if d.maintenanceFailed {
+	if d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
 		return
 	}
 	for _, lease := range d.maintenanceLeases {
@@ -491,21 +522,75 @@ func (d *Daemon) maintenanceRetirementChanged(entry *OwnerEntry) {
 	}
 }
 
+func (d *Daemon) maintenanceTimerStoppedLocked() bool {
+	if d.shuttingDown.Load() {
+		return true
+	}
+	select {
+	case <-d.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (d *Daemon) scheduleMaintenanceExpiryLocked(lease *maintenanceLease) {
-	time.AfterFunc(time.Until(lease.result.ExpiresAt), func() {
+	d.scheduleMaintenanceTimerLocked(lease, time.Until(lease.result.ExpiresAt), false)
+}
+
+// Retirement publication and safe expiry share one exact-lease timer. Only
+// namespace contention retries publication; persistence failure stays fenced.
+func (d *Daemon) scheduleMaintenanceTimerLocked(lease *maintenanceLease, delay time.Duration, retirement bool) {
+	if lease.timer != nil {
+		lease.timer.Stop()
+	}
+	lease.retirementRetry = retirement
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
+		d.maintenanceGate.RLock()
+		current := d.maintenanceLeases[lease.result.HoldID] == lease && lease.timer == timer &&
+			!d.maintenanceFailed && !d.maintenanceTimerStoppedLocked()
+		d.maintenanceGate.RUnlock()
+		if !current {
+			return
+		}
 		lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
 		if err != nil {
-			time.AfterFunc(100*time.Millisecond, func() { d.reconcileMaintenance() })
+			d.maintenanceGate.Lock()
+			defer d.maintenanceGate.Unlock()
+			if d.maintenanceLeases[lease.result.HoldID] != lease || lease.timer != timer ||
+				d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
+				return
+			}
+			if errors.Is(err, ipc.ErrFileLocked) && (!retirement ||
+				lease.result.State == control.MaintenanceRetirementBlocked && d.maintenanceTreesRetiredLocked(lease)) {
+				d.scheduleMaintenanceTimerLocked(lease, 100*time.Millisecond, retirement)
+			} else if retirement {
+				d.scheduleMaintenanceExpiryLocked(lease)
+			}
 			return
 		}
 		defer lock.Close()
 		d.maintenanceGate.Lock()
 		defer d.maintenanceGate.Unlock()
-		if d.maintenanceLeases[lease.result.HoldID] != lease {
+		if d.maintenanceLeases[lease.result.HoldID] != lease || lease.timer != timer ||
+			d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
+			return
+		}
+		if retirement {
+			if lease.result.State != control.MaintenanceRetirementBlocked || !d.maintenanceTreesRetiredLocked(lease) {
+				d.scheduleMaintenanceExpiryLocked(lease)
+				return
+			}
+			// Restore the original safe-expiry timer before publication. A failed
+			// commit must not cancel the current authority's only expiry event.
+			d.scheduleMaintenanceExpiryLocked(lease)
+			_ = d.finishMaintenanceRetirementLocked(lease)
 			return
 		}
 		_ = d.expireMaintenanceLocked(time.Now())
 	})
+	lease.timer = timer
 }
 
 func (d *Daemon) expireMaintenanceLocked(now time.Time) error {
