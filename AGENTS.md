@@ -131,6 +131,10 @@ exact-lease timer, without a reaper. Successful blocked renewal preserves pendin
 retry intent on the replacement lease's guarded timer; it changes only accepted
 expiry, not the original drain deadline. Publication preserves accepted expiry
 and drain authority; stale lease/timer callbacks cannot mutate replacement authority.
+Non-contention namespace-lock errors from exact-current pending retirement
+callbacks/current retirement timers latch existing `maintenanceFailed` authority.
+Direct consumers without a reaper fail closed; contention/renewed-blocked retry
+and original lease clocks stay unchanged. Never delete authority to reopen admission.
 
 Configured authorization must retain private callback authority through return
 and registration/rejection in every owner mode, not only `SessionHandler`.
@@ -222,6 +226,11 @@ engines, and manual active-pointer changes are unsupported. Before downgrade,
 durably resume each exact retired lease through the current aware binary or
 observe safely committed expiry. Incomplete/blocked authority prevents downgrade;
 preserve both authority members even after TTL. Never delete them to open admission.
+Contacted graceful-restart transport uncertainty retains its original cause and
+is terminal. Existing shutdown fallback after an explicit ordinary rejection
+requires fresh validated maintenance-aware/clear status for the SAME nonempty
+daemon generation; failed shutdown is terminal. Old read-only startup compatibility
+is unchanged. This is not permission to bypass a typed maintenance refusal.
 
 Maintenance authority is `<canonical namespace-lock path>.maintenance/<scope digest>/`
 with ledger/transaction members and unchanged scope/schema/state. Never choose a
@@ -306,9 +315,22 @@ all five jobs. Its selected Windows Scenario 11 executed successfully: 1158/1158
 checks, smoke exit0, no cleanup errors, actual owner0.31.0 in23 observations.
 The retained build/JSON receipts bind source, PR head and clone to344 and the
 CGO0/trimpath binary to SHA256 `cf6ab1afa0c3cf41a59caf97ffc0620be7d76aac0bbebaf44d64350d2be23cde`.
-This closes the Windows premerge proof requirement, not a fresh344 Linux full
-run or delivered-artifact canary. Final source-plus-docs acceptance, review
-disposition, merge, tags/module resolution and Engram handoff remain root-owned.
+That Windows result remains344-bound after later production repairs. Actual
+immutable `74d5293ca8cd2d70861db952c4c3c5b504577516` Linux root/module normal tests
+(2+25 tested packages,3 root no-test) and both vets pass once. Fresh clean CGO0/
+trimpath owner0.31.0 artifact runs Scenario11 1191/1191; fresh R1 100+8 uses a
+separate unstamped binary. No local full-race duplicate was run; CI owns that gate.
+[Exact74 CI37242471098](https://github.com/thebtf/mcp-mux/actions/runs/37242471098)
+is RED: macOS live-host fixture socket104 bytes exceeds Darwin103; Ubuntu/
+coverage/BSD PASS,Windows canceled before selected public steps. The test-only
+short namespace correction has actual Linux race4/4 PASS once,0SKIP/races/errors;
+53-byte private TMP gives observed owner96/97/control100/101 bytes below103.
+Root accepts fixture-only proof,not native macOS/nextCI PASS.
+Extended selected Windows canonical critical workflow has STATIC proof only.
+Root reports all33 then-known threads resolved after actual replies/readback;
+not fresh all-PR CLEAN. Final source-plus-docs/next CI/critical proof,merge,
+tags/module resolution,fresh-session delivered canary and Engram handoff remain
+root-owned. Native Engram issue tools are unmounted; only that handoff effect is held.
 Do not report this prepared scope as shipped or `CONSUMER_HANDOFF_PASS`.
 
 Rollback to `muxcore/v0.30.0` or a compatible previous binary only after the

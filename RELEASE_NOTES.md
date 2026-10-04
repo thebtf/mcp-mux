@@ -387,11 +387,48 @@ embedded344 Go1.25.12 CGO0/trimpath binary SHA256
 smoke exit0,1158/1158 checks,0 cleanup errors, actual owner0.31.0 in23 observations.
 Full retained receipt hashes and proof limits are in
 [release evidence](specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact344-hosted-windows-proof).
-Windows premerge proof is closed, not the optional local granted-root route,
-final review disposition/source-plus-docs acceptance or postmerge fresh delivery.
-Linux full/artifact evidence remains1e-bound, not fresh344 Linux full execution.
-Other release/consumer gates remain pending; no local profile/ACL/bypass effects.
-No all-PR CLEAN or release completion is claimed.
+That historical Windows premerge proof is344-bound,not the optional local route,
+later production successor acceptance or postmerge fresh delivery.
+Fresh integrated Linux proof now binds exact
+`74d5293ca8cd2d70861db952c4c3c5b504577516`,not inherited1e/focused overlays:
+root2 tested/3 no-test and module25 tested normal suites plus both vets each
+once PASS. Clean Go1.25.12 CGO0/trimpath embedded74/owner0.31.0 binary SHA256
+`07ef0ebd1c2597a4f032748685d265e3e87efe58939dc19acd6db475d53b3951`
+runs actual Scenario11 1191/1191 with23 public owner0.31.0 rows. Fresh R1
+100/100+8/8 PASS uses separate CGO1/non-trimpath unstamped74d5293c binary
+`70b5b142fdcf67715de1a24bb824ca24ff6df6d04ac7ff9367efaa213147e0bc`,
+not the release artifact. Unix Scenario8 selected6 named tests/8 terminal events
+PASS,0 FAIL/SKIP,not the full playbook. No local full-race duplicate; CI owns it.
+Raw receipt `P/final74-linux/proof-result.json` SHA256
+`3df8e560ca480b5c0ee55753bbfc57d4bf68e46ffd5fb387c29a8a930e928c66`
+binds461 exact Git blobs/0 mismatch/no WIP; commands/limits in
+[release evidence](specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact74-integrated-linux-proof-and-ci-boundary).
+One ancillary R1 metadata stat used old BaseDir and failed; corrected current
+BaseDir provenance succeeded without gate/build/smoke/R1 repeats. Settled0
+processes/socket registrations/authority;3 identity-bound inactive sockets retained,
+not deleted. No cleanup/profile/guard bypass.
+[Exact74 CI37242471098](https://github.com/thebtf/mcp-mux/actions/runs/37242471098)
+FAILED: macOS new4 live-host cases fail before helper at update_test.go1110,
+fixture owner socket104 bytes exceeds Darwin103. Ubuntu/coverage/BSD PASS;
+Windows canceled before selected public/critical steps. Test-only namespace
+`filepath.Base(existing mp* base)` correction2b8ffa now has actual scoped Linux
+race4/4 original branches PASS once,0SKIP/data races/errors/stderr on immutable74
+plus only that fixture;460 other files including production/proof scripts equal.
+Private53-byte TMP,pretest bound97/101,observed owner96/97/control100/101 stay
+below Darwin103. Receipt SHA256
+`43ff6e4957130068ac84536cc069d25a6e3004e95efffe7b355fb8fa091278df`;
+root accepted fixture-only source/behavior,not nativeDarwin or nextCI PASS.
+OldMac failure preserved without unchanged repro;no normal fixture run.
+Production/proof scripts unchanged74. Extended selected workflowbfabb5e SHA256
+`5a8e5d7f2572f06289c135d5a368439902af5e940d8c73de592ecb15f1fe30d4`
+has actionlint/YAML/3AST STATIC PASS,not hosted canonical critical runtime proof.
+Actual replies4179716104/4179716099,full-body readback and2 native resolutions
+close all33 then-known threads; not fresh final-head/all-PR CLEAN.
+Issue135 milestone5985521449 was posted/read back,not delivery. Next integrated
+source/fixture/docs CI,canonical Windows critical/Scenario11,merge,publication,
+tags/module/binary delivery,fresh-session canary and consumer handoffs remain
+pending. Fresh native inventory has Engram issue tools unmounted,no substitute;
+only the consumer handoff effect is held. No release completion is claimed.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

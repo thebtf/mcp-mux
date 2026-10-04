@@ -6,9 +6,9 @@ This is the T029 evidence artifact for GitHub #135. The accepted ADR-015 full-sl
 
 | State | Recorded outcome |
 | --- | --- |
-| Implemented | Root committed restore947e/injection1e45, portable fixture91, workflowc18, callback fixture344, then reports atomic daemon repair/docs `ae21825` (four files). Daemon53cd/d504 scoped proof is below. Root accepts the later six-file engine/cmd fallback repair on immutable315 plus only frozen overlays; its next atomic source/docs commit remains parent-owned. No API/schema/expiry/clock/deadline expansion or old-daemon read-only startup cutover. Workflow45d062/versioned label identity applies to retained344 hosted proof; successor critical workflow runtime remains unproven. |
-| Verified | Historical8142/26f/b86/doc44/old1e/c18 receipts and failures retained. Actual1e Linux normal/vet/full-race each once exit0:27 tested/3 no-test,2339 positive race leaves/5 SKIP,0 failed/races; release owner0.31.0 Scenario11 1191, separate R1 100+8 version1e45a13f. Original focused overlays/portable91 retain scopes/no elapsed TTL/injection18 includes parents. Callback immutablec18+onlya93:one race invocation8/8 original subtests PASS,0 SKIP/errors/warnings/stderr,110 selected production/broader production+proof11 equal1e. Live excluded equality REFUSED4 concurrent documentation drift, no WIP imported. Exact344 CI37236880161 all5 SUCCESS and actual hosted Windows Scenario11 1158/1158 PASS,exit0,0 cleanup errors,owner0.31.0 in23 observations now close the Windows premerge requirement. Not a fresh344 Linux full run or delivered release. |
-| Current-head acceptance | Root's fresh exact344 `artifact://1349` records33 threads,31 resolved,2 unresolved,hasNextPage=false: daemon P2 comment4179066572/update-fallback P1 comment4179436225. Root accepts both scoped repairs below and reports daemon ae21825 committed, not remote thread resolution or final acceptance. Fallback original/final native proof now observed; successor critical CI workflow/full gates/artifact remain unproven. Exact344 Windows CI/job/artifact/raw JSON stay344-bound; historical failures retained. Final document-hash admission, source-plus-docs acceptance and review disposition remain root-owned; no all33-resolved/merge-ready claim. Optional local grant remains effect-only. |
+| Implemented | Root committed daemon ae21825 and fallback `74d5293ca8cd2d70861db952c4c3c5b504577516`;independent focused overlays/causal RED retained below. Workflow extensionbfabb5e STATIC proof only. Root accepts test-only short namespace2b8ffa source/behavior after actual scoped Linux race4/4;production/proof scripts byte-equal74. Final source+fixture+docs commit/next CI remain parent-owned;no new API/schema/clock/deadline expansion. |
+| Verified | Actual exact74 Linux normal root2 tested/3 no-test+module25 tested and both vets each once PASS;clean CGO0/trimpath owner0.31.0 artifact Scenario11 1191/1191+23 public status rows. Separate unstamped74 R1 100/100+8/8 PASS;selected UnixScenario8 6named/8terminal events0FAIL/SKIP.461 exact Git blobs0mismatch/no WIP;no local full-race duplicate. Fixture-only74+2b8ffa existing4race branches PASS once,0SKIP/races/errors/stderr,measured owner96/97/control100/101<=Darwin103;not nativeDarwin. Actual74 CI REDMac/WindowsCanceled retained,no nextCI/canonical hosted critical runtime PASS. Historical344 Windows/all5CI and1e race keep source scopes. |
+| Current-head acceptance | Actual replies4179716104/4179716099 full-body/in-reply-to readback+root2native resolutions closeall33 then-known;historical34433/31/2 distinct,not fresh all-PR CLEAN. Integrated74 Linux and separate fixture-only proof observed/accepted;next exactCI/Windows canonical critical/source-doc hash admission pending. Issue135 milestone5985521449 posted/readback,not delivery. Native Engram issue tools freshly unmounted,no substitute,effect-only. |
 | Delivered | No. Binary/library `0.31.0` is prepared and PR #150 remains open, not merged. T032 is in progress; no new release tags, module/binary publication, post-merge fresh-clone canary, or consumer handoff completion is recorded. T033 remains pending. |
 
 This docs closeout inspected existing diffs, retained receipts and parent-provided readbacks; it ran no tests/builds/formatters/commit/push or external writes. Root owns final artifact/CI/readback and release. Historical failures and bounded source-review limits remain explicit. Post-merge/tag/canary evidence belongs in primary-checkout records, without editing merged source to record delivery.
@@ -596,7 +596,7 @@ separately retained Linux full/artifact commands at1e.
 | Actual Scenario11 | Smoke exit0;1158/1158 passed assertion instances,0 failed, not1158 independent scenarios. Actual executed-file overwrite, original host pipes/IDs, full scoped tree retirement, no held replay and fresh same-era modern admission remain bounded to this managed replacement journey. |
 | Cleanup | Three successful namespace shutdown acknowledgements,0 cleanup errors; scope is fixture-owned resources, not unrelated live owners. Finished `2026-10-04T21:46:08.4876252Z`. |
 
-This positive OS-native proof closes the Windows premerge requirement. It does
+This positive OS-native proof closed the Windows premerge requirement at344. It does
 not exercise the optional local approved-root route or grant profile/ACL/bypass
 authority. Historical1e failure/c18 cancellation and their distinct component
 results remain intact. The JSON expressly limits its scope to live managed
@@ -637,11 +637,11 @@ Fresh root enumeration at exact344,`artifact://1349`,records33 total,31 resolved
 (`PRRT_kwDORq0kOM6o151B`) and update-fallback P1
 [4179436225](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179436225)
 (`PRRT_kwDORq0kOM6o2zUi`). This scoped daemon acceptance does not resolve either
-remote thread. Root reports the daemon repair and two docs atomically committed
-as ae21825. Accepted engine/cmd fallback proof is separately recorded below;
-successor critical CI workflow runtime/full gates/artifact are not proven. No
-all33-resolved,merge-ready,final acceptance or release claim;344 Windows proof
-stays344-bound.
+remote thread by itself. Root committed daemon ae21825 and fallback74; later
+actual replies4179716104/4179716099/readbacks/native resolutions close33 known,
+not fresh all-PR CLEAN. Actual integrated74 Linux gates/artifact are recorded
+below. Mac fixture failure/Windows cancellation and next exact CI/canonical
+critical proof remain distinct;344 Windows proof stays344-bound.
 
 ## Accepted scoped update-fallback repair
 
@@ -683,9 +683,78 @@ This is Linux/amd64 Go1.25.12 native focused normal/race proof,not a separately
 built release CLI,Scenario5b/full critical suite,Windows run,new full gate/CI,
 artifact or release canary. Raw commands/test JSON and settlement are retained;
 no remaining task processes/live endpoints or cleanup deletion. Main retains
-private proof/container/roots/caches and owns the next atomic six-source/two-doc
-commit. Critical workflow runtime and remote thread resolution remain pending;
-no all33-resolved,merge-ready or final acceptance claim.
+private proof/container/roots/caches;root committed fallback as74d5293. The
+later integrated74 proof below is separate from these focused projections;
+actual remote dispositions close33 then-known,not final acceptance/all-PR CLEAN.
+
+## Actual exact74 integrated Linux proof and CI boundary
+
+`P/final74-linux/proof-result.json`, SHA256
+`3df8e560ca480b5c0ee55753bbfc57d4bf68e46ffd5fb387c29a8a930e928c66`,
+records `ASSIGNED_EXACT74_LINUX_GATES_PASS_WITH_RECORDED_LIMITS` at exact
+`74d5293ca8cd2d70861db952c4c3c5b504577516`.461 source files match committed
+Git blobs before/after,0 archive/projection mismatches,0 WIP imported. Cached
+Go1.25.12 linux/amd64 private runtime;every owning gate below executed once.
+`P/final74-linux/commands.json` retains argv,working directories,exit codes and
+raw stdout/stderr hashes;no inferred successor execution or local full-race
+duplicate(CI owns that gate).
+
+| Exact74 owning gate / identity | Actual result and boundary |
+| --- | --- |
+| Normal root/module tests | `go test ./... -count=1` from `/repo/.agent/tmp/c74` and its `muxcore`,each exit0 once. Root2 tested/3 no-test packages,module25 tested;not a verbose leaf denominator. |
+| Both vet suites | `go vet ./...` in the same two roots,each once exit0;silent logs alone are not exit proof. |
+| Release-equivalent build | `go build -trimpath -ldflags "-X github.com/thebtf/mcp-mux/muxcore/owner.Version=0.31.0" -o /repo/.agent/tmp/c74/.agent/u/bin/mcp-mux-linux-amd64 ./cmd/mcp-mux`,CGO0,exit0 once. SHA256 `07ef0ebd1c2597a4f032748685d265e3e87efe58939dc19acd6db475d53b3951`,embedded74/modifiedfalse. |
+| Actual Scenario11 | Existing smoke selects SourceRoot `/repo/.agent/tmp/c74`,that SAME binary,ScratchRoot `/repo/.agent/tmp/c74/.agent/u`,OutputDir `.../s`,EvidencePath `.../scenario11.json`,TimeoutSeconds180;exit0 once,1191/1191 assertion instances,23 actual owner0.31.0 status rows. Fresh same-era modern admission on original pipe,not transparent replay/restoration. |
+| Actual R1 | Existing Unix runner `--source-root /repo/.agent/tmp/c74 --output-dir /repo/.agent/tmp/c74/.agent/u/r1 --keep-base-dir`,cached direct Go1.25.12;exit0 once,100/100 corpus and8/8 scenarios PASS. Separate CGO1/non-trimpath unstamped binary SHA256 `70b5b142fdcf67715de1a24bb824ca24ff6df6d04ac7ff9367efaa213147e0bc`,clean embedded74,actual version74d5293c,NOT release0.31.0 artifact/parity. |
+| Selected UnixScenario8 | Six selected daemon/upstream/procgroup tests,normal `-count=1 -json`,exit0 once:6/6 top-level and8/8 terminal events PASS,0FAIL/SKIP. Names: `TestMaintenanceSafeTTLReleasesDurablyWithoutIdleExitBypass`, `TestMaintenanceBlockedTTLDoesNotReleaseUnprovenTree`, `TestMaintenanceIncompleteLedgerRecoveryCannotInventTreeDeath`, `TestMaintenanceTreeDeathExcludesCommittedTransfer`, `TestConcurrentTreeFinalizationIsIdempotent`, `TestGracefulKill_KillsTree`. Not the entire Scenario8 playbook. |
+| Settlement |0 matching processes,registered Unix sockets or authority entries;3 identity-bound unregistered inactive test sockets retained,no unlink. Owning Scenario11/R1 cleanup only;container/volume/caches/projection/binaries/evidence retained for Main. |
+
+An ancillary post-gate R1 provenance stat used predecessor BaseDir and exited1.
+Current binary hash/go metadata already succeeded;corrected stat operands to
+actual current BaseDir produced exit0. Failure evidence stays retained;no gate,
+build,Scenario11 or R1 was repeated. This is metadata-path correction,not a
+retroactive PASS of the failed stat.
+
+Actual [exact74 CI37242471098](https://github.com/thebtf/mcp-mux/actions/runs/37242471098)
+is FAILED. Ubuntu/coverage/BSD jobs SUCCESS;macOS job111553752695 FAILED in
+the module step. Root's raw failure readback identifies4 new live-host fixture
+cases at update_test.go1110 before the helper:104-byte owner socket exceeds
+Darwin sockaddr_un bound103. Windows job111553752609 CANCELED in module step;
+selected Scenario11/canonical critical/evidence steps SKIPPED,no74 Windows
+public/critical PASS. Linux success does not override either outcome.
+
+The fixture-only `muxcore/engine/update_test.go` SHA256
+`2b8ffa1e97903b0e3afea4c513bf5a0080b24537e95b17e8845dfe78367e155c`
+sets Config.Namespace to filepath.Base(existing unique mp* base). Root now
+accepts actual scoped proof `P/portable-update-fixture-native-linux/proof-result.json`,
+SHA256 `43ff6e4957130068ac84536cc069d25a6e3004e95efffe7b355fb8fa091278df`.
+Immutable74 plus ONLY that fixture;all460 other files including production/proof
+scripts byte-equal before/after,0 mismatches. Existing4 live-host branches run
+once under race:exit0,4/4 PASS,0SKIP/data races/errors/stderr,no normal run.
+Same real owner/authenticated host IPC/unchanged refusal assertions are retained.
+Actual private TMP is53 bytes;pretest bound97owner/101control and observed
+owner96/97,control100/101 are strictly below Darwin103. This is native Linux
+behavior plus measured pathname bounds,NOT nativeDarwin execution. Old74 Mac
+failure retained without unchanged repro. No production/proofscript,assertion,
+deadline or OS-skip change;next exactCI must validate nativeMac and selected
+Windows canonical critical/Scenario11. No future PASS or full-gate repeat.
+
+Selected workflow `bfabb5e8346d532bdbf47371fa6bc17c0c9dad85`, SHA256
+`5a8e5d7f2572f06289c135d5a368439902af5e940d8c73de592ecb15f1fe30d4`,
+extends canonical hosted Windows critical proof. Root records actionlint/YAML/
+3AST STATIC PASS;canonical hosted critical runtime has not executed successfully.
+Source+fixture+sixdocs integration,then next exact CI and selected Windows
+canonical critical/Scenario11 proof remain parent-owned,no future PASS claim.
+
+Actual [daemon reply4179716104](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179716104)
+to4179066572 and [fallback reply4179716099](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179716099)
+to4179436225 have full-body/in-reply-to readback;root reports2 native resolution
+SUCCESS,all33 then-known resolved. Not fresh final-head/all-PR CLEAN.
+[Issue135 milestone5985521449](https://github.com/thebtf/mcp-mux/issues/135#issuecomment-5985521449)
+is posted/read back,not delivered behavior. Fresh native xd inventory leaves
+Engram issue tools UNMOUNTED,no substitute;only that consumer handoff effect is
+held. Merge/tags/module/binary delivery,fresh-session canary and all required
+consumer handoffs remain pending.
 
 ## Remaining release and consumer outcomes
 
@@ -693,22 +762,22 @@ Historical transport P1s `PRRT_kwDORq0kOM6ozALW` and `PRRT_kwDORq0kOM6ozALd` hav
 
 | Task / gate | Current recorded state | Outcome still required |
 | --- | --- | --- |
-| T032 release | `0.31.0` prepared, PR#150 open;1e Linux/portable91/callback race8 receipts and committed/pushed344 retained. Exact344 CI37236880161 all5 SUCCESS and hosted Windows1158/1158/exit0/owner0.31.0 observed above. Old1e/c18 failures remain historical; live excluded-doc equality refused;31 known resolutions historical. | Root binds final doc hashes/source-plus-docs and current review disposition before acceptance/integration/delivery. No all-PR CLEAN, merge-ready or release acceptance; local route optional only. |
-| T033 consumers and canary | Post-merge fresh-clone/tag/module/binary and fresh-session delivered hold/replace/resume proof remain pending. Engram native issue capability is unmounted with no proxy backend; its concrete handoff boundary becomes active after the delivered version/tag target is resolved, not as a global premerge hold. | Perform real target-bound consumer handoffs and delivered-artifact canaries after release-version/tag resolution. Claim `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` only on actual completed criteria. |
+| T032 release | `0.31.0` prepared,PR#150 open;daemon ae21825/fallback74 committed,actual exact74 Linux normal/vet/artifact/Scenario11/R1/selected Unix proof above. Actual74 CI RED Mac fixture/Windows canceled;historical344 Windows proof retained. All33 then-known root-resolved after actual replies/readback,not fresh all-PR CLEAN. | Root integrates short namespace fixture/sixdoc hashes,obtains next exact CI/selected Windows canonical critical+Scenario11 proof,then final acceptance/integration/delivery. No future PASS or merge-ready claim. |
+| T033 consumers and canary | Post-merge fresh-clone/tag/module/binary and fresh-session delivered proof pending. Fresh native xd inventory confirms Engram issue capability UNMOUNTED,no substitute;exact handoff effect-only,not global premerge hold. | Real target-bound handoffs and delivered canaries after target/version resolution;claim PROJECT_RELEASE_PROTOCOL_PASS/CONSUMER_HANDOFF_PASS only on completed criteria. |
 
 Current evidence fields and acceptance limits (not empty placeholders or implied PASS):
 
 | Evidence field | Exact outstanding outcome |
 | --- | --- |
-| Final integrated source SHA / remote convergence | Earlier344 CI/Windows proof and1e Linux proof retain source bindings. Root reports atomic daemon ae21825 four-file commit; its runtime receipt is immutable315+only53cd/d504. Accepted fallback proof is independently immutable315+only six frozen overlays,not a combined ae21825 full run. Parent owns the next six-source/two-doc atomic commit,remote readback and final source-plus-docs/hash admission; successor full gates/CI/artifact remain unproven. |
-| Root/module normal tests, full race and both vet | Actual immutable1e each owning suite/vet once exit0:normal root2 tested/3 no-test,module25 tested; separate race root306 positive leaves/1 SKIP,module2033/4 SKIP,0 failed/races. Aggregate27 tested/3 no-test,2339 positive race leaves/5 named SKIP. `P/final1e45-linux/{proof-result.json,commands.json}` retains commands/names/reasons; historical26f2333/5 separate. Portable91 scoped RED/GREEN/race+9 guards/460 excluded/input equality is not fresh full91. |
+| Final integrated source SHA / remote convergence | Root committed/pushed74 including causal daemon/fallback repairs;actual74 Linux gates/artifact above are integrated,not inferred315 overlays. Separate accepted fixture-only74+2b8ffa race4/4 preserves460 otherfiles/production/proofscripts. Fixture and sixdocs need root hash admission/atomic integration,nextCI/readback;not yet successor fullCI/nativeMac/Windows critical PASS. |
+| Root/module normal tests, full race and both vet | Actual immutable74 root2 tested/3 no-test+module25 tested normal commands and both vets each once exit0. No local full-race duplicate;CI owns it and actual74 aggregate is RED Mac/Windows canceled. Historical1e race2339 positive leaves/5 namedSKIP retains its exact scope,not74 full-race denominator. |
 | Historical1e CI / portable fixture cause |26f all5 SUCCESS retained. [Exact1e CI37229280285](https://github.com/thebtf/mcp-mux/actions/runs/37229280285) FAILED: coverage/Ubuntu/BSD PASS; macOS daemon/Windows component FAIL in `TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed`, line924, `actual snapshot unexpectedly preserved the optional admitted environment`. Windows job CANCELED after component failure, not job FAIL. SOURCE cause: four-assertion guard/raw-canonical CWD aliases/AddCwd now2 roots (Darwin `/var`→`/private/var`, Windows case normalization), not Env retention; earlier inference superseded. admitOwner/PreRegister leave owner.Env unchanged,snapshot follows elected launch/fallback only nil. Fixture-only91 correction has scoped Linux RED/GREEN/race,no production/new deadline/OS skip; old924 failure absent in laterc18 CI,whose distinct callback failure remains below. Exact344 CI SUCCESS is separate evidence, not a retroactive1e PASS; old error verbatim. |
 | Historicalc18 CI / hosted execution not reached | Exactc18 [CI37234225216](https://github.com/thebtf/mcp-mux/actions/runs/37234225216) FAILED: macOS `TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn/0/short_drain`, line231, `actual callback reservations were not counted`,0.02s leaf (actual artifact1319 readback). SOURCE fixture order: opening response flush precedes deferred Pending decrement, reply receipt does not join cleanup; two entered callbacks may coexist with opening reservation. !=2 guard logged no value;3 is SOURCE-possible, NOT observed CI3/no Mac-specific cause. Old restore924 failure absent. Windows daemon127.325s/Ubuntu daemon101.865s component PASS but JOBS CANCELED before hosted opt-in steps; BSD/coverage PASS. Atc18 no Windows Scenario11/artifact/PASS/aggregate GREEN or unchanged-failure confirmation. Exact344 CI and hosted execution above supersede the pending gate, not this historical failure. |
 | Accepted callback fixture correction | Only `muxcore/daemon/maintenance_session_handler_test.go`, SHA256 `a93c3b6c43cf0a7b01f1ed000c64b22942856a0a75887d8c2bf9c17d24aa33c9`, committed/pushed344 after root accepted `P/callback-retirement-fixture-native-linux/proof-result.json`, SHA256 `abe93e7f18a94d56004e035087f40fe2550d068c5601ea79698329dda67a3e51`. Immutablec18+ONLYa93, one invocation race8/8 original subtests,0 SKIP/errors/warnings/stderr. Actual callback returns/generation/clocks/positive-grace hold noncompletion/original IDs/BLOCKED/Done/resume refusal/same-pipe successor retained; structured callbacks are not an extra SubprocessTreeDone case.110 selected production and broader production/proof11 byte-equal1e. Live excluded unchanged-equality REFUSED4 concurrent doc paths, expected independent writer; no WIP imported/staging claim. Root must use final doc hashes, not old exclusion manifests. No prod/schema/helper-clock/deadline/OS skip/fresh344 Linux full/release inference from this focused receipt; opening reservation3 remains SOURCE-possible, not observed CI count. Actual344 CI/Windows proof is separately recorded above. |
-| Version-baked artifact / Scenario11 and R1 | Actual1e clean CGO0/trimpath binary SHA256 `1916d48364cae2d67d8913f72e7b922570a85e3ef183344495b978643e78747d`, owner0.31.0 in23 rows, runs Scenario11 1191/1191 same binary. Separate unchanged R1 binary `9be85251daf2258c2bb50c652c0f85ad6759c5552bedbf15f0a59c58ed3173c9`, CGO1/non-trimpath/unstamped, passes100/100+8/8 and reports1e45a13f, not0.31.0. Historical26f R1 version UNKNOWN retained, no new ELF probe. Portable91 production/proof11 equality supports bounded reuse, not fresh344 Linux full/artifact commands or delivery. Separate exact344 Windows binary/Scenario11 1158 proof and hashes are above. |
-| Native disposition / final PR enumeration | Historical31-thread closure remains distinct. Fresh exact344 `artifact://1349`:33 total,31 resolved,2 unresolved,hasNextPage=false; daemon `PRRT_kwDORq0kOM6o151B`/4179066572 and fallback `PRRT_kwDORq0kOM6o2zUi`/4179436225. Root accepts scoped daemon and fallback proof; daemon ae21825 committed. Neither acceptance nor commit proves remote resolution. Successor critical workflow runtime/full gates/artifact remain pending,no all33-resolved/merge-ready/final acceptance inference. |
+| Version-baked artifact / Scenario11 and R1 | Actual74 clean CGO0/trimpath release-equivalent binary07ef0ebd gives Scenario11 1191/1191+23 owner0.31.0 rows. Separate unstamped CGO1/nontrimpath R1 binary70b5b142/version74d5293c gives100+8 PASS,not release-version parity. Full hashes/commands/metadata-path failure and correction above. Historical1e/26f/344 proofs retain scopes,no delivered-artifact claim. |
+| Native disposition / final PR enumeration | Exact344 artifact1349 33total/31resolved/2pending/hasNextPagefalse remains historical. Actual replies4179716104→4179066572 and4179716099→4179436225/fullbody readback+root2 native resolutions closeall33 then-known;not fresh final-head/all-PR CLEAN. Issue135 milestone5985521449 posted/readback,not delivery. |
 | Optional local Windows public proof | Parent grant-recheck SHA256 `6609fa5c07f91e02ed31a2dffce65d9151cbcd345a1ed90b74dc05f7259a0ba5` retains complete active-profile/all3 records: no mcp-mux grant. Additional `P/windows-proof-grant-bootstrap-recheck.json`, SHA256 `e781288faec760ef690f1adb6f1b4ef2b47e81abd37043aba1d5974678552548`, finds approved target absent; owning guard requires existing non-reparse identity. Optional local re-entry: CREATE exact already-approved `C:/Users/btf/AppData/Local/mcp-mux-verification-01a0fb9a`, `/writable-root add C:/Users/btf/AppData/Local/mcp-mux-verification-01a0fb9a`, then `/writable-root status`; confirm canonical target/origin=profile-state/project=D:/Dev/mcp-mux/expiry/writers. No new task approval/profile ACL mutation/OMP restart/outside probe. Holds only optional local creation/use, not global release; Linux/ordinary CI is not that private journey. |
-| Selected hosted Windows public proof | Exact344 CI37236880161 all5 SUCCESS; Windows job111537660496's selected opt-in/checkout/Scenario11/retention steps SUCCESS. Artifact11315977986 downloaded; build/JSON PASS and full hashes above bind source/pr-head/clone344, clean CGO0/trimpath binary, owner0.31.0 in23 observations,exit0/1158 of1158 checks/0 cleanup errors. Static45d062/versioned label unchanged; exact event head/private LOCALAPPDATA PRIMARY LF/no-hardlinks clone/`.agent/tmp`/existing smoke/redacted two-file upload. Windows premerge proof closed; c18 cancellation retained. Final doc-hash admission/current review disposition/source-plus-docs acceptance and delivery remain root-owned; optional local grant is not a global hold. |
+| Selected hosted Windows public proof | Historical exact344 CI37236880161 all5 SUCCESS/job111537660496/artifact11315977986/raw build+JSON1158/1158/owner0.31.0 retains full hashes above. After later production repairs,actual74 Windows job111553752609 canceled before public/critical steps. Extended bfabb5e/5a8e5d7f STATIC proof only;root needs next integrated exact CI/Windows canonical critical+Scenario11 runtime. Optional local grant remains effect-only,no substitute/guard bypass. |
 | Integration / merge | Final accepted exact source, PR merge and default-branch authoritative-remote convergence remain unrecorded. |
 | Tags / module resolution / binary delivery | Actual `v0.31.0` and `muxcore/v0.31.0` publication, consumer-visible Go resolution and released binary readback remain pending. |
 | Delivered canary / consumers | Post-merge fresh-clone and fresh-session delivered hold/replace/resume proof, target-bound aimux/engram/other consumer handoffs/readback, `PROJECT_RELEASE_PROTOCOL_PASS` and `CONSUMER_HANDOFF_PASS` remain pending. |

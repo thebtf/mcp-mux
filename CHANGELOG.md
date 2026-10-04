@@ -297,21 +297,43 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Actual OS path errors exercise native retirement and unchanged clocks/durable
   bytes/fences/stale-entry guards; root accepts scoped behavior, not new full CI,
   artifact or release proof. Receipt/full hashes are in release evidence.
-  Fresh exact344 root enumeration artifact1349 records33 threads,31 resolved,
-  2 unresolved,hasNextPage=false: daemon P2 comment4179066572 and update-fallback
-  P1 comment4179436225. Daemon repair is committed atomically as ae21825 with its
-  two docs; scoped acceptance/commit is not remote resolution. Root now accepts
-  the focused six-file engine/cmd fallback repair on immutable315+only frozen
-  overlays. New tests with old344 production give4 causal engine RED leaves
+  Historical exact344 enumeration artifact1349 had33 threads/31 resolved/2 pending.
+  Root subsequently posted/read back replies4179716104→4179066572 and
+  4179716099→4179436225 and resolved both:all33 then-known,not fresh all-PR CLEAN.
+  Daemon ae21825 and six-file fallback74d5293 are committed; their original
+  independent focused projections remain immutable315+only respective overlays.
+  New tests with old344 production give4 causal engine RED leaves
   (both public helpers:old/uncertain endpoint,shutdown1/starts1) and cmd6 RED/
   1 known-aware-clear PASS. Final normal/race each prove engine38+cmd13 positive
   leaves,51 distinct/102 total,0 SKIP/data races/unsettled; each family runs once.
   Real same owner and same authenticated host IPC survive refusals. Retained
   engine110-byte socket setup failure is not causal RED; approved short private
   root max85-byte sockets supply actual proof. LF archive rejection is retained.
-  Full six source hashes/receipt10b290 limits are in release evidence. Critical
-  CI workflow runtime,successor full gates/artifact and remote resolutions are
-  not proven; no all33-resolved,merge-ready or final acceptance claim.
+  Full six source hashes/receipt10b290 limits are in release evidence. Actual
+  integrated74 Linux root2/module25 tested normal packages plus3 root no-test,
+  both vets once PASS; fresh CGO0/trimpath clean embedded74/owner0.31.0 binary
+  `07ef0ebd1c2597a4f032748685d265e3e87efe58939dc19acd6db475d53b3951`
+  gives Scenario11 1191/1191+23 owner0.31.0 rows. Separate CGO1/non-trimpath
+  unstamped74d5293c R1 binary gives100+8 PASS,not release-version parity.
+  Unix selected Scenario8 six named/eight terminal events PASS0FAIL/SKIP;
+  461Git blobs0mismatch/no WIP; no local full-race duplicate(CI owns).
+  Ancillary stale-BaseDir stat failure retained,current-base provenance corrected,
+  no gates repeated.0 matching processes/socket registrations/authority;3 inactive
+  identity-bound sockets retained,not deleted. Full final74 receipt/hash in release evidence.
+  [Exact74 CI37242471098](https://github.com/thebtf/mcp-mux/actions/runs/37242471098)
+  RED: Mac new4 live-host fixture cases before helper,line1110,owner socket104 bytes
+  exceeds Darwin103. Ubuntu/coverage/BSD PASS;Windows CANCELED before public steps.
+  Test-only2b8ffa short namespace filepath.Base(existingmp*base) now has actual
+  immutable74+ONLYfixture Linux race4/4 original branches PASS once,0SKIP/races/
+  errors/stderr;460 other files including production/proofscripts byte-equal.
+  Private53-byte TMP/prebound97/101 gives observed owner96/97/control100/101
+  <=Darwin103. Root accepted fixture-only source/behavior,not nativeDarwin/nextCI.
+  Receipt43ff6e49/full hash in release evidence;oldMac failure not rerun,no normal run.
+  Production/proofscripts unchanged74. Selected workflowbfabb5e/5a8e5d7f has
+  actionlint/YAML3AST STATIC PASS;canonical hosted critical runtime pending.
+  Actual issue135 milestone5985521449 posted/readback. Final source+fixture+docs/
+  next CI/critical proof,merge/tags/delivery/canary pending;native Engram issue
+  capability unmounted,effect-only,no substitute/all-PR CLEAN/release completion.
   Historical8142 proofs/failures remain scoped. No all-PR CLEAN or delivery claim.
 
 ### Rollback

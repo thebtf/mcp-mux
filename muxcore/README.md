@@ -824,6 +824,14 @@ then closed/dormant state and maintenance sequence are checked again before enqu
 `ErrInjectClosed`/`ErrInjectFull`, FIFO and suspend accounting remain unchanged.
 No new queue, goroutine, API, or held/unfinished-work replay is added.
 
+Exact-current pending retirement callbacks/current retirement timers latch
+existing `maintenanceFailed` on non-contention namespace-lock errors, including
+direct consumers without a reaper; contention/renewed-blocked retry and clocks
+are unchanged. Contacted graceful-restart transport uncertainty retains its cause
+and is terminal. Ordinary rejection fallback requires fresh validated aware/clear
+status for the SAME nonempty daemon generation; shutdown failure is terminal.
+Old read-only startup compatibility remains; no typed-refusal or fence bypass.
+
 All controlled restart/handoff/shutdown/downgrade and idle-exit paths refuse
 terminally while fences remain. `RestartWithSuccessor` and
 `ApplyUpdateAndRestart` must preserve typed refusal, never fall back to shutdown
@@ -890,10 +898,20 @@ all five jobs; its selected Windows Scenario 11 passed1158/1158 checks, exit0,
 with no cleanup errors and actual owner0.31.0 in23 observations. Source/PR-head/
 clone binding and full binary/receipt hashes are in the
 [release evidence](../specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact344-hosted-windows-proof).
-Linux full/artifact proof remains source-bound to1e, not a fresh344 full run.
-These are premerge facts, not final acceptance, publication, a fresh-session
-delivered-artifact canary or consumer handoff. Maintenance safety limits and
-the separate focused/native/R1 gates above remain unchanged.
+That Windows proof remains344-bound. Actual immutable74 Linux root/module normal
+tests and both vets PASS once (2+25 tested packages,3 root no-test),fresh clean
+CGO0/trimpath owner0.31.0 artifact gives Scenario11 1191/1191,and separate unstamped
+R1 binary gives100/100+8/8 PASS. Exact74 CI37242471098 is RED on macOS fixture
+socket length104>Darwin103; Ubuntu/coverage/BSD PASS,Windows canceled before
+selected public steps. Short-namespace fixture-only Linux race4/4 PASS once,
+0SKIP/races/errors with53-byte private TMP and observed owner96/97/control100/101
+bytes below103 is accepted;not nativeDarwin proof. Next exactCI remains pending;
+extended selected Windows canonical critical workflow has STATIC proof only.
+All33 then-known threads have parent-reported resolutions after actual replies/
+readback,not fresh all-PR CLEAN. No final acceptance,publication,fresh-session
+delivered canary or consumer handoff claim; native Engram issue capability is
+unmounted,effect-only. Full hashes/limits are in the
+[current evidence](../specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact74-integrated-linux-proof-and-ci-boundary).
 
 ## Upgrade and Restart Contract
 
