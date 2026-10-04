@@ -109,11 +109,10 @@ func TestMaintenanceMCPUnsupportedEndpoint(t *testing.T) {
 
 type maintenanceRefusingDaemon struct {
 	fakeDaemonHandler
-	refusal         error
-	legacyCalls     atomic.Int32
-	delay           time.Duration
-	requests        chan control.Request
-	restartResponse control.Response
+	refusal     error
+	legacyCalls atomic.Int32
+	delay       time.Duration
+	requests    chan control.Request
 }
 
 func (h *maintenanceRefusingDaemon) HandleRestartOwner(req control.Request) (control.Response, error) {
@@ -121,7 +120,7 @@ func (h *maintenanceRefusingDaemon) HandleRestartOwner(req control.Request) (con
 		h.requests <- req
 	}
 	time.Sleep(h.delay)
-	return h.restartResponse, h.refusal
+	return control.Response{}, h.refusal
 }
 
 func (h *maintenanceRefusingDaemon) HandleStopOwner(control.Request) (string, error) {
@@ -202,32 +201,19 @@ func TestMaintenanceMCPRestartUnsupportedWithoutDirectOwner(t *testing.T) {
 }
 
 func TestMaintenanceMCPForceRestartDefaultBudgetReceivesDelayedOutcome(t *testing.T) {
-	dir := shortBaseDir(t, "mmrpc-")
-	endpoint := serverid.DaemonControlPath(dir, "mcp-mux")
-	const sid = "exact-local-owner"
-	h := &maintenanceRefusingDaemon{
-		fakeDaemonHandler: fakeDaemonHandler{listOwnersResp: control.ListOwnersResponse{Owners: []control.OwnerInfo{{ServerID: sid, ProtocolEra: "2026-07-28"}}}},
-		delay:             5200 * time.Millisecond,
-		requests:          make(chan control.Request, 4),
-		restartResponse:   control.Response{OK: true, ServerID: "restarted-owner", ProtocolEra: "2026-07-28", IPCPath: "restarted-endpoint", Token: "reservation"},
-	}
-	srv, err := control.NewServer(endpoint, h, log.New(io.Discard, "", 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(srv.Close)
-	legacy := &maintenanceLegacyTarget{}
-	ownerControl, err := control.NewServer(serverid.ControlPath(dir, "mcp-mux", sid), legacy, log.New(io.Discard, "", 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(ownerControl.Close)
-	response, isError := invokeMaintenanceTool(t, dir, endpoint, "mux_restart", `{"server_id":"`+sid+`","force":true}`)
-	if isError || !response.OK || response.ServerID != h.restartResponse.ServerID || response.ProtocolEra != h.restartResponse.ProtocolEra {
+	f := newManagedRestartFixture(t, "2026-07-28", true)
+	endpoint, h := managedRestartEndpoint(t, f)
+	h.delay = 5200 * time.Millisecond
+	sid := f.initial.Owner.ServerID()
+	response, isError := invokeMaintenanceTool(t, f.base, endpoint, "mux_restart", `{"server_id":"`+sid+`","force":true}`)
+	restarted := <-h.replies
+	if isError || !response.OK || response.ServerID != restarted.ServerID || response.ProtocolEra != restarted.ProtocolEra {
 		t.Fatalf("delayed original restart outcome lost: response=%+v isError=%v", response, isError)
 	}
-	if len(h.requests) != 1 || h.legacyCalls.Load() != 0 || legacy.shutdowns.Load() != 0 {
-		t.Fatalf("restart duplicated or fell back: requests=%d spawns=%d shutdowns=%d", len(h.requests), h.legacyCalls.Load(), legacy.shutdowns.Load())
+	o := managedRestartConsumed(t, h, restarted)
+	managedRestartWait(t, func() bool { return o.SessionCount() == 0 && o.SessionMgr().PendingCount() == 0 }, "delayed restart left its tool reservation/session alive")
+	if len(h.requests) != 1 || h.externalSpawns.Load() != 0 || h.externalStops.Load() != 0 {
+		t.Fatal("delayed restart duplicated or fell back")
 	}
 	if req := <-h.requests; req.Cmd != "restart_owner" || req.ServerID != sid || req.DrainTimeoutMs != 0 {
 		t.Fatalf("force restart changed its selected operation: %+v", req)

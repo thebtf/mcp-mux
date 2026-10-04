@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
@@ -1072,7 +1074,69 @@ func (s *Server) toolMuxRestart(id json.RawMessage, args json.RawMessage) {
 		s.sendControlToolError(id, control.ErrMaintenanceInvalid)
 		return
 	}
+	if err := s.releaseRestartReservation(resp); err != nil {
+		s.sendControlToolError(id, err)
+		return
+	}
 	s.sendJSONToolResult(id, map[string]any{"ok": true, "server_id": resp.ServerID, "protocol_era": resp.ProtocolEra})
+}
+
+// The operator tool has no shim to consume its reservation. Send only the native
+// token line, confirm exact-current-owner consumption, then let EOF and ordinary
+// zero-session cleanup release authority. Never mint a reconnect token or MCP frame.
+func (s *Server) releaseRestartReservation(resp *control.Response) error {
+	if _, err := era.ParseProtocolEra(resp.ProtocolEra); err != nil || len(resp.Token) > 64 || strings.Trim(resp.Token, "0123456789abcdef") != "" {
+		return control.ErrMaintenanceInvalid
+	}
+	conn, err := ipc.Dial(resp.IPCPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(conn, resp.Token); err != nil {
+		return err
+	}
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return control.ErrMaintenanceInvalid
+		}
+		check, err := control.SendWithTimeout(s.daemonCtlPath(), control.Request{
+			Cmd: "can_suspend", ServerID: resp.ServerID, PrevToken: resp.Token,
+		}, remaining)
+		if err != nil {
+			return err
+		}
+		if err = check.Err(); err == nil {
+			var verdict struct {
+				Allowed *bool  `json:"allowed"`
+				Reason  string `json:"reason"`
+			}
+			if json.Unmarshal(check.Data, &verdict) != nil || verdict.Allowed == nil || (*verdict.Allowed && verdict.Reason != "") {
+				return control.ErrMaintenanceInvalid
+			}
+			// All these verdicts follow the daemon's exact bound-token/current-entry
+			// lookup. Other sessions' work and persistence must not veto this EOF.
+			if !*verdict.Allowed {
+				switch verdict.Reason {
+				case "pending_persistent", "materializing", "pending_requests", "active_progress", "busy":
+				default:
+					return control.ErrMaintenanceInvalid
+				}
+			}
+			return conn.Close()
+		}
+		// Admission commits asynchronously; only observe this same reservation.
+		// Transport, typed errors, stale-owner verdicts and old protocols are terminal.
+		if check.Message != "unknown token" || check.ErrorCode != "" || check.Maintenance != nil || time.Until(deadline) <= 10*time.Millisecond {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // --- JSON-RPC response helpers ---
