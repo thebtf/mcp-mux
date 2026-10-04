@@ -31,6 +31,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
@@ -406,7 +407,17 @@ func runServe() {
 func runStop(drainTimeout time.Duration, force bool) int {
 	// Try stopping daemon first
 	ctlPath := serverid.DaemonControlPath("", engineName)
-	if isDaemonRunning(ctlPath) {
+	pingResponse, pingErr := control.SendWithTimeout(ctlPath, control.Request{Cmd: "ping"}, daemonPingTimeout)
+	if pingErr == nil {
+		pingErr = pingResponse.Err()
+	}
+	if pingErr != nil {
+		// Only a missing or refused endpoint permits legacy fallback.
+		if !errors.Is(pingErr, os.ErrNotExist) && !errors.Is(pingErr, syscall.ECONNREFUSED) {
+			fmt.Fprintf(os.Stderr, "  daemon: error: %s\n", lifecycleErrorText(pingErr))
+			return 1
+		}
+	} else {
 		fmt.Fprintln(os.Stderr, "Stopping daemon...")
 		drainMs := int(drainTimeout.Milliseconds())
 		if force {

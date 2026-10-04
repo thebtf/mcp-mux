@@ -134,12 +134,50 @@ func (h *stopOutcomeHandler) HandleShutdownWithError(drainMs int) (string, error
 	return "fixture shutdown accepted", h.err
 }
 
+func startStopPingEndpoint(t *testing.T, dir, response string, release <-chan struct{}) <-chan string {
+	t.Helper()
+	endpoint, err := ipc.Listen(serverid.DaemonControlPath(dir, engineName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := make(chan string, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := endpoint.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+			request, _ := bufio.NewReader(conn).ReadString('\n')
+			if request != "" {
+				requests <- request
+				if release != nil {
+					<-release
+				}
+				_, _ = io.WriteString(conn, response)
+			}
+			conn.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		endpoint.Close()
+		<-done
+	})
+	return requests
+}
+
 func TestRunStopDaemonOutcome(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		delayed       bool
 		force         bool
 		absent        bool
+		stale         bool
+		pingFailure   bool
+		pingDelayed   bool
+		pingResponse  string
 		refusal       error
 		wantErrorText string
 	}{
@@ -149,8 +187,18 @@ func TestRunStopDaemonOutcome(t *testing.T) {
 		{name: "held", force: true, refusal: control.ErrMaintenanceHeld, wantErrorText: "maintenance_held: upstream held for update"},
 		{name: "retirement-blocked", refusal: control.ErrMaintenanceRetirementBlocked, wantErrorText: "maintenance_retirement_blocked: maintenance retirement blocked"},
 		{name: "invalid-response", refusal: control.ErrMaintenanceInvalid, wantErrorText: "maintenance_invalid: invalid maintenance request or response"},
+		{name: "ping-nonOK", pingFailure: true, pingResponse: "{\"ok\":false,\"message\":\"ping outcome unavailable\"}\n", wantErrorText: "ping outcome unavailable"},
+		{name: "ping-held", pingFailure: true, force: true, pingResponse: "{\"ok\":false,\"error_code\":\"maintenance_held\"}\n", wantErrorText: "maintenance_held: upstream held for update"},
+		{name: "ping-retirement-blocked", pingFailure: true, pingResponse: "{\"ok\":false,\"error_code\":\"maintenance_retirement_blocked\"}\n", wantErrorText: "maintenance_retirement_blocked: maintenance retirement blocked"},
+		{name: "ping-malformed", pingFailure: true, pingResponse: "not-json\n", wantErrorText: "control: read response:"},
+		{name: "ping-empty-response", pingFailure: true, pingResponse: "{}\n", wantErrorText: "control request failed"},
+		{name: "ping-invalid-typed-response", pingFailure: true, pingResponse: "{\"ok\":true,\"error_code\":\"maintenance_held\"}\n", wantErrorText: "maintenance_invalid: invalid maintenance request or response"},
+		{name: "ping-read-deadline", pingFailure: true, pingDelayed: true, wantErrorText: "control: read response:"},
+		{name: "ping-force-read-deadline", pingFailure: true, pingDelayed: true, force: true, wantErrorText: "control: read response:"},
+		{name: "ping-eof", pingFailure: true, wantErrorText: "control: read response: EOF"},
 		{name: "success"},
 		{name: "absent-daemon", absent: true},
+		{name: "stale-daemon-endpoint", absent: true, stale: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := shortTempDir(t, "stop-outcome")
@@ -165,8 +213,20 @@ func TestRunStopDaemonOutcome(t *testing.T) {
 				// Release only after observing the command's original outcome.
 				defer close(release)
 			}
-			if !tc.absent {
+			var pingRequests <-chan string
+			if tc.pingFailure {
+				var release chan struct{}
+				if tc.pingDelayed {
+					release = make(chan struct{})
+					defer close(release)
+				}
+				pingRequests = startStopPingEndpoint(t, dir, tc.pingResponse, release)
+			} else if !tc.absent {
 				startFakeDaemon(t, dir, daemon)
+			} else if tc.stale {
+				if err := os.WriteFile(serverid.DaemonControlPath(dir, engineName), []byte("private stale daemon endpoint"), 0o600); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			owner := &stopOutcomeHandler{calls: make(chan int, 2)}
@@ -231,7 +291,16 @@ func TestRunStopDaemonOutcome(t *testing.T) {
 			}
 			output, commandErr := command.CombinedOutput()
 			text := string(output)
-			if !tc.absent {
+			if tc.pingFailure {
+				if len(pingRequests) != 1 {
+					t.Errorf("daemon preflight calls = %d, want exactly one; output=%q", len(pingRequests), text)
+				} else if request := <-pingRequests; request != "{\"cmd\":\"ping\"}\n" {
+					t.Errorf("daemon preflight frame = %q, want only ping", request)
+				}
+				if len(daemon.calls) != 0 || strings.Contains(text, "Stopping daemon...\n") {
+					t.Errorf("failed preflight reached daemon shutdown: calls=%d output=%q", len(daemon.calls), text)
+				}
+			} else if !tc.absent {
 				if len(daemon.calls) != 1 {
 					t.Errorf("daemon shutdown calls = %d, want exactly one; output=%q", len(daemon.calls), text)
 				} else if got := <-daemon.calls; got != wantDrainMs {
