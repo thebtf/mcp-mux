@@ -869,3 +869,88 @@ func TestMaintenanceCompetingHoldPreservesRetiredTargetLease(t *testing.T) {
 		t.Fatalf("released target retained stale conflict authority: %v", err)
 	}
 }
+
+func TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed(t *testing.T) {
+	t.Setenv("SERVICE_CONFIG_PATH", "")
+	if err := os.Unsetenv("SERVICE_CONFIG_PATH"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(snapshotRestartEnv, "")
+	t.Setenv("MCPMUX_HANDOFF_TOKEN_PATH", "")
+	t.Setenv("MCPMUX_HANDOFF_SOCKET", "")
+	d := maintenanceDaemon(t)
+	req, _, _, _ := maintenanceHelperRequest(t)
+	req.Mode = "global"
+	template := daemonMaterializationSnapshot(false)
+	template.Env = mergeEnv(req.Env)
+	d.updateTemplate(req.Command, req.Args, template)
+	_, sid, firstToken, err := d.Spawn(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	optional := req
+	optional.Env = cloneSnapshotStringMap(req.Env)
+	optional.Env["SERVICE_CONFIG_PATH"] = filepath.Join(req.Cwd, "service.json")
+	_, sharedSID, secondToken, err := d.Spawn(optional)
+	if err != nil || sharedSID != sid || firstToken == secondToken {
+		t.Fatalf("actual optional environment did not share the same-CWD owner: %q %q %v", sid, sharedSID, err)
+	}
+	original := d.Entry(sid)
+	if !original.Owner.SessionMgr().IsPreRegistered(firstToken) || !original.Owner.SessionMgr().IsPreRegistered(secondToken) {
+		t.Fatal("fixture did not retain both admitted, unconsumed tokens")
+	}
+	// Pending admission already records both maintenance contexts, but neither
+	// token has reconnect history. No clock or synthetic snapshot mutation is
+	// needed to reach the same payload loss as expired disconnected history.
+	path, err := d.SerializeSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot DaemonSnapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Owners) != 1 || len(snapshot.Sessions) != 0 {
+		t.Fatal("fixture did not serialize exactly one owner before token consumption")
+	}
+	observed := snapshot.Owners[0]
+	_, carriesOptionalEnv := observed.Env["SERVICE_CONFIG_PATH"]
+	if observed.ServerID != sid || len(observed.CwdSet) != 1 || len(observed.BoundTokens) != 0 || carriesOptionalEnv {
+		t.Fatal("actual snapshot unexpectedly preserved the optional admitted environment")
+	}
+	removed, err := d.removeOwnerIfCurrent(sid, original, ownerRemovalReasonRestoreFailed, false)
+	if err != nil || !removed.Removed {
+		t.Fatalf("predecessor retirement was not proven: %+v %v", removed, err)
+	}
+	if count := d.loadSnapshot(); count != 1 {
+		t.Fatalf("ordinary snapshot restore without an active lease was refused: %d", count)
+	}
+	restored := d.Entry(sid)
+	if restored == nil || restored == original || restored.Owner == nil {
+		t.Fatal("snapshot did not register a successor owner")
+	}
+	identity := captureOwnerEntryIdentity(restored)
+	pid := 0
+	waitForDaemonCondition(t, 5*time.Second, func() bool {
+		pid, _ = restored.Owner.Status()["upstream_pid"].(int)
+		return daemonTestProcessAlive(pid)
+	}, "ordinary restored upstream did not materialize")
+	result, holdErr := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(600000)})
+	// Exercise forgotten-context demand even on the unsafe original: accepting
+	// the hold retires the owner and this distinct environment escapes its fence.
+	_, demandedSID, freshToken, spawnErr := d.Spawn(optional)
+	if !errors.Is(holdErr, control.ErrMaintenanceInvalid) || result.State == control.MaintenanceHeld || result.TreesRetired {
+		t.Fatalf("incomplete restored scope granted replacement: hold=%+v err=%v forgotten-context spawn=%v predecessor_retired=%t", result, holdErr, spawnErr, restored.Owner.MaintenanceRetired())
+	}
+	if spawnErr != nil || demandedSID != sid || freshToken == "" || d.Entry(sid) != restored || !identity.matches(restored) {
+		t.Fatalf("refused hold changed exact successor admission authority: %q %v", demandedSID, spawnErr)
+	}
+	if len(d.maintenanceResults()) != 0 || restored.Owner.MaintenanceRetired() || !daemonTestProcessAlive(pid) {
+		t.Fatal("refused hold published a fence or retired the restored process authority")
+	}
+}
