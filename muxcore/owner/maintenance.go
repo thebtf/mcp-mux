@@ -57,12 +57,50 @@ func (o *Owner) reserveNativeWork() bool {
 	return true
 }
 
-// Callback-capable readers remain in sessions through teardown. Callback work
-// retains its reservation until actual return, not a verdict timeout. Disconnect
-// reserves under mu before unlinking, so this snapshot cannot miss a producer.
+// waitForAcceptLoop joins only closed admission within the caller's remaining
+// retirement budget. Active callbacks retain blocked authority without waiting
+// for an uncooperative user body; listener closure is not producer completion.
+func (o *Owner) waitForAcceptLoop(deadline time.Time) {
+	o.mu.RLock()
+	done := o.acceptDone
+	o.mu.RUnlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	default:
+	}
+	select {
+	case <-o.listenerDone:
+	default:
+		return
+	}
+	if o.nativeWork.Load() != 0 || !time.Now().Before(deadline) {
+		return
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+// Every reader remains in sessions through teardown. Callback and reader
+// cleanup reservations last through actual return. Accept completion is separate
+// from active-work drain: an open idle listener is not a pending request.
 func (o *Owner) nativeQuiescent() bool {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+	if o.acceptDone != nil {
+		select {
+		case <-o.acceptDone:
+		default:
+			return false
+		}
+	}
 	return o.nativeAdmissionClosed() && len(o.sessions) == 0 && o.nativeWork.Load() == 0 && o.PendingRequests() == 0
 }
 

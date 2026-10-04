@@ -181,7 +181,7 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 	// staged above; no legacy proactive initialize/tools refresh is permitted.
 	go o.readUpstream(proc)
 
-	go o.acceptLoop()
+	o.startAcceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 
 	// Monitor upstream exit. Attached processes are NOT managed by suture

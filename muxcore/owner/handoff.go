@@ -3,6 +3,7 @@ package owner
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
@@ -68,8 +69,8 @@ func (o *Owner) HasHandoffUpstream() bool {
 }
 
 // teardownExceptUpstream closes the control server, IPC listener, and all
-// active sessions. It is the shared first-half of both Shutdown and
-// ShutdownForHandoff. Safe to call with an already-empty sessions map.
+// active sessions. Readers retain their entries until actual deferred removal;
+// closing a transport does not prove its producer has returned.
 // closeListenerOnce ensures the listener is closed at most once.
 func (o *Owner) teardownExceptUpstream() {
 	o.teardownOnce.Do(func() {
@@ -84,9 +85,6 @@ func (o *Owner) teardownExceptUpstream() {
 		o.mu.Lock()
 		for _, s := range o.sessions {
 			s.Close()
-		}
-		if o.sessionHandler == nil && o.authorizeSession == nil && o.onFrameReceived == nil {
-			o.sessions = make(map[int]*Session)
 		}
 		o.mu.Unlock()
 
@@ -223,6 +221,7 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 	}
 	o.removalMu.Lock()
 	defer o.removalMu.Unlock()
+	finalizationDeadline := time.Now().Add(materializationFinalizeTimeout)
 	select {
 	case <-o.done:
 		return HandoffPayload{}, ErrAlreadyShutDown
@@ -241,6 +240,7 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 			closeErr = up.Close()
 			proven = up.RetirementProven()
 		}
+		o.waitForAcceptLoop(finalizationDeadline)
 		proven = proven && o.nativeQuiescent()
 		retErr := errors.Join(fmt.Errorf("owner: quiesce materialization for handoff: %w", err), closeErr)
 		o.recordFailedHandoffTransition(up, retErr, proven)
@@ -252,6 +252,7 @@ func (o *Owner) ShutdownForHandoff() (HandoffPayload, error) {
 
 	up := o.beginHandoffTransition()
 	o.teardownExceptUpstream()
+	o.waitForAcceptLoop(finalizationDeadline)
 	if !o.nativeQuiescent() {
 		o.recordFailedHandoffTransition(up, errFinalizationUnproven, false)
 		return HandoffPayload{}, errFinalizationUnproven

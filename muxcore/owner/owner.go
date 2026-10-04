@@ -258,7 +258,9 @@ type Owner struct {
 	isAccepting             atomic.Bool
 	admissionFrozen         atomic.Bool
 	pendingAdmissionsPurged atomic.Int64
-	listenerDone            chan struct{} // closed when IPC listener is intentionally stopped
+	listenerDone            chan struct{}  // closed when IPC listener is intentionally stopped
+	acceptDone              chan struct{}  // published under mu before launch; closed only by the accept producer
+	sessionReaders          sync.WaitGroup // actual launched readers only; never part of request grace/drain
 	done                    chan struct{}
 
 	restartPins atomic.Int64
@@ -546,7 +548,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	}
 
 	// Start accepting IPC connections (sessions get cached replay immediately)
-	go o.acceptLoop()
+	o.startAcceptLoop()
 
 	// Start synthetic progress reporter
 	go o.runProgressReporter(doneContext(o.done))
@@ -711,7 +713,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		}
 	}
 
-	go o.acceptLoop()
+	o.startAcceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 	return o, nil
 }
@@ -923,14 +925,26 @@ func (o *Owner) startRegisteredSession(s *Session) {
 	if !o.isModern() {
 		o.sendRootsListChanged()
 	}
+	o.admissionMu.Lock()
+	select {
+	case <-o.listenerDone:
+		o.admissionMu.Unlock()
+		s.Close()
+		o.removeSession(s)
+		return
+	default:
+	}
+	o.sessionReaders.Add(1)
 	go o.readSession(s)
+	o.admissionMu.Unlock()
 }
 
 // readSession reads messages from a session and forwards them to the upstream.
 func (o *Owner) readSession(s *Session) {
+	defer o.sessionReaders.Done()
 	defer func() {
-		o.removeSession(s)
 		s.Close()
+		o.removeSession(s)
 	}()
 
 	for {
@@ -2143,6 +2157,28 @@ func (o *Owner) removeSession(s *Session) {
 	}
 }
 
+// startAcceptLoop reserves producer completion before launch. A constructor
+// that fails before this point has no accept producer to join.
+func (o *Owner) startAcceptLoop() {
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.nativeAdmissionClosed() || o.acceptDone != nil {
+		return
+	}
+	done := make(chan struct{})
+	o.acceptDone = done
+	o.isAccepting.Store(true)
+	go func() {
+		defer close(done)
+		o.acceptLoop()
+		// No reader reservation may start once the sole admission producer ends.
+		o.closeListener()
+		o.sessionReaders.Wait()
+	}()
+}
+
 // acceptLoop accepts new IPC connections and creates sessions for them.
 //
 // If listener.Close() is called WITHOUT closing listenerDone, Accept() returns
@@ -2151,7 +2187,6 @@ func (o *Owner) removeSession(s *Session) {
 // Now we detect the "closed" error class and exit cleanly; other errors get a
 // small backoff to prevent CPU saturation.
 func (o *Owner) acceptLoop() {
-	o.isAccepting.Store(true)
 	defer o.isAccepting.Store(false)
 
 	for {
@@ -2775,6 +2810,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	if timeout <= 0 {
 		timeout = materializationFinalizeTimeout
 	}
+	finalizationDeadline := time.Now().Add(timeout)
 
 	o.stopMaterialization()
 	if o.maintenance.Load() != nil {
@@ -2840,6 +2876,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 			return exitCode, false, fmt.Errorf("owner finalization: materialization did not settle after %s", timeout)
 		}
 	}
+	o.waitForAcceptLoop(finalizationDeadline)
 	proofErr := error(nil)
 	proven := proc == nil || proc.RetirementProven()
 	if o.maintenance.Load() != nil && proc != nil {
