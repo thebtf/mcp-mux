@@ -237,7 +237,7 @@ type Owner struct {
 	inflightTracker         sync.Map          // remapped request ID (string) -> *InflightRequest
 	timedOutIDs             sync.Map          // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests         atomic.Int64
-	nativeWork              atomic.Int64  // non-request callbacks and authorization admission producers; never part of PendingRequests
+	nativeWork              atomic.Int64  // non-request callbacks and session admission producers; never part of PendingRequests
 	drainTimeout            time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs           atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
 	idleTimeoutNs           atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
@@ -870,26 +870,19 @@ func extractToolName(raw []byte) string {
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
-	native := o.sessionHandler != nil || o.authorizeSession != nil
-	if native {
-		o.lockRequestAdmission()
-	}
+	o.lockRequestAdmission()
 	o.admissionMu.Lock()
-	if native && o.nativeAdmissionClosed() {
+	if o.nativeAdmissionClosed() {
 		o.admissionMu.Unlock()
 		o.unlockRequestAdmission()
 		s.Close()
 		return
 	}
-	if o.authorizeSession != nil {
-		o.nativeWork.Add(1)
-		defer o.nativeWork.Add(-1)
-	}
+	o.nativeWork.Add(1)
+	defer o.nativeWork.Add(-1)
 	o.addSessionLocked(s)
 	o.admissionMu.Unlock()
-	if native {
-		o.unlockRequestAdmission()
-	}
+	o.unlockRequestAdmission()
 	o.startRegisteredSession(s)
 }
 
@@ -2319,12 +2312,9 @@ func (o *Owner) acceptLoop() {
 				o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
 			}
 
-			trackedAdmission := o.sessionHandler != nil || o.authorizeSession != nil
-			if trackedAdmission {
-				o.lockRequestAdmission()
-			}
+			o.lockRequestAdmission()
 			o.admissionMu.Lock()
-			if trackedAdmission && o.nativeAdmissionClosed() {
+			if o.nativeAdmissionClosed() {
 				o.admissionMu.Unlock()
 				o.unlockRequestAdmission()
 				o.revokePendingAdmission(token)
@@ -2334,9 +2324,7 @@ func (o *Owner) acceptLoop() {
 			select {
 			case <-o.done:
 				o.admissionMu.Unlock()
-				if trackedAdmission {
-					o.unlockRequestAdmission()
-				}
+				o.unlockRequestAdmission()
 				o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
 				o.revokePendingAdmission(token)
 				s.Close()
@@ -2345,9 +2333,7 @@ func (o *Owner) acceptLoop() {
 			}
 			if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
 				o.admissionMu.Unlock()
-				if trackedAdmission {
-					o.unlockRequestAdmission()
-				}
+				o.unlockRequestAdmission()
 				peerPID := readPeerPID(conn)
 				o.rejectionLogger.Log(o.logger, peerPID)
 				s.Close()
@@ -2355,9 +2341,7 @@ func (o *Owner) acceptLoop() {
 			}
 			o.addSessionLocked(s)
 			o.admissionMu.Unlock()
-			if trackedAdmission {
-				o.unlockRequestAdmission()
-			}
+			o.unlockRequestAdmission()
 			o.startRegisteredSession(s)
 		}()
 	}
@@ -2447,7 +2431,7 @@ func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameA
 	if o.onFrameReceived == nil {
 		return muxcore.FramePass
 	}
-	if o.sessionHandler != nil && !o.reserveNativeWork() {
+	if !o.reserveNativeWork() {
 		return muxcore.FramePass
 	}
 	sid := strconv.Itoa(s.ID)
@@ -2456,9 +2440,7 @@ func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameA
 
 	done := make(chan muxcore.FrameAction, 1) // buffered so a late return never blocks the goroutine
 	go func() {
-		if o.sessionHandler != nil {
-			defer o.nativeWork.Add(-1)
-		}
+		defer o.nativeWork.Add(-1)
 		defer func() {
 			if r := recover(); r != nil {
 				o.logger.Printf("frame_hook_panic sid=%s method=%s recovered=%v", sid, method, r)
@@ -2767,7 +2749,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	defer o.removalMu.Unlock()
 	select {
 	case <-o.done:
-		if (o.sessionHandler != nil || o.authorizeSession != nil) && !o.nativeQuiescent() {
+		if !o.nativeQuiescent() {
 			o.materializationMu.Lock()
 			o.materializationState = MaterializationFinalizeBlocked
 			o.materializationBlockedErr = errFinalizationUnproven
@@ -2870,9 +2852,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	if o.maintenance.Load() != nil && proc != nil {
 		proven = proven && proc.TreesDead()
 	}
-	if o.sessionHandler != nil || o.authorizeSession != nil {
-		proven = proven && o.nativeQuiescent()
-	}
+	proven = proven && o.nativeQuiescent()
 	if !proven {
 		if proofErr == nil {
 			proofErr = errFinalizationUnproven

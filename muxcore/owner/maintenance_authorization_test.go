@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -310,5 +311,100 @@ func TestMaintenanceAuthorizationHandoffRetainsProducer(t *testing.T) {
 				t.Fatalf("existing finalizer could not settle refused handoff: proven=%t err=%v", proven, err)
 			}
 		})
+	}
+}
+
+func TestMaintenanceFrameHookRetainsAuthorityAllOwnerModes(t *testing.T) {
+	for _, mode := range []string{"subprocess", "handler_func"} {
+		for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+			for _, held := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/era_%d/held_%t", mode, protocol, held), func(t *testing.T) {
+					o, gate, logs := maintenanceAuthorizationOwner(t, mode, protocol, true, nil)
+					entered, release := make(chan struct{}), make(chan struct{})
+					var releaseOnce sync.Once
+					var calls atomic.Int32
+					o.onFrameReceived = func(_ string, _ int, _ string) muxcore.FrameAction {
+						if calls.Add(1) == 1 {
+							close(entered)
+						}
+						<-release
+						return muxcore.FrameError
+					}
+					t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+					conn := maintenanceAuthorizationConnect(t, o, true)
+					raw := `{"jsonrpc":"2.0","id":701,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+					if _, err := fmt.Fprintln(conn, raw); err != nil {
+						t.Fatal(err)
+					}
+					select {
+					case <-entered:
+					case <-time.After(time.Second):
+						t.Fatal("real session reader did not enter frame callback")
+					}
+					response := readDenyResponse(t, conn, 2*time.Second)
+					if !strings.Contains(response, `"id":701`) || strings.Contains(response, `"error"`) || !strings.Contains(logs.String(), "frame_hook_timeout") {
+						t.Fatalf("reader did not pass the actual 1ms hook timeout: %s", response)
+					}
+					waitForCondition(t, time.Second, func() bool { return o.PendingRequests() == 0 }, "frame callback polluted request accounting")
+					var session *Session
+					o.mu.RLock()
+					for _, current := range o.sessions {
+						session = current
+					}
+					o.mu.RUnlock()
+					if session == nil {
+						t.Fatal("frame callback lost its real reader session")
+					}
+					// Freeze the existing reader's removal producer, not the callback.
+					// Retirement must join both after the hook verdict has timed out.
+					o.launchContextMu.Lock()
+					var unlockOnce sync.Once
+					unlock := func() { unlockOnce.Do(o.launchContextMu.Unlock) }
+					defer unlock()
+					if held {
+						gate.Lock()
+						o.SetMaintenance(&control.MaintenanceResult{State: control.MaintenanceHolding, DrainDeadline: time.Now()})
+						gate.Unlock()
+					}
+					maintenanceNativeBlocked(t, o)
+					if o.nativeWork.Load() != 1 || o.SessionCount() != 1 {
+						t.Fatal("timed-out callback or retained reader escaped retirement accounting")
+					}
+					releaseOnce.Do(func() { close(release) })
+					waitForCondition(t, time.Second, func() bool { return o.nativeWork.Load() == 0 }, "actual frame callback return did not settle work")
+					maintenanceNativeBlocked(t, o)
+					unlock()
+					waitForCondition(t, time.Second, func() bool { return o.SessionCount() == 0 }, "reader did not settle after callback return")
+					if _, proven, err := o.FinalizeForRemoval(false, time.Second); !proven || err != nil || !o.MaintenanceRetired() {
+						t.Fatalf("settled frame/reader producers could not finalize: proven=%t err=%v", proven, err)
+					}
+					o.SetMaintenance(nil)
+					if action := o.invokeFrameHook(session, parseMessage([]byte(raw))); action != muxcore.FramePass || calls.Load() != 1 || o.nativeWork.Load() != 0 {
+						t.Fatal("closed producer admission scheduled a late frame hook after quiescence")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMaintenanceFrameHookNilPreservesOrdinaryRetirementAllOwnerModes(t *testing.T) {
+	for _, mode := range []string{"subprocess", "handler_func"} {
+		for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+			t.Run(fmt.Sprintf("%s/era_%d", mode, protocol), func(t *testing.T) {
+				o, _, _ := maintenanceAuthorizationOwner(t, mode, protocol, true, nil)
+				conn := maintenanceAuthorizationConnect(t, o, true)
+				if _, err := fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":702,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`); err != nil {
+					t.Fatal(err)
+				}
+				if response := readDenyResponse(t, conn, time.Second); !strings.Contains(response, `"id":702`) || strings.Contains(response, `"error"`) {
+					t.Fatalf("nil-hook ordinary dispatch changed: %s", response)
+				}
+				waitForCondition(t, time.Second, func() bool { return o.PendingRequests() == 0 && o.nativeWork.Load() == 0 }, "nil-hook ordinary work did not settle")
+				if _, proven, err := o.FinalizeForRemoval(false, time.Second); !proven || err != nil || !o.MaintenanceRetired() {
+					t.Fatalf("nil-hook ordinary owner gained a retirement deadlock: proven=%t err=%v", proven, err)
+				}
+			})
+		}
 	}
 }

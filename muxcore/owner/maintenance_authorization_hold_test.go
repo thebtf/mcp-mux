@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,15 @@ import (
 )
 
 func TestMaintenanceAuthorizationHoldRetainsAuthorityAllOwnerModes(t *testing.T) {
+	maintenanceLocalCallbackHold(t, false)
+}
+
+func TestMaintenanceFrameHookHoldRetainsAuthorityAllOwnerModes(t *testing.T) {
+	maintenanceLocalCallbackHold(t, true)
+}
+
+func maintenanceLocalCallbackHold(t *testing.T, frameHook bool) {
+	t.Helper()
 	for _, mode := range []string{"subprocess", "handler_func"} {
 		for _, protocol := range []string{"", "2026-07-28"} {
 			for _, completes := range []bool{false, true} {
@@ -46,11 +56,19 @@ func TestMaintenanceAuthorizationHoldRetainsAuthorityAllOwnerModes(t *testing.T)
 					var releaseOnce sync.Once
 					cfg := daemon.Config{
 						ControlPath: path, Namespace: filepath.Base(path), SkipSnapshot: true, Logger: log.New(io.Discard, "", 0),
-						AuthorizeSession: func(ctx context.Context, _ muxcore.ConnInfo, _ muxcore.ProjectContext) muxcore.SessionAuth {
+					}
+					if frameHook {
+						cfg.OnFrameReceived = func(_ string, _ int, _ string) muxcore.FrameAction {
+							entered <- context.Background()
+							<-release
+							return muxcore.FrameError
+						}
+					} else {
+						cfg.AuthorizeSession = func(ctx context.Context, _ muxcore.ConnInfo, _ muxcore.ProjectContext) muxcore.SessionAuth {
 							entered <- ctx
 							<-release
 							return muxcore.SessionAuth{Decision: muxcore.AuthAllow}
-						},
+						}
 					}
 					if mode == "handler_func" {
 						cfg.HandlerFunc = func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
@@ -123,10 +141,23 @@ func TestMaintenanceAuthorizationHoldRetainsAuthorityAllOwnerModes(t *testing.T)
 					if _, err := fmt.Fprintln(conn, token); err != nil {
 						t.Fatal(err)
 					}
+					if frameHook {
+						if _, err := fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":703,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`); err != nil {
+							t.Fatal(err)
+						}
+					}
 					select {
 					case <-entered:
 					case <-time.After(5 * time.Second):
 						t.Fatal("real IPC session did not reach authorization")
+					}
+					if frameHook {
+						_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+						scanner := bufio.NewScanner(conn)
+						if !scanner.Scan() || !strings.Contains(scanner.Text(), `"id":703`) || strings.Contains(scanner.Text(), `"error"`) {
+							t.Fatalf("real reader did not pass timed-out frame callback: %s %v", scanner.Text(), scanner.Err())
+						}
+						_ = conn.SetReadDeadline(time.Time{})
 					}
 					ttl := int64(60000)
 					request = control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: &ttl}

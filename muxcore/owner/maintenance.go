@@ -26,7 +26,7 @@ func (o *Owner) SetMaintenance(result *control.MaintenanceResult) {
 
 // MaintenanceRetired is stronger than handoff-capable owner completion.
 func (o *Owner) MaintenanceRetired() bool {
-	return o.maintenanceRetired.Load() && ((o.sessionHandler == nil && o.authorizeSession == nil) || o.nativeQuiescent())
+	return o.maintenanceRetired.Load() && o.nativeQuiescent()
 }
 
 // nativeAdmissionClosed is checked while admission is serialized with listener
@@ -57,9 +57,9 @@ func (o *Owner) reserveNativeWork() bool {
 	return true
 }
 
-// Native readers remain in sessions through teardown. Authorization retains its
-// producer reservation through registration or rejection in every owner mode.
-// Disconnect reserves under mu before unlinking, so this snapshot cannot miss work.
+// Callback-capable readers remain in sessions through teardown. Callback work
+// retains its reservation until actual return, not a verdict timeout. Disconnect
+// reserves under mu before unlinking, so this snapshot cannot miss a producer.
 func (o *Owner) nativeQuiescent() bool {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
