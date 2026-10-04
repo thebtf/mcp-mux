@@ -618,13 +618,10 @@ func startGenerationIPCServer(t *testing.T, path, generation string) *echoServer
 	srv := &echoServer{ln: ln, received: received}
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			conn, err := srv.accept()
 			if err != nil {
 				return
 			}
-			srv.mu.Lock()
-			srv.conns = append(srv.conns, conn)
-			srv.mu.Unlock()
 			go handleGenerationConn(conn, received, generation)
 		}
 	}()
@@ -669,45 +666,149 @@ func handleGenerationConn(conn net.Conn, received chan string, generation string
 }
 
 func TestReconnect_FallsBackToSpawnAfterNTransientFailures(t *testing.T) {
-	// Generic transient errors (neither unknown_token nor owner_gone) must
-	// retry up to MaxRefreshAttempts before falling back to spawn — this
-	// preserves the original retry path for transient issues like network
-	// blips or server-side temporary failures.
-	var logs bytes.Buffer
-	logger := log.New(&logs, "", 0)
-	rc := newReconnectClient(t, io.Discard, logger)
-	rc.token = "prev-token"
+	logs := &capturingLogger{}
+	defer func() { t.Logf("reconnect diagnostics:\n%s", logs.String()) }()
 
+	initialPath := tempReconnectSocketPath(t, "transient-initial")
+	startSlowEchoIPCServer(t, initialPath, func(conn net.Conn, _ string) {
+		conn.Close()
+	})
 	spawnPath := tempReconnectSocketPath(t, "abcdef123456")
-	srv, _ := startEchoIPCServer(t, spawnPath)
-	defer srv.closeAll()
+	srv := startGenerationIPCServer(t, spawnPath, "transient-successor")
 
-	stdinDone := make(chan error)
+	ccStdinR, ccStdinW := io.Pipe()
+	defer ccStdinR.Close()
+	defer ccStdinW.Close()
+	ccStdoutR, ccStdoutW := io.Pipe()
+	defer ccStdoutR.Close()
+	defer ccStdoutW.Close()
+	stdoutLines := make(chan string, 20)
+	go func() {
+		defer close(stdoutLines)
+		scanner := bufio.NewScanner(ccStdoutR)
+		for scanner.Scan() {
+			stdoutLines <- scanner.Text()
+		}
+	}()
+
+	const maxRefreshAttempts = 3
 	refreshCalls := 0
-	reconnectCalls := 0
-	rc.cfg.RefreshToken = func() (string, string, error) {
-		refreshCalls++
-		return "", "", errors.New("transient: connection refused")
-	}
-	rc.cfg.Reconnect = func() (string, string, error) {
-		reconnectCalls++
-		return spawnPath, "spawn-token", nil
+	spawnRefreshCalls := make(chan int, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunResilientClient(ResilientClientConfig{
+			Stdin:              ccStdinR,
+			Stdout:             ccStdoutW,
+			InitialIPCPath:     initialPath,
+			Token:              "prev-token",
+			ProbeGracePeriod:   time.Nanosecond,
+			ReconnectTimeout:   time.Second,
+			MaxRefreshAttempts: maxRefreshAttempts,
+			Logger:             log.New(logs, "", 0),
+			RefreshToken: func() (string, string, error) {
+				refreshCalls++
+				return "", "", errors.New("transient: connection refused")
+			},
+			Reconnect: func() (string, string, error) {
+				select {
+				case spawnRefreshCalls <- refreshCalls:
+				default:
+				}
+				return spawnPath, "spawn-token", nil
+			},
+		})
+	}()
+
+	const lostRequest = `{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"before-loss"}}`
+	if _, err := fmt.Fprintln(ccStdinW, lostRequest); err != nil {
+		t.Fatalf("write original stdio request: %v", err)
 	}
 
-	conn, err := rc.reconnect(&sync.Mutex{}, stdinDone)
-	if err != nil {
-		t.Fatalf("reconnect() error = %v", err)
+	select {
+	case calls := <-spawnRefreshCalls:
+		if calls != maxRefreshAttempts {
+			t.Fatalf("refresh attempts before fallback = %d, want configured maximum %d", calls, maxRefreshAttempts)
+		}
+	case err := <-errCh:
+		t.Fatalf("RunResilientClient exited instead of falling back: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("transient refresh failures did not reach fallback")
 	}
-	defer closeReconnectConn(t, conn)
 
-	if refreshCalls != 3 {
-		t.Fatalf("refreshCalls = %d, want 3 (transient errors must retry)", refreshCalls)
+	var drained []testJSONRPCResponse
+	readyDeadline := time.After(5 * time.Second)
+	for ready := false; !ready; {
+		select {
+		case line := <-stdoutLines:
+			drained = append(drained, parseJSONRPCResponsesWithID(t, line)...)
+			ready = strings.Contains(line, "notifications/resources/list_changed")
+		case err := <-errCh:
+			t.Fatalf("RunResilientClient exited before successor readiness: %v", err)
+		case <-readyDeadline:
+			t.Fatal("fallback did not reconnect the original stdio transport")
+		}
 	}
-	if reconnectCalls != 1 {
-		t.Fatalf("reconnectCalls = %d, want 1", reconnectCalls)
+	if len(drained) != 1 || string(drained[0].ID) != "99" || drained[0].Error == nil ||
+		drained[0].Error.Code != -32603 || drained[0].Result != nil ||
+		!strings.Contains(drained[0].Error.Message, "request lost during reconnect") {
+		t.Fatalf("old request must receive exactly one loss error with its original ID: %+v", drained)
+	}
+
+	const freshRequest = `{"jsonrpc":"2.0","id":"after-transient","method":"tools/call","params":{"name":"after-reconnect"}}`
+	if _, err := fmt.Fprintln(ccStdinW, freshRequest); err != nil {
+		t.Fatalf("write fresh request on original stdio: %v", err)
+	}
+	select {
+	case line := <-stdoutLines:
+		response := parseJSONRPCResponseLine(t, line)
+		if string(response.ID) != `"after-transient"` || response.Error != nil ||
+			string(response.Result["successor_daemon_generation"]) != `"transient-successor"` {
+			t.Fatalf("fresh original-ID response did not come from the successor: %s", line)
+		}
+	case err := <-errCh:
+		t.Fatalf("RunResilientClient exited before the fresh reply: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("no fresh successor reply on original stdio")
+	}
+
+	freshCount := 0
+	tokenSeen := false
+	quiet := time.NewTimer(100 * time.Millisecond)
+	defer quiet.Stop()
+	for waiting := true; waiting; {
+		select {
+		case frame := <-srv.received:
+			switch frame {
+			case "spawn-token":
+				tokenSeen = true
+			case freshRequest:
+				freshCount++
+			default:
+				t.Fatalf("successor received an old/replayed or unexpected frame: %q", frame)
+			}
+		case line := <-stdoutLines:
+			t.Fatalf("unexpected duplicate stdio response after reconnect: %s", line)
+		case err := <-errCh:
+			t.Fatalf("original stdio transport exited before host EOF: %v", err)
+		case <-quiet.C:
+			waiting = false
+		}
+	}
+	if !tokenSeen || freshCount != 1 {
+		t.Fatalf("successor token seen=%t, fresh request count=%d, want authenticated endpoint and exactly one request", tokenSeen, freshCount)
 	}
 	if !strings.Contains(logs.String(), "shim.reconnect.fallback_spawn reason=N_refresh_fail") {
-		t.Fatalf("missing fallback_spawn reason=N_refresh_fail log, got %q", logs.String())
+		t.Fatal("missing transient-failure fallback diagnostic")
+	}
+
+	ccStdinW.Close()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("RunResilientClient after host EOF: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original stdio transport did not exit after host EOF")
 	}
 }
 

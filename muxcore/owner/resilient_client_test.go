@@ -31,16 +31,35 @@ type echoServer struct {
 	closed   chan struct{}
 	mu       sync.Mutex
 	conns    []net.Conn
+	closing  bool
 }
 
 // closeAll closes the listener and all accepted connections, forcing EOF on clients.
 func (s *echoServer) closeAll() {
-	s.ln.Close()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closing {
+		s.closing = true
+		s.ln.Close()
+	}
 	for _, c := range s.conns {
 		c.Close()
 	}
-	s.mu.Unlock()
+}
+
+func (s *echoServer) accept() (net.Conn, error) {
+	conn, err := s.ln.Accept()
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		conn.Close()
+		return nil, net.ErrClosed
+	}
+	s.conns = append(s.conns, conn)
+	return conn, nil
 }
 
 // startEchoIPCServer starts a simple IPC server at path that:
@@ -63,13 +82,10 @@ func startEchoIPCServer(t *testing.T, path string) (srv *echoServer, received ch
 
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			conn, err := srv.accept()
 			if err != nil {
 				return // listener closed
 			}
-			srv.mu.Lock()
-			srv.conns = append(srv.conns, conn)
-			srv.mu.Unlock()
 			go handleEchoConn(conn, received, srv.closed)
 		}
 	}()
