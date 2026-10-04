@@ -162,6 +162,15 @@ removal. Reject restart drain overflow before
 mutation regardless of raw transport or explicit timeout. Unix cleanup skips
 only the exact canonical owned bound control path, without early serving.
 
+Activation must preserve raw status errors and authorize offline only with exact
+native dial absence plus locked persisted-clear proof, never nondial errno or a
+Boolean collapse. MCP restart last-consumer cleanup is one returned token-only
+IPC connection plus existing exact current ServerID/PrevToken confirmation before
+success and closing only its own connection. Nonidle denial confirms binding,
+not eviction; unknown token/read uncertainty is not success. Reuse native history/
+EOF authority, not MCP/bootstrap frames, token minting, revoke/fallback manager,
+or altered library-consumer semantics.
+
 Process-owning signal/context callers must wait for daemon `Done` after a refused
 shutdown, keeping reaper/reference/control authority alive. Request shutdown once;
 do not infer a retry from lease clearance. A separately explicit admitted shutdown

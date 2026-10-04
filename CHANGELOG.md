@@ -102,6 +102,13 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   contacted ping/read uncertainty remains terminal. Control Start reserves the
   accept producer under the existing Close mutex before launching it, so Close
   waits for real accepted-handler settlement rather than racing Add/Wait.
+- Activation probes preserve the raw status error and accept offline absence only
+  through exact native dial classification, after namespace lock/persisted-clear
+  proof; malformed/contacted/busy/timeout outcomes cannot authorize a swap.
+- MCP `mux_restart` consumes its returned reservation with one native token-only
+  IPC connection, confirms exact current owner/token history before success, then
+  closes only that connection. Library `restart_owner` token semantics are unchanged;
+  no MCP bootstrap, new wire command/token, or eviction permission is added.
 
 ### Compatibility
 
@@ -139,9 +146,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   vet/public1182/R1 8+100 preserve old module RED. Later test-only engine/owner
   fixes have consumer-visible proof and native5ea module-race25/25 PASS, skips explicit.
   Alias/control focused proof and exact4e CI37199675520 all5 success are scoped;
-  exact4e Linux final gates/public/R1 now PASS, but three new admitted source
-  findings still require correction/proof before final freeze; local Windows
-  public positive separately awaits runtime grant. No future-source success inferred.
+  exact4e Linux/CI stays historical. Exactbaa Linux full-race/both vet and actual
+  0.31.0 Scenario11 1173/R1 8+100 now PASS. Baa CI's macOS lexical-CWD fixture
+  failed (coverage/BSD passed, Windows/Ubuntu canceled); test-only SameFile oracle
+  proof/successor CI and three native dispositions still precede final acceptance.
+  Local Windows public positive separately awaits its exact runtime grant.
 
 ### Rollback
 

@@ -122,6 +122,18 @@ contacted read error. Control Start reserves its accept producer under the
 existing Close mutex before launch, closing Add/Wait without new protocol/retry
 or forced handler-cancellation behavior.
 
+Activation uses raw status results and exact native dial absence, never Boolean
+probe uncertainty or nondial errno, and only after namespace-lock/persisted-clear
+proof. Live/old-clear compatibility remains; contacted/malformed/busy/timeout
+cannot authorize offline swap, with no new public helper or API.
+
+MCP restart's tool-owned native token-only connection consumes the returned
+reservation and confirms exact current ServerID/PrevToken history before its
+sole success result, then closes that connection. Valid nonidle denial is binding
+confirmation, not eviction; unknown/stale/malformed/transport outcomes are not
+success. No MCP/bootstrap/discover frames, new command/token/revoke registry or
+fallback; existing owner EOF cleanup and direct-library token contract unchanged.
+
 ## Host transport and lifecycle
 
 Aware managed shims keep the original host pipes open. Held requests receive
@@ -229,9 +241,12 @@ clean Linux root-race/vet and release-equivalent public1182/R1 8+100 PASS do not
 relabel original module RED. Later test-only engine/owner corrections have actual
 consumer-visible stdio/no-replay proof and native5ea module-race25/25 PASS, skips
 explicit. Alias/control focused proof and exact4e CI37199675520 all5 success are
-scoped; exact4e Linux final full/public/R1 now PASS. Three new native review
-findings(PR24/21 resolved/3 pending) still hold source/artifact freeze until repair/
-proof; local Windows public positive remains independently runtime-grant-bound.
+scoped; exact4e Linux/CI remains historical. Exactbaa Linux full-race/both vet,
+actual0.31.0 Scenario11 1173 and R1 8+100 now PASS, including all three corrections.
+Baa CI failed macOS's lexical-CWD oracle; coverage/BSD passed, Windows/Ubuntu
+canceled. Frozen test-only SameFile correction needs alias proof/commit/successor
+CI; three native reply/resolution dispositions still precede final acceptance.
+Local Windows public positive is independently runtime-grant-bound.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

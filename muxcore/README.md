@@ -673,6 +673,24 @@ clearing a failure latch or creating a new external bypass. Soft drain stays 30s
 forced drain 0ms. `restart_owner` validates that drain milliseconds fit
 `time.Duration` before mutation, even on raw control or positive explicit timeout.
 
+Activation status probes preserve raw transport errors, not a Boolean liveness
+result. Offline absence is accepted only from exact native dial evidence, including
+missing Windows pipe `PathError` with `Op="open"`; nondial errno, busy/timeout,
+nil/nonOK/typed-invalid and contacted read/write failures are terminal. Offline
+swap/install still requires the namespace lock and persisted-clear proof first.
+Live/known old-clear endpoint behavior remains, without a new exported helper/API.
+
+MCP `mux_restart` is the last consumer of its returned reservation: it opens one
+returned native IPC connection, writes the existing token only, confirms exact
+ServerID/PrevToken bound history on the current owner through existing control,
+then closes only that tool-owned connection before success. Known nonidle denials
+confirm binding only, not eviction. Unknown token is observed only within the
+inherited post-dial admission bound and never counts as success; stale/malformed/
+contradictory/transport/protocol failure is error. Existing owner EOF handles later
+zero-session cleanup. No initialize/discover/MCP frames, new token/command/revoke
+registry or fallback; direct library `restart_owner` still returns its token for
+its ordinary caller to consume. Persistent/other-host authority is not evicted.
+
 `MaintenanceResult` contains `HoldID`, `ServerID`, `State`, `ExpiresAt`,
 `DrainDeadline`, and `TreesRetired`. States are `MaintenanceHolding`/`HOLDING`,
 `MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
