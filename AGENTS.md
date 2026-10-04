@@ -178,6 +178,19 @@ durably resume each exact retired lease through the current aware binary or
 observe safely committed expiry. Incomplete/blocked authority prevents downgrade;
 preserve both authority members even after TTL. Never delete them to open admission.
 
+Maintenance authority is `<canonical namespace-lock path>.maintenance/<scope digest>/`
+with ledger/transaction members and unchanged scope/schema/state. Never choose a
+new store through UserConfig/HOME or infer clear authority from absence under an
+unsafe parent. Preserve raw endpoint-parent components while authenticating every
+alias/target before canonicalization; private anchor/scope/members require native
+owner/mode/protected-DACL guards. Exact TrustedInstaller trust is ancestors-only.
+The endpoint/lock directory must survive every active fence; no cleanup authority.
+Released v0.30 had no store. Drain/clear older unreleased live candidates with the
+same binary/original environment before cutover; keep their files, no scan/migrate/
+registry/bypass. Safe verification-root approval is not a production TMP override
+or permission to change profile ACLs. A rejected unsafe native test path is not
+healthy execution PASS or a user fault.
+
 Controlled update/install/swap, layout/bootstrap mutation, and active-pointer
 changes serialize with hold-ledger mutation under the existing daemon namespace
 file lock. `daemon.CheckMaintenanceForActivation` is read-only. Status and pure

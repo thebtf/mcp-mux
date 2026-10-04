@@ -145,6 +145,21 @@ does not promise storage rollback. Recovery accepts only a matching COMMITTED
 certificate proving previously acknowledged durable publication. A successful
 durable release cannot resurrect the old lease.
 
+The stable location is `<canonical namespace-lock path>.maintenance/<scope digest>/`
+with the same scope digest and paired authority members, independent of mutable
+HOME/UserConfig selection. The endpoint/lock directory must persist while a fence
+is active. Native guards validate raw parent/alias components before canonicalizing,
+create protected private directories/members, and reject unsafe ownership, aliases,
+or ancestor write/delete authority, including cold read-only checks. Trusted aliases
+remain supported; exact Windows TrustedInstaller trust is ancestry-only. Unix
+private directories/files use0700/0600; Windows uses protected trusted DACLs.
+
+Released v0.30 contained no maintenance store: earlier user-config authority was
+unreleased private-candidate state. Any such live holds must be cleared/drained
+with their original binary/environment before cutover, retaining the old files.
+There is no scan/migrate/new registry and no inference that missing new authority
+clears an unknown old location. No TMP override or cleanup/ACL-bypass permission added.
+
 Controlled installation, launcher swap, layout/bootstrap mutation, and
 active-pointer changes serialize with hold-ledger mutation under the existing
 daemon namespace file lock. `daemon.CheckMaintenanceForActivation` is read-only.
@@ -202,9 +217,13 @@ Frame/shared-handler completion repairs now have focused/race proof, followed by
 d786 cooperative owned-context cancellation after EOF/drain grace. The observed
 c585 and d786 module timeouts remain distinct historical RED. Fixture-only3f
 keeps d786 production unchanged and has fresh postcommit full-module GREEN,
-with earlier root/vet0 reused only in their declared scopes. Final new Windows/
-Linux/live/R1/critical/CI and fresh final-head readback remain pending; final frame
-reply/readback/native resolution is complete, with19 known threads resolved.
+with earlier root/vet0 reused only in their declared scopes. Later ping/ledger
+fixes896a/5e49 now have scoped focused/native/source proof, not final successor
+artifacts. Prior932 complete Windows/Linux/critical/R1/CI stays historical;
+clean Linux root-race/vet and release-equivalent public1182/R1 8+100 PASS do not
+relabel original module engine/owner RED. Corrected actual-anchor engine fixture
+has four-leaf focused race PASS; two bounded owner-test helper/cause repairs and
+safe Windows/current aggregate/CI/readback remain pending, PR21/19/2.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

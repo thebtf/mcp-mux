@@ -91,6 +91,13 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 - In-process `HandlerFunc` retirement requires actual body/pipe completion via
   `Done`, never bookkeeping close. Owned child context cancellation follows the
   existing EOF/drain grace in Close/SoftClose; ignored cancellation stays blocked.
+- CLI stop preserves daemon authority on uncertain/invalid ping, not only shutdown
+  errors; only proven absence permits existing owner/data fallback. Real read/EOF
+  uncertainty is covered without inventing an independent write-timeout fixture.
+- Maintenance authority is anchored beside the canonical namespace lock at
+  `.maintenance/<scope digest>`, not mutable UserConfig. Native path/owner/ACL
+  guards reject unsafe ancestry and foreign alias retargeting before canonicalizing.
+  Existing scope/schema/state/protocol unchanged; endpoint/lock directory must persist.
 
 ### Compatibility
 
@@ -122,7 +129,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   have focused/race proof; d786 supplies cooperative owned-context cancellation.
   Distinct c585/d786 module timeouts are retained as historical RED. Fixture-only
   3f preserves d786 production and now has fresh postcommit full-module GREEN;
-  earlier root/vet retain their scopes. Final new artifacts/critical/R1/CI/readback pending.
+  earlier root/vet retain their scopes. Ping896a and stable-ledger5e49 add focused
+  Windows/Linux ping and Linux authority RED/GREEN/race plus source-only assurance.
+  Windows unsafe-parent refusals are not healthy positive PASS. Clean Linux root/
+  vet PASS and public1182/R1 8+100 PASS do not relabel module-race RED. Engine
+  actual-anchor fixture is focused GREEN; two owner test-helper/cause corrections
+  and safe Windows/current full/CI/readback proof remain pending, no guard weakening.
 
 ### Rollback
 
@@ -131,6 +143,10 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   safely committed expiry. Preserve incomplete/blocked authority, even after TTL.
   Do not downgrade, delete authority, force PID cleanup, or bypass admission to
   escape a fence. Keep modern-owner quarantine and no-replay rules intact.
+- Any live hold from an older unreleased user-config-store candidate must be
+  cleared/drained using that binary and original environment before cutover.
+  Preserve its private authority files. Released v0.30 had no maintenance store;
+  no scan/migrate/new registry or missing-new-store bypass is provided.
 
 ## [0.30.0] - 2026-08-31
 

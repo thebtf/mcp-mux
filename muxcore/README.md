@@ -790,6 +790,31 @@ conservative live admission, even if recovery verifies a matching COMMITTED
 certificate. It is not API success or a guarantee of storage rollback. Successful
 release cannot resurrect the old lease. See the [phase contract](../specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
 
+Authority lives at `<canonical namespace-lock path>.maintenance/<scope digest>/`,
+with paired `ledger.json` and `transaction.json`. The existing namespace/endpoint
+scope digest is unchanged. HOME/UserConfig environment changes do not choose a
+different store. Keep the endpoint/namespace-lock directory persistent while any
+fence is active; this layout grants no cleanup authority.
+
+Native guards authenticate endpoint-parent components and alias targets before
+canonicalization, including links before `..`. Trusted endpoint aliases remain
+supported; foreign-controlled aliases/targets and symlinked authority members
+fail closed. Unix private anchor/scope directories are current-user-owned0700
+and members0600; ancestry must pass ownership/writability checks. Windows private
+paths require protected DACLs and trusted ownership/access, with unsafe ancestor
+mutation/delete rights rejected. Exact OS TrustedInstaller ownership is trusted
+for ancestors only, not arbitrary services or private store members. Missing
+authority under an unsafe parent is not a clear-store result; cold read-only
+checks reject without creating or changing those paths. Use a safe persistent
+namespace directory rather than changing production TMP variables or weakening ACLs.
+
+The released v0.30 baseline had no maintenance store. The earlier user-config
+layout belonged only to unreleased private candidates, not a shipped migration
+contract. Before cutting over any such live binary, clear/drain its holds using
+that same binary and original environment. Preserve its private files; no scan,
+migration, or new registry is added. An absent new store does not certify an
+unknown old location as clear, and cannot justify bypass or authority deletion.
+
 Controlled installation, launcher swap, layout/bootstrap mutation, and active
 pointer changes serialize with hold-ledger mutation using the existing daemon
 namespace file lock. The shared `daemon.CheckMaintenanceForActivation` helper
