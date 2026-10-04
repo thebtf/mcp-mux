@@ -141,6 +141,7 @@ func (rc *resilientClient) attemptReconnectLocked(fn ReconnectFunc) reconnectRes
 	if isMaintenanceFence(err) {
 		rc.enterMaintenance(err)
 	} else if err == nil && rc.maintenanceObserved() {
+		res.ready = make(chan struct{})
 		rc.pendingReconnect.Store(&res)
 	}
 	return res
@@ -148,27 +149,46 @@ func (rc *resilientClient) attemptReconnectLocked(fn ReconnectFunc) reconnectRes
 
 func (rc *resilientClient) recheckMaintenance() (uint64, bool) {
 	rc.reconnectMu.Lock()
-	defer rc.reconnectMu.Unlock()
 	rc.ingressMu.Lock()
 	held, sequence := rc.held, rc.maintenanceSequence
 	rc.ingressMu.Unlock()
 	if !held {
+		rc.reconnectMu.Unlock()
 		return sequence, true
 	}
 	fn := rc.cfg.Reconnect
 	if fn == nil {
 		fn = rc.cfg.RefreshToken
 	}
-	if fn == nil || rc.attemptReconnectLocked(fn).err != nil {
+	if fn == nil {
+		rc.reconnectMu.Unlock()
 		return sequence, false
 	}
-	// Only this newly admitted demand may enter the queue. Pre-fence capacity
-	// waiters retain their old sequence and can never cross into the successor.
-	rc.leaveMaintenance()
+	res := rc.attemptReconnectLocked(fn)
+	if res.err != nil {
+		rc.reconnectMu.Unlock()
+		return sequence, false
+	}
 	rc.ingressMu.Lock()
 	sequence = rc.maintenanceSequence
 	rc.ingressMu.Unlock()
-	return sequence, true
+	// Admission is not activation. Retire the old connection through the proxy's
+	// existing EOF/join path, and let finishReconnect open ingress after dialing.
+	select {
+	case rc.ipcEOF <- struct{}{}:
+	default:
+	}
+	rc.reconnectMu.Unlock()
+	select {
+	case <-res.ready:
+	case <-rc.stdoutDead:
+		return sequence, false
+	case <-rc.transportDone:
+		return sequence, false
+	}
+	rc.ingressMu.Lock()
+	defer rc.ingressMu.Unlock()
+	return sequence, !rc.held && sequence == rc.maintenanceSequence
 }
 
 func (rc *resilientClient) enqueueHostFrame(data []byte, msg *jsonrpc.Message) error {

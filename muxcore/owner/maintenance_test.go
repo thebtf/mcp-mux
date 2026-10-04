@@ -1,18 +1,23 @@
 package owner
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
 	"github.com/thebtf/mcp-mux/muxcore/upstream"
 )
@@ -77,56 +82,411 @@ func TestMaintenanceIngressRejectsCapacityWaiterAcrossRelease(t *testing.T) {
 }
 
 func TestMaintenanceFreshDemandRechecksAdmissionAndReusesOneSuccessor(t *testing.T) {
-	var output bytes.Buffer
-	rc := maintenanceTestClient(t, &output)
-	held, generations := true, 0
-	rc.cfg.Reconnect = func() (string, string, error) {
-		if held {
-			return "", "", control.ErrMaintenanceHeld
-		}
-		generations++
-		return "successor", "successor-token", nil
+	for _, protocol := range []era.ProtocolEra{era.EraLegacy, era.EraModern20260728} {
+		t.Run(fmt.Sprintf("era_%d", protocol), func(t *testing.T) {
+			paths := [2]string{newTestIPCPath(t), newTestIPCPath(t)}
+			var servers [2]*echoServer
+			var frames [2]chan string
+			var connections [2]chan net.Conn
+			for index, path := range paths {
+				listener, err := ipc.Listen(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				server := &echoServer{ln: listener}
+				servers[index] = server
+				frames[index] = make(chan string, 16)
+				connections[index] = make(chan net.Conn, 1)
+				t.Cleanup(server.closeAll)
+				go func() {
+					defer close(frames[index])
+					conn, err := server.accept()
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+					connections[index] <- conn
+					scanner := bufio.NewScanner(conn)
+					for scanner.Scan() {
+						frames[index] <- scanner.Text()
+					}
+				}()
+			}
+			stdin, hostInput := io.Pipe()
+			hostOutput, stdout := io.Pipe()
+			output := &safeBuf{}
+			outputDone := make(chan struct{})
+			go func() {
+				defer close(outputDone)
+				scanner := bufio.NewScanner(hostOutput)
+				for scanner.Scan() {
+					_, _ = fmt.Fprintln(output, scanner.Text())
+				}
+			}()
+			var resumed atomic.Bool
+			var refusals, generations atomic.Int32
+			clientDone := make(chan error, 1)
+			go func() {
+				clientDone <- RunResilientClient(ResilientClientConfig{
+					Stdin: stdin, Stdout: stdout, InitialIPCPath: paths[0], Token: "old-token",
+					ProtocolEra: protocol, ProbeGracePeriod: time.Nanosecond, Logger: resilientTestLogger(t),
+					Reconnect: func() (string, string, error) {
+						if !resumed.Load() {
+							refusals.Add(1)
+							return "", "", control.ErrMaintenanceHeld
+						}
+						generations.Add(1)
+						return paths[1], "successor-token", nil
+					},
+				})
+			}()
+			clientStopped := false
+			t.Cleanup(func() {
+				for _, server := range servers {
+					server.closeAll()
+				}
+				_ = stdin.Close()
+				_ = hostInput.Close()
+				_ = hostOutput.Close()
+				_ = stdout.Close()
+				if !clientStopped {
+					select {
+					case <-clientDone:
+					case <-time.After(3 * time.Second):
+						t.Error("resilient client did not settle after transport cleanup")
+					}
+				}
+				<-outputDone
+			})
+			readFrame := func(ch <-chan string, want string) {
+				t.Helper()
+				select {
+				case got, open := <-ch:
+					if !open || got != want {
+						t.Fatalf("IPC frame = %q (open=%t), want %q", got, open, want)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatalf("IPC did not receive %q", want)
+				}
+			}
+			send := func(raw string) {
+				t.Helper()
+				if _, err := fmt.Fprintln(hostInput, raw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var old net.Conn
+			select {
+			case old = <-connections[0]:
+			case <-time.After(3 * time.Second):
+				t.Fatal("initial IPC connection was not active")
+			}
+			readFrame(frames[0], "old-token")
+			meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
+			openingMethod, listenMethod := "initialize", "tools/call"
+			if protocol == era.EraModern20260728 {
+				openingMethod, listenMethod = "server/discover", "subscriptions/listen"
+			}
+			opening := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{%s}}`, openingMethod, meta)
+			send(opening)
+			readFrame(frames[0], opening)
+			if _, err := fmt.Fprintln(old, `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}`); err != nil {
+				t.Fatal(err)
+			}
+			for _, raw := range []string{
+				fmt.Sprintf(`{"jsonrpc":"2.0","id":41,"method":"tools/call","params":{%s}}`, meta),
+				fmt.Sprintf(`{"jsonrpc":"2.0","id":"old-listen","method":%q,"params":{%s}}`, listenMethod, meta),
+				fmt.Sprintf(`{"jsonrpc":"2.0","id":42,"method":"maintenance/write","params":{%s}}`, meta),
+			} {
+				send(raw)
+				readFrame(frames[0], raw)
+			}
+			// The real peer reports the fence but deliberately keeps the old IPC
+			// socket open. Only the shim may initiate the successor switch.
+			if _, err := fmt.Fprintln(old, `{"jsonrpc":"2.0","id":42,"error":{"code":-32005,"data":{"error_code":"maintenance_held"}}}`); err != nil {
+				t.Fatal(err)
+			}
+			waitForCondition(t, 3*time.Second, func() bool { return strings.Contains(output.String(), `"id":42`) }, "wire fence was not forwarded")
+			for _, raw := range []string{
+				`{"jsonrpc":"2.0","id":2,"method":"maintenance/write"}`,
+				`{"jsonrpc":"2.0","id":"held-string","method":"maintenance/write"}`,
+				`{"jsonrpc":"2.0","method":"notifications/test"}`,
+			} {
+				send(raw)
+			}
+			waitForCondition(t, 3*time.Second, func() bool { return refusals.Load() == 3 }, "held input was not locally disposed")
+			resumed.Store(true)
+			fresh := fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":%q,"params":{%s}}`, listenMethod, meta)
+			send(fresh)
+			var successor net.Conn
+			oldFrames := (<-chan string)(frames[0])
+			deadline := time.After(3 * time.Second)
+			for successor == nil {
+				select {
+				case line, open := <-oldFrames:
+					if open {
+						t.Fatalf("post-resume demand reached the retired connection: %s", line)
+					}
+					oldFrames = nil
+				case successor = <-connections[1]:
+				case <-deadline:
+					t.Fatal("admitted successor did not become active while old IPC stayed open")
+				}
+			}
+			readFrame(frames[1], "successor-token")
+			readFrame(frames[1], fresh)
+			if _, err := fmt.Fprintln(successor, `{"jsonrpc":"2.0","id":3,"result":{"successor":true}}`); err != nil {
+				t.Fatal(err)
+			}
+			waitForCondition(t, 3*time.Second, func() bool { return strings.Contains(output.String(), `"successor":true`) }, "fresh response was not delivered")
+			_ = hostInput.Close()
+			select {
+			case err := <-clientDone:
+				clientStopped = true
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("client did not exit after fresh response and host EOF")
+			}
+			for index, ch := range frames {
+				select {
+				case line, open := <-ch:
+					if open {
+						t.Fatalf("IPC %d received extra/replayed frame: %s", index, line)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatalf("IPC %d did not settle", index)
+				}
+			}
+			responses := parseJSONRPCResponsesWithID(t, output.String())
+			ids := map[string]int{}
+			for _, response := range responses {
+				id := string(response.ID)
+				ids[id]++
+				switch id {
+				case "2", `"held-string"`, "42":
+					if response.Error == nil || response.Error.Code != -32005 {
+						t.Fatalf("held original-ID disposition changed: %+v", response)
+					}
+				case "41", `"old-listen"`:
+					if response.Error == nil || response.Error.Code != -32603 {
+						t.Fatalf("old in-flight work was not failed without replay: %+v", response)
+					}
+				case "1", "3":
+					if response.Error != nil || response.Result == nil {
+						t.Fatalf("active connection response failed: %+v", response)
+					}
+				default:
+					t.Fatalf("invented response obligation: %+v", response)
+				}
+			}
+			if len(ids) != 7 || len(responses) != 7 || generations.Load() != 1 || strings.Contains(output.String(), "list_changed") {
+				t.Fatalf("lost/duplicate IDs, duplicate successor, or replay bootstrap: ids=%v generations=%d stdout=%s", ids, generations.Load(), output.String())
+			}
+		})
 	}
-	rc.enterMaintenance(control.ErrMaintenanceHeld)
-	for _, raw := range []string{
-		`{"jsonrpc":"2.0","id":2,"method":"maintenance/write"}`,
-		`{"jsonrpc":"2.0","id":"held-string","method":"maintenance/write"}`,
-	} {
-		msg, err := jsonrpc.Parse([]byte(raw))
+}
+
+func TestMaintenanceParkedDemandActivatesSuccessor(t *testing.T) {
+	paths := [2]string{newTestIPCPath(t), newTestIPCPath(t)}
+	var servers [2]*echoServer
+	var frames [2]chan string
+	var connections [2]chan net.Conn
+	for index, path := range paths {
+		listener, err := ipc.Listen(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := rc.enqueueHostFrame([]byte(raw), msg); err != nil {
+		server := &echoServer{ln: listener}
+		servers[index] = server
+		frames[index] = make(chan string, 8)
+		connections[index] = make(chan net.Conn, 1)
+		t.Cleanup(server.closeAll)
+		go func() {
+			defer close(frames[index])
+			conn, err := server.accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			connections[index] <- conn
+			scanner := bufio.NewScanner(conn)
+			for scanner.Scan() {
+				frames[index] <- scanner.Text()
+			}
+		}()
+	}
+	stdin, hostInput := io.Pipe()
+	output := &safeBuf{}
+	logs := &capturingLogger{}
+	gateEntered, allowPark := make(chan struct{}), make(chan struct{})
+	var gateOnce, releaseOnce sync.Once
+	releasePark := func() { releaseOnce.Do(func() { close(allowPark) }) }
+	var resumed atomic.Bool
+	var refusals, admissions atomic.Int32
+	admitted := make(chan struct{}, 1)
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- RunResilientClient(ResilientClientConfig{
+			Stdin: stdin, Stdout: output, InitialIPCPath: paths[0], Token: "old-token",
+			ProtocolEra: era.EraLegacy, ProbeGracePeriod: time.Nanosecond,
+			IdleSuspendDelay: 10 * time.Millisecond, Logger: log.New(logs, "", 0),
+			IdleSuspendGate: func() (bool, string, error) {
+				gateOnce.Do(func() { close(gateEntered) })
+				<-allowPark
+				return true, "", nil
+			},
+			Reconnect: func() (string, string, error) {
+				if !resumed.Load() {
+					refusals.Add(1)
+					return "", "", control.ErrMaintenanceHeld
+				}
+				admissions.Add(1)
+				admitted <- struct{}{}
+				return paths[1], "successor-token", nil
+			},
+		})
+	}()
+	clientStopped := false
+	t.Cleanup(func() {
+		releasePark()
+		for _, server := range servers {
+			server.closeAll()
+		}
+		_ = stdin.Close()
+		_ = hostInput.Close()
+		if !clientStopped {
+			select {
+			case <-clientDone:
+			case <-time.After(time.Second):
+				t.Error("parked client did not settle after failed-regression cleanup")
+			}
+		}
+	})
+	readFrame := func(ch <-chan string, want string) {
+		t.Helper()
+		select {
+		case got, open := <-ch:
+			if !open || got != want {
+				t.Fatalf("IPC frame = %q (open=%t), want %q", got, open, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("IPC did not receive %q", want)
+		}
+	}
+	send := func(raw string) {
+		t.Helper()
+		if _, err := fmt.Fprintln(hostInput, raw); err != nil {
 			t.Fatal(err)
 		}
 	}
-	held = false
-	fresh := []byte(`{"jsonrpc":"2.0","id":3,"method":"maintenance/write"}`)
-	msg, err := jsonrpc.Parse(fresh)
-	if err != nil {
+	var old net.Conn
+	select {
+	case old = <-connections[0]:
+	case <-time.After(time.Second):
+		t.Fatal("initial IPC connection was not active")
+	}
+	readFrame(frames[0], "old-token")
+	initialize := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+	send(initialize)
+	readFrame(frames[0], initialize)
+	if _, err := fmt.Fprintln(old, `{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}`); err != nil {
 		t.Fatal(err)
 	}
-	if err := rc.enqueueHostFrame(fresh, msg); err != nil {
+	// The public idle gate witnesses actual eligibility, then holds parking until
+	// the wire fence and held dispositions complete. No private clock is changed.
+	select {
+	case <-gateEntered:
+	case <-time.After(time.Second):
+		t.Fatal("initialized client did not reach the public idle gate")
+	}
+	probe := `{"jsonrpc":"2.0","id":42,"method":"maintenance/write"}`
+	send(probe)
+	readFrame(frames[0], probe)
+	if _, err := fmt.Fprintln(old, `{"jsonrpc":"2.0","id":42,"error":{"code":-32005,"data":{"error_code":"maintenance_held"}}}`); err != nil {
 		t.Fatal(err)
 	}
-	res := rc.attemptReconnect(rc.cfg.Reconnect)
-	if res.err != nil || res.path != "successor" || res.token != "successor-token" || generations != 1 {
-		t.Fatalf("fresh demand created duplicate successors: result=%+v generations=%d", res, generations)
+	waitForCondition(t, time.Second, func() bool { return strings.Contains(output.String(), `"id":42`) }, "wire fence was not forwarded")
+	for _, raw := range []string{
+		`{"jsonrpc":"2.0","id":2,"method":"maintenance/write"}`,
+		`{"jsonrpc":"2.0","id":"held-string","method":"maintenance/write"}`,
+		`{"jsonrpc":"2.0","method":"notifications/test"}`,
+	} {
+		send(raw)
 	}
-	rc.failBufferedRequestsDuringReconnect(rc.outputMu)
+	waitForCondition(t, time.Second, func() bool { return refusals.Load() == 3 }, "held input was not disposed before parking")
+	releasePark()
+	select {
+	case line, open := <-frames[0]:
+		if open {
+			t.Fatalf("held input reached the parking connection: %s", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("public idle lifecycle did not actually close old IPC")
+	}
+	if !strings.Contains(logs.String(), "shim.suspend.idle") {
+		t.Fatal("old EOF had no actual idle-suspend witness")
+	}
+	resumed.Store(true)
+	fresh := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fresh"}}`
+	send(fresh)
+	select {
+	case <-admitted:
+	case <-time.After(time.Second):
+		t.Fatal("parked fresh demand did not obtain control admission")
+	}
+	var successor net.Conn
+	select {
+	case successor = <-connections[1]:
+	case <-time.After(time.Second):
+		t.Fatal("parked resume admission did not activate successor; host admission and parked proxy are mutually waiting")
+	}
+	readFrame(frames[1], "successor-token")
+	readFrame(frames[1], fresh)
+	if _, err := fmt.Fprintln(successor, `{"jsonrpc":"2.0","id":3,"result":{"successor":true}}`); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, func() bool { return strings.Contains(output.String(), `"successor":true`) }, "parked fresh response was not delivered")
+	_ = hostInput.Close()
+	select {
+	case err := <-clientDone:
+		clientStopped = true
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activated parked client did not consume host EOF")
+	}
+	select {
+	case line, open := <-frames[1]:
+		if open {
+			t.Fatalf("parked successor received replay/duplicate frame: %s", line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parked successor IPC did not settle")
+	}
 	responses := parseJSONRPCResponsesWithID(t, output.String())
-	if len(responses) != 2 || string(responses[0].ID) != "2" || string(responses[1].ID) != `"held-string"` {
-		t.Fatalf("original held IDs were not rejected exactly once: %s", output.String())
-	}
+	ids := map[string]int{}
 	for _, response := range responses {
-		if response.Error == nil || response.Error.Code != -32005 {
-			t.Fatalf("held demand disposition: %+v", response)
+		id := string(response.ID)
+		ids[id]++
+		switch id {
+		case "2", `"held-string"`, "42":
+			if response.Error == nil || response.Error.Code != -32005 {
+				t.Fatalf("parked original-ID refusal changed: %+v", response)
+			}
+		case "1", "3":
+			if response.Error != nil || response.Result == nil {
+				t.Fatalf("parked active connection response failed: %+v", response)
+			}
+		default:
+			t.Fatalf("parked route invented a response: %+v", response)
 		}
 	}
-	if len(rc.msgFromCC) != 1 || rc.localWork.Load() != 1 || !bytes.Equal(<-rc.msgFromCC, fresh) {
-		t.Fatal("fresh demand was rejected or held demand replayed")
+	if len(ids) != 5 || len(responses) != 5 || admissions.Load() != 1 || strings.Contains(output.String(), "list_changed") {
+		t.Fatalf("parked lost/duplicate ID, admission, or bootstrap: ids=%v admissions=%d stdout=%s", ids, admissions.Load(), output.String())
 	}
-	rc.noteDequeued()
 }
 
 func TestMaintenanceReconnectDisposesEscapedWakeBeforeRecovery(t *testing.T) {

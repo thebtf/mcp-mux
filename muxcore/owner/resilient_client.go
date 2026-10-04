@@ -145,7 +145,7 @@ type resilientClient struct {
 	token               string        // current handshake token; updated on reconnect
 	msgFromCC           chan []byte   // stdin → proxy (buffered 1000)
 	msgFromIPC          chan []byte   // ipc → stdout (buffered 1000)
-	ipcEOF              chan struct{} // closed when IPC reader detects EOF/error
+	ipcEOF              chan struct{} // requests current IPC closure after resume admission
 	stdoutDead          chan struct{} // closed when CC stdout pipe breaks
 	stdoutOnce          sync.Once     // ensures stdoutDead is closed once
 	startTime           time.Time     // when the client started (for probe detection)
@@ -215,7 +215,7 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 		token:         cfg.Token,
 		msgFromCC:     make(chan []byte, msgFromCCBufferSize),
 		msgFromIPC:    make(chan []byte, msgFromIPCBufferSize),
-		ipcEOF:        make(chan struct{}),
+		ipcEOF:        make(chan struct{}, 1),
 		stdoutDead:    make(chan struct{}),
 		startTime:     time.Now(),
 		log:           logger,
@@ -430,6 +430,10 @@ func (rc *resilientClient) runProxy(conn interface {
 				rc.log.Printf("resilient: CC stdout dead, exiting")
 				return nil
 
+			case <-rc.ipcEOF:
+				conn.Close()
+				continue connected
+
 			case <-ipcEOF:
 				if idleTicker != nil {
 					idleTicker.Stop()
@@ -624,6 +628,8 @@ func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error, deferr
 		} else {
 			select {
 			case data = <-rc.msgFromCC:
+			case <-rc.ipcEOF:
+				return nil, false, nil
 			case err := <-stdinDone:
 				if err == io.EOF {
 					return nil, false, io.EOF
@@ -851,6 +857,7 @@ type reconnectResult struct {
 	path  string
 	token string
 	err   error
+	ready chan struct{} // closed after the pending admission's dial/handshake settles
 }
 
 // reconnect enters the RECONNECTING state: immediately tombstones every
@@ -1081,7 +1088,16 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 ) {
 	rc.reconnectMu.Lock()
 	defer rc.reconnectMu.Unlock()
-	defer rc.pendingReconnect.Store(nil)
+	defer func() {
+		// A resume wake must never survive to close the newly active connection.
+		select {
+		case <-rc.ipcEOF:
+		default:
+		}
+		if pending := rc.pendingReconnect.Swap(nil); pending != nil {
+			close(pending.ready)
+		}
+	}()
 
 	conn, err := ipc.Dial(path)
 	if err != nil {
