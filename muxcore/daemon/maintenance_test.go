@@ -896,8 +896,18 @@ func TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed(t *test
 		t.Fatalf("actual optional environment did not share the same-CWD owner: %q %q %v", sid, sharedSID, err)
 	}
 	original := d.Entry(sid)
-	if !original.Owner.SessionMgr().IsPreRegistered(firstToken) || !original.Owner.SessionMgr().IsPreRegistered(secondToken) {
-		t.Fatal("fixture did not retain both admitted, unconsumed tokens")
+	firstCwd, firstEnv, firstPending := original.Owner.SessionMgr().LookupPendingForOwner(firstToken, sid)
+	secondCwd, secondEnv, secondPending := original.Owner.SessionMgr().LookupPendingForOwner(secondToken, sid)
+	if !firstPending || !secondPending || firstCwd != secondCwd {
+		t.Fatal("fixture did not retain both same-CWD admitted, unconsumed tokens")
+	}
+	firstContext := d.maintenanceContext(era.EraLegacy, req.Command, req.Args, firstCwd, firstEnv)
+	secondContext := d.maintenanceContext(era.EraLegacy, req.Command, req.Args, secondCwd, secondEnv)
+	d.mu.RLock()
+	bothAdmitted := original.maintenanceContexts[firstContext] && original.maintenanceContexts[secondContext]
+	d.mu.RUnlock()
+	if firstContext == secondContext || !bothAdmitted {
+		t.Fatal("fixture did not actually admit two distinct maintenance contexts")
 	}
 	// Pending admission already records both maintenance contexts, but neither
 	// token has reconnect history. No clock or synthetic snapshot mutation is
@@ -919,9 +929,16 @@ func TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed(t *test
 		t.Fatal("fixture did not serialize exactly one owner before token consumption")
 	}
 	observed := snapshot.Owners[0]
-	_, carriesOptionalEnv := observed.Env["SERVICE_CONFIG_PATH"]
-	if observed.ServerID != sid || len(observed.CwdSet) != 1 || len(observed.BoundTokens) != 0 || carriesOptionalEnv {
-		t.Fatal("actual snapshot unexpectedly preserved the optional admitted environment")
+	if observed.ServerID != sid || len(observed.BoundTokens) != 0 {
+		t.Fatal("fixture snapshot did not preserve the owner without reconnect history")
+	}
+	represented, _ := d.maintenanceRestoreContexts(observed)
+	forgotten, forgottenContext := req, firstContext
+	if represented[firstContext] {
+		forgotten, forgottenContext = optional, secondContext
+	}
+	if represented[forgottenContext] || !represented[firstContext] && !represented[secondContext] {
+		t.Fatal("actual snapshot did not retain one admitted context while omitting the other")
 	}
 	removed, err := d.removeOwnerIfCurrent(sid, original, ownerRemovalReasonRestoreFailed, false)
 	if err != nil || !removed.Removed {
@@ -943,7 +960,7 @@ func TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed(t *test
 	result, holdErr := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(600000)})
 	// Exercise forgotten-context demand even on the unsafe original: accepting
 	// the hold retires the owner and this distinct environment escapes its fence.
-	_, demandedSID, freshToken, spawnErr := d.Spawn(optional)
+	_, demandedSID, freshToken, spawnErr := d.Spawn(forgotten)
 	if !errors.Is(holdErr, control.ErrMaintenanceInvalid) || result.State == control.MaintenanceHeld || result.TreesRetired {
 		t.Fatalf("incomplete restored scope granted replacement: hold=%+v err=%v forgotten-context spawn=%v predecessor_retired=%t", result, holdErr, spawnErr, restored.Owner.MaintenanceRetired())
 	}
