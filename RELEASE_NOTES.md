@@ -81,6 +81,11 @@ the new control operations only when they need maintenance.
   return and registration/rejection. Late allow cannot cross closed admission;
   retirement and handoff wait for settlement. No public callback counter or
   `PendingRequests` change is added; nil-authorizer defaults stay unchanged.
+- Configured frame hooks are tracked through actual return in every owner mode;
+  their 1ms verdict timeout does not settle work. In-process HandlerFunc retirement
+  uses actual body/pipe `Done`, not bookkeeping close. After existing EOF/drain
+  grace, Close/SoftClose cancels its owned child context; ignored cancellation
+  remains blocked until completion. No public counter/state/API or manager added.
 
 The durable `HOLDING` seed has provisional timing and never grants replacement.
 Sample `T` once after its first complete writer acknowledgment, then persist clocked `HOLDING` once.
@@ -193,8 +198,13 @@ does not refute its two causal observer P1s. Caller/auth repairs a68aa37/ab28d3d
 now have Windows/native focused/race and bounded source proof plus all four
 full/vet gates on identical frozen precommit bytes. No post-ab28 rerun inferred;
 actual ab28 CI37162331283 all5 successful precedes this documentation successor.
-A new standalone configured-frame callback P1 still requires existing-path repair/
-proof before final artifact freeze; new Windows/Linux/frozen-head readback pending.
+Frame/shared-handler completion repairs now have focused/race proof, followed by
+d786 cooperative owned-context cancellation after EOF/drain grace. The observed
+c585 and d786 module timeouts remain distinct historical RED. Fixture-only3f
+keeps d786 production unchanged and has fresh postcommit full-module GREEN,
+with earlier root/vet0 reused only in their declared scopes. Final new Windows/
+Linux/live/R1/critical/CI and fresh final-head readback remain pending; final frame
+reply/readback/native resolution is complete, with19 known threads resolved.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote

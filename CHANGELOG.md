@@ -86,6 +86,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
 - Signal/context shutdown callers wait for daemon `Done` after refusal, retaining
   reaper, daemon reference and control service. Clearing a lease does not retry the
   refused request; a separately admitted explicit shutdown is required.
+- Configured frame hooks retain private work until actual callback return in every
+  owner mode; the 1ms verdict timeout cannot discharge settlement authority.
+- In-process `HandlerFunc` retirement requires actual body/pipe completion via
+  `Done`, never bookkeeping close. Owned child context cancellation follows the
+  existing EOF/drain grace in Close/SoftClose; ignored cancellation stays blocked.
 
 ### Compatibility
 
@@ -113,8 +118,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   scoped focused/race proof; caaba timeout and the ace2 observer's two P1s stay
   historical. Caller/auth repairs a68aa37/ab28d3d have Windows/native RED/GREEN,
   race and bounded source PASS. All four full/vet gates ran on identical frozen
-  precommit bytes, not freshly after ab28. Ab28 CI37162331283 all5 PASS precedes
-  this doc successor; a new standalone frame-hook P1 still holds final artifact freeze.
+  precommit bytes, not freshly after ab28. Frame/shared-handler completion repairs
+  have focused/race proof; d786 supplies cooperative owned-context cancellation.
+  Distinct c585/d786 module timeouts are retained as historical RED. Fixture-only
+  3f preserves d786 production and now has fresh postcommit full-module GREEN;
+  earlier root/vet retain their scopes. Final new artifacts/critical/R1/CI/readback pending.
 
 ### Rollback
 

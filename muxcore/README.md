@@ -702,6 +702,18 @@ from publishing a session; retirement and normal/error handoff retain blocked
 authority until settlement. This does not add authorization when none is
 configured, change ordinary defaults, or turn `PendingRequests` into a callback metric.
 
+Configured `OnFrameReceived` also retains private work in every owner mode,
+including when neither SessionHandler nor authorization is present. Its 1ms
+verdict timeout is not actual callback settlement. Callback-capable readers stay
+retained through teardown, and closed admission prevents late registration.
+
+In-process `HandlerFunc` retirement and tree proof use actual `Done` after body
+return/pipe settlement, not a bookkeeping closed marker. Close/SoftClose first
+preserve existing EOF/drain grace, then cancel the standard-library owned child
+context; the context is released when the body returns. A body that ignores
+cancellation must retain blocked authority until it actually completes. This
+adds no process manager, public completion field, schema, or retry policy.
+
 Process-owning signal/context callers issue shutdown once and wait for daemon
 `Done` before returning. A refused shutdown keeps reaper, daemon reference and
 control serving authority alive. Lease release alone does not retry that request;

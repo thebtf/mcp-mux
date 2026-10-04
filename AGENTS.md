@@ -123,6 +123,13 @@ and registration/rejection in every owner mode, not only `SessionHandler`.
 Serialize late admission against listener closure; handoff/retirement must join
 that settlement without changing public `PendingRequests` or nil-authorizer defaults.
 
+Every configured frame hook reserves through actual return regardless of owner
+mode; 1ms verdict timeout is not settlement. For in-process HandlerFunc, closed
+bookkeeping or requested cancellation is not retirement proof: actual body/pipe
+`Done` is required. Preserve EOF/drain grace before owned child cancellation,
+and keep ignoring-cancellation work blocked. Fixture cleanup releases barriers
+before Shutdown; never preclose Done, re-pin synthetic proof, or weaken deadlines.
+
 A durable `HOLDING` seed has provisional timing and never grants replacement.
 After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
 TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
