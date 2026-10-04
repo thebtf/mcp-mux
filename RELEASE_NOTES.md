@@ -258,16 +258,27 @@ valid. Clean ceb root/vet/actual0.31.0/public1191/R1 PASS, full-module24/25 and
 coverage reserved-write FAIL retained. Historical fixture-only c0 full-module race
 passed25/25 packages/2021 positive leaves/4 explicit skips and both vet. Its reused
 root/public1191/R1 artifact retains actual ceb provenance, not a newly built c0
-binary. Current pushed b86a998 changes production for retirement publication and
-blocked-renewal retry: native Linux original+renewed_blocked2 normal/race, async12
-and expiry8 race PASS, zero skips/data races. Initial c0 RED and first-fix renewal
-RED retain separate scopes. The exact-hash checker is SOURCE-only, not runtime
-assurance. Exact b86 [CI37221621672](https://github.com/thebtf/mcp-mux/actions/runs/37221621672)
-passed all5 jobs. Parent read back the retirement reply and resolved the last
-thread; all27 known threads are now resolved, not a fresh all-PR CLEAN verdict.
-Current Linux full gates/artifact and final-head enumeration remain pending;
-prior artifacts do not certify changed production. No local Windows public
-positive, freeze or release completion is claimed.
+binary. B86a998 changes production for retirement publication/blocked-renewal
+retry: native Linux original+renewed_blocked2 normal/race, async12 and expiry8 race
+PASS, zero skips/data races. Initial c0 RED and first-fix renewal RED retain their
+scopes; checker SOURCE PASS is not runtime assurance. Actual clean b86 Linux
+root-race306 positive/1 SKIP, module-race2023 positive/4 SKIP (25/25 packages),
+both vet0 and Scenario11 1191/1191 PASS now bind a new CGO0/trimpath artifact with
+clean embedded b86/owner0.31.0. R1 100/100+8 PASS uses a separate CGO1 script-built
+binary, not the release artifact. Both initial public startup refusals remain;
+exact private ancestor775→0700 plus one fresh re-entry per script yielded PASS,
+without source changes or suite/vet/release-build repeats. Exact
+[b86 CI37221621672](https://github.com/thebtf/mcp-mux/actions/runs/37221621672) and
+docs-only [44 CI37222579349](https://github.com/thebtf/mcp-mux/actions/runs/37222579349)
+passed all5 jobs; doc44's evidence check is bounded SOURCE-facts PASS.
+Committed c183 reaper repair has causal failure-latch RED→two normal PASS and
+race3 top-level/5 named PASS rows including parents, zero skips/races. Independent
+timer scheduling removal is SOURCE-only, not a runtime multiplicity assertion.
+Actual reaper reply/readback/native resolution leaves29 known/28 resolved; prior
+27 all-resolved is historical. Owner P1 is still pending: frozen first-fix
+connected-path two-era GREEN/race plus8 complement PASS is not parked-idle or
+final-source acceptance. B86 artifacts do not certify c183 or owner WIP. No fresh
+final all-PR CLEAN, local Windows public positive, freeze or release completion.
 
 These are technical-check facts, not final release verdicts. The release root
 separately proves the actual version-baked artifact, exact merged head, remote
