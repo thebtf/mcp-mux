@@ -68,11 +68,14 @@ func (s *Server) Start() {
 		return
 	}
 	s.started = true
+	// Reserve the accept producer before Close can wait on an empty group.
+	s.wg.Add(1)
 	s.mu.Unlock()
 	go s.acceptLoop()
 }
 
 func (s *Server) acceptLoop() {
+	defer s.wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			if s.isClosed() {

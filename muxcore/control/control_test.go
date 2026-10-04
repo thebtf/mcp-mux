@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -470,6 +471,7 @@ func TestAcceptLoopBacksOffAfterTransientAcceptError(t *testing.T) {
 	}
 
 	done := make(chan struct{})
+	srv.wg.Add(1)
 	go func() {
 		srv.acceptLoop()
 		close(done)
@@ -971,6 +973,11 @@ func TestCloseIdempotent(t *testing.T) {
 
 	srv.Close()
 	srv.Close() // second close must be a no-op, not a panic
+	srv.Start()
+	if conn, err := ipc.DialTimeout(path, 100*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("closed ordinary server restarted")
+	}
 }
 
 func TestPausedServerDoesNotDispatchUntilStart(t *testing.T) {
@@ -1008,6 +1015,233 @@ func TestPausedServerDoesNotDispatchUntilStart(t *testing.T) {
 	srv.Close()
 	srv.Close()
 	srv.Start()
+}
+
+type gatedAcceptListener struct {
+	net.Listener
+	accepted   chan struct{}
+	release    <-chan struct{}
+	closed     chan struct{}
+	acceptOnce sync.Once
+}
+
+func (l *gatedAcceptListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.acceptOnce.Do(func() {
+			close(l.accepted)
+			<-l.release
+		})
+	}
+	return conn, err
+}
+
+func (l *gatedAcceptListener) Close() error {
+	err := l.Listener.Close()
+	close(l.closed)
+	return err
+}
+
+func TestPausedServerCloseWaitsForAcceptLoop(t *testing.T) {
+	path := testSocketPath(t)
+	srv, err := NewPausedServer(path, &mockHandler{}, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	ln := &gatedAcceptListener{
+		Listener: srv.listener,
+		accepted: make(chan struct{}),
+		release:  release,
+		closed:   make(chan struct{}),
+	}
+	srv.listener = ln
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		srv.Close()
+	})
+	srv.Start()
+	conn, err := ipc.DialTimeout(path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	select {
+	case <-ln.accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("real control connection was not accepted")
+	}
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-ln.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("control listener did not close")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned while accept producer still owned a connection")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not drain the accept producer")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if n, err := conn.Read(b[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("connection accepted during Close: read = %d, %v, want EOF", n, err)
+	}
+}
+
+func TestPausedServerStartCloseOverlap(t *testing.T) {
+	for i := range 32 {
+		path := testSocketPath(t)
+		srv, err := NewPausedServer(path, &mockHandler{}, testLogger(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(srv.Close)
+		start := make(chan struct{})
+		started, closed := make(chan struct{}), make(chan struct{})
+		go func() {
+			<-start
+			srv.Start()
+			close(started)
+		}()
+		go func() {
+			<-start
+			srv.Close()
+			close(closed)
+		}()
+		close(start)
+		resp, err := SendWithTimeout(path, Request{Cmd: "ping"}, time.Second)
+		if err == nil && (resp == nil || !resp.OK || resp.Message != "pong") {
+			t.Fatalf("iteration %d: invalid concurrent ping response: %+v", i, resp)
+		}
+		for _, done := range []<-chan struct{}{started, closed} {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iteration %d: Start/Close did not finish", i)
+			}
+		}
+		srv.Start()
+		if conn, err := ipc.DialTimeout(path, 100*time.Millisecond); err == nil {
+			conn.Close()
+			t.Fatalf("iteration %d: closed paused server restarted", i)
+		}
+	}
+}
+
+func TestPausedServerCloseBeforeStart(t *testing.T) {
+	path := testSocketPath(t)
+	srv, err := NewPausedServer(path, &mockHandler{}, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close waited for a producer that was never started")
+	}
+	srv.Start()
+	if conn, err := ipc.DialTimeout(path, 100*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("canceled paused server started accepting")
+	}
+}
+
+func TestServerCloseDrainsAcceptedHandler(t *testing.T) {
+	for _, protocolEra := range []string{"", "2026-07-28"} {
+		t.Run("era="+protocolEra, func(t *testing.T) {
+			path := testSocketPath(t)
+			started, release := make(chan struct{}), make(chan struct{})
+			handler := &mockDaemonHandler{spawnStarted: started, spawnRelease: release}
+			srv, err := NewPausedServer(path, handler, testLogger(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			accepted := make(chan struct{})
+			close(accepted)
+			ln := &gatedAcceptListener{
+				Listener: srv.listener,
+				accepted: make(chan struct{}),
+				release:  accepted,
+				closed:   make(chan struct{}),
+			}
+			srv.listener = ln
+			var releaseOnce sync.Once
+			t.Cleanup(func() {
+				releaseOnce.Do(func() { close(release) })
+				srv.Close()
+			})
+			srv.Start()
+			conn, err := ipc.DialTimeout(path, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.NewEncoder(conn).Encode(Request{Cmd: "spawn", Command: "fixture", ProtocolEra: protocolEra}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("control handler did not start")
+			}
+			closed := make(chan struct{})
+			go func() {
+				srv.Close()
+				close(closed)
+			}()
+			select {
+			case <-ln.closed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("listener did not close during handler drain")
+			}
+			select {
+			case <-closed:
+				t.Fatal("Close returned before accepted handler completed")
+			case <-time.After(100 * time.Millisecond):
+			}
+			releaseOnce.Do(func() { close(release) })
+			reader := bufio.NewReader(conn)
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				t.Fatal(err)
+			}
+			var resp Response
+			if err := json.Unmarshal(line, &resp); err != nil || !resp.OK || resp.ProtocolEra != protocolEra {
+				t.Fatalf("accepted response lost during drain: %+v, err=%v", resp, err)
+			}
+			if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+				t.Fatalf("drained control connection did not reach EOF: %v", err)
+			}
+			select {
+			case <-closed:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Close did not finish after handler drain")
+			}
+		})
+	}
 }
 
 func TestCloseRemovesSocketPath(t *testing.T) {
@@ -1059,6 +1293,7 @@ func TestAcceptLoopClosedServerRecoversAcceptPanic(t *testing.T) {
 	srv.closed = true
 
 	done := make(chan struct{})
+	srv.wg.Add(1)
 	go func() {
 		defer close(done)
 		srv.acceptLoop()
@@ -1078,6 +1313,7 @@ func TestAcceptLoopUnexpectedPanicPropagates(t *testing.T) {
 		done:     make(chan struct{}),
 	}
 
+	srv.wg.Add(1)
 	defer func() {
 		if r := recover(); r == nil {
 			t.Fatal("acceptLoop swallowed unexpected panic")
@@ -1111,6 +1347,7 @@ func TestAcceptLoopUnexpectedNetErrClosedLogs(t *testing.T) {
 		done:     make(chan struct{}),
 	}
 
+	srv.wg.Add(1)
 	srv.acceptLoop()
 
 	if got := buf.String(); !strings.Contains(got, "unexpected listener close") {
