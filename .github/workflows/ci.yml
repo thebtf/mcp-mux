@@ -204,7 +204,7 @@ jobs:
             $env:UV_NO_CONFIG = 'true'
             $env:UV_DEFAULT_INDEX = 'https://pypi.org/simple'
             $env:UV_PYTHON_DOWNLOADS = 'automatic'
-            $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+            $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
             $env:UV_PYTHON = '3.12.11'
             $uvPrefix = Join-Path $artifactRoot 'uv-prefix'
             & $python -m pip --isolated install --disable-pip-version-check --ignore-installed --no-deps --only-binary=:all: `
