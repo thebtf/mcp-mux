@@ -26,13 +26,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/thebtf/mcp-mux/internal/mcpserver"
@@ -414,9 +412,7 @@ func runStop(drainTimeout time.Duration, force bool) int {
 	}
 	if pingErr != nil {
 		// Only a missing, refused, or non-socket endpoint permits legacy fallback.
-		var dialErr *net.OpError
-		nonSocketEndpoint := errors.As(pingErr, &dialErr) && dialErr.Op == "dial" && errors.Is(dialErr, syscall.ENOTSOCK)
-		if !errors.Is(pingErr, os.ErrNotExist) && !errors.Is(pingErr, syscall.ECONNREFUSED) && !nonSocketEndpoint {
+		if !daemonEndpointAbsent(pingErr) {
 			fmt.Fprintf(os.Stderr, "  daemon: error: %s\n", lifecycleErrorText(pingErr))
 			return 1
 		}

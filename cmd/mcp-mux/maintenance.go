@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"syscall"
@@ -137,13 +138,23 @@ func acquireMaintenanceMutation() (io.Closer, error) {
 	return lock, nil
 }
 
+func daemonEndpointAbsent(err error) bool {
+	var socketErr *net.OpError
+	if errors.As(err, &socketErr) {
+		return socketErr.Op == "dial" && (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOTSOCK))
+	}
+	// Named-pipe dialing reports a missing pipe as an open PathError.
+	var pipeErr *os.PathError
+	return errors.As(err, &pipeErr) && pipeErr.Op == "open" && errors.Is(err, os.ErrNotExist)
+}
+
 func checkMaintenanceMutationStatus() error {
 	response, err := launcherControlSendWithTimeout(serverid.DaemonControlPath("", engineName), control.Request{Cmd: "status"}, 5*time.Second)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+		if daemonEndpointAbsent(err) {
 			return nil // Persisted authority was proven clear under the same lock.
 		}
-		return control.ErrMaintenanceUnsupported
+		return err
 	}
 	if err := response.Err(); err != nil {
 		return err

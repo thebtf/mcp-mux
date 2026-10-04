@@ -3,7 +3,10 @@ package engine
 import (
 	"encoding/json"
 	"errors"
+	"net"
+	"os"
 	"strings"
+	"syscall"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
@@ -18,21 +21,28 @@ func isMaintenanceFence(err error) bool {
 	return errors.Is(err, control.ErrMaintenanceHeld) || errors.Is(err, control.ErrMaintenanceRetirementBlocked) || errors.Is(err, control.ErrMaintenancePersistenceFailed)
 }
 
+func activationEndpointAbsent(err error) bool {
+	var socketErr *net.OpError
+	if errors.As(err, &socketErr) {
+		return socketErr.Op == "dial" && (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOTSOCK))
+	}
+	// Named-pipe dialing reports a missing pipe as an open PathError.
+	var pipeErr *os.PathError
+	return errors.As(err, &pipeErr) && pipeErr.Op == "open" && errors.Is(err, os.ErrNotExist)
+}
+
 // The caller owns the namespace lock until activation and replacement settle.
 func (e *MuxEngine) checkMaintenanceForActivation() error {
 	path := e.ControlSocketPath()
 	if err := daemon.CheckMaintenanceForActivation(e.cfg.Namespace, path); err != nil {
 		return err
 	}
-	if !engineIsDaemonRunning(path) {
-		if engineControlSocketAvailable(path) {
-			return control.ErrMaintenanceUnsupported
-		}
-		return nil
-	}
 	response, err := engineControlSend(path, control.Request{Cmd: "status"})
 	if err != nil {
-		return control.ErrMaintenanceUnsupported
+		if activationEndpointAbsent(err) {
+			return nil // Persisted authority was proven clear under the same lock.
+		}
+		return err
 	}
 	if err := response.Err(); err != nil {
 		return err
