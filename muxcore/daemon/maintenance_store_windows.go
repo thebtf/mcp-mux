@@ -5,7 +5,6 @@ package daemon
 import (
 	"errors"
 	"os"
-	"path/filepath"
 	"unsafe"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
