@@ -283,3 +283,163 @@ func TestMaintenanceRetirementPublicationRetriesNamespaceContentionWithoutReaper
 		})
 	}
 }
+
+func TestMaintenanceRetirementPublicationLockFailureStaysFencedWithoutReaper(t *testing.T) {
+	for _, scenario := range []string{"callback", "retirement_timer"} {
+		t.Run(scenario, func(t *testing.T) {
+			d := maintenanceDaemon(t) // Direct New, without NewReaper or reconciliation.
+			b := newMaintenanceNativeBarrier(t)
+			d.sessionHandler = &maintenanceNotificationWork{barrier: b}
+			initial, entry, conn, frames := maintenanceNativeIPC(t, d, era.EraLegacy)
+			identity := captureOwnerEntryIdentity(entry)
+			maintenanceNativeSend(t, conn, era.EraLegacy, "1", "initialize")
+			maintenanceNativeRead(t, frames, "1")
+			maintenanceNativeSend(t, conn, era.EraLegacy, "", "maintenance/native-notification")
+			maintenanceNativeEntered(t, b)
+			result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: initial.ServerID, HoldTTLMS: maintenanceTTL(60000)}, 5*time.Second)
+			if !errors.Is(err, control.ErrMaintenanceRetirementBlocked) || result == nil || result.State != control.MaintenanceRetirementBlocked || result.TreesRetired {
+				t.Fatalf("live native producer did not retain blocked authority: %+v %v", result, err)
+			}
+			maintenanceNativeRetained(t, d, entry)
+			ledgerBefore, err := os.ReadFile(d.maintenancePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transactionBefore, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retry *maintenanceLease
+			if scenario == "retirement_timer" {
+				lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = lock.Close() })
+				b.open()
+				waitForDaemonCondition(t, 5*time.Second, func() bool {
+					return d.Entry(entry.ServerID) == nil && entry.Owner.MaintenanceRetired()
+				}, "actual callback return did not retire the exact owner")
+				// Pause only an automatically owned retry that has not fired, so the
+				// real namespace path can be replaced without an acquisition race.
+				waitForDaemonCondition(t, 5*time.Second, func() bool {
+					d.maintenanceGate.Lock()
+					defer d.maintenanceGate.Unlock()
+					lease := d.maintenanceLeases[result.HoldID]
+					if lease == nil || lease.result != *result || !lease.retirementRetry || lease.timer == nil || !lease.timer.Stop() {
+						return false
+					}
+					retry = lease
+					return true
+				}, "real retirement callback did not retain an exact-lease contention retry")
+				if d.maintenanceStatusCode() != "" {
+					t.Fatal("namespace contention poisoned persistence authority")
+				}
+				if err := lock.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			lockPath := d.maintenanceLockPath
+			saved := lockPath + ".retirement-original"
+			if err := os.Rename(lockPath, saved); err != nil {
+				t.Fatal(err)
+			}
+			restored := false
+			restore := func() {
+				t.Helper()
+				if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if err := os.Rename(saved, lockPath); err != nil {
+					t.Fatal(err)
+				}
+				restored = true
+			}
+			t.Cleanup(func() {
+				if !restored {
+					restore()
+				}
+			})
+			// A directory at the private daemon's actual namespace lock path fails
+			// os.OpenFile on both platforms; this is not an injected error verdict.
+			if err := os.Mkdir(lockPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			probe, lockErr := ipc.AcquireFileLock(lockPath)
+			if probe != nil {
+				_ = probe.Close()
+			}
+			if lockErr == nil || errors.Is(lockErr, ipc.ErrFileLocked) {
+				t.Fatalf("fixture did not produce an actual non-contention lock error: %v", lockErr)
+			}
+			d.maintenanceRetirementChanged(&OwnerEntry{ServerID: identity.serverID, ProtocolEra: identity.protocolEra, OwnerGeneration: identity.ownerGeneration})
+			if d.maintenanceStatusCode() != "" {
+				t.Fatal("a noncurrent entry latched another generation's authority")
+			}
+			if retry != nil {
+				func() {
+					d.maintenanceGate.Lock()
+					defer d.maintenanceGate.Unlock()
+					if d.maintenanceLeases[result.HoldID] != retry || retry.result != *result {
+						t.Fatal("namespace failure fixture lost the current retry lease or its clocks")
+					}
+					// Rearm the same production timer/lease after the path swap, without
+					// changing expiry/drain or relying on another retirement callback.
+					d.scheduleMaintenanceTimerLocked(retry, 100*time.Millisecond, true)
+				}()
+			} else {
+				b.open() // The existing exact-entry finalizer invokes the real callback.
+			}
+			waitForDaemonCondition(t, 5*time.Second, func() bool {
+				return d.maintenanceStatusCode() == control.ErrMaintenancePersistenceFailed.Code
+			}, "non-contention retirement publication lock failure did not latch persistence authority without a reaper")
+			waitForDaemonCondition(t, 5*time.Second, func() bool {
+				return d.Entry(entry.ServerID) == nil && entry.Owner.MaintenanceRetired()
+			}, "persistence failure lost already-owned exact-entry finalization")
+			if !identity.matches(entry) || b.entered.Load() != 1 || b.returned.Load() != 1 {
+				t.Fatal("lock failure changed the retired generation or replayed native work")
+			}
+			restore()
+			d.maintenanceRetirementChanged(entry)
+			response, err := control.SendWithTimeout(d.ctlSrv.SocketPath(), control.Request{Cmd: "status"}, 2*time.Second)
+			if err != nil || response == nil || !response.OK {
+				t.Fatalf("failed-authority status unavailable: %+v %v", response, err)
+			}
+			var status struct {
+				Code        control.MaintenanceErrorCode `json:"maintenance_error_code"`
+				Maintenance []control.MaintenanceResult  `json:"maintenance"`
+			}
+			if err := json.Unmarshal(response.Data, &status); err != nil {
+				t.Fatal(err)
+			}
+			if status.Code != control.ErrMaintenancePersistenceFailed.Code || len(status.Maintenance) != 1 || status.Maintenance[0] != *result {
+				t.Fatalf("recovered lock path cleared the latch or changed accepted lease clocks: %+v", status)
+			}
+			for _, command := range []string{entry.Command, entry.Command + "-unrelated"} {
+				spawn := control.Request{Cmd: "spawn", Command: command, Mode: "isolated", Cwd: t.TempDir()}
+				response, err := control.SendWithTimeout(d.ctlSrv.SocketPath(), spawn, 2*time.Second)
+				if err != nil || response == nil || !errors.Is(response.Err(), control.ErrMaintenancePersistenceFailed) || response.Token != "" || response.IPCPath != "" {
+					t.Fatalf("lock failure admitted %q after the path recovered: %+v %v", command, response, err)
+				}
+			}
+			for _, cmd := range []string{"renew", "resume"} {
+				updated, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: cmd, HoldID: result.HoldID}, 2*time.Second)
+				if !errors.Is(err, control.ErrMaintenancePersistenceFailed) || updated == nil || *updated != *result {
+					t.Fatalf("lock failure allowed %s to mutate accepted authority: %+v %v", cmd, updated, err)
+				}
+			}
+			if _, err := d.HandleShutdownWithError(0); !errors.Is(err, control.ErrMaintenancePersistenceFailed) || d.shuttingDown.Load() {
+				t.Fatalf("lock failure lost the lifecycle fence: %v", err)
+			}
+			ledgerAfter, ledgerErr := os.ReadFile(d.maintenancePath)
+			transactionAfter, transactionErr := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+			if ledgerErr != nil || transactionErr != nil || !bytes.Equal(ledgerBefore, ledgerAfter) || !bytes.Equal(transactionBefore, transactionAfter) {
+				t.Fatalf("lock failure changed durable predecessor bytes: ledger=%v transaction=%v", ledgerErr, transactionErr)
+			}
+			if _, _, ledger, err := readMaintenanceAuthority(d.namespace, d.ctlSrv.SocketPath()); err != nil || ledger == nil || len(ledger.Leases) != 1 || ledger.Leases[0].State != control.MaintenanceRetirementBlocked {
+				t.Fatalf("failed publication lost durable blocked recovery authority: %+v %v", ledger, err)
+			}
+			maintenanceNativeNoReply(t, frames)
+		})
+	}
+}

@@ -482,21 +482,23 @@ func (d *Daemon) finishMaintenanceRetirementLocked(lease *maintenanceLease) erro
 func (d *Daemon) maintenanceRetirementChanged(entry *OwnerEntry) {
 	lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
 	if err != nil {
-		if errors.Is(err, ipc.ErrFileLocked) {
-			d.maintenanceGate.Lock()
-			defer d.maintenanceGate.Unlock()
-			if d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
-				return
+		d.maintenanceGate.Lock()
+		defer d.maintenanceGate.Unlock()
+		if d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
+			return
+		}
+		for _, lease := range d.maintenanceLeases {
+			if lease.result.State == control.MaintenanceHeld {
+				continue
 			}
-			for _, lease := range d.maintenanceLeases {
-				if lease.result.State != control.MaintenanceRetirementBlocked || lease.retirementRetry {
-					continue
-				}
-				for _, pin := range lease.pins {
-					if pin.entry == entry && pin.identity.matches(entry) {
+			for _, pin := range lease.pins {
+				if pin.entry == entry && pin.identity.matches(entry) {
+					if !errors.Is(err, ipc.ErrFileLocked) {
+						d.maintenanceFailed = true
+					} else if lease.result.State == control.MaintenanceRetirementBlocked && !lease.retirementRetry {
 						d.scheduleMaintenanceTimerLocked(lease, 100*time.Millisecond, true)
-						break
 					}
+					break
 				}
 			}
 		}
@@ -562,7 +564,9 @@ func (d *Daemon) scheduleMaintenanceTimerLocked(lease *maintenanceLease, delay t
 				d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
 				return
 			}
-			if errors.Is(err, ipc.ErrFileLocked) && (!retirement ||
+			if retirement && !errors.Is(err, ipc.ErrFileLocked) {
+				d.maintenanceFailed = true
+			} else if errors.Is(err, ipc.ErrFileLocked) && (!retirement ||
 				lease.result.State == control.MaintenanceRetirementBlocked && d.maintenanceTreesRetiredLocked(lease)) {
 				d.scheduleMaintenanceTimerLocked(lease, 100*time.Millisecond, retirement)
 			} else if retirement {

@@ -71,6 +71,11 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   exact-lease timer without a reaper. Successful blocked renewal preserves pending
   retry intent on the replacement lease's guarded timer, retaining the original
   drain deadline and legitimately accepted expiry; stale callbacks stay fenced.
+- Non-contention namespace-lock failure during exact-current pending retirement
+  callback or current retirement timer now latches existing `maintenanceFailed`
+  authority. Direct consumers without a reaper fail closed instead of silently
+  losing publication intent. Contention and renewed-blocked retry remain unchanged;
+  no new state, scheduler, clock reset or authority-deletion bypass is added.
 - Recovered lease timers and control request serving activate only after daemon
   construction succeeds. Failed registry/control setup cannot leave a stale
   expiry timer that later overwrites renewed authority; accepted expiry is unchanged.
@@ -280,6 +285,17 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   clone uses `.agent/tmp`,0.31.0 build/existing Scenario11. Only redacted windows.json/
   build-receipt.json upload; ordinary triggers/tests unchanged. Actual job/JSON
   hashes are recorded in release evidence; no local profile/ACL/bypass effects.
+  Later bounded daemon proof on immutable315+only53cd/d504 establishes actual
+  original71dc callback/timer lock-error RED2 leaves, then normal/race PASS each
+  3 top-level/5 positive leaves,0 SKIP/race warnings/stderr,each invocation once.
+  Actual OS path errors exercise native retirement and unchanged clocks/durable
+  bytes/fences/stale-entry guards; root accepts scoped behavior, not new full CI,
+  artifact or release proof. Receipt/full hashes are in release evidence.
+  Fresh exact344 root enumeration artifact1349 records33 threads,31 resolved,
+  2 unresolved,hasNextPage=false: daemon P2 comment4179066572 and update-fallback
+  P1 comment4179436225. Daemon scoped acceptance is not remote resolution; engine/
+  cmd correction proof and critical CI workflow remain in progress,not proven.
+  No all33-resolved,merge-ready or final acceptance claim.
   Historical8142 proofs/failures remain scoped. No all-PR CLEAN or delivery claim.
 
 ### Rollback
