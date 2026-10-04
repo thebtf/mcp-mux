@@ -565,6 +565,9 @@ func (p *Process) ReadLine() ([]byte, error) {
 //     x-mux.drainTimeout capability (default: 5s).
 //  3. If still alive: proc.GracefulKill() — SIGTERM→wait→SIGKILL on Unix,
 //     CTRL_BREAK_EVENT→wait→TerminateJobObject on Windows. Kills the whole tree.
+//
+// Handler-based processes may outlive this wait; RetirementProven requires
+// actual handler completion, not just Close returning successfully.
 func (p *Process) Close() error {
 	p.closeMu.Lock()
 	defer p.closeMu.Unlock()
@@ -625,13 +628,13 @@ func (p *Process) PID() int {
 }
 
 // RetirementProven reports whether this Process no longer owns a live process
-// tree authority. Attached OS processes require both Process.Done and retired
-// process-group/Job authority. A committed detach is also terminal for this
-// owner because authority has transferred to the successor.
+// tree authority. Handler-based processes require actual completion via
+// Process.Done. Attached OS processes additionally require retired process-group/
+// Job authority. A committed detach is terminal for this owner because authority
+// has transferred to the successor.
 func (p *Process) RetirementProven() bool {
 	p.mu.Lock()
 	detach := p.detach
-	closed := p.closed
 	hasOSProcess := p.proc != nil || p.pid > 0
 	p.mu.Unlock()
 
@@ -639,7 +642,12 @@ func (p *Process) RetirementProven() bool {
 		return true
 	}
 	if !hasOSProcess {
-		return closed
+		select {
+		case <-p.Done:
+			return true
+		default:
+			return false
+		}
 	}
 
 	p.finalizeMu.Lock()
@@ -840,7 +848,8 @@ func (p *Process) AbortDetach() error {
 // the handler goroutine returns.
 //
 // The returned Process has PID() == 0 and no procgroup backing; Close() closes
-// the stdin pipe (EOF signal) and waits for the handler to exit.
+// the stdin pipe (EOF signal) and waits up to the drain timeout for the handler
+// to exit; Done proves actual handler completion.
 func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context, stdin io.Reader, stdout io.Writer) error) *Process {
 	// stdinR → handler reads its "stdin" from here
 	// stdinW → process.WriteLine writes here

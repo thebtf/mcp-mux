@@ -42,16 +42,6 @@ func TestBeginExitFinalizationSerializesDetachLease(t *testing.T) {
 	})
 }
 
-func TestCloseRetriesAbortedDetachFinalization(t *testing.T) {
-	p := &Process{detach: detachAborted, Done: make(chan struct{})}
-	if err := p.Close(); err != nil {
-		t.Fatalf("Close() after aborted detach: %v", err)
-	}
-	if !p.RetirementProven() {
-		t.Fatal("Close() did not prove retirement for aborted detach")
-	}
-}
-
 func TestCloseDoesNotFinalizeCommittedDetach(t *testing.T) {
 	p := &Process{detach: detachCommitted, Done: make(chan struct{})}
 	if err := p.Close(); err != nil {
@@ -62,6 +52,93 @@ func TestCloseDoesNotFinalizeCommittedDetach(t *testing.T) {
 	p.mu.Unlock()
 	if closed {
 		t.Fatal("Close() reclaimed authority after committed detach")
+	}
+}
+
+func TestHandlerRetirementRequiresActualCompletion(t *testing.T) {
+	for _, method := range []string{"Close", "SoftClose"} {
+		t.Run(method, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelled := make(chan struct{})
+			stdinClosed := make(chan error, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			p := NewProcessFromHandler(ctx, func(ctx context.Context, stdin io.Reader, _ io.Writer) error {
+				<-ctx.Done()
+				close(cancelled)
+				_, err := io.Copy(io.Discard, stdin)
+				stdinClosed <- err
+				<-release
+				return err
+			})
+			t.Cleanup(func() {
+				cancel()
+				releaseOnce.Do(func() { close(release) })
+				_ = p.stdin.Close()
+				select {
+				case <-p.Done:
+					_ = p.Close()
+				case <-time.After(2 * time.Second):
+					t.Error("released handler did not complete during cleanup")
+				}
+			})
+			cancel()
+			select {
+			case <-cancelled:
+			case <-time.After(2 * time.Second):
+				t.Fatal("handler did not observe cancellation")
+			}
+			if p.RetirementProven() || p.TreesDead() {
+				t.Error("cancellation alone proved handler retirement")
+			}
+
+			p.SetDrainTimeout(time.Millisecond)
+			if method == "Close" {
+				if err := p.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			} else if code, err := p.SoftClose(0); code != -1 || err == nil {
+				t.Fatalf("SoftClose = (%d, %v), want handler timeout", code, err)
+			}
+			select {
+			case err := <-stdinClosed:
+				if err != nil {
+					t.Fatalf("handler stdin close: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("close did not signal handler stdin EOF")
+			}
+			select {
+			case <-p.Done:
+				t.Fatal("handler completed before explicit body release")
+			default:
+			}
+			if p.RetirementProven() {
+				t.Error("close proved retirement while handler body was still running")
+			}
+			if p.TreesDead() {
+				t.Error("close proved tree death while handler body was still running")
+			}
+
+			releaseOnce.Do(func() { close(release) })
+			select {
+			case <-p.Done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("handler did not complete after explicit body release")
+			}
+			if !p.RetirementProven() || !p.TreesDead() {
+				t.Error("actual handler completion did not prove retirement and tree death")
+			}
+		})
+	}
+}
+
+func TestRetirementProvenRejectsUnobservedHandlerCompletion(t *testing.T) {
+	for _, done := range []chan struct{}{nil, make(chan struct{})} {
+		p := &Process{closed: true, Done: done}
+		if p.RetirementProven() || p.TreesDead() {
+			t.Fatal("closed bookkeeping without observed Done proved handler retirement")
+		}
 	}
 }
 
