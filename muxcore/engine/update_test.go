@@ -1082,7 +1082,22 @@ func TestUpdateRestartLiveEndpointFailurePreservesOwnerAndHost(t *testing.T) {
 				config := t.TempDir()
 				t.Setenv("APPDATA", config)
 				t.Setenv("XDG_CONFIG_HOME", config)
-				eng := maintenanceProbeEngine(t)
+				base, err := os.MkdirTemp(os.TempDir(), "mp*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.RemoveAll(base) })
+				// Keep isolated owner sockets within Darwin's path limit under the unchanged temp root.
+				eng, err := New(Config{
+					Name:       "update-test",
+					Namespace:  filepath.Base(base),
+					Command:    "test-command",
+					BaseDir:    base,
+					DaemonFlag: "--test-daemon",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
 				engineCheckMaintenanceForActivation = (*MuxEngine).checkMaintenanceForActivation
 				engineDaemonIdentity = daemonIdentityFromStatus
 				engineControlSend = control.Send
