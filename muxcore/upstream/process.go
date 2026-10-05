@@ -58,6 +58,16 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 		_ = p.stdin.Close()
 	}
 
+	// Completion wins even when a zero-grace timer is also ready.
+	select {
+	case <-p.Done:
+	default:
+		select {
+		case <-p.Done:
+		case <-time.After(timeout):
+		}
+	}
+
 	select {
 	case <-p.Done:
 		if err := p.finalizeOwnedTree(); err != nil {
@@ -65,7 +75,7 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 		}
 		p.markClosed()
 		return softCloseExitCode(p.ExitErr), nil
-	case <-time.After(timeout):
+	default:
 	}
 
 	if p.proc != nil || p.pid > 0 {
@@ -79,6 +89,9 @@ func (p *Process) SoftClose(timeout time.Duration) (int, error) {
 			return -1, fmt.Errorf("upstream: process tree did not exit after termination")
 		}
 		return softCloseExitCode(p.ExitErr), fmt.Errorf("upstream: forced kill after soft-close timeout")
+	}
+	if p.handlerCancel != nil {
+		p.handlerCancel()
 	}
 	return -1, fmt.Errorf("upstream: handler did not exit after %v", timeout)
 }
@@ -215,13 +228,15 @@ type Process struct {
 	lineBuf *lineBuffer
 
 	mu            sync.Mutex
+	writeMu       sync.Mutex // line serialization; retirement never waits for stdin I/O
 	closeMu       sync.Mutex
 	finalizeMu    sync.Mutex
 	closed        bool
 	retiring      bool
 	treeFinalized bool
 	detach        detachState
-	drainTimeout  time.Duration // from x-mux.drainTimeout; overrides default 5s stdin-close wait
+	drainTimeout  time.Duration      // from x-mux.drainTimeout; overrides default 5s stdin-close wait
+	handlerCancel context.CancelFunc // owned handler lifetime; nil for OS processes
 
 	// Done is closed when the process exits.
 	Done chan struct{}
@@ -515,18 +530,22 @@ func finalizeFailedStart(p *Process, proc *procgroup.Process, pipes ...*os.File)
 
 // WriteLine sends a line of data to the upstream process stdin, followed by newline.
 func (p *Process) WriteLine(data []byte) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed || p.retiring {
+	unavailable := p.closed || p.retiring
+	stdin := p.stdin
+	p.mu.Unlock()
+	if unavailable {
 		return fmt.Errorf("upstream: process closed")
 	}
 
-	_, err := p.stdin.Write(data)
+	_, err := stdin.Write(data)
 	if err != nil {
 		return fmt.Errorf("upstream: write: %w", err)
 	}
 
-	_, err = p.stdin.Write([]byte("\n"))
+	_, err = stdin.Write([]byte("\n"))
 	if err != nil {
 		return fmt.Errorf("upstream: write newline: %w", err)
 	}
@@ -550,6 +569,9 @@ func (p *Process) ReadLine() ([]byte, error) {
 //     x-mux.drainTimeout capability (default: 5s).
 //  3. If still alive: proc.GracefulKill() — SIGTERM→wait→SIGKILL on Unix,
 //     CTRL_BREAK_EVENT→wait→TerminateJobObject on Windows. Kills the whole tree.
+//
+// Handler-based processes may outlive this wait; RetirementProven requires
+// actual handler completion, not just Close returning successfully.
 func (p *Process) Close() error {
 	p.closeMu.Lock()
 	defer p.closeMu.Unlock()
@@ -592,6 +614,9 @@ func (p *Process) Close() error {
 		return err
 	}
 	if p.proc == nil && p.pid <= 0 {
+		if p.handlerCancel != nil {
+			p.handlerCancel()
+		}
 		p.markClosed()
 		return nil
 	}
@@ -610,13 +635,13 @@ func (p *Process) PID() int {
 }
 
 // RetirementProven reports whether this Process no longer owns a live process
-// tree authority. Attached OS processes require both Process.Done and retired
-// process-group/Job authority. A committed detach is also terminal for this
-// owner because authority has transferred to the successor.
+// tree authority. Handler-based processes require actual completion via
+// Process.Done. Attached OS processes additionally require retired process-group/
+// Job authority. A committed detach is terminal for this owner because authority
+// has transferred to the successor.
 func (p *Process) RetirementProven() bool {
 	p.mu.Lock()
 	detach := p.detach
-	closed := p.closed
 	hasOSProcess := p.proc != nil || p.pid > 0
 	p.mu.Unlock()
 
@@ -624,7 +649,12 @@ func (p *Process) RetirementProven() bool {
 		return true
 	}
 	if !hasOSProcess {
-		return closed
+		select {
+		case <-p.Done:
+			return true
+		default:
+			return false
+		}
 	}
 
 	p.finalizeMu.Lock()
@@ -636,6 +666,23 @@ func (p *Process) RetirementProven() bool {
 	select {
 	case <-p.Done:
 		return true
+	default:
+		return false
+	}
+}
+
+// TreesDead excludes transferred authority and requires actual handler/leader
+// completion as well as the OS tree finalizer's proof.
+func (p *Process) TreesDead() bool {
+	p.mu.Lock()
+	detach := p.detach
+	p.mu.Unlock()
+	if detach == detachCommitted || detach == detachLegacy || detach == detachPrepared {
+		return false
+	}
+	select {
+	case <-p.Done:
+		return p.RetirementProven()
 	default:
 		return false
 	}
@@ -653,6 +700,8 @@ func (p *Process) RetirementProven() bool {
 // Returns ErrAlreadyClosed if the process has been closed.
 // Returns ErrAlreadyDetached if Detach has already been called.
 func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -682,6 +731,8 @@ func (p *Process) Detach() (pid int, stdinFD uintptr, stdoutFD uintptr, err erro
 // DetachWithAuthority prepares a handoff while retaining the predecessor's
 // authority until the successor receives a duplicated handle.
 func (p *Process) DetachWithAuthority() (pid int, stdinFD, stdoutFD, stderrFD, authorityFD uintptr, err error) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
 	if p.closed || p.retiring {
 		p.mu.Unlock()
@@ -804,7 +855,8 @@ func (p *Process) AbortDetach() error {
 // the handler goroutine returns.
 //
 // The returned Process has PID() == 0 and no procgroup backing; Close() closes
-// the stdin pipe (EOF signal) and waits for the handler to exit.
+// the stdin pipe (EOF signal), waits up to the drain timeout, then cancels the
+// handler's child context if still running. Done proves actual handler completion.
 func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context, stdin io.Reader, stdout io.Writer) error) *Process {
 	// stdinR → handler reads its "stdin" from here
 	// stdinW → process.WriteLine writes here
@@ -814,11 +866,14 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 	// stdoutW → handler writes its responses here
 	stdoutR, stdoutW := io.Pipe()
 
+	handlerCtx, cancel := context.WithCancel(ctx)
+
 	p := &Process{
-		stdin:   stdinW,
-		stdout:  stdoutR,
-		Done:    make(chan struct{}),
-		lineBuf: newLineBuffer(),
+		stdin:         stdinW,
+		stdout:        stdoutR,
+		Done:          make(chan struct{}),
+		lineBuf:       newLineBuffer(),
+		handlerCancel: cancel,
 	}
 
 	go func() {
@@ -842,8 +897,9 @@ func NewProcessFromHandler(ctx context.Context, handler func(ctx context.Context
 	}()
 
 	go func() {
-		// handler runs until it returns or ctx is cancelled.
-		err := handler(ctx, stdinR, stdoutW)
+		// Cancellation requests shutdown; Done still follows actual return.
+		err := handler(handlerCtx, stdinR, stdoutW)
+		cancel()
 		// Signal EOF on stdout so ReadLine returns io.EOF.
 		stdoutW.CloseWithError(err)
 		// Drain stdin pipe (in case handler exited before reading all input).

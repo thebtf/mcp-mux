@@ -1,3 +1,458 @@
+# mcp-mux v0.31.0
+
+**Prepared:** 2026-10-03
+
+**Type:** Additive, optional minor release for the binary and muxcore library
+
+**Publication targets:** `v0.31.0` and `muxcore/v0.31.0`
+
+These notes prepare the #135 release annotation. Publication, final
+delivered-artifact verification, and the required Engram consumer handoff remain
+pending. Accepted-source validation is not a claim that consumers have received
+this release.
+
+## Summary
+
+v0.31.0 adds managed upstream maintenance so an installer can replace an
+executable without new managed starts racing the replacement. Hold closes
+admission, drains already-forwarded work, and proves full scoped process-tree
+death before granting a usable lease. The installer owns the actual file
+replacement. Resume or safe expiry permits fresh demand on the existing host
+transport; mcp-mux never replays held or terminated requests.
+
+Legacy remains the default. The explicit MCP `2026-07-28` R1 route retains
+same-era admission, forced isolation, cache-off/replay-off behavior, and
+snapshot/handoff quarantine.
+
+## Optional control APIs
+
+Use the exact local `server_id` from status and the returned opaque `hold_id`:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <returned-hold-id> --ttl 5m --json
+mcp-mux resume <returned-hold-id> --json
+```
+
+MCP tools `mux_hold`, `mux_resume`, and `mux_renew` delegate to the same local
+daemon. `mux_hold` accepts integer `hold_seconds` in 1..3600, default 300,
+and nonnegative `drain_timeout_ms`, default 10000. `mux_renew` uses the same
+TTL bounds. There is no substring, PID, foreign-engine, or direct-owner fallback.
+`mux_restart` uses daemon-owned `restart_owner` with the original exact context
+and era, rather than rebuilding a launch from ambient adapter credentials.
+
+Library consumers can adopt `control.SendMaintenance`, `Response.Err()`,
+`MaintenanceResult`, and typed `MaintenanceError` handling with `errors.Is` and
+`errors.As`. Optional `MaintenanceHandler`, `ShutdownWithErrorHandler`, and
+`OwnerRestartHandler` preserve existing consumer interfaces. See the
+[public library contract](muxcore/README.md#upstream-maintenance-control).
+Ordinary legacy `engine.New` users require no source changes. Products adopt
+the new control operations only when they need maintenance.
+
+## Lease and replacement safety
+
+- Replace a file only after a successful hold result reports durable `HELD`,
+  `trees_retired=true`, and a future `expires_at`. `HOLDING` and
+  `RETIREMENT_BLOCKED` remain fenced and do not authorize replacement.
+- Scope is the selected owner's finite already-admitted context set, partitioned
+  by daemon namespace, CWD, protocol era, and strict security/configuration
+  identity. Other contexts and unmanaged processes can still lock the file.
+  The lease is not a host-wide executable lock.
+- TTL defaults to 5m and must be positive
+  and at most 1h. Renew changes only the exact current unexpired lease and sets
+  expiry from serialized renewal acceptance plus TTL. It does not change the
+  retirement state or revive released/expired authority. Stale identities cannot
+  clear a replacement lease.
+- Resume requires full tree death and durable release. Safe HELD expiry also
+  requires a successful durable release commit. Blocked retirement never clears
+  merely because its TTL elapsed.
+- Drain defaults to 10s and uses the same `T` as TTL without restarting. Zero skips grace,
+  not tree-death proof. CLI TTL and drain durations require whole milliseconds;
+  sub-millisecond values are rejected rather than truncated.
+- Native retirement accounts for notifications, connect/disconnect lifecycle,
+  authentication, and frame hooks through actual return, retaining sessions as
+  teardown producers. Ordinary removal and maintenance require quiescence before
+  completion, so a later hold cannot miss callbacks whose owner entry disappeared.
+  Notification cancellation follows session/owner closure but does not prove
+  settlement. Active work remains blocked without TTL/resume bypass; existing
+  retry uses the original clock. `PendingRequests` stays request-only; no public
+  metric, state, schema, topology exclusion, or modern notification dispatch added.
+- Plain sessions and accepted pre-token connections remain accounted until full
+  reader/remove cleanup. Accept completion is reserved before launch in all three
+  constructors; reader startup is serialized with admission closure. Transport
+  completion is separate from request/native grace, with actual process proof
+  sampled after the bounded existing-budget join. No new public counter/schema/
+  state, manager, timeout, replay or fake Done is introduced.
+- Retirement publication retries namespace-lock contention through the existing
+  exact-lease timer without a reaper. Successful blocked renewal carries pending
+  retry intent to the replacement lease's guarded timer, preserving the original
+  drain deadline and legitimately accepted expiry. Stale callbacks cannot mutate
+  renewed, released, or replacement authority.
+- Configured authorization is tracked in all owner modes through actual callback
+  return and registration/rejection. Late allow cannot cross closed admission;
+  retirement and handoff wait for settlement. No public callback counter or
+  `PendingRequests` change is added; nil-authorizer defaults stay unchanged.
+- Configured frame hooks are tracked through actual return in every owner mode;
+  their 1ms verdict timeout does not settle work. In-process HandlerFunc retirement
+  uses actual body/pipe `Done`, not bookkeeping close. After existing EOF/drain
+  grace, Close/SoftClose cancels its owned child context; ignored cancellation
+  remains blocked until completion. No public counter/state/API or manager added.
+
+The durable `HOLDING` seed has provisional timing and never grants replacement.
+Sample `T` once after its first complete writer acknowledgment, then persist clocked `HOLDING` once.
+That write, retirement, HELD persistence, and response consume the original TTL/drain window; write failure retains the seed fence.
+Incomplete recovery remains `RETIREMENT_BLOCKED`, without expiry/resume. No schema or state is added.
+
+Recovered lease timers and control request serving stay paused through fallible
+daemon construction. Only successful construction activates them; failed registry
+publication/control setup cannot leave a stale timer overwriting a renewed lease.
+Recovery retains original expiry and blocked fences, without new API/state/schema.
+Unix stale cleanup excludes the exact canonical bound control path before
+ping/unlink, retaining the paused publication barrier and stale sibling cleanup.
+
+Neutral control's default for `hold`/`restart_owner` is 180s plus one drain; CLI/MCP request it with a zero caller timeout.
+Explicit positive budgets remain unchanged; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
+Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, without automatic retry/resume or stop fallback.
+CLI `stop` returns status 1 when a contacted daemon yields an error or invalid/
+untyped failure response, with no per-owner or legacy data-channel fallback.
+Successful shutdown and genuinely absent-daemon behavior remain unchanged.
+Resolved MCP `mux_stop` always uses daemon authority; transport/malformed/typed
+uncertainty never selects owner fallback. Only the exact known old unsupported-
+stop response retains legacy compatibility. New external soft/forced admission
+checks authority before finalization without holding admission locks through waits.
+Exact already-owned whole-daemon cleanup keeps its private claim, without failure-
+latch clearing or a new public stop/shutdown/restart bypass. `restart_owner`
+rejects duration overflow before mutation on raw/
+explicit-timeout routes; zero replacement and 30s/0ms stop defaults are unchanged.
+Signal/context shutdown callers wait for daemon `Done` after refusal, retaining
+reaper/reference/control service. They do not retry automatically after lease
+release; a separate explicit admitted shutdown completes caller termination.
+
+Darwin's regular-file endpoint ENOTSOCK is absence only in native dial, not a
+contacted read error. Control Start reserves its accept producer under the
+existing Close mutex before launch, closing Add/Wait without new protocol/retry
+or forced handler-cancellation behavior.
+
+Activation uses raw status results and exact native dial absence, never Boolean
+probe uncertainty or nondial errno, and only after namespace-lock/persisted-clear
+proof. Live/old-clear compatibility remains; contacted/malformed/busy/timeout
+cannot authorize offline swap, with no new public helper or API.
+
+MCP restart's tool-owned native token-only connection consumes the returned
+reservation and confirms exact current ServerID/PrevToken history before its
+sole success result, then closes that connection. Valid nonidle denial is binding
+confirmation, not eviction; unknown/stale/malformed/transport outcomes are not
+success. No MCP/bootstrap/discover frames, new command/token/revoke registry or
+fallback; existing owner EOF cleanup and direct-library token contract unchanged.
+
+## Host transport and lifecycle
+
+Aware managed shims keep the original host pipes open. Held requests receive
+JSON-RPC `-32005`, message `upstream held for update`, and
+`data.error_code=maintenance_held`, preserving the original numeric or string
+ID. The fence wins over cached success. Unfinished work terminated by retirement
+gets one terminal error. Held and terminated work never replays, and
+notifications receive no invented response.
+Pre-fence unfinished work may receive the existing original-ID `-32603`
+reconnect error. `-32005` applies to requests received under the fence; this
+correction does not change that distinction or add replay.
+
+After durable release, fresh legacy demand reaches a new generation on the same
+pipes. Modern demand uses fresh exact-era isolated admission with required
+metadata, without legacy bootstrap, cache, progress, or subscription restoration.
+
+Fresh demand rechecks admission before writing to retired IPC and activates the
+same admitted successor for connected and parked shims. The parked path consumes
+the existing private IPC-EOF wake, without a new transport/controller, era
+fallback, or held/unfinished-work replay.
+
+First post-resume `OnInject` demand uses that same admission/activation path,
+outside ingress/dormant/suspend locks. Healthy injection retains one-pass lock
+admission and nonblocking queue-capacity behavior; its callback remains single-fire.
+Caller bytes are copied before unlocked revalidation; closed/dormant state and
+maintenance sequence are rechecked before enqueue. Closed/full sentinels, FIFO and
+suspend accounting remain, without a new queue, goroutine, API, or replay.
+
+Controlled restart, handoff, shutdown, downgrade, and idle daemon exit refuse
+terminally while any fence remains. Launcher and library update helpers retain
+typed refusal instead of falling back to shutdown or starting a successor.
+Aware unplanned recovery loads durable authority before listener/restore/spawn.
+
+Era-less snapshot/handoff payloads do not prove every historical environment:
+`CwdSet` lacks associated environments and retained `BoundTokens` are observations,
+not a complete inventory. Ordinary no-lease restore remains available, but hold
+acquisition for an incomplete restored owner and restoration under an active lease
+fail closed with existing `maintenance_invalid`. No payload schema/version, API,
+or expiry seam is added. The causal case loses an admitted environment before token
+consumption; it does not execute elapsed-TTL expiry.
+
+Maintenance storage is one schema-2 authority with mandatory `ledger.json` and
+`transaction.json`. Missing, pending, corrupt, or mismatched authority fails
+closed. A persistence error is not a usable hold or release acknowledgment and
+does not promise storage rollback. Recovery accepts only a matching COMMITTED
+certificate proving previously acknowledged durable publication. A successful
+durable release cannot resurrect the old lease.
+
+The stable location is `<canonical namespace-lock path>.maintenance/<scope digest>/`
+with the same scope digest and paired authority members, independent of mutable
+HOME/UserConfig selection. The endpoint/lock directory must persist while a fence
+is active. Native guards validate raw parent/alias components before canonicalizing,
+create protected private directories/members, and reject unsafe ownership, aliases,
+or ancestor write/delete authority, including cold read-only checks. Trusted aliases
+remain supported; exact Windows TrustedInstaller trust is ancestry-only. Unix
+private directories/files use0700/0600; Windows uses protected trusted DACLs.
+
+Released v0.30 contained no maintenance store: earlier user-config authority was
+unreleased private-candidate state. Any such live holds must be cleared/drained
+with their original binary/environment before cutover, retaining the old files.
+There is no scan/migrate/new registry and no inference that missing new authority
+clears an unknown old location. No TMP override or cleanup/ACL-bypass permission added.
+
+Controlled installation, launcher swap, layout/bootstrap mutation, and
+active-pointer changes serialize with hold-ledger mutation under the existing
+daemon namespace file lock. `daemon.CheckMaintenanceForActivation` is read-only.
+Status and pure startup inspection do not acquire/write that lock or proactively
+start a daemon. Offline/old activation requires locked persisted-clear proof.
+
+## Compatibility and rollback
+
+Use maintenance-aware managed binaries, daemons, and shims together. An old
+daemon or uncoordinated standalone path returns `maintenance_unsupported`; do
+not substitute stop, kill, PID cleanup, or direct execution. An aware daemon
+physically fences old managed shims' starts, but cannot promise those shims
+immediate errors or non-replay behavior. Arbitrary old binaries, foreign engines,
+unmanaged processes, and manual active-pointer replacement are not controlled.
+
+Before restoring a compatible previous binary or pinning `muxcore/v0.30.0`, use
+the current aware version to durably resume each exact retired lease or observe
+its safely committed expiry. Incomplete or retirement-blocked authority prevents
+downgrade and must be retained, even after TTL. Do not delete either authority
+member or bypass admission. Stop new explicit-modern admissions and retire modern
+owners through their existing quarantine path; never transfer live modern work
+to legacy or replay unfinished work.
+
+## Prior accepted-source technical checks
+
+Before the durable-clock and RPC-budget corrections, the release root recorded:
+
+- Actual held executable overwrite, resume/TTL recovery, and scoped cleanup on
+  Windows and Linux, with 1,158 and 1,191 maintenance checks respectively.
+- R1 parity on each OS, including the 100-frame native opening corpus and eight
+  scenarios, with legacy-default and modern-isolation behavior preserved.
+- Root and muxcore Go test and vet suites, 143 focused maintenance checks, and
+  full race coverage across the five selected packages.
+- Native consumer Scenario 5b with two sessions, six Unix lifecycle cases, and
+  the complete critical suite, 5/5 with exit zero. The seven known review
+  corrections were closed in the accepted source.
+
+Later timing/RPC and cold-start checks have source-bound receipts in
+[release evidence](specs/002-upstream-maintenance-hold/release-evidence.md).
+Native-family source `6fc7eb44853a6446283dc1c1fad7ab4db874f4f5` has actual
+Windows original-overlay RED and normal/race GREEN: four top-level tests and
+28 named rows fail before repair; seven top-level tests and 45 named rows pass
+afterward. Named totals include parents, not independent scenarios. Root tests
+and both vet suites pass at their recorded source. Fixture-only successor
+`435bcfa70da85f3763f1ddbc861016f2e18b07c4` closes the old owner-test failure
+with fresh whole-muxcore PASS, without production changes after 6fc7. Historical
+RED and closed family proof remain preserved. Three newer commits for Unix
+owned-endpoint cleanup, managed stop admission, and restart drain validation now
+have scoped focused/race proof. Historical ace2 Windows/Linux/critical/CI PASS
+does not refute its two causal observer P1s. Caller/auth repairs a68aa37/ab28d3d
+now have Windows/native focused/race and bounded source proof plus all four
+full/vet gates on identical frozen precommit bytes. No post-ab28 rerun inferred;
+actual ab28 CI37162331283 all5 successful precedes this documentation successor.
+Frame/shared-handler completion repairs now have focused/race proof, followed by
+d786 cooperative owned-context cancellation after EOF/drain grace. The observed
+c585 and d786 module timeouts remain distinct historical RED. Fixture-only3f
+keeps d786 production unchanged and has fresh postcommit full-module GREEN,
+with earlier root/vet0 reused only in their declared scopes. Later ping/ledger
+fixes896a/5e49 now have scoped focused/native/source proof, not final successor
+artifacts. Prior932 complete Windows/Linux/critical/R1/CI stays historical;
+clean Linux root-race/vet and release-equivalent public1182/R1 8+100 PASS do not
+relabel original module RED. Later test-only engine/owner corrections have actual
+consumer-visible stdio/no-replay proof and native5ea module-race25/25 PASS, skips
+explicit. Alias/control focused proof and exact4e CI37199675520 all5 success are
+scoped. Baa Linux full/public1173/R1 and f902 CIall5 remain historical. Committed
+cebc76 transport focused43/race43/callback58/preservation23/final SOURCEPASS are
+valid. Clean ceb root/vet/actual0.31.0/public1191/R1 PASS, full-module24/25 and
+coverage reserved-write FAIL retained. Historical fixture-only c0 full-module race
+passed25/25 packages/2021 positive leaves/4 explicit skips and both vet. Its reused
+root/public1191/R1 artifact retains actual ceb provenance, not a newly built c0
+binary. B86a998 changes production for retirement publication/blocked-renewal
+retry: native Linux original+renewed_blocked2 normal/race, async12 and expiry8 race
+PASS, zero skips/data races. Initial c0 RED and first-fix renewal RED retain their
+scopes; checker SOURCE PASS is not runtime assurance. Actual clean b86 Linux
+root-race306 positive/1 SKIP, module-race2023 positive/4 SKIP (25/25 packages),
+both vet0 and Scenario11 1191/1191 PASS now bind a new CGO0/trimpath artifact with
+clean embedded b86/owner0.31.0. R1 100/100+8 PASS uses a separate CGO1 script-built
+binary, not the release artifact. Both initial public startup refusals remain;
+exact private ancestor775→0700 plus one fresh re-entry per script yielded PASS,
+without source changes or suite/vet/release-build repeats. Exact
+[b86 CI37221621672](https://github.com/thebtf/mcp-mux/actions/runs/37221621672) and
+docs-only [44 CI37222579349](https://github.com/thebtf/mcp-mux/actions/runs/37222579349)
+passed all5 jobs; doc44's evidence check is bounded SOURCE-facts PASS.
+Committed c183 reaper repair has causal failure-latch RED→two normal PASS and
+race3 top-level/5 named PASS rows including parents, zero skips/races. Independent
+timer scheduling removal is SOURCE-only, not a runtime multiplicity assertion.
+Earlier29 closure and26f enumeration31/29/2 are historical. Restore-environment
+completeness and first-fresh OnInject repairs are committed/focused-proven.
+Actual [restore reply4179041769](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179041769)
+and [injection reply4179041932](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4179041932)
+have exact UTF8/in-reply-to readback and native resolutions. All31 known threads
+are root-resolved, not a fresh final-head/all-PR CLEAN verdict.
+Prior owner source is committed/frozen/pushed26f. Initial966d
+proof retains original both-era RED→first-fix connected GREEN/race; discovered
+parked SOURCE deadlock and actual first-fix parked RED→final3 leaves plain/race
+(connected legacy/modern, parked legacy) plus8 complement race PASS bindf29,
+zero SKIP/data races. ParkedOwnerSeamRecheck is bounded SOURCE-only F1 PASS at
+exact e5/3da5 production hashes, not broad runtime assurance. Actual
+[owner reply4178899382](https://github.com/thebtf/mcp-mux/pull/150#discussion_r4178899382)
+has exact UTF8 readback/native resolution. Root's exact26f
+[CI37226616613](https://github.com/thebtf/mcp-mux/actions/runs/37226616613) completed
+SUCCESS, all5 jobs. Actual immutable26f Linux root/module full race and both vets
+each pass once:27 tested packages PASS/3 no-test,2333 leaf PASS/5 named SKIP,
+0 failures/races. Clean CGO0/trimpath26f artifact/owner0.31.0 gives Scenario11
+1191/1191 PASS; separate CGO1 R1 binary gives100/100+8/8 PASS, not release-version
+evidence. Supplemental R1 ELF version read failed/UNKNOWN, retained without retry;
+not an owning gate. Restore947e and injection1e45 are committed/frozen at
+`1e45a13f176e8322c2f6530ded433a1cbfa2df9e`. Each focused receipt proves
+immutable26f plus only its two overlays, not a full integrated1e gate. Actual
+restore unsafe HELD/tree retirement/forgotten-environment spawn RED becomes typed
+invalid/no new lease/same live owner GREEN and race,1 leaf each, plus9 complement
+leaves under race. Environment loss precedes token consumption; TTL extension is
+SOURCE-only, with no expiry probe. Injection connected both-era/parked RED4 named
+records becomes GREEN4; race12 top-level/18 named PASS records include parents,
+not18 leaves,0 SKIP/races. Integrated1e source is pushed to the PR branch;
+Actual immutable1e Linux normal root/module tests, both vets and full-race suites
+each once exit0:27 tested packages/3 no-test;2339 positive race leaves/5 named SKIP,
+0 failed/races. Clean CGO0/trimpath1e owner0.31.0 binary gives Scenario11 1191/1191;
+separate unstamped CGO1 R1 100+8 PASS reports1e45a13f, not0.31.0. Old CI RED remains.
+[Exact1e CI37229280285](https://github.com/thebtf/mcp-mux/actions/runs/37229280285)
+FAILED: coverage/Ubuntu/BSD PASS; macOS daemon and Windows daemon component fail
+`TestMaintenanceSnapshotPendingCompatibleEnvironmentScopeFailsClosed` at line924,
+`actual snapshot unexpectedly preserved the optional admitted environment`.
+Windows job was canceled after the observed daemon failure, not a failed job verdict.
+Parent's SOURCE trace distinguishes the four-assertion guard from its error text:
+AddCwd logs show2 roots from raw/canonical spelling (Darwin `/var`→`/private/var`,
+Windows case normalization), violating the cardinality assumption, not proving
+optional environment retention. Fixture-only `91dc293afb71059097fcdb65c6a07cf8feadb0b3`
+removes cardinality/env-slot assumptions: original26 production/new fixture actual
+unsafe HELD/retirement/forgotten-spawn RED→current plain/race1 leaf PASS each+9
+guard race leaves,0 SKIP/races. Production/proof11 inputs match1e,460 excluded
+files unchanged; no build/public repeat/full91/Windows/macOS PASS. Workflow later
+committedc18; old1e/c18 CI RED retained, exact344 CI SUCCESS below. No production/new deadline/
+OS skip; old error verbatim. Historical8142
+receipts/failures are preserved, not Windows/delivery
+acceptance. Root's complete3-record recheck finds no project runtime grant; only
+the optional local Windows effect is held, task approval retained. Bootstrap finds
+approved target absent: CREATE that exact non-reparse directory, then re-enter:
+`/writable-root add C:/Users/btf/AppData/Local/mcp-mux-verification-01a0fb9a`, then
+`/writable-root status`, confirming root/origin/project/expiry/writer coverage.
+The missing grant holds only that optional local route, not release globally:
+FR-016/SC-001 require OS-native Windows+Unix proof, not this workstation. Root's
+selected explicit maintenance-proof-v0.31.0 hosted Windows opt-in is committed/
+pushed as workflow-only `c18bfc7619f42d5fc9330ea5c0c5a31634abacaf` after91. Root label
+readback preceded push; actionlint/YAML/P7 AST both steps PASS, STATIC only.
+[CI37234225216](https://github.com/thebtf/mcp-mux/actions/runs/37234225216) boundc18
+FAILED: macOS daemon `TestMaintenanceSessionHandlerRetirementWaitsForActualCallbackReturn/0/short_drain`,
+line231, `actual callback reservations were not counted` (0.02s leaf), retained verbatim.
+Old restore line924 failure is absent. Windows/Ubuntu daemon components PASS
+(127.325s/101.865s), both jobs CANCELED by fail-fast before hosted steps; BSD/
+coverage PASS. Atc18 no actual Windows Scenario11/artifact/PASS or aggregate GREEN.
+SOURCE cause is fixture ordering, not a production defect: opening reply flush
+precedes deferred Pending decrement; receiving it does not join cleanup. Two
+callbacks can coexist with that reservation. CI's !=2 guard logged no count;
+3 is SOURCE-possible, not observed or a Mac-specific cause. Frozen one-file a93c3b6
+removes exact-two snapshots and asserts positive-grace hold waits for real callback
+return after original-ID errors, preserving drains/clocks/BLOCKED/Done/cancel-
+without-return/resume refusal/same-pipe successor. Actual one-invocation native
+race8/8 original subtests PASS,0 SKIP/errors/warnings/stderr on immutablec18+onlya93.
+Root committed/pushed test-only `34410430507ef771cf8d88598bb7ede7afcdfb5d`;
+110 selected production and broader production/proof11 inputs equal1e. Live
+excluded equality REFUSED4 concurrent docs drift, no WIP import/staging claim;
+root must bind final doc hashes. Exact344 CI and hosted Windows proof succeeded
+below; no fresh344 Linux full run or prod/schema/helper-clock/deadline/OS skip/
+extra SubprocessTreeDone case is inferred. Workflow/label unchanged.
+Conditional second checkout uses exact event
+PR head, not synthetic merge; fresh full LOCALAPPDATA PRIMARY LF/no-hardlinks
+clone uses `.agent/tmp`,0.31.0 build/existing Scenario11. Only redacted windows.json/
+build-receipt.json upload; ordinary triggers/tests unchanged. Actual
+[CI37236880161](https://github.com/thebtf/mcp-mux/actions/runs/37236880161) bound344
+completed SUCCESS, all5 jobs. Selected Windows job111537660496's opt-in,
+checkout, Scenario11 and evidence-retention steps all SUCCESS. Retained/downloaded
+artifact11315977986 is `maintenance-proof-windows-v0.31.0-37236880161-1`.
+Actual Windows JSON/build receipt PASS: source/pr-head/clone344 equal, clean
+embedded344 Go1.25.12 CGO0/trimpath binary SHA256
+`cf6ab1afa0c3cf41a59caf97ffc0620be7d76aac0bbebaf44d64350d2be23cde`;
+smoke exit0,1158/1158 checks,0 cleanup errors, actual owner0.31.0 in23 observations.
+Full retained receipt hashes and proof limits are in
+[release evidence](specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact344-hosted-windows-proof).
+That historical Windows premerge proof is344-bound,not the optional local route,
+later production successor acceptance or postmerge fresh delivery.
+Fresh integrated Linux proof now binds exact
+`74d5293ca8cd2d70861db952c4c3c5b504577516`,not inherited1e/focused overlays:
+root2 tested/3 no-test and module25 tested normal suites plus both vets each
+once PASS. Clean Go1.25.12 CGO0/trimpath embedded74/owner0.31.0 binary SHA256
+`07ef0ebd1c2597a4f032748685d265e3e87efe58939dc19acd6db475d53b3951`
+runs actual Scenario11 1191/1191 with23 public owner0.31.0 rows. Fresh R1
+100/100+8/8 PASS uses separate CGO1/non-trimpath unstamped74d5293c binary
+`70b5b142fdcf67715de1a24bb824ca24ff6df6d04ac7ff9367efaa213147e0bc`,
+not the release artifact. Unix Scenario8 selected6 named tests/8 terminal events
+PASS,0 FAIL/SKIP,not the full playbook. No local full-race duplicate; CI owns it.
+Raw receipt `P/final74-linux/proof-result.json` SHA256
+`3df8e560ca480b5c0ee55753bbfc57d4bf68e46ffd5fb387c29a8a930e928c66`
+binds461 exact Git blobs/0 mismatch/no WIP; commands/limits in
+[release evidence](specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact74-integrated-linux-proof-and-ci-boundary).
+One ancillary R1 metadata stat used old BaseDir and failed; corrected current
+BaseDir provenance succeeded without gate/build/smoke/R1 repeats. Settled0
+processes/socket registrations/authority;3 identity-bound inactive sockets retained,
+not deleted. No cleanup/profile/guard bypass.
+[Exact74 CI37242471098](https://github.com/thebtf/mcp-mux/actions/runs/37242471098)
+FAILED: macOS new4 live-host cases fail before helper at update_test.go1110,
+fixture owner socket104 bytes exceeds Darwin103. Ubuntu/coverage/BSD PASS;
+Windows canceled before selected public/critical steps. Test-only namespace
+`filepath.Base(existing mp* base)` correction2b8ffa now has actual scoped Linux
+race4/4 original branches PASS once,0SKIP/data races/errors/stderr on immutable74
+plus only that fixture;460 other files including production/proof scripts equal.
+Private53-byte TMP,pretest bound97/101,observed owner96/97/control100/101 stay
+below Darwin103. Receipt SHA256
+`43ff6e4957130068ac84536cc069d25a6e3004e95efffe7b355fb8fa091278df`;
+root accepted fixture-only source/behavior,not nativeDarwin or nextCI PASS.
+OldMac failure preserved without unchanged repro;no normal fixture run.
+Production/proof scripts unchanged74. Extended selected workflowbfabb5e SHA256
+`5a8e5d7f2572f06289c135d5a368439902af5e940d8c73de592ecb15f1fe30d4`
+has actionlint/YAML/3AST STATIC PASS,not hosted canonical critical runtime proof.
+Actual replies4179716104/4179716099,full-body readback and2 native resolutions
+close all33 then-known threads; not fresh final-head/all-PR CLEAN.
+Issue135 milestone5985521449 was posted/read back,not delivery. Next integrated
+source/fixture/docs CI,canonical Windows critical/Scenario11,merge,publication,
+tags/module/binary delivery,fresh-session canary and consumer handoffs remain
+pending. Fresh native inventory has Engram issue tools unmounted,no substitute;
+only the consumer handoff effect is held. No release completion is claimed.
+
+These are technical-check facts, not final release verdicts. The release root
+separately proves the actual version-baked artifact, exact merged head, remote
+tags, Go module resolution, and fresh-session delivered-artifact canary under
+the [release protocol](docs/RELEASE-PROTOCOL.md).
+
+## Upgrade and consumer handoff
+
+After publication and tag resolution, use the `v0.31.0` binary release or the
+product's versioned-engine upgrade path. Pin library consumers with:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+```
+
+Fresh Engram handoff for aimux, engram, and any other impacted consumer remains
+pending. It must include released-version/module-resolution evidence, optional
+maintenance adoption instructions, aware/old-shim/old-daemon limits, finite scope,
+terminal lifecycle refusal, fresh modern admission, and safe rollback. Ordinary
+legacy users do not need maintenance-specific source changes. Publication alone
+does not establish consumer adoption or `CONSUMER_HANDOFF_PASS`.
+
+---
+
 # mcp-mux v0.30.0
 
 **Release date:** 2026-08-31

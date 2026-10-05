@@ -1,19 +1,26 @@
 package engine
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	muxcore "github.com/thebtf/mcp-mux/muxcore"
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/daemon"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -40,6 +47,7 @@ type updateSeams struct {
 	prepareSocket   func(context.Context, string, time.Duration) error
 	available       func(string) bool
 	acquireLock     func(string) (daemonLock, error)
+	maintenanceGate func(*MuxEngine) error
 }
 
 func captureUpdateSeams() updateSeams {
@@ -57,16 +65,17 @@ func captureUpdateSeams() updateSeams {
 		prepareSocket:   enginePrepareControlSocket,
 		available:       engineControlSocketAvailable,
 		acquireLock:     engineAcquireDaemonLock,
+		maintenanceGate: engineCheckMaintenanceForActivation,
 	}
 }
 
 func restoreUpdateSeams(t *testing.T) {
 	t.Helper()
 	orig := captureUpdateSeams()
+	engineCheckMaintenanceForActivation = func(*MuxEngine) error { return nil }
 	enginePrepareControlSocket = func(context.Context, string, time.Duration) error { return nil }
-	engineDaemonIdentity = func(string) (daemonIdentity, error) {
-		return daemonIdentity{pid: 1, generation: "old"}, nil
-	}
+	engineDaemonIdentity = daemonIdentityFromStatus
+	engineControlSend = func(string, control.Request) (*control.Response, error) { return updateAwareStatus(), nil }
 	engineWaitForReplacement = func(context.Context, string, daemonIdentity, time.Duration) (bool, error) {
 		return true, nil
 	}
@@ -84,7 +93,12 @@ func restoreUpdateSeams(t *testing.T) {
 		enginePrepareControlSocket = orig.prepareSocket
 		engineControlSocketAvailable = orig.available
 		engineAcquireDaemonLock = orig.acquireLock
+		engineCheckMaintenanceForActivation = orig.maintenanceGate
 	})
+}
+
+func updateAwareStatus() *control.Response {
+	return &control.Response{OK: true, Data: []byte(`{"pid":1,"daemon_generation":"old","maintenance":[]}`)}
 }
 
 func newUpdateTestEngine(t *testing.T) *MuxEngine {
@@ -331,9 +345,12 @@ func TestRestartWithSuccessor_GracefulErrorFallbackStartsSuccessor(t *testing.T)
 	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
 	engineControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
 		sent = append(sent, req.Cmd)
-		return nil, errors.New("dial failed")
+		return &control.Response{Message: "graceful restart rejected"}, nil
 	}
 	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		sent = append(sent, req.Cmd)
 		return &control.Response{OK: true}, nil
 	}
@@ -418,42 +435,6 @@ func TestApplyUpdateAndRestart_GracefulSuccessUsesSuccessorExe(t *testing.T) {
 	}
 }
 
-func TestApplyUpdateAndRestart_DaemonNotRunningOnlySwaps(t *testing.T) {
-	restoreUpdateSeams(t)
-	eng := newUpdateTestEngine(t)
-	lockCalls, controlCalls, startCalls := 0, 0, 0
-
-	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
-	engineCleanStale = func(string) int { return 1 }
-	engineIsDaemonRunning = func(string) bool { return false }
-	engineAcquireDaemonLock = func(string) (daemonLock, error) {
-		lockCalls++
-		return &fakeDaemonLock{}, nil
-	}
-	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		controlCalls++
-		return &control.Response{OK: true}, nil
-	}
-	engineStartDaemonExecutable = func(string, string) error {
-		startCalls++
-		return nil
-	}
-
-	got, err := eng.ApplyUpdateAndRestart(context.Background(), baseUpdateOptions())
-	if err != nil {
-		t.Fatalf("ApplyUpdateAndRestart: %v", err)
-	}
-	if got.DaemonWasRunning || got.ReplacementStarted || got.ReplacementReady {
-		t.Fatalf("unexpected daemon flags when daemon is stopped: %+v", got)
-	}
-	if lockCalls != 0 || controlCalls != 0 || startCalls != 0 {
-		t.Fatalf("side effects lock/control/start = %d/%d/%d, want all zero", lockCalls, controlCalls, startCalls)
-	}
-	if got.CleanedStale != 1 {
-		t.Fatalf("CleanedStale = %d, want 1", got.CleanedStale)
-	}
-}
-
 func TestApplyUpdateAndRestart_SwapFailureStopsBeforeDaemonCalls(t *testing.T) {
 	restoreUpdateSeams(t)
 	eng := newUpdateTestEngine(t)
@@ -491,9 +472,12 @@ func TestApplyUpdateAndRestart_GracefulErrorFallsBackToShutdownAndStart(t *testi
 	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
 	engineControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
 		sent = append(sent, req.Cmd)
-		return nil, errors.New("dial failed")
+		return &control.Response{Message: "graceful restart rejected"}, nil
 	}
 	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		sent = append(sent, req.Cmd)
 		return &control.Response{OK: true}, nil
 	}
@@ -692,42 +676,6 @@ func TestApplyUpdateAndRestart_LockFailureIsPhaseError(t *testing.T) {
 	}
 }
 
-func TestApplyUpdateAndRestart_ProceedWithoutLockContinuesWithWarning(t *testing.T) {
-	restoreUpdateSeams(t)
-	eng := newUpdateTestEngine(t)
-	lockErr := errors.New("locked by another updater")
-
-	engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
-	engineCleanStale = func(string) int { return 0 }
-	engineIsDaemonRunning = func(string) bool { return true }
-	engineAcquireDaemonLock = func(string) (daemonLock, error) { return nil, lockErr }
-	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		return nil, errors.New("dial failed")
-	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
-		return &control.Response{OK: true}, nil
-	}
-	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
-	engineStartDaemonExecutable = func(string, string) error { return nil }
-	engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
-
-	opts := baseUpdateOptions()
-	opts.ProceedWithoutLock = true
-	got, err := eng.ApplyUpdateAndRestart(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("ApplyUpdateAndRestart: %v", err)
-	}
-	if got.LockAcquired {
-		t.Fatalf("LockAcquired = true, want false")
-	}
-	if !got.FallbackShutdown || !got.ReplacementReady {
-		t.Fatalf("unexpected result flags: %+v", got)
-	}
-	if len(got.Warnings) == 0 || !strings.Contains(got.Warnings[0], "could not acquire daemon lock") {
-		t.Fatalf("warnings = %#v, want daemon lock warning", got.Warnings)
-	}
-}
-
 func TestApplyUpdateAndRestart_FallbackExitTimeoutIsPhaseError(t *testing.T) {
 	restoreUpdateSeams(t)
 	eng := newUpdateTestEngine(t)
@@ -740,7 +688,10 @@ func TestApplyUpdateAndRestart_FallbackExitTimeoutIsPhaseError(t *testing.T) {
 	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
 		return &control.Response{OK: false, Message: "nope"}, nil
 	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		return &control.Response{OK: true}, nil
 	}
 	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return exitErr }
@@ -768,9 +719,12 @@ func TestApplyUpdateAndRestart_ErrorResultIncludesCleanStaleCount(t *testing.T) 
 	engineIsDaemonRunning = func(string) bool { return true }
 	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
 	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		return nil, errors.New("dial failed")
+		return &control.Response{Message: "graceful restart rejected"}, nil
 	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		return &control.Response{OK: true}, nil
 	}
 	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
@@ -834,9 +788,12 @@ func TestApplyUpdateAndRestart_ReadyTimeoutIsPhaseError(t *testing.T) {
 	engineIsDaemonRunning = func(string) bool { return true }
 	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
 	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		return nil, errors.New("dial failed")
+		return &control.Response{Message: "graceful restart rejected"}, nil
 	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		return &control.Response{OK: true}, nil
 	}
 	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
@@ -866,9 +823,12 @@ func TestApplyUpdateAndRestart_StartFailureIsPhaseError(t *testing.T) {
 	engineIsDaemonRunning = func(string) bool { return true }
 	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
 	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		return nil, errors.New("dial failed")
+		return &control.Response{Message: "graceful restart rejected"}, nil
 	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		return &control.Response{OK: true}, nil
 	}
 	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
@@ -918,9 +878,12 @@ func TestApplyUpdateAndRestart_SessionHandlerConsumerUsesEngineNamespace(t *test
 		return &fakeDaemonLock{}, nil
 	}
 	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
-		return nil, errors.New("force fallback")
+		return &control.Response{Message: "graceful restart rejected"}, nil
 	}
-	engineControlSend = func(string, control.Request) (*control.Response, error) {
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
 		return &control.Response{OK: true}, nil
 	}
 	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
@@ -938,5 +901,299 @@ func TestApplyUpdateAndRestart_SessionHandlerConsumerUsesEngineNamespace(t *test
 	}
 	if sawDaemonFlag != "--aimux-daemon" {
 		t.Fatalf("daemon flag = %q, want --aimux-daemon", sawDaemonFlag)
+	}
+}
+
+func TestUpdateRestartUncertainGracefulOutcomePreservesCause(t *testing.T) {
+	for _, apply := range []bool{false, true} {
+		for name, cause := range map[string]error{
+			"timeout":      context.DeadlineExceeded,
+			"eof":          io.EOF,
+			"unclassified": errors.New("graceful outcome unavailable"),
+		} {
+			t.Run(fmt.Sprintf("apply=%t/%s", apply, name), func(t *testing.T) {
+				restoreUpdateSeams(t)
+				eng := newUpdateTestEngine(t)
+				engineUpgradeSwap = func(string, string) (string, error) { return "old", nil }
+				engineCleanStale = func(string) int { return 7 }
+				engineIsDaemonRunning = func(string) bool { return true }
+				engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+				engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) { return nil, cause }
+				engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+					if req.Cmd == "status" {
+						return updateAwareStatus(), nil
+					}
+					t.Fatal("uncertain outcome sent shutdown")
+					return nil, nil
+				}
+				engineWaitForDaemonExit = func(context.Context, string, time.Duration) error {
+					t.Fatal("uncertain outcome waited for exit")
+					return nil
+				}
+				engineStartDaemonExecutable = func(string, string) error { t.Fatal("uncertain outcome started successor"); return nil }
+				var result UpdateAndRestartResult
+				var err error
+				if apply {
+					result, err = eng.ApplyUpdateAndRestart(context.Background(), baseUpdateOptions())
+				} else {
+					result, err = eng.RestartWithSuccessor(context.Background(), baseRestartWithSuccessorOptions())
+				}
+				var updateErr *UpdateAndRestartError
+				if !errors.Is(err, cause) || !errors.As(err, &updateErr) || updateErr.Phase != UpdatePhaseRestart {
+					t.Fatalf("original uncertainty/phase lost: %v", err)
+				}
+				if !result.LockAcquired || !result.DaemonWasRunning || result.FallbackShutdown || result.GracefulRestarted || result.ReplacementStarted || result.ReplacementReady {
+					t.Fatalf("uncertainty crossed lifecycle boundary: %+v", result)
+				}
+				if apply && (result.OldPath != "old" || result.CleanedStale != 7 || updateErr.Result.OldPath != "old" || updateErr.Result.CleanedStale != 7) {
+					t.Fatalf("completed swap/cleanup missing from partial result: %+v / %+v", result, updateErr.Result)
+				}
+			})
+		}
+	}
+}
+
+func TestUpdateRestartFallbackRequiresSameAwareGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    string
+		statusErr error
+		want      error
+	}{
+		{"old-endpoint", `{"pid":1,"daemon_generation":"old"}`, nil, control.ErrMaintenanceUnsupported},
+		{"new-generation", `{"pid":1,"daemon_generation":"new","maintenance":[]}`, nil, control.ErrMaintenanceInvalid},
+		{"missing-generation", `{"pid":1,"maintenance":[]}`, nil, control.ErrMaintenanceInvalid},
+		{"status-uncertain", "", io.EOF, io.EOF},
+		{"status-held", "", control.ErrMaintenanceHeld, control.ErrMaintenanceHeld},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreUpdateSeams(t)
+			eng := newUpdateTestEngine(t)
+			engineIsDaemonRunning = func(string) bool { return true }
+			engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+			reads := 0
+			engineDaemonIdentity = func(path string) (daemonIdentity, error) {
+				reads++
+				if reads == 1 {
+					return daemonIdentity{pid: 1, generation: "old"}, nil
+				}
+				if tc.statusErr != nil {
+					return daemonIdentity{}, tc.statusErr
+				}
+				return daemonIdentityFromStatus(path)
+			}
+			engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+				return &control.Response{Message: "graceful restart rejected"}, nil
+			}
+			engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+				if req.Cmd == "status" {
+					return &control.Response{OK: true, Data: []byte(tc.status)}, nil
+				}
+				t.Fatal("unproven fallback sent shutdown")
+				return nil, nil
+			}
+			engineStartDaemonExecutable = func(string, string) error { t.Fatal("unproven fallback started successor"); return nil }
+			result, err := eng.RestartWithSuccessor(context.Background(), baseRestartWithSuccessorOptions())
+			if !errors.Is(err, tc.want) || result.FallbackShutdown || result.ReplacementStarted || reads != 2 {
+				t.Fatalf("fallback proof accepted or cause lost: %+v %v reads=%d", result, err, reads)
+			}
+		})
+	}
+}
+
+func TestRestartWithSuccessor_ShutdownOutcomeUnknownStopsBeforeReplacement(t *testing.T) {
+	restoreUpdateSeams(t)
+	eng := newUpdateTestEngine(t)
+	engineIsDaemonRunning = func(string) bool { return true }
+	engineAcquireDaemonLock = func(string) (daemonLock, error) { return &fakeDaemonLock{}, nil }
+	engineControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		return &control.Response{Message: "graceful restart rejected"}, nil
+	}
+	engineControlSend = func(_ string, req control.Request) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return updateAwareStatus(), nil
+		}
+		return nil, io.EOF
+	}
+	engineWaitForDaemonExit = func(context.Context, string, time.Duration) error {
+		t.Fatal("uncertain shutdown waited for exit")
+		return nil
+	}
+	engineStartDaemonExecutable = func(string, string) error { t.Fatal("uncertain shutdown started successor"); return nil }
+	result, err := eng.RestartWithSuccessor(context.Background(), baseRestartWithSuccessorOptions())
+	if !errors.Is(err, io.EOF) || !result.FallbackShutdown || result.ReplacementStarted || result.ReplacementReady {
+		t.Fatalf("unknown shutdown lost cause or partial result: %+v %v", result, err)
+	}
+}
+
+type updateFallbackEndpoint struct {
+	control.DaemonHandler
+	aware    bool
+	entered  chan struct{}
+	release  <-chan struct{}
+	graceful atomic.Int32
+	shutdown atomic.Int32
+}
+
+func (h *updateFallbackEndpoint) HandleStatus() map[string]interface{} {
+	status := h.DaemonHandler.HandleStatus()
+	if !h.aware {
+		delete(status, "maintenance")
+		delete(status, "maintenance_error_code")
+	}
+	return status
+}
+
+func (h *updateFallbackEndpoint) HandleGracefulRestart(int) (string, func(), error) {
+	h.graceful.Add(1)
+	if h.release != nil {
+		h.entered <- struct{}{}
+		<-h.release
+	}
+	return "", nil, errors.New("graceful restart rejected")
+}
+
+func (h *updateFallbackEndpoint) HandleShutdown(ms int) string {
+	h.shutdown.Add(1)
+	return h.DaemonHandler.HandleShutdown(ms)
+}
+
+type updateLiveSessionHandler struct{}
+
+func (updateLiveSessionHandler) HandleRequest(_ context.Context, _ muxcore.ProjectContext, raw []byte) ([]byte, error) {
+	var request struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  any             `json:"result"`
+	}{"2.0", request.ID, nil})
+}
+
+func TestUpdateRestartLiveEndpointFailurePreservesOwnerAndHost(t *testing.T) {
+	for _, apply := range []bool{false, true} {
+		for _, uncertain := range []bool{false, true} {
+			t.Run(fmt.Sprintf("apply=%t/uncertain=%t", apply, uncertain), func(t *testing.T) {
+				restoreUpdateSeams(t)
+				config := t.TempDir()
+				t.Setenv("APPDATA", config)
+				t.Setenv("XDG_CONFIG_HOME", config)
+				base, err := os.MkdirTemp(os.TempDir(), "mp*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.RemoveAll(base) })
+				// Keep isolated owner sockets within Darwin's path limit under the unchanged temp root.
+				eng, err := New(Config{
+					Name:       "update-test",
+					Namespace:  filepath.Base(base),
+					Command:    "test-command",
+					BaseDir:    base,
+					DaemonFlag: "--test-daemon",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				engineCheckMaintenanceForActivation = (*MuxEngine).checkMaintenanceForActivation
+				engineDaemonIdentity = daemonIdentityFromStatus
+				engineControlSend = control.Send
+				d, err := daemon.New(daemon.Config{ControlPath: filepath.Join(eng.cfg.BaseDir, "backing.sock"), Namespace: eng.cfg.Namespace, SkipSnapshot: true, SessionHandler: updateLiveSessionHandler{}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(d.Shutdown)
+				handler := &updateFallbackEndpoint{DaemonHandler: d, aware: uncertain, entered: make(chan struct{}, 1)}
+				var release chan struct{}
+				if uncertain {
+					release = make(chan struct{})
+					handler.release = release
+				}
+				endpoint, err := control.NewServer(eng.ControlSocketPath(), handler, log.New(io.Discard, "", 0))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(endpoint.Close)
+				if uncertain {
+					t.Cleanup(func() { close(release) })
+				}
+				path, sid, token, err := d.Spawn(control.Request{Command: "live-update-consumer", Mode: "isolated", Cwd: t.TempDir()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				entry := d.Entry(sid)
+				conn, err := ipc.Dial(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = conn.Close() })
+				if _, err := fmt.Fprintln(conn, token); err != nil {
+					t.Fatal(err)
+				}
+				scanner := bufio.NewScanner(conn)
+				probe := func() {
+					t.Helper()
+					if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":1,"method":"update/probe"}`); err != nil {
+						t.Fatal(err)
+					}
+					if !scanner.Scan() || !strings.Contains(scanner.Text(), `"id":1`) || !strings.Contains(scanner.Text(), `"result":null`) {
+						t.Fatalf("original host cannot use live owner: frame=%q err=%v", scanner.Text(), scanner.Err())
+					}
+				}
+				probe()
+				starts := 0
+				engineStartDaemonExecutable = func(string, string) error { starts++; return nil }
+				engineWaitForDaemonExit = func(context.Context, string, time.Duration) error { return nil }
+				engineWaitForDaemonReady = func(context.Context, string, time.Duration) error { return nil }
+				var exchangeErr error
+				engineControlSendWithTimeout = func(path string, req control.Request, timeout time.Duration) (*control.Response, error) {
+					response, err := control.SendWithTimeout(path, req, timeout)
+					exchangeErr = err
+					return response, err
+				}
+				current, staged := maintenanceUpdateFiles(t)
+				var result UpdateAndRestartResult
+				if apply {
+					result, err = eng.ApplyUpdateAndRestart(context.Background(), UpdateAndRestartOptions{CurrentExe: current, StagedExe: staged, RestartTimeout: 250 * time.Millisecond})
+				} else {
+					result, err = eng.RestartWithSuccessor(context.Background(), RestartWithSuccessorOptions{SuccessorExe: staged, RestartTimeout: 250 * time.Millisecond})
+				}
+				if uncertain {
+					var timeout net.Error
+					if !errors.As(exchangeErr, &timeout) || !timeout.Timeout() || !errors.Is(err, exchangeErr) {
+						t.Fatalf("contacted uncertainty lost: %v / %v shutdown=%d starts=%d", err, exchangeErr, handler.shutdown.Load(), starts)
+					}
+					select {
+					case <-handler.entered:
+					default:
+						t.Fatal("graceful request never contacted endpoint")
+					}
+				} else if !errors.Is(err, control.ErrMaintenanceUnsupported) {
+					t.Fatalf("old endpoint not terminal unsupported: %v shutdown=%d starts=%d", err, handler.shutdown.Load(), starts)
+				}
+				var updateErr *UpdateAndRestartError
+				if !errors.As(err, &updateErr) || updateErr.Phase != UpdatePhaseRestart || !result.DaemonWasRunning || result.FallbackShutdown || result.GracefulRestarted || result.ReplacementStarted || result.ReplacementReady {
+					t.Fatalf("live failure crossed lifecycle boundary: %+v %v", result, err)
+				}
+				if apply && (result.OldPath == "" || updateErr.Result.OldPath != result.OldPath) {
+					t.Fatal("completed swap omitted from partial error")
+				}
+				if starts != 0 || handler.shutdown.Load() != 0 || handler.graceful.Load() != 1 || d.Entry(sid) != entry || d.OwnerCount() != 1 {
+					t.Fatalf("failure replaced live owner: starts=%d shutdown=%d graceful=%d owners=%d", starts, handler.shutdown.Load(), handler.graceful.Load(), d.OwnerCount())
+				}
+				select {
+				case <-d.Done():
+					t.Fatal("failure shut down live daemon")
+				default:
+				}
+				probe()
+			})
+		}
 	}
 }

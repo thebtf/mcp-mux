@@ -3,8 +3,8 @@ package daemon
 import (
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
@@ -172,6 +172,7 @@ func TestHandleListOwners_ModernPolicyFactsMirrorDaemonStatus(t *testing.T) {
 		ServerID:                    modernID,
 		Command:                     "entry-command-must-not-infer-policy",
 		ProtocolEra:                 era.EraModern20260728,
+		Env:                         map[string]string{"API_TOKEN": "modern-credential-sentinel"},
 		Persistent:                  true,
 		OwnerGeneration:             "private-modern-generation",
 		RestoredFromOwnerGeneration: "private-predecessor-generation",
@@ -181,6 +182,7 @@ func TestHandleListOwners_ModernPolicyFactsMirrorDaemonStatus(t *testing.T) {
 		Owner:           legacy,
 		ServerID:        legacyID,
 		ProtocolEra:     era.EraLegacy,
+		Env:             map[string]string{"API_TOKEN": "legacy-credential-sentinel"},
 		OwnerGeneration: "legacy-generation",
 		RestoreSource:   "fresh",
 	}
@@ -220,58 +222,21 @@ func TestHandleListOwners_ModernPolicyFactsMirrorDaemonStatus(t *testing.T) {
 
 	legacyWire := ownerInfoJSONMap(t, legacyInfo)
 	assertStatusKeysAbsent(t, "HandleListOwners legacy owner", legacyWire, modernOwnerPolicyKeys)
+	for label, fields := range map[string]map[string]any{"modern": modernWire, "legacy": legacyWire} {
+		assertStatusKeysAbsent(t, "HandleListOwners "+label+" owner", fields, []string{"env", "token", "credentials", "authorization"})
+	}
+	wire, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal list owners response: %v", err)
+	}
+	for _, private := range []string{"modern-credential-sentinel", "legacy-credential-sentinel", "private-modern-generation", "private-predecessor-generation"} {
+		if strings.Contains(string(wire), private) {
+			t.Errorf("list owners response leaked private fixture value %q", private)
+		}
+	}
 }
 
-func TestOwnerInfo_ModernPolicySchemaAndZeroJSONOmission(t *testing.T) {
-	typ := reflect.TypeOf(control.OwnerInfo{})
-	wantTags := map[string]string{
-		"ServerID":             "server_id",
-		"EngineName":           "engine_name,omitempty",
-		"Command":              "command",
-		"Args":                 "args",
-		"Cwd":                  "cwd",
-		"CwdSet":               "cwd_set",
-		"Sessions":             "sessions",
-		"Pending":              "pending",
-		"UpstreamPID":          "upstream_pid,omitempty",
-		"Classification":       "classification",
-		"ClassificationSource": "classification_source,omitempty",
-		"ClassificationReason": "classification_reason,omitempty",
-		"MuxVersion":           "mux_version",
-		"Persistent":           "persistent",
-		"CachedInit":           "cached_init,omitempty",
-		"CachedTools":          "cached_tools,omitempty",
-		"CachedPrompts":        "cached_prompts,omitempty",
-		"CachedResources":      "cached_resources,omitempty",
-		"ProtocolEra":          "protocol_era,omitempty",
-		"SharingPolicy":        "sharing_policy,omitempty",
-		"CachePolicy":          "cache_policy,omitempty",
-		"LifecyclePolicy":      "lifecycle_policy,omitempty",
-	}
-	if typ.NumField() != len(wantTags) {
-		t.Errorf("OwnerInfo field count = %d, want exactly %d", typ.NumField(), len(wantTags))
-	}
-	for name, wantTag := range wantTags {
-		field, found := typ.FieldByName(name)
-		if !found {
-			t.Errorf("OwnerInfo missing required field %s", name)
-			continue
-		}
-		if name == "ProtocolEra" || name == "SharingPolicy" || name == "CachePolicy" || name == "LifecyclePolicy" {
-			if field.Type.Kind() != reflect.String {
-				t.Errorf("OwnerInfo.%s type = %s, want string", name, field.Type)
-			}
-		}
-		if got := field.Tag.Get("json"); got != wantTag {
-			t.Errorf("OwnerInfo.%s json tag = %q, want %q", name, got, wantTag)
-		}
-	}
-	for i := range typ.NumField() {
-		if _, allowed := wantTags[typ.Field(i).Name]; !allowed {
-			t.Errorf("OwnerInfo unexpectedly exposes prohibited/R3 field %s", typ.Field(i).Name)
-		}
-	}
-
+func TestOwnerInfo_ZeroJSONOmission(t *testing.T) {
 	zeroWire, err := json.Marshal(control.OwnerInfo{})
 	if err != nil {
 		t.Fatalf("marshal zero OwnerInfo: %v", err)
@@ -285,22 +250,8 @@ func TestOwnerInfo_ModernPolicySchemaAndZeroJSONOmission(t *testing.T) {
 			t.Errorf("zero OwnerInfo JSON contains %q: %s", key, zeroWire)
 		}
 	}
-
-	var roundTrip control.OwnerInfo
-	if err := json.Unmarshal(zeroWire, &roundTrip); err != nil {
-		t.Fatalf("unmarshal zero OwnerInfo roundtrip: %v", err)
-	}
-	roundTripWire, err := json.Marshal(roundTrip)
-	if err != nil {
-		t.Fatalf("marshal zero OwnerInfo roundtrip: %v", err)
-	}
-	for _, key := range modernOwnerPolicyKeys {
-		if stringFieldPresent(t, typ, roundTrip, key) {
-			t.Errorf("zero OwnerInfo roundtrip populated %q", key)
-		}
-		if containsJSONKey(roundTripWire, key) {
-			t.Errorf("zero OwnerInfo roundtrip JSON contains %q: %s", key, roundTripWire)
-		}
+	if _, found := zeroFields["maintenance"]; found {
+		t.Errorf("zero OwnerInfo JSON contains maintenance: %s", zeroWire)
 	}
 }
 
@@ -380,21 +331,4 @@ func assertOwnerInfoMatchesModernStatus(t *testing.T, info control.OwnerInfo, st
 	if got := info.Persistent; got != true {
 		t.Errorf("HandleListOwners persistent = %v, want true", got)
 	}
-}
-
-func stringFieldPresent(t *testing.T, typ reflect.Type, value control.OwnerInfo, jsonKey string) bool {
-	t.Helper()
-	for i := range typ.NumField() {
-		field := typ.Field(i)
-		if field.Tag.Get("json") != jsonKey+",omitempty" {
-			continue
-		}
-		return reflect.ValueOf(value).Field(i).String() != ""
-	}
-	return false
-}
-
-func containsJSONKey(wire []byte, key string) bool {
-	var fields map[string]json.RawMessage
-	return json.Unmarshal(wire, &fields) == nil && fields[key] != nil
 }

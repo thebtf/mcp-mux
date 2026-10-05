@@ -134,6 +134,8 @@ func TestNewOwner_SessionHandlerOnly_NoUpstream(t *testing.T) {
 	// Add a session and send an initialize request; the handler should receive it.
 	cwd := "/test-session-handler-only-project"
 	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
 	buf := &safeBuf{}
 	s := NewSession(pr, buf)
 	s.Cwd = cwd
@@ -141,12 +143,9 @@ func TestNewOwner_SessionHandlerOnly_NoUpstream(t *testing.T) {
 
 	// Send an initialize request into the session's reader.
 	initReq := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}` + "\n"
-	go func() {
-		pw.Write([]byte(initReq))
-		// Close so readSession exits after processing the single request.
-		time.Sleep(200 * time.Millisecond)
-		pw.Close()
-	}()
+	if _, err := io.WriteString(pw, initReq); err != nil {
+		t.Fatalf("write initialize request: %v", err)
+	}
 
 	// Wait for the handler to receive the request.
 	ok := waitCondition(t, 2*time.Second, func() bool {
@@ -192,6 +191,27 @@ func TestNewOwner_SessionHandlerOnly_NoUpstream(t *testing.T) {
 	resp := buf.String()
 	if !strings.Contains(resp, `"result"`) && !strings.Contains(resp, `"error"`) {
 		t.Errorf("session response is not a JSON-RPC response: %s", resp)
+	}
+
+	// Response delivery is not reader/disconnect retirement. Close the owned
+	// input after checking dispatch, then retry the existing finalization API
+	// until it proves actual native settlement, without a daemon retry owner.
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close session input: %v", err)
+	}
+	ok = waitCondition(t, 2*time.Second, func() bool {
+		if o.SessionCount() != 0 || o.PendingRequests() != 0 || len(handler.capturedDisconnects()) == 0 {
+			return false
+		}
+		_, finalized, err := o.FinalizeForRemoval(false, time.Second)
+		return finalized && err == nil
+	})
+	if !ok {
+		t.Fatal("session reader and lifecycle callbacks did not settle within timeout")
+	}
+	disconnects := handler.capturedDisconnects()
+	if len(disconnects) != 1 || disconnects[0] != wantID {
+		t.Errorf("OnProjectDisconnect got IDs=%v, want [%q]", disconnects, wantID)
 	}
 
 	// Verify owner shuts down cleanly.

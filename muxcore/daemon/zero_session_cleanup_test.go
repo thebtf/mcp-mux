@@ -505,7 +505,9 @@ func TestZeroSessionCleanupModernReconnectReservationRetainsThenRemovesSameGener
 
 	conn := dialLifecycleSession(t, ipcPath, previousToken)
 	waitOwnerSessionCount(t, entry, 1)
+	d.mu.RLock()
 	lastSessionBeforeDisconnect := entry.LastSession
+	d.mu.RUnlock()
 	if err := conn.Close(); err != nil {
 		t.Fatalf("initial conn.Close() error: %v", err)
 	}
@@ -543,7 +545,9 @@ func TestZeroSessionCleanupModernReconnectReservationRetainsThenRemovesSameGener
 	if got := entry.Owner.SessionMgr().PendingCount(); got != 0 {
 		t.Fatalf("PendingCount() after reconnect consumption = %d, want 0", got)
 	}
+	d.mu.RLock()
 	lastSessionBeforeWakeDisconnect := entry.LastSession
+	d.mu.RUnlock()
 	if err := wakeConn.Close(); err != nil {
 		t.Fatalf("wake conn.Close() error: %v", err)
 	}

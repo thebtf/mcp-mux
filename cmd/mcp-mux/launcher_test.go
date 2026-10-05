@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +38,7 @@ func writeContentAddressedTestEngine(t *testing.T, launcherPath, content string)
 }
 
 func TestInstallVersionedEngineKeepsLauncherStableByDefault(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -81,6 +84,7 @@ func TestInstallVersionedEngineKeepsLauncherStableByDefault(t *testing.T) {
 }
 
 func TestInstallVersionedEngineSwitchesPointerAndKeepsOldVersion(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -118,7 +122,7 @@ func TestWriteActiveEngineStoresRelativePointer(t *testing.T) {
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
 	writeTestFile(t, enginePath, "engine")
 
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 
@@ -188,7 +192,7 @@ func TestDaemonExecutableForSpawnUsesActiveEnginePointer(t *testing.T) {
 	activeEnginePath := filepath.Join(versionStoreDir(launcherPath), "new456", engineFileName())
 	writeTestFile(t, oldEnginePath, "old engine")
 	writeTestFile(t, activeEnginePath, "new engine")
-	if err := writeActiveEngine(launcherPath, activeEnginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, activeEnginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 	t.Setenv(envActiveEngineFile, activeEngineFile(launcherPath))
@@ -205,7 +209,7 @@ func TestDaemonExecutableForSpawnIgnoresMissingActiveEnginePointer(t *testing.T)
 	currentEnginePath := filepath.Join(versionStoreDir(launcherPath), "old123", engineFileName())
 	missingActiveEnginePath := filepath.Join(versionStoreDir(launcherPath), "missing", engineFileName())
 	writeTestFile(t, currentEnginePath, "old engine")
-	if err := writeActiveEngine(launcherPath, missingActiveEnginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, missingActiveEnginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 	t.Setenv(envActiveEngineFile, activeEngineFile(launcherPath))
@@ -268,6 +272,7 @@ func TestDaemonStartReportsActiveAndFallbackStartFailures(t *testing.T) {
 }
 
 func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
@@ -305,6 +310,7 @@ func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
 }
 
 func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	t.Setenv("TEMP", dir)
 	t.Setenv("TMP", dir)
@@ -333,6 +339,9 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 		return path == serverid.DaemonControlPath("", engineName)
 	}
 	launcherControlSendWithTimeout = func(path string, req control.Request, timeout time.Duration) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+		}
 		sendCalled = true
 		gotReq = req
 		if path != serverid.DaemonControlPath("", engineName) {
@@ -385,6 +394,7 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 }
 
 func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	t.Setenv("TEMP", dir)
 	t.Setenv("TMP", dir)
@@ -416,7 +426,7 @@ func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T)
 		case "status":
 			return &control.Response{
 				OK:   true,
-				Data: []byte(`{"servers":[{"session_count":1}]}`),
+				Data: []byte(`{"maintenance":[],"servers":[{"session_count":1}]}`),
 			}, nil
 		case "graceful-restart":
 			gracefulCalled = true
@@ -447,6 +457,7 @@ func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T)
 }
 
 func TestRunLauncherUpgradeRestartNoDaemonSucceeds(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -491,6 +502,7 @@ func TestRunLauncherUpgradeRestartNoDaemonSucceeds(t *testing.T) {
 }
 
 func TestRunLauncherUpgradeRestartReexecsExplicitLauncherUpdate(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -532,6 +544,7 @@ func TestRunLauncherUpgradeRestartReexecsExplicitLauncherUpdate(t *testing.T) {
 }
 
 func TestRunLauncherUpgradeRestartActiveDoesNotRequirePendingUpdate(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
@@ -563,6 +576,7 @@ func TestRunLauncherUpgradeRestartActiveDoesNotRequirePendingUpdate(t *testing.T
 }
 
 func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(dir, "relative-engine", engineFileName())
@@ -603,6 +617,9 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 	})
 	launcherIsDaemonRunning = func(string) bool { return true }
 	launcherControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
+		if req.Cmd == "status" {
+			return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+		}
 		gotEnginePath = req.SuccessorExe
 		return &control.Response{OK: true}, nil
 	}
@@ -630,6 +647,7 @@ func TestRunLauncherUpgradeRestartActiveCanonicalizesEnginePath(t *testing.T) {
 }
 
 func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	pendingPath := launcherPath + "~"
@@ -641,7 +659,7 @@ func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *t
 	}
 	enginePath := filepath.Join(versionStoreDir(launcherPath), hash[:12], engineFileName())
 	writeTestFile(t, enginePath, "new engine")
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatalf("writeActiveEngine() error = %v", err)
 	}
 
@@ -667,5 +685,78 @@ func TestInstallVersionedEngineKeepsStaleLauncherWhenEngineAlreadyInstalled(t *t
 	}
 	if string(gotLauncher) != "old launcher" {
 		t.Fatalf("launcher content = %q, want old launcher", gotLauncher)
+	}
+}
+
+func TestRestartDaemonAfterEngineSwitchFallbackRequiresSameAwareGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		before    string
+		after     string
+		transport error
+		want      error
+	}{
+		{"aware-clear", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old"}`, nil, nil},
+		{"old-endpoint", `{"daemon_generation":"old"}`, `{"daemon_generation":"old"}`, nil, control.ErrMaintenanceUnsupported},
+		{"changed-generation", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"new"}`, nil, control.ErrMaintenanceInvalid},
+		{"unknown-transport", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old"}`, io.EOF, io.EOF},
+		{"unknown-deadline", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old"}`, os.ErrDeadlineExceeded, os.ErrDeadlineExceeded},
+		{"invalid-status", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":null,"daemon_generation":"old"}`, nil, control.ErrMaintenanceInvalid},
+		{"writer-failed", `{"maintenance":[],"daemon_generation":"old"}`, `{"maintenance":[],"daemon_generation":"old","maintenance_error_code":"maintenance_persistence_failed"}`, nil, control.ErrMaintenancePersistenceFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			oldRunning, oldSend := launcherIsDaemonRunning, launcherControlSendWithTimeout
+			oldExit, oldWait, oldStart := launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom
+			t.Cleanup(func() {
+				launcherIsDaemonRunning, launcherControlSendWithTimeout = oldRunning, oldSend
+				launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom = oldExit, oldWait, oldStart
+			})
+			statusCalls, graceful, shutdown, starts, exits := 0, 0, 0, 0, 0
+			launcherIsDaemonRunning = func(string) bool { return true }
+			launcherWaitForDaemonExit = func(string, string) { exits++ }
+			launcherWaitForDaemon = func(string, time.Duration) error { return nil }
+			launcherStartDaemonProcessFrom = func(string, string) error { starts++; return nil }
+			launcherControlSendWithTimeout = func(_ string, req control.Request, _ time.Duration) (*control.Response, error) {
+				switch req.Cmd {
+				case "status":
+					statusCalls++
+					data := tc.before
+					if statusCalls > 2 {
+						data = tc.after
+					}
+					return &control.Response{OK: true, Data: []byte(data)}, nil
+				case "graceful-restart":
+					graceful++
+					if tc.transport != nil {
+						return nil, tc.transport
+					}
+					return &control.Response{Message: "graceful restart rejected"}, nil
+				case "shutdown":
+					shutdown++
+					return &control.Response{OK: true}, nil
+				default:
+					t.Fatalf("unexpected control command: %s", req.Cmd)
+					return nil, nil
+				}
+			}
+			err := restartDaemonAfterEngineSwitch("launcher", "engine", true)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("fallback cause lost: %v, want %v", err, tc.want)
+			}
+			if graceful != 1 {
+				t.Fatalf("graceful requests=%d, want 1", graceful)
+			}
+			if tc.want == nil {
+				if shutdown != 1 || starts != 1 || exits != 1 {
+					t.Fatalf("aware clean fallback lost: shutdown=%d starts=%d exits=%d", shutdown, starts, exits)
+				}
+			} else if shutdown != 0 || starts != 0 || exits != 0 {
+				t.Fatalf("unproven fallback mutated live daemon: shutdown=%d starts=%d exits=%d", shutdown, starts, exits)
+			}
+			if tc.transport != nil && statusCalls != 2 {
+				t.Fatalf("unknown transport retried status/lifecycle: statuses=%d", statusCalls)
+			}
+		})
 	}
 }

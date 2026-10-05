@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
@@ -65,8 +66,10 @@ type ResilientClientConfig struct {
 	Stdin          io.Reader
 	Stdout         io.Writer
 	InitialIPCPath string
-	Token          string          // handshake token from initial spawn; sent to owner on connect
-	ProtocolEra    era.ProtocolEra // zero value preserves legacy reconnect behavior
+	// InitialError starts the aware shim fenced without closing host transport.
+	InitialError error
+	Token        string          // handshake token from initial spawn; sent to owner on connect
+	ProtocolEra  era.ProtocolEra // zero value preserves legacy reconnect behavior
 	// OnInject, when non-nil, is invoked exactly once after the initial IPC
 	// handshake completes. The closure pushes raw JSON-RPC frames into msgFromCC
 	// via select-default semantics. Single-fire across reconnects. Closure is
@@ -128,28 +131,38 @@ type initCache struct {
 
 // resilientClient holds the runtime state for RunResilientClient.
 type resilientClient struct {
-	cfg                ResilientClientConfig
-	token              string        // current handshake token; updated on reconnect
-	msgFromCC          chan []byte   // stdin → proxy (buffered 1000)
-	msgFromIPC         chan []byte   // ipc → stdout (buffered 1000)
-	ipcEOF             chan struct{} // closed when IPC reader detects EOF/error
-	stdoutDead         chan struct{} // closed when CC stdout pipe breaks
-	stdoutOnce         sync.Once     // ensures stdoutDead is closed once
-	startTime          time.Time     // when the client started (for probe detection)
-	ipcMsgSent         atomic.Bool   // true after first IPC→stdout message forwarded (disables probe detection)
-	initCache          initCache
-	inflight           sync.Map // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
-	initialized        atomic.Bool
-	persistent         atomic.Bool
-	effectiveIdleDelay atomic.Int64
-	lastHostActivity   atomic.Int64
-	localWork          atomic.Int64
-	suspendMu          sync.Mutex
-	suspending         bool
-	closed             atomic.Bool
-	dormantMu          sync.Mutex
-	dormantCommitted   bool
-	log                *log.Logger
+	cfg                 ResilientClientConfig
+	reconnectMu         sync.Mutex
+	pendingReconnect    atomic.Pointer[reconnectResult]
+	ingressMu           sync.Mutex
+	held                bool
+	heldResult          *control.MaintenanceResult
+	maintenanceSeen     bool
+	maintenanceSequence uint64
+	queueSpace          chan struct{}
+	transportDone       chan struct{}
+	outputMu            *sync.Mutex
+	token               string        // current handshake token; updated on reconnect
+	msgFromCC           chan []byte   // stdin → proxy (buffered 1000)
+	msgFromIPC          chan []byte   // ipc → stdout (buffered 1000)
+	ipcEOF              chan struct{} // requests current IPC closure after resume admission
+	stdoutDead          chan struct{} // closed when CC stdout pipe breaks
+	stdoutOnce          sync.Once     // ensures stdoutDead is closed once
+	startTime           time.Time     // when the client started (for probe detection)
+	ipcMsgSent          atomic.Bool   // true after first IPC→stdout message forwarded (disables probe detection)
+	initCache           initCache
+	inflight            sync.Map // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
+	initialized         atomic.Bool
+	persistent          atomic.Bool
+	effectiveIdleDelay  atomic.Int64
+	lastHostActivity    atomic.Int64
+	localWork           atomic.Int64
+	suspendMu           sync.Mutex
+	suspending          bool
+	closed              atomic.Bool
+	dormantMu           sync.Mutex
+	dormantCommitted    bool
+	log                 *log.Logger
 }
 
 // ErrReconnectExit asks a supervised product child to exit so its stable
@@ -193,32 +206,48 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 		logger = log.New(io.Discard, "", 0)
 	}
 
+	var stdoutMu sync.Mutex
 	rc := &resilientClient{
-		cfg:        cfg,
-		token:      cfg.Token,
-		msgFromCC:  make(chan []byte, msgFromCCBufferSize),
-		msgFromIPC: make(chan []byte, msgFromIPCBufferSize),
-		ipcEOF:     make(chan struct{}),
-		stdoutDead: make(chan struct{}),
-		startTime:  time.Now(),
-		log:        logger,
+		outputMu:      &stdoutMu,
+		queueSpace:    make(chan struct{}, 1),
+		transportDone: make(chan struct{}),
+		cfg:           cfg,
+		token:         cfg.Token,
+		msgFromCC:     make(chan []byte, msgFromCCBufferSize),
+		msgFromIPC:    make(chan []byte, msgFromIPCBufferSize),
+		ipcEOF:        make(chan struct{}, 1),
+		stdoutDead:    make(chan struct{}),
+		startTime:     time.Now(),
+		log:           logger,
 	}
 	rc.lastHostActivity.Store(time.Now().UnixNano())
 	rc.effectiveIdleDelay.Store(int64(cfg.IdleSuspendDelay))
 	defer rc.closed.Store(true)
+	defer close(rc.transportDone)
 
-	// Connect to initial IPC path.
-	conn, err := ipc.Dial(cfg.InitialIPCPath)
-	if err != nil {
-		return fmt.Errorf("resilient client: initial dial %s: %w", cfg.InitialIPCPath, err)
+	// A typed initial fence must not tear down host stdin/stdout.
+	var conn interface {
+		io.Reader
+		io.Writer
+		io.Closer
 	}
-
-	// Send handshake token so the owner can bind this connection to a session context.
-	if rc.token != "" {
-		if _, err := fmt.Fprintf(conn, "%s\n", rc.token); err != nil {
-			conn.Close()
-			return fmt.Errorf("resilient client: send token: %w", err)
+	var err error
+	if isMaintenanceFence(cfg.InitialError) {
+		rc.enterMaintenance(cfg.InitialError)
+	} else {
+		conn, err = ipc.Dial(cfg.InitialIPCPath)
+		if err != nil {
+			return fmt.Errorf("resilient client: initial dial %s: %w", cfg.InitialIPCPath, err)
 		}
+
+		// Send handshake token so the owner can bind this connection to a session context.
+		if rc.token != "" {
+			if _, err := fmt.Fprintf(conn, "%s\n", rc.token); err != nil {
+				conn.Close()
+				return fmt.Errorf("resilient client: send token: %w", err)
+			}
+		}
+
 	}
 
 	// Wire OnInject after handshake (if any). Lives outside the token branch so
@@ -237,18 +266,24 @@ func RunResilientClient(cfg ResilientClientConfig) error {
 
 	// stdoutWriter mu: protects stdout writes shared between ipcReader forward
 	// path and keepalive sender.
-	var stdoutMu sync.Mutex
-
 	// stdoutWriter: drains msgFromIPC to CC stdout.
 	go rc.runStdoutWriter(&stdoutMu)
 
+	if conn == nil {
+		conn, err = rc.reconnect(&stdoutMu, stdinDone)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
 	// Run the main proxy loop.
 	return rc.runProxy(conn, &stdoutMu, stdinDone)
 }
 
-// runStdinReader reads newline-delimited JSON-RPC messages from CC stdin and
-// puts raw bytes into rc.msgFromCC. On channel full, the oldest message is
-// dropped and a warning is logged (NFR2: capped at 1000 messages).
+// runStdinReader applies maintenance disposition before bounded queue admission.
+// Queue capacity backpressures host input rather than dropping request IDs.
 // Sends io.EOF to stdinDone when stdin closes.
 func (rc *resilientClient) runStdinReader(done chan<- error) {
 	scanner := jsonrpc.NewScanner(rc.cfg.Stdin)
@@ -259,42 +294,11 @@ func (rc *resilientClient) runStdinReader(done chan<- error) {
 			return
 		}
 
-		// Cache the first initialize request for replay.
-		if msg.IsRequest() && msg.Method == "initialize" {
-			rc.initCache.mu.Lock()
-			if rc.initCache.request == nil {
-				raw := make([]byte, len(msg.Raw))
-				copy(raw, msg.Raw)
-				rc.initCache.request = raw
-				rc.initCache.requestID = string(msg.ID)
-				rc.log.Printf("resilient: cached initialize request (%d bytes)", len(raw))
-			}
-			rc.initCache.mu.Unlock()
+		raw := append([]byte(nil), msg.Raw...)
+		if err := rc.enqueueHostFrame(raw, msg); err != nil {
+			done <- err
+			return
 		}
-
-		raw := make([]byte, len(msg.Raw))
-		copy(raw, msg.Raw)
-		rc.suspendMu.Lock()
-		rc.lastHostActivity.Store(time.Now().UnixNano())
-
-		if msg.IsRequest() {
-			rc.log.Printf("resilient: CC sent request method=%s id=%s (%d bytes)", msg.Method, string(msg.ID), len(raw))
-		}
-
-		rc.localWork.Add(1)
-		select {
-		case rc.msgFromCC <- raw:
-		default:
-			// Buffer full: drop oldest message to make room.
-			select {
-			case dropped := <-rc.msgFromCC:
-				rc.localWork.Add(-1)
-				rc.log.Printf("resilient: msgFromCC buffer full, dropped oldest message (%d bytes)", len(dropped))
-			default:
-			}
-			rc.msgFromCC <- raw
-		}
-		rc.suspendMu.Unlock()
 	}
 }
 
@@ -329,6 +333,9 @@ func (rc *resilientClient) runProxy(conn interface {
 		rc.suspendMu.Lock()
 		rc.suspending = false
 		rc.suspendMu.Unlock()
+		rc.ingressMu.Lock()
+		connectionSequence := rc.maintenanceSequence
+		rc.ingressMu.Unlock()
 
 		ipcEOF := make(chan struct{})
 		go rc.runIPCReader(conn, ipcEOF)
@@ -423,15 +430,35 @@ func (rc *resilientClient) runProxy(conn interface {
 				rc.log.Printf("resilient: CC stdout dead, exiting")
 				return nil
 
+			case <-rc.ipcEOF:
+				conn.Close()
+				continue connected
+
 			case <-ipcEOF:
 				if idleTicker != nil {
 					idleTicker.Stop()
 				}
 				conn.Close()
-				<-writerDone
+				deferred := <-writerDone
 				rc.log.Printf("resilient: IPC connection lost, reconnecting...")
 
-				newConn, err := rc.reconnect(stdoutMu, stdinDone)
+				newConn, err := rc.reconnect(stdoutMu, stdinDone, &deferred)
+				if deferred != nil {
+					// An old connection's dequeued frame cannot cross a fence,
+					// even if fresh demand already observed resume. Never replay
+					// it; retain maintenance precedence by connection sequence.
+					rc.ingressMu.Lock()
+					fenced := connectionSequence != rc.maintenanceSequence
+					if fenced {
+						_ = rc.failMaintenanceFrameLocked(deferred)
+					}
+					rc.ingressMu.Unlock()
+					if id := extractRequestID(deferred); !fenced && id != "" {
+						rc.inflight.Store(id, true)
+						rc.drainOrphanedInflight(stdoutMu)
+					}
+					rc.noteDequeued()
+				}
 				if err != nil {
 					if errors.Is(err, io.EOF) {
 						return nil
@@ -509,10 +536,10 @@ func (rc *resilientClient) runProxy(conn interface {
 					}
 				}
 
-				newConn, err := rc.reconnect(stdoutMu, stdinDone)
+				newConn, err := rc.reconnect(stdoutMu, stdinDone, &demand)
 				if err != nil {
 					if demand != nil {
-						rc.localWork.Add(-1)
+						rc.noteDequeued()
 					}
 					if errors.Is(err, io.EOF) {
 						return nil
@@ -521,7 +548,7 @@ func (rc *resilientClient) runProxy(conn interface {
 				}
 				writeErr := rc.forwardToIPC(newConn, demand)
 				if demand != nil {
-					rc.localWork.Add(-1)
+					rc.noteDequeued()
 				}
 				if writeErr != nil {
 					newConn.Close()
@@ -601,6 +628,8 @@ func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error, deferr
 		} else {
 			select {
 			case data = <-rc.msgFromCC:
+			case <-rc.ipcEOF:
+				return nil, false, nil
 			case err := <-stdinDone:
 				if err == io.EOF {
 					return nil, false, io.EOF
@@ -614,7 +643,7 @@ func (rc *resilientClient) waitForSuspendedDemand(stdinDone <-chan error, deferr
 		}
 		control, reserved, controlErr := rc.lifecycleControl(data)
 		if reserved {
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			if controlErr != nil {
 				return nil, false, controlErr
 			}
@@ -637,13 +666,13 @@ func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-ch
 	case data := <-rc.msgFromCC:
 		control, reserved, controlErr := rc.lifecycleControl(data)
 		if reserved && controlErr == nil && control == supervisor.ControlCommitDormant {
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			rc.dormantMu.Lock()
 			select {
 			case demand := <-rc.msgFromCC:
 				rc.dormantMu.Unlock()
 				if err := rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantNack); err != nil {
-					rc.localWork.Add(-1)
+					rc.noteDequeued()
 					return nil, false, err
 				}
 				rc.log.Printf("shim.dormant.nack reason=injected_demand")
@@ -659,7 +688,7 @@ func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-ch
 			return nil, true, nil
 		}
 		if reserved {
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			if controlErr == nil {
 				controlErr = fmt.Errorf("unexpected private lifecycle control %d", control)
 			}
@@ -667,7 +696,7 @@ func (rc *resilientClient) negotiateDormant(stdoutMu *sync.Mutex, stdinDone <-ch
 			return nil, false, fmt.Errorf("resilient: dormant handshake: %w", controlErr)
 		}
 		if err := rc.writeDormantNotification(stdoutMu, supervisor.ControlDormantNack); err != nil {
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			return nil, false, err
 		}
 		rc.log.Printf("shim.dormant.nack reason=host_demand")
@@ -722,16 +751,18 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 		copy(data, line)
 
 		rc.observeIPCResponse(data)
+		if held, ok := maintenanceWireResult(data); ok {
+			rc.enterMaintenance(&control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held})
+		}
 
 		select {
 		case rc.msgFromIPC <- data:
-		default:
-			select {
-			case dropped := <-rc.msgFromIPC:
-				rc.log.Printf("resilient: msgFromIPC buffer full, dropped %d bytes", len(dropped))
-			default:
-			}
-			rc.msgFromIPC <- data
+		case <-rc.stdoutDead:
+			close(ipcEOF)
+			return
+		case <-rc.transportDone:
+			close(ipcEOF)
+			return
 		}
 	}
 
@@ -766,7 +797,7 @@ func (rc *resilientClient) observeIPCResponse(data []byte) {
 
 // runIPCWriter reads from rc.msgFromCC and writes to the IPC connection.
 // Stops when ipcEOF is closed (preventing writes to a dead connection).
-// Closes writerDone when it exits.
+// Returns any dequeued unsent frame through writerDone when it exits.
 // Tracks request IDs so orphaned in-flight requests can get error responses on reconnect.
 func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, writerDone chan<- []byte) {
 	var deferred []byte
@@ -784,11 +815,17 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 				return
 			}
 			if _, reserved, _ := rc.lifecycleControl(data); reserved {
-				rc.localWork.Add(-1)
+				rc.noteDequeued()
 				continue
 			}
+			select {
+			case <-ipcEOF:
+				deferred = data
+				return
+			default:
+			}
 			err := rc.forwardToIPC(conn, data)
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			if err != nil {
 				rc.log.Printf("resilient: ipc write error: %v", err)
 				return
@@ -798,6 +835,14 @@ func (rc *resilientClient) runIPCWriter(conn io.Writer, ipcEOF <-chan struct{}, 
 }
 
 func (rc *resilientClient) forwardToIPC(conn io.Writer, data []byte) error {
+	if data == nil {
+		return nil
+	}
+	rc.ingressMu.Lock()
+	defer rc.ingressMu.Unlock()
+	if rc.held {
+		return rc.failMaintenanceFrameLocked(data)
+	}
 	// Track request IDs (messages with "id" field that are not responses).
 	if id := extractRequestID(data); id != "" {
 		rc.inflight.Store(id, true)
@@ -812,6 +857,7 @@ type reconnectResult struct {
 	path  string
 	token string
 	err   error
+	ready chan struct{} // closed after the pending admission's dial/handshake settles
 }
 
 // reconnect enters the RECONNECTING state: immediately tombstones every
@@ -839,7 +885,7 @@ type reconnectResult struct {
 // CC's stdio transport does NOT time out on silence — it times out on
 // unanswered requests. Draining the in-flight map with error responses
 // below is the spec-compliant substitute.
-func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan error) (interface {
+func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan error, wake ...*[]byte) (interface {
 	io.Reader
 	io.Writer
 	io.Closer
@@ -851,6 +897,7 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	// broken when it fires — even though the reconnect itself would have
 	// succeeded in under a second.
 	rc.drainOrphanedInflight(stdoutMu)
+	rc.rejectReconnectWake(wake)
 
 	if rc.cfg.RefreshToken == nil && rc.cfg.Reconnect == nil {
 		return nil, fmt.Errorf("resilient: reconnect function not configured")
@@ -861,8 +908,19 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	if rc.cfg.RefreshToken != nil {
 		fallbackReason := ""
 		for attempt := 0; attempt < rc.cfg.MaxRefreshAttempts; attempt++ {
-			res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.RefreshToken)
+			res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.RefreshToken, wake...)
 			if err != nil {
+				if isMaintenanceFence(err) {
+					attempt-- // Maintenance is not the ordinary refresh retry budget.
+					if waitErr := rc.waitBeforeReconnectRetry(stdinDone, stdoutMu, degraded); waitErr != nil {
+						return nil, waitErr
+					}
+					continue
+				}
+				var refusal *control.MaintenanceError
+				if errors.As(err, &refusal) {
+					return nil, err
+				}
 				if errors.Is(err, ErrReconnectExit) {
 					return nil, err
 				}
@@ -908,8 +966,12 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	}
 
 	for {
-		res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.Reconnect)
+		res, err := rc.awaitReconnectAttempt(&graceDeadline, stdinDone, stdoutMu, &degraded, rc.cfg.Reconnect, wake...)
 		if err != nil {
+			var refusal *control.MaintenanceError
+			if errors.As(err, &refusal) && !isMaintenanceFence(err) {
+				return nil, err
+			}
 			if errors.Is(err, ErrReconnectExit) {
 				return nil, err
 			}
@@ -934,15 +996,14 @@ func (rc *resilientClient) reconnect(stdoutMu *sync.Mutex, stdinDone <-chan erro
 	}
 }
 
-func (rc *resilientClient) awaitReconnectAttempt(graceDeadline *time.Time, stdinDone <-chan error, stdoutMu *sync.Mutex, degraded *bool, fn ReconnectFunc) (reconnectResult, error) {
+func (rc *resilientClient) awaitReconnectAttempt(graceDeadline *time.Time, stdinDone <-chan error, stdoutMu *sync.Mutex, degraded *bool, fn ReconnectFunc, wake ...*[]byte) (reconnectResult, error) {
 	if fn == nil {
 		return reconnectResult{}, fmt.Errorf("resilient: reconnect function not configured")
 	}
 
 	resultCh := make(chan reconnectResult, 1)
 	go func() {
-		newPath, newToken, err := fn()
-		resultCh <- reconnectResult{path: newPath, token: newToken, err: err}
+		resultCh <- rc.attemptReconnect(fn)
 	}()
 
 	drainTicker := time.NewTicker(degradedDrainInterval)
@@ -968,7 +1029,17 @@ func (rc *resilientClient) awaitReconnectAttempt(graceDeadline *time.Time, stdin
 			}
 			return reconnectResult{}, fmt.Errorf("resilient: stdin during reconnect: %w", err)
 		case res := <-resultCh:
+			if isMaintenanceFence(res.err) {
+				var refusal *control.MaintenanceError
+				var held *control.MaintenanceResult
+				if errors.As(res.err, &refusal) {
+					held = refusal.Result
+				}
+				rc.rejectReconnectWake(wake, held)
+			}
 			return res, res.err
+		case <-rc.stdoutDead:
+			return reconnectResult{}, io.EOF
 		case <-graceC:
 			*degraded = true
 			graceC = nil
@@ -994,6 +1065,8 @@ func (rc *resilientClient) waitBeforeReconnectRetry(stdinDone <-chan error, stdo
 				return io.EOF
 			}
 			return fmt.Errorf("resilient: stdin during reconnect retry: %w", err)
+		case <-rc.stdoutDead:
+			return io.EOF
 		case <-timer.C:
 			if degraded {
 				rc.failBufferedRequestsDuringReconnect(stdoutMu)
@@ -1013,6 +1086,19 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 	io.Closer
 }, string, error,
 ) {
+	rc.reconnectMu.Lock()
+	defer rc.reconnectMu.Unlock()
+	defer func() {
+		// A resume wake must never survive to close the newly active connection.
+		select {
+		case <-rc.ipcEOF:
+		default:
+		}
+		if pending := rc.pendingReconnect.Swap(nil); pending != nil {
+			close(pending.ready)
+		}
+	}()
+
 	conn, err := ipc.Dial(path)
 	if err != nil {
 		return nil, "dial", err
@@ -1025,7 +1111,8 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 			return nil, "handshake", err
 		}
 	}
-	if rc.cfg.ProtocolEra == era.EraModern20260728 {
+	if rc.cfg.ProtocolEra == era.EraModern20260728 || rc.maintenanceObserved() {
+		rc.leaveMaintenance()
 		return conn, "", nil
 	}
 
@@ -1035,6 +1122,7 @@ func (rc *resilientClient) finishReconnect(path, token string, stdoutMu *sync.Mu
 	}
 
 	rc.sendListChangedNotifications(stdoutMu)
+	rc.leaveMaintenance()
 	return conn, "", nil
 }
 
@@ -1158,14 +1246,37 @@ func (rc *resilientClient) replayInit(conn interface {
 
 func (rc *resilientClient) injectFrame(b []byte) error {
 	rc.dormantMu.Lock()
-	defer rc.dormantMu.Unlock()
 	if rc.closed.Load() || rc.dormantCommitted {
+		rc.dormantMu.Unlock()
 		rc.log.Printf("proxy.inject.dropped reason=closed")
 		return ErrInjectClosed
 	}
 	// Copy the caller's buffer — they may reuse or pool it after inject returns.
 	data := make([]byte, len(b))
 	copy(data, b)
+	rc.ingressMu.Lock()
+	sequence := rc.maintenanceSequence
+	if rc.held {
+		rc.ingressMu.Unlock()
+		rc.dormantMu.Unlock()
+		// Activation joins the old transport; never wait while holding ingress
+		// or the dormant/suspend barriers needed by that same proxy lifecycle.
+		if admittedSequence, admitted := rc.recheckMaintenance(); admitted {
+			sequence = admittedSequence
+		}
+		rc.dormantMu.Lock()
+		if rc.closed.Load() || rc.dormantCommitted {
+			rc.dormantMu.Unlock()
+			rc.log.Printf("proxy.inject.dropped reason=closed")
+			return ErrInjectClosed
+		}
+		rc.ingressMu.Lock()
+	}
+	defer rc.dormantMu.Unlock()
+	defer rc.ingressMu.Unlock()
+	if rc.held || sequence != rc.maintenanceSequence {
+		return rc.failMaintenanceFrameLocked(data)
+	}
 	rc.suspendMu.Lock()
 	defer rc.suspendMu.Unlock()
 	rc.lastHostActivity.Store(time.Now().UnixNano())
@@ -1175,7 +1286,7 @@ func (rc *resilientClient) injectFrame(b []byte) error {
 		rc.log.Printf("proxy.inject.delivered bytes=%d", len(b))
 		return nil
 	default:
-		rc.localWork.Add(-1)
+		rc.noteDequeued()
 		rc.log.Printf("proxy.inject.dropped reason=full")
 		return ErrInjectFull
 	}
@@ -1208,13 +1319,22 @@ func (rc *resilientClient) sendListChangedNotifications(mu *sync.Mutex) {
 // MCP host's stdio transport alive while still making individual tool calls
 // fail fast and retryable during a backend outage.
 func (rc *resilientClient) failBufferedRequestsDuringReconnect(stdoutMu *sync.Mutex) {
+	rc.ingressMu.Lock()
+	defer rc.ingressMu.Unlock()
+	if rc.pendingReconnect.Load() != nil {
+		return
+	}
+	if rc.held {
+		rc.drainMaintenanceBufferLocked()
+		return
+	}
 	failedRequests := 0
 	droppedMessages := 0
 	stdoutBroken := false
 	for {
 		select {
 		case data := <-rc.msgFromCC:
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			id := extractRequestID(data)
 			if id == "" {
 				droppedMessages++
@@ -1258,11 +1378,11 @@ func (rc *resilientClient) flushBuffer(conn io.Writer) {
 		select {
 		case data := <-rc.msgFromCC:
 			if _, reserved, _ := rc.lifecycleControl(data); reserved {
-				rc.localWork.Add(-1)
+				rc.noteDequeued()
 				continue
 			}
 			err := rc.forwardToIPC(conn, data)
-			rc.localWork.Add(-1)
+			rc.noteDequeued()
 			if err != nil {
 				rc.log.Printf("resilient: flush write error: %v", err)
 				return

@@ -571,6 +571,149 @@ Broken signals:
 - A persistent/eager template owner waits for demand instead of starting
   eagerly.
 
+## Scenario 11: Upstream maintenance replacement
+
+Run this scenario for the upstream maintenance hold change and later changes to
+its fence, drain, lease, shim, CLI, or recovery behavior. It is an explicit
+cross-platform release gate, not an automatically enrolled critical-suite test.
+This section defines expected observations; it does not record a runtime PASS.
+
+Use the exact integrated candidate, Go compatible with `go.mod`, and PowerShell
+7 on Windows and Unix. Root allocates fresh owned scratch beneath the PRIMARY
+checkout's `.agent`, checks capacity, and binds the candidate binary hash to its
+source SHA. Never use the linked worktree's inner `.agent`, OS temp, or the
+operator's daemon/config namespace. Keep the primary path short enough for Unix
+domain socket limits. The runner rejects a long control endpoint instead of
+silently using another namespace.
+
+The canonical inputs are `SourceRoot`, `CandidateBinary`, `OutputDir`, and
+`TimeoutSeconds`, plus required explicit `ScratchRoot` and `EvidencePath`.
+`ScratchRoot` must already exist under PRIMARY `.agent`, outside worktrees.
+`OutputDir` and `EvidencePath` must be new paths beneath it. `CandidateBinary`
+is input only; fixture builds, caches, runtime/config directories, executable
+copies, and evidence stay in that owned scratch. No `Binary` alias or temp default
+is provided.
+
+After root has allocated `$Scratch` and built `$CandidateBinary` from
+`$CandidateRoot`, run on Windows:
+
+```powershell
+pwsh -NoProfile -File "$CandidateRoot/scripts/smoke-upstream-maintenance.ps1" `
+  -SourceRoot $CandidateRoot -CandidateBinary $CandidateBinary `
+  -ScratchRoot $Scratch -OutputDir "$Scratch/w" `
+  -EvidencePath "$Scratch/windows.json" -TimeoutSeconds 180
+if ($LASTEXITCODE -ne 0) { throw 'Windows maintenance replacement proof failed' }
+```
+
+From a separate exact-head Unix checkout, use that checkout's PRIMARY `.agent`
+scratch and Unix candidate binary:
+
+```powershell
+pwsh -NoProfile -File "$CandidateRoot/scripts/smoke-upstream-maintenance.ps1" `
+  -SourceRoot $CandidateRoot -CandidateBinary $CandidateBinary `
+  -ScratchRoot $Scratch -OutputDir "$Scratch/u" `
+  -EvidencePath "$Scratch/unix.json" -TimeoutSeconds 180
+if ($LASTEXITCODE -ne 0) { throw 'Unix maintenance replacement proof failed' }
+```
+
+Both platforms are required. The runner builds link-time v1/v2 versions of
+`scripts/lifecycle-smoke-upstream/main.go` and the unchanged native
+`testdata/mock_modern_server.go`. The lifecycle fixture defaults to isolated;
+only this smoke opts into sharing and frame capture. The script invokes the
+actual candidate CLI, keeps two original legacy host pipes open, and uses private
+current-user config/IPC contexts. It does not substitute mocked hold results,
+source-text checks, PID cleanup, or rename-only replacement.
+
+Required live observations:
+
+1. Two initialized legacy hosts share one real v1 leader and its managed
+   descendant. OS executable/start-time and child-parent observations bind their
+   identities; capture has a positive request denominator.
+2. Actual `hold <observed-server-id> --ttl 30s --drain-timeout 2s --json`
+   fences before new demand. Already-forwarded short work completes before the
+   accepted single deadline. A second long operation is ended once at retirement,
+   without replay. HELD requires future expiry and `trees_retired=true`.
+3. Every recorded selected leader and descendant is dead. No new scoped fixture
+   generation appears while held. The installer opens and overwrites the exact
+   previously executed path with v2 bytes, flushes it, and observes a changed
+   SHA-256. Dead-tree proof is required even when Unix permits rename or unlink.
+4. Held numeric/string requests receive exactly one original-ID `-32005`
+   `maintenance_held` error without ordinary reconnect grace. Normally cached
+   discovery also errors. Notifications invent no response ID. Captures exclude
+   held frames before and after release; original native pipe handles stay open.
+5. Renew returns expiry from acceptance. Competing/stale IDs cannot mutate the
+   lease. Managed `restart_owner`, graceful restart/handoff, shutdown, CLI stop,
+   launcher forced restart, and staged upgrade refuse terminally without replacing
+   the daemon or starting the held fixture. Held CLI refusal uses the fixed safe
+   message, not merely a nonzero exit. Launcher, staged binary, layout, and active
+   pointer file sets/hashes remain unchanged. An unrelated managed context stays usable.
+6. Exact resume and a separate short safely proven TTL each admit one new v2
+   shared generation serving both original legacy host pipes. No held or
+   terminated request reaches that generation.
+7. A dedicated HELD scenario loses only its observed owned daemon. The aware
+   replacement reloads the same durable lease before admission. Buffered
+   numeric/string demand receives maintenance errors; overwrite/resume then
+   reaches v2 on the unchanged host pipes. No operator ledger is corrupted.
+8. A known native MCP `2026-07-28` host uses required per-request metadata and
+   the unchanged modern fixture. Held original IDs error. Fresh demand after
+   resume succeeds through fresh same-era isolated admission on the same pipes.
+   Exact upstream captures contain no injected legacy bootstrap or held replay.
+   Generic `-32603`, EOF, and an unnamed new-launch refusal are failures for this
+   selected proof, not modern restoration evidence.
+9. Safe control/status readbacks contain no fixture credential value or request
+   marker. Cleanup closes owned hosts, resumes only safely proven holds, and
+   uses the exact private lifecycle endpoint. A blocked lease or failed cleanup
+   keeps evidence/resources for root recovery and makes the exit nonzero.
+
+`summary.json`, `transcript.ndjson`, fixture generation records/captures, and the
+explicit `EvidencePath` retain observed commands, timestamps, exit codes,
+SHA/binary/fixture hashes, original host/pipe identities, scoped PID/tree
+observations, control replies, overwritten file hashes, and failures. PASS means
+all live observations passed with a nonzero denominator and cleanup completed.
+It is not full feature or release acceptance.
+
+Root also runs named focused `TestMaintenance` cases for deterministic
+queue/reconnect, start/install, and hold-versus-activation races, finite
+CWD/era/security/namespace scopes, stale identities/generations, corrupt/incomplete
+authority, failed persistence, blocked retirement despite expiry/resume,
+unsupported old endpoints/optional handlers, whole-millisecond duration boundaries,
+and library update-helper terminal refusal. Prove that status/pure startup checks
+do not acquire/write the namespace lock or start a daemon, and that offline/old
+activation requires locked persisted-clear proof. Record actual case names,
+nonzero denominators, and RED/GREEN evidence. The live runner lists these as
+`required_focused_proof`; it does not execute or mark them PASS. Timing-only live
+traffic cannot prove those races, and missing cases cannot be marked PASS.
+
+```powershell
+Push-Location "$CandidateRoot/muxcore"
+go test ./control ./daemon ./owner ./engine ./upstream -run '^TestMaintenance' -count=1
+go test -race ./control ./daemon ./owner ./engine ./upstream -run '^TestMaintenance' -count=1
+Pop-Location
+Push-Location $CandidateRoot
+go test ./cmd/mcp-mux ./internal/mcpserver -run '^TestMaintenance' -count=1
+Pop-Location
+```
+
+Keep existing Scenario 5b, applicable Scenario 8 Windows/Unix tree gates, the
+repository critical suite and its `MCP_LAUNCHER`/`-Launcher` prerequisite, and
+R1 native parity runners. Scenario 11 supplements them. Root runs integrated
+tests/vet once after makers land, then follows `docs/RELEASE-PROTOCOL.md` with
+the actual selected release version and delivered-artifact/fresh-session proof.
+
+Support limits are part of acceptance: the finite admitted context set is not
+host-wide file-lock authority; old daemons are unsupported; old shims receive
+physical start fencing only, not immediate-error/non-replay guarantees.
+Uncoordinated standalone/direct-owner launch, foreign engines, arbitrary old
+binaries, and manual active-pointer replacement are unsupported. Controlled
+restart/handoff/shutdown/downgrade and idle exit refuse while any fence remains.
+Before downgrade, clear safely proven holds using the current aware binary.
+Blocked retirement never TTL-clears; retain its authority and do not delete
+ledgers, sweep PIDs, or directly start the upstream to manufacture recovery.
+Controlled update/install/swap, layout/bootstrap mutation, and active-pointer
+updates share the existing namespace file lock with hold-ledger mutation. This
+coordination does not extend the finite context set or add a host-wide file lock
+or updater lease.
+
 ## Verdict Template
 
 Create a run report under `.agent/reports/emulation-playbook-run-YYYYMMDD-HHMM.md`
@@ -589,6 +732,7 @@ with this table:
 | 8 | Lifecycle Convergence and Tree Authority (v0.27.0+) | Dormant wake is exact-once; v1 skew aborts pre-detach; post-Hello fallback is single-shot; same-v2 handoff retains one full-tree authority |  | PASS/FAIL |
 | 9 | Demand-Driven Upstream Materialization (v0.28.0) | 8 owners / 0 processes before demand; same transport response; 8 / 1 after one wake; one authority |  | PASS/FAIL |
 | 10 | Critical muxcore consumer handoff | `CONSUMER_HANDOFF_PASS`, or `CONSUMER_HANDOFF_BLOCKED` with the full critical scope not called shipped |  | PASS/BLOCKED |
+| 11 | Upstream maintenance replacement | Actual Windows and Unix overwrite; unchanged aware host pipes; original-ID errors/no replay; safe resume/TTL/aware recovery and fresh native modern demand, plus focused maintenance proof |  | PASS/FAIL |
 
 Overall verdict:
 

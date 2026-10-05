@@ -968,20 +968,57 @@ func TestAcquireRestartPinCancelsMaterializationAndFreezesSnapshot(t *testing.T)
 	}
 
 	sendReq(t, s.write, 2, "custom/during-restart", `{}`)
-	first := scanControllerResponseWithID(s.read, 1)
-	if first.err != nil || !strings.Contains(string(first.response), "cancelled for restart") {
-		t.Fatalf("cancelled demand result: response=%s err=%v", first.response, first.err)
+	responses := make(chan controllerResponseResult, 3)
+	go func() {
+		scanner := bufio.NewScanner(s.read)
+		for range cap(responses) {
+			if !scanner.Scan() {
+				err := scanner.Err()
+				if err == nil {
+					err = io.EOF
+				}
+				responses <- controllerResponseResult{err: err}
+				return
+			}
+			responses <- controllerResponseResult{response: append([]byte(nil), scanner.Bytes()...)}
+		}
+	}()
+	want := map[string]string{
+		"1": "upstream materialization cancelled for restart",
+		"2": "restart snapshot in progress",
 	}
-	second := scanControllerResponseWithID(s.read, 2)
-	if second.err != nil || !strings.Contains(string(second.response), "restart snapshot in progress") {
-		t.Fatalf("pinned demand result: response=%s err=%v", second.response, second.err)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for range 2 {
+		select {
+		case result := <-responses:
+			if result.err != nil {
+				t.Fatalf("restart demand response: %v", result.err)
+			}
+			response := parseJSONRPCResponseLine(t, string(result.response))
+			id := string(response.ID)
+			message, ok := want[id]
+			if !ok {
+				t.Fatalf("unexpected or duplicate restart demand response: %s", result.response)
+			}
+			if response.Error == nil || response.Error.Code != -32603 || response.Error.Message != message || response.Result != nil {
+				t.Fatalf("restart demand %s: got %s, want explicit -32603 error %q", id, result.response, message)
+			}
+			delete(want, id)
+		case <-deadline.C:
+			t.Fatalf("restart demand responses timed out; missing %v", want)
+		}
 	}
 	pin.Release()
 	if o.Status()["restart_pin_count"] != int64(0) {
 		t.Fatalf("restart pin leaked: %#v", o.Status())
 	}
 	waitForCondition(t, time.Second, func() bool { return starts.Load() == 2 }, "pin release did not resume the cancelled materialization obligation")
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case result := <-responses:
+		t.Fatalf("extra restart demand response: response=%s err=%v", result.response, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
 	if got := starts.Load(); got != 2 {
 		t.Fatalf("pin release started %d generations, want exactly 2 total", got)
 	}
@@ -1306,10 +1343,20 @@ func TestFinishMaterializationSuccessPreservesFinalizeBlocked(t *testing.T) {
 func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.T) {
 	o := newMinimalOwner()
 	defer close(o.materializationStop)
+	o.materializationPolicy = MaterializationPersistent
 	proc := upstream.NewProcessFromHandler(context.Background(), func(_ context.Context, stdin io.Reader, _ io.Writer) error {
 		_, err := io.Copy(io.Discard, stdin)
 		return err
 	})
+	t.Cleanup(func() { _ = proc.Close() })
+	startErr := errors.New("synthetic start failed after authority install")
+	var starts atomic.Int32
+	originalStart := materializationStartProcess
+	materializationStartProcess = func(string, []string, map[string]string, string, *log.Logger) (*upstream.Process, error) {
+		starts.Add(1)
+		return proc, startErr
+	}
+	t.Cleanup(func() { materializationStartProcess = originalStart })
 	a := newMaterializationAttempt(1, MaterializationTriggerUpstreamExit)
 	o.materializationAttempt = a
 	o.materializationState = MaterializationMaterializing
@@ -1319,12 +1366,10 @@ func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.
 		sawExactAuthority.Store(got == proc)
 		return errors.New("synthetic failed-start authority remains")
 	}
-	retireErr := o.retireFailedMaterializationStart(a, proc)
-	if retireErr == nil || !strings.Contains(retireErr.Error(), "authority remains") {
-		t.Fatalf("failed-start retirement = %v, want unproven authority", retireErr)
+	o.runMaterialization(a)
+	if !errors.Is(a.err, startErr) || !strings.Contains(a.err.Error(), "authority remains") {
+		t.Fatalf("failed-start result = %v, want start failure and unproven authority", a.err)
 	}
-	startErr := errors.New("synthetic start failed after authority install")
-	o.finishMaterializationFailure(a, errors.Join(startErr, retireErr))
 
 	if !sawExactAuthority.Load() {
 		t.Fatal("failed-start finalization did not receive the installed process authority")
@@ -1335,9 +1380,15 @@ func TestFailedStartAuthorityEntersFinalizeBlockedWithoutReplacement(t *testing.
 	if a.process != proc || o.retiringProcess != proc || o.MaterializationState() != MaterializationFinalizeBlocked {
 		t.Fatalf("failed-start authority was not retained: attempt=%p retiring=%p status=%#v", a.process, o.retiringProcess, o.Status())
 	}
+	if !o.MaterializationBlocksEviction() {
+		t.Fatal("unproven failed-start authority allowed owner eviction")
+	}
 	blocked := o.startMaterialization(MaterializationTriggerUpstreamExit)
 	if blocked.err == nil || !strings.Contains(blocked.err.Error(), "authority remains") {
 		t.Fatalf("replacement start while failed-start authority remained = %v", blocked.err)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("failed-start replacement started %d upstreams, want 1", got)
 	}
 }
 

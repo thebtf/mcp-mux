@@ -88,6 +88,181 @@ To roll back, stop callers from selecting `era.PolicyModern20260728` or `--mcp-p
 
 R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
 
+## Upstream maintenance hold consumer contract
+
+The prepared binary/library consumer target is v0.31.0. Maintenance requires
+aware managed binary/daemon/shim cooperation and is optional for ordinary legacy
+`engine.New` consumers. Use the exact local status `server_id`, then the returned
+opaque `hold_id`:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <hold-id> --ttl 5m --json
+mcp-mux resume <hold-id> --json
+```
+
+Only durable, unexpired `HELD` with `trees_retired=true` permits installer-owned
+replacement. `HOLDING` and `RETIREMENT_BLOCKED` stay fenced; blocked retirement
+never TTL-clears. TTL defaults to 5m, is positive, and is at most 1h. Drain
+defaults to 10s; zero skips grace, not tree-death proof. Resume/renew
+affect only the exact current lease; renew sets expiry from serialized acceptance
+and cannot revive a released/expired lease. Resume/safe expiry require tree death
+and durable release.
+CLI TTL and drain durations must be whole milliseconds; reject sub-millisecond
+values instead of truncating a positive drain to zero-force retirement.
+
+Native finalization, including ordinary removal, must retain the owner/session
+producers until reader/disconnect settlement and actual callback return. Closing
+or cancelling is not quiescence; losing the registry entry early can orphan work
+before a later hold. Reuse blocked finalization/exact-entry retry, not a new waiter
+or scheduler. `PendingRequests` is request-only, not complete native-work proof;
+private nonrequest accounting adds no public metric, state, API, or schema.
+
+Retain every session through actual reader removal, including plain/no-hook and
+accepted pre-token connections. Publish private acceptDone before launch in all
+three constructors; serialize ReaderWG Add/launch with admission closure. Reader
+Done follows full deferred close/remove cleanup; accept closes admission before
+Wait and acceptDone. Transport completion is separate from request/nativeWork
+grace; sample actual process proof after the bounded existing-budget join. Reuse
+real reader cleanup, not a redundant cleanup counter, new timeout or fake Done.
+
+Retirement publication retries namespace-lock contention through the existing
+exact-lease timer, without a reaper. Successful blocked renewal preserves pending
+retry intent on the replacement lease's guarded timer; it changes only accepted
+expiry, not the original drain deadline. Publication preserves accepted expiry
+and drain authority; stale lease/timer callbacks cannot mutate replacement authority.
+Non-contention namespace-lock errors from exact-current pending retirement
+callbacks/current retirement timers latch existing `maintenanceFailed` authority.
+Direct consumers without a reaper fail closed; contention/renewed-blocked retry
+and original lease clocks stay unchanged. Never delete authority to reopen admission.
+
+Configured authorization must retain private callback authority through return
+and registration/rejection in every owner mode, not only `SessionHandler`.
+Serialize late admission against listener closure; handoff/retirement must join
+that settlement without changing public `PendingRequests` or nil-authorizer defaults.
+
+Every configured frame hook reserves through actual return regardless of owner
+mode; 1ms verdict timeout is not settlement. For in-process HandlerFunc, closed
+bookkeeping or requested cancellation is not retirement proof: actual body/pipe
+`Done` is required. Preserve EOF/drain grace before owned child cancellation,
+and keep ignoring-cancellation work blocked. Fixture cleanup releases barriers
+before Shutdown; never preclose Done, re-pin synthetic proof, or weaken deadlines.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+Without a positive caller timeout, neutral `control.SendWithTimeout` allows 180s plus one drain for `hold`/`restart_owner`.
+Explicit positive budgets are honored; other commands retain 5s. This finite exchange allowance does not promise full-pin/storage completion.
+A timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, with no automatic retry/resume or stop fallback.
+
+CLI `stop` must terminate with status 1 after a contacted-daemon error or invalid/
+untyped failure response, never continuing into per-owner/data fallback. Genuine
+daemon absence retains its existing path. Keep recovered timers and control
+request serving paused until every fallible daemon-construction step succeeds;
+failed construction must not retain a stale expiry mutation or admit control work.
+
+Reserve acceptLoop producer synchronously under the existing Start/Close mutex
+before launch; accepted handlers remain counted through response/connection/
+after-callback completion. ENOTSOCK absence is dial-only, never contacted error.
+Alias positives must prove os.SameFile parent identity/canonical scope/member bytes;
+absolute/relative aliases execute on both platforms without skips, while owned
+inner-link-before-.. traversal is Unix-specific, not a guard relaxation.
+
+All resolved MCP stops use daemon authority; accept legacy owner fallback only
+for the exact known old unsupported-stop response, never transport/malformed/
+typed uncertainty. New external operator claims take maintenance read admission
+before the daemon mutex; release both before finalization/waits. Existing exact
+entry already-owned whole-daemon cleanup remains a distinct private claim, not
+a failure-latch clear or external bypass. Preserve admitted retry and maintenance
+removal. Reject restart drain overflow before
+mutation regardless of raw transport or explicit timeout. Unix cleanup skips
+only the exact canonical owned bound control path, without early serving.
+
+Activation must preserve raw status errors and authorize offline only with exact
+native dial absence plus locked persisted-clear proof, never nondial errno or a
+Boolean collapse. MCP restart last-consumer cleanup is one returned token-only
+IPC connection plus existing exact current ServerID/PrevToken confirmation before
+success and closing only its own connection. Nonidle denial confirms binding,
+not eviction; unknown token/read uncertainty is not success. Reuse native history/
+EOF authority, not MCP/bootstrap frames, token minting, revoke/fallback manager,
+or altered library-consumer semantics.
+
+Process-owning signal/context callers must wait for daemon `Done` after a refused
+shutdown, keeping reaper/reference/control authority alive. Request shutdown once;
+do not infer a retry from lease clearance. A separately explicit admitted shutdown
+is needed before caller return. A direct-method refusal test is not signal/context proof.
+
+Scope is the selected owner's finite admitted CWD/era/security/configuration/
+namespace context set, not a host-wide executable lock. Aware shims preserve
+host pipes, return original numeric/string ID `-32005` maintenance errors before
+cache or forwarding, and never replay held or terminated work. Notifications
+have no invented replies. Modern resumed demand uses fresh same-era isolated
+admission without legacy bootstrap, cache, or subscription restoration.
+
+Era-less snapshot/handoff payloads do not prove the complete historical environment
+inventory: `CwdSet` lacks associated environments and retained `BoundTokens` are
+only observations. Ordinary no-lease restore remains available, but hold acquisition
+for an incomplete restored owner and restoration under an active lease fail closed
+with existing `maintenance_invalid`. Do not add a payload schema/version, API, or
+expiry seam. The causal case loses an admitted environment before token consumption;
+elapsed TTL is not its runtime oracle.
+
+First post-resume `OnInject` demand uses the same admission/activation path as stdin,
+waiting outside ingress/dormant/suspend locks. Healthy injection retains one-pass
+lock admission and nonblocking queue-capacity behavior; the callback remains single-fire.
+Copy caller bytes before unlocked revalidation, then recheck closed/dormant state and
+maintenance sequence before enqueue. Preserve `ErrInjectClosed`, `ErrInjectFull`,
+FIFO and suspend accounting; no new queue, goroutine, API, or replay.
+
+Controlled restart/handoff/shutdown/downgrade and idle exit refuse terminally
+under any fence, including launcher/library update fallback paths. Aware
+unplanned recovery reads durable authority before admission. Old daemons and
+uncoordinated standalone paths are `maintenance_unsupported`; never substitute
+stop, PID cleanup, or direct exec. Old shims receive physical start fencing only,
+not immediate-error/non-replay guarantees. Arbitrary old binaries, foreign
+engines, and manual active-pointer changes are unsupported. Before downgrade,
+durably resume each exact retired lease through the current aware binary or
+observe safely committed expiry. Incomplete/blocked authority prevents downgrade;
+preserve both authority members even after TTL. Never delete them to open admission.
+Contacted graceful-restart transport uncertainty retains its original cause and
+is terminal. Existing shutdown fallback after an explicit ordinary rejection
+requires fresh validated maintenance-aware/clear status for the SAME nonempty
+daemon generation; failed shutdown is terminal. Old read-only startup compatibility
+is unchanged. This is not permission to bypass a typed maintenance refusal.
+
+Maintenance authority is `<canonical namespace-lock path>.maintenance/<scope digest>/`
+with ledger/transaction members and unchanged scope/schema/state. Never choose a
+new store through UserConfig/HOME or infer clear authority from absence under an
+unsafe parent. Preserve raw endpoint-parent components while authenticating every
+alias/target before canonicalization; private anchor/scope/members require native
+owner/mode/protected-DACL guards. Exact TrustedInstaller trust is ancestors-only.
+The endpoint/lock directory must survive every active fence; no cleanup authority.
+Released v0.30 had no store. Drain/clear older unreleased live candidates with the
+same binary/original environment before cutover; keep their files, no scan/migrate/
+registry/bypass. Safe verification-root approval is not a production TMP override
+or permission to change profile ACLs. A rejected unsafe native test path is not
+healthy execution PASS or a user fault.
+
+Controlled update/install/swap, layout/bootstrap mutation, and active-pointer
+changes serialize with hold-ledger mutation under the existing daemon namespace
+file lock. `daemon.CheckMaintenanceForActivation` is read-only. Status and pure
+startup reads do not acquire/write that lock or proactively start a daemon.
+Activation also checks live aware status; offline/old endpoints are allowed only
+after locked persisted-clear proof. Do not introduce a separate updater lease
+or treat namespace coordination as host-wide file-lock authority.
+
+`mux_hold`, `mux_resume`, and `mux_renew` use the local daemon; `mux_restart` uses
+daemon-owned `restart_owner`, not ambient-context reconstruction. See
+[`muxcore/README.md`](muxcore/README.md#upstream-maintenance-control)
+for additive optional APIs and typed errors. Root owns the live cross-platform
+proof in production Scenario 11, focused maintenance regressions, existing
+Scenario 5b/8 and R1 parity gates, integration, and release. Smoke scratch/output/
+evidence must be explicitly supplied beneath PRIMARY `.agent`, never a linked
+inner `.agent` or OS temp. No maintenance smoke is implicitly enrolled in the
+critical suite.
+
 ## CONVENTIONS
 
 - Investigation reports: `.agent/reports/YYYY-MM-DD-topic.md`
@@ -114,13 +289,54 @@ issues or comments for `aimux`, `engram`, and any other impacted muxcore
 consumer. If Engram cannot be updated, report `CONSUMER_HANDOFF_BLOCKED` and
 do not call the full critical muxcore scope shipped.
 
-## muxcore Library API (v0.30.x)
+## muxcore Library API (v0.31.x)
 
 ### Upgrade
 
+Prepared consumer target, usable after publication and Go proxy tag resolution:
+
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
 ```
+
+### v0.31.0 - optional managed upstream maintenance
+
+**No required source changes for ordinary legacy `engine.New` users.** Optional
+`control.SendMaintenance`, typed errors, and handlers provide hold/resume/renew
+without changing existing interface signatures. The finite durable context fence,
+full-tree HELD proof, original-ID errors/no replay, exact lease timing, terminal
+lifecycle refusal, and compatibility limits above are the consumer contract.
+Legacy stays the default and modern R1 stays explicitly same-era and isolated.
+
+Publication targets are `v0.31.0` and `muxcore/v0.31.0`. Source-bound checks are
+recorded in `RELEASE_NOTES.md` and the maintenance release evidence. Exact344
+[CI37236880161](https://github.com/thebtf/mcp-mux/actions/runs/37236880161) passed
+all five jobs. Its selected Windows Scenario 11 executed successfully: 1158/1158
+checks, smoke exit0, no cleanup errors, actual owner0.31.0 in23 observations.
+The retained build/JSON receipts bind source, PR head and clone to344 and the
+CGO0/trimpath binary to SHA256 `cf6ab1afa0c3cf41a59caf97ffc0620be7d76aac0bbebaf44d64350d2be23cde`.
+That Windows result remains344-bound after later production repairs. Actual
+immutable `74d5293ca8cd2d70861db952c4c3c5b504577516` Linux root/module normal tests
+(2+25 tested packages,3 root no-test) and both vets pass once. Fresh clean CGO0/
+trimpath owner0.31.0 artifact runs Scenario11 1191/1191; fresh R1 100+8 uses a
+separate unstamped binary. No local full-race duplicate was run; CI owns that gate.
+[Exact74 CI37242471098](https://github.com/thebtf/mcp-mux/actions/runs/37242471098)
+is RED: macOS live-host fixture socket104 bytes exceeds Darwin103; Ubuntu/
+coverage/BSD PASS,Windows canceled before selected public steps. The test-only
+short namespace correction has actual Linux race4/4 PASS once,0SKIP/races/errors;
+53-byte private TMP gives observed owner96/97/control100/101 bytes below103.
+Root accepts fixture-only proof,not native macOS/nextCI PASS.
+Extended selected Windows canonical critical workflow has STATIC proof only.
+Root reports all33 then-known threads resolved after actual replies/readback;
+not fresh all-PR CLEAN. Final source-plus-docs/next CI/critical proof,merge,
+tags/module resolution,fresh-session delivered canary and Engram handoff remain
+root-owned. Native Engram issue tools are unmounted; only that handoff effect is held.
+Do not report this prepared scope as shipped or `CONSUMER_HANDOFF_PASS`.
+
+Rollback to `muxcore/v0.30.0` or a compatible previous binary only after the
+current aware version durably resumes every exact retired lease or proves safe
+expiry. Incomplete/blocked authority prevents downgrade and must not be deleted.
+Modern owners still require quarantine rather than live legacy conversion.
 
 ### v0.30.0 - explicit native MCP 2026-07-28 route
 

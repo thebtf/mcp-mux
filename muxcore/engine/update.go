@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"time"
 
@@ -53,8 +52,8 @@ type UpdateAndRestartOptions struct {
 	ReadyTimeout time.Duration
 	// CleanStale removes stale old-binary artifacts after the restart attempt.
 	CleanStale bool
-	// ProceedWithoutLock allows restart to continue when the daemon namespace
-	// lock cannot be acquired. The default is fail-closed.
+	// ProceedWithoutLock is retained for source compatibility. Namespace
+	// activation always requires the lock, even when this field is true.
 	ProceedWithoutLock bool
 }
 
@@ -73,8 +72,8 @@ type RestartWithSuccessorOptions struct {
 	ShutdownTimeout time.Duration
 	// ReadyTimeout bounds waiting for the replacement daemon to answer ping.
 	ReadyTimeout time.Duration
-	// ProceedWithoutLock allows restart to continue when the daemon namespace
-	// lock cannot be acquired. The default is fail-closed.
+	// ProceedWithoutLock is retained for source compatibility. Namespace
+	// activation always requires the lock, even when this field is true.
 	ProceedWithoutLock bool
 }
 
@@ -117,13 +116,10 @@ type daemonLock interface {
 	Close() error
 }
 
-type fileDaemonLock struct {
-	f *os.File
-}
-
 type daemonIdentity struct {
-	pid        int
-	generation string
+	pid              int
+	generation       string
+	maintenanceAware bool
 }
 
 func (id daemonIdentity) isZero() bool {
@@ -140,32 +136,21 @@ func (id daemonIdentity) same(other daemonIdentity) bool {
 	return false
 }
 
-func (l *fileDaemonLock) Close() error {
-	if l == nil || l.f == nil {
-		return nil
-	}
-	unlockErr := unlockDaemonFile(l.f)
-	closeErr := l.f.Close()
-	if unlockErr != nil {
-		return unlockErr
-	}
-	return closeErr
-}
-
 var (
-	engineUpgradeSwap            = upgrade.Swap
-	engineCleanStale             = upgrade.CleanStale
-	engineControlSend            = control.Send
-	engineControlSendWithTimeout = control.SendWithTimeout
-	engineIsDaemonRunning        = isDaemonRunning
-	engineStartDaemonExecutable  = startDaemonExecutable
-	engineWaitForDaemonReady     = waitForDaemonReady
-	engineWaitForDaemonExit      = waitForDaemonExit
-	engineWaitForReplacement     = waitForDaemonReplacementOrExit
-	engineDaemonIdentity         = daemonIdentityFromStatus
-	enginePrepareControlSocket   = prepareControlSocketForReplacement
-	engineControlSocketAvailable = ipc.IsAvailable
-	engineAcquireDaemonLock      = acquireDaemonLock
+	engineUpgradeSwap                   = upgrade.Swap
+	engineCleanStale                    = upgrade.CleanStale
+	engineControlSend                   = control.Send
+	engineControlSendWithTimeout        = control.SendWithTimeout
+	engineIsDaemonRunning               = isDaemonRunning
+	engineStartDaemonExecutable         = startDaemonExecutable
+	engineWaitForDaemonReady            = waitForDaemonReady
+	engineWaitForDaemonExit             = waitForDaemonExit
+	engineWaitForReplacement            = waitForDaemonReplacementOrExit
+	engineDaemonIdentity                = daemonIdentityFromStatus
+	enginePrepareControlSocket          = prepareControlSocketForReplacement
+	engineControlSocketAvailable        = ipc.IsAvailable
+	engineAcquireDaemonLock             = acquireDaemonLock
+	engineCheckMaintenanceForActivation = (*MuxEngine).checkMaintenanceForActivation
 )
 
 // ApplyUpdateAndRestart swaps in a staged binary and restarts this engine's
@@ -188,6 +173,18 @@ func (e *MuxEngine) ApplyUpdateAndRestart(ctx context.Context, opts UpdateAndRes
 		return result, phaseError(UpdatePhaseValidate, result, errors.New("StagedExe is required"))
 	}
 
+	lock, lockErr := engineAcquireDaemonLock(serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace))
+	if lockErr != nil {
+		return result, phaseError(UpdatePhaseLock, result, lockErr)
+	}
+	result.LockAcquired = true
+	defer lock.Close()
+	if gateErr := engineCheckMaintenanceForActivation(e); gateErr != nil {
+		return result, phaseError(UpdatePhaseLock, result, gateErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return result, phaseError(UpdatePhaseValidate, result, err)
+	}
 	oldPath, err := engineUpgradeSwap(opts.CurrentExe, opts.StagedExe)
 	if err != nil {
 		return result, phaseError(UpdatePhaseSwap, result, err)
@@ -238,6 +235,17 @@ func (e *MuxEngine) RestartWithSuccessor(ctx context.Context, opts RestartWithSu
 
 func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts RestartWithSuccessorOptions, result UpdateAndRestartResult) (UpdateAndRestartResult, error) {
 	ctlPath := e.ControlSocketPath()
+	if !result.LockAcquired {
+		lock, err := engineAcquireDaemonLock(serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace))
+		if err != nil {
+			return result, phaseError(UpdatePhaseLock, result, err)
+		}
+		result.LockAcquired = true
+		defer lock.Close()
+		if err := engineCheckMaintenanceForActivation(e); err != nil {
+			return result, phaseError(UpdatePhaseLock, result, err)
+		}
+	}
 	if !engineIsDaemonRunning(ctlPath) {
 		return result, nil
 	}
@@ -245,22 +253,6 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 	beforeRestart, identityErr := engineDaemonIdentity(ctlPath)
 	if identityErr != nil {
 		result.Warnings = append(result.Warnings, fmt.Sprintf("could not read daemon identity before restart: %v", identityErr))
-	}
-
-	lockPath := serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace)
-	lock, err := engineAcquireDaemonLock(lockPath)
-	if err != nil {
-		if !opts.ProceedWithoutLock {
-			return result, phaseError(UpdatePhaseLock, result, err)
-		}
-		result.Warnings = append(result.Warnings, fmt.Sprintf("could not acquire daemon lock %s: %v", lockPath, err))
-	} else {
-		result.LockAcquired = true
-		defer func() {
-			if closeErr := lock.Close(); closeErr != nil {
-				result.Warnings = append(result.Warnings, fmt.Sprintf("could not release daemon lock %s: %v", lockPath, closeErr))
-			}
-		}()
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -272,20 +264,36 @@ func (e *MuxEngine) restartDaemonWithSuccessor(ctx context.Context, opts Restart
 		SuccessorExe:   opts.SuccessorExe,
 	}, opts.RestartTimeout)
 	if err != nil {
+		return result, phaseError(UpdatePhaseRestart, result, err)
+	}
+	err = resp.Err()
+	if isMaintenanceError(err) {
+		return result, phaseError(UpdatePhaseRestart, result, err)
+	}
+	if err != nil {
+		current, statusErr := engineDaemonIdentity(ctlPath)
+		if statusErr != nil {
+			return result, phaseError(UpdatePhaseRestart, result, errors.Join(err, statusErr))
+		}
+		if !current.maintenanceAware {
+			return result, phaseError(UpdatePhaseRestart, result, errors.Join(err, control.ErrMaintenanceUnsupported))
+		}
+		if identityErr != nil || beforeRestart.generation == "" || current.generation != beforeRestart.generation {
+			return result, phaseError(UpdatePhaseRestart, result, errors.Join(err, control.ErrMaintenanceInvalid, identityErr))
+		}
 		result.Warnings = append(result.Warnings, fmt.Sprintf("graceful-restart unavailable: %v", err))
-		result.FallbackShutdown = true
-	} else if !resp.OK {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("graceful-restart failed: %s", resp.Message))
 		result.FallbackShutdown = true
 	} else {
 		result.GracefulRestarted = true
 	}
 
 	if result.FallbackShutdown {
-		if shutdownResp, shutdownErr := engineControlSend(ctlPath, control.Request{Cmd: "shutdown"}); shutdownErr != nil {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("shutdown fallback send failed: %v", shutdownErr))
-		} else if !shutdownResp.OK {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("shutdown fallback failed: %s", shutdownResp.Message))
+		shutdownResp, shutdownErr := engineControlSend(ctlPath, control.Request{Cmd: "shutdown"})
+		if shutdownErr == nil {
+			shutdownErr = shutdownResp.Err()
+		}
+		if shutdownErr != nil {
+			return result, phaseError(UpdatePhaseRestart, result, shutdownErr)
 		}
 	}
 
@@ -433,15 +441,7 @@ func durationMillis(d time.Duration) int {
 }
 
 func acquireDaemonLock(lockPath string) (daemonLock, error) {
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, err
-	}
-	if err := lockDaemonFile(f); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return &fileDaemonLock{f: f}, nil
+	return ipc.AcquireFileLock(lockPath)
 }
 
 func startDaemonExecutable(exe, daemonFlag string) error {
@@ -513,20 +513,43 @@ func daemonIdentityFromStatus(ctlPath string) (daemonIdentity, error) {
 	if err != nil {
 		return daemonIdentity{}, err
 	}
-	if resp == nil {
-		return daemonIdentity{}, errors.New("status returned nil response")
-	}
-	if !resp.OK {
-		return daemonIdentity{}, fmt.Errorf("status failed: %s", resp.Message)
+	if err := resp.Err(); err != nil {
+		return daemonIdentity{}, err
 	}
 	var data struct {
-		PID        int    `json:"pid"`
-		Generation string `json:"daemon_generation"`
+		PID                  int             `json:"pid"`
+		Generation           string          `json:"daemon_generation"`
+		Maintenance          json.RawMessage `json:"maintenance"`
+		MaintenanceErrorCode json.RawMessage `json:"maintenance_error_code"`
 	}
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
 		return daemonIdentity{}, fmt.Errorf("decode status identity: %w", err)
 	}
+	if data.MaintenanceErrorCode != nil {
+		var code control.MaintenanceErrorCode
+		if string(data.MaintenanceErrorCode) == "null" || json.Unmarshal(data.MaintenanceErrorCode, &code) != nil {
+			return daemonIdentity{}, control.ErrMaintenanceInvalid
+		}
+		if code != "" {
+			return daemonIdentity{}, (&control.Response{ErrorCode: code}).Err()
+		}
+	}
 	id := daemonIdentity{pid: data.PID, generation: data.Generation}
+	if data.Maintenance != nil {
+		var leases []control.MaintenanceResult
+		if json.Unmarshal(data.Maintenance, &leases) != nil || leases == nil {
+			return daemonIdentity{}, control.ErrMaintenanceInvalid
+		}
+		for i := range leases {
+			if err := (&control.Response{OK: true, Maintenance: &leases[i]}).Err(); err != nil || leases[i].State == control.MaintenanceReleased {
+				return daemonIdentity{}, control.ErrMaintenanceInvalid
+			}
+		}
+		if len(leases) > 0 {
+			return daemonIdentity{}, &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: &leases[0]}
+		}
+		id.maintenanceAware = true
+	}
 	if id.isZero() {
 		return daemonIdentity{}, errors.New("status missing pid and daemon_generation")
 	}

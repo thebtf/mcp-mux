@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/ipc"
@@ -1308,7 +1309,17 @@ func startDaemonProcess(successor bool) error {
 	if successor {
 		cmd.Env = append(cmd.Env, envSuccessor+"=1")
 	}
-	cmd.Stderr = os.Stderr
+	runtime := runtimeDir()
+	if err := os.MkdirAll(runtime, 0o700); err != nil {
+		return err
+	}
+	// The daemon outlives its launcher, so it must not inherit a host capture pipe.
+	stderr, err := os.OpenFile(filepath.Join(runtime, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open daemon log: %w", err)
+	}
+	defer stderr.Close()
+	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -2090,14 +2101,11 @@ func probeGenerationHandoff() error {
 	})
 }
 
-func probeIdleReaper() error {
+func probeIdleReaper() (probeErr error) {
 	oldRuntime, hadRuntime := os.LookupEnv(envRuntime)
 	oldControl, hadControl := os.LookupEnv(envCtlPath)
 	oldIdleTTL, hadIdleTTL := os.LookupEnv(envIdleTTLMS)
-	runtimeParent, err := filepath.Abs(filepath.Join(".", ".agent"))
-	if err != nil {
-		return err
-	}
+	runtimeParent := runtimeDir()
 	if err := os.MkdirAll(runtimeParent, 0o755); err != nil {
 		return err
 	}
@@ -2112,11 +2120,18 @@ func probeIdleReaper() error {
 		}
 		_ = os.Unsetenv(key)
 	}
+	cleanupComplete := true
+	var result map[string]any
 	defer func() {
 		restoreEnv(envRuntime, oldRuntime, hadRuntime)
 		restoreEnv(envCtlPath, oldControl, hadControl)
 		restoreEnv(envIdleTTLMS, oldIdleTTL, hadIdleTTL)
-		_ = os.RemoveAll(tempRuntime)
+		if cleanupComplete {
+			probeErr = errors.Join(probeErr, os.RemoveAll(tempRuntime))
+		}
+		if probeErr == nil && result != nil {
+			probeErr = writeJSONLine(os.Stdout, result)
+		}
 	}()
 
 	isolatedControl := filepath.Join(tempRuntime, "control.sock")
@@ -2129,8 +2144,13 @@ func probeIdleReaper() error {
 	if err := os.Setenv(envIdleTTLMS, "300"); err != nil {
 		return err
 	}
+	cleanupComplete = false
 	defer func() {
-		_, _ = sendControl(isolatedControl, "shutdown", nil, 2*time.Second)
+		cleanupErr := shutdownProbeDaemon(isolatedControl, 2*time.Second)
+		cleanupComplete = cleanupErr == nil
+		if cleanupErr != nil {
+			probeErr = errors.Join(probeErr, fmt.Errorf("idle reaper cleanup failed; runtime retained at %s: %w", tempRuntime, cleanupErr))
+		}
 	}()
 
 	if err := ensureDaemonReady(); err != nil {
@@ -2291,9 +2311,10 @@ func probeIdleReaper() error {
 		return fmt.Errorf("persistent owner classification not restored: persistent_id=%s after_restart=%v", persistentID, afterRestart)
 	}
 
-	return writeJSONLine(os.Stdout, map[string]any{
+	result = map[string]any{
 		"ok":                        true,
 		"probe":                     "idle_reaper",
+		"runtime_dir":               tempRuntime,
 		"phase":                     "phase9",
 		"break_observed":            false,
 		"idle_ms":                   idleWindow.Milliseconds(),
@@ -2309,7 +2330,73 @@ func probeIdleReaper() error {
 		"active_session_survived":   true,
 		"active_reaped_after_close": true,
 		"persistent_restored":       true,
-	})
+	}
+	return nil
+}
+
+func shutdownProbeDaemon(control string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	status, err := sendControl(control, "status", nil, min(timeout/4, time.Until(deadline)))
+	if err != nil {
+		return err
+	}
+	pid, ok := jsonNumberToInt(status["pid"])
+	var process *os.Process
+	if runtime.GOOS == "windows" {
+		if !ok || pid <= 0 {
+			return fmt.Errorf("invalid private daemon pid: %v", status["pid"])
+		}
+		process, err = os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		defer process.Release()
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return fmt.Errorf("private shutdown deadline expired after %s", timeout)
+	}
+	response, err := sendControl(control, "shutdown", nil, min(timeout/4, remaining))
+	if err != nil {
+		return err
+	}
+	if !boolValue(response["ok"]) {
+		return fmt.Errorf("private shutdown rejected: %v", response)
+	}
+	if process != nil {
+		done := make(chan error, 1)
+		go func() {
+			state, waitErr := process.Wait()
+			if waitErr == nil && !state.Success() {
+				waitErr = fmt.Errorf("private daemon pid=%d exited with code %d", pid, state.ExitCode())
+			}
+			done <- waitErr
+		}()
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		select {
+		case waitErr := <-done:
+			return waitErr
+		case <-timer.C:
+			return fmt.Errorf("private daemon pid=%d did not exit within %s", pid, timeout)
+		}
+	}
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		conn, dialErr := ipc.DialTimeout(control, min(100*time.Millisecond, remaining))
+		if dialErr != nil {
+			if errors.Is(dialErr, os.ErrNotExist) || errors.Is(dialErr, syscall.ECONNREFUSED) {
+				return nil
+			}
+			return dialErr
+		}
+		_ = conn.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("private control listener did not close within %s", timeout)
 }
 
 func newProbeRPCClient() (*probeRPCClient, error) {

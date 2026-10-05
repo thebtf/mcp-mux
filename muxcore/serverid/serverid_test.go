@@ -540,7 +540,17 @@ func TestWorktreeRoot_LinkedWorktree(t *testing.T) {
 }
 
 func TestWorktreeRoot_NoGit(t *testing.T) {
-	dir := t.TempDir()
+	scratch := t.TempDir()
+	root := filepath.VolumeName(scratch) + string(filepath.Separator)
+	missing := filepath.Join(root, "mcp-mux-no-git-"+filepath.Base(filepath.Dir(scratch)))
+	// Exercise an absent CWD without creating scratch outside the owned TMP root.
+	// Its missing ancestors cannot contain .git; check the filesystem root too.
+	for _, path := range []string{missing, filepath.Join(root, ".git")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("no-Git fixture requires %q to be absent, stat error = %v", path, err)
+		}
+	}
+	dir := filepath.Join(missing, "cwd")
 	got := WorktreeRoot(dir)
 	if CanonicalizePath(got) != CanonicalizePath(dir) {
 		t.Errorf("WorktreeRoot(no .git) = %q, want canonical cwd %q", got, dir)

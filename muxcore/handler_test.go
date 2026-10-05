@@ -18,6 +18,11 @@ func TestProjectContextID_Deterministic(t *testing.T) {
 func TestProjectContextID_DifferentCwd(t *testing.T) {
 	dir1 := t.TempDir()
 	dir2 := t.TempDir()
+	for _, dir := range []string{dir1, dir2} {
+		if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	id1 := ProjectContextID(dir1)
 	id2 := ProjectContextID(dir2)
 	if id1 == id2 {

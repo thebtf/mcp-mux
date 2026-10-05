@@ -110,19 +110,21 @@ func runGlobalDaemon() {
 
 	// Start reaper
 	reaper := daemon.NewReaper(d, 10*time.Second)
+	defer reaper.Stop()
 
 	// Handle shutdown signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	select {
 	case sig := <-sigCh:
 		logger.Printf("received signal %v, shutting down", sig)
-		reaper.Stop()
 		d.Shutdown()
+		// Shutdown may refuse; retain service authority until actual completion.
+		<-d.Done()
 	case <-d.Done():
 		// Daemon shut down (idle auto-exit or control command)
-		reaper.Stop()
 	}
 }
 
@@ -421,12 +423,15 @@ func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, m
 		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%q", rpcDur, err.Error())
 		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
-	if !resp.OK {
-		logger.Printf("daemon_rpc_spawn status=not_ok duration=%v msg=%q", rpcDur, resp.Message)
+	if responseErr := resp.Err(); responseErr != nil {
+		logger.Printf("daemon_rpc_spawn status=not_ok duration=%v err=%q", rpcDur, responseErr.Error())
+		if isMaintenanceError(responseErr) {
+			return "", "", "", fmt.Errorf("daemon spawn failed: %w", responseErr)
+		}
 		if resp.Message == daemon.ErrDaemonShuttingDown.Error() {
 			return "", "", "", fmt.Errorf("daemon spawn failed: %w", daemon.ErrDaemonShuttingDown)
 		}
-		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+		return "", "", "", fmt.Errorf("daemon spawn failed: %w", responseErr)
 	}
 	if protocolEra != "" && resp.ProtocolEra != protocolEra {
 		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
@@ -461,8 +466,11 @@ func refreshTokenViaDaemon(prevToken, protocolEra string, logger *log.Logger) (s
 		logger.Printf("daemon_rpc_refresh status=error duration=%v err=%q", rpcDur, err.Error())
 		return "", fmt.Errorf("refresh token via daemon: %w", err)
 	}
-	if !resp.OK {
-		logger.Printf("daemon_rpc_refresh status=not_ok duration=%v msg=%q", rpcDur, resp.Message)
+	if responseErr := resp.Err(); responseErr != nil {
+		logger.Printf("daemon_rpc_refresh status=not_ok duration=%v err=%q", rpcDur, responseErr.Error())
+		if isMaintenanceError(responseErr) {
+			return "", fmt.Errorf("daemon refresh failed: %w", responseErr)
+		}
 		switch resp.Message {
 		case daemon.ErrOwnerGone.Error():
 			return "", daemon.ErrOwnerGone
@@ -473,7 +481,7 @@ func refreshTokenViaDaemon(prevToken, protocolEra string, logger *log.Logger) (s
 		case daemon.ErrProtocolEraMismatch.Error():
 			return "", daemon.ErrProtocolEraMismatch
 		default:
-			return "", fmt.Errorf("daemon refresh failed: %s", resp.Message)
+			return "", fmt.Errorf("daemon refresh failed: %w", responseErr)
 		}
 	}
 	if requestedEra == era.EraModern20260728 && resp.ProtocolEra != protocolEra {

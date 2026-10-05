@@ -56,7 +56,13 @@ var (
 // Version is the mcp-mux build version, included in status output.
 // Auto-detected from Go build info (vcs.revision + vcs.modified).
 // Override at build time via: -ldflags "-X github.com/thebtf/mcp-mux/muxcore/owner.Version=..."
-var Version = initVersion()
+var Version string
+
+func init() {
+	if Version == "" {
+		Version = initVersion()
+	}
+}
 
 func initVersion() string {
 	info, ok := debug.ReadBuildInfo()
@@ -170,6 +176,11 @@ type Owner struct {
 	upstreamWriter              io.Writer // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID                    string    // server identity hash
 	protocolEra                 era.ProtocolEra
+	maintenanceGate             *sync.RWMutex
+	admitMaterialization        func(*Owner, LaunchContext) error
+	maintenance                 atomic.Pointer[control.MaintenanceResult]
+	maintenanceRetired          atomic.Bool
+	lastMaintenanceLaunch       LaunchContext
 	listener                    net.Listener
 	logger                      *log.Logger
 
@@ -226,6 +237,7 @@ type Owner struct {
 	inflightTracker         sync.Map          // remapped request ID (string) -> *InflightRequest
 	timedOutIDs             sync.Map          // remapped request ID (string) -> struct{} — watchdog-claimed IDs, late upstream responses are dropped
 	pendingRequests         atomic.Int64
+	nativeWork              atomic.Int64  // non-request callbacks and session admission producers; never part of PendingRequests
 	drainTimeout            time.Duration // from x-mux.drainTimeout capability; 0 = use default
 	toolTimeoutNs           atomic.Int64  // from x-mux.toolTimeout capability; stored as nanoseconds for atomic access
 	idleTimeoutNs           atomic.Int64  // from x-mux.idleTimeout capability; 0 = use daemon default
@@ -246,7 +258,9 @@ type Owner struct {
 	isAccepting             atomic.Bool
 	admissionFrozen         atomic.Bool
 	pendingAdmissionsPurged atomic.Int64
-	listenerDone            chan struct{} // closed when IPC listener is intentionally stopped
+	listenerDone            chan struct{}  // closed when IPC listener is intentionally stopped
+	acceptDone              chan struct{}  // published under mu before launch; closed only by the accept producer
+	sessionReaders          sync.WaitGroup // actual launched readers only; never part of request grace/drain
 	done                    chan struct{}
 
 	restartPins atomic.Int64
@@ -306,6 +320,13 @@ type OwnerConfig struct {
 	// ProtocolEra is immutable for the owner lifetime. Its zero value preserves
 	// legacy routing and cache behavior.
 	ProtocolEra era.ProtocolEra
+
+	// MaintenanceGate coordinates managed starts and frame admission with the
+	// daemon fence. AdmitMaterialization runs under its read lease, before start,
+	// after context election; it must not acquire this gate or owner locks.
+	// Nil preserves standalone library behavior.
+	MaintenanceGate      *sync.RWMutex
+	AdmitMaterialization func(*Owner, LaunchContext) error
 
 	// OnZeroSessions is called with the exact owner whose last session left.
 	// If nil, the owner does not auto-shutdown on zero sessions.
@@ -450,6 +471,8 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		protocolEra:            cfg.ProtocolEra,
+		maintenanceGate:        cfg.MaintenanceGate,
+		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
@@ -525,7 +548,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 	}
 
 	// Start accepting IPC connections (sessions get cached replay immediately)
-	go o.acceptLoop()
+	o.startAcceptLoop()
 
 	// Start synthetic progress reporter
 	go o.runProgressReporter(doneContext(o.done))
@@ -625,6 +648,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		protocolEra:            cfg.ProtocolEra,
+		maintenanceGate:        cfg.MaintenanceGate,
+		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
 		logger:                 logger,
 		onZeroSessions:         cfg.OnZeroSessions,
@@ -688,7 +713,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		}
 	}
 
-	go o.acceptLoop()
+	o.startAcceptLoop()
 	go o.runProgressReporter(doneContext(o.done))
 	return o, nil
 }
@@ -847,9 +872,19 @@ func extractToolName(raw []byte) string {
 // AddSession registers a new downstream session and starts routing its messages.
 // This is used for the owner's own stdio session (first client).
 func (o *Owner) AddSession(s *Session) {
+	o.lockRequestAdmission()
 	o.admissionMu.Lock()
+	if o.nativeAdmissionClosed() {
+		o.admissionMu.Unlock()
+		o.unlockRequestAdmission()
+		s.Close()
+		return
+	}
+	o.nativeWork.Add(1)
+	defer o.nativeWork.Add(-1)
 	o.addSessionLocked(s)
 	o.admissionMu.Unlock()
+	o.unlockRequestAdmission()
 	o.startRegisteredSession(s)
 }
 
@@ -859,6 +894,11 @@ func (o *Owner) AddSession(s *Session) {
 func (o *Owner) addSessionLocked(s *Session) {
 	o.mu.Lock()
 	o.sessions[s.ID] = s
+	if o.sessionHandler != nil {
+		if _, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
+			o.nativeWork.Add(1)
+		}
+	}
 	o.mu.Unlock()
 	o.sessionMgr.RegisterSession(s, s.Cwd)
 }
@@ -874,7 +914,10 @@ func (o *Owner) startRegisteredSession(s *Session) {
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
-			go lc.OnProjectConnect(project)
+			go func() {
+				defer o.nativeWork.Add(-1)
+				lc.OnProjectConnect(project)
+			}()
 		}
 	}
 
@@ -882,14 +925,26 @@ func (o *Owner) startRegisteredSession(s *Session) {
 	if !o.isModern() {
 		o.sendRootsListChanged()
 	}
+	o.admissionMu.Lock()
+	select {
+	case <-o.listenerDone:
+		o.admissionMu.Unlock()
+		s.Close()
+		o.removeSession(s)
+		return
+	default:
+	}
+	o.sessionReaders.Add(1)
 	go o.readSession(s)
+	o.admissionMu.Unlock()
 }
 
 // readSession reads messages from a session and forwards them to the upstream.
 func (o *Owner) readSession(s *Session) {
+	defer o.sessionReaders.Done()
 	defer func() {
-		o.removeSession(s)
 		s.Close()
+		o.removeSession(s)
 	}()
 
 	for {
@@ -909,6 +964,9 @@ func (o *Owner) readSession(s *Session) {
 
 // handleDownstreamMessage processes a message from a downstream session.
 func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error {
+	if held := o.maintenance.Load(); held != nil {
+		return o.rejectMaintenance(s, msg, held)
+	}
 	// OnFrameReceived hook (FR-4 / NFR-2) — invoked synchronously on the
 	// reader goroutine for every inbound frame, AFTER IsNotification /
 	// IsRequest classification but BEFORE any dispatch / cache replay /
@@ -970,17 +1028,41 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 		// Cached at owner construction (cacheHandlerInterfaces) so the
 		// per-frame hot path skips a type assertion (CodeRabbit nitpick).
 		if o.sessionHandler != nil {
+			nh, ordinary := o.sessionHandler.(muxcore.NotificationHandler)
+			if o.notificationHandlerWithMeta == nil && !ordinary {
+				return nil
+			}
+			if !o.reserveNativeWork() {
+				return nil
+			}
 			project := muxcore.ProjectContext{
 				ID:  muxcore.ProjectContextID(s.Cwd),
 				Cwd: s.Cwd,
 				Env: s.Env,
 			}
+			var meta muxcore.SessionMeta
 			if o.notificationHandlerWithMeta != nil {
-				meta := s.Meta()
-				go o.notificationHandlerWithMeta.HandleNotificationWithSessionMeta(context.Background(), project, meta, msg.Raw)
-			} else if nh, ok := o.sessionHandler.(muxcore.NotificationHandler); ok {
-				go nh.HandleNotification(context.Background(), project, msg.Raw)
+				meta = s.Meta()
 			}
+			go func() {
+				defer o.nativeWork.Add(-1)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go func() {
+					select {
+					case <-s.Done():
+						cancel()
+					case <-o.done:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+				if o.notificationHandlerWithMeta != nil {
+					o.notificationHandlerWithMeta.HandleNotificationWithSessionMeta(ctx, project, meta, msg.Raw)
+				} else {
+					nh.HandleNotification(ctx, project, msg.Raw)
+				}
+			}()
 			return nil // notifications don't need forwarding to upstream
 		}
 		// Forward other notifications as-is to upstream.
@@ -1093,6 +1175,10 @@ func (o *Owner) forwardModernCancelledNotification(s *Session, msg *jsonrpc.Mess
 // dispatchToSessionHandler calls the SessionHandler directly instead of writing
 // to the pipe. Runs in a goroutine for concurrent request handling.
 func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return o.rejectMaintenance(s, msg, held)
+	}
 	project := muxcore.ProjectContext{
 		ID:  muxcore.ProjectContextID(s.Cwd),
 		Cwd: s.Cwd,
@@ -1100,6 +1186,7 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 	}
 
 	o.pendingRequests.Add(1)
+	o.unlockRequestAdmission()
 
 	go func() {
 		defer o.decrementPending()
@@ -1338,6 +1425,8 @@ func (o *Owner) markCurrentUpstreamDead(proc *upstream.Process) bool {
 	return true
 }
 
+var materializationStartProcess = upstream.Start
+
 func (o *Owner) spawnReplacementUpstream(launch LaunchContext) (*upstream.Process, error) {
 	if o.handlerFunc != nil {
 		o.logger.Printf("upstream respawn: in-process handler")
@@ -1346,7 +1435,7 @@ func (o *Owner) spawnReplacementUpstream(launch LaunchContext) (*upstream.Proces
 	if o.command == "" {
 		return nil, errors.New("upstream command is empty")
 	}
-	return upstream.Start(o.command, o.args, launch.Env, launch.Cwd, o.logger)
+	return materializationStartProcess(o.command, o.args, launch.Env, launch.Cwd, o.logger)
 }
 
 // isProactiveID identifies only this Owner's proactive namespace. A response
@@ -2014,6 +2103,14 @@ func (n *ownerNotifier) Broadcast(notification []byte) {
 func (o *Owner) removeSession(s *Session) {
 	o.launchContextMu.Lock()
 	o.mu.Lock()
+	var lifecycle muxcore.ProjectLifecycle
+	if o.sessionHandler != nil {
+		lifecycle, _ = o.sessionHandler.(muxcore.ProjectLifecycle)
+		if lifecycle != nil {
+			// Transfer the retained reader's producer authority before unlinking.
+			o.nativeWork.Add(1)
+		}
+	}
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
 	var removedTokens []string
@@ -2045,10 +2142,11 @@ func (o *Owner) removeSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
 
-	if o.sessionHandler != nil {
-		if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
-			go lc.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
-		}
+	if lifecycle != nil {
+		go func() {
+			defer o.nativeWork.Add(-1)
+			lifecycle.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
+		}()
 	}
 
 	if remaining > 0 {
@@ -2059,6 +2157,28 @@ func (o *Owner) removeSession(s *Session) {
 	}
 }
 
+// startAcceptLoop reserves producer completion before launch. A constructor
+// that fails before this point has no accept producer to join.
+func (o *Owner) startAcceptLoop() {
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.nativeAdmissionClosed() || o.acceptDone != nil {
+		return
+	}
+	done := make(chan struct{})
+	o.acceptDone = done
+	o.isAccepting.Store(true)
+	go func() {
+		defer close(done)
+		o.acceptLoop()
+		// No reader reservation may start once the sole admission producer ends.
+		o.closeListener()
+		o.sessionReaders.Wait()
+	}()
+}
+
 // acceptLoop accepts new IPC connections and creates sessions for them.
 //
 // If listener.Close() is called WITHOUT closing listenerDone, Accept() returns
@@ -2067,7 +2187,6 @@ func (o *Owner) removeSession(s *Session) {
 // Now we detect the "closed" error class and exit cleanly; other errors get a
 // small backoff to prevent CPU saturation.
 func (o *Owner) acceptLoop() {
-	o.isAccepting.Store(true)
 	defer o.isAccepting.Store(false)
 
 	for {
@@ -2139,113 +2258,133 @@ func (o *Owner) acceptLoop() {
 		o.logger.Printf("peer_creds_extracted sid=%d pid=%d uid=%d platform=%s",
 			s.ID, info.PeerPid, info.PeerUid, info.Platform)
 
-		// AuthorizeSession gate (FR-3). Single-shot per session; runs after
-		// peer-creds extraction and BEFORE AddSession. nil = no gate
-		// (byte-identical to v0.23 dispatch path).
-		//
-		// Shutdown handling (CHK015 / EC-11): if owner.done fires before
-		// the callback runs, refuse the session without invoking.
-		// Panic guard: any panic inside the callback is recovered and
-		// treated as AuthDeny{Reason: "authorize panic"} — the daemon
-		// continues accepting subsequent connections.
-		if o.authorizeSession != nil {
+		// Keep authorization and its registration/rejection continuation reserved
+		// together; callback return alone does not settle the admission producer.
+		func() {
+			// AuthorizeSession gate (FR-3). Single-shot per session; runs after
+			// peer-creds extraction and BEFORE AddSession. nil = no gate
+			// (byte-identical to v0.23 dispatch path).
+			//
+			// Shutdown handling (CHK015 / EC-11): if owner.done fires before
+			// the callback runs, refuse the session without invoking.
+			// Panic guard: any panic inside the callback is recovered and
+			// treated as AuthDeny{Reason: "authorize panic"} — the daemon
+			// continues accepting subsequent connections.
+			if o.authorizeSession != nil {
+				select {
+				case <-o.done:
+					o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+					o.revokePendingAdmission(token)
+					conn.Close()
+					s.Close()
+					return
+				default:
+				}
+				if !o.reserveNativeWork() {
+					o.revokePendingAdmission(token)
+					s.Close()
+					return
+				}
+				defer o.nativeWork.Add(-1)
+
+				project := muxcore.ProjectContext{
+					ID:  muxcore.ProjectContextID(s.Cwd),
+					Cwd: s.Cwd,
+					Env: s.Env,
+				}
+				verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+
+				// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
+				// MAJOR review on PR #113). The pre-callback check at the top
+				// of the authorize block closes the gap up to the call, but a
+				// long-running callback (external RPC, slow tenant lookup) can
+				// outlast o.done. Without this re-check, AuthAllow would still
+				// reach AddSession during teardown, registering a session in a
+				// shutting-down owner.
+				select {
+				case <-o.done:
+					o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
+					o.revokePendingAdmission(token)
+					conn.Close()
+					s.Close()
+					return
+				default:
+				}
+
+				if verdict.Decision == muxcore.AuthDeny {
+					// Apply the documented "empty Reason → stable fallback"
+					// contract from session_auth.go SessionAuth godoc. Without
+					// this fallback the JSON-RPC error.message would be an
+					// empty string and consumers' deny-categorisation logic
+					// (which keys off Reason) would silently bucket every
+					// such denial together. CodeRabbit MINOR on PR #113.
+					reason := verdict.Reason
+					if reason == "" {
+						reason = "session not authorized"
+					}
+					if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, reason); marshalErr == nil {
+						// Write the JSON-RPC -32000 error directly to the conn
+						// (not through s.WriteRaw — the session is being torn
+						// down, no need for the buffered-writer/bufio path).
+						_, _ = conn.Write(append(errBytes, '\n'))
+					} else {
+						o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
+					}
+					o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
+					o.revokePendingAdmission(token)
+					conn.Close()
+					s.Close()
+					return
+				}
+
+				// AuthAllow: stamp tenant + authorized timestamp on cached meta.
+				// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
+				s.SetMeta(muxcore.SessionMeta{
+					Conn:         info,
+					TenantID:     verdict.TenantID,
+					AuthorizedAt: time.Now(),
+				})
+				o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
+			}
+
+			o.lockRequestAdmission()
+			o.admissionMu.Lock()
+			if o.nativeAdmissionClosed() {
+				o.admissionMu.Unlock()
+				o.unlockRequestAdmission()
+				o.revokePendingAdmission(token)
+				s.Close()
+				return
+			}
 			select {
 			case <-o.done:
-				o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
+				o.admissionMu.Unlock()
+				o.unlockRequestAdmission()
+				o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
 				o.revokePendingAdmission(token)
-				conn.Close()
 				s.Close()
-				continue
+				return
 			default:
 			}
-
-			project := muxcore.ProjectContext{
-				ID:  muxcore.ProjectContextID(s.Cwd),
-				Cwd: s.Cwd,
-				Env: s.Env,
-			}
-			verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
-
-			// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
-			// MAJOR review on PR #113). The pre-callback check at the top
-			// of the authorize block closes the gap up to the call, but a
-			// long-running callback (external RPC, slow tenant lookup) can
-			// outlast o.done. Without this re-check, AuthAllow would still
-			// reach AddSession during teardown, registering a session in a
-			// shutting-down owner.
-			select {
-			case <-o.done:
-				o.logger.Printf("auth_aborted_shutdown sid=%d", s.ID)
-				o.revokePendingAdmission(token)
-				conn.Close()
+			if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
+				o.admissionMu.Unlock()
+				o.unlockRequestAdmission()
+				peerPID := readPeerPID(conn)
+				o.rejectionLogger.Log(o.logger, peerPID)
 				s.Close()
-				continue
-			default:
+				return
 			}
-
-			if verdict.Decision == muxcore.AuthDeny {
-				// Apply the documented "empty Reason → stable fallback"
-				// contract from session_auth.go SessionAuth godoc. Without
-				// this fallback the JSON-RPC error.message would be an
-				// empty string and consumers' deny-categorisation logic
-				// (which keys off Reason) would silently bucket every
-				// such denial together. CodeRabbit MINOR on PR #113.
-				reason := verdict.Reason
-				if reason == "" {
-					reason = "session not authorized"
-				}
-				if errBytes, marshalErr := buildJSONRPCErrorBytes(nil, -32000, reason); marshalErr == nil {
-					// Write the JSON-RPC -32000 error directly to the conn
-					// (not through s.WriteRaw — the session is being torn
-					// down, no need for the buffered-writer/bufio path).
-					_, _ = conn.Write(append(errBytes, '\n'))
-				} else {
-					o.logger.Printf("auth_deny_marshal_error sid=%d err=%v", s.ID, marshalErr)
-				}
-				o.logger.Printf("auth_deny sid=%d reason=%q", s.ID, reason)
-				o.revokePendingAdmission(token)
-				conn.Close()
-				s.Close()
-				continue
-			}
-
-			// AuthAllow: stamp tenant + authorized timestamp on cached meta.
-			// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
-			s.SetMeta(muxcore.SessionMeta{
-				Conn:         info,
-				TenantID:     verdict.TenantID,
-				AuthorizedAt: time.Now(),
-			})
-			o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
-		}
-
-		o.admissionMu.Lock()
-		select {
-		case <-o.done:
+			o.addSessionLocked(s)
 			o.admissionMu.Unlock()
-			o.logger.Printf("admission_aborted_shutdown sid=%d", s.ID)
-			o.revokePendingAdmission(token)
-			s.Close()
-			continue
-		default:
-		}
-		if token != "" && !o.sessionMgr.Bind(token, o.ServerID(), s) {
-			o.admissionMu.Unlock()
-			peerPID := readPeerPID(conn)
-			o.rejectionLogger.Log(o.logger, peerPID)
-			s.Close()
-			continue
-		}
-		o.addSessionLocked(s)
-		o.admissionMu.Unlock()
-		o.startRegisteredSession(s)
+			o.unlockRequestAdmission()
+			o.startRegisteredSession(s)
+		}()
 	}
 }
 
 // invokeAuthorize calls cb under a defer/recover guard with an owner-bound
-// context. Cancellation propagates from o.done, so a long-running callback
-// (external RPC, slow tenant lookup) can observe shutdown via ctx.Done()
-// and abort early instead of running to completion against a teardown.
+// context. Listener teardown cancels authorization while finalization withholds
+// Done until the callback and its admission continuation actually return.
 // Panic is logged with the panic value and converted to
 // AuthDeny{Reason: "authorize panic"}; the daemon continues accepting
 // subsequent connections.
@@ -2265,9 +2404,12 @@ func invokeAuthorize(
 	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	listenerDone := o.listenerDone
 	go func() {
 		select {
 		case <-o.done:
+			cancel()
+		case <-listenerDone:
 			cancel()
 		case <-ctx.Done():
 		}
@@ -2324,12 +2466,16 @@ func (o *Owner) invokeFrameHook(s *Session, msg *jsonrpc.Message) muxcore.FrameA
 	if o.onFrameReceived == nil {
 		return muxcore.FramePass
 	}
+	if !o.reserveNativeWork() {
+		return muxcore.FramePass
+	}
 	sid := strconv.Itoa(s.ID)
 	method := msg.Method
 	frameSize := len(msg.Raw)
 
 	done := make(chan muxcore.FrameAction, 1) // buffered so a late return never blocks the goroutine
 	go func() {
+		defer o.nativeWork.Add(-1)
 		defer func() {
 			if r := recover(); r != nil {
 				o.logger.Printf("frame_hook_panic sid=%s method=%s recovered=%v", sid, method, r)
@@ -2510,13 +2656,14 @@ func (o *Owner) claimInflightRequests(proc *upstream.Process) []drainedInflightR
 		s, ok := o.sessions[result.SessionID]
 		o.mu.RUnlock()
 		if ok {
+			payload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`, string(result.OriginalID)))
+			if held := o.maintenance.Load(); held != nil {
+				payload = maintenanceErrorBytes(result.OriginalID, held)
+			}
 			responses = append(responses, drainedInflightResponse{
 				session:   s,
 				sessionID: result.SessionID,
-				payload: []byte(fmt.Sprintf(
-					`{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"upstream process exited"}}`,
-					string(result.OriginalID),
-				)),
+				payload:   payload,
 			})
 		}
 
@@ -2545,7 +2692,11 @@ func (o *Owner) claimModernInflightRequests(proc *upstream.Process) []drainedInf
 		var payload []byte
 		if session != nil {
 			var err error
-			payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
+			if held := o.maintenance.Load(); held != nil {
+				payload = maintenanceErrorBytes(json.RawMessage(requestID), held)
+			} else {
+				payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
+			}
 			if err != nil {
 				o.logger.Printf("drainInflight: build error for %s: %v", requestID, err)
 				return true
@@ -2633,18 +2784,38 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	defer o.removalMu.Unlock()
 	select {
 	case <-o.done:
+		if !o.nativeQuiescent() {
+			o.materializationMu.Lock()
+			o.materializationState = MaterializationFinalizeBlocked
+			o.materializationBlockedErr = errFinalizationUnproven
+			o.materializationMu.Unlock()
+			return 0, false, errFinalizationUnproven
+		}
+		if o.maintenance.Load() != nil && !o.MaintenanceRetired() {
+			return 0, false, control.ErrMaintenanceRetirementBlocked
+		}
 		return 0, true, nil
 	default:
 	}
 	abortPreparedHandoff := o.handoffPrepared && o.handoffAbortRequested
+	if o.maintenance.Load() != nil && o.handoffPrepared {
+		return 0, false, control.ErrMaintenanceRetirementBlocked
+	}
 	if o.handoffPrepared && !abortPreparedHandoff {
 		return 0, false, ErrHandoffAlreadyPrepared
+	}
+	if held := o.maintenance.Load(); held != nil {
+		o.DrainForMaintenance(held.DrainDeadline)
 	}
 	if timeout <= 0 {
 		timeout = materializationFinalizeTimeout
 	}
+	finalizationDeadline := time.Now().Add(timeout)
 
 	o.stopMaterialization()
+	if o.maintenance.Load() != nil {
+		o.drainInflightRequests()
+	}
 	o.teardownExceptUpstream()
 
 	o.materializationMu.Lock()
@@ -2653,7 +2824,8 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		attempt.cancelMaterialization()
 	}
 	o.materializationMu.Unlock()
-	if attempt != nil {
+	maintenance := o.maintenance.Load() != nil
+	if attempt != nil && !maintenance {
 		timer := time.NewTimer(timeout)
 		select {
 		case <-attempt.done:
@@ -2682,7 +2854,9 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 	exitCode := 0
 	var closeErr error
 	if proc != nil {
-		if abortPreparedHandoff {
+		if o.maintenance.Load() != nil {
+			exitCode, closeErr = proc.SoftClose(0)
+		} else if abortPreparedHandoff {
 			closeErr = proc.AbortDetach()
 		} else if soft {
 			exitCode, closeErr = proc.SoftClose(timeout)
@@ -2690,12 +2864,32 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 			closeErr = proc.Close()
 		}
 	}
+	if attempt != nil && maintenance {
+		// A queued demand or bootstrap can be blocked in this generation's
+		// stdin. Interrupt it before joining; the fence already covers the
+		// complete start-through-install interval.
+		timer := time.NewTimer(timeout)
+		select {
+		case <-attempt.done:
+			timer.Stop()
+		case <-timer.C:
+			return exitCode, false, fmt.Errorf("owner finalization: materialization did not settle after %s", timeout)
+		}
+	}
+	o.waitForAcceptLoop(finalizationDeadline)
 	proofErr := error(nil)
 	proven := proc == nil || proc.RetirementProven()
+	if o.maintenance.Load() != nil && proc != nil {
+		proven = proc.TreesDead()
+	}
 	if proc != nil && o.materializationFinalizationProbe != nil {
 		proofErr = o.materializationFinalizationProbe(proc)
 		proven = proofErr == nil
 	}
+	if o.maintenance.Load() != nil && proc != nil {
+		proven = proven && proc.TreesDead()
+	}
+	proven = proven && o.nativeQuiescent()
 	if !proven {
 		if proofErr == nil {
 			proofErr = errFinalizationUnproven
@@ -2735,6 +2929,7 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		o.handoffPrepared = false
 		o.handoffAbortRequested = false
 	}
+	o.maintenanceRetired.Store(proc == nil || proc.TreesDead())
 	o.completeShutdown("owner shut down")
 	return exitCode, true, closeErr
 }
@@ -3079,19 +3274,31 @@ func (o *Owner) writeUpstream(data []byte) error {
 	return err
 }
 
-// writeUpstreamFromCurrent returns the exact process generation used for the
-// write so a failure cannot retire a replacement generation. bind runs after
-// generation selection and before the write begins.
+// writeUpstreamFromCurrent binds the exact process generation and reserves the
+// request under the admission lease, then releases it before transport I/O.
+// A write failure cannot retire a replacement generation.
 func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Process)) (*upstream.Process, error) {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return nil, &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held}
+	}
 	o.touchActivity()
 	o.mu.RLock()
 	writer := o.upstreamWriter
 	up := o.upstream
 	o.mu.RUnlock()
+	if writer == nil && up == nil {
+		o.unlockRequestAdmission()
+		return nil, errors.New("upstream writer unavailable")
+	}
 	if writer != nil {
-		if bind != nil {
-			bind(nil)
-		}
+		up = nil
+	}
+	if bind != nil {
+		bind(up)
+	}
+	o.unlockRequestAdmission()
+	if writer != nil {
 		if _, err := writer.Write(data); err != nil {
 			return nil, fmt.Errorf("upstream writer: write: %w", err)
 		}
@@ -3100,12 +3307,6 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 		}
 		return nil, nil
 	}
-	if up == nil {
-		return nil, errors.New("upstream writer unavailable")
-	}
-	if bind != nil {
-		bind(up)
-	}
 	if o.beforeCurrentUpstreamWrite != nil {
 		o.beforeCurrentUpstreamWrite(up)
 	}
@@ -3113,10 +3314,16 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 }
 
 func (o *Owner) writeUpstreamToProcess(proc *upstream.Process, data []byte) error {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held}
+	}
 	if proc == nil {
+		o.unlockRequestAdmission()
 		return errors.New("upstream writer unavailable")
 	}
 	o.touchActivity()
+	o.unlockRequestAdmission()
 	return proc.WriteLine(data)
 }
 
@@ -3479,8 +3686,13 @@ func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte)
 	if o.isModern() {
 		return era.NewAdmissionError(era.AdmissionUnsafeLifecycleBoundary)
 	}
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return o.rejectMaintenance(s, msg, held)
+	}
 	replaced, err := jsonrpc.ReplaceID(cached, msg.ID)
 	if err != nil {
+		o.unlockRequestAdmission()
 		return fmt.Errorf("replay %s: replace id: %w", msg.Method, err)
 	}
 
@@ -3491,6 +3703,7 @@ func (o *Owner) replayFromCache(s *Session, msg *jsonrpc.Message, cached []byte)
 		o.cachedInitSessions[s.ID] = true
 		o.mu.Unlock()
 	}
+	o.unlockRequestAdmission()
 
 	o.logger.Printf("session %d: replaying cached %s response", s.ID, msg.Method)
 	return s.WriteRaw(replaced)

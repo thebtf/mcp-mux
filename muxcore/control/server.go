@@ -68,11 +68,14 @@ func (s *Server) Start() {
 		return
 	}
 	s.started = true
+	// Reserve the accept producer before Close can wait on an empty group.
+	s.wg.Add(1)
 	s.mu.Unlock()
 	go s.acceptLoop()
 }
 
 func (s *Server) acceptLoop() {
+	defer s.wg.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			if s.isClosed() {
@@ -162,14 +165,14 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) rollbackUndeliveredSpawn(req Request, resp Response, writeErr error) {
-	if req.Cmd != "spawn" || !resp.OK || resp.ServerID == "" || resp.Token == "" {
+	if (req.Cmd != "spawn" && req.Cmd != "restart_owner") || !resp.OK || resp.ServerID == "" || resp.Token == "" {
 		return
 	}
 	handler, ok := s.handler.(SpawnResponseFailureHandler)
 	if !ok {
 		return
 	}
-	s.logger.Printf("control: spawn response undelivered for server %s: %v", resp.ServerID, writeErr)
+	s.logger.Printf("control: %s response undelivered for server %s: %v", req.Cmd, resp.ServerID, writeErr)
 	handler.HandleSpawnResponseFailure(resp.ServerID, resp.Token)
 }
 
@@ -178,7 +181,44 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 	case "ping":
 		return Response{OK: true, Message: "pong"}, nil
 
+	case "hold", "resume", "renew":
+		return s.dispatchMaintenance(req), nil
+
+	case "restart_owner":
+		if !exactMaintenanceID(req.ServerID) || req.Command != "" || req.HoldID != "" || req.DrainTimeoutMs < 0 {
+			return errorResponse("", ErrMaintenanceInvalid), nil
+		}
+		handler, ok := s.handler.(OwnerRestartHandler)
+		if !ok {
+			return errorResponse("", ErrMaintenanceUnsupported), nil
+		}
+		resp, err := handler.HandleRestartOwner(req)
+		if err != nil {
+			return errorResponse("restart_owner", err), nil
+		}
+		if err := resp.Err(); err != nil {
+			if resp.OK {
+				s.rollbackUndeliveredSpawn(req, resp, err)
+			}
+			return errorResponse("restart_owner", err), nil
+		}
+		if _, err := era.ParseProtocolEra(resp.ProtocolEra); err != nil || resp.IPCPath == "" || !exactMaintenanceID(resp.ServerID) || resp.Token == "" {
+			s.rollbackUndeliveredSpawn(req, resp, ErrMaintenanceInvalid)
+			return errorResponse("", ErrMaintenanceInvalid), nil
+		}
+		return resp, nil
+
 	case "shutdown":
+		if req.DrainTimeoutMs < 0 {
+			return errorResponse("", ErrMaintenanceInvalid), nil
+		}
+		if handler, ok := s.handler.(ShutdownWithErrorHandler); ok {
+			msg, err := handler.HandleShutdownWithError(req.DrainTimeoutMs)
+			if err != nil {
+				return errorResponse("shutdown", err), nil
+			}
+			return Response{OK: true, Message: msg}, nil
+		}
 		msg := s.handler.HandleShutdown(req.DrainTimeoutMs)
 		return Response{OK: true, Message: msg}, nil
 
@@ -200,7 +240,7 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		}
 		ipcPath, serverID, token, err := dh.HandleSpawn(req)
 		if err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}, nil
+			return errorResponse("spawn", err), nil
 		}
 		return Response{OK: true, Message: "spawned", IPCPath: ipcPath, ServerID: serverID, Token: token, ProtocolEra: req.ProtocolEra}, nil
 
@@ -210,7 +250,7 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 			return Response{OK: false, Message: "remove not supported (not a daemon)"}, nil
 		}
 		if err := dh.HandleRemove(req.Command); err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("remove: %v", err)}, nil
+			return errorResponse("remove", err), nil
 		}
 		return Response{OK: true, Message: "removed"}, nil
 
@@ -221,11 +261,14 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		}
 		msg, err := oh.HandleStopOwner(req)
 		if err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("stop_owner: %v", err)}, nil
+			return errorResponse("stop_owner", err), nil
 		}
 		return Response{OK: true, Message: msg}, nil
 
 	case "graceful-restart":
+		if req.DrainTimeoutMs < 0 {
+			return errorResponse("", ErrMaintenanceInvalid), nil
+		}
 		dh, ok := s.handler.(DaemonHandler)
 		if !ok {
 			return Response{OK: false, Message: "graceful-restart not supported (not a daemon)"}, nil
@@ -242,7 +285,7 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 			snapshotPath, afterFn, err = dh.HandleGracefulRestart(req.DrainTimeoutMs)
 		}
 		if err != nil {
-			return Response{OK: false, Message: fmt.Sprintf("graceful-restart: %v", err)}, nil
+			return errorResponse("graceful-restart", err), nil
 		}
 		return Response{OK: true, Message: "snapshot written, shutting down", IPCPath: snapshotPath}, afterFn
 
@@ -266,6 +309,10 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 			newToken, err = dh.HandleRefreshSessionToken(req.PrevToken)
 		}
 		if err != nil {
+			var maintenanceErr *MaintenanceError
+			if errors.As(err, &maintenanceErr) {
+				return errorResponse("", err), nil
+			}
 			switch {
 			case matchesControlError(err, errUnknownToken):
 				return Response{OK: false, Message: "unknown token"}, nil

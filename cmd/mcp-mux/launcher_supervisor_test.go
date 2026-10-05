@@ -25,7 +25,7 @@ func TestPrepareSupervisedEngineStartOwnsDaemonInLauncher(t *testing.T) {
 	t.Setenv("MCP_MUX_NO_DAEMON", "")
 	launcherPath := filepath.Join(t.TempDir(), "mcp-mux.exe")
 	enginePath := writeContentAddressedTestEngine(t, launcherPath, "active engine")
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatal(err)
 	}
 	oldEnsure := launcherSupervisorEnsureDaemon
@@ -64,7 +64,7 @@ func TestPrepareSupervisedEngineStartCancelsDaemonPreparation(t *testing.T) {
 	t.Setenv("MCP_MUX_NO_DAEMON", "")
 	launcherPath := filepath.Join(t.TempDir(), "mcp-mux.exe")
 	enginePath := writeContentAddressedTestEngine(t, launcherPath, "active engine")
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatal(err)
 	}
 
@@ -112,7 +112,7 @@ func TestPrepareSupervisedEngineStartRejectsNonActiveEngineBeforeDaemon(t *testi
 	launcherPath := filepath.Join(t.TempDir(), "mcp-mux.exe")
 	activeEnginePath := writeContentAddressedTestEngine(t, launcherPath, "active engine")
 	staleEnginePath := writeContentAddressedTestEngine(t, launcherPath, "stale engine")
-	if err := writeActiveEngine(launcherPath, activeEnginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, activeEnginePath); err != nil {
 		t.Fatal(err)
 	}
 

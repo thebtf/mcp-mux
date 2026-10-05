@@ -12,16 +12,31 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-Install the current release after its tag resolves through the Go proxy:
+Install the prepared v0.31.0 target after publication and Go proxy tag resolution:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.30.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
 ```
 
-v0.30.0 adds an explicit native MCP `2026-07-28` route while retaining the
-released legacy path as the zero-value default. Existing consumers require no
-source or configuration change. A known same-era consumer opts in before
-admission with `engine.Config.ProtocolPolicy = era.PolicyModern20260728`.
+v0.31.0 adds optional managed upstream maintenance while retaining the released
+legacy path as the zero-value default and modern R1 as an explicit isolated route.
+Ordinary legacy `engine.New` users need no source or configuration changes.
+Publication, delivered-artifact proof, and Engram consumer handoff remain pending.
+
+### v0.31.0 - optional managed upstream maintenance
+
+Adopt `control.SendMaintenance` and its typed errors only when a product needs
+hold/resume/renew. Existing control interface signatures remain unchanged, with
+optional handlers and lease readback. See [maintenance control](#upstream-maintenance-control)
+for finite context scope, durable HELD/full-tree proof, original-ID errors/no replay,
+terminal lifecycle refusal, exact lease timing, and old-version/standalone limits.
+
+Current rollback: use the current aware version to durably resume each exact
+retired lease or observe safely committed expiry before pinning `muxcore/v0.30.0`
+or restoring a compatible previous binary. Incomplete/blocked authority prevents
+downgrade and must be retained, even after TTL. Never delete authority to reopen
+admission. Modern owners still retire through R1 quarantine, without live legacy
+conversion or replay.
 
 ### v0.30.0 - explicit native MCP 2026-07-28 route
 
@@ -32,7 +47,7 @@ authoritative; unsafe transitions preserve the exact era or quarantine the
 route rather than restoring it as legacy. Status exposes only the minimal
 redacted protocol, sharing, cache, and lifecycle policy facts.
 
-Current rollback: stop new modern admissions, retire active modern owners
+v0.30.0 rollback: stop new modern admissions, retire active modern owners
 through the existing lifecycle path, then pin `muxcore/v0.29.1` or restore the
 prior product binary. Do not transfer live modern state into a legacy owner.
 
@@ -51,7 +66,7 @@ callbacks mutate the daemon registry only through its exact-current-generation
 transaction. Stale owner generations are no-ops, while process-generation
 authority stays in `muxcore/owner`.
 
-Current rollback: pin `muxcore/v0.29.0` or restore the prior product binary;
+v0.29.1 rollback: pin `muxcore/v0.29.0` or restore the prior product binary;
 do not force a mixed-version live handoff.
 
 ### v0.29.0 - public stable-stdio supervisor
@@ -489,11 +504,11 @@ network calls, database writes, or heavy policy evaluation in this hook.
 
 `muxcore/supervisor` is the public boundary for products whose MCP host keeps
 one stdio transport open while the product replaces a child engine executable.
-Introduced in `muxcore/v0.29.0`. After the current tag resolves through the Go
-proxy, pin `muxcore/v0.29.1` with:
+Introduced in `muxcore/v0.29.0`. For the current prepared release, after
+publication and Go proxy tag resolution, pin `muxcore/v0.31.0` with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.29.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
 ```
 
 Minimal ordinary-supervision shape:
@@ -599,11 +614,304 @@ Use the public APIs `supervisor.ProtocolV2()`, `supervisor.Run`,
 `supervisor.StartCommand`, `supervisor.StartWithFallback`, and
 `supervisor/attest`.
 
-To roll back the current v0.29.1 patch, pin `muxcore/v0.29.0` or restore the
-prior product binary. Do not
-force a mixed-version live supervisor handoff or forward an old attestation
-advertisement. Old/new combinations run as ordinary MCP without private
-dormancy and should restart through the product's bounded replacement path.
+The v0.29.1 patch rollback pinned `muxcore/v0.29.0` or restored the prior product
+binary without a mixed-version live supervisor handoff or an old attestation
+advertisement. Old/new combinations run as ordinary MCP without private dormancy.
+For current v0.31.0 rollback, first durably release exact retired maintenance
+leases or prove safe expiry through the aware version. Incomplete/blocked
+authority prevents downgrade. Use the product's bounded replacement path.
+
+## Upstream maintenance control
+
+v0.31.0 adds optional maintenance for exact managed upstreams and installer-owned
+executable replacement. Ordinary legacy `engine.New` consumers need no source
+changes. Existing `DaemonHandler`, `CommandHandler`, `Send`, and `SendWithTimeout`
+signatures remain unchanged.
+`control.Request` adds `HoldID string` and `HoldTTLMS *int64`; it reuses exact
+`ServerID` and `DrainTimeoutMs`. Omitted TTL is 300000ms; explicit TTL must be
+positive and at most 3600000ms. CLI drain defaults to 10000ms; zero skips grace.
+CLI TTL and drain durations must be whole milliseconds. Sub-millisecond values
+are invalid, never silently truncated to a zero-force drain.
+
+```go
+ttlMS := int64(5 * time.Minute / time.Millisecond)
+held, err := control.SendMaintenance(controlPath, control.Request{
+	Cmd: "hold", ServerID: exactServerID,
+	HoldTTLMS: &ttlMS, DrainTimeoutMs: 10000,
+}, 0) // Use the neutral operation default.
+if err != nil {
+	return err // Do not substitute stop, kill, direct exec, or restart.
+}
+// Replace the upstream executable only after the validated HELD result.
+_, err = control.SendMaintenance(controlPath, control.Request{
+	Cmd: "resume", HoldID: held.HoldID,
+}, 0)
+```
+
+`Send` and nonpositive `SendWithTimeout` budgets use 180s plus one drain for `hold`/`restart_owner`; `SendMaintenance(..., 0)` shares this policy.
+Explicit positive timeouts are honored unchanged; all other commands retain 5s. This is finite exchange headroom, not full-pin/storage completion.
+Timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status; do not automatically retry, resume, or fall back to stop.
+
+CLI `stop` treats a contacted-daemon error, including an untyped failure or invalid
+response, as terminal status 1 without per-owner or legacy data-channel fallback.
+Successful shutdown and the genuinely absent-daemon path are unchanged; an
+unknown contacted outcome is not permission to bypass daemon authority.
+
+On Darwin, ENOTSOCK is native absence only for the wrapped `dial` operation;
+read-phase/contacted uncertainty cannot select fallback. Control Start reserves
+the accept producer under the existing Close mutex before its goroutine, retaining
+accepted handlers through response, connection closure, and after-callback return.
+
+Resolved MCP `mux_stop` also delegates first to daemon authority, not stale owner
+snapshots or a direct-owner preference. Transport/malformed/typed uncertainty is
+terminal; only the exact known old unsupported-stop response allows legacy
+compatibility fallback. New external soft/forced removal claims atomically check
+lease, persistent authority, and target context before finalization; waits do not
+hold those admission locks. Exact admitted retry, maintenance-owned removal, and
+exact already-owned whole-daemon cleanup keep their existing authority, without
+clearing a failure latch or creating a new external bypass. Soft drain stays 30s,
+forced drain 0ms. `restart_owner` validates that drain milliseconds fit
+`time.Duration` before mutation, even on raw control or positive explicit timeout.
+
+Activation status probes preserve raw transport errors, not a Boolean liveness
+result. Offline absence is accepted only from exact native dial evidence, including
+missing Windows pipe `PathError` with `Op="open"`; nondial errno, busy/timeout,
+nil/nonOK/typed-invalid and contacted read/write failures are terminal. Offline
+swap/install still requires the namespace lock and persisted-clear proof first.
+Live/known old-clear endpoint behavior remains, without a new exported helper/API.
+
+MCP `mux_restart` is the last consumer of its returned reservation: it opens one
+returned native IPC connection, writes the existing token only, confirms exact
+ServerID/PrevToken bound history on the current owner through existing control,
+then closes only that tool-owned connection before success. Known nonidle denials
+confirm binding only, not eviction. Unknown token is observed only within the
+inherited post-dial admission bound and never counts as success; stale/malformed/
+contradictory/transport/protocol failure is error. Existing owner EOF handles later
+zero-session cleanup. No initialize/discover/MCP frames, new token/command/revoke
+registry or fallback; direct library `restart_owner` still returns its token for
+its ordinary caller to consume. Persistent/other-host authority is not evicted.
+
+`MaintenanceResult` contains `HoldID`, `ServerID`, `State`, `ExpiresAt`,
+`DrainDeadline`, and `TreesRetired`. States are `MaintenanceHolding`/`HOLDING`,
+`MaintenanceHeld`/`HELD`, `MaintenanceRetirementBlocked`/`RETIREMENT_BLOCKED`, and
+`MaintenanceReleased`/`RELEASED`. Successful hold requires durable, unexpired
+HELD and full scoped tree death, not handoff or detached live authority.
+Resume/safe expiry require
+tree death and durable release; blocked retirement never TTL-clears. Renew uses
+`Cmd: "renew"`, the exact current `HoldID`, and `HoldTTLMS`, setting expiry from
+serialized acceptance without changing retirement state or reviving a released/
+expired lease. Stale identities cannot clear a replacement lease.
+
+Managed `SessionHandler` retirement requires native callback quiescence, not
+merely cancelled contexts or closed transports. Request callbacks and admitted
+notification, connect/disconnect lifecycle, authentication, and frame-hook
+callbacks remain accounted until actual return. Native sessions stay retained
+as teardown producers until reader/disconnect settlement. Existing modern native
+notification non-dispatch behavior is unchanged.
+
+Both ordinary removal and maintenance require this settlement before `Done` or
+retirement proof. Otherwise ordinary removal could lose the registry entry
+before a later hold could pin its still-active callbacks. Existing blocked
+finalization/exact-entry retry retains authority; maintenance remains
+`RETIREMENT_BLOCKED` without TTL/resume bypass, using the original lease clock.
+Keep the fence and inspect status; notification cancellation on session/owner
+closure does not prove return. `PendingRequests` remains request-only; the
+private nonrequest accounting adds no public counter, status field, or schema.
+
+This also covers plain sessions without hooks and accepted connections still
+waiting for their native token. Private accept completion is reserved before
+launch in all three owner constructors; reader startup is serialized with
+admission closure. Readers complete only after full deferred close/remove
+cleanup, and the accept producer closes admission before joining readers and
+publishing completion. Transport completion is distinct from request/native
+work grace; actual process proof follows the bounded existing-budget join.
+No public counter/schema/state, manager, new timeout, replay or fake Done is added.
+
+If proven retirement cannot publish because the namespace lock is contended,
+retry through the existing exact-lease timer; no reaper is required. Successful
+`RETIREMENT_BLOCKED` renewal retains pending retry intent on the replacement
+lease's guarded timer. Renewal changes only accepted expiry, never the original
+drain deadline; publication preserves both. Stale lease/timer callbacks cannot
+overwrite renewed, released, or replacement authority. Other errors do not gain
+a new automatic retry policy.
+
+When `AuthorizeSession` is configured, every owner mode, including subprocess
+and `HandlerFunc`, retains private callback authority through actual return and
+the registration/rejection continuation. Admission closure prevents late allow
+from publishing a session; retirement and normal/error handoff retain blocked
+authority until settlement. This does not add authorization when none is
+configured, change ordinary defaults, or turn `PendingRequests` into a callback metric.
+
+Configured `OnFrameReceived` also retains private work in every owner mode,
+including when neither SessionHandler nor authorization is present. Its 1ms
+verdict timeout is not actual callback settlement. Callback-capable readers stay
+retained through teardown, and closed admission prevents late registration.
+
+In-process `HandlerFunc` retirement and tree proof use actual `Done` after body
+return/pipe settlement, not a bookkeeping closed marker. Close/SoftClose first
+preserve existing EOF/drain grace, then cancel the standard-library owned child
+context; the context is released when the body returns. A body that ignores
+cancellation must retain blocked authority until it actually completes. This
+adds no process manager, public completion field, schema, or retry policy.
+
+Process-owning signal/context callers issue shutdown once and wait for daemon
+`Done` before returning. A refused shutdown keeps reaper, daemon reference and
+control serving authority alive. Lease release alone does not retry that request;
+resume when allowed, then issue an independently admitted explicit shutdown.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+Recovered lease expiry timers and control request serving activate only after
+successful daemon construction. Failed registry publication or control setup
+leaves no recovered timer or control mutation admission. Successful recovery
+keeps the original accepted expiry and blocked `HOLDING`/`RETIREMENT_BLOCKED`
+fences; startup still uses the existing namespace lock.
+Unix stale cleanup excludes the exact canonical bound `ctlSrv.SocketPath()`
+before ping/unlink. It still cleans genuinely stale siblings and preserves live/
+foreign endpoints; it never enables control serving early to make self-ping pass.
+
+`Response` adds optional `Maintenance` and `ErrorCode`; `OwnerInfo` adds optional
+`Maintenance`. Daemon status retains a safe maintenance list after owner removal.
+After unplanned recovery, its `ServerID` may be empty; never reconstruct a target
+from that field. Optional `MaintenanceHandler`, `ShutdownWithErrorHandler`, and
+`OwnerRestartHandler` preserve existing consumer interfaces. The managed
+`restart_owner` operation chooses the original context and ProtocolEra in the
+daemon, rather than rebuilding a command with adapter credentials.
+
+`Response.Err()` and `SendMaintenance` preserve typed classification through
+`errors.Is` and `errors.As` with `*control.MaintenanceError`:
+
+| Wire code | Sentinel |
+| --- | --- |
+| `maintenance_held` | `ErrMaintenanceHeld` |
+| `maintenance_conflict` | `ErrMaintenanceConflict` |
+| `maintenance_not_found` | `ErrMaintenanceNotFound` |
+| `maintenance_retirement_blocked` | `ErrMaintenanceRetirementBlocked` |
+| `maintenance_unsupported` | `ErrMaintenanceUnsupported` |
+| `maintenance_persistence_failed` | `ErrMaintenancePersistenceFailed` |
+| `maintenance_invalid` | `ErrMaintenanceInvalid` |
+
+Unknown nonempty codes fail closed as invalid. Missing optional support, an
+untyped old endpoint refusal, or a missing maintenance result is unsupported.
+No raw credentials, environment values, request bodies, or private context keys
+belong in public readbacks or persisted matching records.
+
+Scope is the exact selected owner's finite admitted context set, partitioned by
+engine namespace, CWD, protocol era, and strict security/configuration identity.
+It is not host-wide file-lock authority. Admission is fenced before cache,
+materialization, or forwarding. Aware managed shims return `-32005`, message
+`upstream held for update`, and `data.error_code=maintenance_held` by original ID
+without closing host pipes. Held or terminated requests do not replay; modern
+fresh demand re-enters same-era isolated admission without legacy bootstrap,
+cache, progress, or subscription restoration.
+
+Era-less snapshot/handoff payloads retain CWD/environment observations, not the
+complete historical environment inventory. `CwdSet` has no associated environments
+and retained `BoundTokens` cannot certify every admitted context. Ordinary no-lease
+restore remains available. Hold acquisition for an incomplete restored owner and
+restoration under an active lease fail closed with existing `maintenance_invalid`;
+no payload schema/version, public API, or expiry seam is added. The causal regression
+uses admitted environment loss before token consumption, not elapsed TTL.
+
+The first post-resume frame from `OnInject` revalidates admission and waits for the
+same successor activation as stdin, outside ingress/dormant/suspend locks. Healthy
+injection retains one-pass lock admission and nonblocking queue-capacity behavior;
+`OnInject` itself still fires once. Caller bytes are copied before unlocked revalidation,
+then closed/dormant state and maintenance sequence are checked again before enqueue.
+`ErrInjectClosed`/`ErrInjectFull`, FIFO and suspend accounting remain unchanged.
+No new queue, goroutine, API, or held/unfinished-work replay is added.
+
+Exact-current pending retirement callbacks/current retirement timers latch
+existing `maintenanceFailed` on non-contention namespace-lock errors, including
+direct consumers without a reaper; contention/renewed-blocked retry and clocks
+are unchanged. Contacted graceful-restart transport uncertainty retains its cause
+and is terminal. Ordinary rejection fallback requires fresh validated aware/clear
+status for the SAME nonempty daemon generation; shutdown failure is terminal.
+Old read-only startup compatibility remains; no typed-refusal or fence bypass.
+
+All controlled restart/handoff/shutdown/downgrade and idle-exit paths refuse
+terminally while fences remain. `RestartWithSuccessor` and
+`ApplyUpdateAndRestart` must preserve typed refusal, never fall back to shutdown
+or start a successor. Aware startup loads authority before admission after
+unplanned loss; incomplete/corrupt state stays blocked. Old managed shims receive
+physical fencing only, not immediate-error/non-replay guarantees. Old daemons,
+uncoordinated standalone/direct-owner paths, foreign engines, arbitrary old
+binaries, and manual active-pointer replacement are unsupported. Before downgrade,
+durably resume every exact retired lease or observe safely committed expiry using
+the current aware binary. Incomplete/blocked authority prevents downgrade and
+must remain intact, even after TTL. Neither authority deletion nor PID cleanup
+is a recovery API.
+
+Schema-2 maintenance authority requires both `ledger.json` and `transaction.json`.
+Startup and activation validate the aggregate, not the ledger member alone.
+PREPARE retains predecessor leases and target digest; FINALIZE certifies only
+previously acknowledged durable publication. Pending, missing, or invalid pairs
+fail closed. A finalize error remains `ErrMaintenancePersistenceFailed` with
+conservative live admission, even if recovery verifies a matching COMMITTED
+certificate. It is not API success or a guarantee of storage rollback. Successful
+release cannot resurrect the old lease. See the [phase contract](../specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
+Authority lives at `<canonical namespace-lock path>.maintenance/<scope digest>/`,
+with paired `ledger.json` and `transaction.json`. The existing namespace/endpoint
+scope digest is unchanged. HOME/UserConfig environment changes do not choose a
+different store. Keep the endpoint/namespace-lock directory persistent while any
+fence is active; this layout grants no cleanup authority.
+
+Native guards authenticate endpoint-parent components and alias targets before
+canonicalization, including links before `..`. Trusted endpoint aliases remain
+supported; foreign-controlled aliases/targets and symlinked authority members
+fail closed. Unix private anchor/scope directories are current-user-owned0700
+and members0600; ancestry must pass ownership/writability checks. Windows private
+paths require protected DACLs and trusted ownership/access, with unsafe ancestor
+mutation/delete rights rejected. Exact OS TrustedInstaller ownership is trusted
+for ancestors only, not arbitrary services or private store members. Missing
+authority under an unsafe parent is not a clear-store result; cold read-only
+checks reject without creating or changing those paths. Use a safe persistent
+namespace directory rather than changing production TMP variables or weakening ACLs.
+
+The released v0.30 baseline had no maintenance store. The earlier user-config
+layout belonged only to unreleased private candidates, not a shipped migration
+contract. Before cutting over any such live binary, clear/drain its holds using
+that same binary and original environment. Preserve its private files; no scan,
+migration, or new registry is added. An absent new store does not certify an
+unknown old location as clear, and cannot justify bypass or authority deletion.
+
+Controlled installation, launcher swap, layout/bootstrap mutation, and active
+pointer changes serialize with hold-ledger mutation using the existing daemon
+namespace file lock. The shared `daemon.CheckMaintenanceForActivation` helper
+reads persisted authority without mutation. Status and pure startup inspection
+do not acquire/write that lock or proactively start a daemon. Activation also
+checks live aware status; offline/old endpoints permit it only when persisted
+authority is proven clear under the lock. This does not add an updater lease or
+host-wide executable-lock authority.
+
+Run [production Scenario 11](../docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
+on Windows and Unix with the actual integrated binary. Focused maintenance
+regressions and existing native Scenario 5b/8 and R1 parity remain separate gates.
+
+Recorded premerge proof: exact344
+[CI37236880161](https://github.com/thebtf/mcp-mux/actions/runs/37236880161) passed
+all five jobs; its selected Windows Scenario 11 passed1158/1158 checks, exit0,
+with no cleanup errors and actual owner0.31.0 in23 observations. Source/PR-head/
+clone binding and full binary/receipt hashes are in the
+[release evidence](../specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact344-hosted-windows-proof).
+That Windows proof remains344-bound. Actual immutable74 Linux root/module normal
+tests and both vets PASS once (2+25 tested packages,3 root no-test),fresh clean
+CGO0/trimpath owner0.31.0 artifact gives Scenario11 1191/1191,and separate unstamped
+R1 binary gives100/100+8/8 PASS. Exact74 CI37242471098 is RED on macOS fixture
+socket length104>Darwin103; Ubuntu/coverage/BSD PASS,Windows canceled before
+selected public steps. Short-namespace fixture-only Linux race4/4 PASS once,
+0SKIP/races/errors with53-byte private TMP and observed owner96/97/control100/101
+bytes below103 is accepted;not nativeDarwin proof. Next exactCI remains pending;
+extended selected Windows canonical critical workflow has STATIC proof only.
+All33 then-known threads have parent-reported resolutions after actual replies/
+readback,not fresh all-PR CLEAN. No final acceptance,publication,fresh-session
+delivered canary or consumer handoff claim; native Engram issue capability is
+unmounted,effect-only. Full hashes/limits are in the
+[current evidence](../specs/002-upstream-maintenance-hold/release-evidence.md#actual-exact74-integrated-linux-proof-and-ci-boundary).
 
 ## Upgrade and Restart Contract
 
@@ -715,7 +1023,8 @@ The helper:
 2. Acquires the daemon namespace lock for the resolved `engine.Config.Namespace`
    and `BaseDir`.
 3. Sends `graceful-restart` with `successor_exe` set to `CurrentExe`.
-4. Falls back to `shutdown` if graceful restart is unavailable or rejected.
+4. Falls back to `shutdown` if graceful restart is unavailable or rejected,
+   except typed maintenance refusal, which is terminal with no fallback/start.
 5. Starts the replacement daemon from `CurrentExe` when a successor is not
    already ready.
 6. Waits for the replacement daemon to answer `ping` before releasing the lock.

@@ -53,6 +53,10 @@ graph TB
 
 ## Быстрый старт
 
+Подготовленная версия бинарника — **v0.31.0**. После публикации используйте
+[релиз v0.31.0](https://github.com/thebtf/mcp-mux/releases/tag/v0.31.0).
+Команды ниже собирают исходники, а не доказывают работу доставленного артефакта.
+
 **1. Сборка**
 
 ```sh
@@ -265,15 +269,112 @@ Daemon включён по умолчанию. Он запускается ав�
 `web_dashboard: false`. Подробнее — в
 [документации Serena](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
-**Отключить daemon-режим** (устаревшее поведение с владельцем на уровне сессии):
+Standalone-запуск upstream через `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON` или
+direct-owner путь `--daemon` в v0.31.0 явно возвращает
+`maintenance_unsupported`. Сохраняйте managed admission через daemon;
+прямой запуск не обходит maintenance.
 
-```sh
-MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
+## Удержать upstream для замены исполняемого файла
+
+v0.31.0 добавляет необязательные managed операции hold, resume и renew.
+Используйте maintenance-aware binary, daemon и shim вместе. Публикация и
+consumer handoff ещё не завершены; старые установленные теги не получают эту поддержку.
+
+Возьмите точный `server_id` из локального `mcp-mux status`. Флаги идут после ID:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <returned-hold-id> --ttl 5m --json
+mcp-mux resume <returned-hold-id> --json
 ```
+
+Hold блокирует новые запросы и запуски до drain уже переданных запросов.
+Drain по умолчанию равен 10 секундам; `--drain-timeout 0s` пропускает grace,
+но всё равно требует доказанного завершения всего managed дерева. Положительный
+drain использует общий с TTL момент `T` и не сбрасывается при retry.
+Заменяйте файл самостоятельно только после успешного JSON-результата с
+`state: HELD`, `trees_retired: true` и будущим `expires_at`. Результат также
+содержит `hold_id`, `server_id` и `drain_deadline`.
+
+`HOLDING` закрывает admission; provisional timing предшествует clocked drain/retirement и не разрешает замену. `HELD` означает
+доказанную смерть всех scoped деревьев. `RETIREMENT_BLOCKED` сохраняет запрет
+запуска: замена небезопасна. `RELEASED` разрешает свежий спрос после durable release.
+TTL по умолчанию равен пяти минутам, должен быть положительным и не превышать
+один час. Renew меняет expiry только
+точного текущего неистёкшего hold ID от момента serialized acceptance, не меняя
+retirement state и не восстанавливая released/expired lease.
+CLI принимает TTL и drain только в целых миллисекундах. Значения меньше
+миллисекунды отклоняются, а не округляются до zero-force retirement.
+Чужой или устаревший ID не заменяет lease. Resume и истечение TTL открывают
+admission только после доказанного retirement. Blocked retirement не очищается
+по таймеру, даже если TTL истёк.
+
+Durable seed в состоянии `HOLDING` содержит provisional timing и не разрешает замену.
+После первого полного writer acknowledgment момент `T` выбирается один раз; clocked `HOLDING` сохраняется один раз.
+TTL/drain отсчитываются от `T`; эта запись, retirement, сохранение HELD и ответ расходуют исходное окно, не сбрасывая его.
+Любая ошибка записи при acquisition сохраняет seed fence; incomplete recovery остаётся `RETIREMENT_BLOCKED`, без expiry/resume.
+
+Без положительного caller timeout neutral control даёт `hold`/`restart_owner` 180s плюс один drain; CLI/MCP используют этот default.
+Явный положительный library budget сохраняется; для остальных команд default равен 5s. Это конечный exchange allowance, не гарантия полного pin/storage completion.
+Timeout оставляет outcome неизвестным: durable lease/restart может сохраниться. Проверьте status, без автоматического retry/resume или stop fallback.
+
+Aware shim сохраняет исходные stdin/stdout host. Запрос во время fence получает
+JSON-RPC `-32005`, сообщение `upstream held for update` и
+`data.error_code: maintenance_held` с исходным числовым или строковым ID, а не
+кешированный успех. Отклонённые и завершённые ошибкой in-flight запросы не
+воспроизводятся; notification не получает выдуманный ID. После release свежий
+legacy-запрос достигает новой версии на тех же pipes. Modern использует свежий
+same-era isolated admission с обязательными per-request metadata, без legacy
+bootstrap, cache и восстановления запросов или subscriptions.
+
+Scope включает конечный набор уже admitted контекстов выбранного owner, а не
+host-wide блокировку файла. Другой CWD, protocol era, credential/configuration
+context, engine namespace или unmanaged процесс не включается автоматически и
+может продолжать удерживать файл.
+
+MCP `mux_hold`, `mux_resume` и `mux_renew` используют тот же локальный daemon.
+`mux_restart` вызывает daemon-owned `restart_owner` с исходными точными context
+и era, без реконструкции через ambient credentials адаптера. При активном fence
+controlled restart, handoff, shutdown, downgrade и idle exit получают terminal
+refusal. Launcher и library update helpers не делают shutdown fallback и не
+запускают successor. После unplanned loss aware daemon загружает hold до admission;
+неполное или нечитаемое authority остаётся fail closed.
+
+Durable authority состоит из обязательной пары schema-2 `ledger.json` и
+`transaction.json`. Неполная, pending или невалидная пара запрещает admission.
+Persistence error сохраняет консервативное live-состояние, но не гарантирует
+откат записей. После ошибки FINALIZE recovery может принять только совпадающий
+COMMITTED certificate как доказательство ранее подтверждённой durable publication.
+Ответ caller остаётся ошибкой. Успешный release не восстанавливает старый lease.
+Подробности в [контракте фаз записи](specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
+Controlled install engine, swap launcher, изменения layout/bootstrap и active
+pointer используют существующий file lock namespace daemon. Изменения hold
+ledger используют тот же lock, поэтому hold не может пройти между проверкой
+и активацией. `daemon.CheckMaintenanceForActivation` только читает сохранённое
+authority. Status и чистые startup-проверки не захватывают и не создают этот
+lock и не запускают daemon заранее. Activation также проверяет live aware
+status. Offline или old endpoint допускается только при доказанно пустом
+сохранённом authority под lock. Это координация namespace, а не host-wide
+file lock или отдельный updater lease.
+
+Old daemon возвращает `maintenance_unsupported`, без stop/kill/restart fallback.
+Aware daemon физически блокирует старые managed shim, но не обещает им immediate
+errors и non-replay. Arbitrary old binary, foreign engine, ручная замена active
+pointer и standalone bypass не поддерживаются. Перед downgrade текущим aware
+binary выполните durable resume каждого точного retired lease либо подтвердите
+его безопасно зафиксированное истечение. Incomplete/blocked authority запрещает
+downgrade и сохраняется даже после TTL. Не удаляйте ни один член authority и не
+делайте PID cleanup для открытия admission.
+
+Перед релизом выполните [live replacement proof на Windows и Unix](docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement).
+Он использует private scratch primary checkout и реальную перезапись файла;
+сборка fixture или unit test не заменяет это доказательство.
 
 ## Устойчивый shim
 
-Shim-ы mcp-mux автоматически переподключаются при перезапуске daemon. Это означает:
+Вне maintenance fence legacy shim автоматически переподключается при рестарте
+daemon. Modern R1 не воспроизводит legacy handshake, описанный ниже. Это означает:
 
 - `mcp-mux upgrade` переключает active versioned engine без разрыва соединений
 - `mcp-mux stop --force` вызывает автоматическое переподключение в течение нескольких секунд
@@ -461,12 +562,12 @@ stdio-транспорт, но не воспроизводит уже отпра
 
 ### Контракт
 
-| Триггер | До v0.21.0 | Контракт v0.27.0 |
+| Триггер | До v0.21.0 | Текущий контракт |
 |---|---|---|
 | `mcp-mux upgrade --restart` с живыми сессиями | Upstream убивался и перезапускался, активные запросы терялись | Рестарт daemon откладывается: существующие stdio-транспорты остаются на текущем daemon, а новые shim используют новый указатель engine |
 | `mcp-mux upgrade --restart` без живых сессий | Upstream убивался и перезапускался, активные запросы терялись | Handoff v2 сохраняет дерево upstream; первый рестарт с v1 на v2 выполняет один ограниченный snapshot-backed respawn |
 | Потеря daemon или owner | Жизненный цикл upstream зависел от лидирующего процесса | Восстановление запускается спросом; заброшенные поколения очищаются как полные деревья, а уже отправленные запросы получают явные ошибки без воспроизведения |
-| `mux_restart <sid>` (инициировано оператором) | Жёсткое убийство — без изменений | Жёсткое убийство — без изменений (явное намерение оператора) |
+| `mux_restart <sid>` (инициировано оператором) | Жёсткое завершение | Daemon-owned `restart_owner` сохраняет точные исходные launch context и era. Drain по умолчанию 30s; `force: true` пропускает только drain. Maintenance-held target получает terminal refusal без stop/spawn fallback. |
 | Idle-вытеснение reaper'ом | Жёсткий SIGKILL | Мягкое закрытие: 30s слив stdin → SIGTERM только по таймауту |
 
 ### Как это работает
@@ -599,6 +700,22 @@ scripts\verify-handoff.ps1
 это сам; если конфигурация неоднозначна, он должен падать рано и с понятной
 ошибкой.
 
+Подготовленный текущий library target — `muxcore/v0.31.0`. После публикации
+и разрешения тега через Go proxy закрепите зависимость:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+```
+
+Обычным legacy-потребителям `engine.New` менять исходники не требуется.
+`control.SendMaintenance` нужен только при принятии необязательных операций
+maintenance. Legacy остаётся zero-value default; modern R1 требует явного
+same-era admission и сохраняет isolation/cache-off/replay-off.
+Откат на `muxcore/v0.30.0` или совместимый предыдущий binary возможен только
+после durable resume каждого точного retired lease либо безопасного committed
+expiry через текущую aware-версию. Incomplete/blocked authority запрещает downgrade
+и не удаляется. Modern owner завершается через quarantine, без live-перехода в legacy.
+
 ### Ссылки
 
 - Спецификация: `.agent/specs/upstream-survives-daemon-restart/spec.md`
@@ -610,7 +727,7 @@ scripts\verify-handoff.ps1
 
 | Переменная | По умолчанию | Описание |
 |------------|-------------|----------|
-| `MCP_MUX_NO_DAEMON` | `0` | Установите `1`, чтобы отключить daemon-режим (устаревший владелец на уровне сессии) |
+| `MCP_MUX_NO_DAEMON` | `0` | Устаревшая настройка; значение `1` не поддерживается и отклоняется с `maintenance_unsupported` по правилу fail closed. Сохраняйте admission через daemon; это не способ обойти daemon. |
 | `MCP_MUX_ISOLATED` | `0` | Установите `1`, чтобы принудительно включить изолированный режим для данного вызова |
 | `MCP_MUX_STATELESS` | `0` | Установите `1`, чтобы игнорировать cwd при хешировании идентичности сервера (включает глобальную дедупликацию) |
 | `MCPMUX_SHIM_IDLE_TIMEOUT` | `10m` | Период безопасного простоя host до парковки daemon IPC-сессии неpersistent shim; ноль или отрицательное значение отключает стадию |
@@ -640,7 +757,7 @@ scripts\verify-handoff.ps1
 |-----------|----------|
 | `mux_list` | Возвращает запущенные экземпляры **текущего проекта** внутри daemon namespace продукта `mcp-mux` (фильтруется по cwd вызывающей сессии). Передайте `all: true` для получения экземпляров всех проектов в этом daemon. Включает идентификатор сервера, engine name, PID, количество сессий, ожидающие запросы, классификацию и состояние кеша. |
 | `mux_stop` | Корректно завершает работу экземпляра по `server_id` после дрейна запросов. Используйте `force: true` для немедленного завершения. |
-| `mux_restart` | Останавливает экземпляр и запускает новый daemon-владелец с той же командой. При вызове без явного указания разрешается в экземпляр, принадлежащий текущей сессии (например, `mux_restart(name: "aimux")` перезапускает aimux этого проекта, а не другого). Подключённые сессии переподключаются автоматически при следующем вызове инструмента. |
+| `mux_restart` | Вызывает daemon-owned `restart_owner` с точными исходными launch context и era. Drain по умолчанию 30s; `force: true` пропускает только drain, не обходит maintenance-held terminal refusal и не разрешает stop/spawn fallback. Без явного target выбирается экземпляр текущей сессии (например, `mux_restart(name: "aimux")` выбирает mux-managed aimux этого проекта, а не native engine). Область CR-001 ограничена текущим namespace; cross-engine restart не поддерживается. |
 
 **Управляющая плоскость с привязкой к сессии:**
 

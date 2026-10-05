@@ -1277,7 +1277,8 @@ func TestRestartRacingSharedToIsolatedCommitCapturesMatchingGeneration(t *testin
 	d := testDaemon(t)
 	publishEntered := make(chan struct{})
 	releasePublish := make(chan struct{})
-	var publishOnce sync.Once
+	var publishOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releasePublish) }) })
 	d.beforeOwnerCachePublish = func(*owner.Owner) {
 		publishOnce.Do(func() { close(publishEntered) })
 		<-releasePublish
@@ -1336,7 +1337,7 @@ func TestRestartRacingSharedToIsolatedCommitCapturesMatchingGeneration(t *testin
 		serialized <- serializeResult{err: serializeErr}
 	}()
 	time.Sleep(30 * time.Millisecond)
-	close(releasePublish)
+	releaseOnce.Do(func() { close(releasePublish) })
 	select {
 	case result := <-serialized:
 		if result.err != nil {
@@ -1788,7 +1789,10 @@ func TestRestartCaptureZeroSessionMaterializationBarrier(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New daemon: %v", err)
 			}
-			t.Cleanup(d.Shutdown)
+			t.Cleanup(func() {
+				releaseToolsOnce.Do(func() { close(releaseTools) })
+				d.Shutdown()
+			})
 			command := "restart-capture-upstream"
 			template := daemonMaterializationSnapshot(false)
 			template.Cwd = "/cached/restart"
@@ -1911,7 +1915,7 @@ func TestPersistentWinningContextSurvivesRestartHydration(t *testing.T) {
 	initSeen := make(chan struct{})
 	toolsSeen := make(chan struct{})
 	var initOnce, toolsOnce sync.Once
-	handler := func(_ context.Context, stdin io.Reader, stdout io.Writer) error {
+	handler := func(ctx context.Context, stdin io.Reader, stdout io.Writer) error {
 		generation := starts.Add(1)
 		current := active.Add(1)
 		for {
@@ -1947,8 +1951,12 @@ func TestPersistentWinningContextSurvivesRestartHydration(t *testing.T) {
 			case "tools/list":
 				if generation == 1 {
 					toolsOnce.Do(func() { close(toolsSeen) })
-					<-releaseFirstTools
-					return fmt.Errorf("retired first persistent generation")
+					select {
+					case <-releaseFirstTools:
+						return fmt.Errorf("retired first persistent generation")
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				}
 				if err := writeDaemonResponse(stdout, req.ID, `{"tools":[{"name":"persistent-ready"}]}`); err != nil {
 					return err
@@ -1973,7 +1981,10 @@ func TestPersistentWinningContextSurvivesRestartHydration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New predecessor: %v", err)
 	}
-	t.Cleanup(d.Shutdown)
+	t.Cleanup(func() {
+		releaseFirstToolsOnce.Do(func() { close(releaseFirstTools) })
+		d.Shutdown()
+	})
 	command := "persistent-winning-upstream"
 	template := daemonMaterializationSnapshot(false)
 	d.updateTemplate(command, nil, template)

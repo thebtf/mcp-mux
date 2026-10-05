@@ -25,7 +25,7 @@ func launcherCapabilityTestLayout(t *testing.T, launcherContents, engineContents
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "candidate", engineFileName())
 	writeTestFile(t, launcherPath, launcherContents)
 	writeTestFile(t, enginePath, engineContents)
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatalf("write active engine: %v", err)
 	}
 	return launcherPath, enginePath, activeEngineFile(launcherPath)
@@ -134,7 +134,7 @@ func TestLauncherLifecycleCapabilityRejectsInactiveEngine(t *testing.T) {
 
 	otherEnginePath := filepath.Join(versionStoreDir(launcherPath), "other", engineFileName())
 	writeTestFile(t, otherEnginePath, "other versioned engine")
-	if err := writeActiveEngine(launcherPath, otherEnginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, otherEnginePath); err != nil {
 		t.Fatalf("write inactive engine pointer: %v", err)
 	}
 	if launcherLifecycleCapable() {
@@ -182,6 +182,7 @@ func TestLauncherLifecycleCapabilityRejectsUnverifiedAttestation(t *testing.T) {
 }
 
 func TestBootstrapStableLauncherUsesInstalledLayout(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	launcherPath, enginePath, _ := launcherCapabilityTestLayout(t, "old launcher", "new launcher")
 	redirectedLauncher := filepath.Join(t.TempDir(), "redirected-launcher")
 	writeTestFile(t, redirectedLauncher, "unrelated")
@@ -214,6 +215,7 @@ func TestBootstrapStableLauncherUsesInstalledLayout(t *testing.T) {
 }
 
 func TestLauncherMigrationRequiresOneFutureInvocation(t *testing.T) {
+	isolateMaintenanceActivation(t)
 	launcherPath, enginePath, _ := launcherCapabilityTestLayout(t, "old launcher", "capable launcher")
 	t.Setenv(envLauncherProtocol, "") // Current old launcher cannot serve target-bound attestation.
 	t.Setenv(envLauncherAttestation, "")
@@ -495,7 +497,7 @@ func TestSupervisedStartFailureCancelsActiveAttestationOnly(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "missing-launcher")
 	enginePath := writeContentAddressedTestEngine(t, launcherPath, "not an executable")
-	if err := writeActiveEngine(launcherPath, enginePath); err != nil {
+	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := startDefaultSupervisedEngineChild(context.Background(), launcherPath, enginePath, nil, io.Discard); err == nil {

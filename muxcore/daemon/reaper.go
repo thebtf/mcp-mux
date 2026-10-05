@@ -104,10 +104,13 @@ func (r *Reaper) loop() {
 			}
 
 			// Idle auto-exit: no owners and no sessions for idleTimeout
-			if r.daemon.OwnerCount() == 0 && r.totalSessions() == 0 {
+			if r.daemon.OwnerCount() == 0 && r.totalSessions() == 0 && !r.daemon.maintenanceFenced() {
 				if time.Since(lastActivity) > r.daemon.idleTimeout {
+					if err := r.daemon.beginMaintenanceLifecycle(); err != nil {
+						continue
+					}
 					r.logger.Printf("reaper: daemon idle for %s, auto-exiting", r.daemon.idleTimeout)
-					go r.daemon.Shutdown()
+					go r.daemon.shutdown(nil)
 					return
 				}
 			}
@@ -117,6 +120,7 @@ func (r *Reaper) loop() {
 
 // sweep runs one GC cycle and returns the number of owners affected.
 func (r *Reaper) sweep() int {
+	r.daemon.reconcileMaintenance()
 	now := time.Now()
 	affected := 0
 

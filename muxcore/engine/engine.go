@@ -14,7 +14,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -26,6 +25,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
 	"github.com/thebtf/mcp-mux/muxcore/era"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/registry"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
@@ -342,7 +342,7 @@ func (e *MuxEngine) isProxyMode() bool {
 //   - If MCP_MUX_SESSION_ID env var is set → proxy mode (pass-through, T025)
 //   - Otherwise → client/shim mode (find/start daemon, connect via IPC, T024)
 //
-// Blocks until ctx is cancelled or the engine exits naturally.
+// Cancellation requests shutdown; daemon mode retains authority until Done.
 func (e *MuxEngine) Run(ctx context.Context) error {
 	if e.isDaemonMode() {
 		return e.runDaemon(ctx)
@@ -456,14 +456,15 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 	}()
 
 	reaper := daemon.NewReaper(d, defaultReaperInterval)
+	defer reaper.Stop()
 
 	select {
 	case <-ctx.Done():
-		reaper.Stop()
 		d.Shutdown()
+		// Shutdown may refuse; retain the daemon reference and reaper until Done.
+		<-d.Done()
 		return ctx.Err()
 	case <-d.Done():
-		reaper.Stop()
 		return nil
 	}
 }
@@ -544,7 +545,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
 	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, protocolWire, e.logger)
-	if err != nil {
+	if err != nil && !isMaintenanceFence(err) {
 		if errors.Is(err, era.AdmissionControlEraMismatch) {
 			admission := selection.AdmissionError(era.AdmissionControlEraMismatch)
 			writeEngineAdmissionError(os.Stdout, admission)
@@ -595,6 +596,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		Stdin:            clientStdin,
 		Stdout:           os.Stdout,
 		InitialIPCPath:   ipcPath,
+		InitialError:     err,
 		Token:            token,
 		ProtocolEra:      protocolEra,
 		OnInject:         e.cfg.OnInject,
@@ -690,29 +692,27 @@ func (e *MuxEngine) runProxy(ctx context.Context) error {
 // process, then polls until the daemon control socket responds (up to
 // daemonStartupTimeout).
 func (e *MuxEngine) startDaemon() error {
+	ctlPath := e.ControlSocketPath()
+	lock, err := engineAcquireDaemonLock(serverid.DaemonLockPath(e.cfg.BaseDir, e.cfg.Namespace))
+	if err != nil {
+		if errors.Is(err, ipc.ErrFileLocked) {
+			return waitForDaemon(ctlPath, daemonStartupTimeout)
+		}
+		return err
+	}
+	defer lock.Close()
+	if isDaemonRunning(ctlPath) {
+		return nil
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
 
-	cmd := exec.Command(exe, e.cfg.DaemonFlag)
-	closeStdio, err := attachDetachedStdio(cmd)
-	if err != nil {
+	if err := engineStartDaemonExecutable(exe, e.cfg.DaemonFlag); err != nil {
 		return err
 	}
-	defer closeStdio()
-	setDetached(cmd)
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start daemon process: %w", err)
-	}
-
-	// Release: we don't wait for the daemon — it runs independently.
-	if err := cmd.Process.Release(); err != nil {
-		return fmt.Errorf("release daemon process: %w", err)
-	}
-
-	ctlPath := serverid.DaemonControlPath(e.cfg.BaseDir, e.cfg.Namespace)
 	return waitForDaemon(ctlPath, daemonStartupTimeout)
 }
 
@@ -859,8 +859,8 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
-	if !resp.OK {
-		return "", "", "", fmt.Errorf("daemon spawn failed: %s", resp.Message)
+	if err := resp.Err(); err != nil {
+		return "", "", "", fmt.Errorf("daemon spawn failed: %w", err)
 	}
 	if protocolEra != "" && resp.ProtocolEra != protocolEra {
 		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
@@ -924,6 +924,9 @@ func refreshTokenViaDaemon(ctlPath, prevToken, protocolEra string, logger *log.L
 	}, refreshRPCTimeout)
 	if err != nil {
 		return "", fmt.Errorf("refresh token via daemon: %w", err)
+	}
+	if err := resp.Err(); isMaintenanceError(err) {
+		return "", err
 	}
 	if !resp.OK {
 		switch resp.Message {

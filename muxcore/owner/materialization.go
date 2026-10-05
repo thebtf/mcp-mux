@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/classify"
+	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/jsonrpc"
@@ -451,32 +452,7 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			return
 		}
 
-		o.launchContextMu.Lock()
-		o.materializationMu.Lock()
-		if !a.launchFrozen {
-			if !o.launchSessionEligible(a.launch) {
-				if a.launchRequiresSession {
-					if replacement, ok := o.oldestEligibleLaunchContext(); ok {
-						a.launch = replacement
-					}
-				} else {
-					a.launch = o.electLaunchContextLocked()
-				}
-			}
-			a.launchFrozen = true
-		}
-		if !o.materializationEraMatches(a) {
-			o.materializationMu.Unlock()
-			o.launchContextMu.Unlock()
-			a.signalStarted(errMaterializationEraChanged)
-			o.finishMaterializationFailure(a, errMaterializationEraChanged)
-			return
-		}
-		launch := LaunchContext{SessionID: a.launch.SessionID, Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
-		o.materializationMu.Unlock()
-
-		proc, err := o.spawnReplacementUpstream(launch)
-		o.launchContextMu.Unlock()
+		proc, signals, err := o.startAdmittedMaterialization(a)
 		if !o.materializationEraMatches(a) {
 			driftErr := error(errMaterializationEraChanged)
 			if err != nil {
@@ -521,7 +497,11 @@ func (o *Owner) runMaterialization(a *materializationAttempt) {
 			continue
 		}
 
-		signals := o.installMaterializationProcess(a, proc)
+		if signals == nil {
+			a.signalStarted(errors.New("upstream start returned no process"))
+			o.finishMaterializationFailure(a, errors.New("upstream start returned no process"))
+			return
+		}
 		a.signalStarted(nil)
 		o.logger.Printf("upstream materialization started generation=%d attempt=%d trigger=%s", a.generation, attemptNumber, a.trigger)
 		if a.cancelled() {
@@ -631,6 +611,9 @@ func (o *Owner) shouldRetryMaterialization(trigger MaterializationTrigger) bool 
 }
 
 func (o *Owner) shouldRetryMaterializationLocked(trigger MaterializationTrigger) bool {
+	if o.maintenance.Load() != nil {
+		return false
+	}
 	select {
 	case <-o.materializationStop:
 		return false
@@ -660,6 +643,7 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 	o.upstreamEventMu.Lock()
 	o.materializationMu.Lock()
 	a.process = proc
+	o.lastMaintenanceLaunch = LaunchContext{Cwd: a.launch.Cwd, Env: cloneLaunchEnv(a.launch.Env)}
 	a.signals = signals
 	if a.protocolEra == era.EraModern20260728 {
 		o.cacheStage = nil
@@ -676,7 +660,6 @@ func (o *Owner) installMaterializationProcess(a *materializationAttempt, proc *u
 }
 
 func (o *Owner) retireFailedMaterializationStart(a *materializationAttempt, proc *upstream.Process) error {
-	o.installMaterializationProcess(a, proc)
 	return o.retireMaterializationProcess(a, proc)
 }
 
@@ -1299,6 +1282,20 @@ func (o *Owner) sessionEligibleForDemand(s *Session) bool {
 }
 
 func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, error) {
+	if held := o.lockRequestAdmission(); held != nil {
+		o.unlockRequestAdmission()
+		return true, o.rejectMaintenance(s, msg, held)
+	}
+	queued, err := o.enqueueLocalDemandAdmitted(s, msg)
+	o.unlockRequestAdmission()
+	if queued && err != nil {
+		return true, o.writeDemandError(s, msg.ID, err.Error())
+	}
+	return queued, err
+}
+
+// enqueueLocalDemandAdmitted reserves local demand without transport I/O.
+func (o *Owner) enqueueLocalDemandAdmitted(s *Session, msg *jsonrpc.Message) (bool, error) {
 	raw := append([]byte(nil), msg.Raw...)
 	copyMsg, err := jsonrpc.Parse(raw)
 	if err != nil {
@@ -1310,7 +1307,7 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 	o.materializationMu.Lock()
 	if !o.sessionEligibleForDemand(s) {
 		o.materializationMu.Unlock()
-		return true, o.writeDemandError(s, msg.ID, "request no longer admitted before upstream materialization")
+		return true, errors.New("request no longer admitted before upstream materialization")
 	}
 	if o.materializationState == MaterializationReady && !o.upstreamDead.Load() {
 		o.materializationMu.Unlock()
@@ -1318,7 +1315,7 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 	}
 	if o.restartPins.Load() > 0 {
 		o.materializationMu.Unlock()
-		return true, o.writeDemandError(s, msg.ID, "restart snapshot in progress")
+		return true, errors.New("restart snapshot in progress")
 	}
 	if o.materializationState == MaterializationFinalizeBlocked {
 		err := o.materializationBlockedErr
@@ -1326,17 +1323,17 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 			err = errFinalizationUnproven
 		}
 		o.materializationMu.Unlock()
-		return true, o.writeDemandError(s, msg.ID, err.Error())
+		return true, err
 	}
 	if _, exists := o.pendingDemands[key]; exists {
 		o.materializationMu.Unlock()
-		return true, o.writeDemandError(s, msg.ID, "duplicate request id while upstream materializes")
+		return true, errors.New("duplicate request id while upstream materializes")
 	}
 	active := o.materializationAttempt
 	postAttemptRecovery := o.materializationState == MaterializationCacheOnly && active != nil
 	if active != nil && !postAttemptRecovery && !o.launchContextCompatible(active.launch, candidate) {
 		o.materializationMu.Unlock()
-		return true, o.writeDemandError(s, msg.ID, "request context incompatible with active upstream materialization")
+		return true, errors.New("request context incompatible with active upstream materialization")
 	}
 
 	demand := &localDemand{key: key, session: s, message: copyMsg, state: localDemandWaiting}
@@ -1358,7 +1355,7 @@ func (o *Owner) enqueueLocalDemand(s *Session, msg *jsonrpc.Message) (bool, erro
 		}
 		o.materializationMu.Unlock()
 		if a.err != nil {
-			return true, o.writeDemandError(s, msg.ID, a.err.Error())
+			return true, a.err
 		}
 		return false, nil
 	}
@@ -1473,6 +1470,10 @@ func (o *Owner) writeFailedLocalDemands(demands []*localDemand, err error) {
 		err = errors.New("upstream materialization failed")
 	}
 	for _, demand := range demands {
+		if held := o.maintenance.Load(); held != nil {
+			_ = o.rejectMaintenance(demand.session, demand.message, held)
+			continue
+		}
 		_ = o.writeDemandError(demand.session, demand.message.ID, err.Error())
 	}
 }
@@ -1486,6 +1487,14 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	demand := o.pendingDemands[key]
 	if demand == nil || demand.state != localDemandWaiting || demand.generation != generation {
 		o.materializationMu.Unlock()
+		return
+	}
+	if held := o.maintenance.Load(); held != nil {
+		demand, claimed := o.transitionLocalDemandLocked(key, localDemandRejected)
+		o.materializationMu.Unlock()
+		if claimed {
+			_ = o.rejectMaintenance(demand.session, demand.message, held)
+		}
 		return
 	}
 
@@ -1533,6 +1542,10 @@ func (o *Owner) forwardQueuedDemand(key string, generation uint64, launch Launch
 	if o.afterQueuedDemandWrite != nil {
 		o.afterQueuedDemandWrite()
 	}
+	var refusal *control.MaintenanceError
+	if errors.As(err, &refusal) {
+		err = o.rejectMaintenance(demand.session, demand.message, refusal.Result)
+	}
 	if err != nil {
 		o.logger.Printf("session %d: queued demand forwarding failed: %v", demand.session.ID, err)
 	}
@@ -1571,6 +1584,9 @@ func (o *Owner) transitionLocalDemandLocked(key string, terminal localDemandStat
 }
 
 func (o *Owner) writeDemandError(s *Session, id json.RawMessage, message string) error {
+	if held := o.maintenance.Load(); held != nil {
+		return s.WriteRaw(maintenanceErrorBytes(id, held))
+	}
 	payload, err := buildJSONRPCErrorBytes(id, -32603, message)
 	if err != nil {
 		return err
@@ -1580,6 +1596,10 @@ func (o *Owner) writeDemandError(s *Session, id json.RawMessage, message string)
 
 func (o *Owner) forwardRequestNow(s *Session, msg *jsonrpc.Message) error {
 	failedProc, writeFailed, err := o.forwardRequestPrepared(s, msg)
+	var refusal *control.MaintenanceError
+	if errors.As(err, &refusal) {
+		return o.rejectMaintenance(s, msg, refusal.Result)
+	}
 	if writeFailed {
 		if failedProc != nil {
 			o.retireReadyProcess(failedProc, MaterializationTriggerWriteError)
@@ -1594,11 +1614,9 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 	if o.isModern() {
 		return o.forwardModernRequestPrepared(s, msg)
 	}
-	o.pendingRequests.Add(1)
 	newID := remap.Remap(s.ID, msg.ID)
 	remapped, err := jsonrpc.ReplaceID(msg.Raw, newID)
 	if err != nil {
-		o.decrementPending()
 		return nil, false, fmt.Errorf("remap request: %w", err)
 	}
 
@@ -1607,15 +1625,6 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 		Tool:      extractToolName(msg.Raw),
 		SessionID: s.ID,
 		StartTime: time.Now(),
-	}
-	o.inflightTracker.Store(string(newID), inflight)
-	if msg.Method == "initialize" || msg.Method == "tools/list" ||
-		msg.Method == "prompts/list" || msg.Method == "resources/list" ||
-		msg.Method == "resources/templates/list" {
-		o.methodTags.Store(string(newID), msg.Method)
-	}
-	if msg.Method == "initialize" {
-		o.captureInitFingerprint(msg.Raw)
 	}
 
 	o.mu.RLock()
@@ -1643,21 +1652,41 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 		}
 	}
 
-	o.trackProgressToken(s.ID, string(newID), msg.Raw)
-	o.sessionMgr.TrackRequest(string(newID), s.ID)
-	if msg.Method == "tools/call" && o.toolTimeoutNs.Load() > 0 {
-		o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
-	}
-	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped, inflight.process.Store)
+	published := false
+	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped, func(proc *upstream.Process) {
+		inflight.process.Store(proc)
+		o.pendingRequests.Add(1)
+		o.inflightTracker.Store(string(newID), inflight)
+		if msg.Method == "initialize" || msg.Method == "tools/list" ||
+			msg.Method == "prompts/list" || msg.Method == "resources/list" ||
+			msg.Method == "resources/templates/list" {
+			o.methodTags.Store(string(newID), msg.Method)
+		}
+		if msg.Method == "initialize" {
+			o.captureInitFingerprint(msg.Raw)
+		}
+		o.trackProgressToken(s.ID, string(newID), msg.Raw)
+		o.sessionMgr.TrackRequest(string(newID), s.ID)
+		if msg.Method == "tools/call" && o.toolTimeoutNs.Load() > 0 {
+			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
+		}
+		published = true
+	})
 	if writeErr != nil {
+		if isMaintenanceFence(writeErr) {
+			return usedProc, false, writeErr
+		}
 		o.logger.Printf("session %d: upstream write failed for request id=%s: %v", s.ID, string(newID), writeErr)
-		if _, loaded := o.inflightTracker.LoadAndDelete(string(newID)); loaded {
+		if published && o.inflightTracker.CompareAndDelete(string(newID), inflight) {
 			o.methodTags.Delete(string(newID))
 			o.sessionMgr.CompleteRequest(string(newID))
 			o.clearProgressTokensForRequest(string(newID))
 			o.decrementPending()
+			_ = o.writeDemandError(s, msg.ID, "upstream write failed")
 		}
-		_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+		if !published {
+			_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+		}
 		return usedProc, true, nil
 	}
 	return usedProc, false, nil
@@ -1683,12 +1712,18 @@ func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (
 	if writeErr == nil {
 		return usedProc, false, nil
 	}
+	if isMaintenanceFence(writeErr) {
+		return usedProc, false, writeErr
+	}
 
 	o.logger.Printf("session %d: native upstream write failed for request id=%s: %v", s.ID, key, writeErr)
 	if published && o.claimModernInflight(key, inflight, nil) {
 		o.clearModernInflightState(key)
+		_ = o.writeDemandError(s, msg.ID, "upstream write failed")
 	}
-	_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+	if !published {
+		_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+	}
 	return usedProc, true, nil
 }
 

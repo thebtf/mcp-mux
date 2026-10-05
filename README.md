@@ -58,6 +58,10 @@ Result: one upstream process per server instead of N — approximately 3x memory
 
 ## Quick Start
 
+The prepared binary target is **v0.31.0**. After publication, use the
+[v0.31.0 release](https://github.com/thebtf/mcp-mux/releases/tag/v0.31.0).
+The build commands below are source builds, not delivered-artifact proof.
+
 **1. Build**
 
 ```sh
@@ -276,15 +280,115 @@ it opening automatically, pass `--open-web-dashboard false` to Serena's
 `web_dashboard: false` only when the dashboard itself must be disabled; see the
 [Serena dashboard documentation](https://oraios.github.io/serena/02-usage/060_dashboard.html).
 
-**Disable daemon mode** (legacy per-session owner behavior):
+Standalone upstream launches through `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON`, or
+the direct-owner `--daemon` path are explicitly `maintenance_unsupported` in
+v0.31.0. Keep managed daemon admission enabled; direct execution is not a
+maintenance bypass.
 
-```sh
-MCP_MUX_NO_DAEMON=1 mcp-mux uvx my-server
+## Hold an upstream for executable replacement
+
+v0.31.0 adds optional maintenance-aware managed hold, resume, and renew operations.
+Use an aware binary, daemon, and shim together. Publication and consumer handoff
+remain pending; older installed tags do not acquire maintenance support.
+
+Read the exact `server_id` from local `mcp-mux status`. Flags follow the identifier:
+
+```text
+mcp-mux hold <exact-server-id> --ttl 5m --drain-timeout 10s --json
+mcp-mux renew <returned-hold-id> --ttl 5m --json
+mcp-mux resume <returned-hold-id> --json
 ```
+
+Hold fences new demand before draining already-forwarded requests. The default
+drain is 10 seconds; `--drain-timeout 0s` skips grace but still requires complete
+managed tree death. Positive grace uses the same `T` as TTL and never restarts
+on retirement retry. Replace the executable yourself only after a successful
+JSON result reports `state: HELD`, `trees_retired: true`, and a future `expires_at`.
+The result also contains `hold_id`, `server_id`, and `drain_deadline`.
+
+| State | Meaning |
+| --- | --- |
+| `HOLDING` | Admission is fenced; provisional timing precedes clocked drain/retirement. No replacement grant. |
+| `HELD` | Every scoped managed tree is proven dead; the lease is usable until expiry. |
+| `RETIREMENT_BLOCKED` | Tree death is unproven; replacement is unsafe and admission stays fenced. |
+| `RELEASED` | Durable release permits fresh demand. |
+
+TTL defaults to five minutes, must be positive, and cannot exceed one hour.
+Renewal uses the exact current unexpired
+hold ID and sets expiry from serialized renewal acceptance, without changing
+retirement state or reviving a released/expired lease.
+CLI TTL and drain durations must be whole milliseconds; sub-millisecond values
+are rejected rather than rounded down to zero-force retirement.
+Competing or stale identities cannot replace or clear a lease. Explicit resume
+and TTL recovery open admission only after proven retirement and durable release.
+Blocked retirement never clears because time elapsed.
+
+A durable `HOLDING` seed has provisional timing and never grants replacement.
+After its first complete writer acknowledgment, sample `T` once and persist clocked `HOLDING` once.
+TTL/drain use `T`; that write, retirement, HELD persistence, and response consume the original window.
+Any acquisition write failure retains the seed fence; incomplete recovery is `RETIREMENT_BLOCKED`, with no expiry/resume.
+
+With no positive caller timeout, neutral control allows 180s plus one drain for `hold`/`restart_owner`; CLI/MCP use this default.
+Explicit positive library budgets are honored; other commands retain 5s. This finite exchange allowance does not guarantee full-pin/storage completion.
+A timeout leaves outcome unknown: a durable lease/restart may remain. Inspect status, with no automatic retry/resume or stop fallback.
+
+Aware shims keep the original host pipes open. Requests received while fenced
+return JSON-RPC `-32005`, message `upstream held for update`, and
+`data.error_code: maintenance_held` with the original numeric or string ID.
+Maintenance wins over cached success. Rejected requests and unfinished work
+ended by retirement are not replayed; notifications receive no invented ID.
+Fresh legacy demand after release can reach a replacement on the same pipes.
+Modern demand uses fresh same-era isolated admission with required per-request
+metadata, without legacy bootstrap, cache, or request/subscription restoration.
+
+Scope is the selected owner's finite already-admitted context set, not a
+host-wide executable lock. Different CWDs, protocol eras, credentials/configuration
+contexts, engine namespaces, and unmanaged processes are outside that set unless
+already admitted explicitly. An unrelated process can still lock the file.
+
+MCP `mux_hold`, `mux_resume`, and `mux_renew` use the same local daemon operation.
+`mux_restart` uses daemon-owned `restart_owner` with the original exact context
+and era, not an adapter's ambient credentials. Controlled restart, handoff,
+shutdown, downgrade, and idle daemon exit refuse terminally while a fence remains;
+launcher and library update helpers cannot substitute shutdown or a successor.
+After unplanned daemon loss, aware startup reloads held authority before admission.
+Incomplete or unreadable authority fails closed.
+
+Durable authority is the mandatory schema-2 pair `ledger.json` and
+`transaction.json`, not either file alone. Pending, missing, or invalid pairs
+fail closed. A persistence error keeps live admission conservative but does not
+guarantee storage rollback. After a finalize error, recovery can accept only a
+matching COMMITTED certificate proving earlier acknowledged durable publication;
+the failed caller response remains an error. Successful release cannot resurrect
+the old lease. See the [storage phase contract](specs/002-upstream-maintenance-hold/contracts/maintenance.md#authority-and-lifecycle-boundaries).
+
+Controlled engine installation, launcher swap, layout/bootstrap mutation, and
+active-pointer updates use the existing daemon namespace file lock. Hold-ledger
+mutations use the same lock, so a hold cannot race past an activation check.
+`daemon.CheckMaintenanceForActivation` reads persisted authority without changing
+it. Status and pure startup inspection neither acquire nor write that lock and
+never proactively start a daemon. Activation checks also consult live aware
+status; an offline or old endpoint is allowed only when persisted authority is
+proven clear under the lock. This is namespace coordination, not a host-wide
+file lock or a separate updater lease.
+
+Old daemons return `maintenance_unsupported`, never a stop/kill/restart fallback.
+An aware daemon fences old managed shims' starts, but those shims have no promised
+immediate-error or non-replay semantics. Arbitrary old binaries, foreign engines,
+manual active-pointer replacement, and direct standalone bypass are unsupported.
+Before downgrade, use the current aware binary to durably resume every exact
+retired lease or observe its safely committed expiry. Incomplete/blocked authority
+prevents downgrade and must be retained, even after TTL. Do not delete either
+authority member or perform PID cleanup to reopen admission.
+
+Run the [live Windows and Unix replacement proof](docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
+before release. Its private primary-checkout scratch and actual overwrite evidence
+supplement focused regressions; a fixture build or unit test is not that proof.
 
 ## Resilient Shim
 
-mcp-mux shims automatically reconnect when the daemon restarts. This means:
+Outside maintenance fences, legacy mcp-mux shims automatically reconnect when
+the daemon restarts. Modern R1 does not replay the legacy handshake below. This means:
 
 - `mcp-mux upgrade` switches the active versioned engine without dropping connections
 - `mcp-mux stop --force` triggers automatic reconnect within seconds
@@ -486,12 +590,12 @@ transport but does not replay already-sent requests.
 
 ### The contract
 
-| Trigger | Pre-v0.21.0 | v0.27.0 contract |
+| Trigger | Pre-v0.21.0 | Current contract |
 |---|---|---|
 | `mcp-mux upgrade --restart` with live sessions | Upstream killed + respawned, in-flight requests dropped | Daemon restart deferred; existing stdio transports remain on the current daemon while new shims use the new engine pointer |
 | `mcp-mux upgrade --restart` with zero live sessions | Upstream killed + respawned, in-flight requests dropped | Same-v2 handoff retains the upstream tree; the first v1-to-v2 restart takes one snapshot-backed respawn |
 | Daemon/owner loss | Upstream lifecycle was leader-oriented | Recovery is demand-driven; abandoned generations are cleaned as full trees and already-sent requests receive explicit errors instead of replay |
-| `mux_restart <sid>` (operator-initiated) | Hard kill — unchanged | Hard kill — unchanged (explicit operator intent) |
+| `mux_restart <sid>` (operator-initiated) | Hard kill | Daemon-owned `restart_owner` preserves the exact launch context and era, with 30s drain by default. `force: true` skips drain only; maintenance-held targets refuse terminally without stop/spawn fallback. |
 | Reaper idle-eviction | Hard SIGKILL | Soft-close: 30s stdin drain → SIGTERM only after timeout |
 
 ### How it works
@@ -644,7 +748,7 @@ All configuration is via environment variables. No config file is required.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_MUX_NO_DAEMON` | `0` | Set to `1` to disable daemon mode (legacy per-session owner) |
+| `MCP_MUX_NO_DAEMON` | `0` | Legacy setting; `1` is unsupported and fails closed with `maintenance_unsupported`. Keep daemon-managed admission enabled; this is not a daemon bypass. |
 | `MCP_MUX_ISOLATED` | `0` | Set to `1` to force isolated mode for this invocation |
 | `MCP_MUX_STATELESS` | `0` | Set to `1` to ignore cwd in server identity hash (enables global deduplication) |
 | `MCPMUX_SHIM_IDLE_TIMEOUT` | `10m` | Safe host-idle period before a non-persistent shim parks its daemon IPC session; zero or negative disables |
@@ -691,17 +795,24 @@ executable swapping. Windows verifies the named-pipe server with
 including BSD targets without both proofs, fail closed and never emit private
 dormant frames.
 
-The stable stdio loop, strict MCP correlation, shared protocol-v2 codec,
-process-tree finalization, generic peer-PID attestation, and the explicit native
-MCP `2026-07-28` route are public in `muxcore/v0.30.0`. Native consumers should
-pin that tag and use `engine.Config.ProtocolPolicy` for an explicit known
-same-era modern route; legacy remains the zero-value default. Supervisor users
-should continue to use `supervisor.Run`, `supervisor.StartCommand`,
-`supervisor.StartWithFallback`, `supervisor.ProtocolV2`, and the attestation
-package rather than copying the `mcp-mux` product adapter, private wire
-constants, parser, replay loop, or exit code. To roll back, pin
-`muxcore/v0.29.1` or restore the prior product binary after stopping new modern
-admissions and retiring active modern owners through the quarantine path.
+The prepared current library target is `muxcore/v0.31.0`, which adds optional
+managed maintenance to the existing stable stdio supervisor and explicit native
+MCP `2026-07-28` route. After publication and Go proxy tag resolution, pin:
+
+```bash
+go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+```
+
+Ordinary legacy `engine.New` consumers require no source changes. Use
+`control.SendMaintenance` only when adopting maintenance. Select
+`engine.Config.ProtocolPolicy` explicitly for a known same-era modern route;
+legacy remains the zero-value default. Supervisor users should keep using
+`supervisor.Run`, `supervisor.StartCommand`, `supervisor.StartWithFallback`,
+`supervisor.ProtocolV2`, and the attestation package rather than copying the
+product adapter or private wire codec. Roll back to `muxcore/v0.30.0` or a
+compatible prior binary only after exact retired leases are durably resumed or
+safely expired through the current aware version. Preserve incomplete/blocked
+authority and retire modern owners through quarantine, never live conversion.
 
 The shared daemon is owned by the stable launcher rather than by any supervised engine generation. The launcher prepares it before starting a child; on Windows the daemon therefore remains outside the child's KillOnJobClose Job Object. A supervised child never spawns that daemon inside its own process tree and exits back to the stable launcher if the daemon must be recreated, preserving the host-facing stdio pipe.
 
@@ -729,7 +840,7 @@ any other server:
 | `mux_prune_engines` | Dry-run by default. Lists or removes stale / invalid native muxcore registry descriptor files after the same verification used by `mux_engines`. This is registry garbage collection only: it never stops processes, owners, daemon control sockets, or live native muxcore products. |
 | `mux_list` | Returns running instances for the **current project** inside this `mcp-mux` daemon namespace (filtered by caller's cwd). Pass `all: true` to list this daemon's instances across all projects. Pass exact `engine_name` from `mux_engines` to query one verified native muxcore engine explicitly. Includes server ID, engine name, PID, downstream session count, pending requests, classification, and cache status. With `verbose: true`, includes classification source/reason and inflight request details when present. |
 | `mux_stop` | Gracefully drains and stops an instance by `server_id`. Use `force: true` for immediate kill. CR-001 scope is current `mcp-mux` daemon namespace only; it does not stop native registered engines. |
-| `mux_restart` | Stops an instance and spawns a fresh daemon owner with the same command. When called without arguments, resolves to the instance belonging to the caller's session (e.g. `mux_restart(name: "aimux")` restarts this project's aimux if it was launched through this `mcp-mux` daemon, not a native `aimux` engine). CR-001 scope is current namespace only; cross-engine restart is a future opt-in management feature. |
+| `mux_restart` | Uses daemon-owned `restart_owner` with the original exact launch context and era. Drain defaults to 30s; `force: true` skips drain only and never bypasses maintenance-held terminal refusal or enables stop/spawn fallback. Without an explicit target, resolves to the caller's session instance (e.g. `mux_restart(name: "aimux")` targets this project's mux-managed aimux, not a native engine). CR-001 scope is the current namespace only; cross-engine restart is a future opt-in feature. |
 
 **Session-scoped control plane:**
 

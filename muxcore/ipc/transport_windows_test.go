@@ -89,6 +89,46 @@ func TestDialMayStartBeforeAccept(t *testing.T) {
 	defer a.conn.Close()
 }
 
+func startDetachedListenerHelper(t *testing.T, cmd *exec.Cmd) func() {
+	t.Helper()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	// Wait retains authority over the exact spawned process until terminal
+	// proof. Early Release would make failed-test cleanup unable to reap it.
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		killErr := cmd.Process.Kill()
+		select {
+		case <-done:
+			// An exit racing Kill is safe only after this exact child is joined.
+		case <-time.After(5 * time.Second):
+			t.Errorf("helper did not exit after scoped cleanup: kill error = %v", killErr)
+		}
+	})
+	return func() {
+		t.Helper()
+		select {
+		case <-done:
+			if waitErr != nil {
+				t.Fatalf("helper exit: %v", waitErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("helper did not exit after publishing its result")
+		}
+	}
+}
+
 func TestDetachedProcessListenerAcceptsParentDial(t *testing.T) {
 	path := socketPath(t)
 	readyPath := path + ".ready"
@@ -108,12 +148,7 @@ func TestDetachedProcessListenerAcceptsParentDial(t *testing.T) {
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 		HideWindow:    true,
 	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper: %v", err)
-	}
-	if err := cmd.Process.Release(); err != nil {
-		t.Fatalf("release helper: %v", err)
-	}
+	waitHelper := startDetachedListenerHelper(t, cmd)
 
 	waitForFile(t, readyPath, 5*time.Second)
 
@@ -121,9 +156,12 @@ func TestDetachedProcessListenerAcceptsParentDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialTimeout() error: %v", err)
 	}
-	conn.Close()
+	// Dial success does not prove Accept returned: go-winio retries clients
+	// that disconnect first. The helper's result is the post-Accept handshake.
+	defer conn.Close()
 
 	waitForFile(t, resultPath, 5*time.Second)
+	waitHelper()
 	result, err := os.ReadFile(resultPath)
 	if err != nil {
 		t.Fatalf("read result: %v", err)
@@ -157,12 +195,7 @@ func TestDetachedDevNullProcessListenerAcceptsParentDial(t *testing.T) {
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 		HideWindow:    true,
 	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start helper: %v", err)
-	}
-	if err := cmd.Process.Release(); err != nil {
-		t.Fatalf("release helper: %v", err)
-	}
+	waitHelper := startDetachedListenerHelper(t, cmd)
 
 	waitForFile(t, readyPath, 5*time.Second)
 
@@ -170,9 +203,11 @@ func TestDetachedDevNullProcessListenerAcceptsParentDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialTimeout() error: %v", err)
 	}
-	conn.Close()
+	// Keep the client alive until the helper proves acceptance, not just Dial.
+	defer conn.Close()
 
 	waitForFile(t, resultPath, 5*time.Second)
+	waitHelper()
 	result, err := os.ReadFile(resultPath)
 	if err != nil {
 		t.Fatalf("read result: %v", err)
@@ -293,23 +328,23 @@ func TestDetachedProcessListenerHelper(t *testing.T) {
 
 	ln, err := Listen(path)
 	if err != nil {
-		_ = os.WriteFile(resultPath, []byte("listen: "+err.Error()), 0600)
+		_ = os.WriteFile(resultPath, []byte("listen: "+err.Error()), 0o600)
 		os.Exit(0)
 	}
 	defer ln.Close()
 
-	if err := os.WriteFile(readyPath, []byte("ready"), 0600); err != nil {
-		_ = os.WriteFile(resultPath, []byte("ready: "+err.Error()), 0600)
+	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+		_ = os.WriteFile(resultPath, []byte("ready: "+err.Error()), 0o600)
 		os.Exit(0)
 	}
 
 	conn, err := ln.Accept()
 	if err != nil {
-		_ = os.WriteFile(resultPath, []byte("accept: "+err.Error()), 0600)
+		_ = os.WriteFile(resultPath, []byte("accept: "+err.Error()), 0o600)
 		os.Exit(0)
 	}
 	conn.Close()
-	_ = os.WriteFile(resultPath, []byte("ok"), 0600)
+	_ = os.WriteFile(resultPath, []byte("ok"), 0o600)
 	os.Exit(0)
 }
 

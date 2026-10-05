@@ -34,5 +34,11 @@ The persist check also stays status-backed because `mcp-launcher -mode persist`
 currently treats live processes as dead when `Process.Signal(0)` returns
 Windows `EWINDOWS`.
 
+The idle-reaper probe owns a nested runtime and control namespace. Its cleanup
+captures the private daemon before requesting shutdown, then waits for Windows
+OS process exit (or control-listener retirement on other systems) within the
+existing two-second cleanup deadline. Only successful cleanup removes that
+runtime and emits the success JSON; failures retain it and exit nonzero.
+
 See `PHASES.md` for the current experiment ladder. Each phase adds one
 production-like mechanism and must keep the same runner green.

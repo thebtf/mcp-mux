@@ -139,6 +139,11 @@ func bootstrapStableLauncher() (bool, error) {
 	if sameFile(launcherPath, enginePath) {
 		return false, nil
 	}
+	mutationLock, err := acquireMaintenanceMutation()
+	if err != nil {
+		return false, err
+	}
+	defer mutationLock.Close()
 
 	lock, err := os.OpenFile(launcherPath+".bootstrap.lock", os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
