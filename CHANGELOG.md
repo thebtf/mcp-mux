@@ -76,6 +76,12 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   authority. Direct consumers without a reaper fail closed instead of silently
   losing publication intent. Contention and renewed-blocked retry remain unchanged;
   no new state, scheduler, clock reset or authority-deletion bypass is added.
+- Automatic retirement callback/timer publication write failures and ordinary
+  expiry write/non-contention lock failures now latch existing `maintenanceFailed`.
+  Guarded expiry cannot delete a latched lease before an RPC's failure check;
+  known current-lease renew/resume refusal preserves safe lease readback. Shared
+  store/reconciliation stay unchanged:healthy explicit durable retry and owned
+  contention/ticker retry remain,without another controller or failure bypass.
 - Library `ApplyUpdateAndRestart`/`RestartWithSuccessor` and launcher engine-switch
   restart keep contacted graceful-restart transport uncertainty terminal with its
   original cause. Unaware or invalid endpoints cannot select shutdown fallback.
@@ -334,6 +340,26 @@ delivered-artifact proof, and the required Engram consumer handoff remain pendin
   Actual issue135 milestone5985521449 posted/readback. Final source+fixture+docs/
   next CI/critical proof,merge/tags/delivery/canary pending;native Engram issue
   capability unmounted,effect-only,no substitute/all-PR CLEAN/release completion.
+  Later0119 [CI37244791265](https://github.com/thebtf/mcp-mux/actions/runs/37244791265)
+  has allOS race/vet/module PASS and Windows Scenario11 step SUCCESS,but aggregate
+  RED:critical build/lifecycle/time3 PASS,topology cleanup status1 FAIL,native5b
+  not reached. Python selection correction worked,not a five-step critical PASS.
+  Topology fixture later committed4aa7 has independent existing-producer Linux
+  proof ca0a1eb0:five idle assertion booleans true,old/new daemon PIDs absent,
+  listener ENOENT. Windows crosscompile only;native Windows five-step pending.
+  New automatic-write-failure receipt84ac3ed1 binds immutable4aa7+ONLY3 daemon
+  overlays:original53cd two families5 leaves gives4 causalRED/1healthy contention
+  PASS;final9families34positive leaves normal/race each once,0FAIL/SKIP/races/setup.
+  Real authority-leaf writes after PREPARE/native retirement and recovered path+
+  pastTTL remain fenced,exact HoldID/clocks/bytes preserved;healthy explicit retry
+  retained.217 actual authority files/71pairs retained despite0taskPIDs/sockets;
+  empty configured authority directory is not absence proof,no deletion/release.
+  Root accepts this one-class scoped repair,next atomic3source+2docs commit pending;
+  sharedstore/reconcile unchanged,no exact errno or whole-phase fault claim.
+  Remote0119 snapshot35total33resolved has2 new P2s:4179727154/PRRT_kwDORq0kOM6o3fCS
+  and4179791527/PRRT_kwDORq0kOM6o3pHP. No remote resolution/futureclosing inferred.
+  Linux74 artifact is prior production only;new integrated full/build/public/CI/
+  nativeWindows critical proof and release remain parent-owned,pending.
   Historical8142 proofs/failures remain scoped. No all-PR CLEAN or delivery claim.
 
 ### Rollback

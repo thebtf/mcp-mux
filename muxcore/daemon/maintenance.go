@@ -519,7 +519,10 @@ func (d *Daemon) maintenanceRetirementChanged(entry *OwnerEntry) {
 			}
 		}
 		if matched && lease.result.State != control.MaintenanceHeld && d.maintenanceTreesRetiredLocked(lease) {
-			_ = d.finishMaintenanceRetirementLocked(lease)
+			if err := d.finishMaintenanceRetirementLocked(lease); err != nil {
+				d.maintenanceFailed = true
+				return
+			}
 		}
 	}
 }
@@ -564,10 +567,9 @@ func (d *Daemon) scheduleMaintenanceTimerLocked(lease *maintenanceLease, delay t
 				d.maintenanceFailed || d.maintenanceTimerStoppedLocked() {
 				return
 			}
-			if retirement && !errors.Is(err, ipc.ErrFileLocked) {
+			if !errors.Is(err, ipc.ErrFileLocked) {
 				d.maintenanceFailed = true
-			} else if errors.Is(err, ipc.ErrFileLocked) && (!retirement ||
-				lease.result.State == control.MaintenanceRetirementBlocked && d.maintenanceTreesRetiredLocked(lease)) {
+			} else if !retirement || lease.result.State == control.MaintenanceRetirementBlocked && d.maintenanceTreesRetiredLocked(lease) {
 				d.scheduleMaintenanceTimerLocked(lease, 100*time.Millisecond, retirement)
 			} else if retirement {
 				d.scheduleMaintenanceExpiryLocked(lease)
@@ -589,15 +591,22 @@ func (d *Daemon) scheduleMaintenanceTimerLocked(lease *maintenanceLease, delay t
 			// Restore the original safe-expiry timer before publication. A failed
 			// commit must not cancel the current authority's only expiry event.
 			d.scheduleMaintenanceExpiryLocked(lease)
-			_ = d.finishMaintenanceRetirementLocked(lease)
+			if err := d.finishMaintenanceRetirementLocked(lease); err != nil {
+				d.maintenanceFailed = true
+			}
 			return
 		}
-		_ = d.expireMaintenanceLocked(time.Now())
+		if err := d.expireMaintenanceLocked(time.Now()); err != nil {
+			d.maintenanceFailed = true
+		}
 	})
 	lease.timer = timer
 }
 
 func (d *Daemon) expireMaintenanceLocked(now time.Time) error {
+	if d.maintenanceFailed {
+		return control.ErrMaintenancePersistenceFailed
+	}
 	for _, lease := range d.maintenanceLeases {
 		if lease.result.State != control.MaintenanceHeld || now.Before(lease.result.ExpiresAt) {
 			continue
@@ -620,6 +629,9 @@ func (d *Daemon) mutateMaintenance(req control.Request, ttl time.Duration) (cont
 	d.maintenanceGate.Lock()
 	defer d.maintenanceGate.Unlock()
 	if err := d.expireMaintenanceLocked(time.Now()); err != nil {
+		if current := d.maintenanceLeases[req.HoldID]; d.maintenanceFailed && current != nil {
+			return current.result, maintenanceFailure(control.ErrMaintenancePersistenceFailed, current)
+		}
 		return control.MaintenanceResult{}, err
 	}
 	current := d.maintenanceLeases[req.HoldID]

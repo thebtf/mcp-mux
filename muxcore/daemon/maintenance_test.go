@@ -650,6 +650,170 @@ func TestMaintenanceAwareShimRejectsHeldWorkWithoutReplayAndUsesFreshGeneration(
 	}
 }
 
+func TestMaintenanceAutomaticExpiryFailureStaysFencedWithoutReaper(t *testing.T) {
+	for _, scenario := range []string{"publication", "namespace_lock", "healthy_contention"} {
+		t.Run(scenario, func(t *testing.T) {
+			d := maintenanceDaemon(t) // Direct New; no reaper can retry a lost timer.
+			req, _, _, _ := maintenanceHelperRequest(t)
+			path, sid, token, err := d.Spawn(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry := d.Entry(sid)
+			identity := captureOwnerEntryIdentity(entry)
+			conn, scanner := connectSpawnedOwner(t, path, token)
+			defer conn.Close()
+			fmt.Fprintln(conn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"automatic-expiry","version":"1"}}}`)
+			readDaemonResponseID(t, scanner, "1")
+			pid, _ := entry.Owner.Status()["upstream_pid"].(int)
+			if !daemonTestProcessAlive(pid) {
+				t.Fatal("expiry fixture has no actual live process authority")
+			}
+			result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: sid, HoldTTLMS: maintenanceTTL(60000), DrainTimeoutMs: 1000}, 5*time.Second)
+			if err != nil || result == nil || result.State != control.MaintenanceHeld || !result.TreesRetired || !entry.Owner.MaintenanceRetired() || d.Entry(sid) != nil || daemonTestProcessAlive(pid) {
+				t.Fatalf("expiry fixture lacks actual retired HELD authority: %+v %v", result, err)
+			}
+			drainDeadline := result.DrainDeadline
+			var faulted <-chan error
+			if scenario == "publication" {
+				faulted = maintenanceFailAutomaticPublication(t, d, control.MaintenanceReleased)
+			}
+			result, err = control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "renew", HoldID: result.HoldID, HoldTTLMS: maintenanceTTL(1000)}, 5*time.Second)
+			if err != nil || result == nil || !result.DrainDeadline.Equal(drainDeadline) {
+				t.Fatalf("serialized expiry setup changed original drain authority: %+v %v", result, err)
+			}
+			var lease *maintenanceLease
+			var ledgerBefore, transactionBefore []byte
+			var restore func()
+			var contention io.Closer
+			func() {
+				d.maintenanceGate.Lock()
+				defer d.maintenanceGate.Unlock()
+				lease = d.maintenanceLeases[result.HoldID]
+				if lease == nil || lease.result != *result || lease.timer == nil || !time.Now().Before(result.ExpiresAt) {
+					t.Fatal("fixture lost its accepted exact-lease expiry timer")
+				}
+				ledgerBefore, err = os.ReadFile(d.maintenancePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				transactionBefore, err = os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "namespace_lock" {
+					if !lease.timer.Stop() {
+						t.Fatal("expiry timer fired before namespace fault setup")
+					}
+					lockPath := d.maintenanceLockPath
+					saved := filepath.Join(t.TempDir(), "namespace.lock")
+					if err := os.Rename(lockPath, saved); err != nil {
+						t.Fatal(err)
+					}
+					restored := false
+					restore = func() {
+						t.Helper()
+						if restored {
+							return
+						}
+						if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+							t.Fatal(err)
+						}
+						if err := os.Rename(saved, lockPath); err != nil {
+							t.Fatal(err)
+						}
+						restored = true
+					}
+					t.Cleanup(restore)
+					if err := os.Mkdir(lockPath, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					probe, lockErr := ipc.AcquireFileLock(lockPath)
+					if probe != nil {
+						_ = probe.Close()
+					}
+					if lockErr == nil || errors.Is(lockErr, ipc.ErrFileLocked) {
+						t.Fatalf("expiry fixture lacks an actual non-contention OS lock error: %v", lockErr)
+					}
+					// Rearm only the same production timer, with unchanged accepted clocks.
+					d.scheduleMaintenanceExpiryLocked(lease)
+				} else if scenario == "healthy_contention" {
+					contention, err = ipc.AcquireFileLock(d.maintenanceLockPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = contention.Close() })
+				}
+			}()
+			if scenario == "healthy_contention" {
+				<-time.After(time.Until(result.ExpiresAt) + 150*time.Millisecond)
+				current := d.maintenanceResults()
+				if len(current) != 1 || current[0] != *result || d.maintenanceStatusCode() != "" {
+					t.Fatalf("ordinary expiry contention lost authority or poisoned persistence: %+v", current)
+				}
+				if err := contention.Close(); err != nil {
+					t.Fatal(err)
+				}
+				waitForDaemonCondition(t, 5*time.Second, func() bool { return len(d.maintenanceResults()) == 0 }, "owned expiry retry did not release proven HELD without a reaper")
+				if d.maintenanceStatusCode() != "" {
+					t.Fatal("successful automatic expiry latched persistence failure")
+				}
+				if err := CheckMaintenanceForActivation(d.namespace, d.ctlSrv.SocketPath()); err != nil {
+					t.Fatalf("successful expiry did not durably clear activation: %v", err)
+				}
+				response, err := control.SendWithTimeout(d.ctlSrv.SocketPath(), control.Request{Cmd: "spawn", Command: req.Command, Args: req.Args, Cwd: req.Cwd, Env: req.Env, Mode: req.Mode}, 5*time.Second)
+				if err != nil || response == nil || !response.OK || response.Token == "" || response.IPCPath == "" || d.Entry(response.ServerID) == entry {
+					t.Fatalf("durable safe expiry did not admit a fresh generation: %+v %v", response, err)
+				}
+				return
+			}
+			if scenario == "publication" {
+				select {
+				case err := <-faulted:
+					if err == nil {
+						t.Fatal("actual safe-expiry authority-leaf writer did not fail")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("proven HELD expiry did not reach its real durable release writer")
+				}
+			} else {
+				waitForDaemonCondition(t, 5*time.Second, func() bool {
+					return d.maintenanceStatusCode() == control.ErrMaintenancePersistenceFailed.Code
+				}, "one-shot expiry OS lock failure lost its only authority without a reaper")
+				restore()
+			}
+			if time.Now().Before(result.ExpiresAt) || !identity.matches(entry) || !entry.Owner.MaintenanceRetired() || daemonTestProcessAlive(pid) {
+				t.Fatal("expiry failure changed clocks or invented exact process retirement")
+			}
+			maintenanceAssertAutomaticFailureFenced(t, d, *result, req)
+			d.maintenanceGate.RLock()
+			retained := d.maintenanceLeases[result.HoldID] == lease
+			d.maintenanceGate.RUnlock()
+			ledgerAfter, err := os.ReadFile(d.maintenancePath)
+			if !retained || err != nil || !bytes.Equal(ledgerBefore, ledgerAfter) {
+				t.Fatalf("failed expiry lost exact in-memory/durable predecessor: retained=%t err=%v", retained, err)
+			}
+			transactionData, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "namespace_lock" {
+				if !bytes.Equal(transactionBefore, transactionData) {
+					t.Fatal("expiry lock failure mutated durable transaction bytes")
+				}
+			} else {
+				var transaction maintenanceTransaction
+				if err := json.Unmarshal(transactionData, &transaction); err != nil {
+					t.Fatal(err)
+				}
+				if transaction.State != "prepared" || len(transaction.Predecessor) != 1 || transaction.Predecessor[0].HoldID != result.HoldID || transaction.Predecessor[0].State != control.MaintenanceHeld || !transaction.Predecessor[0].ExpiresAt.Equal(result.ExpiresAt) || !transaction.Predecessor[0].DrainDeadline.Equal(result.DrainDeadline) {
+					t.Fatalf("failed expiry lost prepared original-clock HELD authority: %+v", transaction)
+				}
+			}
+		})
+	}
+}
+
 func TestMaintenanceSafeTTLReleasesDurablyWithoutIdleExitBypass(t *testing.T) {
 	d := maintenanceDaemon(t)
 	req, _, _, _ := maintenanceHelperRequest(t)

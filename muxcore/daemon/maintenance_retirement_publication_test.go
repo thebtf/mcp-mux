@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -438,6 +439,191 @@ func TestMaintenanceRetirementPublicationLockFailureStaysFencedWithoutReaper(t *
 			}
 			if _, _, ledger, err := readMaintenanceAuthority(d.namespace, d.ctlSrv.SocketPath()); err != nil || ledger == nil || len(ledger.Leases) != 1 || ledger.Leases[0].State != control.MaintenanceRetirementBlocked {
 				t.Fatalf("failed publication lost durable blocked recovery authority: %+v %v", ledger, err)
+			}
+			maintenanceNativeNoReply(t, frames)
+		})
+	}
+}
+
+func maintenanceFailAutomaticPublication(t *testing.T, d *Daemon, target control.MaintenanceState) <-chan error {
+	t.Helper()
+	saved := filepath.Join(t.TempDir(), "ledger.json")
+	faulted := make(chan error, 1)
+	d.maintenanceGate.Lock()
+	d.maintenanceCommit = func(data []byte) error {
+		var ledger maintenanceLedger
+		if err := json.Unmarshal(data, &ledger); err != nil {
+			return err
+		}
+		matches := target == control.MaintenanceReleased && len(ledger.Leases) == 0 ||
+			len(ledger.Leases) == 1 && ledger.Leases[0].State == target
+		if !matches {
+			return writeMaintenanceLedger(d.maintenancePath, data)
+		}
+		// Fail the real writer at its actual authority leaf, after PREPARE.
+		if err := os.Rename(d.maintenancePath, saved); err != nil {
+			return err
+		}
+		if err := os.Mkdir(d.maintenancePath, 0o700); err != nil {
+			return errors.Join(err, os.Rename(saved, d.maintenancePath))
+		}
+		writeErr := writeMaintenanceLedger(d.maintenancePath, data)
+		restoreErr := errors.Join(os.Remove(d.maintenancePath), os.Rename(saved, d.maintenancePath))
+		faulted <- writeErr
+		return errors.Join(writeErr, restoreErr)
+	}
+	d.maintenanceGate.Unlock()
+	t.Cleanup(func() {
+		d.maintenanceGate.Lock()
+		d.maintenanceCommit = nil
+		d.maintenanceGate.Unlock()
+	})
+	return faulted
+}
+
+func maintenanceAssertAutomaticFailureFenced(t *testing.T, d *Daemon, result control.MaintenanceResult, demand control.Request) {
+	t.Helper()
+	// This read waits for the automatic transaction, without reconciling it.
+	current := d.maintenanceResults()
+	if d.maintenanceStatusCode() != control.ErrMaintenancePersistenceFailed.Code || len(current) != 1 || current[0] != result {
+		t.Fatalf("automatic failure lost its persistence signal or exact lease without a reaper: %+v code=%s", current, d.maintenanceStatusCode())
+	}
+	d.maintenanceGate.Lock()
+	d.maintenanceCommit = nil // The real writer has recovered; the latch must not.
+	d.maintenanceGate.Unlock()
+	ledgerBefore, err := os.ReadFile(d.maintenancePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionBefore, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := control.SendWithTimeout(d.ctlSrv.SocketPath(), control.Request{Cmd: "status"}, 2*time.Second)
+	if err != nil || response == nil || !response.OK {
+		t.Fatalf("failed-authority control status: %+v %v", response, err)
+	}
+	var status struct {
+		Code        control.MaintenanceErrorCode `json:"maintenance_error_code"`
+		Maintenance []control.MaintenanceResult  `json:"maintenance"`
+	}
+	if err := json.Unmarshal(response.Data, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Code != control.ErrMaintenancePersistenceFailed.Code || len(status.Maintenance) != 1 || status.Maintenance[0] != result {
+		t.Fatalf("control status lost failed original-clock authority: %+v", status)
+	}
+	for _, cmd := range []string{"renew", "resume", "hold"} {
+		req := control.Request{Cmd: cmd, HoldID: result.HoldID}
+		if cmd == "hold" {
+			req.HoldID, req.ServerID = "", result.ServerID
+		}
+		updated, err := control.SendMaintenance(d.ctlSrv.SocketPath(), req, 2*time.Second)
+		if !errors.Is(err, control.ErrMaintenancePersistenceFailed) || updated != nil && *updated != result || cmd != "hold" && updated == nil {
+			t.Fatalf("recovered writer allowed %s to mutate failed authority: %+v %v", cmd, updated, err)
+		}
+	}
+	for _, candidate := range []control.Request{demand, {Command: demand.Command + "-unrelated", Mode: "isolated", Cwd: t.TempDir()}} {
+		candidate.Cmd = "spawn"
+		response, err := control.SendWithTimeout(d.ctlSrv.SocketPath(), candidate, 2*time.Second)
+		if err != nil || response == nil || !errors.Is(response.Err(), control.ErrMaintenancePersistenceFailed) || response.Token != "" || response.IPCPath != "" {
+			t.Fatalf("failed authority admitted %q after writer recovery: %+v %v", candidate.Command, response, err)
+		}
+	}
+	if _, err := d.HandleShutdownWithError(0); !errors.Is(err, control.ErrMaintenancePersistenceFailed) || d.shuttingDown.Load() {
+		t.Fatalf("automatic failure lost lifecycle authority: %v", err)
+	}
+	d.reconcileMaintenance()
+	current = d.maintenanceResults()
+	ledgerAfter, ledgerErr := os.ReadFile(d.maintenancePath)
+	transactionAfter, transactionErr := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+	if len(current) != 1 || current[0] != result || d.OwnerCount() != 0 || ledgerErr != nil || transactionErr != nil || !bytes.Equal(ledgerBefore, ledgerAfter) || !bytes.Equal(transactionBefore, transactionAfter) {
+		t.Fatalf("writer recovery deleted or replaced failed predecessor: leases=%+v owners=%d ledger=%v transaction=%v", current, d.OwnerCount(), ledgerErr, transactionErr)
+	}
+	if err := CheckMaintenanceForActivation(d.namespace, d.ctlSrv.SocketPath()); !errors.Is(err, control.ErrMaintenanceHeld) && !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+		t.Fatalf("failed automatic mutation granted activation: %v", err)
+	}
+}
+
+func TestMaintenanceRetirementPublicationWriteFailureStaysFencedWithoutReaper(t *testing.T) {
+	for _, scenario := range []string{"callback", "retirement_timer"} {
+		t.Run(scenario, func(t *testing.T) {
+			d := maintenanceDaemon(t) // Direct New, no reaper or reconciliation retry.
+			b := newMaintenanceNativeBarrier(t)
+			d.sessionHandler = &maintenanceNotificationWork{barrier: b}
+			initial, entry, conn, frames := maintenanceNativeIPC(t, d, era.EraLegacy)
+			identity := captureOwnerEntryIdentity(entry)
+			maintenanceNativeSend(t, conn, era.EraLegacy, "1", "initialize")
+			maintenanceNativeRead(t, frames, "1")
+			launch := entry.Owner.CurrentLaunchContext()
+			demand := control.Request{Command: entry.Command, Args: entry.Args, Cwd: launch.Cwd, Env: launch.Env, Mode: entry.Mode}
+			maintenanceNativeSend(t, conn, era.EraLegacy, "", "maintenance/native-notification")
+			maintenanceNativeEntered(t, b)
+			result, err := control.SendMaintenance(d.ctlSrv.SocketPath(), control.Request{Cmd: "hold", ServerID: initial.ServerID, HoldTTLMS: maintenanceTTL(60000)}, 5*time.Second)
+			if !errors.Is(err, control.ErrMaintenanceRetirementBlocked) || result == nil || result.State != control.MaintenanceRetirementBlocked || result.TreesRetired {
+				t.Fatalf("actual native work did not retain blocked authority: %+v %v", result, err)
+			}
+			maintenanceNativeRetained(t, d, entry)
+			ledgerBefore, err := os.ReadFile(d.maintenancePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.maintenanceGate.RLock()
+			lease := d.maintenanceLeases[result.HoldID]
+			d.maintenanceGate.RUnlock()
+			faulted := maintenanceFailAutomaticPublication(t, d, control.MaintenanceHeld)
+			d.maintenanceRetirementChanged(&OwnerEntry{ServerID: identity.serverID, ProtocolEra: identity.protocolEra, OwnerGeneration: identity.ownerGeneration})
+			if d.maintenanceStatusCode() != "" {
+				t.Fatal("obsolete entry latched current persistence authority")
+			}
+			if scenario == "retirement_timer" {
+				lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = lock.Close() })
+				b.open()
+				waitForDaemonCondition(t, 5*time.Second, func() bool {
+					d.maintenanceGate.RLock()
+					retrying := d.maintenanceLeases[result.HoldID] == lease && lease.retirementRetry
+					d.maintenanceGate.RUnlock()
+					return d.Entry(entry.ServerID) == nil && entry.Owner.MaintenanceRetired() && retrying
+				}, "exact-entry callback did not retain a real contention timer")
+				if err := lock.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				b.open()
+			}
+			select {
+			case err := <-faulted:
+				if err == nil {
+					t.Fatal("actual authority-leaf writer did not fail")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("automatic retirement never reached the post-lock durable writer")
+			}
+			maintenanceAssertAutomaticFailureFenced(t, d, *result, demand)
+			d.maintenanceGate.RLock()
+			retained := d.maintenanceLeases[result.HoldID] == lease
+			d.maintenanceGate.RUnlock()
+			if !retained || d.Entry(entry.ServerID) != nil || !entry.Owner.MaintenanceRetired() || !identity.matches(entry) || b.entered.Load() != 1 || b.returned.Load() != 1 {
+				t.Fatal("writer failure lost exact retired generation or replayed native work")
+			}
+			ledgerAfter, err := os.ReadFile(d.maintenancePath)
+			if err != nil || !bytes.Equal(ledgerBefore, ledgerAfter) {
+				t.Fatalf("failed publication replaced durable predecessor: %v", err)
+			}
+			transactionData, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var transaction maintenanceTransaction
+			if err := json.Unmarshal(transactionData, &transaction); err != nil {
+				t.Fatal(err)
+			}
+			if transaction.State != "prepared" || len(transaction.Predecessor) != 1 || transaction.Predecessor[0].HoldID != result.HoldID || transaction.Predecessor[0].State != result.State || !transaction.Predecessor[0].ExpiresAt.Equal(result.ExpiresAt) || !transaction.Predecessor[0].DrainDeadline.Equal(result.DrainDeadline) {
+				t.Fatalf("failed publication lost prepared original-clock authority: %+v", transaction)
 			}
 			maintenanceNativeNoReply(t, frames)
 		})
