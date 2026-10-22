@@ -87,6 +87,9 @@ func (o *Owner) teardownExceptUpstream() {
 			s.Close()
 		}
 		o.mu.Unlock()
+		if o.isModern() {
+			o.removeModernInflightForSession(nil)
+		}
 
 		if o.rejectionLogger != nil {
 			o.rejectionLogger.Close()

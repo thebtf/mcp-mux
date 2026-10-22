@@ -112,6 +112,8 @@ func main() {
 	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
 	standalone := flag.Bool("daemon", false, "Unsupported: direct headless owners require managed admission")
 	mcpProtocol := flag.String("mcp-protocol", "", "MCP protocol era (2026-07-28)")
+	mcpSharing := flag.String("mcp-sharing", "", "Explicit modern owner sharing (shared)")
+	mcpPartition := flag.String("mcp-partition", "", "Non-secret stable authorization partition for modern sharing")
 	flag.Parse()
 
 	args := flag.Args()
@@ -171,6 +173,17 @@ func main() {
 	}
 	if os.Getenv("MCP_MUX_ISOLATED") == "1" {
 		*isolated = true
+	}
+	if protocolEra == era.EraModern20260728 && strings.EqualFold(strings.TrimSpace(os.Getenv("MCP_MUX_DEFAULT_MODE")), "isolated") {
+		mode = serverid.ModeIsolated
+	}
+	modernSharing, partition, err := modernSharingOptions(protocolEra, *mcpSharing, *mcpPartition, mode)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if modernSharing {
+		mode = serverid.ModeGlobal
 	}
 	if os.Getenv("MCP_MUX_DAEMON") == "1" {
 		*standalone = true
@@ -254,7 +267,11 @@ func main() {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
-			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonForEra(command, cmdArgs, cwd, modeStr, shimEnv, protocolWire, logger)
+			spawnRequest := control.Request{
+				Cmd: "spawn", Command: command, Args: cmdArgs, Cwd: cwd, Mode: modeStr, Env: shimEnv,
+				ProtocolEra: protocolWire, ModernSharing: modernSharing, Partition: partition,
+			}
+			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonRequest(spawnRequest, logger, defaultDaemonSpawnTimeout)
 			held := errors.Is(err, control.ErrMaintenanceHeld) || errors.Is(err, control.ErrMaintenanceRetirementBlocked) || errors.Is(err, control.ErrMaintenancePersistenceFailed)
 			if err != nil && !held {
 				if errors.Is(err, era.AdmissionControlEraMismatch) {
@@ -287,6 +304,16 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", supervisedDaemonReconnectError(err)
 					}
+					if modernSharing {
+						request := spawnRequest
+						request.ReconnectReason = "refresh"
+						newIPC, newServerID, newToken, err := spawnViaDaemonRequest(request, logger, defaultDaemonSpawnTimeout)
+						if err != nil {
+							return "", "", err
+						}
+						currentIPC, currentServerID, currentToken = newIPC, newServerID, newToken
+						return newIPC, newToken, nil
+					}
 					newToken, err := refreshTokenViaDaemon(currentToken, protocolWire, logger)
 					if err != nil {
 						return "", "", err
@@ -313,7 +340,9 @@ func main() {
 							}
 							return "", "", supervisedDaemonReconnectError(err)
 						}
-						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeoutForEra(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", protocolWire, logger, time.Until(deadline))
+						request := spawnRequest
+						request.ReconnectReason = "fallback_spawn"
+						newIPC, newServerID, newToken, err := spawnViaDaemonRequest(request, logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())

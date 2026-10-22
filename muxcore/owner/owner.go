@@ -124,7 +124,13 @@ func (o *Owner) forceModernClassification() {
 		return
 	}
 	o.autoClassification = classify.ModeIsolated
+	if o.modernShared {
+		o.autoClassification = classify.ModeShared
+	}
 	o.classificationSource = "protocol-era"
+	if o.modernShared {
+		o.classificationSource = "modern-sharing"
+	}
 	o.classificationReason = []string{"2026-07-28"}
 	o.classifiedOnce.Do(func() {
 		if o.classified != nil {
@@ -176,6 +182,12 @@ type Owner struct {
 	upstreamWriter              io.Writer // injected writer (non-nil = skip subprocess, write directly; tests only)
 	serverID                    string    // server identity hash
 	protocolEra                 era.ProtocolEra
+	modernShared                bool
+	modernMu                    sync.Mutex
+	modernSequence              atomic.Uint64
+	modernRequests              map[string]*modernRequest
+	modernHostRequests          map[string]*modernRequest
+	modernProgress              map[string]*modernRequest
 	maintenanceGate             *sync.RWMutex
 	admitMaterialization        func(*Owner, LaunchContext) error
 	maintenance                 atomic.Pointer[control.MaintenanceResult]
@@ -320,6 +332,11 @@ type OwnerConfig struct {
 	// ProtocolEra is immutable for the owner lifetime. Its zero value preserves
 	// legacy routing and cache behavior.
 	ProtocolEra era.ProtocolEra
+
+	// ModernShared enables session-local wire correlation after daemon admission
+	// has validated the launch context and explicit sharing partition.
+	// False preserves isolated modern wire bytes and logging behavior.
+	ModernShared bool
 
 	// MaintenanceGate coordinates managed starts and frame admission with the
 	// daemon fence. AdmitMaterialization runs under its read lease, before start,
@@ -471,6 +488,7 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		protocolEra:            cfg.ProtocolEra,
+		modernShared:           cfg.ModernShared && cfg.ProtocolEra == era.EraModern20260728,
 		maintenanceGate:        cfg.MaintenanceGate,
 		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
@@ -648,6 +666,7 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		upstreamWriter:         cfg.UpstreamWriter,
 		serverID:               cfg.ServerID,
 		protocolEra:            cfg.ProtocolEra,
+		modernShared:           cfg.ModernShared && cfg.ProtocolEra == era.EraModern20260728,
 		maintenanceGate:        cfg.MaintenanceGate,
 		admitMaterialization:   cfg.AdmitMaterialization,
 		listener:               ln,
@@ -1123,6 +1142,9 @@ func (o *Owner) handleModernDownstreamMessage(s *Session, msg *jsonrpc.Message) 
 		return o.forwardNotificationIfReady(msg.Raw)
 
 	case msg.IsRequest():
+		if o.modernShared && modernHasLogLevel(msg.Raw) {
+			return o.rejectModernSharedLogging(s, msg.ID)
+		}
 		if o.sessionHandler != nil {
 			return o.dispatchToSessionHandler(s, msg)
 		}
@@ -1140,36 +1162,6 @@ func (o *Owner) handleModernDownstreamMessage(s *Session, msg *jsonrpc.Message) 
 	default:
 		return fmt.Errorf("unexpected message type from downstream: %s", msg.Type)
 	}
-}
-
-func (o *Owner) forwardModernCancelledNotification(s *Session, msg *jsonrpc.Message) error {
-	var envelope struct {
-		Params struct {
-			RequestID json.RawMessage `json:"requestId"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal(msg.Raw, &envelope); err != nil || envelope.Params.RequestID == nil {
-		return nil
-	}
-
-	tracked, ok := o.inflightTracker.Load(string(envelope.Params.RequestID))
-	if !ok {
-		return nil
-	}
-	inflight, ok := tracked.(*InflightRequest)
-	if !ok || inflight.SessionID != s.ID {
-		return nil
-	}
-	if proc := inflight.process.Load(); proc != nil {
-		if !o.acceptsProcessEvent(proc) {
-			return nil
-		}
-		return o.writeUpstreamToProcess(proc, msg.Raw)
-	}
-	if o.upstreamWriter != nil {
-		return o.writeUpstream(msg.Raw)
-	}
-	return nil
 }
 
 // dispatchToSessionHandler calls the SessionHandler directly instead of writing
@@ -1650,93 +1642,6 @@ func (o *Owner) handleUpstreamMessageFromLocked(proc *upstream.Process, msg *jso
 	return nil
 }
 
-func (o *Owner) handleModernUpstreamResponse(proc *upstream.Process, msg *jsonrpc.Message) error {
-	requestID := string(msg.ID)
-	tracked, ok := o.inflightTracker.Load(requestID)
-	if !ok {
-		return nil
-	}
-	inflight, ok := tracked.(*InflightRequest)
-	if !ok || !o.claimModernInflight(requestID, inflight, proc) {
-		return nil
-	}
-	o.clearModernInflightState(requestID)
-	o.mu.RLock()
-	session := o.sessions[inflight.SessionID]
-	o.mu.RUnlock()
-	if session == nil {
-		return nil
-	}
-	return session.WriteRaw(msg.Raw)
-}
-
-func (o *Owner) handleModernUpstreamNotification(proc *upstream.Process, msg *jsonrpc.Message) error {
-	if strings.HasPrefix(msg.Method, "notifications/x-mux/") {
-		return nil
-	}
-	if msg.Method == "notifications/progress" {
-		if err := o.routeProgressNotification(msg.Raw); err != nil {
-			o.logger.Printf("drop notifications/progress: %v (preventing transport tear-down in MCP client)", err)
-		}
-		return nil
-	}
-	if msg.Method == "notifications/message" {
-		// Request-scoped logs must preserve the upstream order and cannot use
-		// the bounded, lossy asynchronous notification queue.
-		session := o.modernInflightSession(proc, true)
-		if session == nil {
-			return nil
-		}
-		return session.WriteRaw(msg.Raw)
-	}
-
-	// A modern owner is forced isolated. Subscription notifications continue
-	// after their listen request has completed, so route them to its one live
-	// recipient instead of tying them to a completed inflight request.
-	session := o.soleModernSession()
-	if session == nil {
-		return nil
-	}
-	return session.WriteRaw(msg.Raw)
-}
-
-func (o *Owner) soleModernSession() *Session {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-
-	var only *Session
-	for _, session := range o.sessions {
-		if session == nil || session.IsClosed() {
-			continue
-		}
-		if only != nil {
-			return nil
-		}
-		only = session
-	}
-	return only
-}
-
-func (o *Owner) modernInflightSession(proc *upstream.Process, requireLogSubscription bool) *Session {
-	var sessionID int
-	o.inflightTracker.Range(func(_, value any) bool {
-		inflight, ok := value.(*InflightRequest)
-		if !ok || (proc != nil && inflight.process.Load() != proc) ||
-			(requireLogSubscription && !inflight.logSubscribed) {
-			return true
-		}
-		sessionID = inflight.SessionID
-		return false
-	})
-	if sessionID == 0 {
-		return nil
-	}
-	o.mu.RLock()
-	session := o.sessions[sessionID]
-	o.mu.RUnlock()
-	return session
-}
-
 // handleUpstreamRequest handles server→client requests from the upstream.
 // Most requests (roots/list, sampling, elicitation) are forwarded to the active
 // session — CC itself responds with correct per-session data.
@@ -2061,6 +1966,9 @@ type ownerNotifier struct {
 // Notify dispatches notifications for a project with best-effort semantics.
 // best effort; failures logged at session level.
 func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
+	if n.owner.modernShared {
+		return errors.New("shared modern notifications require request correlation")
+	}
 	// Collect ALL sessions matching projectID under RLock, then release before
 	// SendNotification to avoid blocking on slow IPC consumers.
 	// Holding o.mu.RLock() during SendNotification would still stall
@@ -2088,6 +1996,9 @@ func (n *ownerNotifier) Notify(projectID string, notification []byte) error {
 }
 
 func (n *ownerNotifier) Broadcast(notification []byte) {
+	if n.owner.modernShared {
+		return
+	}
 	n.owner.mu.RLock()
 	sessions := make([]*Session, 0, len(n.owner.sessions))
 	for _, s := range n.owner.sessions {
@@ -2128,7 +2039,7 @@ func (o *Owner) removeSession(s *Session) {
 	o.mu.Unlock()
 	o.launchContextMu.Unlock()
 	if o.isModern() {
-		o.removeModernInflightForSession(s.ID)
+		o.removeModernInflightForSession(s)
 	}
 	o.cancelLocalDemandsForSession(s.ID)
 	if remaining == 0 {
@@ -2674,83 +2585,6 @@ func (o *Owner) claimInflightRequests(proc *upstream.Process) []drainedInflightR
 	return responses
 }
 
-func (o *Owner) claimModernInflightRequests(proc *upstream.Process) []drainedInflightResponse {
-	responses := make([]drainedInflightResponse, 0)
-	claimed := 0
-	o.inflightTracker.Range(func(key, value any) bool {
-		requestID, ok := key.(string)
-		if !ok {
-			return true
-		}
-		inflight, ok := value.(*InflightRequest)
-		if !ok || (proc != nil && inflight.process.Load() != proc) {
-			return true
-		}
-		o.mu.RLock()
-		session := o.sessions[inflight.SessionID]
-		o.mu.RUnlock()
-		var payload []byte
-		if session != nil {
-			var err error
-			if held := o.maintenance.Load(); held != nil {
-				payload = maintenanceErrorBytes(json.RawMessage(requestID), held)
-			} else {
-				payload, err = buildJSONRPCErrorBytes(json.RawMessage(requestID), -32603, "upstream process exited")
-			}
-			if err != nil {
-				o.logger.Printf("drainInflight: build error for %s: %v", requestID, err)
-				return true
-			}
-		}
-		if !o.claimModernInflight(requestID, inflight, proc) {
-			return true
-		}
-		claimed++
-		o.clearModernInflightState(requestID)
-		if session != nil {
-			responses = append(responses, drainedInflightResponse{
-				session:   session,
-				sessionID: inflight.SessionID,
-				payload:   payload,
-			})
-		}
-		return true
-	})
-	if claimed > 0 {
-		o.logger.Printf("upstream died: sending error responses for %d in-flight requests", claimed)
-	}
-	return responses
-}
-
-func (o *Owner) claimModernInflight(requestID string, inflight *InflightRequest, proc *upstream.Process) bool {
-	if inflight == nil || (proc != nil && inflight.process.Load() != proc) {
-		return false
-	}
-	return o.inflightTracker.CompareAndDelete(requestID, inflight)
-}
-
-func (o *Owner) clearModernInflightState(requestID string) {
-	o.decrementPending()
-	o.methodTags.Delete(requestID)
-	o.timedOutIDs.Delete(requestID)
-	o.clearProgressTokensForRequest(requestID)
-}
-
-func (o *Owner) removeModernInflightForSession(sessionID int) {
-	o.inflightTracker.Range(func(key, value any) bool {
-		requestID, ok := key.(string)
-		if !ok {
-			return true
-		}
-		inflight, ok := value.(*InflightRequest)
-		if !ok || inflight.SessionID != sessionID || !o.claimModernInflight(requestID, inflight, nil) {
-			return true
-		}
-		o.clearModernInflightState(requestID)
-		return true
-	})
-}
-
 func (o *Owner) drainProactiveRequests(proc *upstream.Process) {
 	o.proactiveRequests.Range(func(key, value any) bool {
 		request := value.(proactiveRequest)
@@ -3222,6 +3056,11 @@ func (o *Owner) PendingRequests() int64 {
 // long-running tool calls that are still streaming notifications/progress
 // from upstream. While non-zero, the reaper must not kill this owner.
 func (o *Owner) ActiveProgressTokens() int {
+	if o.isModern() {
+		o.modernMu.Lock()
+		defer o.modernMu.Unlock()
+		return len(o.modernProgress)
+	}
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	return len(o.progressOwners)
@@ -3277,7 +3116,7 @@ func (o *Owner) writeUpstream(data []byte) error {
 // writeUpstreamFromCurrent binds the exact process generation and reserves the
 // request under the admission lease, then releases it before transport I/O.
 // A write failure cannot retire a replacement generation.
-func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Process)) (*upstream.Process, error) {
+func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Process) error) (*upstream.Process, error) {
 	if held := o.lockRequestAdmission(); held != nil {
 		o.unlockRequestAdmission()
 		return nil, &control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held}
@@ -3295,7 +3134,10 @@ func (o *Owner) writeUpstreamFromCurrent(data []byte, bind func(*upstream.Proces
 		up = nil
 	}
 	if bind != nil {
-		bind(up)
+		if err := bind(up); err != nil {
+			o.unlockRequestAdmission()
+			return up, err
+		}
 	}
 	o.unlockRequestAdmission()
 	if writer != nil {
@@ -3481,6 +3323,9 @@ func (o *Owner) Status() map[string]any {
 	if modern {
 		status["protocol_era"] = "2026-07-28"
 		status["sharing_policy"] = "forced-isolated"
+		if o.modernShared {
+			status["sharing_policy"] = "shared-exact-context"
+		}
 		status["cache_policy"] = "off"
 		status["lifecycle_policy"] = "r1-quarantine"
 	} else {

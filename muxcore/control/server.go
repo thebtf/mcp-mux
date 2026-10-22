@@ -230,6 +230,17 @@ func (s *Server) dispatch(req Request) (Response, func()) {
 		}
 		return Response{OK: true, Data: data}, nil
 
+	case "prepare_modern_sharing":
+		handler, ok := s.handler.(ModernSharingHandler)
+		if !ok {
+			return Response{Message: "modern sharing not supported"}, nil
+		}
+		binding, err := handler.HandlePrepareModernSharing(req)
+		if err != nil {
+			return errorResponse("prepare_modern_sharing", err), nil
+		}
+		return Response{OK: true, SharingBinding: binding, ProtocolEra: req.ProtocolEra}, nil
+
 	case "spawn":
 		if _, err := era.ParseProtocolEra(req.ProtocolEra); err != nil {
 			return Response{OK: false, Message: fmt.Sprintf("spawn: %v", err)}, nil

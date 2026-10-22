@@ -184,6 +184,13 @@ type Config struct {
 	// preserves the released legacy ingress and daemon ordering.
 	ProtocolPolicy era.ProtocolPolicy
 
+	// ModernSharing opts modern callers into exact-context owner reuse.
+	// Nil or unknown PartitionResolver results retain dedicated owners.
+	ModernSharing bool
+	// PartitionResolver supplies the product's stable, non-secret auth/tenant
+	// partition before every admission. Errors and panics refuse admission.
+	PartitionResolver func(context.Context, muxcore.ProjectContext) (control.PartitionAssertion, error)
+
 	// OnInject forwards to owner.ResilientClientConfig.OnInject. See owner package
 	// for closure semantics. Zero value (nil) preserves pre-v0.23 behavior.
 	OnInject func(inject func([]byte) error)
@@ -285,6 +292,9 @@ type MuxEngine struct {
 func New(cfg Config) (*MuxEngine, error) {
 	if _, err := protocolEraForPolicy(cfg.ProtocolPolicy); err != nil {
 		return nil, err
+	}
+	if cfg.ModernSharing && cfg.ProtocolPolicy != era.PolicyModern20260728 {
+		return nil, fmt.Errorf("engine: modern sharing requires modern protocol policy")
 	}
 	if cfg.Command == "" && cfg.Handler == nil && cfg.SessionHandler == nil {
 		return nil, fmt.Errorf("engine: Command, Handler, or SessionHandler is required")
@@ -534,6 +544,12 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	if os.Getenv("MCP_MUX_ISOLATED") == "1" {
 		mode = serverid.ModeIsolated
 	}
+	if protocolEra == era.EraModern20260728 && strings.EqualFold(strings.TrimSpace(os.Getenv("MCP_MUX_DEFAULT_MODE")), "isolated") {
+		mode = serverid.ModeIsolated
+	}
+	if e.cfg.ModernSharing && mode != serverid.ModeIsolated {
+		mode = serverid.ModeGlobal
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -544,7 +560,22 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	env := collectEnv()
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
-	ipcPath, serverID, token, err := spawnViaDaemon(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, protocolWire, e.logger)
+	spawnClientOwner := func(reason string) (string, string, string, error) {
+		var partition *control.PartitionAssertion
+		if mode != serverid.ModeIsolated {
+			var err error
+			partition, err = e.resolvePartition(ctx, cwd, env)
+			if err != nil {
+				return "", "", "", err
+			}
+		}
+		return spawnViaDaemonRequest(ctlPath, control.Request{
+			Cmd: "spawn", Command: e.cfg.Command, Args: e.cfg.Args, Cwd: cwd, Mode: string(mode), Env: env,
+			ProtocolEra: protocolWire, ReconnectReason: reason,
+			ModernSharing: e.cfg.ModernSharing && mode != serverid.ModeIsolated, Partition: partition,
+		}, e.logger)
+	}
+	ipcPath, serverID, token, err := spawnClientOwner("")
 	if err != nil && !isMaintenanceFence(err) {
 		if errors.Is(err, era.AdmissionControlEraMismatch) {
 			admission := selection.AdmissionError(era.AdmissionControlEraMismatch)
@@ -567,6 +598,14 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "refresh"); err != nil {
 			return "", "", err
 		}
+		if e.cfg.ModernSharing && mode != serverid.ModeIsolated {
+			newIPC, newServerID, newToken, err := spawnClientOwner("refresh")
+			if err != nil {
+				return "", "", err
+			}
+			currentIPC, serverID, currentToken = newIPC, newServerID, newToken
+			return newIPC, newToken, nil
+		}
 		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, protocolWire, e.logger)
 		if err != nil {
 			return "", "", err
@@ -582,7 +621,7 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "reconnect"); err != nil {
 			return "", "", err
 		}
-		newIPC, newServerID, newToken, err := spawnViaDaemonWithReason(ctlPath, e.cfg.Command, e.cfg.Args, cwd, string(mode), env, "fallback_spawn", protocolWire, e.logger)
+		newIPC, newServerID, newToken, err := spawnClientOwner("fallback_spawn")
 		if err != nil {
 			return "", "", err
 		}
@@ -845,8 +884,7 @@ func spawnViaDaemon(ctlPath, command string, args []string, cwd, mode string, en
 }
 
 func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger) (string, string, string, error) {
-	// spawnRPCTimeout covers daemon processing + upstream process start + proactive init.
-	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+	return spawnViaDaemonRequest(ctlPath, control.Request{
 		Cmd:             "spawn",
 		Command:         command,
 		Args:            args,
@@ -855,14 +893,18 @@ func spawnViaDaemonWithReason(ctlPath, command string, args []string, cwd, mode 
 		Env:             env,
 		ReconnectReason: reconnectReason,
 		ProtocolEra:     protocolEra,
-	}, spawnRPCTimeout)
+	}, logger)
+}
+
+func spawnViaDaemonRequest(ctlPath string, req control.Request, logger *log.Logger) (string, string, string, error) {
+	resp, err := control.SendSpawn(ctlPath, req, spawnRPCTimeout)
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn via daemon: %w", err)
 	}
 	if err := resp.Err(); err != nil {
 		return "", "", "", fmt.Errorf("daemon spawn failed: %w", err)
 	}
-	if protocolEra != "" && resp.ProtocolEra != protocolEra {
+	if req.ProtocolEra != "" && resp.ProtocolEra != req.ProtocolEra {
 		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
 	}
 
