@@ -42,6 +42,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   only the affected session, without dispatching requests for it. After connect
   settles, its matching disconnect cleanup runs once, including partially
   established lifecycle state; the owner and sibling sessions remain available.
+- Restored legacy `notifications/roots/list_changed` completion before the
+  session reader can dispatch its first frame; modern bootstrap remains disabled.
+- Reconcile a zero-grace in-process close warning only after actual handler,
+  pipe, and native-work retirement proof, returning its final exit status without
+  hiding blocked handlers or OS process-tree finalization errors.
 
 ### Compatibility
 

@@ -2833,6 +2833,11 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		proven = proven && proc.TreesDead()
 	}
 	proven = proven && o.nativeQuiescent()
+	if proven && maintenance && proc != nil && proc.PID() == 0 && closeErr != nil {
+		// Actual handler settlement can overtake the zero-grace close verdict.
+		exitCode, closeErr = proc.SoftClose(0)
+		proven = proc.TreesDead() && o.nativeQuiescent()
+	}
 	if !proven {
 		if proofErr == nil {
 			proofErr = errFinalizationUnproven
