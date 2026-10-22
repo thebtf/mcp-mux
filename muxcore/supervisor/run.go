@@ -185,6 +185,9 @@ func (runner *runner) readHost() {
 		arrived := runner.cfg.runtimeClock.Now()
 		sequence := runner.hostBoundary.record(arrived)
 		frame, parseErr := parseFrame(raw, runner.cfg.MaxFrameBytes)
+		if parseErr == nil && runner.modern() {
+			frame.raw = frame.wire
+		}
 		event := hostFrameEvent{sequence: sequence, arrived: arrived, frame: frame, err: parseErr}
 		select {
 		case runner.events <- event:
@@ -308,7 +311,12 @@ func (runner *runner) handleStartAttempt(event startAttemptEvent) {
 	runner.current = generation
 	runner.dormancyInvalid = false
 
-	if runner.initializeRequest != nil {
+	if runner.modern() {
+		runner.host.clearTransitionTombstones()
+		runner.host.clearRetiredCorrelations()
+		runner.child.clearTransitionTombstones()
+		runner.child.clearRetiredCorrelations()
+	} else if runner.initializeRequest != nil {
 		runner.beginReplay()
 		return
 	}

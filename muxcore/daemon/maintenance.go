@@ -711,11 +711,18 @@ func (d *Daemon) HandleRestartOwner(req control.Request) (control.Response, erro
 			return control.Response{}, err
 		}
 	}
+	compatibility := entry.modernCompatibility
 	d.mu.RUnlock()
 	// Capture exactly the elected upstream context, never under registry locks.
 	launch := entry.Owner.CurrentLaunchContext()
 	wire, _ := entry.ProtocolEra.Wire()
 	spawn := control.Request{Cmd: "spawn", Command: entry.Command, Args: append([]string(nil), entry.Args...), Cwd: launch.Cwd, Env: launch.Env, Mode: entry.Mode, ProtocolEra: wire}
+	if compatibility != nil {
+		partition := compatibility.Partition
+		spawn.ModernSharing = true
+		spawn.Partition = &partition
+		spawn.Mode = "global"
+	}
 	d.maintenanceGate.RUnlock()
 	if req.DrainTimeoutMs > 0 {
 		entry.Owner.DrainRequestsUntil(time.Now().Add(time.Duration(req.DrainTimeoutMs) * time.Millisecond))
@@ -732,6 +739,18 @@ func (d *Daemon) HandleRestartOwner(req control.Request) (control.Response, erro
 			return control.Response{}, control.ErrMaintenanceNotFound
 		}
 		return control.Response{}, control.ErrMaintenanceConflict
+	}
+	if spawn.ModernSharing {
+		spawn.SpawnNonce, err = generateToken()
+		if err != nil {
+			return control.Response{}, err
+		}
+		prepare := spawn
+		prepare.Cmd = "prepare_modern_sharing"
+		spawn.SharingBinding, err = d.HandlePrepareModernSharing(prepare)
+		if err != nil {
+			return control.Response{}, err
+		}
 	}
 	path, sid, token, err := d.Spawn(spawn)
 	if err != nil {

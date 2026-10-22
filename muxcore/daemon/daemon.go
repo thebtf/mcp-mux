@@ -105,6 +105,7 @@ type OwnerEntry struct {
 	Mode                        string
 	ProtocolEra                 era.ProtocolEra
 	Env                         map[string]string
+	modernCompatibility         *modernCompatibility
 	maintenanceContexts         map[string]bool
 	maintenanceIncomplete       bool
 	Persistent                  bool
@@ -210,6 +211,7 @@ type Daemon struct {
 	maintenanceCommit   func([]byte) error
 	maintenanceFailed   bool
 	owners              map[string]*OwnerEntry
+	modernSharingKey    [32]byte
 	logger              *log.Logger
 	ctlSrv              *control.Server
 	done                chan struct{}
@@ -559,8 +561,14 @@ func New(cfg Config) (*Daemon, error) {
 		supCancel()
 		return nil, err
 	}
+	var modernSharingKey [32]byte
+	if _, err := rand.Read(modernSharingKey[:]); err != nil {
+		supCancel()
+		return nil, fmt.Errorf("daemon sharing key: %w", err)
+	}
 	d := &Daemon{
 		owners:                  make(map[string]*OwnerEntry),
+		modernSharingKey:        modernSharingKey,
 		logger:                  logger,
 		done:                    make(chan struct{}),
 		ownerIdleTimeout:        ownerIdleTimeout,
@@ -1217,12 +1225,17 @@ func (d *Daemon) Spawn(req control.Request) (string, string, string, error) {
 	if _, err := era.ParseProtocolEra(req.ProtocolEra); err != nil {
 		return "", "", "", fmt.Errorf("spawn: %w", err)
 	}
+	normalized, compatibility, err := normalizeModernSpawn(req)
+	if err != nil {
+		return "", "", "", err
+	}
+	req = normalized
 	var isolatedRetry int64
 	templateMismatches := 0
 	templateBypass := false
 	generalRetries := 0
 	for range maxSpawnRetries + maxTemplateRevisionMismatches {
-		ipcPath, sid, token, err := d.spawnOnce(&req, &isolatedRetry, &templateMismatches, &templateBypass)
+		ipcPath, sid, token, err := d.spawnOnce(&req, compatibility, &isolatedRetry, &templateMismatches, &templateBypass)
 		switch {
 		case errors.Is(err, errTemplateRevisionMismatch):
 			continue
@@ -1256,11 +1269,16 @@ func (d *Daemon) promoteIsolatedRetry(req *control.Request, entry *OwnerEntry) i
 // spawnOnce performs one attempt at creating or reusing an owner. It takes req
 // by pointer because some retry paths mutate req.Mode (isolated promotion) and
 // the mutation must persist across iterations of the Spawn retry loop.
-func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templateMismatches *int, templateBypass *bool) (string, string, string, error) {
+func (d *Daemon) spawnOnce(reqPtr *control.Request, compatibility *modernCompatibility, isolatedRetry *int64, templateMismatches *int, templateBypass *bool) (string, string, string, error) {
 	req := *reqPtr
 	protocolEra, err := era.ParseProtocolEra(req.ProtocolEra)
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn: %w", err)
+	}
+	if compatibility != nil {
+		if err := d.validateModernSharing(req, compatibility); err != nil {
+			return "", "", "", err
+		}
 	}
 	// CR-002: default Mode flipped from "cwd" → "global". A shim that omits
 	// Mode now gets the global identity (one upstream per (cmd, args)) per the
@@ -1287,10 +1305,12 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 			req.Mode, req.Command, req.Args)
 		mode = serverid.ModeGlobal
 	}
+	modernShared := compatibility != nil
 	if protocolEra == era.EraModern20260728 {
 		mode = serverid.ModeIsolated
-		req.Mode = string(mode)
-		reqPtr.Mode = req.Mode
+		if modernShared {
+			mode = serverid.ModeGlobal
+		}
 	}
 
 	// Generate handshake token upfront — valid for this spawn call only.
@@ -1298,7 +1318,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	if err != nil {
 		return "", "", "", fmt.Errorf("spawn: %w", err)
 	}
-	effectiveEnv := mergeEnv(req.Env)
+	effectiveEnv := req.Env
+	if protocolEra == era.EraLegacy {
+		effectiveEnv = mergeEnv(req.Env)
+	}
 	contextKey := d.maintenanceContext(protocolEra, req.Command, req.Args, req.Cwd, effectiveEnv)
 	if err := d.maintenanceAdmission(contextKey); err != nil {
 		return "", "", "", err
@@ -1351,7 +1374,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	// same (cmd, args) must NOT collapse onto a shared owner. Derive an
 	// env-bucketed sid suffix when an existing entry has incompatible env.
 	// Compatible env OR no existing entry → sid unchanged.
-	if mode == serverid.ModeGlobal {
+	if protocolEra == era.EraLegacy && mode == serverid.ModeGlobal {
 		sid = d.deriveEnvBucketedSid(sid, req.Env)
 	}
 
@@ -1359,7 +1382,16 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		return "", "", "", err
 	}
 	if protocolEra == era.EraModern20260728 {
-		if _, occupied := d.owners[sid]; occupied {
+		if modernShared {
+			// A retiring exact match keeps process authority until existing removal gates settle.
+			for candidateSID, candidate := range d.owners {
+				if candidate != nil && candidate.ProtocolEra == protocolEra && candidate.modernCompatibility.equal(compatibility) {
+					sid = candidateSID
+					break
+				}
+			}
+		}
+		if entry, occupied := d.owners[sid]; occupied && (!modernShared || !entry.modernCompatibility.equal(compatibility)) {
 			d.unlockMaintenanceRegistry()
 			return "", "", "", fmt.Errorf("spawn: modern identity collision")
 		}
@@ -1379,7 +1411,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 	}
 
 	// 1. Exact match (same command+args+cwd)?
-	if entry, ok := d.owners[sid]; ok && protocolEra == era.EraLegacy {
+	if entry, ok := d.owners[sid]; ok && (protocolEra == era.EraLegacy || modernShared) {
 		if entry.creating != nil {
 			// Another goroutine is creating this owner — wait with timeout.
 			creating := entry.creating
@@ -1416,7 +1448,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				//
 				// effectiveEnv is the same post-merge form stored on the owner,
 				// so envCompatible compares like-for-like across create waiters.
-				if mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, effectiveEnv) {
+				if protocolEra == era.EraLegacy && mode == serverid.ModeGlobal && e.Env != nil && !envCompatible(e.Env, effectiveEnv) {
 					d.logger.Printf("env-incompat after create-wait: owner %s — retrying with bucketed sid", shortServerID(sid))
 					d.unlockMaintenanceRegistry()
 					return "", "", "", errSpawnRetry
@@ -1427,7 +1459,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				// existing owner's classification before binding. Isolated
 				// classification forces fall-through to a fresh isolated-seeded
 				// owner; shareable classification permits the bind.
-				if mode == serverid.ModeGlobal {
+				if protocolEra == era.EraLegacy && mode == serverid.ModeGlobal {
 					shareable, gateErr := d.waitForCrossCwdClassify(e, req.Cwd)
 					if gateErr != nil {
 						d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
@@ -1515,7 +1547,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				// entry. Without this, concurrent spawns with different
 				// credentials can collapse onto one upstream during startup
 				// storms, defeating the credentials-boundary guarantee.
-				if mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, effectiveEnv) {
+				if protocolEra == era.EraLegacy && mode == serverid.ModeGlobal && current.Env != nil && !envCompatible(current.Env, effectiveEnv) {
 					d.logger.Printf("env-incompat after CAS on fast path: owner %s — retrying with bucketed sid", shortServerID(probeSID))
 					d.unlockMaintenanceRegistry()
 					return "", "", "", errSpawnRetry
@@ -1525,7 +1557,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 				// CR-002 admission gate: same fresh-global logic as the
 				// placeholder-wait path. An unclassified owner waits for
 				// Classified(); an isolated verdict forces fall-through.
-				if mode == serverid.ModeGlobal {
+				if protocolEra == era.EraLegacy && mode == serverid.ModeGlobal {
 					shareable, gateErr := d.waitForCrossCwdClassify(current, req.Cwd)
 					if gateErr != nil {
 						d.logger.Printf("admission-gate: %v — falling through to fresh isolated spawn for cwd=%q", gateErr, req.Cwd)
@@ -1649,6 +1681,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		ProtocolEra:         protocolEra,
 		OwnerGeneration:     ownerGeneration,
 		Env:                 effectiveEnv,
+		modernCompatibility: compatibility,
 		maintenanceContexts: map[string]bool{d.maintenanceContext(protocolEra, req.Command, req.Args, req.Cwd, effectiveEnv): true},
 		RestoreSource:       "fresh",
 		creating:            make(chan struct{}),
@@ -1695,6 +1728,7 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, isolatedRetry *int64, templa
 		ControlPath:                 controlPath,
 		ServerID:                    sid,
 		ProtocolEra:                 protocolEra,
+		ModernShared:                modernShared,
 		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
 		MaterializationPolicy:       materializationPolicy,
 		DeferInitialMaterialization: true,
@@ -2468,6 +2502,9 @@ func (d *Daemon) HandleRefreshSessionToken(prevToken string) (string, error) {
 		d.logger.Printf("shim.reconnect.refresh_fail reason=unknown_token")
 		return "", ErrUnknownToken
 	}
+	if isModernOwnerEntry(entry) {
+		return "", ErrProtocolEraMismatch
+	}
 
 	if err := d.checkMaintenanceEntryLocked(entry); err != nil {
 		return "", err
@@ -2526,6 +2563,9 @@ func (d *Daemon) HandleRefreshSessionTokenWithProtocolEra(prevToken, protocolEra
 	if current.ProtocolEra != requestedEra {
 		d.logger.Printf("shim.reconnect.refresh_fail reason=protocol_era_mismatch")
 		return "", ErrProtocolEraMismatch
+	}
+	if current.modernCompatibility != nil {
+		return "", errModernSharingAdmission
 	}
 
 	if err := d.checkMaintenanceEntryLocked(current); err != nil {
@@ -3037,6 +3077,9 @@ func (d *Daemon) findSharedOwnerLocked(command string, args []string, env map[st
 			admissionWait *owner.Owner    // short cache-commit admission freeze
 		)
 		for _, entry := range d.owners {
+			if isModernOwnerEntry(entry) {
+				continue
+			}
 			if entry.Command != command {
 				continue
 			}
@@ -3188,17 +3231,23 @@ func mergeEnv(shimEnv map[string]string) map[string]string {
 	merged := make(map[string]string, len(shimEnv)+64)
 	if runtime.GOOS != "windows" {
 		for _, entry := range os.Environ() {
-			if i := strings.IndexByte(entry, '='); i > 0 {
+			if i := strings.IndexByte(entry, '='); i > 0 && !envidentity.IsLauncherAdvertisement(entry[:i]) {
 				merged[entry[:i]] = entry[i+1:]
 			}
 		}
 		for key, value := range shimEnv {
+			if envidentity.IsLauncherAdvertisement(key) {
+				continue
+			}
 			merged[key] = value
 		}
 		return merged
 	}
 
 	set := func(key, value string) {
+		if envidentity.IsLauncherAdvertisement(key) {
+			return
+		}
 		merged[strings.ToUpper(key)] = value
 	}
 	for _, entry := range os.Environ() {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"strings"
@@ -619,7 +620,7 @@ func TestModernOwner_DeliversSubscriptionNotificationsAfterAcknowledgement(t *te
 	o := newModernWriterOwner(t, &upstream, nil)
 	session, downstream := addModernOwnerSession(t, o, t.TempDir())
 
-	listen := []byte(`{"jsonrpc":"2.0","id":"modern-listen","method":"subscriptions/listen","params":{"uri":"file:///project","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	listen := []byte(`{"jsonrpc":"2.0","id":"modern-listen","method":"subscriptions/listen","params":{"notifications":{"resourceSubscriptions":["file:///project"]},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
 	if err := o.handleDownstreamMessage(session, parseMessage(listen)); err != nil {
 		t.Fatalf("forward modern subscriptions/listen: %v", err)
 	}
@@ -627,11 +628,11 @@ func TestModernOwner_DeliversSubscriptionNotificationsAfterAcknowledgement(t *te
 		t.Fatalf("modern subscriptions/listen upstream bytes = %q, want %q", got, want)
 	}
 
-	acknowledgement := []byte(`{"jsonrpc":"2.0","id":"modern-listen","result":{"subscriptionId":"modern-subscription"}}`)
+	acknowledgement := []byte(`{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"modern-listen"},"notifications":{"resourceSubscriptions":["file:///project"]}}}`)
 	if err := o.handleUpstreamMessage(parseMessage(acknowledgement)); err != nil {
 		t.Fatalf("route modern subscriptions/listen acknowledgement: %v", err)
 	}
-	notification := []byte(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///project"}}`)
+	notification := []byte(`{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"modern-listen"},"uri":"file:///project"}}`)
 	if err := o.handleUpstreamMessage(parseMessage(notification)); err != nil {
 		t.Fatalf("route modern subscription notification: %v", err)
 	}
@@ -787,7 +788,8 @@ func assertModernProcessLossErrors(t *testing.T, output string, wantIDs ...strin
 func TestModernOwner_ProcessBoundLossClaimsNativeInflightExactlyOnce(t *testing.T) {
 	o := newModernWriterOwner(t, io.Discard, nil)
 	session, downstream := addModernOwnerSession(t, o, t.TempDir())
-	proc := &upstream.Process{}
+	proc := newModernLossProcess(t)
+	setModernLossProcess(o, proc)
 
 	entries := []struct {
 		requestID     string
@@ -798,21 +800,19 @@ func TestModernOwner_ProcessBoundLossClaimsNativeInflightExactlyOnce(t *testing.
 		{requestID: `418`, progressToken: `"native-loss-progress-number"`},
 	}
 	for _, entry := range entries {
-		inflight := &InflightRequest{
-			Method:        "tools/call",
-			SessionID:     session.ID,
-			StartTime:     time.Now(),
-			logSubscribed: entry.logSubscribed,
+		logLevel := ""
+		if entry.logSubscribed {
+			logLevel = `,"io.modelcontextprotocol/logLevel":"info"`
 		}
-		inflight.process.Store(proc)
-		o.inflightTracker.Store(entry.requestID, inflight)
-		o.pendingRequests.Add(1)
-		seedProgressToken(o, session.ID, entry.requestID, entry.progressToken)
+		request := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"echo","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"progressToken":%s%s}}}`, entry.requestID, entry.progressToken, logLevel)
+		if err := o.handleDownstreamMessage(session, parseMessage([]byte(request))); err != nil {
+			t.Fatalf("forward native loss request: %v", err)
+		}
 	}
-	o.mu.Lock()
-	o.upstream = proc
-	o.mu.Unlock()
-
+	if o.PendingRequests() != int64(len(entries)) || o.ActiveProgressTokens() != len(entries) {
+		t.Fatalf("native ingress did not publish both requests and progress routes: pending=%d progress=%d", o.PendingRequests(), o.ActiveProgressTokens())
+	}
+	retireModernLossProcess(t, proc)
 	if !o.markCurrentUpstreamDead(proc) {
 		t.Fatal("exact current process loss was not claimed")
 	}
@@ -828,19 +828,17 @@ func TestModernOwner_ProcessBoundLossClaimsNativeInflightExactlyOnce(t *testing.
 	if got := o.ActiveProgressTokens(); got != 0 {
 		t.Errorf("active progress tokens after loss = %d, want 0", got)
 	}
-	o.mu.RLock()
-	progressOwners := len(o.progressOwners)
-	progressRequestIDs := len(o.progressTokenRequestID)
-	requestTokens := len(o.requestToTokens)
-	o.mu.RUnlock()
-	if progressOwners != 0 || progressRequestIDs != 0 || requestTokens != 0 {
-		t.Errorf("loss left progress routes: owners=%d requestIDs=%d requestTokens=%d", progressOwners, progressRequestIDs, requestTokens)
-	}
 
 	firstDelivery := downstream.String()
+	for _, entry := range entries {
+		progress := fmt.Sprintf(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":%s,"progress":1}}`, entry.progressToken)
+		if err := o.handleUpstreamMessageFrom(proc, parseMessage([]byte(progress))); err != nil {
+			t.Fatalf("late lost-process progress: %v", err)
+		}
+	}
 	_ = o.markCurrentUpstreamDead(proc)
 	if got := downstream.String(); got != firstDelivery {
-		t.Errorf("second exact-process loss duplicated responses: got %q, want %q", got, firstDelivery)
+		t.Errorf("lost process delivered late traffic or duplicate errors: got %q, want %q", got, firstDelivery)
 	}
 }
 
@@ -889,22 +887,16 @@ func TestModernOwner_PublishesProcessBoundInflightBeforeWrite(t *testing.T) {
 func TestModernOwner_WrongGenerationCannotConsumeOrRouteInflight(t *testing.T) {
 	o := newModernWriterOwner(t, io.Discard, nil)
 	session, downstream := addModernOwnerSession(t, o, t.TempDir())
-	o.upstreamWriter = nil
 	oldProc := newModernLossProcess(t)
 	currentProc := newModernLossProcess(t)
-	o.mu.Lock()
-	o.upstream = currentProc
-	o.upstreamDead.Store(false)
-	o.mu.Unlock()
-	o.materializationMu.Lock()
-	o.materializationState = MaterializationReady
-	o.materializationMu.Unlock()
-
+	setModernLossProcess(o, oldProc)
 	const requestID = `"generation-bound"`
-	inflight := &InflightRequest{Method: "subscriptions/listen", SessionID: session.ID, StartTime: time.Now(), logSubscribed: true}
-	inflight.process.Store(oldProc)
-	o.inflightTracker.Store(requestID, inflight)
-	o.pendingRequests.Store(1)
+	request := parseMessage([]byte(`{"jsonrpc":"2.0","id":"generation-bound","method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info"}}}`))
+	if err := o.handleDownstreamMessage(session, request); err != nil {
+		t.Fatalf("forward old-generation listen: %v", err)
+	}
+	retireModernLossProcess(t, oldProc)
+	setModernLossProcess(o, currentProc)
 
 	notification := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"stale"}}`))
 	if err := o.handleUpstreamMessageFrom(currentProc, notification); err != nil {
@@ -923,28 +915,30 @@ func TestModernOwner_WrongGenerationCannotConsumeOrRouteInflight(t *testing.T) {
 	if got := o.PendingRequests(); got != 1 {
 		t.Fatalf("wrong generation changed pending count to %d, want 1", got)
 	}
+	o.deliverInflightResponses(o.claimInflightRequests(oldProc))
+	assertModernProcessLossErrors(t, downstream.String(), requestID)
+	if got := o.PendingRequests(); got != 0 {
+		t.Fatalf("exact old-process loss left pending count %d, want 0", got)
+	}
 }
 
 func TestModernOwner_CancelTargetsOnlyCurrentProcessGeneration(t *testing.T) {
 	o := newModernWriterOwner(t, io.Discard, nil)
 	session, _ := addModernOwnerSession(t, o, t.TempDir())
-	o.upstreamWriter = nil
-	oldFrames := make(chan string, 1)
-	currentFrames := make(chan string, 1)
+	oldFrames := make(chan string, 2)
+	currentFrames := make(chan string, 2)
 	oldProc := newModernLossRecordingProcess(t, oldFrames)
 	currentProc := newModernLossRecordingProcess(t, currentFrames)
-	o.mu.Lock()
-	o.upstream = currentProc
-	o.upstreamDead.Store(false)
-	o.mu.Unlock()
-	o.materializationMu.Lock()
-	o.materializationState = MaterializationReady
-	o.materializationMu.Unlock()
-
-	const requestID = `"cancel-generation"`
-	inflight := &InflightRequest{Method: "tools/call", SessionID: session.ID, StartTime: time.Now()}
-	inflight.process.Store(oldProc)
-	o.inflightTracker.Store(requestID, inflight)
+	setModernLossProcess(o, oldProc)
+	request := parseMessage([]byte(`{"jsonrpc":"2.0","id":"cancel-generation","method":"tools/call","params":{"name":"echo","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`))
+	if err := o.handleDownstreamMessage(session, request); err != nil {
+		t.Fatalf("forward old-generation request: %v", err)
+	}
+	if frame := readModernLossFrame(t, oldFrames); !strings.Contains(frame, `"method":"tools/call"`) {
+		t.Fatalf("old generation did not receive original request: %s", frame)
+	}
+	retireModernLossProcess(t, oldProc)
+	setModernLossProcess(o, currentProc)
 	cancel := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"cancel-generation","reason":"host"}}`))
 	if err := o.handleModernDownstreamMessage(session, cancel); err != nil {
 		t.Fatalf("stale-generation cancel: %v", err)
@@ -957,33 +951,39 @@ func TestModernOwner_CancelTargetsOnlyCurrentProcessGeneration(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	currentInflight := &InflightRequest{Method: "tools/call", SessionID: session.ID, StartTime: time.Now()}
-	currentInflight.process.Store(currentProc)
-	o.inflightTracker.Store(requestID, currentInflight)
+	o.deliverInflightResponses(o.claimInflightRequests(oldProc))
+	if err := o.handleDownstreamMessage(session, request); err != nil {
+		t.Fatalf("forward current-generation request: %v", err)
+	}
+	if frame := readModernLossFrame(t, currentFrames); !strings.Contains(frame, `"method":"tools/call"`) {
+		t.Fatalf("current generation did not receive its own request: %s", frame)
+	}
 	if err := o.handleModernDownstreamMessage(session, cancel); err != nil {
 		t.Fatalf("current-generation cancel: %v", err)
 	}
-	select {
-	case frame := <-currentFrames:
-		if !strings.Contains(frame, `"notifications/cancelled"`) {
-			t.Fatalf("current cancel frame = %s", frame)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("current generation did not receive cancellation")
+	frame := readModernLossFrame(t, currentFrames)
+	var forwarded struct {
+		Method string `json:"method"`
+		Params struct {
+			RequestID string `json:"requestId"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(frame), &forwarded); err != nil || forwarded.Method != "notifications/cancelled" || forwarded.Params.RequestID != "cancel-generation" {
+		t.Fatalf("current cancel frame = %s, want cancellation of its own original request", frame)
 	}
 }
 
 func TestModernOwner_RemoveSessionClearsEphemeralInflightRoutes(t *testing.T) {
 	o := newModernWriterOwner(t, io.Discard, nil)
-	session, _ := addModernOwnerSession(t, o, t.TempDir())
-	const (
-		requestID = `"session-route"`
-		token     = `"session-progress"`
-	)
-	inflight := &InflightRequest{Method: "subscriptions/listen", SessionID: session.ID, StartTime: time.Now(), logSubscribed: true}
-	o.inflightTracker.Store(requestID, inflight)
-	o.pendingRequests.Store(1)
-	seedProgressToken(o, session.ID, requestID, token)
+	session, downstream := addModernOwnerSession(t, o, t.TempDir())
+	const requestID = `"session-route"`
+	request := parseMessage([]byte(`{"jsonrpc":"2.0","id":"session-route","method":"subscriptions/listen","params":{"notifications":{"toolsListChanged":true},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info","progressToken":"session-progress"}}}`))
+	if err := o.handleDownstreamMessage(session, request); err != nil {
+		t.Fatalf("forward session-bound listen: %v", err)
+	}
+	if o.PendingRequests() != 1 || o.ActiveProgressTokens() != 1 {
+		t.Fatalf("native ingress did not publish session routes: pending=%d progress=%d", o.PendingRequests(), o.ActiveProgressTokens())
+	}
 
 	o.removeSession(session)
 	if _, ok := o.inflightTracker.Load(requestID); ok {
@@ -995,13 +995,54 @@ func TestModernOwner_RemoveSessionClearsEphemeralInflightRoutes(t *testing.T) {
 	if got := o.ActiveProgressTokens(); got != 0 {
 		t.Fatalf("disconnected modern session progress tokens = %d, want 0", got)
 	}
-	o.mu.RLock()
-	progressOwners := len(o.progressOwners)
-	progressRequestIDs := len(o.progressTokenRequestID)
-	requestTokens := len(o.requestToTokens)
-	o.mu.RUnlock()
-	if progressOwners != 0 || progressRequestIDs != 0 || requestTokens != 0 {
-		t.Fatalf("disconnected modern session retained routes: owners=%d requestIDs=%d requestTokens=%d", progressOwners, progressRequestIDs, requestTokens)
+	before := downstream.String()
+	progress := parseMessage([]byte(`{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"session-progress","progress":1}}`))
+	if err := o.handleUpstreamMessage(progress); err != nil {
+		t.Fatalf("late detached-session progress: %v", err)
+	}
+	if got := downstream.String(); got != before {
+		t.Fatalf("detached session received stale progress: %s", got)
+	}
+	replacement, _ := addModernOwnerSession(t, o, t.TempDir())
+	if err := o.handleDownstreamMessage(replacement, request); err != nil {
+		t.Fatalf("reuse detached request ID and progress token: %v", err)
+	}
+	if o.PendingRequests() != 1 || o.ActiveProgressTokens() != 1 {
+		t.Fatalf("detached route blocked a new request with the same ID/token: pending=%d progress=%d", o.PendingRequests(), o.ActiveProgressTokens())
+	}
+}
+
+func setModernLossProcess(o *Owner, proc *upstream.Process) {
+	o.upstreamWriter = nil
+	o.mu.Lock()
+	o.upstream = proc
+	o.upstreamDead.Store(false)
+	o.mu.Unlock()
+	o.materializationMu.Lock()
+	o.materializationState = MaterializationReady
+	o.materializationMu.Unlock()
+}
+
+func retireModernLossProcess(t *testing.T, proc *upstream.Process) {
+	t.Helper()
+	if err := proc.Close(); err != nil {
+		t.Fatalf("close actual modern process: %v", err)
+	}
+	select {
+	case <-proc.Done:
+	case <-time.After(time.Second):
+		t.Fatal("modern handler did not actually finish before generation replacement")
+	}
+}
+
+func readModernLossFrame(t *testing.T, frames <-chan string) string {
+	t.Helper()
+	select {
+	case frame := <-frames:
+		return frame
+	case <-time.After(time.Second):
+		t.Fatal("modern process did not receive its expected frame")
+		return ""
 	}
 }
 

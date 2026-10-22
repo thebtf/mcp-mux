@@ -58,6 +58,9 @@ func (o *Owner) runProgressReporter(ctx context.Context) {
 // emitSyntheticProgress scans inflight requests and sends synthetic notifications
 // for any that have been running longer than the reporting interval.
 func (o *Owner) emitSyntheticProgress(interval time.Duration) {
+	if o.isModern() {
+		return
+	}
 	now := time.Now()
 
 	o.inflightTracker.Range(func(key, value any) bool {

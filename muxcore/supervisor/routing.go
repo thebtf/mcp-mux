@@ -31,6 +31,10 @@ func (runner *runner) handleHostEvent(event hostFrameEvent) {
 		}
 		return
 	}
+	if runner.modern() {
+		runner.handleModernHost(item)
+		return
+	}
 	if runner.handleHostLifecycle(item) {
 		return
 	}
@@ -239,6 +243,9 @@ func (runner *runner) enqueueHost(item *pendingFrame, sameGenerationOnly bool) {
 }
 
 func (runner *runner) validateHostRequest(frame *parsedFrame) (int, error) {
+	if runner.modern() {
+		return codeInvalidRequest, runner.validateModernHostRequest(frame)
+	}
 	if frame.taskAugmented && !taskRequestSupported(runner.initializeResponse, true, frame.method) {
 		frame.taskAugmented = false
 	}
@@ -286,7 +293,12 @@ func (runner *runner) deliverHostFirst(item *pendingFrame) {
 
 	outcome, err := runner.writeChild(frame.raw)
 	if frame.kind == frameRequest && outcome != writeNotWritten {
-		runner.host.register(frame, runner.current.id)
+		record := runner.host.register(frame, runner.current.id)
+		if runner.modern() {
+			record.initialize = false
+			record.taskAugmented = false
+			record.taskID = ""
+		}
 	}
 	if outcome == writeDelivered && err == nil {
 		return
@@ -405,6 +417,10 @@ func (runner *runner) handleChildFrame(frame *parsedFrame) {
 	}
 	if frame.reserved {
 		runner.handleChildControl(frame)
+		return
+	}
+	if runner.modern() {
+		runner.handleModernChild(frame)
 		return
 	}
 	if runner.state == StateReplaying {
@@ -584,6 +600,10 @@ func (runner *runner) commitQuiescingCancellations() error {
 		if record == nil || record.generation != runner.current.id || record.initialize || record.taskAugmented {
 			continue
 		}
+		if runner.modern() {
+			runner.finishModernRequest(record)
+			continue
+		}
 		if err := runner.host.cancel(record); err != nil {
 			return err
 		}
@@ -603,7 +623,7 @@ func (runner *runner) handleChildControl(frame *parsedFrame) {
 	}
 	switch control {
 	case ControlDormantReady:
-		if runner.state != StateActive || runner.initializeAwaiting || runner.initialized == nil {
+		if runner.state != StateActive || (!runner.modern() && (runner.initializeAwaiting || runner.initialized == nil)) {
 			runner.replaceCurrent(ReasonProtocolFailure)
 			return
 		}

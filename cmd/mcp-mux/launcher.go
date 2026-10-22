@@ -122,6 +122,11 @@ func launcherTracef(format string, args ...any) {
 	if os.Getenv(envLauncherTrace) != "1" {
 		return
 	}
+	for i, value := range args {
+		if invocation, ok := value.([]string); ok {
+			args[i] = launcherTraceArgs(invocation)
+		}
+	}
 	fmt.Fprintf(os.Stderr, "mcp-mux launcher trace: "+format+"\n", args...)
 }
 

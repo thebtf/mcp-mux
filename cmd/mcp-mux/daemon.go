@@ -400,15 +400,7 @@ func spawnViaDaemonWithReasonTimeout(command string, args []string, cwd, mode st
 }
 
 func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, mode string, env map[string]string, reconnectReason, protocolEra string, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
-	if timeout <= 0 {
-		return "", "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
-	}
-	ctlPath := serverid.DaemonControlPath("", engineName)
-
-	// Spawn returns immediately after creating the owner — proactive init runs
-	// in background. 30s timeout covers daemon processing + upstream process start.
-	rpcStart := time.Now()
-	resp, err := control.SendWithTimeout(ctlPath, control.Request{
+	return spawnViaDaemonRequest(control.Request{
 		Cmd:             "spawn",
 		Command:         command,
 		Args:            args,
@@ -417,7 +409,16 @@ func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, m
 		Env:             env,
 		ReconnectReason: reconnectReason,
 		ProtocolEra:     protocolEra,
-	}, timeout)
+	}, logger, timeout)
+}
+
+func spawnViaDaemonRequest(req control.Request, logger *log.Logger, timeout time.Duration) (string, string, string, error) {
+	if timeout <= 0 {
+		return "", "", "", fmt.Errorf("spawn via daemon: reconnect budget exhausted")
+	}
+	ctlPath := serverid.DaemonControlPath("", engineName)
+	rpcStart := time.Now()
+	resp, err := control.SendSpawn(ctlPath, req, timeout)
 	rpcDur := time.Since(rpcStart)
 	if err != nil {
 		logger.Printf("daemon_rpc_spawn status=error duration=%v err=%q", rpcDur, err.Error())
@@ -433,7 +434,7 @@ func spawnViaDaemonWithReasonTimeoutForEra(command string, args []string, cwd, m
 		}
 		return "", "", "", fmt.Errorf("daemon spawn failed: %w", responseErr)
 	}
-	if protocolEra != "" && resp.ProtocolEra != protocolEra {
+	if req.ProtocolEra != "" && resp.ProtocolEra != req.ProtocolEra {
 		return "", "", "", era.NewAdmissionError(era.AdmissionControlEraMismatch)
 	}
 

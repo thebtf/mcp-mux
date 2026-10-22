@@ -234,7 +234,14 @@ func runDaemonRespawnHelperServer(generation int) {
 			}
 			writeDaemonRespawnResult(req.ID, map[string]any{"generation": generation})
 		case "ping":
-			writeDaemonRespawnResult(req.ID, map[string]any{"generation": generation})
+			_, attestationPresent := os.LookupEnv("MCPMUX_LAUNCHER_ATTESTATION")
+			_, protocolPresent := os.LookupEnv("MCPMUX_LAUNCHER_PROTOCOL")
+			writeDaemonRespawnResult(req.ID, map[string]any{
+				"generation":                   generation,
+				"pid":                          os.Getpid(),
+				"launcher_attestation_present": attestationPresent,
+				"launcher_protocol_present":    protocolPresent,
+			})
 		default:
 			writeDaemonRespawnError(req.ID, -32601, "method not found")
 		}

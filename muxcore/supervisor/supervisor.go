@@ -9,6 +9,8 @@ import (
 	"log"
 	"reflect"
 	"time"
+
+	"github.com/thebtf/mcp-mux/muxcore/era"
 )
 
 const (
@@ -197,6 +199,9 @@ type Config struct {
 	HostOut io.Writer
 	Logger  *log.Logger
 
+	// ProtocolEra selects native lifecycle semantics; zero preserves legacy replay.
+	ProtocolEra era.ProtocolEra
+
 	Resolve ResolveFunc
 	Start   StartFunc
 	Observe func(Event)
@@ -220,6 +225,9 @@ type Config struct {
 }
 
 func (cfg Config) withDefaults() (Config, error) {
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		return Config{}, fmt.Errorf("supervisor: %w", err)
+	}
 	if cfg.HostIn == nil {
 		return Config{}, fmt.Errorf("supervisor: host input is nil")
 	}

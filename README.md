@@ -58,8 +58,8 @@ Result: one upstream process per server instead of N — approximately 3x memory
 
 ## Quick Start
 
-The prepared binary target is **v0.31.0**. After publication, use the
-[v0.31.0 release](https://github.com/thebtf/mcp-mux/releases/tag/v0.31.0).
+This documentation targets **v0.32.0**:
+[version-specific release page](https://github.com/thebtf/mcp-mux/releases/tag/v0.32.0).
 The build commands below are source builds, not delivered-artifact proof.
 
 **1. Build**
@@ -114,6 +114,9 @@ daemon, and proxies all MCP traffic transparently.
 
 ## Sharing Modes
 
+The table below describes the legacy route. Modern callers use isolated R1
+unless they explicitly opt into [R2 exact-context sharing](#modern-r2-opt-in-exact-context-sharing).
+
 | Mode | Behavior | Use When |
 |------|----------|----------|
 | `shared` (default) | One upstream serves all sessions. Responses to `initialize`, `tools/list`, `prompts/list`, and `resources/list` are cached and replayed without a round-trip. | Stateless servers: search, docs, LLM proxy. |
@@ -129,6 +132,78 @@ MCP_MUX_ISOLATED=1 mcp-mux uvx my-server
 # CLI flag (equivalent)
 mcp-mux --isolated uvx my-server
 ```
+
+### Serena: fixed-project stdio configuration
+
+Serena keeps one active project per process. In the legacy route, an advertised
+`activate_project` tool matches mcp-mux's isolation heuristic unless an
+authoritative `x-mux` declaration overrides it. Switching that project in a
+shared process would also change the project seen by the other clients.
+
+For clients that all work on one fixed project, Serena documents a different
+configuration: combine `--context ide` (or `--context claude-code`) with an
+explicit `--project` at startup. In these single-project contexts, Serena
+disables `activate_project`; the context alone is not enough. See Serena's
+[project activation](https://oraios.github.io/serena/02-usage/040_workflow.html#project-activation)
+and [context configuration](https://oraios.github.io/serena/02-usage/050_configuration.html#contexts).
+
+The examples below explicitly select `--agent-interface tools`. Serena also
+has a [REPL interface](https://oraios.github.io/serena/02-usage/050_configuration.html#agent-interfaces),
+which exposes operations through `serena_repl` rather than separate symbol
+tools. With that interface, absence of an advertised `activate_project` alone
+does not establish a fixed project or safe sharing: the mux's tool-name
+heuristic does not inspect operations inside the REPL. Keep mutable-project
+instances isolated rather than relying on that absence.
+
+With Serena installed and `serena` available to the host, use this `.mcp.json`
+entry. Replace the project path with the same absolute project directory for
+every client:
+
+```json
+{
+  "mcpServers": {
+    "serena": {
+      "command": "mcp-mux",
+      "args": [
+        "serena",
+        "start-mcp-server",
+        "--agent-interface", "tools",
+        "--context", "ide",
+        "--project", "D:/Dev/my-project",
+        "--open-web-dashboard", "false"
+      ],
+      "env": {
+        "MCP_MUX_DEFAULT_MODE": "cwd"
+      }
+    }
+  }
+}
+```
+
+This uses Serena's default stdio transport. Keep the upstream command, complete
+ordered argument list (including context and project path), project binding,
+and relevant environment consistent across clients. With this `cwd` setting,
+launch the clients from the same canonical working directory as well. Use a
+separate configuration and owner for each different project or worktree; do
+not substitute `--project-from-cwd` when the intended binding is explicit.
+
+`MCP_MUX_DEFAULT_MODE=cwd` selects legacy per-working-directory owner identity.
+It is not a `--sharing` flag, does not force the `shared` classification, and
+does not disable isolation. Removing `activate_project` removes that heuristic
+trigger only; other tool-name matches, an `x-mux` declaration, or explicit
+isolation still apply. Modern R1 remains forced-isolated even with this
+fixed-project configuration; see [Modern R1](#modern-r1-mcp-2026-07-28).
+
+**Support boundary:** Serena explicitly documents
+[multiple clients sharing one project over HTTP](https://oraios.github.io/serena/02-usage/020_running.html#streamable-http-mode)
+and recommends separate instances for different projects. The fixed-project
+stdio-through-mux configuration above is an inference from those Serena
+semantics and mcp-mux's source classification/identity rules, not documented
+Serena support for mcp-mux. It does not make Serena session-aware: active
+project, modes, memories, and edits are not private per client. Do not switch
+shared process configuration independently or assume concurrent edits are
+isolated. The [smoke procedure](#smoke-testing) below is not a recorded local
+runtime result or a Serena memory-savings benchmark.
 
 ## Modern R1 (MCP 2026-07-28)
 
@@ -177,6 +252,76 @@ To roll back an R1 configuration:
 3. Start a new host connection with the legacy configuration. Never downgrade a live R1 owner or replay old requests or subscriptions.
 
 A refused, absent, or mismatched era confirmation means modern admission failed. Do not retry the same route as legacy.
+
+## Modern R2: opt-in exact-context sharing
+
+R2 is introduced in **v0.32.0**, separate from isolated R1. Use it only
+with a known MCP `2026-07-28` host and same-era upstream whose application state
+is safe for the intended clients to share. Select all three options before the
+upstream command:
+
+```sh
+mcp-mux --mcp-protocol=2026-07-28 --mcp-sharing=shared \
+  --mcp-partition=partition-01 my-modern-server --stdio
+```
+
+The stable launcher and engine use the same top-level option parser. Wrapper
+options are validated before a child starts; parsing stops at the first
+upstream command, so that command's own flags cannot select the wrapper era.
+Payload metadata, `clientInfo`, and `--stateless` do not select it either.
+
+Replace `partition-01` with a stable, non-secret opaque key for the actual
+authorization/tenant boundary. It is an explicit assertion by the caller, not
+a credential or a mechanism for making an unsafe application shareable. Do not
+use a universal key when that boundary is unknown. CLI shared mode requires a
+nonempty key and the explicit modern era; a key without shared mode is an error.
+Without sharing opt-in, modern callers remain R1 isolated. Explicit isolation
+wins over sharing opt-in.
+
+Shared admission requires the same protocol era, normalized upstream command,
+complete ordered arguments, canonical CWD, **all normalized effective upstream
+environment entries**, and known partition key. A difference in any of these
+facts separates owners. Explicit modern sharing in the CLI and engine
+normalizes inherited `cwd`/`git` identity settings to the internal `global`
+mode; explicit isolation still wins. Despite the internal mode name, R2 never
+shares across different canonical CWDs. No environment/profile change is needed
+to opt in, and existing legacy and isolated R1 behavior remains unchanged.
+
+The effective upstream environment excludes only the controller advertisements
+`MCPMUX_LAUNCHER_ATTESTATION` and `MCPMUX_LAUNCHER_PROTOCOL`, which are not
+delivered to upstream processes. Every other effective environment entry still
+participates in compatibility; this is not a broad transient-variable whitelist.
+
+The daemon validates an opaque, short-lived binding for the exact admission
+before reusing an owner. Reconnect goes through fresh admission rather than
+reusing a raw refresh token. For library callers, `engine.Config.ModernSharing`
+and `PartitionResolver` provide the opt-in; an absent or unknown resolver result
+keeps R1 isolation. See the [library contract](muxcore/README.md#v0320--r2-exact-context-modern-sharing)
+and [protocol details](docs/mux-protocol.md#mcp-2026-07-28-r2-exact-context-sharing).
+
+R2 correlates request IDs, progress tokens, subscriptions, and cancellations to
+the originating session and upstream generation; it does not broadcast unknown
+or stale notifications. A request containing
+`params._meta.io.modelcontextprotocol/logLevel` receives JSON-RPC `-32602`
+before upstream forwarding. Use isolated R1 when request-scoped logging is
+needed. R1's existing wire bytes and logging behavior are unchanged.
+
+The stable launcher also uses explicit modern supervisor semantics: native
+frames do not trigger legacy initialization or handshake replay. Generation
+loss fails written or uncertain requests once; only definitely unwritten
+first-delivery FIFO entries can remain queued. Active RPCs and subscriptions
+block verified dormancy, and a fresh modern wake sends no legacy initialize.
+See the [supervisor contract](muxcore/README.md#stable-stdio-supervisor-v029x).
+
+Shared owners report `sharing_policy: "shared-exact-context"`; the modern
+`cache_policy: "off"` and `lifecycle_policy: "r1-quarantine"` remain unchanged.
+Managed owner restart retains the admitted sharing policy and partition but
+obtains a fresh nonce and binding; it does not replay old work. Modern cache,
+legacy bootstrap, replay, and persisted snapshot/handoff recovery stay disabled.
+After loss, hosts issue fresh requests and re-listen for subscriptions. R2 is
+not load balancing, era translation, or virtualization of arbitrary mutable
+application state. This configuration reference is not a full-protocol,
+release, Windows-runtime, or memory-savings proof.
 
 ## Auto-Classification
 
@@ -282,14 +427,14 @@ it opening automatically, pass `--open-web-dashboard false` to Serena's
 
 Standalone upstream launches through `MCP_MUX_NO_DAEMON=1`, `MCP_MUX_DAEMON`, or
 the direct-owner `--daemon` path are explicitly `maintenance_unsupported` in
-v0.31.0. Keep managed daemon admission enabled; direct execution is not a
+v0.31.0 and newer. Keep managed daemon admission enabled; direct execution is not a
 maintenance bypass.
 
 ## Hold an upstream for executable replacement
 
-v0.31.0 adds optional maintenance-aware managed hold, resume, and renew operations.
-Use an aware binary, daemon, and shim together. Publication and consumer handoff
-remain pending; older installed tags do not acquire maintenance support.
+Managed hold, resume, and renew operations were introduced in v0.31.0.
+Use a maintenance-aware binary, daemon, and shim together, all v0.31.0 or newer;
+older installed versions do not acquire maintenance support.
 
 Read the exact `server_id` from local `mcp-mux status`. Flags follow the identifier:
 
@@ -795,12 +940,12 @@ executable swapping. Windows verifies the named-pipe server with
 including BSD targets without both proofs, fail closed and never emit private
 dormant frames.
 
-The prepared current library target is `muxcore/v0.31.0`, which adds optional
-managed maintenance to the existing stable stdio supervisor and explicit native
-MCP `2026-07-28` route. After publication and Go proxy tag resolution, pin:
+The library target for this documentation is `muxcore/v0.32.0`, adding optional
+exact-context modern sharing while retaining managed maintenance, the stable
+stdio supervisor, and the explicit isolated R1 route. Pin the module version:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.32.0
 ```
 
 Ordinary legacy `engine.New` consumers require no source changes. Use
@@ -931,30 +1076,63 @@ migration path: [`docs/mux-protocol.md`](docs/mux-protocol.md).
 
 ## Smoke Testing
 
-mcp-mux includes a smoke test that validates mux-specific behavior with real upstream servers:
+The existing helper exercises the **legacy** daemon route with real upstreams.
+It sends `initialize` with MCP `2025-11-25` and requests `cwd` owner identity
+directly; it does not test modern R1 or the CLI environment-mode parser.
+
+Run these POSIX-shell examples (including Git Bash) from the repository root,
+with Serena installed, the project directories present, and the managed daemon
+already running, for example after a host has connected through mcp-mux. Replace
+the paths with your projects. Do not run the mutable-project cases against an
+owner used by another live client.
 
 ```sh
-# Basic: verify serena works through mux
+# Mutable-project context: activate_project remains available, so expect isolation.
 SMOKE_CWD=D:/Dev/my-project SMOKE_EXPECT=isolated \
-  go run testdata/smoke_isolated.go uvx --from git+https://github.com/oraios/serena \
-  serena start-mcp-server --project-from-cwd
+  go run testdata/smoke_isolated.go serena start-mcp-server \
+  --agent-interface tools --context desktop-app --project-from-cwd \
+  --open-web-dashboard false
 
-# Isolation check: two projects get separate owners
+# Mutable-project context: different working directories must get separate owners.
 SMOKE_CWD=D:/Dev/project-a SMOKE_CWD2=D:/Dev/project-b SMOKE_EXPECT=isolated \
-  go run testdata/smoke_isolated.go uvx --from serena ...
+  go run testdata/smoke_isolated.go serena start-mcp-server \
+  --agent-interface tools --context desktop-app --project-from-cwd \
+  --open-web-dashboard false
 
-# With tool call
-SMOKE_CWD=D:/Dev/my-project SMOKE_TOOL=activate_project \
-  go run testdata/smoke_isolated.go uvx --from serena ...
+# Fixed-project context: check shared classification, not simultaneous host sharing.
+SMOKE_CWD=D:/Dev/my-project SMOKE_EXPECT=shared \
+  go run testdata/smoke_isolated.go serena start-mcp-server \
+  --agent-interface tools --context ide --project D:/Dev/my-project \
+  --open-web-dashboard false
 ```
 
-**What it validates** (mux behavior, not upstream correctness):
+The fixed-project expectation assumes Serena advertises no other isolation
+patterns and no overriding `x-mux` declaration. If it is classified differently,
+inspect the advertised tools and capabilities; do not force sharing to bypass
+mutable state.
 
-- Spawn via daemon with proactive init
-- Classification matches expected mode
-- Session isolation: different cwds → different owners for isolated servers
-- Init response forwarded correctly through mux
-- Optional: tool call forwarded and response returned
+**What the helper checks** (mux behavior, not upstream semantic correctness):
+
+- Spawn via daemon with proactive initialization.
+- Classification matches `SMOKE_EXPECT`.
+- Different working directories get separate owners when classified `isolated`.
+- Initialization and `tools/list` responses reach the helper.
+- Optionally, `SMOKE_TOOL` and JSON `SMOKE_TOOL_ARGS` exercise a tool round trip;
+  inspect the tool result separately for application-level errors.
+
+The helper does not keep two real host sessions attached simultaneously or
+assert shared-owner reuse as a failure condition. To check the fixed-project
+configuration end to end, connect two hosts with the identical entry above
+from the same working directory. Confirm the advertised tools include symbol
+tools such as `get_symbols_overview`, not just `serena_repl`, and exclude
+`activate_project`. Then issue a read-only symbol query from each host.
+While both are attached, use `mcp-mux status` to inspect whether they share one
+owner and one nonzero `upstream_pid`. A cache-only owner with PID zero is not
+evidence of a running shared upstream.
+
+These are instructions, not results from a local run. Neither classification
+nor a shared PID measures RAM savings or proves that mutable Serena state is
+isolated between clients.
 
 ## Contributing
 

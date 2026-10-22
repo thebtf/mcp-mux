@@ -108,13 +108,15 @@ func main() {
 		}
 	}
 
-	isolated := flag.Bool("isolated", false, "Run in isolated mode (dedicated upstream per client)")
-	stateless := flag.Bool("stateless", false, "Ignore cwd in server identity (for stateless servers like time, tavily)")
-	standalone := flag.Bool("daemon", false, "Unsupported: direct headless owners require managed admission")
-	mcpProtocol := flag.String("mcp-protocol", "", "MCP protocol era (2026-07-28)")
-	flag.Parse()
-
-	args := flag.Args()
+	options, err := parseWrapperOptions(os.Args[1:], os.Stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	args := options.Args
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: mcp-mux [flags] <command> [args...]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux stop [--drain-timeout 30s] [--force]")
@@ -125,59 +127,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
 		os.Exit(1)
 	}
-	protocolEra, err := era.ParseProtocolEra(*mcpProtocol)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: unsupported MCP protocol %q\n", *mcpProtocol)
-		os.Exit(1)
-	}
-	protocolWire, err := protocolEra.Wire()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: protocol era: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Determine sharing mode — env vars take precedence over flags.
-	//
-	// Default flipped from ModeCwd to ModeGlobal in CR-002 (muxcore-global-
-	// first-identity). Original intent of mcp-mux was "one upstream per
-	// (cmd, args), isolation as exception" but the historical ModeCwd
-	// default produced one upstream per (cmd, args, cwd) and defeated that
-	// intent (Engram #244 Bug 1). The new ModeGlobal default restores it:
-	// post-init tools/list classification (handled daemon-side) splits
-	// genuinely-isolated upstreams off via the admission gate; everything
-	// else shares one upstream per (cmd, args).
-	//
-	// Escape valve: set MCP_MUX_DEFAULT_MODE=cwd to revert to legacy
-	// per-cwd behavior (D1 If-Wrong pivot from the spec — emergency
-	// rollback without redeploy).
-	mode := serverid.ModeGlobal
-	if envMode := strings.TrimSpace(strings.ToLower(os.Getenv("MCP_MUX_DEFAULT_MODE"))); envMode != "" {
-		switch envMode {
-		case "cwd":
-			mode = serverid.ModeCwd
-		case "git":
-			mode = serverid.ModeGit
-		case "global":
-			mode = serverid.ModeGlobal
-		case "isolated":
-			mode = serverid.ModeIsolated
-		}
-	}
-	if *stateless || os.Getenv("MCP_MUX_STATELESS") == "1" {
-		mode = serverid.ModeGlobal
-	}
-	if *isolated || os.Getenv("MCP_MUX_ISOLATED") == "1" {
-		mode = serverid.ModeIsolated
-	}
-	if os.Getenv("MCP_MUX_ISOLATED") == "1" {
-		*isolated = true
-	}
-	if os.Getenv("MCP_MUX_DAEMON") == "1" {
-		*standalone = true
-	}
+	protocolEra, protocolWire := options.ProtocolEra, options.ProtocolWire
+	mode := options.Mode
+	modernSharing, partition := options.ModernSharing, options.Partition
+	standalone := options.Standalone || os.Getenv("MCP_MUX_DAEMON") == "1"
 
 	noDaemon := os.Getenv("MCP_MUX_NO_DAEMON") == "1"
-	if err := standaloneAdmissionError(noDaemon, *standalone); err != nil {
+	if err := standaloneAdmissionError(noDaemon, standalone); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s: standalone owners require daemon-managed admission\n", lifecycleErrorText(err))
 		os.Exit(1)
 	}
@@ -254,7 +210,11 @@ func main() {
 			modeStr := string(mode)
 			shimEnv := collectEnv()
 			spawnStart := time.Now()
-			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonForEra(command, cmdArgs, cwd, modeStr, shimEnv, protocolWire, logger)
+			spawnRequest := control.Request{
+				Cmd: "spawn", Command: command, Args: cmdArgs, Cwd: cwd, Mode: modeStr, Env: shimEnv,
+				ProtocolEra: protocolWire, ModernSharing: modernSharing, Partition: partition,
+			}
+			daemonIPC, daemonServerID, daemonToken, err := spawnViaDaemonRequest(spawnRequest, logger, defaultDaemonSpawnTimeout)
 			held := errors.Is(err, control.ErrMaintenanceHeld) || errors.Is(err, control.ErrMaintenanceRetirementBlocked) || errors.Is(err, control.ErrMaintenancePersistenceFailed)
 			if err != nil && !held {
 				if errors.Is(err, era.AdmissionControlEraMismatch) {
@@ -287,6 +247,16 @@ func main() {
 					if err := ensureDaemon(logger); err != nil {
 						return "", "", supervisedDaemonReconnectError(err)
 					}
+					if modernSharing {
+						request := spawnRequest
+						request.ReconnectReason = "refresh"
+						newIPC, newServerID, newToken, err := spawnViaDaemonRequest(request, logger, defaultDaemonSpawnTimeout)
+						if err != nil {
+							return "", "", err
+						}
+						currentIPC, currentServerID, currentToken = newIPC, newServerID, newToken
+						return newIPC, newToken, nil
+					}
 					newToken, err := refreshTokenViaDaemon(currentToken, protocolWire, logger)
 					if err != nil {
 						return "", "", err
@@ -313,7 +283,9 @@ func main() {
 							}
 							return "", "", supervisedDaemonReconnectError(err)
 						}
-						newIPC, newServerID, newToken, err := spawnViaDaemonWithReasonTimeoutForEra(command, cmdArgs, cwd, modeStr, shimEnv, "fallback_spawn", protocolWire, logger, time.Until(deadline))
+						request := spawnRequest
+						request.ReconnectReason = "fallback_spawn"
+						newIPC, newServerID, newToken, err := spawnViaDaemonRequest(request, logger, time.Until(deadline))
 						if err != nil {
 							if isTransientDaemonReconnectErr(err) && time.Now().Before(deadline) {
 								logger.Printf("shim.reconnect.fallback_spawn transient=%q retrying", err.Error())

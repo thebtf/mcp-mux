@@ -14,9 +14,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/internal/envidentity"
 	"github.com/thebtf/mcp-mux/muxcore/procgroup"
 )
 
@@ -289,6 +291,7 @@ func (p *Process) SetDrainTimeout(d time.Duration) {
 // Start spawns an upstream process with the given command, args, environment, and working directory.
 // When env is non-empty, it is used as the complete process environment (converted from map to slice).
 // When env is nil/empty, the current process environment (os.Environ()) is used as fallback.
+// Controller-only launcher advertisements are excluded from either environment.
 // If cwd is non-empty, the child process runs in that directory.
 //
 // If logger is non-nil, upstream stderr is forwarded to it (one log.Printf per line,
@@ -311,12 +314,22 @@ func Start(command string, args []string, env map[string]string, cwd string, log
 		// Full session env provided — use it directly, no os.Environ() merge.
 		merged = make([]string, 0, len(env))
 		for k, v := range env {
+			if envidentity.IsLauncherAdvertisement(k) {
+				continue
+			}
 			merged = append(merged, fmt.Sprintf("%s=%s", k, v))
 		}
 	} else {
 		// No session env (nil map) — fallback to daemon process env.
 		// This covers owners created without spawn request (tests, direct construction).
-		merged = os.Environ()
+		inherited := os.Environ()
+		merged = inherited[:0]
+		for _, entry := range inherited {
+			key, _, _ := strings.Cut(entry, "=")
+			if !envidentity.IsLauncherAdvertisement(key) {
+				merged = append(merged, entry)
+			}
+		}
 	}
 
 	p := &Process{

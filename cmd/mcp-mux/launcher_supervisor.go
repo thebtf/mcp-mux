@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/supervisor"
 	"github.com/thebtf/mcp-mux/muxcore/supervisor/attest"
 )
@@ -28,6 +30,7 @@ type launcherSupervisorConfig struct {
 	LauncherPath        string
 	InitialEnginePath   string
 	Args                []string
+	ProtocolEra         era.ProtocolEra
 	Stdin               io.ReadCloser
 	Stdout              io.Writer
 	Stderr              io.Writer
@@ -72,6 +75,9 @@ func shouldSuperviseEngineProcess(args []string) bool {
 
 func runLauncherStdioSupervisor(cfg launcherSupervisorConfig) int {
 	if err := runLauncherStdioSupervisorErr(cfg); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		stderr := cfg.Stderr
 		if stderr == nil {
 			stderr = io.Discard
@@ -83,6 +89,17 @@ func runLauncherStdioSupervisor(cfg launcherSupervisorConfig) int {
 }
 
 func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
+	options, err := parseWrapperOptions(cfg.Args, cfg.Stderr)
+	if err != nil {
+		return err
+	}
+	if _, err := cfg.ProtocolEra.Wire(); err != nil {
+		return err
+	}
+	if cfg.ProtocolEra != era.EraLegacy && cfg.ProtocolEra != options.ProtocolEra {
+		return errors.New("launcher protocol era does not match its explicit CLI option")
+	}
+	cfg.ProtocolEra = options.ProtocolEra
 	if cfg.Stdin == nil {
 		return errors.New("stdin is nil")
 	}
@@ -130,6 +147,7 @@ func runLauncherStdioSupervisorErr(cfg launcherSupervisorConfig) error {
 	return supervisor.Run(context.Background(), supervisor.Config{
 		HostIn:                   cfg.Stdin,
 		HostOut:                  cfg.Stdout,
+		ProtocolEra:              cfg.ProtocolEra,
 		Resolve:                  resolve,
 		Start:                    start,
 		Observe:                  observeLauncherSupervisor,

@@ -1653,7 +1653,7 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 	}
 
 	published := false
-	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped, func(proc *upstream.Process) {
+	usedProc, writeErr := o.writeUpstreamFromCurrent(remapped, func(proc *upstream.Process) error {
 		inflight.process.Store(proc)
 		o.pendingRequests.Add(1)
 		o.inflightTracker.Store(string(newID), inflight)
@@ -1671,6 +1671,7 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 			o.startToolWatchdog(string(newID), msg.ID, s, msg.Method)
 		}
 		published = true
+		return nil
 	})
 	if writeErr != nil {
 		if isMaintenanceFence(writeErr) {
@@ -1693,55 +1694,43 @@ func (o *Owner) forwardRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstr
 }
 
 func (o *Owner) forwardModernRequestPrepared(s *Session, msg *jsonrpc.Message) (*upstream.Process, bool, error) {
-	inflight := &InflightRequest{
-		Method:        msg.Method,
-		Tool:          extractToolName(msg.Raw),
-		SessionID:     s.ID,
-		StartTime:     time.Now(),
-		logSubscribed: modernLogSubscribed(msg.Raw),
+	if o.modernShared && modernHasLogLevel(msg.Raw) {
+		return nil, false, o.rejectModernSharedLogging(s, msg.ID)
 	}
-	key := string(msg.ID)
+	r, raw, err := o.prepareModernRequest(s, msg)
+	if err != nil {
+		return nil, false, err
+	}
 	published := false
-	usedProc, writeErr := o.writeUpstreamFromCurrent(msg.Raw, func(proc *upstream.Process) {
-		inflight.process.Store(proc)
-		o.pendingRequests.Add(1)
-		o.inflightTracker.Store(key, inflight)
-		o.trackProgressToken(s.ID, key, msg.Raw)
+	usedProc, writeErr := o.writeUpstreamFromCurrent(raw, func(proc *upstream.Process) error {
+		if err := o.publishModernRequest(r, proc); err != nil {
+			return err
+		}
 		published = true
+		return nil
 	})
+	r.mu.Lock()
+	r.releaseWriteLocked()
+	r.mu.Unlock()
 	if writeErr == nil {
 		return usedProc, false, nil
 	}
 	if isMaintenanceFence(writeErr) {
 		return usedProc, false, writeErr
 	}
-
-	o.logger.Printf("session %d: native upstream write failed for request id=%s: %v", s.ID, key, writeErr)
-	if published && o.claimModernInflight(key, inflight, nil) {
-		o.clearModernInflightState(key)
-		_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+	if errors.Is(writeErr, errModernRouteUnavailable) {
+		return usedProc, false, o.writeDemandError(s, msg.ID, writeErr.Error())
 	}
-	if !published {
-		_ = o.writeDemandError(s, msg.ID, "upstream write failed")
+	if published {
+		r.mu.Lock()
+		claimed := o.finishModernRequest(r)
+		r.mu.Unlock()
+		if !claimed {
+			return usedProc, true, nil
+		}
 	}
+	_ = o.writeDemandError(s, msg.ID, "upstream write failed")
 	return usedProc, true, nil
-}
-
-func modernLogSubscribed(raw []byte) bool {
-	var request struct {
-		Params struct {
-			Meta map[string]json.RawMessage `json:"_meta"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal(raw, &request); err != nil {
-		return false
-	}
-	rawLevel, ok := request.Params.Meta["io.modelcontextprotocol/logLevel"]
-	if !ok {
-		return false
-	}
-	var level string
-	return json.Unmarshal(rawLevel, &level) == nil && level != "" && level != "off"
 }
 
 func (o *Owner) ensureUpstreamReadyForRequest() error {

@@ -12,16 +12,71 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-Install the prepared v0.31.0 target after publication and Go proxy tag resolution:
+The module version targeted by this documentation is `muxcore/v0.32.0`:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.32.0
 ```
 
-v0.31.0 adds optional managed upstream maintenance while retaining the released
-legacy path as the zero-value default and modern R1 as an explicit isolated route.
-Ordinary legacy `engine.New` users need no source or configuration changes.
-Publication, delivered-artifact proof, and Engram consumer handoff remain pending.
+v0.32.0 adds optional exact-context modern sharing while retaining managed
+upstream maintenance (introduced in v0.31.0), the legacy zero-value default,
+and isolated R1. Ordinary legacy `engine.New` users need no source or
+configuration changes.
+
+### v0.32.0 — R2 exact-context modern sharing
+
+The following optional APIs are introduced in v0.32.0. Legacy callers remain
+unchanged; selecting only `era.PolicyModern20260728` still uses forced-isolated R1.
+
+| API | Contract |
+| --- | --- |
+| `engine.Config.ModernSharing bool` | Explicit sharing opt-in. Requires `ProtocolPolicy: era.PolicyModern20260728`; the zero value keeps R1 isolation. |
+| `engine.Config.PartitionResolver func(context.Context, muxcore.ProjectContext) (control.PartitionAssertion, error)` | Resolve the product's stable non-secret authorization/tenant partition before each admission, including reconnect. A nil resolver or unknown assertion retains isolated R1. Errors and panics refuse admission with redacted errors. |
+| `control.PartitionAssertion{Known bool, Key string}` | Known requires a nonempty stable opaque key. Unknown is `{Known: false, Key: ""}`. Other Known/Key combinations are invalid. This is a product assertion, not authentication or an application-state sandbox. |
+| `control.Request.ModernSharing` and `Partition *control.PartitionAssertion` | Lower-level wire opt-in and partition assertion. Prefer the engine; direct control users use `control.SendSpawn` for preparation plus spawn. |
+| `owner.OwnerConfig.ModernShared` | Daemon-approved owner integration only; do not set it to bypass exact-context admission. |
+
+Use `ModernSharing: true` only when the product can establish the actual
+partition and the upstream's application state is safe to share. Do not return
+a universal key for unknown authorization. Explicit isolation wins. The engine
+normalizes inherited `cwd`/`git` identity settings to internal `global` mode
+for explicit modern sharing. Direct shared control admission accepts only
+empty/`global` mode; it does not normalize private-wire `cwd`/`git` requests.
+Legacy and isolated R1 behavior remains unchanged, with no profile edit needed.
+
+The daemon validates an opaque 30-second `prepare_modern_sharing` binding for
+the exact daemon, spawn nonce, era, normalized command, ordered arguments,
+canonical CWD, **all normalized effective upstream environment entries**, and
+partition. Exact-compatible admissions reuse the existing owner and creation
+placeholder authority. A difference in CWD, environment, partition, command,
+or arguments separates owners even though the internal mode is `global`.
+Only `MCPMUX_LAUNCHER_ATTESTATION` and `MCPMUX_LAUNCHER_PROTOCOL` are excluded
+from the effective upstream environment; neither is delivered upstream, even
+with inherited-environment fallback. This is not a transient-variable whitelist.
+No key, raw environment, compatibility digest, or admission binding appears
+in status. Reconnect re-resolves and re-admits; raw token refresh cannot bypass
+this path. Managed `restart_owner` retains the admitted partition and sharing
+policy but obtains a fresh nonce and binding, without replaying old work.
+
+Shared modern owners correlate IDs, progress, subscription acknowledgements
+and filters, subscription metadata, and cancellations to the originating
+session and upstream generation. Terminal result/cancel/subscription end,
+detach, and generation loss remove that correlation once. Unknown or stale
+notifications are not broadcast. Opaque MRTR `requestState` and `inputResponses`
+remain unchanged application data; retries use fresh request IDs.
+
+A shared request containing `params._meta.io.modelcontextprotocol/logLevel`
+returns `-32602` before upstream work. Keep ordinary request-scoped logging
+on the isolated R1 route. R1 bytes and logging behavior remain unchanged.
+Modern cache, templates, legacy bootstrap, replay, and persisted
+snapshot/handoff recovery stay disabled under the existing lifecycle gates.
+Status reports `sharing_policy=shared-exact-context`, `cache_policy=off`, and
+the retained `lifecycle_policy=r1-quarantine` label.
+
+Before integrating or changing lower-level R2 admission or routing, read the
+[protocol contract](../docs/mux-protocol.md#mcp-2026-07-28-r2-exact-context-sharing).
+R2 does not virtualize arbitrary application state, balance requests across
+upstreams, translate protocol eras, or prove production memory savings.
 
 ### v0.31.0 - optional managed upstream maintenance
 
@@ -504,12 +559,27 @@ network calls, database writes, or heavy policy evaluation in this hook.
 
 `muxcore/supervisor` is the public boundary for products whose MCP host keeps
 one stdio transport open while the product replaces a child engine executable.
-Introduced in `muxcore/v0.29.0`. For the current prepared release, after
-publication and Go proxy tag resolution, pin `muxcore/v0.31.0` with:
+Introduced in `muxcore/v0.29.0`. The current documentation target is
+`muxcore/v0.32.0`; pin it with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.31.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.32.0
 ```
+
+`supervisor.Config.ProtocolEra` selects lifecycle semantics independently of
+sharing. Its zero value is legacy. For a known native MCP `2026-07-28` host and
+child, set it explicitly to `era.EraModern20260728`; neither payload metadata
+nor `clientInfo` selects it. The mcp-mux stable launcher obtains the era from
+the same validated top-level wrapper options as the engine, before child
+startup; parsing stops at the upstream command.
+
+The modern path preserves raw native frames and skips legacy initialization,
+handshake replay, and synthesized legacy list changes. After generation loss,
+written or uncertain RPCs/subscriptions fail once by original ID; only
+definitely unwritten bounded FIFO entries remain eligible for first delivery.
+Active RPC or subscription correlation prevents verified dormancy. A fresh
+modern child/wake requires no legacy initialize. The same single-child and
+full process-tree retirement authority applies; no old work replays.
 
 Minimal ordinary-supervision shape:
 
@@ -551,17 +621,17 @@ The supervisor guarantees:
 - strict bounded newline-delimited JSON-RPC/MCP validation in both directions;
 - count-and-byte bounded first-delivery FIFO while a child starts, replays,
   finalizes, quiesces, or is dormant;
-- replay of only the cached `initialize` / `notifications/initialized`
-  handshake, while lifecycle-permitted client/server pings remain correlated
-  and server logging prelude preserves order;
+- on the legacy path, replay of only the cached `initialize` /
+  `notifications/initialized` handshake, while lifecycle-permitted client/server
+  pings remain correlated and server logging prelude preserves order;
 - explicit original-ID errors for delivered requests lost on a generation
   change;
-- generation-safe request, cancellation, progress-token, and MCP task
-  correlation;
+- generation-safe request, cancellation, and progress-token correlation;
+  MCP task correlation belongs to the legacy path;
 - full Unix process-group or Windows Job Object retirement before a successor
   starts when `StartCommand` is used;
-- optional tools/prompts/resources list-change notifications after replacement,
-  gated by the initialize capability contract already visible to the host.
+- on the legacy path, optional tools/prompts/resources list-change notifications
+  after replacement, gated by the initialize capability contract visible to the host.
 
 When `Start` reports a fallback whose `Actual` identity differs from the
 `requested` identity, reconciliation compares later `Resolve` results with the
@@ -582,9 +652,9 @@ than permitting overlapping child authorities, and `StartFunc` must honor its
 context and roll back partial authority. If rollback cannot be proven and no
 partial `StartResult` is available for `Run` to finalize, return
 `supervisor.ErrStartRollbackUnproven`; the supervisor terminates instead of
-retrying into a second authority. `ReplayTimeout` bounds both the first
-`initialize` response and replacement handshake replay. `DormantExitTimeout`
-bounds the ACK/NACK response to `commit-dormant` and is then re-armed for the
+retrying into a second authority. On the legacy path, `ReplayTimeout` bounds
+both the first `initialize` response and replacement handshake replay.
+`DormantExitTimeout` bounds the ACK/NACK response to `commit-dormant` and is then re-armed for the
 post-ACK exit/output-drain proof. Built-in lifecycle logs contain only
 generation, state, finite reason, and fallback status; opaque engine identities
 are exposed only to an explicitly configured `Observe` callback.
