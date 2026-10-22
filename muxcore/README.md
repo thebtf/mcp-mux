@@ -12,16 +12,18 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-The module version targeted by this documentation is `muxcore/v0.32.0`:
+The module version targeted by this documentation is `muxcore/v0.33.0`:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.32.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.33.0
 ```
 
-v0.32.0 adds optional exact-context modern sharing while retaining managed
-upstream maintenance (introduced in v0.31.0), the legacy zero-value default,
-and isolated R1. Ordinary legacy `engine.New` users need no source or
-configuration changes.
+v0.33.0 adds exact-session lifecycle/authorization metadata and opt-in per-owner
+callback limits. See [consumer adoption](#v0330--exact-session-lifecycle-and-callback-admission)
+for the required integration changes. Existing interfaces and nil/zero defaults
+remain compatible; a dependency bump alone does not migrate consumer quota tracking
+or enable bounds. R2 exact-context modern sharing, managed upstream maintenance,
+legacy defaults, and isolated R1 remain available as documented below.
 
 ### v0.32.0 — R2 exact-context modern sharing
 
@@ -503,14 +505,108 @@ Important rules:
 `ConnInfo` zero values are meaningful: `PeerPid == 0` and `PeerUid == 0` mean
 "unavailable", not PID 0 or root.
 
+### v0.33.0 — exact-session lifecycle and callback admission
+
+Exact-session lifecycle metadata and callback limits are additive, opt-in APIs.
+Existing interfaces and nil callbacks remain source-compatible, and existing
+zero-value concurrency settings remain unlimited. Full adoption requires both
+`AuthorizeSessionWithSessionMeta` and `ProjectLifecycleWithSessionMeta` keyed by
+`SessionMeta.SessionID`, plus explicit request/notification limits such as 64/64.
+A dependency bump alone cannot fix a consumer's project-only FIFO reservation
+tracker or enable these bounds. This is integration guidance, not a claim that
+AIMUX or Engram has already adopted the APIs.
+
+`SessionMeta.SessionID` is an opaque, nonempty identifier unique to each
+connection/admission, including sessions without an authorizer. The same ID is
+available before authorization and through connect, request, notification, and
+disconnect callbacks. Reconnect gets a fresh ID. It is neither authorization nor
+a persisted identity; do not substitute `project.ID`, tenant, or peer PID for it.
+Preauthorization metadata has no tenant/time stamp; `AuthAllow` later stamps
+`TenantID` and `AuthorizedAt` without changing `SessionID`.
+
+Add the upgraded lifecycle methods to your existing handler, retaining its
+request/notification implementations. In this integration fragment, `handler`
+is that server and its `quotas` field is your concurrency-safe product ledger,
+not a muxcore API. `AuthorizeAndReserve` returns `muxcore.SessionAuth` and must
+atomically authorize and reserve by the exact `sessionID`; denial or panic must
+not leave a reservation. `MarkConnected` activates that reservation, and
+`Release` removes only that ID, including an allowed admission that aborts
+before registration. It must not decrement or remove a sibling session's reservation.
+
+```go
+import (
+    "context"
+
+    muxcore "github.com/thebtf/mcp-mux/muxcore"
+    "github.com/thebtf/mcp-mux/muxcore/engine"
+)
+
+func (s *server) OnProjectConnectWithSessionMeta(project muxcore.ProjectContext, meta muxcore.SessionMeta) {
+    s.quotas.MarkConnected(project.ID, meta.SessionID)
+}
+
+func (s *server) OnProjectDisconnectWithSessionMeta(projectID string, meta muxcore.SessionMeta) {
+    s.quotas.Release(projectID, meta.SessionID)
+}
+
+eng, err := engine.New(engine.Config{
+    Name:                       "my-mcp-server",
+    SessionHandler:             handler,
+    MaxConcurrentRequests:      64,
+    MaxConcurrentNotifications: 64,
+    AuthorizeSessionWithSessionMeta: func(ctx context.Context, project muxcore.ProjectContext, meta muxcore.SessionMeta) muxcore.SessionAuth {
+        return handler.quotas.AuthorizeAndReserve(ctx, project, meta.Conn, meta.SessionID)
+    },
+})
+```
+
+- `ProjectLifecycleWithSessionMeta` has exactly the two lifecycle method
+  signatures above. When implemented, it replaces `ProjectLifecycle` callbacks;
+  implementing both does not cause duplicate connect/disconnect notifications.
+  `AuthorizeSessionWithSessionMeta` likewise takes precedence over
+  `AuthorizeSession`, without calling both. Request/notification metadata
+  upgrades retain their existing single-dispatch preference.
+- For one session, connect must return before its first dispatch, and disconnect
+  cannot overtake connect's return. A session registered before a maintenance
+  fence owns connect-then-disconnect settlement even if the fence or `Close`
+  occurs before its connect callback runs. Only an `AuthAllow` admission that
+  aborts before registration gets exactly one upgraded disconnect with that
+  same ID and no late connect. Disconnect therefore must handle reservations
+  that were never marked connected. Sibling sessions of the same project retain
+  independent lifecycle/reservation identity.
+- Callbacks do not run under global owner/admission locks. Cancellation or a
+  closed connection is not callback completion: maintenance, native-work, and
+  reader/teardown proof retain actual callback settlement through return.
+- `MaxConcurrentRequests` and `MaxConcurrentNotifications` are `int` fields on
+  `engine.Config`, `daemon.Config`, and `owner.OwnerConfig`. Each positive value
+  fixes an independent bound per owner, shared across its sessions. Nonpositive
+  values preserve the unlimited legacy default. The example explicitly opts
+  into 64 requests and 64 notifications; these are not new defaults or
+  per-tenant fairness guarantees.
+- Admission is synchronous and nonblocking, before launching a handler
+  goroutine. Request overflow returns JSON-RPC `-32004` with the original
+  numeric/string request ID; notification overflow drops the notification
+  without a reply. Legacy and metadata-aware structured handler paths share
+  these bounds. Slots remain held until the actual callback returns and are
+  released in deferred cleanup, including error, cancellation, and panic paths;
+  cancellation alone cannot free a slot for a still-running callback.
+- These limits do not bound arbitrary frame hooks or subprocess queues, and do
+  not change protocol-era routing, modern notification dispatch policy, cache,
+  replay, or maintenance policy.
+
 ## Authorization and Frame Hooks
 
-Muxcore provides two optional policy hooks on `engine.Config`.
+Muxcore provides two optional policy hook kinds on `engine.Config`:
+session authorization and inbound frame hooks.
 
-### `AuthorizeSession`
+### `AuthorizeSession` and `AuthorizeSessionWithSessionMeta`
 
-`AuthorizeSession` runs once per session after IPC token handshake and peer
-credential extraction, before the session is added or any frame is dispatched.
+The selected authorizer runs once per session after IPC token handshake and
+peer credential extraction, before the session is added or any frame is
+dispatched. The v0.33.0 `AuthorizeSessionWithSessionMeta` upgrade receives
+`(context.Context, ProjectContext, SessionMeta)` and is preferred when non-nil;
+otherwise the existing `AuthorizeSession` callback below remains in use. With
+both nil, no authorization callback runs and auth metadata remains unstamped.
 
 ```go
 AuthorizeSession: func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth {
@@ -560,10 +656,10 @@ network calls, database writes, or heavy policy evaluation in this hook.
 `muxcore/supervisor` is the public boundary for products whose MCP host keeps
 one stdio transport open while the product replaces a child engine executable.
 Introduced in `muxcore/v0.29.0`. The current documentation target is
-`muxcore/v0.32.0`; pin it with:
+`muxcore/v0.33.0`; pin it with:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.32.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.33.0
 ```
 
 `supervisor.Config.ProtocolEra` selects lifecycle semantics independently of
@@ -805,8 +901,8 @@ drain deadline; publication preserves both. Stale lease/timer callbacks cannot
 overwrite renewed, released, or replacement authority. Other errors do not gain
 a new automatic retry policy.
 
-When `AuthorizeSession` is configured, every owner mode, including subprocess
-and `HandlerFunc`, retains private callback authority through actual return and
+When either session authorizer is configured, every owner mode, including
+subprocess and `HandlerFunc`, retains private callback authority through actual return and
 the registration/rejection continuation. Admission closure prevents late allow
 from publishing a session; retirement and normal/error handoff retain blocked
 authority until settlement. This does not add authorization when none is

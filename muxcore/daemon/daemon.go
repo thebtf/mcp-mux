@@ -332,7 +332,10 @@ type Daemon struct {
 
 	// authorizeSession is forwarded from Config.AuthorizeSession to every
 	// Owner created by this daemon. nil = no gate (pre-v0.24 behaviour).
-	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+	authorizeSession                func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+	authorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
+	maxConcurrentRequests           int
+	maxConcurrentNotifications      int
 
 	// onFrameReceived is forwarded from Config.OnFrameReceived to every
 	// Owner created by this daemon. nil = no per-frame hook (pre-v0.24
@@ -486,6 +489,13 @@ type Config struct {
 	// for the full semantics; this field is the daemon-layer passthrough.
 	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
+	// AuthorizeSessionWithSessionMeta is the preferred metadata-aware gate.
+	AuthorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
+
+	// Positive limits bound structured callbacks per owner; nonpositive is unlimited.
+	MaxConcurrentRequests      int
+	MaxConcurrentNotifications int
+
 	// OnFrameReceived, when non-nil, is forwarded to every Owner created by
 	// this daemon. Owners invoke the callback in handleDownstreamMessage on
 	// the reader goroutine for every inbound frame BEFORE dispatch.
@@ -567,29 +577,32 @@ func New(cfg Config) (*Daemon, error) {
 		return nil, fmt.Errorf("daemon sharing key: %w", err)
 	}
 	d := &Daemon{
-		owners:                  make(map[string]*OwnerEntry),
-		modernSharingKey:        modernSharingKey,
-		logger:                  logger,
-		done:                    make(chan struct{}),
-		ownerIdleTimeout:        ownerIdleTimeout,
-		zeroSessionCleanupDelay: zeroSessionCleanupDelay,
-		isolatedIdleTimeout:     isolatedIdleTimeout,
-		admissionBufferTimeout:  admissionBufferTimeout,
-		idleTimeout:             idleTimeout,
-		templateCache:           make(map[string]*templateFamily),
-		crashTracker:            make(map[string][]time.Time),
-		supervisorCtx:           supCtx,
-		supervisorCancel:        supCancel,
-		handlerFunc:             cfg.HandlerFunc,
-		sessionHandler:          cfg.SessionHandler,
-		daemonFlag:              daemonFlag,
-		name:                    name,
-		namespace:               namespace,
-		persistent:              cfg.Persistent,
-		daemonGeneration:        daemonGeneration,
-		authorizeSession:        cfg.AuthorizeSession,
-		onFrameReceived:         cfg.OnFrameReceived,
-		ownerRemoval:            newOwnerRemovalStats(),
+		owners:                          make(map[string]*OwnerEntry),
+		modernSharingKey:                modernSharingKey,
+		logger:                          logger,
+		done:                            make(chan struct{}),
+		ownerIdleTimeout:                ownerIdleTimeout,
+		zeroSessionCleanupDelay:         zeroSessionCleanupDelay,
+		isolatedIdleTimeout:             isolatedIdleTimeout,
+		admissionBufferTimeout:          admissionBufferTimeout,
+		idleTimeout:                     idleTimeout,
+		templateCache:                   make(map[string]*templateFamily),
+		crashTracker:                    make(map[string][]time.Time),
+		supervisorCtx:                   supCtx,
+		supervisorCancel:                supCancel,
+		handlerFunc:                     cfg.HandlerFunc,
+		sessionHandler:                  cfg.SessionHandler,
+		daemonFlag:                      daemonFlag,
+		name:                            name,
+		namespace:                       namespace,
+		persistent:                      cfg.Persistent,
+		daemonGeneration:                daemonGeneration,
+		authorizeSession:                cfg.AuthorizeSession,
+		authorizeSessionWithSessionMeta: cfg.AuthorizeSessionWithSessionMeta,
+		maxConcurrentRequests:           cfg.MaxConcurrentRequests,
+		maxConcurrentNotifications:      cfg.MaxConcurrentNotifications,
+		onFrameReceived:                 cfg.OnFrameReceived,
+		ownerRemoval:                    newOwnerRemovalStats(),
 	}
 	if err := d.loadMaintenance(cfg.ControlPath); err != nil {
 		supCancel()
@@ -1720,27 +1733,30 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, compatibility *modernCompati
 		materializationPolicy = owner.MaterializationPersistent
 	}
 	ownerCfg := owner.OwnerConfig{
-		Command:                     req.Command,
-		Args:                        req.Args,
-		Env:                         sessionEnv,
-		Cwd:                         req.Cwd,
-		IPCPath:                     ipcPath,
-		ControlPath:                 controlPath,
-		ServerID:                    sid,
-		ProtocolEra:                 protocolEra,
-		ModernShared:                modernShared,
-		TokenHandshake:              true, // daemon-managed owners: shims send a handshake token
-		MaterializationPolicy:       materializationPolicy,
-		DeferInitialMaterialization: true,
-		MaintenanceGate:             &d.maintenanceGate,
-		AdmitMaterialization:        d.admitMaterialization,
-		PersistentRequired:          d.persistent,
-		HandlerFunc:                 d.handlerFunc,
-		SessionHandler:              d.sessionHandler,
-		AuthorizeSession:            d.authorizeSession,
-		OnFrameReceived:             d.onFrameReceived,
-		OnZeroSessions:              d.onZeroSessions,
-		OnUpstreamExit:              d.onUpstreamExit,
+		Command:                         req.Command,
+		Args:                            req.Args,
+		Env:                             sessionEnv,
+		Cwd:                             req.Cwd,
+		IPCPath:                         ipcPath,
+		ControlPath:                     controlPath,
+		ServerID:                        sid,
+		ProtocolEra:                     protocolEra,
+		ModernShared:                    modernShared,
+		TokenHandshake:                  true, // daemon-managed owners: shims send a handshake token
+		MaterializationPolicy:           materializationPolicy,
+		DeferInitialMaterialization:     true,
+		MaintenanceGate:                 &d.maintenanceGate,
+		AdmitMaterialization:            d.admitMaterialization,
+		PersistentRequired:              d.persistent,
+		HandlerFunc:                     d.handlerFunc,
+		SessionHandler:                  d.sessionHandler,
+		AuthorizeSession:                d.authorizeSession,
+		AuthorizeSessionWithSessionMeta: d.authorizeSessionWithSessionMeta,
+		MaxConcurrentRequests:           d.maxConcurrentRequests,
+		MaxConcurrentNotifications:      d.maxConcurrentNotifications,
+		OnFrameReceived:                 d.onFrameReceived,
+		OnZeroSessions:                  d.onZeroSessions,
+		OnUpstreamExit:                  d.onUpstreamExit,
 		OnPersistentDetected: func(expected *owner.Owner) {
 			d.setOwnerPersistent(expected, true)
 		},

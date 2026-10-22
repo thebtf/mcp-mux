@@ -17,6 +17,10 @@ import "time"
 //
 // Use IsAuthorized() to distinguish the two cases without comparing strings.
 type SessionMeta struct {
+	// SessionID is an opaque per-admission identity, renewed on reconnect.
+	// It is neither a persistent project key nor an authorization credential.
+	SessionID string
+
 	// Conn carries OS-level peer identity captured at accept time.
 	Conn ConnInfo
 

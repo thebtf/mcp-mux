@@ -43,6 +43,13 @@ type ProjectLifecycle interface {
 	OnProjectDisconnect(projectID string)
 }
 
+// ProjectLifecycleWithSessionMeta replaces ProjectLifecycle when implemented.
+// Connect returns before dispatch; disconnect follows actual connect settlement.
+type ProjectLifecycleWithSessionMeta interface {
+	OnProjectConnectWithSessionMeta(project ProjectContext, meta SessionMeta)
+	OnProjectDisconnectWithSessionMeta(projectID string, meta SessionMeta)
+}
+
 // NotificationHandler is optionally implemented by SessionHandler.
 // Receives client-to-server notifications (e.g. notifications/cancelled).
 // Handlers that don't implement this: notifications handled by Owner or dropped.

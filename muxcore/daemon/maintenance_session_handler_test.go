@@ -638,7 +638,8 @@ func TestMaintenanceNativeNonRequestWorkRetainsAuthority(t *testing.T) {
 					}
 					initial, entry, conn, frames := maintenanceNativeIPC(t, d, protocol)
 					identity := captureOwnerEntryIdentity(entry)
-					if kind != "authorize" {
+					// A blocked connect must settle before any opening request can dispatch.
+					if kind != "authorize" && kind != "connect" {
 						opening := "initialize"
 						if protocol == era.EraModern20260728 {
 							opening = "server/discover"

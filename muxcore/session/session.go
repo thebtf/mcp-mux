@@ -55,9 +55,8 @@ type Session struct {
 	meta   muxcore.SessionMeta
 }
 
-// Meta returns a copy of the session's cached SessionMeta. The zero value
-// is returned until Owner.acceptLoop populates Conn (T011) and, optionally,
-// engine.Config.AuthorizeSession populates TenantID + AuthorizedAt (Phase 2).
+// Meta returns a copy of the session's cached SessionMeta. SessionID is assigned
+// at construction; accept and authorization later populate the other fields.
 // Safe to call from any goroutine.
 func (s *Session) Meta() muxcore.SessionMeta {
 	s.metaMu.Lock()
@@ -65,14 +64,11 @@ func (s *Session) Meta() muxcore.SessionMeta {
 	return s.meta
 }
 
-// SetMeta replaces the session's cached SessionMeta atomically. Intended to
-// be called at most twice per session: once after IPC Bind succeeds (Conn
-// populated) and once on AuthorizeSession AuthAllow (TenantID + AuthorizedAt
-// populated). Safe to call from any goroutine but Owner enforces the
-// "set-twice" discipline at the call site.
+// SetMeta replaces cached metadata while preserving the admission's SessionID.
 func (s *Session) SetMeta(m muxcore.SessionMeta) {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
+	m.SessionID = s.meta.SessionID
 	s.meta = m
 }
 
@@ -91,6 +87,7 @@ func NewSession(r io.Reader, w io.Writer) *Session {
 	s := &Session{
 		ID:           int(sessionCounter.Add(1)),
 		MuxSessionID: generateMuxSessionID(),
+		meta:         muxcore.SessionMeta{SessionID: rand.Text()},
 		reader:       jsonrpc.NewScanner(r),
 		writer:       bufio.NewWriter(w),
 		conn:         conn,
@@ -242,6 +239,7 @@ func (s *Session) Done() <-chan struct{} {
 func NewSessionWithRawWriter(id int, w io.Writer) *Session {
 	return &Session{
 		ID:      id,
+		meta:    muxcore.SessionMeta{SessionID: rand.Text()},
 		writer:  w,
 		notifCh: make(chan []byte, notificationBufferSize),
 		done:    make(chan struct{}),
