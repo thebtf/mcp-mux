@@ -41,7 +41,7 @@ CC 4 ──stdio──> mcp-mux ──IPC──┘
 - **Isolated** (`--isolated`): Each client gets its own upstream
 
 
-## MCP 2026-07-28 R1 native boundary
+## MCP 2026-07-28 native boundary (R1 default, R2 opt-in)
 
 R1 is an additive opt-in for a known MCP `2026-07-28` host and a same-era upstream. It preserves the existing legacy default, legacy identity, and legacy route. It is not protocol negotiation or a legacy-to-modern bridge.
 
@@ -53,13 +53,13 @@ R1 is an additive opt-in for a known MCP `2026-07-28` host and a same-era upstre
 - `MCP_MUX_ISOLATED`, `--isolated`, `MCP_MUX_STATELESS`, `--stateless`, and `x-mux.sharing` remain sharing inputs. They never select an MCP protocol era.
 - `clientInfo`, discovery responses, upstream names, and failed modern attempts also never select an era.
 
-The selected `era.ProtocolEra` travels through `control.Request.ProtocolEra`, `control.Response.ProtocolEra`, `owner.OwnerConfig.ProtocolEra`, and `owner.ResilientClientConfig.ProtocolEra`. Modern admission requires an exact `2026-07-28` control echo before attachment. The opening frame is one newline-delimited JSON-RPC request with `params._meta.io.modelcontextprotocol/protocolVersion` set to `2026-07-28` and an object-valued `params._meta.io.modelcontextprotocol/clientCapabilities`. `io.modelcontextprotocol/clientInfo` is optional, but valid string `name` and `version` values are required when it is present. The same frame reaches the same-era upstream unchanged. `server/discover` is valid when the host sends it; mcp-mux never generates it.
+The selected `era.ProtocolEra` travels through `control.Request.ProtocolEra`, `control.Response.ProtocolEra`, `owner.OwnerConfig.ProtocolEra`, and `owner.ResilientClientConfig.ProtocolEra`. Modern admission requires an exact `2026-07-28` control echo before attachment. The opening frame is one newline-delimited JSON-RPC request with `params._meta.io.modelcontextprotocol/protocolVersion` set to `2026-07-28` and an object-valued `params._meta.io.modelcontextprotocol/clientCapabilities`. `io.modelcontextprotocol/clientInfo` is optional, but valid string `name` and `version` values are required when it is present. On isolated R1, the same frame reaches the same-era upstream unchanged; R2 rewrites correlation fields as described below. `server/discover` is valid when the host sends it; mcp-mux never generates it.
 
 ### Keep modern traffic native and isolated
 
 R1 forces one downstream recipient per modern owner. Its `sharing_policy` is `forced-isolated`, regardless of command, arguments, CWD, environment, historical sharing flags, or an existing legacy owner. A modern route never falls back to, attaches to, or reuses a legacy owner.
 
-Do not add legacy bootstrap or recovery behavior to this route. A modern owner sends no mux-generated `initialize`, `notifications/initialized`, roots/list, list-change, cache, template, or replay traffic. It does not use response caching, template reuse, cache invalidation, or reconnect replay. A modern upstream JSON-RPC request is contained rather than forwarded to the host. After request opt-in with `io.modelcontextprotocol/logLevel`, a valid request-scoped standard log reaches the sole recipient once. mcp-mux never synthesizes or broadcasts that log.
+Do not add legacy bootstrap or recovery behavior to this route. A modern owner sends no mux-generated `initialize`, `notifications/initialized`, roots/list, list-change, cache, template, or replay traffic. It does not use response caching, template reuse, cache invalidation, or reconnect replay. A modern upstream JSON-RPC request is contained rather than forwarded to the host. On isolated R1, after request opt-in with `io.modelcontextprotocol/logLevel`, a valid request-scoped standard log reaches the sole recipient once. mcp-mux never synthesizes or broadcasts that log.
 
 ### Preserve owner and process authority
 
@@ -73,7 +73,7 @@ For reaper, zero-session removal, retry rehydration, respawn, daemon loss, upstr
 
 ### Readback, rollback, and exclusions
 
-The exact control echo proves admission. Existing direct owner status and status/list projections that carry `control.OwnerInfo` report these policy facts for an active modern owner:
+The exact control echo proves admission. Existing direct owner status and status/list projections that carry `control.OwnerInfo` report these policy facts for an active isolated R1 owner:
 
 ```text
 protocol_era = 2026-07-28
@@ -88,11 +88,46 @@ To roll back, stop callers from selecting `era.PolicyModern20260728` or `--mcp-p
 
 R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
 
+### R2 requires explicit exact-context admission
+
+Before changing modern sharing admission or correlation, read
+[the R2 protocol contract](docs/mux-protocol.md#mcp-2026-07-28-r2-exact-context-sharing)
+and [consumer API contract](muxcore/README.md#v0320--r2-exact-context-modern-sharing).
+R2 requires explicit modern era, `ModernSharing`, and a known non-secret
+`control.PartitionAssertion` from `engine.Config.PartitionResolver`; CLI uses
+`--mcp-sharing=shared --mcp-partition=<key>`. Absent/unknown authority stays
+isolated, and explicit isolation wins. Never substitute a universal partition.
+
+The daemon validates a 30-second binding for the exact daemon, nonce,
+normalized launch, canonical CWD, all effective upstream environment, and
+partition before existing owner election. CLI/engine explicit sharing normalizes
+`cwd`/`git` to internal `global`; exact CWD still binds and isolation wins.
+Only the two launcher controller advertisements are absent from upstream env;
+do not replace exact-env comparison with a transient whitelist.
+`OwnerConfig.ModernShared` is the admitted result, not a bypass. Reconnect
+re-resolves and re-admits; raw token refresh cannot attach a shared owner.
+Managed restart retains the partition/policy and gets a fresh nonce/binding;
+no unfinished work replays.
+Keep keys, raw environment, digests, and bindings out of status. Preserve one
+generation-owned correlation authority for IDs, progress, subscriptions, and
+cancellation; terminal events remove once and unowned events never broadcast.
+Shared `logLevel` requests error before upstream work; isolated R1 logging
+and bytes stay unchanged. Cache/replay/bootstrap/persistence quarantine and
+existing lifecycle authority still bind. R2 does not virtualize application state.
+
+For stable-launcher modern changes, preserve explicit
+`supervisor.Config.ProtocolEra` selection (zero stays legacy), raw native
+frames, and no legacy init/replay. Fail written/uncertain work once on generation
+loss; retain only definitely unwritten FIFO work. Active RPC/subscriptions
+block verified dormancy; fresh modern wake sends no initialize. Keep the shared
+CLI wrapper parser before child startup and stop parsing at the upstream
+command; payloads, `clientInfo`, stateless mode, and upstream flags cannot select era.
+
 ## Upstream maintenance hold consumer contract
 
-The prepared binary/library consumer target is v0.31.0. Maintenance requires
-aware managed binary/daemon/shim cooperation and is optional for ordinary legacy
-`engine.New` consumers. Use the exact local status `server_id`, then the returned
+The binary/library target is v0.32.0. Maintenance was introduced in v0.31.0 and
+requires aware binary/daemon/shim versions v0.31.0 or newer; it is optional for
+ordinary legacy `engine.New` consumers. Use the exact local status `server_id`, then the returned
 opaque `hold_id`:
 
 ```text

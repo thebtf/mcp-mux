@@ -5,12 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.32.0] - 2026-10-22
 
-## [0.31.0] - 2026-10-03
+### Added
 
-Prepared for publication as `v0.31.0` and `muxcore/v0.31.0`; tag publication,
-delivered-artifact proof, and the required Engram consumer handoff remain pending.
+- Added opt-in MCP `2026-07-28` exact-context sharing through CLI
+  `--mcp-sharing=shared --mcp-partition=<nonsecret-key>` and
+  `engine.Config.ModernSharing` with `PartitionResolver`. The daemon validates
+  a short-lived binding for the exact launch, CWD, all effective upstream environment,
+  and known partition before reusing an owner. Unknown authority retains R1
+  isolation; explicit isolation wins. Legacy behavior remains unchanged.
+  Explicit CLI/engine sharing normalizes identity mode without relaxing exact
+  CWD comparison. Only two launcher controller advertisements, never delivered
+  upstream, are excluded from environment comparison; no transient whitelist
+  is added. Managed restart preserves sharing policy with fresh admission.
+- Added generation-bound session correlation for modern IDs, progress,
+  subscription acknowledgements/filters/metadata, and cancellation. Shared
+  request-scoped `logLevel` returns an error before upstream work; isolated R1
+  logging is unchanged. Modern bootstrap, cache, replay, and persisted recovery
+  remain disabled; no arbitrary application-state virtualization is implied.
+- Added explicit native-era stable supervision through
+  `supervisor.Config.ProtocolEra`, with legacy behavior as the zero value.
+  Modern frames bypass legacy initialization/replay; generation loss fails
+  written or uncertain work once, retaining only definitely unwritten FIFO
+  entries. Active RPCs/subscriptions prevent verified dormancy; a fresh modern
+  wake sends no legacy initialize. Launcher and engine share pre-child wrapper
+  option validation, stopping before upstream arguments.
+- Documented Serena's fixed-project tools-interface configuration and smoke
+  boundaries, distinguishing documented HTTP multi-client support from the
+  stdio-through-mux inference without claiming memory-savings benchmarks.
+
+## [0.31.0] - 2026-10-05
+
+Published as [`v0.31.0`](https://github.com/thebtf/mcp-mux/releases/tag/v0.31.0)
+and `muxcore/v0.31.0`. Native Engram handoff was not filed under an explicit
+operator exception; production consumer upgrades are not claimed.
 
 ### Added
 

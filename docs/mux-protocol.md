@@ -2,9 +2,9 @@
 
 **Document version:** 1.1
 **Legacy MCP reference:** 2025-11-25
-**Native R1 route:** MCP 2026-07-28
-**Prepared binary/library target:** v0.31.0
-**Updated:** 2026-10-03
+**Native R1/R2 routes:** MCP 2026-07-28
+**Binary/library target:** v0.32.0
+**Updated:** 2026-10-22
 
 ## Overview
 
@@ -16,9 +16,9 @@ for zero-config operation with mcp-mux.
 
 ### Version scope
 
-The legacy reference from **Quick Start** through **Migration Path** documents the MCP `2025-11-25` route. Its `x-mux` capability, sharing modes, session metadata, cache, and replay rules do not select or describe the native R1 route.
+The legacy reference from **Quick Start** through **Migration Path** documents the MCP `2025-11-25` route. Its `x-mux` capability, sharing modes, session metadata, cache, and replay rules do not select or describe the native modern routes.
 
-The **MCP 2026-07-28 R1 native route** section is authoritative for `--mcp-protocol=2026-07-28`. That route is additive and native-only. When callers do not select it, mcp-mux keeps the legacy route.
+The **MCP 2026-07-28 R1 native route** section describes isolated admission with `--mcp-protocol=2026-07-28`. The **R2 exact-context sharing** section adds explicit sharing opt-in in v0.32.0. Both routes are native-only; omitting the modern era preserves the legacy route.
 
 ## Quick Start
 
@@ -121,6 +121,16 @@ into every JSON-RPC request via the `_meta` field:
 - Allows session-aware servers with `--project-from-cwd` to scope per-request
 - Works with git worktrees — each worktree session gets its own cwd
 - Only injected when the session has a bound cwd (daemon mode with token handshake)
+
+This metadata works only when the upstream reads it and partitions its own
+state. It does not rebind Serena's process-wide active project or make Serena
+session-aware. Serena documents
+[HTTP multi-client access for one project](https://oraios.github.io/serena/02-usage/020_running.html#streamable-http-mode),
+not stdio-through-mux support. The legacy fixed-project example and its
+limitations are in the
+[README](../README.md#serena-fixed-project-stdio-configuration). Its
+`MCP_MUX_DEFAULT_MODE=cwd` scopes owner identity; it is not a sharing override.
+Modern R1 remains forced-isolated and does not use this legacy metadata.
 
 ### Per-Session Environment (`_meta.muxEnv`)
 
@@ -301,7 +311,7 @@ After daemon loss, upstream loss, or downstream reconnect, mcp-mux ends current 
 
 ### Inspect and roll back an R1 owner
 
-The exact control echo proves modern admission. Existing direct owner status and status/list projections that carry `control.OwnerInfo` report these facts for an active R1 owner:
+The exact control echo proves modern admission. Existing direct owner status and status/list projections that carry `control.OwnerInfo` report these facts for an active isolated R1 owner:
 
 ```text
 protocol_era = 2026-07-28
@@ -316,9 +326,124 @@ To roll back, stop new explicit-modern admissions and drain or remove existing m
 
 R1 excludes modern sharing or reuse, shared causal correlation, semantic translation, automatic dual-era fallback, modern response caching or template reuse, persisted modern snapshot or handoff transfer, automatic subscription continuation, and new registry, topology, lifecycle-state, or counter readbacks.
 
+## MCP 2026-07-28 R2 exact-context sharing
+
+R2 is introduced in v0.32.0 to reuse one modern upstream for compatible clients.
+It preserves the legacy default and isolated R1 path. Protocol era and sharing
+authorization remain separate decisions; no legacy/modern translation is added.
+
+### Select sharing and assert a known partition
+
+- CLI: use `--mcp-protocol=2026-07-28 --mcp-sharing=shared --mcp-partition=<key>`
+  before the upstream command. The nonempty key must be stable, opaque, and
+  non-secret. Missing modern selection or key is an error, not implicit consent.
+- Library: set `engine.Config.ProtocolPolicy = era.PolicyModern20260728` and
+  `ModernSharing = true`, and provide
+  `PartitionResolver func(context.Context, muxcore.ProjectContext) (control.PartitionAssertion, error)`.
+  The product must establish the actual authorization/tenant boundary before
+  returning `control.PartitionAssertion{Known: true, Key: key}`.
+- A nil resolver or `{Known: false, Key: ""}` means unknown and retains R1
+  isolation. Known with an empty key, or unknown with a nonempty key, is invalid.
+  Resolver errors and panics refuse admission without exposing resolver details.
+- Explicit isolation wins. Historical `--stateless` and `x-mux.sharing` do not
+  authorize modern sharing. Explicit sharing in the CLI and engine normalizes
+  inherited `cwd`/`git` identity settings to internal `global` mode. Direct
+  shared control admission accepts only empty/`global` mode; `cwd`/`git` on
+  that private wire path is refused. This does not change legacy or isolated R1.
+
+The CLI engine and stable launcher share the top-level wrapper parser, which
+validates options before child startup and stops at the first upstream command.
+Upstream flags, payload metadata, `clientInfo`, and `--stateless` cannot select
+the wrapper's protocol era.
+
+The partition assertion is not authentication and does not partition arbitrary
+application state. Do not replace unknown authority with a universal key.
+
+### Bind exact launch facts before owner election
+
+`control.Request.ModernSharing` and `Partition *control.PartitionAssertion`
+carry the opt-in and assertion. `control.SendSpawn` obtains a fresh
+`prepare_modern_sharing` binding, then sends `spawn` under one bounded exchange.
+The opaque binding expires after 30 seconds and is bound to this daemon,
+the spawn nonce, protocol era, normalized command, ordered arguments,
+canonical CWD, every normalized effective environment entry, and partition.
+Preparation does not create an owner or provide an attachment token.
+
+The daemon validates those facts before election and uses the existing owner
+registry and creation placeholder. Known-equal exact contexts can reuse one
+owner; a command, argument, CWD, environment, or partition difference cannot.
+The comparison uses all normalized effective upstream environment entries,
+not the legacy security-variable whitelist. Only controller advertisements
+`MCPMUX_LAUNCHER_ATTESTATION` and `MCPMUX_LAUNCHER_PROTOCOL` are excluded;
+neither is delivered to upstream processes, including inherited-environment
+fallback. Every other effective entry participates, with no broad transient
+whitelist. Internal `global` mode never permits cross-CWD R2 reuse. Modern
+identities remain nonce-based; no deterministic public partition identity or
+additional owner registry is introduced.
+
+`owner.OwnerConfig.ModernShared` is the daemon-approved integration result,
+not a consumer shortcut around admission. Reconnect re-runs the library
+resolver and obtains fresh exact-context admission; a raw token-refresh request
+cannot reattach a shared owner. Preparation failure never falls back to an
+unbound, isolated, or legacy spawn. Partition keys, raw environment values,
+compatibility digests, and admission bindings are not status readback.
+
+Managed `restart_owner` retains the private known partition and sharing policy,
+then obtains a fresh spawn nonce and daemon binding before normal admission.
+Existing retirement gates still apply; no old request or subscription replays.
+
+### Keep shared wire state session-local
+
+One generation-bound correlation record owns each request's terminal state.
+Shared owners rewrite request IDs and progress tokens upstream and restore
+their original string/numeric values for the originating host. Subscription
+acknowledgements, accepted filters, `io.modelcontextprotocol/subscriptionId`,
+and cancellation `requestId` are correlated to that same host. Unknown, stale,
+unowned, unacknowledged, and out-of-filter notifications are not broadcast.
+
+A result, client cancellation, server subscription termination, detach, or
+generation loss ends the affected record once. Late events cannot reach a
+new session or generation. Opaque multi-round-trip `requestState` and
+`inputResponses` remain application data; retries are independent requests
+with fresh IDs, not replay or state translation. R1 wire bytes are unchanged.
+
+A shared request containing `params._meta.io.modelcontextprotocol/logLevel`
+returns `-32602` before upstream forwarding. Shared owners do not synthesize
+or broadcast request-scoped logs. Use isolated R1 for ordinary request-scoped
+logging; its existing opt-in behavior is preserved.
+
+### Preserve quarantine and inspect policy
+
+The existing daemon, generation fences, maintenance gates, reaper, and
+`RetirementProven()` authority remain in charge. Modern legacy bootstrap,
+response cache, templates, replay, and era-less snapshot/handoff restoration
+stay off. Loss requires fresh admission, fresh host requests, and a fresh
+`subscriptions/listen`; R2 does not resume subscriptions automatically.
+
+Stable-launcher consumers select native lifecycle semantics with
+`supervisor.Config.ProtocolEra = era.EraModern20260728`; the zero value retains
+legacy behavior. The modern supervisor forwards raw native frames without
+legacy initialization, handshake replay, or synthesized legacy list changes.
+Generation loss fails written/uncertain RPCs and subscriptions once; only
+definitely unwritten first-delivery FIFO entries may survive for initial
+delivery. Active RPC/subscription correlation blocks verified dormancy. A fresh
+modern child or wake starts without legacy initialize, under the same verified
+process-tree retirement and single-child authority.
+
+Existing owner readback reports `sharing_policy = shared-exact-context`,
+`protocol_era = 2026-07-28`, `cache_policy = off`, and
+`lifecycle_policy = r1-quarantine`. The lifecycle label is retained for R2;
+it does not imply isolated sharing policy. To return to R1, stop new R2
+opt-ins and drain/remove shared owners through the existing lifecycle path,
+then reconnect without sharing opt-in. Never convert a live shared owner to
+legacy or replay its unfinished work.
+
+R2 does not add round-robin balancing, cross-era semantic translation,
+application-state virtualization, or production memory-savings guarantees.
+
 ## Managed upstream maintenance in v0.31.0
 
-The prepared v0.31.0 target adds optional local authenticated control NDJSON,
+v0.31.0 introduced optional local authenticated control NDJSON,
 not an upstream MCP method or a new protocol version. Legacy remains the default
 and modern R1 remains explicitly same-era and isolated. CLI flags follow the exact
 local identifier:
@@ -416,11 +541,11 @@ Activation also checks live aware status. Offline/old endpoints allow activation
 only when persisted authority is proven clear under the lock. This is neither
 a host-wide executable lock nor a separate updater lease.
 
-Publication targets are `v0.31.0` and `muxcore/v0.31.0`, not a new MCP protocol
-version. Ordinary legacy `engine.New` consumers need no maintenance-specific
-source changes. Accepted-source actual Windows/Linux overwrite and separate
-focused race/recovery checks are recorded in [release notes](../RELEASE_NOTES.md).
-Final version-baked/delivered-artifact proof, tag/module resolution, and Engram
-consumer handoff remain pending under the [release protocol](RELEASE-PROTOCOL.md).
+Managed maintenance requires aware binary, daemon, and shim versions v0.31.0
+or newer; it does not select a new MCP protocol version. Ordinary legacy
+`engine.New` consumers need no maintenance-specific source changes.
+Accepted-source Windows/Linux overwrite and separate focused race/recovery
+checks are recorded in [release notes](../RELEASE_NOTES.md). Consumer production
+adoption is a separate claim, governed by the [release protocol](RELEASE-PROTOCOL.md).
 See [production Scenario 11](PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 for the live replacement oracle.
