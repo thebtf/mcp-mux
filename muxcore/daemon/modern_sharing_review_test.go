@@ -24,8 +24,7 @@ func TestModernSharingReview_LauncherAdvertisementsNeverReachSharedUpstream(t *t
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Setenv("MCPMUX_LAUNCHER_ATTESTATION", "fixture-daemon-attestation")
 			t.Setenv("MCPMUX_LAUNCHER_PROTOCOL", "1:41001")
-			d := testDaemon(t)
-			launchA := modernSharingLaunch(t)
+			d, launchA := modernSharingDaemon(t)
 			envA := launchA["env"].(map[string]string)
 			delete(envA, "MCPMUX_LAUNCHER_ATTESTATION")
 			delete(envA, "MCPMUX_LAUNCHER_PROTOCOL")
@@ -89,8 +88,7 @@ func modernSharingReviewHostEnvironment(t *testing.T, host *ipcConn) int {
 }
 
 func TestModernSharingReview_RestartOwnerPreservesSharedAdmission(t *testing.T) {
-	d := testDaemon(t)
-	launch := modernSharingLaunch(t)
+	d, launch := modernSharingDaemon(t)
 	original := spawnModernSharing(t, d, launch, true)
 	originalHost := dialIPC(t, original.IPCPath, original.Token)
 	t.Cleanup(func() { _ = originalHost.conn.Close() })

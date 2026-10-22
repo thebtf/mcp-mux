@@ -14,8 +14,7 @@ import (
 )
 
 func TestModernSharingDaemon_TwoHostPipesUseOneUpstreamPID(t *testing.T) {
-	d := testDaemon(t)
-	launch := modernSharingLaunch(t)
+	d, launch := modernSharingDaemon(t)
 	a := spawnModernSharing(t, d, launch, true)
 	b := spawnModernSharing(t, d, launch, true)
 	if a.ServerID != b.ServerID || a.IPCPath != b.IPCPath || d.OwnerCount() != 1 {
@@ -43,8 +42,7 @@ func TestModernSharingDaemon_TwoHostPipesUseOneUpstreamPID(t *testing.T) {
 func TestModernSharingDaemon_UnknownPartitionAndDifferentEffectiveEnvStayIsolated(t *testing.T) {
 	for _, boundary := range []string{"unknown partition", "AUTHORIZATION", "CLAUDE_CODE_ENTRYPOINT"} {
 		t.Run(boundary, func(t *testing.T) {
-			d := testDaemon(t)
-			launchA := modernSharingLaunch(t)
+			d, launchA := modernSharingDaemon(t)
 			launchB := make(map[string]any, len(launchA))
 			for key, value := range launchA {
 				launchB[key] = value
@@ -79,6 +77,14 @@ func TestModernSharingDaemon_UnknownPartitionAndDifferentEffectiveEnvStayIsolate
 			}
 		})
 	}
+}
+
+func modernSharingDaemon(t *testing.T) (*Daemon, map[string]any) {
+	t.Helper()
+	// Launch directories must outlive daemon-owned children on Windows.
+	launch := modernSharingLaunch(t)
+	d := testDaemon(t)
+	return d, launch
 }
 
 func modernSharingLaunch(t *testing.T) map[string]any {
