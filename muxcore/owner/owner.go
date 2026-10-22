@@ -450,8 +450,12 @@ type OwnerConfig struct {
 	// Its preauthorization metadata already contains the admission's SessionID.
 	AuthorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
 
-	// Positive limits bound structured callbacks per owner; nonpositive is unlimited.
-	MaxConcurrentRequests      int
+	// MaxConcurrentRequests bounds full structured request dispatch goroutines per
+	// owner, including response writes and deferred cleanup. Nonpositive is unlimited.
+	MaxConcurrentRequests int
+
+	// MaxConcurrentNotifications bounds structured notification dispatch goroutines
+	// per owner through deferred cleanup. Nonpositive is unlimited.
 	MaxConcurrentNotifications int
 
 	// OnFrameReceived, when non-nil, is invoked by handleDownstreamMessage
@@ -985,11 +989,12 @@ func (o *Owner) addSessionLocked(s *Session) bool {
 func (o *Owner) startRegisteredSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
-	// Connect runs on this session's reader, never on the global accept producer.
-	go o.readSession(s)
+	// Publish legacy roots before the reader can dispatch its first frame.
 	if !o.isModern() {
 		o.sendRootsListChanged()
 	}
+	// Connect runs on this session's reader, never on the global accept producer.
+	go o.readSession(s)
 }
 
 func (o *Owner) connectSession(s *Session, lifecycle *sessionLifecycle) (connected bool) {

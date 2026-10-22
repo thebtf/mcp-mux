@@ -492,8 +492,12 @@ type Config struct {
 	// AuthorizeSessionWithSessionMeta is the preferred metadata-aware gate.
 	AuthorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
 
-	// Positive limits bound structured callbacks per owner; nonpositive is unlimited.
-	MaxConcurrentRequests      int
+	// MaxConcurrentRequests bounds full structured request dispatch goroutines per
+	// owner, including response writes and deferred cleanup. Nonpositive is unlimited.
+	MaxConcurrentRequests int
+
+	// MaxConcurrentNotifications bounds structured notification dispatch goroutines
+	// per owner through deferred cleanup. Nonpositive is unlimited.
 	MaxConcurrentNotifications int
 
 	// OnFrameReceived, when non-nil, is forwarded to every Owner created by

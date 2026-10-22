@@ -566,14 +566,19 @@ eng, err := engine.New(engine.Config{
   `AuthorizeSessionWithSessionMeta` likewise takes precedence over
   `AuthorizeSession`, without calling both. Request/notification metadata
   upgrades retain their existing single-dispatch preference.
-- For one session, connect must return before its first dispatch, and disconnect
-  cannot overtake connect's return. A session registered before a maintenance
+- For one session, connect must return normally before its first dispatch, and
+  disconnect cannot overtake connect's settlement. A session registered before a maintenance
   fence owns connect-then-disconnect settlement even if the fence or `Close`
   occurs before its connect callback runs. Only an `AuthAllow` admission that
   aborts before registration gets exactly one upgraded disconnect with that
   same ID and no late connect. Disconnect therefore must handle reservations
   that were never marked connected. Sibling sessions of the same project retain
   independent lifecycle/reservation identity.
+- A panic in either the legacy or metadata-aware connect callback is logged
+  and closes only the affected session. No request is dispatched for that
+  session; after connect settles, its matching disconnect cleanup runs once,
+  including cleanup of partially established lifecycle state. The owner and
+  sibling sessions remain available.
 - Callbacks do not run under global owner/admission locks. Cancellation or a
   closed connection is not callback completion: maintenance, native-work, and
   reader/teardown proof retain actual callback settlement through return.
@@ -587,9 +592,15 @@ eng, err := engine.New(engine.Config{
   goroutine. Request overflow returns JSON-RPC `-32004` with the original
   numeric/string request ID; notification overflow drops the notification
   without a reply. Legacy and metadata-aware structured handler paths share
-  these bounds. Slots remain held until the actual callback returns and are
-  released in deferred cleanup, including error, cancellation, and panic paths;
-  cancellation alone cannot free a slot for a still-running callback.
+  these bounds. A positive `MaxConcurrentRequests` bounds the full request
+  dispatch goroutine, including callback execution, response writing, and
+  deferred cleanup, not just concurrent callbacks. A slow peer blocked on a
+  response write can intentionally consume owner-wide capacity and cause
+  sibling-session requests to receive `-32004`; retaining the slot prevents
+  unbounded queued response-writing goroutines. Notification slots remain held
+  through actual callback return. Slot release and work accounting stay in
+  deferred cleanup, including error, cancellation, and panic paths; cancellation
+  alone cannot release capacity or settle accounting for a still-running callback.
 - These limits do not bound arbitrary frame hooks or subprocess queues, and do
   not change protocol-era routing, modern notification dispatch policy, cache,
   replay, or maintenance policy.

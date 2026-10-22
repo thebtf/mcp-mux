@@ -18,9 +18,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added opt-in per-owner `MaxConcurrentRequests` and
   `MaxConcurrentNotifications` settings across engine, daemon, and owner config.
   Nonblocking admission precedes handler goroutines: request overflow returns
-  original-ID `-32004`, notification overflow drops without reply, and slots
-  remain held through actual callback return. Nonpositive values remain unlimited;
-  consumers must explicitly configure bounds, such as 64 requests/64 notifications.
+  original-ID `-32004` and notification overflow drops without reply. A positive
+  request limit bounds the full dispatch goroutine, including response writing
+  and deferred cleanup, not just callback execution. A blocked slow peer can
+  intentionally consume owner-wide capacity and reject sibling requests rather
+  than allow unbounded queued response writers. Notification slots remain held
+  through actual callback return; slot release and work accounting stay deferred
+  through actual callback settlement, including error, cancellation, and panic
+  paths. Nonpositive values remain unlimited; consumers must explicitly configure
+  bounds, such as 64 requests/64 notifications.
 
 ### Fixed
 
@@ -32,6 +38,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   before registration get one matching upgraded disconnect without a late
   connect or releasing a sibling's reservation. Actual callback settlement
   remains part of maintenance and reader/teardown proof.
+- A panic in a legacy or metadata-aware connect callback is logged and closes
+  only the affected session, without dispatching requests for it. After connect
+  settles, its matching disconnect cleanup runs once, including partially
+  established lifecycle state; the owner and sibling sessions remain available.
 
 ### Compatibility
 

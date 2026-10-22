@@ -254,10 +254,14 @@ type Config struct {
 	// receives the same preauthorization SessionID and Conn used by lifecycle.
 	AuthorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
 
-	// Positive limits bound concurrent structured callbacks per owner, across
-	// sessions. Nonpositive values are unlimited. Overflow requests receive
-	// -32004; overflow notifications are silently dropped before goroutine launch.
-	MaxConcurrentRequests      int
+	// MaxConcurrentRequests bounds full structured request dispatch goroutines per
+	// owner across sessions, including response writes and deferred cleanup.
+	// Nonpositive values are unlimited; overflow receives -32004 before launch.
+	MaxConcurrentRequests int
+
+	// MaxConcurrentNotifications bounds structured notification dispatch goroutines
+	// per owner through deferred cleanup. Nonpositive values are unlimited;
+	// overflow notifications are silently dropped before goroutine launch.
 	MaxConcurrentNotifications int
 
 	// OnFrameReceived, when non-nil, is invoked synchronously for every
