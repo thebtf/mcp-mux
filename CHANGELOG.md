@@ -686,7 +686,8 @@ operator exception; production consumer upgrades are not claimed.
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/thebtf/mcp-mux/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/thebtf/mcp-mux/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/thebtf/mcp-mux/compare/v0.29.1...v0.30.0
 [0.29.1]: https://github.com/thebtf/mcp-mux/compare/v0.29.0...v0.29.1

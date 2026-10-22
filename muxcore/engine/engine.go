@@ -560,22 +560,30 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 	env := collectEnv()
 
 	// 3. Ask the daemon to spawn (or locate) an owner for our server identity.
-	spawnClientOwner := func(reason string) (string, string, string, error) {
-		var partition *control.PartitionAssertion
-		if mode != serverid.ModeIsolated {
-			var err error
-			partition, err = e.resolvePartition(ctx, cwd, env)
-			if err != nil {
-				return "", "", "", err
-			}
+	sharingRequested := e.cfg.ModernSharing && mode != serverid.ModeIsolated
+	currentShared := false
+	resolveClientPartition := func() (*control.PartitionAssertion, error) {
+		if mode == serverid.ModeIsolated {
+			return nil, nil
 		}
-		return spawnViaDaemonRequest(ctlPath, control.Request{
+		return e.resolvePartition(ctx, cwd, env)
+	}
+	spawnClientOwner := func(reason string, partition *control.PartitionAssertion) (string, string, string, error) {
+		path, sid, token, err := spawnViaDaemonRequest(ctlPath, control.Request{
 			Cmd: "spawn", Command: e.cfg.Command, Args: e.cfg.Args, Cwd: cwd, Mode: string(mode), Env: env,
 			ProtocolEra: protocolWire, ReconnectReason: reason,
-			ModernSharing: e.cfg.ModernSharing && mode != serverid.ModeIsolated, Partition: partition,
+			ModernSharing: sharingRequested, Partition: partition,
 		}, e.logger)
+		if err == nil {
+			currentShared = sharingRequested && partition != nil && partition.Known
+		}
+		return path, sid, token, err
 	}
-	ipcPath, serverID, token, err := spawnClientOwner("")
+	partition, err := resolveClientPartition()
+	if err != nil {
+		return fmt.Errorf("engine client: spawn: %w", err)
+	}
+	ipcPath, serverID, token, err := spawnClientOwner("", partition)
 	if err != nil && !isMaintenanceFence(err) {
 		if errors.Is(err, era.AdmissionControlEraMismatch) {
 			admission := selection.AdmissionError(era.AdmissionControlEraMismatch)
@@ -598,13 +606,22 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "refresh"); err != nil {
 			return "", "", err
 		}
-		if e.cfg.ModernSharing && mode != serverid.ModeIsolated {
-			newIPC, newServerID, newToken, err := spawnClientOwner("refresh")
+		if sharingRequested {
+			partition, err := resolveClientPartition()
 			if err != nil {
 				return "", "", err
 			}
-			currentIPC, serverID, currentToken = newIPC, newServerID, newToken
-			return newIPC, newToken, nil
+			if partition != nil && partition.Known {
+				newIPC, newServerID, newToken, err := spawnClientOwner("refresh", partition)
+				if err != nil {
+					return "", "", err
+				}
+				currentIPC, serverID, currentToken = newIPC, newServerID, newToken
+				return newIPC, newToken, nil
+			}
+			if currentShared {
+				return "", "", fmt.Errorf("engine: shared refresh requires a known partition")
+			}
 		}
 		newToken, err := refreshTokenViaDaemon(ctlPath, currentToken, protocolWire, e.logger)
 		if err != nil {
@@ -621,7 +638,11 @@ func (e *MuxEngine) runClient(ctx context.Context) error {
 		if err := e.ensureDaemonForReconnect(ctlPath, "reconnect"); err != nil {
 			return "", "", err
 		}
-		newIPC, newServerID, newToken, err := spawnClientOwner("fallback_spawn")
+		partition, err := resolveClientPartition()
+		if err != nil {
+			return "", "", err
+		}
+		newIPC, newServerID, newToken, err := spawnClientOwner("fallback_spawn", partition)
 		if err != nil {
 			return "", "", err
 		}
