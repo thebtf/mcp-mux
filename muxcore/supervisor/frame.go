@@ -45,6 +45,7 @@ type taskMeta struct {
 
 type parsedFrame struct {
 	raw       []byte
+	wire      []byte
 	kind      frameKind
 	id        *scalarValue
 	method    string
@@ -110,7 +111,8 @@ func parseFrame(raw []byte, maxBytes int) (*parsedFrame, error) {
 		return nil, fmt.Errorf("supervisor: response contains both result and error")
 	}
 
-	frame := &parsedFrame{raw: append([]byte(nil), trimmed...)}
+	wire := append([]byte(nil), raw...)
+	frame := &parsedFrame{raw: trimJSONWhitespace(wire), wire: wire}
 	if hasID {
 		id, err := parseScalar(idRaw)
 		if err != nil {
