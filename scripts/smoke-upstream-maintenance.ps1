@@ -683,7 +683,7 @@ try {
     $until = Get-UtcInstant $ttlLease.expires_at
     $expiryReleased = $false
     $expiryStatus = $null
-    while ([DateTime]::UtcNow -lt $Deadline) {
+    while ([DateTime]::UtcNow -lt $Deadline.AddSeconds(-30)) {
         Assert-TreeRetired $ctx $Fixture 2
         # The lease clock permits expiry; only durable daemon readback proves release.
         if ([DateTimeOffset]::UtcNow -ge $until) {
