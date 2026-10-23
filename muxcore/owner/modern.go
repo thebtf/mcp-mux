@@ -406,7 +406,7 @@ func (o *Owner) forwardModernCancelledNotification(s *Session, msg *jsonrpc.Mess
 	if json.Unmarshal(msg.Raw, &notification) != nil || notification.Params.RequestID == nil {
 		return nil
 	}
-	if o.cancelLocalDemand(s, notification.Params.RequestID) {
+	if o.cancelLocalDemand(s, notification.Params.RequestID) || o.cancelActiveSessionRequest(s, notification.Params.RequestID) {
 		return nil
 	}
 	o.modernMu.Lock()

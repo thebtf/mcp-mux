@@ -12,13 +12,14 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-The module version targeted by this documentation is `muxcore/v0.33.0`:
+The module version targeted by this documentation is `muxcore/v0.33.1`:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.33.0
+go get github.com/thebtf/mcp-mux/muxcore@v0.33.1
 ```
 
-v0.33.0 adds exact-session lifecycle/authorization metadata and opt-in per-owner
+v0.33.1 fixes cancellation of active structured requests. v0.33.0 added
+exact-session lifecycle/authorization metadata and opt-in per-owner
 callback limits. See [consumer adoption](#v0330--exact-session-lifecycle-and-callback-admission)
 for the required integration changes. Existing interfaces and nil/zero defaults
 remain compatible; a dependency bump alone does not migrate consumer quota tracking
@@ -495,8 +496,9 @@ Important rules:
 - `ProjectContext.Env` is a merged session environment: shim-provided values
   win, daemon environment fills gaps. This prevents trimmed client environments
   from losing credentials.
-- Implement `NotificationHandler` if you need client-to-server notifications
-  such as `notifications/cancelled`.
+- Implement `NotificationHandler` for client-to-server notifications other than
+  `notifications/cancelled`, which muxcore handles by cancelling the matching
+  active request context.
 - Implement `SessionHandlerWithSessionMeta` and
   `NotificationHandlerWithSessionMeta` when you need OS peer identity or
   `AuthorizeSession` metadata. If both legacy and `WithSessionMeta` methods are
@@ -504,6 +506,24 @@ Important rules:
 
 `ConnInfo` zero values are meaningful: `PeerPid == 0` and `PeerUid == 0` mean
 "unavailable", not PID 0 or root.
+
+### v0.33.1 — active structured request cancellation
+
+For both legacy and modern owners, `notifications/cancelled` cancels the active
+`HandleRequest` or `HandleRequestWithSessionMeta` context belonging to that exact
+session and typed request ID. Numeric `1` and string `"1"` remain distinct.
+Unknown IDs, another session's IDs, and repeated cancellation do not cancel
+unrelated callbacks or produce notification responses. No notification-handler
+interface is required to receive cancellation through the request context.
+
+Concurrent requests with the same session and ID remain admitted as before.
+While more than one matching callback is active, cancellation cannot identify
+one uniquely and cancels none. Each callback retains its own cancellation entry
+until actual return, including panic unwinding; exact-entry cleanup cannot erase
+a still-active duplicate or a later reuse of the ID. Cancellation alone never
+releases a request slot or decrements `PendingRequests`: the existing full
+dispatch cleanup still includes callback execution and response writing.
+Queued-demand cancellation and upstream cancellation routing remain unchanged.
 
 ### v0.33.0 — exact-session lifecycle and callback admission
 

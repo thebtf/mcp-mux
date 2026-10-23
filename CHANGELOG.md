@@ -7,6 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.33.1] - 2026-10-23
+
+### Fixed
+
+- Route `notifications/cancelled` to active structured request contexts in both
+  legacy and modern owners, using the exact session and typed numeric/string ID.
+  Repeated, unknown, or wrong-session cancellation cannot affect unrelated
+  callbacks. Concurrent duplicate IDs retain existing admission and are not
+  cancelled while ambiguous; actual callback return removes only its own entry.
+  Cancellation does not release callback capacity or pending accounting before
+  the existing full dispatch settles. Queued-demand and upstream cancellation
+  behavior remain unchanged.
+
 ## [0.33.0] - 2026-10-23
 
 ### Added
@@ -740,7 +753,8 @@ operator exception; production consumer upgrades are not claimed.
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.33.1...HEAD
+[0.33.1]: https://github.com/thebtf/mcp-mux/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/thebtf/mcp-mux/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/thebtf/mcp-mux/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/thebtf/mcp-mux/compare/v0.30.0...v0.31.0

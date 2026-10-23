@@ -166,6 +166,12 @@ type sessionLifecycle struct {
 	started     bool
 }
 
+type activeSessionRequest struct {
+	session *Session
+	cancel  context.CancelFunc
+	next    *activeSessionRequest
+}
+
 // Owner is the multiplexer core. It manages a single upstream process and
 // routes requests from multiple downstream sessions through it.
 type Owner struct {
@@ -223,24 +229,25 @@ type Owner struct {
 	// Read-only after construction.
 	onFrameReceived func(sessionID string, frameSize int, method string) muxcore.FrameAction
 
-	mu                   sync.RWMutex
-	sessions             map[int]*Session
-	sessionLifecycles    map[int]*sessionLifecycle
-	cachedInitSessions   map[int]bool // sessions that received a cached (replayed) initialize response
-	initDone             bool
-	initResp             []byte // cached initialize response (raw JSON-RPC)
-	initProtocolVersion  string // protocolVersion from first initialize request (for fingerprint matching)
-	toolList             []byte // cached tools/list response (raw JSON-RPC)
-	promptList           []byte // cached prompts/list response (raw JSON-RPC)
-	resourceList         []byte // cached resources/list response (raw JSON-RPC)
-	resourceTemplateList []byte // cached resources/templates/list response (raw JSON-RPC)
-	autoClassification   classify.SharingMode
-	classificationSource string        // "capability" or "tools" — what determined classification
-	classificationReason []string      // tool names that triggered isolation
-	classified           chan struct{} // closed when autoClassification is first set
-	classifiedOnce       sync.Once
-	initReady            chan struct{} // closed when initialize response is cached or upstream dies
-	initReadyOnce        sync.Once
+	mu                    sync.RWMutex
+	sessions              map[int]*Session
+	sessionLifecycles     map[int]*sessionLifecycle
+	activeSessionRequests map[string]*activeSessionRequest
+	cachedInitSessions    map[int]bool // sessions that received a cached (replayed) initialize response
+	initDone              bool
+	initResp              []byte // cached initialize response (raw JSON-RPC)
+	initProtocolVersion   string // protocolVersion from first initialize request (for fingerprint matching)
+	toolList              []byte // cached tools/list response (raw JSON-RPC)
+	promptList            []byte // cached prompts/list response (raw JSON-RPC)
+	resourceList          []byte // cached resources/list response (raw JSON-RPC)
+	resourceTemplateList  []byte // cached resources/templates/list response (raw JSON-RPC)
+	autoClassification    classify.SharingMode
+	classificationSource  string        // "capability" or "tools" — what determined classification
+	classificationReason  []string      // tool names that triggered isolation
+	classified            chan struct{} // closed when autoClassification is first set
+	classifiedOnce        sync.Once
+	initReady             chan struct{} // closed when initialize response is cached or upstream dies
+	initReadyOnce         sync.Once
 
 	sessionMgr             *SessionManager
 	tokenHandshake         bool   // true when daemon manages this owner (shims send token)
@@ -1274,6 +1281,17 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 		Env: s.Env,
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	key := string(remap.Remap(s.ID, msg.ID))
+	request := &activeSessionRequest{session: s, cancel: cancel}
+	o.mu.Lock()
+	if o.activeSessionRequests == nil {
+		o.activeSessionRequests = make(map[string]*activeSessionRequest)
+	}
+	request.next = o.activeSessionRequests[key]
+	o.activeSessionRequests[key] = request
+	o.mu.Unlock()
+
 	o.pendingRequests.Add(1)
 	o.unlockRequestAdmission()
 
@@ -1289,17 +1307,7 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 			}
 		}()
 
-		// Build context: cancel on session disconnect or owner shutdown, and
-		// optionally apply the per-call tool timeout. The WithTimeout wrapping
-		// MUST happen before the watcher goroutine is spawned — otherwise the
-		// goroutine captures the outer ctx and races the parent's ctx
-		// reassignment on the `ctx, timeoutCancel = context.WithTimeout(...)`
-		// line (caught by -race as a data race on the ctx variable,
-		// dispatch_test.go:TestDispatchToSessionHandler_Timeout on CI).
-		// The semantic bug is real too: if toolTimeout fires before s.Done()
-		// or o.done, the watcher is still blocking on the OLD ctx.Done() and
-		// leaks until one of the other two triggers.
-		ctx, cancel := context.WithCancel(context.Background())
+		// Apply the timeout before starting the watcher so it observes the final context.
 		defer cancel()
 
 		if timeout := o.toolTimeoutNs.Load(); timeout > 0 {
@@ -1323,13 +1331,13 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 		// path. Cached at owner construction (cacheHandlerInterfaces) so
 		// the per-frame hot path skips a type assertion (CodeRabbit
 		// nitpick on PR #113).
-		var resp []byte
-		var err error
-		if o.sessionHandlerWithMeta != nil {
-			resp, err = o.sessionHandlerWithMeta.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
-		} else {
-			resp, err = o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
-		}
+		resp, err := func() ([]byte, error) {
+			defer o.removeActiveSessionRequest(key, request)
+			if o.sessionHandlerWithMeta != nil {
+				return o.sessionHandlerWithMeta.HandleRequestWithSessionMeta(ctx, project, s.Meta(), msg.Raw)
+			}
+			return o.sessionHandler.HandleRequest(ctx, project, msg.Raw)
+		}()
 		if err != nil {
 			// Route through buildJSONRPCErrorBytes so error messages with JSON-special
 			// characters (quotes, backslashes, newlines, Windows paths, control bytes)
@@ -1354,6 +1362,51 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 	}()
 
 	return nil
+}
+
+func (o *Owner) removeActiveSessionRequest(key string, request *activeSessionRequest) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.activeSessionRequests[key] == request {
+		if request.next == nil {
+			delete(o.activeSessionRequests, key)
+		} else {
+			o.activeSessionRequests[key] = request.next
+		}
+		return
+	}
+	for current := o.activeSessionRequests[key]; current != nil; current = current.next {
+		if current.next == request {
+			current.next = request.next
+			return
+		}
+	}
+}
+
+func (o *Owner) cancelActiveSessionRequest(s *Session, requestID json.RawMessage) bool {
+	if o.sessionHandler == nil {
+		return false
+	}
+	key := string(remap.Remap(s.ID, requestID))
+	o.mu.RLock()
+	var selected *activeSessionRequest
+	for request := o.activeSessionRequests[key]; request != nil; request = request.next {
+		if request.session != s {
+			continue
+		}
+		if selected != nil {
+			// Duplicate IDs stay admitted, but cancellation cannot select a unique callback.
+			o.mu.RUnlock()
+			return true
+		}
+		selected = request
+	}
+	o.mu.RUnlock()
+	if selected == nil {
+		return false
+	}
+	selected.cancel()
+	return true
 }
 
 // sendProactiveInit sends an initialize request to the upstream immediately after
@@ -3801,7 +3854,7 @@ func (o *Owner) forwardCancelledNotification(s *Session, msg *jsonrpc.Message) e
 	if !hasRequestID {
 		return o.forwardNotificationIfReady(msg.Raw)
 	}
-	if o.cancelLocalDemand(s, requestIDRaw) {
+	if o.cancelLocalDemand(s, requestIDRaw) || o.cancelActiveSessionRequest(s, requestIDRaw) {
 		return nil
 	}
 
