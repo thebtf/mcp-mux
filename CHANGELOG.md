@@ -47,8 +47,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Reconcile a zero-grace in-process close warning only after actual handler,
   pipe, and native-work retirement proof, returning its final exit status without
   hiding blocked handlers or OS process-tree finalization errors.
-- Fixed spurious five-second probe waits when the host closes stdin after reading
-  an IPC response but before its stdout write returns.
+- Fixed stdin-EOF settlement to drain accepted IPC output within the existing
+  five-second budget, including after IPC disconnect, without treating active
+  requests as empty startup probes.
 
 ### Compatibility
 

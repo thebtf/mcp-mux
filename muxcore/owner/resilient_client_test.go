@@ -168,14 +168,31 @@ func newTestIPCPath(t *testing.T) string {
 
 type delayedReturnWriter struct {
 	io.Writer
-	release <-chan struct{}
+	entered     chan<- struct{}
+	beforeWrite <-chan struct{}
+	release     <-chan struct{}
 }
 
 func (w *delayedReturnWriter) Write(p []byte) (int, error) {
+	if w.entered != nil {
+		close(w.entered)
+	}
+	if w.beforeWrite != nil {
+		<-w.beforeWrite
+	}
 	n, err := w.Writer.Write(p)
 	// The host can consume the response before the outer Write returns.
-	<-w.release
+	if w.release != nil {
+		<-w.release
+	}
 	return n, err
+}
+
+type resilientLogWriter func([]byte)
+
+func (w resilientLogWriter) Write(p []byte) (int, error) {
+	w(p)
+	return len(p), nil
 }
 
 func TestResilientClient_StdinCloseAfterVisibleResponse(t *testing.T) {
@@ -196,6 +213,7 @@ func TestResilientClient_StdinCloseAfterVisibleResponse(t *testing.T) {
 			releaseWrite := sync.OnceFunc(func() { close(allowWriteReturn) })
 			clientDone := make(chan struct{})
 			hostDone := make(chan struct{})
+			eofObserved := make(chan struct{}, 1)
 			var clientErr, hostErr error
 			var response string
 			t.Cleanup(func() {
@@ -214,12 +232,20 @@ func TestResilientClient_StdinCloseAfterVisibleResponse(t *testing.T) {
 			})
 			go func() {
 				defer close(clientDone)
+				defer stdoutW.Close()
 				clientErr = RunResilientClient(ResilientClientConfig{
 					Stdin:            stdinR,
 					Stdout:           &delayedReturnWriter{Writer: stdoutW, release: allowWriteReturn},
 					InitialIPCPath:   path,
 					ProbeGracePeriod: time.Minute,
-					Logger:           resilientTestLogger(t),
+					Logger: log.New(resilientLogWriter(func(p []byte) {
+						if strings.Contains(string(p), "stdin EOF") {
+							select {
+							case eofObserved <- struct{}{}:
+							default:
+							}
+						}
+					}), "", 0),
 				})
 			}()
 			go func() {
@@ -243,13 +269,180 @@ func TestResilientClient_StdinCloseAfterVisibleResponse(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("host did not receive the IPC response and close stdin")
 			}
+			if tc.stdinErr == nil {
+				select {
+				case <-eofObserved:
+				case <-clientDone:
+					t.Fatal("client returned before its stdout Write completed")
+				case <-time.After(time.Second):
+					t.Fatal("client did not observe host stdin EOF")
+				}
+				select {
+				case <-clientDone:
+					t.Fatal("client returned while its visible response Write was still blocked")
+				case <-time.After(200 * time.Millisecond):
+				}
+				releaseWrite()
+			}
 			select {
 			case <-clientDone:
 				if !errors.Is(clientErr, tc.stdinErr) {
 					t.Fatalf("client error = %v, want %v", clientErr, tc.stdinErr)
 				}
 			case <-time.After(time.Second):
-				t.Fatal("client waited for probe grace after the host received a response and closed stdin, while stdout Write had not returned")
+				t.Fatal("client did not settle after stdin close and permitted stdout completion")
+			}
+		})
+	}
+}
+
+func TestResilientClient_StdinEOFDrainsBlockedResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		responseAfterEOF bool
+		disconnectIPC    bool
+		lostRequest      bool
+	}{
+		{name: "accepted_output"},
+		{name: "response_after_eof", responseAfterEOF: true},
+		{name: "ipc_disconnect", disconnectIPC: true},
+		{name: "ipc_disconnect_with_lost_request", disconnectIPC: true, lostRequest: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newTestIPCPath(t)
+			requests := make(chan string, 2)
+			allowResponse := make(chan struct{})
+			releaseResponse := sync.OnceFunc(func() { close(allowResponse) })
+			srv := startSlowEchoIPCServer(t, path, func(_ net.Conn, rawID string) {
+				requests <- rawID
+				if tc.responseAfterEOF || rawID == "43" {
+					<-allowResponse
+				}
+			})
+			stdinR, stdinW := io.Pipe()
+			stdoutR, stdoutW := io.Pipe()
+			writeEntered := make(chan struct{})
+			allowDelivery := make(chan struct{})
+			releaseWrite := sync.OnceFunc(func() { close(allowDelivery) })
+			eofObserved := make(chan struct{}, 1)
+			clientDone, hostDone := make(chan struct{}), make(chan struct{})
+			var clientErr, hostErr error
+			var response string
+			t.Cleanup(func() {
+				releaseResponse()
+				releaseWrite()
+				stdinW.Close()
+				stdinR.Close()
+				stdoutR.Close()
+				stdoutW.Close()
+				for _, done := range []<-chan struct{}{hostDone, clientDone} {
+					select {
+					case <-done:
+					case <-time.After(6 * time.Second):
+						t.Error("consumer goroutine did not stop during cleanup")
+					}
+				}
+			})
+			go func() {
+				defer close(clientDone)
+				defer stdoutW.Close()
+				clientErr = RunResilientClient(ResilientClientConfig{
+					Stdin: stdinR,
+					Stdout: &delayedReturnWriter{
+						Writer: stdoutW, entered: writeEntered, beforeWrite: allowDelivery,
+					},
+					InitialIPCPath:   path,
+					ProbeGracePeriod: time.Minute,
+					Logger: log.New(resilientLogWriter(func(p []byte) {
+						if strings.Contains(string(p), "stdin EOF") {
+							select {
+							case eofObserved <- struct{}{}:
+							default:
+							}
+						}
+					}), "", 0),
+				})
+			}()
+			go func() {
+				defer close(hostDone)
+				if _, hostErr = fmt.Fprintln(stdinW, `{"jsonrpc":"2.0","id":42,"method":"ping"}`); hostErr != nil {
+					return
+				}
+				response, hostErr = bufio.NewReader(stdoutR).ReadString('\n')
+			}()
+			select {
+			case id := <-requests:
+				if id != "42" {
+					t.Fatalf("upstream request ID = %s, want 42", id)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream did not receive the host request")
+			}
+			if !tc.responseAfterEOF {
+				select {
+				case <-writeEntered:
+				case <-time.After(5 * time.Second):
+					t.Fatal("IPC response did not reach the blocked stdout writer")
+				}
+			}
+			if tc.lostRequest {
+				if _, err := fmt.Fprintln(stdinW, `{"jsonrpc":"2.0","id":43,"method":"ping"}`); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case id := <-requests:
+					if id != "43" {
+						t.Fatalf("upstream request ID = %s, want 43", id)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("upstream did not receive the request to be lost on disconnect")
+				}
+			}
+			if err := stdinW.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-eofObserved:
+			case <-clientDone:
+				t.Fatal("client returned before delivering its accepted IPC response")
+			case <-time.After(time.Second):
+				t.Fatal("client did not observe host stdin EOF")
+			}
+			if tc.responseAfterEOF {
+				releaseResponse()
+				select {
+				case <-writeEntered:
+				case <-time.After(time.Second):
+					t.Fatal("response arriving after EOF did not reach the stdout writer")
+				}
+			}
+			if tc.disconnectIPC {
+				srv.closeAll()
+			}
+			select {
+			case <-clientDone:
+				t.Fatal("client returned while response delivery was still blocked")
+			case <-time.After(200 * time.Millisecond):
+			}
+			releaseWrite()
+			select {
+			case <-hostDone:
+				if hostErr != nil {
+					t.Fatalf("host response read: %v", hostErr)
+				}
+				if want := `{"jsonrpc":"2.0","id":42,"result":{"ok":true}}` + "\n"; response != want {
+					t.Fatalf("host response = %q, want %q", response, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("accepted IPC response did not reach the host after unblocking stdout")
+			}
+			select {
+			case <-clientDone:
+				if clientErr != nil {
+					t.Fatalf("client error = %v, want nil", clientErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("client did not settle after its response was delivered")
 			}
 		})
 	}
