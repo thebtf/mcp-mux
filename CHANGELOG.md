@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.33.0] - 2026-10-23
+
+### Added
+
+- Added opaque per-admission `SessionMeta.SessionID`, optional
+  `ProjectLifecycleWithSessionMeta`, and `AuthorizeSessionWithSessionMeta`.
+  Upgraded callbacks take precedence without duplicate legacy calls; existing
+  interfaces and nil defaults remain compatible.
+- Added opt-in per-owner `MaxConcurrentRequests` and
+  `MaxConcurrentNotifications` settings across engine, daemon, and owner config.
+  Nonblocking admission precedes handler goroutines: request overflow returns
+  original-ID `-32004` and notification overflow drops without reply. A positive
+  request limit bounds the full dispatch goroutine, including response writing
+  and deferred cleanup, not just callback execution. A blocked slow peer can
+  intentionally consume owner-wide capacity and reject sibling requests rather
+  than allow unbounded queued response writers. Notification slots remain held
+  through actual callback return; slot release and work accounting stay deferred
+  through actual callback settlement, including error, cancellation, and panic
+  paths. Nonpositive values remain unlimited; consumers must explicitly configure
+  bounds, such as 64 requests/64 notifications.
+
+### Fixed
+
+- Fixed ghost lifecycle callbacks and sibling-session reservation release:
+  reservations use the same exact-session preauthorization ID through teardown,
+  and connect settles before dispatch/disconnect. Sessions registered before a
+  maintenance fence retain connect-then-disconnect settlement even if the fence
+  or `Close` occurs before connect runs. Only `AuthAllow` admissions aborted
+  before registration get one matching upgraded disconnect without a late
+  connect or releasing a sibling's reservation. Actual callback settlement
+  remains part of maintenance and reader/teardown proof.
+- A panic in a legacy or metadata-aware connect callback is logged and closes
+  only the affected session, without dispatching requests for it. After connect
+  settles, its matching disconnect cleanup runs once, including partially
+  established lifecycle state; the owner and sibling sessions remain available.
+- Restored legacy `notifications/roots/list_changed` completion before the
+  session reader can dispatch its first frame; modern bootstrap remains disabled.
+- Reconcile a zero-grace in-process close warning only after actual handler,
+  pipe, and native-work retirement proof, returning its final exit status without
+  hiding blocked handlers or OS process-tree finalization errors.
+- Fixed stdin-EOF settlement to drain accepted IPC output within the existing
+  five-second budget, including after IPC disconnect, without treating active
+  requests as empty startup probes.
+
+### Compatibility
+
+- Full consumer adoption requires the metadata authorizer and upgraded lifecycle
+  methods to reserve/release by `SessionMeta.SessionID`, plus explicit per-owner
+  request/notification limits such as 64/64. A dependency bump alone cannot fix
+  a project-only FIFO reservation tracker or enable bounds. No AIMUX or Engram
+  consumer upgrade is claimed.
+
 ## [0.32.0] - 2026-10-22
 
 ### Added
@@ -686,7 +740,8 @@ operator exception; production consumer upgrades are not claimed.
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/thebtf/mcp-mux/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/thebtf/mcp-mux/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/thebtf/mcp-mux/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/thebtf/mcp-mux/compare/v0.29.1...v0.30.0

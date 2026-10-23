@@ -250,6 +250,20 @@ type Config struct {
 	// AuthDeny{Reason: "authorize panic"} — the daemon never crashes.
 	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
+	// AuthorizeSessionWithSessionMeta takes precedence over AuthorizeSession and
+	// receives the same preauthorization SessionID and Conn used by lifecycle.
+	AuthorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
+
+	// MaxConcurrentRequests bounds full structured request dispatch goroutines per
+	// owner across sessions, including response writes and deferred cleanup.
+	// Nonpositive values are unlimited; overflow receives -32004 before launch.
+	MaxConcurrentRequests int
+
+	// MaxConcurrentNotifications bounds structured notification dispatch goroutines
+	// per owner through deferred cleanup. Nonpositive values are unlimited;
+	// overflow notifications are silently dropped before goroutine launch.
+	MaxConcurrentNotifications int
+
 	// OnFrameReceived, when non-nil, is invoked synchronously for every
 	// inbound (client→server) frame on the reader goroutine AFTER framing /
 	// JSON-RPC parsing but BEFORE dispatch. Default (nil) preserves pre-v0.24
@@ -435,21 +449,24 @@ func (e *MuxEngine) runDaemon(ctx context.Context) error {
 		handlerFunc = nil // SessionHandler is passed separately; clear HandlerFunc
 	}
 	d, err := daemon.New(daemon.Config{
-		ControlPath:             ctlPath,
-		OwnerIdleTimeout:        e.cfg.IdleTimeout,
-		IdleTimeout:             e.cfg.IdleTimeout,
-		ZeroSessionCleanupDelay: e.cfg.ZeroSessionCleanupDelay,
-		Logger:                  e.logger,
-		SkipSnapshot:            e.cfg.SkipSnapshot,
-		HandlerFunc:             handlerFunc,
-		SessionHandler:          e.cfg.SessionHandler,
-		DaemonFlag:              e.cfg.DaemonFlag,
-		Name:                    e.cfg.Name,
-		Namespace:               e.cfg.Namespace,
-		Persistent:              e.cfg.Persistent,
-		Registry:                e.cfg.Registry,
-		AuthorizeSession:        e.cfg.AuthorizeSession,
-		OnFrameReceived:         e.cfg.OnFrameReceived,
+		ControlPath:                     ctlPath,
+		OwnerIdleTimeout:                e.cfg.IdleTimeout,
+		IdleTimeout:                     e.cfg.IdleTimeout,
+		ZeroSessionCleanupDelay:         e.cfg.ZeroSessionCleanupDelay,
+		Logger:                          e.logger,
+		SkipSnapshot:                    e.cfg.SkipSnapshot,
+		HandlerFunc:                     handlerFunc,
+		SessionHandler:                  e.cfg.SessionHandler,
+		DaemonFlag:                      e.cfg.DaemonFlag,
+		Name:                            e.cfg.Name,
+		Namespace:                       e.cfg.Namespace,
+		Persistent:                      e.cfg.Persistent,
+		Registry:                        e.cfg.Registry,
+		AuthorizeSession:                e.cfg.AuthorizeSession,
+		AuthorizeSessionWithSessionMeta: e.cfg.AuthorizeSessionWithSessionMeta,
+		MaxConcurrentRequests:           e.cfg.MaxConcurrentRequests,
+		MaxConcurrentNotifications:      e.cfg.MaxConcurrentNotifications,
+		OnFrameReceived:                 e.cfg.OnFrameReceived,
 	})
 	if err != nil {
 		return fmt.Errorf("engine daemon: %w", err)

@@ -360,7 +360,7 @@ func TestFinishReconnect_LegacyRetainsInitializeReplayAndListChanges(t *testing.
 }
 
 func TestReconnect_ModernDrainsInflightAndForwardsFreshListenOnce(t *testing.T) {
-	stdout := &bytes.Buffer{}
+	stdout := &capturingLogger{}
 	rc := newReconnectClient(t, stdout, resilientTestLogger(t))
 	rc.cfg.ProtocolEra = era.EraModern20260728
 
@@ -397,23 +397,35 @@ func TestReconnect_ModernDrainsInflightAndForwardsFreshListenOnce(t *testing.T) 
 	}
 
 	var stdoutMu sync.Mutex
+	stdoutDone := make(chan struct{})
+	go func() {
+		defer close(stdoutDone)
+		rc.runStdoutWriter(&stdoutMu)
+	}()
 	proxyErr := make(chan error, 1)
 	proxyStopped := false
 	go func() {
 		proxyErr <- rc.runProxy(initialConn, &stdoutMu, stdinDone)
 	}()
 	defer func() {
-		if proxyStopped {
-			return
-		}
 		releaseReconnect()
-		select {
-		case stdinDone <- io.EOF:
-		default:
+		if !proxyStopped {
+			select {
+			case stdinDone <- io.EOF:
+			default:
+			}
+			select {
+			case <-proxyErr:
+			case <-time.After(time.Second):
+				t.Error("runProxy did not stop during fixture cleanup")
+				return
+			}
 		}
+		close(rc.msgFromIPC)
 		select {
-		case <-proxyErr:
+		case <-stdoutDone:
 		case <-time.After(time.Second):
+			t.Error("stdout writer did not stop during fixture cleanup")
 		}
 	}()
 
@@ -470,8 +482,8 @@ func TestReconnect_ModernDrainsInflightAndForwardsFreshListenOnce(t *testing.T) 
 
 	out := stdout.String()
 	responses := parseJSONRPCResponsesWithID(t, out)
-	if len(responses) != 1 {
-		t.Fatalf("modern reconnect drained response count = %d, want 1; stdout=%q", len(responses), out)
+	if len(responses) != 2 {
+		t.Fatalf("modern reconnect response count = %d, want one old-request error and one fresh response; stdout=%q", len(responses), out)
 	}
 	if got := string(responses[0].ID); got != "41" {
 		t.Fatalf("modern reconnect drained response ID = %s, want old ID 41; stdout=%q", got, out)
@@ -479,6 +491,11 @@ func TestReconnect_ModernDrainsInflightAndForwardsFreshListenOnce(t *testing.T) 
 	if responses[0].Error == nil || responses[0].Error.Code != -32603 ||
 		!strings.Contains(responses[0].Error.Message, "request lost during reconnect") {
 		t.Fatalf("modern reconnect did not emit the old-request loss error exactly once; response=%+v", responses[0])
+	}
+	fresh := responses[1]
+	if string(fresh.ID) != "42" || fresh.Error != nil ||
+		string(fresh.Result["successor_daemon_generation"]) != `"modern-successor"` {
+		t.Fatalf("modern reconnect did not deliver the fresh successor response exactly once; response=%+v", fresh)
 	}
 	if got := strings.Count(out, "request lost during reconnect"); got != 1 {
 		t.Fatalf("modern reconnect old-request loss count = %d, want 1; stdout=%q", got, out)

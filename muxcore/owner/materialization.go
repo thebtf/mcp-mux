@@ -352,7 +352,7 @@ func (o *Owner) oldestEligibleSessionLocked() *Session {
 		if session == nil || session.IsClosed() {
 			continue
 		}
-		if o.authorizeSession != nil && !session.Meta().IsAuthorized() {
+		if (o.authorizeSession != nil || o.authorizeSessionWithSessionMeta != nil) && !session.Meta().IsAuthorized() {
 			continue
 		}
 		if selected == nil || id < selectedID {
@@ -1272,7 +1272,7 @@ func (o *Owner) sessionEligibleForDemand(s *Session) bool {
 	if s == nil || s.IsClosed() {
 		return false
 	}
-	if o.authorizeSession != nil && !s.Meta().IsAuthorized() {
+	if (o.authorizeSession != nil || o.authorizeSessionWithSessionMeta != nil) && !s.Meta().IsAuthorized() {
 		return false
 	}
 	o.mu.RLock()

@@ -414,11 +414,23 @@ func newModernWriterOwner(
 
 func addModernOwnerSession(t *testing.T, o *Owner, cwd string) (*Session, *safeBuf) {
 	t.Helper()
-	session, output := newTestSession(cwd)
+	reader, input := io.Pipe()
+	output := &safeBuf{}
+	session := NewSession(reader, output)
+	session.Cwd = cwd
 	o.admissionMu.Lock()
 	o.addSessionLocked(session)
 	o.admissionMu.Unlock()
-	t.Cleanup(session.Close)
+	readerDone := make(chan struct{})
+	go func() {
+		o.readSession(session)
+		close(readerDone)
+	}()
+	t.Cleanup(func() {
+		_ = input.Close()
+		session.Close()
+		<-readerDone
+	})
 	return session, output
 }
 
@@ -650,12 +662,22 @@ func TestModernOwner_BackpressuresRequestScopedLogs(t *testing.T) {
 	release := func() { releaseOnce.Do(func() { close(gate) }) }
 	writer := &gatedWriter{started: make(chan struct{}), release: gate}
 	o := newModernWriterOwner(t, io.Discard, nil)
-	session := NewSession(strings.NewReader(""), writer)
+	reader, input := io.Pipe()
+	session := NewSession(reader, writer)
 	o.admissionMu.Lock()
 	o.addSessionLocked(session)
 	o.admissionMu.Unlock()
-	t.Cleanup(session.Close)
-	t.Cleanup(release)
+	readerDone := make(chan struct{})
+	go func() {
+		o.readSession(session)
+		close(readerDone)
+	}()
+	t.Cleanup(func() {
+		release()
+		_ = input.Close()
+		session.Close()
+		<-readerDone
+	})
 
 	optedInRequest := []byte(`{"jsonrpc":"2.0","id":"modern-log-backpressure","method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/logLevel":"info"}}}`)
 	if err := o.handleDownstreamMessage(session, parseMessage(optedInRequest)); err != nil {

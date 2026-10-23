@@ -389,11 +389,21 @@ func TestCancellationAfterForwardingDoesNotWaitForGeneration(t *testing.T) {
 	o := newMinimalOwner()
 	var upstream bytes.Buffer
 	o.upstreamWriter = &upstream
-	s := NewSession(strings.NewReader(""), io.Discard)
+	reader, input := io.Pipe()
+	s := NewSession(reader, io.Discard)
 	o.admissionMu.Lock()
 	o.addSessionLocked(s)
 	o.admissionMu.Unlock()
-	defer s.Close()
+	readerDone := make(chan struct{})
+	go func() {
+		o.readSession(s)
+		close(readerDone)
+	}()
+	t.Cleanup(func() {
+		_ = input.Close()
+		s.Close()
+		<-readerDone
+	})
 
 	msg, err := jsonrpc.Parse([]byte(`{"jsonrpc":"2.0","id":41,"method":"custom/forwarded","params":{}}`))
 	if err != nil {
@@ -411,6 +421,8 @@ func TestCancellationAfterForwardingDoesNotWaitForGeneration(t *testing.T) {
 
 	writeEntered := make(chan struct{})
 	releaseWrite := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseWrite) })
+	defer release()
 	var writeOnce sync.Once
 	o.beforeQueuedDemandWrite = func() {
 		writeOnce.Do(func() { close(writeEntered) })
@@ -429,7 +441,7 @@ func TestCancellationAfterForwardingDoesNotWaitForGeneration(t *testing.T) {
 
 	cancelResult := make(chan bool, 1)
 	go func() { cancelResult <- o.cancelLocalDemand(s, msg.ID) }()
-	close(releaseWrite)
+	release()
 	select {
 	case local := <-cancelResult:
 		if local {
@@ -3256,11 +3268,21 @@ func TestBlockedQueuedWriteDoesNotHoldMaterializationMutex(t *testing.T) {
 	o := newMinimalOwner()
 	var upstream bytes.Buffer
 	o.upstreamWriter = &upstream
-	s := NewSession(strings.NewReader(""), io.Discard)
+	reader, input := io.Pipe()
+	s := NewSession(reader, io.Discard)
 	o.admissionMu.Lock()
 	o.addSessionLocked(s)
 	o.admissionMu.Unlock()
-	defer s.Close()
+	readerDone := make(chan struct{})
+	go func() {
+		o.readSession(s)
+		close(readerDone)
+	}()
+	t.Cleanup(func() {
+		_ = input.Close()
+		s.Close()
+		<-readerDone
+	})
 
 	msg, err := jsonrpc.Parse([]byte(`{"jsonrpc":"2.0","id":41,"method":"custom/blocked","params":{}}`))
 	if err != nil {
@@ -3272,6 +3294,8 @@ func TestBlockedQueuedWriteDoesNotHoldMaterializationMutex(t *testing.T) {
 
 	writeEntered := make(chan struct{})
 	releaseWrite := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseWrite) })
+	defer release()
 	o.beforeQueuedDemandWrite = func() {
 		close(writeEntered)
 		<-releaseWrite
@@ -3296,11 +3320,11 @@ func TestBlockedQueuedWriteDoesNotHoldMaterializationMutex(t *testing.T) {
 	select {
 	case <-lockAcquired:
 	case <-time.After(150 * time.Millisecond):
-		close(releaseWrite)
+		release()
 		<-forwardDone
 		t.Fatal("blocked upstream write held materializationMu")
 	}
-	close(releaseWrite)
+	release()
 	select {
 	case <-forwardDone:
 	case <-time.After(time.Second):

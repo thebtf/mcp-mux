@@ -38,9 +38,19 @@ type SessionHandler interface {
 
 // ProjectLifecycle is optionally implemented by SessionHandler.
 // Owner calls these when CC sessions connect/disconnect.
+// Connect returns before dispatch. A connect panic closes only that session and
+// runs disconnect cleanup without continuing dispatch.
 type ProjectLifecycle interface {
 	OnProjectConnect(project ProjectContext)
 	OnProjectDisconnect(projectID string)
+}
+
+// ProjectLifecycleWithSessionMeta replaces ProjectLifecycle when implemented.
+// Connect returns before dispatch; disconnect follows actual connect settlement.
+// A connect panic closes that session and runs disconnect cleanup without dispatch.
+type ProjectLifecycleWithSessionMeta interface {
+	OnProjectConnectWithSessionMeta(project ProjectContext, meta SessionMeta)
+	OnProjectDisconnectWithSessionMeta(projectID string, meta SessionMeta)
 }
 
 // NotificationHandler is optionally implemented by SessionHandler.

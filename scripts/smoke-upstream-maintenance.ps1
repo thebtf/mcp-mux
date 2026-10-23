@@ -678,10 +678,26 @@ try {
     Assert-Observation ($heldResult.exit_code -eq 0) "Short TTL hold succeeds before expiry" $heldResult.exit_code
     $ttlLease = Assert-Held $heldResponse $ttlServerID
     Assert-TreeRetired $ctx $Fixture 2
+    $expiryDaemon = Get-Status $ctx
+    Assert-Observation ($expiryDaemon.ContainsKey("maintenance_error_code") -and [string]::IsNullOrEmpty([string]$expiryDaemon["maintenance_error_code"])) "Safe expiry starts without a maintenance persistence error" $expiryDaemon["maintenance_error_code"]
     $until = Get-UtcInstant $ttlLease.expires_at
-    while ([DateTimeOffset]::UtcNow -lt $until) {
+    $expiryReleased = $false
+    $expiryStatus = $null
+    while ([DateTime]::UtcNow -lt $Deadline.AddSeconds(-30)) {
         Assert-TreeRetired $ctx $Fixture 2
+        # The lease clock permits expiry; only durable daemon readback proves release.
+        if ([DateTimeOffset]::UtcNow -ge $until) {
+            $expiryStatus = Get-Status $ctx
+            Assert-Observation ($expiryStatus.pid -eq $expiryDaemon.pid -and $expiryStatus.daemon_generation -ceq $expiryDaemon.daemon_generation -and -not [string]::IsNullOrWhiteSpace($expiryStatus.daemon_generation)) "Safe expiry retains the authoritative daemon identity" @{ pid = $expiryStatus.pid; daemon_generation = $expiryStatus.daemon_generation; expected_pid = $expiryDaemon.pid; expected_generation = $expiryDaemon.daemon_generation }
+            Assert-Observation ($expiryStatus.ContainsKey("maintenance_error_code") -and [string]::IsNullOrEmpty([string]$expiryStatus["maintenance_error_code"]) -and $expiryStatus.ContainsKey("maintenance")) "Safe expiry readback has no maintenance persistence error" $expiryStatus["maintenance_error_code"]
+            $currentLease = @($expiryStatus["maintenance"] | Where-Object { $_.hold_id -ceq $ttlLease.hold_id })
+            if ($currentLease.Count -eq 0) { $expiryReleased = $true; break }
+        }
         Start-Sleep -Milliseconds 100
+    }
+    Assert-Observation $expiryReleased "Safe expiry durably released exact lease" @{ hold_id = $ttlLease.hold_id; daemon_generation = $expiryDaemon.daemon_generation; status = $expiryStatus }
+    for ($i = $ctx.holds.Count - 1; $i -ge 0; $i--) {
+        if ($ctx.holds[$i].hold_id -ceq $ttlLease.hold_id) { $ctx.holds.RemoveAt($i) }
     }
     $ttlA = Invoke-Probe $a 500 "ttl-recovered-a" "2"
     $ttlB = Invoke-Probe $b "ttl-recovered-b-id" "ttl-recovered-b" "2"

@@ -149,7 +149,8 @@ type resilientClient struct {
 	stdoutDead          chan struct{} // closed when CC stdout pipe breaks
 	stdoutOnce          sync.Once     // ensures stdoutDead is closed once
 	startTime           time.Time     // when the client started (for probe detection)
-	ipcMsgSent          atomic.Bool   // true after first IPC→stdout message forwarded (disables probe detection)
+	ipcMsgSent          atomic.Bool   // true once first IPC→stdout write starts (disables probe detection)
+	pendingIPCOutput    atomic.Int64  // queued IPC frames plus stdout writes not yet returned
 	initCache           initCache
 	inflight            sync.Map // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
 	initialized         atomic.Bool
@@ -307,16 +308,17 @@ func (rc *resilientClient) runStdinReader(done chan<- error) {
 func (rc *resilientClient) runStdoutWriter(mu *sync.Mutex) {
 	for data := range rc.msgFromIPC {
 		mu.Lock()
+		// The host can read the response and close stdin before Write returns.
+		rc.ipcMsgSent.Store(true)
 		_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", data)
 		mu.Unlock()
 		if err != nil {
 			rc.log.Printf("resilient: stdout broken (CC gone): %v", err)
 			rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
+			rc.pendingIPCOutput.Add(-1)
 			return
 		}
-		// Mark that we successfully forwarded data to CC.
-		// Once set, stdin EOF is treated as intentional disconnect (not probe).
-		rc.ipcMsgSent.Store(true)
+		rc.pendingIPCOutput.Add(-1)
 	}
 }
 
@@ -372,44 +374,49 @@ func (rc *resilientClient) runProxy(conn interface {
 					continue connected
 				}
 
-				if err == io.EOF && rc.cfg.ProbeGracePeriod > 0 &&
-					time.Since(rc.startTime) < rc.cfg.ProbeGracePeriod &&
-					!rc.ipcMsgSent.Load() {
-					rc.log.Printf("resilient: stdin EOF after %.1fs (probe, no data sent), waiting for stdout", time.Since(rc.startTime).Seconds())
-					select {
-					case <-rc.stdoutDead:
-						rc.log.Printf("resilient: stdout also dead after probe, exiting")
-					case <-time.After(5 * time.Second):
-						rc.log.Printf("resilient: probe grace expired, exiting")
-					}
-				} else if err == io.EOF {
+				if err == io.EOF {
 					pending := rc.countInflight()
-					if pending > 0 {
-						rc.log.Printf("resilient: stdin EOF with %d in-flight request(s), draining (max 5s)", pending)
+					pendingOutput := rc.pendingIPCOutput.Load()
+					if rc.cfg.ProbeGracePeriod > 0 &&
+						time.Since(rc.startTime) < rc.cfg.ProbeGracePeriod &&
+						pending == 0 && pendingOutput == 0 && !rc.ipcMsgSent.Load() {
+						rc.log.Printf("resilient: stdin EOF after %.1fs (probe, no data sent), waiting for stdout", time.Since(rc.startTime).Seconds())
+						select {
+						case <-rc.stdoutDead:
+							rc.log.Printf("resilient: stdout also dead after probe, exiting")
+						case <-time.After(5 * time.Second):
+							rc.log.Printf("resilient: probe grace expired, exiting")
+						}
+					} else if pending > 0 || pendingOutput > 0 {
+						rc.log.Printf("resilient: stdin EOF with %d in-flight request(s) and %d pending stdout frame(s), draining (max 5s)", pending, pendingOutput)
 						deadline := time.After(5 * time.Second)
 						ticker := time.NewTicker(50 * time.Millisecond)
+						drainIPC := ipcEOF
 					drain:
 						for {
 							select {
 							case <-deadline:
-								rc.log.Printf("resilient: drain timeout, %d response(s) lost", rc.countInflight())
+								rc.log.Printf("resilient: drain timeout, %d request(s) and %d stdout frame(s) pending", rc.countInflight(), rc.pendingIPCOutput.Load())
 								break drain
 							case <-rc.stdoutDead:
 								rc.log.Printf("resilient: stdout dead during drain, exiting")
 								break drain
-							case <-ipcEOF:
+							case <-drainIPC:
 								rc.log.Printf("resilient: IPC disconnected during drain")
-								break drain
+								if rc.pendingIPCOutput.Load() == 0 {
+									break drain
+								}
+								drainIPC = nil
 							case <-ticker.C:
-								if rc.countInflight() == 0 {
-									rc.log.Printf("resilient: drain complete, all responses delivered")
+								if (drainIPC == nil || rc.countInflight() == 0) && rc.pendingIPCOutput.Load() == 0 {
+									rc.log.Printf("resilient: drain complete, accepted responses delivered")
 									break drain
 								}
 							}
 						}
 						ticker.Stop()
 					} else {
-						rc.log.Printf("resilient: stdin EOF after %.1fs, no pending requests, exiting",
+						rc.log.Printf("resilient: stdin EOF after %.1fs, no pending requests or output, exiting",
 							time.Since(rc.startTime).Seconds())
 					}
 				}
@@ -750,6 +757,8 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 		data := make([]byte, len(line))
 		copy(data, line)
 
+		// Reserve delivery before response observation removes its in-flight ID.
+		rc.pendingIPCOutput.Add(1)
 		rc.observeIPCResponse(data)
 		if held, ok := maintenanceWireResult(data); ok {
 			rc.enterMaintenance(&control.MaintenanceError{Code: control.ErrMaintenanceHeld.Code, Result: held})
@@ -758,9 +767,11 @@ func (rc *resilientClient) runIPCReader(conn io.Reader, ipcEOF chan<- struct{}) 
 		select {
 		case rc.msgFromIPC <- data:
 		case <-rc.stdoutDead:
+			rc.pendingIPCOutput.Add(-1)
 			close(ipcEOF)
 			return
 		case <-rc.transportDone:
+			rc.pendingIPCOutput.Add(-1)
 			close(ipcEOF)
 			return
 		}
@@ -1239,7 +1250,16 @@ func (rc *resilientClient) replayInit(conn interface {
 			return nil
 		}
 		if len(line) > 0 {
-			rc.msgFromIPC <- append([]byte(nil), line...)
+			rc.pendingIPCOutput.Add(1)
+			select {
+			case rc.msgFromIPC <- append([]byte(nil), line...):
+			case <-rc.stdoutDead:
+				rc.pendingIPCOutput.Add(-1)
+				return io.ErrClosedPipe
+			case <-rc.transportDone:
+				rc.pendingIPCOutput.Add(-1)
+				return io.EOF
+			}
 		}
 	}
 }

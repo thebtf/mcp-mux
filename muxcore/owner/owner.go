@@ -160,6 +160,12 @@ type proactiveRequest struct {
 
 var proactiveOwnerSequence atomic.Uint64
 
+// started is published by closing connectDone after the callback actually settles.
+type sessionLifecycle struct {
+	connectDone chan struct{}
+	started     bool
+}
+
 // Owner is the multiplexer core. It manages a single upstream process and
 // routes requests from multiple downstream sessions through it.
 type Owner struct {
@@ -206,7 +212,10 @@ type Owner struct {
 	// authorizeSession is the optional pre-dispatch session-admission gate
 	// forwarded from engine.Config / daemon.Config / OwnerConfig. nil = no
 	// gate (pre-v0.24 behaviour). Read-only after construction.
-	authorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+	authorizeSession                func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
+	authorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
+	requestSlots                    chan struct{}
+	notificationSlots               chan struct{}
 
 	// onFrameReceived is the optional per-frame admission hook forwarded
 	// from engine.Config. handleDownstreamMessage invokes it on every
@@ -216,6 +225,7 @@ type Owner struct {
 
 	mu                   sync.RWMutex
 	sessions             map[int]*Session
+	sessionLifecycles    map[int]*sessionLifecycle
 	cachedInitSessions   map[int]bool // sessions that received a cached (replayed) initialize response
 	initDone             bool
 	initResp             []byte // cached initialize response (raw JSON-RPC)
@@ -436,6 +446,18 @@ type OwnerConfig struct {
 	// nil-default preserves pre-v0.24 behaviour.
 	AuthorizeSession func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth
 
+	// AuthorizeSessionWithSessionMeta takes precedence over AuthorizeSession.
+	// Its preauthorization metadata already contains the admission's SessionID.
+	AuthorizeSessionWithSessionMeta func(context.Context, muxcore.ProjectContext, muxcore.SessionMeta) muxcore.SessionAuth
+
+	// MaxConcurrentRequests bounds full structured request dispatch goroutines per
+	// owner, including response writes and deferred cleanup. Nonpositive is unlimited.
+	MaxConcurrentRequests int
+
+	// MaxConcurrentNotifications bounds structured notification dispatch goroutines
+	// per owner through deferred cleanup. Nonpositive is unlimited.
+	MaxConcurrentNotifications int
+
 	// OnFrameReceived, when non-nil, is invoked by handleDownstreamMessage
 	// for every inbound frame BEFORE dispatch with a 1 ms callback budget
 	// (overrun → FramePass; panic → FramePass). See
@@ -445,6 +467,31 @@ type OwnerConfig struct {
 
 	// Logger for debug output. Uses log.Default() if nil.
 	Logger *log.Logger
+}
+
+func makeHandlerSlots(limit int) chan struct{} {
+	if limit <= 0 {
+		return nil
+	}
+	return make(chan struct{}, limit)
+}
+
+func tryAcquireHandlerSlot(slots chan struct{}) bool {
+	if slots == nil {
+		return true
+	}
+	select {
+	case slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseHandlerSlot(slots chan struct{}) {
+	if slots != nil {
+		<-slots
+	}
 }
 
 // NewOwnerFromSnapshot creates a cache-backed Owner without a live upstream.
@@ -476,53 +523,56 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		cwdSet[cfg.Cwd] = true
 	}
 	o := &Owner{
-		proactiveNamespace:     nextProactiveNamespace(),
-		ipcPath:                cfg.IPCPath,
-		cwd:                    cfg.Cwd,
-		cwdSet:                 cwdSet,
-		command:                cfg.Command,
-		args:                   cfg.Args,
-		env:                    cfg.Env,
-		handlerFunc:            cfg.HandlerFunc,
-		sessionHandler:         cfg.SessionHandler,
-		upstreamWriter:         cfg.UpstreamWriter,
-		serverID:               cfg.ServerID,
-		protocolEra:            cfg.ProtocolEra,
-		modernShared:           cfg.ModernShared && cfg.ProtocolEra == era.EraModern20260728,
-		maintenanceGate:        cfg.MaintenanceGate,
-		admitMaterialization:   cfg.AdmitMaterialization,
-		listener:               ln,
-		logger:                 logger,
-		onZeroSessions:         cfg.OnZeroSessions,
-		onUpstreamExit:         cfg.OnUpstreamExit,
-		onPersistentDetected:   cfg.OnPersistentDetected,
-		onPersistentResolved:   cfg.OnPersistentResolved,
-		onCacheReady:           cfg.OnCacheReady,
-		onCacheInvalidated:     cfg.OnCacheInvalidated,
-		authorizeSession:       cfg.AuthorizeSession,
-		onFrameReceived:        cfg.OnFrameReceived,
-		sessions:               make(map[int]*Session),
-		cachedInitSessions:     make(map[int]bool),
-		sessionMgr:             NewSessionManager(),
-		tokenHandshake:         cfg.TokenHandshake,
-		autoClassification:     snap.Classification,
-		classificationSource:   snap.ClassificationSource,
-		classificationReason:   snap.ClassificationReason,
-		classified:             make(chan struct{}),
-		initReady:              make(chan struct{}),
-		progressOwners:         make(map[string]int),
-		progressTokenRequestID: make(map[string]string),
-		requestToTokens:        make(map[string][]string),
-		progressTracker:        progress.NewTracker(),
-		startTime:              time.Now(),
-		listenerDone:           make(chan struct{}),
-		done:                   make(chan struct{}),
-		materializationPolicy:  cfg.MaterializationPolicy,
-		materializationState:   MaterializationCacheOnly,
-		persistentRequired:     cfg.PersistentRequired,
-		materializationStop:    make(chan struct{}),
-		pendingDemands:         make(map[string]*localDemand),
-		persistentPending:      cfg.PersistentPending,
+		proactiveNamespace:              nextProactiveNamespace(),
+		ipcPath:                         cfg.IPCPath,
+		cwd:                             cfg.Cwd,
+		cwdSet:                          cwdSet,
+		command:                         cfg.Command,
+		args:                            cfg.Args,
+		env:                             cfg.Env,
+		handlerFunc:                     cfg.HandlerFunc,
+		sessionHandler:                  cfg.SessionHandler,
+		upstreamWriter:                  cfg.UpstreamWriter,
+		serverID:                        cfg.ServerID,
+		protocolEra:                     cfg.ProtocolEra,
+		modernShared:                    cfg.ModernShared && cfg.ProtocolEra == era.EraModern20260728,
+		maintenanceGate:                 cfg.MaintenanceGate,
+		admitMaterialization:            cfg.AdmitMaterialization,
+		listener:                        ln,
+		logger:                          logger,
+		onZeroSessions:                  cfg.OnZeroSessions,
+		onUpstreamExit:                  cfg.OnUpstreamExit,
+		onPersistentDetected:            cfg.OnPersistentDetected,
+		onPersistentResolved:            cfg.OnPersistentResolved,
+		onCacheReady:                    cfg.OnCacheReady,
+		onCacheInvalidated:              cfg.OnCacheInvalidated,
+		authorizeSession:                cfg.AuthorizeSession,
+		authorizeSessionWithSessionMeta: cfg.AuthorizeSessionWithSessionMeta,
+		requestSlots:                    makeHandlerSlots(cfg.MaxConcurrentRequests),
+		notificationSlots:               makeHandlerSlots(cfg.MaxConcurrentNotifications),
+		onFrameReceived:                 cfg.OnFrameReceived,
+		sessions:                        make(map[int]*Session),
+		cachedInitSessions:              make(map[int]bool),
+		sessionMgr:                      NewSessionManager(),
+		tokenHandshake:                  cfg.TokenHandshake,
+		autoClassification:              snap.Classification,
+		classificationSource:            snap.ClassificationSource,
+		classificationReason:            snap.ClassificationReason,
+		classified:                      make(chan struct{}),
+		initReady:                       make(chan struct{}),
+		progressOwners:                  make(map[string]int),
+		progressTokenRequestID:          make(map[string]string),
+		requestToTokens:                 make(map[string][]string),
+		progressTracker:                 progress.NewTracker(),
+		startTime:                       time.Now(),
+		listenerDone:                    make(chan struct{}),
+		done:                            make(chan struct{}),
+		materializationPolicy:           cfg.MaterializationPolicy,
+		materializationState:            MaterializationCacheOnly,
+		persistentRequired:              cfg.PersistentRequired,
+		materializationStop:             make(chan struct{}),
+		pendingDemands:                  make(map[string]*localDemand),
+		persistentPending:               cfg.PersistentPending,
 	}
 	if cfg.UpstreamWriter != nil || (cfg.SessionHandler != nil && cfg.HandlerFunc == nil) {
 		o.materializationState = MaterializationReady
@@ -654,50 +704,53 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 	}
 
 	o := &Owner{
-		proactiveNamespace:     nextProactiveNamespace(),
-		ipcPath:                cfg.IPCPath,
-		cwd:                    cfg.Cwd,
-		cwdSet:                 map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
-		command:                cfg.Command,
-		args:                   cfg.Args,
-		env:                    cfg.Env,
-		handlerFunc:            cfg.HandlerFunc,
-		sessionHandler:         cfg.SessionHandler,
-		upstreamWriter:         cfg.UpstreamWriter,
-		serverID:               cfg.ServerID,
-		protocolEra:            cfg.ProtocolEra,
-		modernShared:           cfg.ModernShared && cfg.ProtocolEra == era.EraModern20260728,
-		maintenanceGate:        cfg.MaintenanceGate,
-		admitMaterialization:   cfg.AdmitMaterialization,
-		listener:               ln,
-		logger:                 logger,
-		onZeroSessions:         cfg.OnZeroSessions,
-		onUpstreamExit:         cfg.OnUpstreamExit,
-		onPersistentDetected:   cfg.OnPersistentDetected,
-		onPersistentResolved:   cfg.OnPersistentResolved,
-		onCacheReady:           cfg.OnCacheReady,
-		onCacheInvalidated:     cfg.OnCacheInvalidated,
-		authorizeSession:       cfg.AuthorizeSession,
-		onFrameReceived:        cfg.OnFrameReceived,
-		sessions:               make(map[int]*Session),
-		cachedInitSessions:     make(map[int]bool),
-		sessionMgr:             NewSessionManager(),
-		tokenHandshake:         cfg.TokenHandshake,
-		classified:             make(chan struct{}),
-		initReady:              make(chan struct{}),
-		progressOwners:         make(map[string]int),
-		progressTokenRequestID: make(map[string]string),
-		requestToTokens:        make(map[string][]string),
-		progressTracker:        progress.NewTracker(),
-		startTime:              time.Now(),
-		listenerDone:           make(chan struct{}),
-		done:                   make(chan struct{}),
-		materializationPolicy:  cfg.MaterializationPolicy,
-		materializationState:   MaterializationCacheOnly,
-		persistentRequired:     cfg.PersistentRequired,
-		materializationStop:    make(chan struct{}),
-		pendingDemands:         make(map[string]*localDemand),
-		persistentPending:      cfg.PersistentPending,
+		proactiveNamespace:              nextProactiveNamespace(),
+		ipcPath:                         cfg.IPCPath,
+		cwd:                             cfg.Cwd,
+		cwdSet:                          map[string]bool{serverid.CanonicalizePath(cfg.Cwd): true},
+		command:                         cfg.Command,
+		args:                            cfg.Args,
+		env:                             cfg.Env,
+		handlerFunc:                     cfg.HandlerFunc,
+		sessionHandler:                  cfg.SessionHandler,
+		upstreamWriter:                  cfg.UpstreamWriter,
+		serverID:                        cfg.ServerID,
+		protocolEra:                     cfg.ProtocolEra,
+		modernShared:                    cfg.ModernShared && cfg.ProtocolEra == era.EraModern20260728,
+		maintenanceGate:                 cfg.MaintenanceGate,
+		admitMaterialization:            cfg.AdmitMaterialization,
+		listener:                        ln,
+		logger:                          logger,
+		onZeroSessions:                  cfg.OnZeroSessions,
+		onUpstreamExit:                  cfg.OnUpstreamExit,
+		onPersistentDetected:            cfg.OnPersistentDetected,
+		onPersistentResolved:            cfg.OnPersistentResolved,
+		onCacheReady:                    cfg.OnCacheReady,
+		onCacheInvalidated:              cfg.OnCacheInvalidated,
+		authorizeSession:                cfg.AuthorizeSession,
+		authorizeSessionWithSessionMeta: cfg.AuthorizeSessionWithSessionMeta,
+		requestSlots:                    makeHandlerSlots(cfg.MaxConcurrentRequests),
+		notificationSlots:               makeHandlerSlots(cfg.MaxConcurrentNotifications),
+		onFrameReceived:                 cfg.OnFrameReceived,
+		sessions:                        make(map[int]*Session),
+		cachedInitSessions:              make(map[int]bool),
+		sessionMgr:                      NewSessionManager(),
+		tokenHandshake:                  cfg.TokenHandshake,
+		classified:                      make(chan struct{}),
+		initReady:                       make(chan struct{}),
+		progressOwners:                  make(map[string]int),
+		progressTokenRequestID:          make(map[string]string),
+		requestToTokens:                 make(map[string][]string),
+		progressTracker:                 progress.NewTracker(),
+		startTime:                       time.Now(),
+		listenerDone:                    make(chan struct{}),
+		done:                            make(chan struct{}),
+		materializationPolicy:           cfg.MaterializationPolicy,
+		materializationState:            MaterializationCacheOnly,
+		persistentRequired:              cfg.PersistentRequired,
+		materializationStop:             make(chan struct{}),
+		pendingDemands:                  make(map[string]*localDemand),
+		persistentPending:               cfg.PersistentPending,
 	}
 	o.forceModernClassification()
 	o.progressIntervalNs.Store(int64(5 * time.Second))
@@ -901,61 +954,81 @@ func (o *Owner) AddSession(s *Session) {
 	}
 	o.nativeWork.Add(1)
 	defer o.nativeWork.Add(-1)
-	o.addSessionLocked(s)
+	registered := o.addSessionLocked(s)
 	o.admissionMu.Unlock()
 	o.unlockRequestAdmission()
-	o.startRegisteredSession(s)
+	if registered {
+		o.startRegisteredSession(s)
+	}
 }
 
-// addSessionLocked atomically publishes one admitted session. The caller holds
-// admissionMu so an isolated classification commit cannot split token Bind
-// from owner/session-manager registration.
-func (o *Owner) addSessionLocked(s *Session) {
+// addSessionLocked publishes a session and reserves its reader before admission
+// can close. The caller holds admissionMu across token Bind and registration.
+func (o *Owner) addSessionLocked(s *Session) bool {
 	o.mu.Lock()
-	o.sessions[s.ID] = s
-	if o.sessionHandler != nil {
-		if _, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
-			o.nativeWork.Add(1)
-		}
+	if o.sessions[s.ID] != nil {
+		o.mu.Unlock()
+		return false
 	}
+	o.sessions[s.ID] = s
+	_, legacy := o.sessionHandler.(muxcore.ProjectLifecycle)
+	_, withMeta := o.sessionHandler.(muxcore.ProjectLifecycleWithSessionMeta)
+	if legacy || withMeta {
+		if o.sessionLifecycles == nil {
+			o.sessionLifecycles = make(map[int]*sessionLifecycle)
+		}
+		o.sessionLifecycles[s.ID] = &sessionLifecycle{connectDone: make(chan struct{})}
+		o.nativeWork.Add(1)
+	}
+	o.sessionReaders.Add(1)
 	o.mu.Unlock()
 	o.sessionMgr.RegisterSession(s, s.Cwd)
+	return true
 }
 
 func (o *Owner) startRegisteredSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
-
-	if o.sessionHandler != nil {
-		if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
-			project := muxcore.ProjectContext{
-				ID:  muxcore.ProjectContextID(s.Cwd),
-				Cwd: s.Cwd,
-				Env: s.Env,
-			}
-			go func() {
-				defer o.nativeWork.Add(-1)
-				lc.OnProjectConnect(project)
-			}()
-		}
-	}
-
-	// Notify upstream that roots may have changed (new client = new potential root)
+	// Publish legacy roots before the reader can dispatch its first frame.
 	if !o.isModern() {
 		o.sendRootsListChanged()
 	}
-	o.admissionMu.Lock()
-	select {
-	case <-o.listenerDone:
-		o.admissionMu.Unlock()
-		s.Close()
-		o.removeSession(s)
-		return
-	default:
-	}
-	o.sessionReaders.Add(1)
+	// Connect runs on this session's reader, never on the global accept producer.
 	go o.readSession(s)
-	o.admissionMu.Unlock()
+}
+
+func (o *Owner) connectSession(s *Session, lifecycle *sessionLifecycle) (connected bool) {
+	defer o.nativeWork.Add(-1)
+	defer close(lifecycle.connectDone)
+	defer func() {
+		if r := recover(); r != nil {
+			o.logger.Printf("session %d: OnProjectConnect panic: %v", s.ID, r)
+		}
+	}()
+	lifecycle.started = true
+	project := muxcore.ProjectContext{ID: muxcore.ProjectContextID(s.Cwd), Cwd: s.Cwd, Env: s.Env}
+	if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycleWithSessionMeta); ok {
+		lc.OnProjectConnectWithSessionMeta(project, s.Meta())
+	} else if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok {
+		lc.OnProjectConnect(project)
+	}
+	return true
+}
+
+// An authorized abort has no connect, but must release the exact reservation.
+func (o *Owner) disconnectSession(s *Session, connected bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			o.logger.Printf("session %d: OnProjectDisconnect panic: %v", s.ID, r)
+		}
+	}()
+	if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycleWithSessionMeta); ok {
+		if connected || s.Meta().IsAuthorized() {
+			lc.OnProjectDisconnectWithSessionMeta(muxcore.ProjectContextID(s.Cwd), s.Meta())
+		}
+	} else if lc, ok := o.sessionHandler.(muxcore.ProjectLifecycle); ok && connected {
+		lc.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
+	}
 }
 
 // readSession reads messages from a session and forwards them to the upstream.
@@ -966,6 +1039,12 @@ func (o *Owner) readSession(s *Session) {
 		o.removeSession(s)
 	}()
 
+	o.mu.RLock()
+	lifecycle := o.sessionLifecycles[s.ID]
+	o.mu.RUnlock()
+	if lifecycle != nil && !o.connectSession(s, lifecycle) {
+		return
+	}
 	for {
 		msg, err := s.ReadMessage()
 		if err != nil {
@@ -1051,7 +1130,11 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			if o.notificationHandlerWithMeta == nil && !ordinary {
 				return nil
 			}
+			if !tryAcquireHandlerSlot(o.notificationSlots) {
+				return nil
+			}
 			if !o.reserveNativeWork() {
+				releaseHandlerSlot(o.notificationSlots)
 				return nil
 			}
 			project := muxcore.ProjectContext{
@@ -1065,6 +1148,12 @@ func (o *Owner) handleDownstreamMessage(s *Session, msg *jsonrpc.Message) error 
 			}
 			go func() {
 				defer o.nativeWork.Add(-1)
+				defer releaseHandlerSlot(o.notificationSlots)
+				defer func() {
+					if r := recover(); r != nil {
+						o.logger.Printf("session %d: HandleNotification panic: %v", s.ID, r)
+					}
+				}()
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				go func() {
@@ -1171,6 +1260,14 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 		o.unlockRequestAdmission()
 		return o.rejectMaintenance(s, msg, held)
 	}
+	if !tryAcquireHandlerSlot(o.requestSlots) {
+		o.unlockRequestAdmission()
+		errBytes, err := buildJSONRPCErrorBytes(msg.ID, -32004, "rate limited")
+		if err != nil {
+			return err
+		}
+		return s.WriteRaw(errBytes)
+	}
 	project := muxcore.ProjectContext{
 		ID:  muxcore.ProjectContextID(s.Cwd),
 		Cwd: s.Cwd,
@@ -1182,6 +1279,7 @@ func (o *Owner) dispatchToSessionHandler(s *Session, msg *jsonrpc.Message) error
 
 	go func() {
 		defer o.decrementPending()
+		defer releaseHandlerSlot(o.requestSlots)
 		defer func() {
 			if r := recover(); r != nil {
 				o.logger.Printf("session %d: HandleRequest panic: %v", s.ID, r)
@@ -2012,16 +2110,26 @@ func (n *ownerNotifier) Broadcast(notification []byte) {
 
 // removeSession removes a session from the owner.
 func (o *Owner) removeSession(s *Session) {
+	o.mu.RLock()
+	lifecycle := o.sessionLifecycles[s.ID]
+	o.mu.RUnlock()
+	if lifecycle != nil {
+		<-lifecycle.connectDone
+	}
 	o.launchContextMu.Lock()
 	o.mu.Lock()
-	var lifecycle muxcore.ProjectLifecycle
-	if o.sessionHandler != nil {
-		lifecycle, _ = o.sessionHandler.(muxcore.ProjectLifecycle)
-		if lifecycle != nil {
-			// Transfer the retained reader's producer authority before unlinking.
-			o.nativeWork.Add(1)
-		}
+	if o.sessions[s.ID] != s {
+		o.mu.Unlock()
+		o.launchContextMu.Unlock()
+		return
 	}
+	_, legacy := o.sessionHandler.(muxcore.ProjectLifecycle)
+	_, withMeta := o.sessionHandler.(muxcore.ProjectLifecycleWithSessionMeta)
+	if legacy || withMeta {
+		// Transfer the retained reader's producer authority before unlinking.
+		o.nativeWork.Add(1)
+	}
+	delete(o.sessionLifecycles, s.ID)
 	delete(o.sessions, s.ID)
 	remaining := len(o.sessions)
 	var removedTokens []string
@@ -2053,10 +2161,10 @@ func (o *Owner) removeSession(s *Session) {
 	o.touchActivity()
 	o.logger.Printf("session %d disconnected (%d remaining)", s.ID, remaining)
 
-	if lifecycle != nil {
+	if legacy || withMeta {
 		go func() {
 			defer o.nativeWork.Add(-1)
-			lifecycle.OnProjectDisconnect(muxcore.ProjectContextID(s.Cwd))
+			o.disconnectSession(s, lifecycle == nil || lifecycle.started)
 		}()
 	}
 
@@ -2172,6 +2280,7 @@ func (o *Owner) acceptLoop() {
 		// Keep authorization and its registration/rejection continuation reserved
 		// together; callback return alone does not settle the admission producer.
 		func() {
+			registered := false
 			// AuthorizeSession gate (FR-3). Single-shot per session; runs after
 			// peer-creds extraction and BEFORE AddSession. nil = no gate
 			// (byte-identical to v0.23 dispatch path).
@@ -2181,7 +2290,7 @@ func (o *Owner) acceptLoop() {
 			// Panic guard: any panic inside the callback is recovered and
 			// treated as AuthDeny{Reason: "authorize panic"} — the daemon
 			// continues accepting subsequent connections.
-			if o.authorizeSession != nil {
+			if o.authorizeSession != nil || o.authorizeSessionWithSessionMeta != nil {
 				select {
 				case <-o.done:
 					o.logger.Printf("auth_skipped_shutdown sid=%d", s.ID)
@@ -2197,13 +2306,25 @@ func (o *Owner) acceptLoop() {
 					return
 				}
 				defer o.nativeWork.Add(-1)
+				defer func() {
+					if !registered && s.Meta().IsAuthorized() {
+						o.disconnectSession(s, false)
+					}
+				}()
 
 				project := muxcore.ProjectContext{
 					ID:  muxcore.ProjectContextID(s.Cwd),
 					Cwd: s.Cwd,
 					Env: s.Env,
 				}
-				verdict := invokeAuthorize(o, o.authorizeSession, info, project, s.ID, o.logger)
+				verdict := invokeAuthorize(o, project, s)
+				if verdict.Decision != muxcore.AuthDeny {
+					meta := s.Meta()
+					meta.TenantID = verdict.TenantID
+					meta.AuthorizedAt = time.Now()
+					s.SetMeta(meta)
+					o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
+				}
 
 				// Post-callback shutdown re-check (CHK015 amendment / CodeRabbit
 				// MAJOR review on PR #113). The pre-callback check at the top
@@ -2248,14 +2369,6 @@ func (o *Owner) acceptLoop() {
 					return
 				}
 
-				// AuthAllow: stamp tenant + authorized timestamp on cached meta.
-				// Re-SetMeta with the full payload (Conn + TenantID + AuthorizedAt).
-				s.SetMeta(muxcore.SessionMeta{
-					Conn:         info,
-					TenantID:     verdict.TenantID,
-					AuthorizedAt: time.Now(),
-				})
-				o.logger.Printf("auth_allow sid=%d tenant=%q", s.ID, verdict.TenantID)
 			}
 
 			o.lockRequestAdmission()
@@ -2285,31 +2398,24 @@ func (o *Owner) acceptLoop() {
 				s.Close()
 				return
 			}
-			o.addSessionLocked(s)
+			registered = o.addSessionLocked(s)
 			o.admissionMu.Unlock()
 			o.unlockRequestAdmission()
-			o.startRegisteredSession(s)
+			if registered {
+				o.startRegisteredSession(s)
+			} else {
+				s.Close()
+			}
 		}()
 	}
 }
 
-// invokeAuthorize calls cb under a defer/recover guard with an owner-bound
-// context. Listener teardown cancels authorization while finalization withholds
-// Done until the callback and its admission continuation actually return.
-// Panic is logged with the panic value and converted to
-// AuthDeny{Reason: "authorize panic"}; the daemon continues accepting
-// subsequent connections.
-func invokeAuthorize(
-	o *Owner,
-	cb func(ctx context.Context, conn muxcore.ConnInfo, project muxcore.ProjectContext) muxcore.SessionAuth,
-	info muxcore.ConnInfo,
-	project muxcore.ProjectContext,
-	sid int,
-	logger *log.Logger,
-) (verdict muxcore.SessionAuth) {
+// invokeAuthorize preserves the legacy panic and lifecycle-cancellation policy
+// while preferring the metadata-aware gate for the same admission identity.
+func invokeAuthorize(o *Owner, project muxcore.ProjectContext, s *Session) (verdict muxcore.SessionAuth) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Printf("auth_panic sid=%d recovered=%v", sid, r)
+			o.logger.Printf("auth_panic sid=%d recovered=%v", s.ID, r)
 			verdict = muxcore.SessionAuth{Decision: muxcore.AuthDeny, Reason: "authorize panic"}
 		}
 	}()
@@ -2325,7 +2431,10 @@ func invokeAuthorize(
 		case <-ctx.Done():
 		}
 	}()
-	return cb(ctx, info, project)
+	if o.authorizeSessionWithSessionMeta != nil {
+		return o.authorizeSessionWithSessionMeta(ctx, project, s.Meta())
+	}
+	return o.authorizeSession(ctx, s.Meta().Conn, project)
 }
 
 // frameHookBudget is the per-frame OnFrameReceived deadline (NFR-2).
@@ -2724,6 +2833,11 @@ func (o *Owner) FinalizeForRemoval(soft bool, timeout time.Duration) (int, bool,
 		proven = proven && proc.TreesDead()
 	}
 	proven = proven && o.nativeQuiescent()
+	if proven && maintenance && proc != nil && proc.PID() == 0 && closeErr != nil {
+		// Actual handler settlement can overtake the zero-grace close verdict.
+		exitCode, closeErr = proc.SoftClose(0)
+		proven = proc.TreesDead() && o.nativeQuiescent()
+	}
 	if !proven {
 		if proofErr == nil {
 			proofErr = errFinalizationUnproven
