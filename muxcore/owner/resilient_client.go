@@ -149,7 +149,7 @@ type resilientClient struct {
 	stdoutDead          chan struct{} // closed when CC stdout pipe breaks
 	stdoutOnce          sync.Once     // ensures stdoutDead is closed once
 	startTime           time.Time     // when the client started (for probe detection)
-	ipcMsgSent          atomic.Bool   // true after first IPC→stdout message forwarded (disables probe detection)
+	ipcMsgSent          atomic.Bool   // true once first IPC→stdout write starts (disables probe detection)
 	initCache           initCache
 	inflight            sync.Map // request ID (json.RawMessage string) → true; tracks sent-but-unanswered
 	initialized         atomic.Bool
@@ -307,6 +307,8 @@ func (rc *resilientClient) runStdinReader(done chan<- error) {
 func (rc *resilientClient) runStdoutWriter(mu *sync.Mutex) {
 	for data := range rc.msgFromIPC {
 		mu.Lock()
+		// The host can read the response and close stdin before Write returns.
+		rc.ipcMsgSent.Store(true)
 		_, err := fmt.Fprintf(rc.cfg.Stdout, "%s\n", data)
 		mu.Unlock()
 		if err != nil {
@@ -314,9 +316,6 @@ func (rc *resilientClient) runStdoutWriter(mu *sync.Mutex) {
 			rc.stdoutOnce.Do(func() { close(rc.stdoutDead) })
 			return
 		}
-		// Mark that we successfully forwarded data to CC.
-		// Once set, stdin EOF is treated as intentional disconnect (not probe).
-		rc.ipcMsgSent.Store(true)
 	}
 }
 

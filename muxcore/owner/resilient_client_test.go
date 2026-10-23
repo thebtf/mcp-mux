@@ -166,6 +166,144 @@ func newTestIPCPath(t *testing.T) string {
 	return path
 }
 
+type delayedReturnWriter struct {
+	io.Writer
+	release <-chan struct{}
+}
+
+func (w *delayedReturnWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	// The host can consume the response before the outer Write returns.
+	<-w.release
+	return n, err
+}
+
+func TestResilientClient_StdinCloseAfterVisibleResponse(t *testing.T) {
+	stdinErr := errors.New("host stdin read failed")
+	for _, tc := range []struct {
+		name     string
+		stdinErr error
+	}{
+		{name: "eof"},
+		{name: "read_error", stdinErr: stdinErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newTestIPCPath(t)
+			startEchoIPCServer(t, path)
+			stdinR, stdinW := io.Pipe()
+			stdoutR, stdoutW := io.Pipe()
+			allowWriteReturn := make(chan struct{})
+			releaseWrite := sync.OnceFunc(func() { close(allowWriteReturn) })
+			clientDone := make(chan struct{})
+			hostDone := make(chan struct{})
+			var clientErr, hostErr error
+			var response string
+			t.Cleanup(func() {
+				releaseWrite()
+				stdinW.Close()
+				stdinR.Close()
+				stdoutR.Close()
+				stdoutW.Close()
+				for _, done := range []<-chan struct{}{hostDone, clientDone} {
+					select {
+					case <-done:
+					case <-time.After(6 * time.Second):
+						t.Error("consumer goroutine did not stop during cleanup")
+					}
+				}
+			})
+			go func() {
+				defer close(clientDone)
+				clientErr = RunResilientClient(ResilientClientConfig{
+					Stdin:            stdinR,
+					Stdout:           &delayedReturnWriter{Writer: stdoutW, release: allowWriteReturn},
+					InitialIPCPath:   path,
+					ProbeGracePeriod: time.Minute,
+					Logger:           resilientTestLogger(t),
+				})
+			}()
+			go func() {
+				defer close(hostDone)
+				if _, hostErr = fmt.Fprintln(stdinW, `{"jsonrpc":"2.0","id":41,"method":"ping"}`); hostErr != nil {
+					return
+				}
+				response, hostErr = bufio.NewReader(stdoutR).ReadString('\n')
+				if hostErr == nil {
+					hostErr = stdinW.CloseWithError(tc.stdinErr)
+				}
+			}()
+			select {
+			case <-hostDone:
+				if hostErr != nil {
+					t.Fatalf("host round trip: %v", hostErr)
+				}
+				if want := `{"jsonrpc":"2.0","id":41,"result":{"ok":true}}` + "\n"; response != want {
+					t.Fatalf("host response = %q, want %q", response, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("host did not receive the IPC response and close stdin")
+			}
+			select {
+			case <-clientDone:
+				if !errors.Is(clientErr, tc.stdinErr) {
+					t.Fatalf("client error = %v, want %v", clientErr, tc.stdinErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("client waited for probe grace after the host received a response and closed stdin, while stdout Write had not returned")
+			}
+		})
+	}
+}
+
+func TestResilientClient_StdinEOFWithoutResponseKeepsProbeGrace(t *testing.T) {
+	path := newTestIPCPath(t)
+	startEchoIPCServer(t, path)
+	stdinR, stdinW := io.Pipe()
+	clientDone := make(chan struct{})
+	ready := make(chan struct{})
+	var clientErr error
+	t.Cleanup(func() {
+		stdinW.Close()
+		stdinR.Close()
+		select {
+		case <-clientDone:
+		case <-time.After(6 * time.Second):
+			t.Error("probe client did not stop during cleanup")
+		}
+	})
+	go func() {
+		defer close(clientDone)
+		clientErr = RunResilientClient(ResilientClientConfig{
+			Stdin:            stdinR,
+			Stdout:           io.Discard,
+			InitialIPCPath:   path,
+			ProbeGracePeriod: time.Minute,
+			OnInject:         func(func([]byte) error) { close(ready) },
+			Logger:           resilientTestLogger(t),
+		})
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe client did not connect")
+	}
+	start := time.Now()
+	if err := stdinW.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-clientDone:
+		if clientErr != nil {
+			t.Fatalf("probe client error = %v, want nil", clientErr)
+		}
+		if elapsed := time.Since(start); elapsed < 5*time.Second {
+			t.Fatalf("no-response probe exited after %v, before its five-second grace", elapsed)
+		}
+	case <-time.After(7 * time.Second):
+		t.Fatal("no-response probe did not exit after its five-second grace")
+	}
+}
+
 // TestResilientClient_ReconnectAfterIPCClose verifies that when the initial IPC
 // connection is closed (simulating daemon restart), the client calls ReconnectFunc,
 // reconnects transparently, and resumes proxying — RunResilientClient does NOT exit
