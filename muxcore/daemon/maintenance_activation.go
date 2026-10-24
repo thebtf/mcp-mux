@@ -31,9 +31,11 @@ func CheckMaintenanceForActivation(namespace, controlEndpoint string) error {
 	return maintenanceActivationError(ledger)
 }
 
-// AcquireMaintenanceForActivation holds the original existing namespace lock and
-// native path guards until Close. It never creates the lock or changes authority.
-// Callers must also check live status and retain the closer through publication.
+// AcquireMaintenanceForActivation acquires the original namespace lock and checks
+// its paired durable authority. Only exact lock absence in a private guarded
+// endpoint permits exclusive cold creation; a failed acquisition leaves that lock
+// in place for peers. On success, callers must also check live status and retain
+// the closer (including native path guards) through publication.
 func AcquireMaintenanceForActivation(namespace, controlEndpoint string) (io.Closer, error) {
 	namespace = strings.TrimSpace(namespace)
 	if namespace == "" {

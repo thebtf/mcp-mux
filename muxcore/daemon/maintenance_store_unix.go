@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"golang.org/x/sys/unix"
 )
 
 func createMaintenanceDirectory(path string) error {
@@ -48,6 +49,10 @@ func validateMaintenancePath(path string, directory bool) error {
 	if err != nil {
 		return err
 	}
+	return validateMaintenanceUnixInfo(info, directory)
+}
+
+func validateMaintenanceUnixInfo(info os.FileInfo, directory bool) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	mode := os.FileMode(0o600)
 	if directory {
@@ -79,25 +84,61 @@ func replaceMaintenanceLedger(src, dst string) error {
 	return errors.Join(syncErr, dir.Close())
 }
 
-type maintenancePathGuard struct{ lockPath string }
+type maintenancePathGuard struct {
+	endpoint *os.File
+	lockName string
+}
 
 func guardMaintenanceParent(path, lockName string) (*maintenancePathGuard, error) {
 	if err := validateMaintenanceParent(path); err != nil {
 		return nil, err
 	}
-	return &maintenancePathGuard{lockPath: filepath.Join(path, lockName)}, nil
-}
-
-func (g *maintenancePathGuard) Close() error { return nil }
-
-func (g *maintenancePathGuard) openNamespaceLock() (*os.File, error) {
-	file, err := os.Open(g.lockPath)
+	endpoint, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	info, err := file.Stat()
-	if err == nil && !info.Mode().IsRegular() {
+	info, err := endpoint.Stat()
+	if err == nil && !info.IsDir() {
 		err = control.ErrMaintenancePersistenceFailed
+	}
+	if err != nil {
+		return nil, errors.Join(err, endpoint.Close())
+	}
+	return &maintenancePathGuard{endpoint: endpoint, lockName: lockName}, nil
+}
+
+func (g *maintenancePathGuard) Close() error {
+	if g.endpoint == nil {
+		return nil
+	}
+	endpoint := g.endpoint
+	g.endpoint = nil
+	return endpoint.Close()
+}
+
+func (g *maintenancePathGuard) openNamespaceLock() (*os.File, error) {
+	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
+	fd, err := unix.Openat(int(g.endpoint.Fd()), g.lockName, flags, 0)
+	if errors.Is(err, unix.ENOENT) {
+		info, checkErr := g.endpoint.Stat()
+		if checkErr == nil {
+			checkErr = validateMaintenanceUnixInfo(info, true)
+		}
+		if checkErr != nil {
+			return nil, checkErr
+		}
+		fd, err = unix.Openat(int(g.endpoint.Fd()), g.lockName, flags|unix.O_CREAT|unix.O_EXCL, 0o600)
+		if errors.Is(err, unix.EEXIST) {
+			fd, err = unix.Openat(int(g.endpoint.Fd()), g.lockName, flags, 0)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), g.lockName)
+	info, err := file.Stat()
+	if err == nil {
+		err = validateMaintenanceUnixInfo(info, false)
 	}
 	if err != nil {
 		return nil, errors.Join(err, file.Close())
@@ -120,4 +161,17 @@ func (g *maintenancePathGuard) readStoreMember(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-func (g *maintenancePathGuard) validateCanonicalParent(path string) error { return nil }
+func (g *maintenancePathGuard) validateCanonicalParent(path string) error {
+	original, err := g.endpoint.Stat()
+	if err != nil {
+		return err
+	}
+	canonical, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(original, canonical) {
+		return control.ErrMaintenancePersistenceFailed
+	}
+	return nil
+}

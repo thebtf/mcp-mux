@@ -12,11 +12,14 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-The module version targeted by this documentation is `muxcore/v0.33.1`:
+The module version targeted by this documentation is `muxcore/v0.33.4`:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.33.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.33.4
 ```
+
+v0.33.4 fixes native maintenance admission and guarded cold-upgrade initialization
+without moving the existing namespace or weakening persisted maintenance fences.
 
 v0.33.1 fixes cancellation of active structured requests. v0.33.0 added
 exact-session lifecycle/authorization metadata and opt-in per-owner
@@ -1091,15 +1094,27 @@ pointer changes serialize with hold-ledger mutation using the existing daemon
 namespace file lock. Use
 `daemon.AcquireMaintenanceForActivation(namespace, endpoint) (io.Closer, error)`
 to open the original existing lock read-only, acquire its existing byte-range lock,
-and check persisted authority. Retain its closer through live status validation
-and final publication. Missing lock refuses without creating one. The compatible
-`daemon.CheckMaintenanceForActivation` remains read-only and requires an external
-namespace lock. Both use the same guarded reader as cold recovery; writers retain
-parent guards through publication without pinning old members across atomic
-replacement. Status and pure startup inspection never acquire the byte-range lock
-or proactively start a daemon. Live aware status still gates activation, including
-offline/old endpoints only after locked persisted-clear proof. This adds neither
-an updater lease nor host-wide executable-lock authority.
+and check persisted authority. Only an exact native missing immediate lock child
+under the same held guard and a private final endpoint permits cold creation of
+that original lock. Creation is exclusive, parent-relative and no-follow, with
+private owner/access set atomically; an already-existing winner is opened and
+validated once. Unix validates every opened lock as current-user-owned `0600` and
+regular, retaining sticky-ancestor compatibility but requiring a private `0700`
+final endpoint for creation. A Windows endpoint may inherit its all-trusted DACL
+from the guarded parent; the endpoint DACL need not be protected. Cold-created
+and winner lock files require trusted ownership and protected private DACLs;
+ordinary existing locks retain old-writer write sharing. A permissive local TEMP
+endpoint never creates a missing lock. No lock is truncated, repaired or removed
+on failure, because another peer may already hold it.
+Retain the closer through live status validation and final publication. Cold
+creation never skips the original paired-store parser: HELD, prepared or malformed
+authority still refuses activation. The compatible `daemon.CheckMaintenanceForActivation`
+remains strictly read-only and requires an external namespace lock. Both use the
+same guarded reader as cold recovery; writers retain parent guards through
+publication without pinning old members across atomic replacement. Status and
+pure startup inspection never acquire the byte-range lock or proactively start a
+daemon. Offline/old endpoints still require locked persisted-clear proof. This adds
+neither an updater lease nor host-wide executable-lock authority.
 
 Run [production Scenario 11](../docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 on Windows and Unix with the actual integrated binary. Focused maintenance

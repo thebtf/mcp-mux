@@ -168,6 +168,8 @@ type maintenancePathGuard struct {
 	scope       windows.Handle
 	user        *windows.SID
 	lock        *os.File
+	lockName    string
+	lockMissing bool
 	permissive  bool
 }
 
@@ -196,7 +198,7 @@ func openMaintenanceWindowsPath(path string) (windows.Handle, error) {
 }
 
 // Every child name is resolved against the pinned parent, never a second full-path walk.
-func openMaintenanceWindowsChild(parent windows.Handle, name string, directory, create bool, security *windows.SECURITY_DESCRIPTOR) (windows.Handle, error) {
+func openMaintenanceWindowsChild(parent windows.Handle, name string, directory bool, disposition uint32, security *windows.SECURITY_DESCRIPTOR) (windows.Handle, error) {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `\/:`) {
 		return 0, control.ErrMaintenancePersistenceFailed
 	}
@@ -215,10 +217,6 @@ func openMaintenanceWindowsChild(parent windows.Handle, name string, directory, 
 		options |= windows.FILE_NON_DIRECTORY_FILE
 		access |= windows.FILE_READ_DATA
 	}
-	disposition := uint32(windows.FILE_OPEN)
-	if create {
-		disposition = windows.FILE_OPEN_IF
-	}
 	var handle windows.Handle
 	var status windows.IO_STATUS_BLOCK
 	err = windows.NtCreateFile(&handle, access, &attributes, &status, nil, 0, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, disposition, options, 0, 0)
@@ -233,7 +231,7 @@ func guardMaintenanceParent(path, lockName string) (*maintenancePathGuard, error
 	if err != nil {
 		return nil, err
 	}
-	g := &maintenancePathGuard{user: user.User.Sid}
+	g := &maintenancePathGuard{user: user.User.Sid, lockName: lockName}
 	if filepath.Clean(path) != filepath.FromSlash(path) {
 		err = g.pinStrict(path)
 	} else {
@@ -248,9 +246,10 @@ func guardMaintenanceParent(path, lockName string) (*maintenancePathGuard, error
 		_ = g.Close()
 		return nil, err
 	}
-	handle, err := openMaintenanceWindowsChild(g.endpoint, lockName, false, false, nil)
+	handle, err := openMaintenanceWindowsChild(g.endpoint, lockName, false, windows.FILE_OPEN, nil)
 	if err != nil {
-		if !g.permissive && errors.Is(err, os.ErrNotExist) {
+		if !g.permissive && errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+			g.lockMissing = true
 			return g, nil
 		}
 		_ = g.Close()
@@ -260,6 +259,17 @@ func guardMaintenanceParent(path, lockName string) (*maintenancePathGuard, error
 	var info windows.ByHandleFileInformation
 	if err = windows.GetFileInformationByHandle(handle, &info); err == nil && info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
 		err = control.ErrMaintenancePersistenceFailed
+	}
+	if err == nil {
+		descriptor, ownerErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+		if ownerErr != nil {
+			err = ownerErr
+		} else {
+			owner, _, ownerErr := descriptor.Owner()
+			if ownerErr != nil || owner == nil || !owner.IsValid() || !trustedMaintenanceSID(owner, g.user) {
+				err = control.ErrMaintenancePersistenceFailed
+			}
+		}
 	}
 	if err == nil {
 		_, err = maintenanceWindowsAccess(g.endpoint, g.user, true, false, false, g.permissive)
@@ -309,7 +319,7 @@ func (g *maintenancePathGuard) pinOrdinary(path string) error {
 		for end < len(path) && !os.IsPathSeparator(path[end]) {
 			end++
 		}
-		handle, err = openMaintenanceWindowsChild(g.endpoint, path[start:end], true, false, nil)
+		handle, err = openMaintenanceWindowsChild(g.endpoint, path[start:end], true, windows.FILE_OPEN, nil)
 		if err != nil {
 			return err
 		}
@@ -368,17 +378,46 @@ func (g *maintenancePathGuard) pinStrict(path string) error {
 }
 
 func (g *maintenancePathGuard) openNamespaceLock() (*os.File, error) {
-	if g.lock == nil {
+	if g.lock != nil {
+		file := g.lock
+		g.lock = nil
+		return file, nil
+	}
+	if !g.lockMissing {
 		return nil, control.ErrMaintenancePersistenceFailed
 	}
-	file := g.lock
-	g.lock = nil
+	g.lockMissing = false
+	// Held ancestor guards also protect a private inherited endpoint ACL.
+	mask, err := maintenanceWindowsAccess(g.endpoint, g.user, true, false, false, true)
+	if err != nil {
+		return nil, err
+	}
+	if g.permissive || mask != 0 {
+		return nil, control.ErrMaintenancePersistenceFailed
+	}
+	security, err := windows.SecurityDescriptorFromString("O:" + g.user.String() + "D:P(A;;FA;;;" + g.user.String() + ")")
+	if err != nil {
+		return nil, err
+	}
+	handle, err := openMaintenanceWindowsChild(g.endpoint, g.lockName, false, windows.FILE_CREATE, security)
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		handle, err = openMaintenanceWindowsChild(g.endpoint, g.lockName, false, windows.FILE_OPEN, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(handle), g.lockName)
+	if _, err := maintenanceWindowsAccess(handle, g.user, false, true, false, false); err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
 	return file, nil
 }
 
 func (g *maintenancePathGuard) checkStorePaths(path string, create bool) (bool, error) {
 	var security *windows.SECURITY_DESCRIPTOR
+	disposition := uint32(windows.FILE_OPEN)
 	if create {
+		disposition = windows.FILE_OPEN_IF
 		var err error
 		security, err = windows.SecurityDescriptorFromString("O:" + g.user.String() + "D:P(A;OICI;FA;;;" + g.user.String() + ")")
 		if err != nil {
@@ -388,7 +427,7 @@ func (g *maintenancePathGuard) checkStorePaths(path string, create bool) (bool, 
 	dir := filepath.Dir(path)
 	parent := g.endpoint
 	for _, name := range [2]string{filepath.Base(filepath.Dir(dir)), filepath.Base(dir)} {
-		handle, err := openMaintenanceWindowsChild(parent, name, true, create, security)
+		handle, err := openMaintenanceWindowsChild(parent, name, true, disposition, security)
 		if err != nil {
 			if !create && errors.Is(err, os.ErrNotExist) {
 				return false, nil
@@ -404,7 +443,7 @@ func (g *maintenancePathGuard) checkStorePaths(path string, create bool) (bool, 
 	g.scope = parent
 	// Member handles close before publication so atomic ledger replacement still works.
 	for _, name := range [3]string{filepath.Base(path), "ledger.json", "transaction.json"} {
-		handle, err := openMaintenanceWindowsChild(parent, name, false, false, nil)
+		handle, err := openMaintenanceWindowsChild(parent, name, false, windows.FILE_OPEN, nil)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -421,7 +460,7 @@ func (g *maintenancePathGuard) checkStorePaths(path string, create bool) (bool, 
 }
 
 func (g *maintenancePathGuard) readStoreMember(path string) ([]byte, error) {
-	handle, err := openMaintenanceWindowsChild(g.scope, filepath.Base(path), false, false, nil)
+	handle, err := openMaintenanceWindowsChild(g.scope, filepath.Base(path), false, windows.FILE_OPEN, nil)
 	if err != nil {
 		return nil, err
 	}

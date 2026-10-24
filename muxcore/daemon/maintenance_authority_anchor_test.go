@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -321,5 +323,143 @@ func maintenanceAnchorTrustedAliasPreserves(t *testing.T, d *Daemon, endpoint, a
 	transactionAfter, err := os.ReadFile(maintenanceTransactionPath(d.maintenancePath))
 	if err != nil || !bytes.Equal(transactionBefore, transactionAfter) {
 		t.Fatalf("trusted alias read/activation changed transaction certificate: %v", err)
+	}
+}
+
+func TestMaintenanceActivationColdPreservesOriginalFences(t *testing.T) {
+	for _, state := range []string{"held", "prepared", "malformed-ledger", "malformed-transaction"} {
+		t.Run(state, func(t *testing.T) {
+			d, endpoint := maintenanceAnchorGuardFixture(t)
+			transactionPath := maintenanceTransactionPath(d.maintenancePath)
+			want := error(control.ErrMaintenanceHeld)
+			if state == "prepared" {
+				data, err := os.ReadFile(transactionPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var transaction maintenanceTransaction
+				if err := json.Unmarshal(data, &transaction); err != nil {
+					t.Fatal(err)
+				}
+				transaction.State = "prepared"
+				data, err = json.Marshal(transaction)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(transactionPath, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				want = control.ErrMaintenancePersistenceFailed
+			} else if state == "malformed-ledger" || state == "malformed-transaction" {
+				path := d.maintenancePath
+				if state == "malformed-transaction" {
+					path = transactionPath
+				}
+				if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				want = control.ErrMaintenancePersistenceFailed
+			}
+			before := make(map[string][]byte)
+			for _, path := range []string{d.maintenancePath, transactionPath} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = data
+			}
+			if err := os.Remove(d.maintenanceLockPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := CheckMaintenanceForActivation(d.namespace, endpoint); !errors.Is(err, want) {
+				t.Fatalf("read-only missing-lock check lost the original fence: %v", err)
+			}
+			if _, err := os.Lstat(d.maintenanceLockPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("read-only check created a namespace lock: %v", err)
+			}
+			activation, err := AcquireMaintenanceForActivation(d.namespace, endpoint)
+			if activation != nil {
+				_ = activation.Close()
+				t.Fatal("cold lock creation bypassed existing maintenance authority")
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("cold activation fence=%v, want %v", err, want)
+			}
+			if err := validateMaintenancePath(d.maintenanceLockPath, false); err != nil {
+				t.Fatalf("cold refusal did not retain its private regular lock: %v", err)
+			}
+			lock, err := ipc.AcquireFileLock(d.maintenanceLockPath)
+			if err != nil {
+				t.Fatalf("cold refusal retained the namespace lock handle: %v", err)
+			}
+			if err := lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for path, data := range before {
+				after, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(data, after) {
+					t.Fatalf("cold refusal changed original authority: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestMaintenanceActivationColdCreatorsShareNamespace(t *testing.T) {
+	base := maintenanceAnchorTempDir(t, "mux-cold-creators-")
+	if err := secureMaintenancePath(base, true); err != nil {
+		t.Fatal(err)
+	}
+	const namespace = "cold-creators"
+	endpoint := filepath.Join(base, "control.sock")
+	lockPath := serverid.DaemonLockPath(base, namespace)
+	if err := CheckMaintenanceForActivation(namespace, endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(base); err != nil || len(entries) != 0 {
+		t.Fatalf("read-only cold check mutated namespace: entries=%d err=%v", len(entries), err)
+	}
+	type result struct {
+		lock io.Closer
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			lock, err := AcquireMaintenanceForActivation(namespace, endpoint)
+			results <- result{lock: lock, err: err}
+		}()
+	}
+	close(start)
+	successful := 0
+	for range 2 {
+		result := <-results
+		if result.lock != nil {
+			defer result.lock.Close()
+		}
+		if result.err == nil && result.lock != nil {
+			successful++
+		} else if !errors.Is(result.err, ipc.ErrFileLocked) {
+			t.Errorf("cold creator did not use ordinary namespace contention: %v", result.err)
+		}
+	}
+	if successful != 1 {
+		t.Fatalf("cold creators admitted %d independent lock owners, want one", successful)
+	}
+	if err := validateMaintenancePath(lockPath, false); err != nil {
+		t.Fatalf("cold creators did not publish a private regular namespace lock: %v", err)
+	}
+	competing, err := ipc.AcquireFileLock(lockPath)
+	if competing != nil {
+		_ = competing.Close()
+	}
+	if !errors.Is(err, ipc.ErrFileLocked) {
+		t.Fatalf("ordinary writer reached a different lock identity: %v", err)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(lockPath) {
+		t.Fatalf("cold creators mutated maintenance authority: entries=%d err=%v", len(entries), err)
 	}
 }

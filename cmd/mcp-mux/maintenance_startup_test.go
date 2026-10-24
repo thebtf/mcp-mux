@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -250,6 +252,116 @@ func TestMaintenanceStartupHeldOpeningKeepsPipesAndResumesFresh(t *testing.T) {
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatal("product did not finish after intentional host EOF")
+			}
+		})
+	}
+}
+
+func TestMaintenanceColdInstallMissingLockPreservesOriginalFence(t *testing.T) {
+	for _, state := range []string{"held", "prepared", "malformed-ledger", "malformed-transaction"} {
+		t.Run(state, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			dir := os.TempDir()
+			d, err := daemon.New(daemon.Config{
+				ControlPath: serverid.DaemonControlPath(dir, engineName), Name: engineName,
+				Namespace: engineName, SkipSnapshot: true,
+				ZeroSessionCleanupDelay: -1, Logger: log.New(io.Discard, "", 0),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var holdID string
+			t.Cleanup(func() {
+				if holdID != "" {
+					_, _ = d.HandleMaintenance(control.Request{Cmd: "resume", HoldID: holdID})
+				}
+				d.Shutdown()
+			})
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			host := startMaintenanceStartupHost(t, executable, dir, filepath.Join(dir, "cold-effects"))
+			host.write(t, "1", "before-hold")
+			host.read(t, "1", false)
+			owners, err := d.HandleListOwners(control.Request{})
+			if err != nil || len(owners.Owners) != 1 {
+				t.Fatalf("initial native owner: %+v %v", owners, err)
+			}
+			ttl := int64(time.Hour / time.Millisecond)
+			hold, err := d.HandleMaintenance(control.Request{Cmd: "hold", ServerID: owners.Owners[0].ServerID, HoldTTLMS: &ttl})
+			holdID = hold.HoldID
+			if err != nil || hold.State != control.MaintenanceHeld || !hold.TreesRetired {
+				t.Fatalf("original persisted hold: %+v %v", hold, err)
+			}
+			lockPath := serverid.DaemonLockPath(dir, engineName)
+			ledgers, err := filepath.Glob(lockPath + ".maintenance/*/ledger.json")
+			if err != nil || len(ledgers) != 1 {
+				t.Fatalf("original authority not found: count=%d err=%v", len(ledgers), err)
+			}
+			transactionPath := filepath.Join(filepath.Dir(ledgers[0]), "transaction.json")
+			want := error(control.ErrMaintenanceHeld)
+			if state == "prepared" {
+				data, err := os.ReadFile(transactionPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var transaction map[string]json.RawMessage
+				if err := json.Unmarshal(data, &transaction); err != nil {
+					t.Fatal(err)
+				}
+				transaction["state"] = json.RawMessage(`"prepared"`)
+				data, err = json.Marshal(transaction)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(transactionPath, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				want = control.ErrMaintenancePersistenceFailed
+			} else if state == "malformed-ledger" || state == "malformed-transaction" {
+				path := ledgers[0]
+				if state == "malformed-transaction" {
+					path = transactionPath
+				}
+				if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				want = control.ErrMaintenancePersistenceFailed
+			}
+			launcher := filepath.Join(t.TempDir(), launcherFileName())
+			pending := launcher + "~"
+			previous := filepath.Join(versionStoreDir(launcher), "previous", engineFileName())
+			writeTestFile(t, launcher, "original launcher")
+			writeTestFile(t, pending, "pending engine")
+			writeTestFile(t, previous, "previous engine")
+			if err := writeActiveEngineUnderLock(launcher, previous); err != nil {
+				t.Fatal(err)
+			}
+			before := make(map[string][]byte)
+			for _, path := range []string{launcher, pending, previous, activeEngineFile(launcher), ledgers[0], transactionPath} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = data
+			}
+			if err := os.Remove(lockPath); err != nil {
+				t.Fatal(err)
+			}
+			_, _, _, err = installVersionedEngineWithOptions(launcher, pending, versionedEngineInstallOptions{UpdateLauncher: true})
+			if !errors.Is(err, want) {
+				t.Fatalf("missing-lock original fence refusal=%v, want %v", err, want)
+			}
+			for path, data := range before {
+				after, err := os.ReadFile(path)
+				if err != nil || !bytes.Equal(data, after) {
+					t.Fatalf("cold refusal changed payload, pointer or original authority: %v", err)
+				}
+			}
+			entries, err := os.ReadDir(versionStoreDir(launcher))
+			if err != nil || len(entries) != 2 {
+				t.Fatalf("cold refusal changed installed engine layout: entries=%d err=%v", len(entries), err)
 			}
 		})
 	}

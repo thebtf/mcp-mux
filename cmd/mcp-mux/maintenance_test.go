@@ -289,13 +289,6 @@ func isolateMaintenanceActivation(t *testing.T) {
 	t.Setenv("APPDATA", config)
 	t.Setenv("XDG_CONFIG_HOME", config)
 	t.Setenv("HOME", config)
-	lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lock.Close(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestMaintenanceUpgradeRefusesBeforeActivation(t *testing.T) {

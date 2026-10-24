@@ -182,29 +182,69 @@ func TestMaintenanceActivationWindowsEndpointBinding(t *testing.T) {
 }
 
 func TestMaintenanceActivationWindowsMissingLockDoesNotCreateAuthority(t *testing.T) {
-	base := maintenanceAnchorTempDir(t, "mux-no-lock-")
-	if err := secureMaintenancePath(base, true); err != nil {
-		t.Fatal(err)
-	}
-	before := maintenanceAnchorWindowsSecurity(t, base)
-	endpoint := filepath.Join(base, "control.sock")
-	if err := CheckMaintenanceForActivation("missing-lock", endpoint); err != nil {
-		t.Fatalf("compatible read-only check rejected private absent authority: %v", err)
-	}
-	activation, err := AcquireMaintenanceForActivation("missing-lock", endpoint)
-	if activation != nil {
-		_ = activation.Close()
-		t.Fatal("activation admitted a missing namespace lock")
-	}
-	if err == nil {
-		t.Fatal("activation did not reject the missing namespace lock")
-	}
-	entries, err := os.ReadDir(base)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("missing-lock refusal created namespace state: entries=%d err=%v", len(entries), err)
-	}
-	if maintenanceAnchorWindowsSecurity(t, base) != before {
-		t.Fatal("missing-lock refusal changed directory security")
+	for _, grant := range []string{"", "0x1301bf", "0x1201bf", "0x4"} {
+		t.Run("endpoint_"+grant, func(t *testing.T) {
+			parent := maintenanceAnchorTempDir(t, "mux-no-lock-")
+			if err := secureMaintenancePath(parent, true); err != nil {
+				t.Fatal(err)
+			}
+			base := filepath.Join(parent, "endpoint")
+			if err := os.Mkdir(base, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			descriptor, err := windows.GetNamedSecurityInfo(base, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+			if err != nil {
+				t.Fatal(err)
+			}
+			flags, _, err := descriptor.Control()
+			if err != nil || flags&windows.SE_DACL_PROTECTED != 0 {
+				t.Fatalf("cold endpoint must inherit its trusted parent DACL: flags=%#x err=%v", flags, err)
+			}
+			if grant != "" {
+				maintenanceAnchorWindowsGrantACE(t, base, "(A;OICI;"+grant+";;;BU)")
+			}
+			before := maintenanceAnchorWindowsSecurity(t, base)
+			endpoint := filepath.Join(base, "control.sock")
+			wantCheck := error(nil)
+			if grant == "0x1301bf" || grant == "0x1201bf" {
+				wantCheck = control.ErrMaintenancePersistenceFailed
+			}
+			if err := CheckMaintenanceForActivation("missing-lock", endpoint); !errors.Is(err, wantCheck) {
+				t.Fatalf("read-only missing-lock check=%v, want %v", err, wantCheck)
+			}
+			if entries, err := os.ReadDir(base); err != nil || len(entries) != 0 {
+				t.Fatalf("read-only check created namespace state: entries=%d err=%v", len(entries), err)
+			}
+			activation, err := AcquireMaintenanceForActivation("missing-lock", endpoint)
+			wantEntries := 0
+			if grant == "" {
+				if err != nil || activation == nil {
+					t.Fatalf("private cold activation failed: %v", err)
+				}
+				if err := activation.Close(); err != nil {
+					t.Fatal(err)
+				}
+				wantEntries = 1
+				if err := validateMaintenancePath(serverid.DaemonLockPath(base, "missing-lock"), false); err != nil {
+					t.Fatalf("cold activation created a non-private lock: %v", err)
+				}
+			} else {
+				if activation != nil {
+					_ = activation.Close()
+					t.Fatal("activation admitted cold creation under untrusted endpoint grants")
+				}
+				if err == nil {
+					t.Fatal("activation did not reject the missing namespace lock")
+				}
+			}
+			entries, err := os.ReadDir(base)
+			if err != nil || len(entries) != wantEntries {
+				t.Fatalf("cold activation changed unexpected namespace state: entries=%d err=%v", len(entries), err)
+			}
+			if maintenanceAnchorWindowsSecurity(t, base) != before {
+				t.Fatal("cold activation changed directory security")
+			}
+		})
 	}
 }
 
@@ -293,7 +333,7 @@ func TestMaintenanceActivationWindowsRejectsNamespaceLockReparse(t *testing.T) {
 	}
 	defer targetLock.Close()
 	// Replace the child after its parent is pinned, before the relative open.
-	child, childErr := openMaintenanceWindowsChild(parent, filepath.Base(d.maintenanceLockPath), false, false, nil)
+	child, childErr := openMaintenanceWindowsChild(parent, filepath.Base(d.maintenanceLockPath), false, windows.FILE_OPEN, nil)
 	if childErr == nil {
 		var info windows.ByHandleFileInformation
 		infoErr := windows.GetFileInformationByHandle(child, &info)
@@ -400,6 +440,77 @@ func TestMaintenanceActivationWindowsMemberReparseAfterValidation(t *testing.T) 
 			}
 			if data, err := guard.readStoreMember(path); err == nil || len(data) != 0 {
 				t.Fatalf("guarded read followed a member replaced after validation: bytes=%d err=%v", len(data), err)
+			}
+		})
+	}
+}
+
+func TestMaintenanceActivationWindowsColdWinnerValidation(t *testing.T) {
+	for _, kind := range []string{"private", "foreign-access", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			base := maintenanceAnchorTempDir(t, "mux-cold-winner-")
+			if err := secureMaintenancePath(base, true); err != nil {
+				t.Fatal(err)
+			}
+			const namespace = "cold-winner"
+			endpoint := filepath.Join(base, "control.sock")
+			lockPath := serverid.DaemonLockPath(base, namespace)
+			guard, _, err := openMaintenanceAuthority(namespace, endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer guard.Close()
+			var winnerInfo os.FileInfo
+			if kind == "private" {
+				winner, _, err := openMaintenanceAuthority(namespace, endpoint)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer winner.Close()
+				file, err := winner.openNamespaceLock()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				winnerInfo, err = file.Stat()
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if kind == "foreign-access" {
+				if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				maintenanceAnchorWindowsGrant(t, lockPath, "FR")
+			} else {
+				target := filepath.Join(base, "target")
+				if err := os.WriteFile(target, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, lockPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+			file, err := guard.openNamespaceLock()
+			if kind == "private" {
+				if err != nil {
+					t.Fatalf("cold loser did not open the private winner: %v", err)
+				}
+				defer file.Close()
+				info, err := file.Stat()
+				if err != nil || !os.SameFile(winnerInfo, info) {
+					t.Fatalf("cold creators selected different lock objects: %v", err)
+				}
+			} else {
+				if file != nil {
+					_ = file.Close()
+					t.Fatal("cold loser accepted an unsafe precreated lock")
+				}
+				if err == nil {
+					t.Fatal("cold loser did not reject the unsafe winner")
+				}
+			}
+			if _, err := os.Lstat(lockPath + ".maintenance"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("cold lock validation created maintenance authority: %v", err)
 			}
 		})
 	}
