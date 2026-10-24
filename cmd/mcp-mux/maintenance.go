@@ -14,7 +14,6 @@ import (
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
 	"github.com/thebtf/mcp-mux/muxcore/daemon"
-	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -123,13 +122,9 @@ func runMaintenanceCommand(cmd string, args []string, stdout, stderr io.Writer) 
 // acquireMaintenanceMutation serializes product activation with every durable
 // maintenance mutation. Status must be a read-only projection of aware authority.
 func acquireMaintenanceMutation() (io.Closer, error) {
-	lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
+	lock, err := daemon.AcquireMaintenanceForActivation(engineName, serverid.DaemonControlPath("", engineName))
 	if err != nil {
-		return nil, fmt.Errorf("acquire daemon namespace mutation lock: %w", err)
-	}
-	if err := daemon.CheckMaintenanceForActivation(engineName, serverid.DaemonControlPath("", engineName)); err != nil {
-		_ = lock.Close()
-		return nil, err
+		return nil, fmt.Errorf("acquire daemon namespace mutation authority: %w", err)
 	}
 	if err := checkMaintenanceMutationStatus(); err != nil {
 		_ = lock.Close()

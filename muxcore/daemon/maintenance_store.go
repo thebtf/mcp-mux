@@ -144,39 +144,59 @@ func (d *Daemon) loadMaintenance(endpoint string) error {
 	return nil
 }
 
-func readMaintenanceAuthority(namespace, endpoint string) (string, string, *maintenanceLedger, error) {
+func openMaintenanceAuthority(namespace, endpoint string) (*maintenancePathGuard, string, error) {
 	if endpoint == "" {
-		return "", "", nil, control.ErrMaintenancePersistenceFailed
+		return nil, "", control.ErrMaintenancePersistenceFailed
 	}
 	absolute := endpoint
 	if !filepath.IsAbs(absolute) {
 		// Do not clean away original components before authenticating them.
 		// Drive-relative/root-relative Windows paths lack a bound directory.
 		if filepath.VolumeName(absolute) != "" || os.IsPathSeparator(absolute[0]) {
-			return "", "", nil, control.ErrMaintenancePersistenceFailed
+			return nil, "", control.ErrMaintenancePersistenceFailed
 		}
 		cwd, err := os.Getwd()
 		if err != nil {
-			return "", "", nil, control.ErrMaintenancePersistenceFailed
+			return nil, "", control.ErrMaintenancePersistenceFailed
 		}
 		absolute = cwd + string(os.PathSeparator) + absolute
 	}
-	if validateMaintenanceParent(maintenanceOriginalParent(absolute)) != nil {
-		return "", "", nil, control.ErrMaintenancePersistenceFailed
+	parent := maintenanceOriginalParent(absolute)
+	guard, err := guardMaintenanceParent(parent, filepath.Base(serverid.DaemonLockPath(parent, namespace)))
+	if err != nil {
+		return nil, "", control.ErrMaintenancePersistenceFailed
 	}
 	canonical := canonicalMaintenancePath(absolute)
-	if canonical == "" {
-		return "", "", nil, control.ErrMaintenancePersistenceFailed
+	if canonical == "" || guard.validateCanonicalParent(filepath.Dir(canonical)) != nil {
+		_ = guard.Close()
+		return nil, "", control.ErrMaintenancePersistenceFailed
 	}
+	return guard, canonical, nil
+}
+
+func readMaintenanceAuthority(namespace, endpoint string) (string, string, *maintenanceLedger, error) {
+	guard, canonical, err := openMaintenanceAuthority(namespace, endpoint)
+	if err != nil {
+		return "", "", nil, err
+	}
+	defer guard.Close()
+	return readMaintenanceAuthorityGuarded(namespace, canonical, guard)
+}
+
+func readMaintenanceAuthorityGuarded(namespace, canonical string, guard *maintenancePathGuard) (string, string, *maintenanceLedger, error) {
 	scope := maintenanceDigest("mcp-mux-maintenance-scope-v1", namespace, canonical)
 	// Keep durable authority beside the namespace lock, independent of the
 	// caller's mutable user-config environment and the endpoint leaf lifetime.
 	path := filepath.Join(serverid.DaemonLockPath(filepath.Dir(canonical), namespace)+".maintenance", scope[3:], "ledger.json")
-	if err := checkMaintenanceStorePaths(path, false); err != nil {
+	present, err := guard.checkStorePaths(path, false)
+	if err != nil {
 		return path, scope, nil, control.ErrMaintenancePersistenceFailed
 	}
-	data, ledgerErr := os.ReadFile(path)
-	transactionData, transactionErr := os.ReadFile(maintenanceTransactionPath(path))
+	if !present {
+		return path, scope, nil, nil
+	}
+	data, ledgerErr := guard.readStoreMember(path)
+	transactionData, transactionErr := guard.readStoreMember(maintenanceTransactionPath(path))
 	if errors.Is(ledgerErr, os.ErrNotExist) && errors.Is(transactionErr, os.ErrNotExist) {
 		// An existing namespace directory without its complete authority is not
 		// a cold start (including a crash during the first preparation).
@@ -462,12 +482,27 @@ func resolveMaintenanceTraversal(path string, links *int, validate func(string, 
 
 // The two private directories are authority boundaries, not directories to
 // adopt or repair. Readers validate without creating or changing permissions.
-func checkMaintenanceStorePaths(path string, create bool) error {
+func guardMaintenanceStore(path string, create bool) (*maintenancePathGuard, error) {
 	dir := filepath.Dir(path)
 	anchor := filepath.Dir(dir)
-	if err := validateMaintenanceParent(filepath.Dir(anchor)); err != nil {
-		return err
+	guard, err := guardMaintenanceParent(filepath.Dir(anchor), strings.TrimSuffix(filepath.Base(anchor), ".maintenance"))
+	if err != nil {
+		return nil, err
 	}
+	if err := guard.validateCanonicalParent(filepath.Dir(anchor)); err != nil {
+		_ = guard.Close()
+		return nil, err
+	}
+	if _, err := guard.checkStorePaths(path, create); err != nil {
+		_ = guard.Close()
+		return nil, err
+	}
+	return guard, nil
+}
+
+func checkMaintenancePrivatePaths(path string, create bool) error {
+	dir := filepath.Dir(path)
+	anchor := filepath.Dir(dir)
 	for _, directory := range [2]string{anchor, dir} {
 		if create {
 			if err := createMaintenanceDirectory(directory); err != nil {
@@ -494,9 +529,11 @@ func writeMaintenanceLedger(path string, data []byte) error {
 		return control.ErrMaintenancePersistenceFailed
 	}
 	dir := filepath.Dir(path)
-	if err := checkMaintenanceStorePaths(path, true); err != nil {
+	guard, err := guardMaintenanceStore(path, true)
+	if err != nil {
 		return err
 	}
+	defer guard.Close()
 	file, err := os.CreateTemp(dir, ".ledger-*")
 	if err != nil {
 		return err

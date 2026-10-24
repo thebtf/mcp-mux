@@ -1064,12 +1064,20 @@ canonicalization, including links before `..`. Trusted endpoint aliases remain
 supported; foreign-controlled aliases/targets and symlinked authority members
 fail closed. Unix private anchor/scope directories are current-user-owned0700
 and members0600; ancestry must pass ownership/writability checks. Windows private
-paths require protected DACLs and trusted ownership/access, with unsafe ancestor
-mutation/delete rights rejected. Exact OS TrustedInstaller ownership is trusted
-for ancestors only, not arbitrary services or private store members. Missing
-authority under an unsafe parent is not a clear-store result; cold read-only
-checks reject without creating or changing those paths. Use a safe persistent
-namespace directory rather than changing production TMP variables or weakening ACLs.
+paths require protected DACLs and trusted ownership/access. Ordinary ancestors
+remain strict. A writable ordinary endpoint is admitted only with a proven
+nonreplaceable incoming binding on local NTFS: untrusted parent create-directory
+rights cannot combine with child DELETE; DELETE_CHILD, WRITE_DAC, WRITE_OWNER,
+unknown ACEs and unsafe generic grants remain refusals. Directory handles stay
+open without delete sharing; child opens are parent-relative and no-follow. An
+existing regular namespace lock pins the nonempty endpoint and is itself opened
+no-follow, preserving write sharing and the original byte-range lock for older
+writers. Trusted aliases keep the original stricter policy. Exact OS
+TrustedInstaller ownership is ancestors-only. Missing authority is clear only
+after guarded lookup; malformed, missing-member and uncertain reads fail closed.
+No production TMP override, group allowlist or host/profile ACL repair is added.
+Running older binaries do not gain these no-follow checks in place; their existing
+maintenance-awareness and refusal boundaries still apply.
 
 The released v0.30 baseline had no maintenance store. The earlier user-config
 layout belonged only to unreleased private candidates, not a shipped migration
@@ -1080,12 +1088,18 @@ unknown old location as clear, and cannot justify bypass or authority deletion.
 
 Controlled installation, launcher swap, layout/bootstrap mutation, and active
 pointer changes serialize with hold-ledger mutation using the existing daemon
-namespace file lock. The shared `daemon.CheckMaintenanceForActivation` helper
-reads persisted authority without mutation. Status and pure startup inspection
-do not acquire/write that lock or proactively start a daemon. Activation also
-checks live aware status; offline/old endpoints permit it only when persisted
-authority is proven clear under the lock. This does not add an updater lease or
-host-wide executable-lock authority.
+namespace file lock. Use
+`daemon.AcquireMaintenanceForActivation(namespace, endpoint) (io.Closer, error)`
+to open the original existing lock read-only, acquire its existing byte-range lock,
+and check persisted authority. Retain its closer through live status validation
+and final publication. Missing lock refuses without creating one. The compatible
+`daemon.CheckMaintenanceForActivation` remains read-only and requires an external
+namespace lock. Both use the same guarded reader as cold recovery; writers retain
+parent guards through publication without pinning old members across atomic
+replacement. Status and pure startup inspection never acquire the byte-range lock
+or proactively start a daemon. Live aware status still gates activation, including
+offline/old endpoints only after locked persisted-clear proof. This adds neither
+an updater lease nor host-wide executable-lock authority.
 
 Run [production Scenario 11](../docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 on Windows and Unix with the actual integrated binary. Focused maintenance

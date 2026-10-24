@@ -78,3 +78,35 @@ func replaceMaintenanceLedger(src, dst string) error {
 	syncErr := dir.Sync()
 	return errors.Join(syncErr, dir.Close())
 }
+
+type maintenancePathGuard struct{ lockPath string }
+
+func guardMaintenanceParent(path, lockName string) (*maintenancePathGuard, error) {
+	if err := validateMaintenanceParent(path); err != nil {
+		return nil, err
+	}
+	return &maintenancePathGuard{lockPath: filepath.Join(path, lockName)}, nil
+}
+
+func (g *maintenancePathGuard) Close() error { return nil }
+
+func (g *maintenancePathGuard) openNamespaceLock() (*os.File, error) {
+	return os.Open(g.lockPath)
+}
+
+func (g *maintenancePathGuard) checkStorePaths(path string, create bool) (bool, error) {
+	if err := checkMaintenancePrivatePaths(path, create); err != nil {
+		return false, err
+	}
+	_, err := os.Stat(filepath.Dir(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (g *maintenancePathGuard) readStoreMember(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
+func (g *maintenancePathGuard) validateCanonicalParent(path string) error { return nil }

@@ -246,10 +246,7 @@ func TestMaintenanceLauncherRestartRefusalIsTerminal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateMaintenanceActivation(t)
-			dir := shortTempDir(t, "mr")
-			t.Setenv("TMPDIR", dir)
-			t.Setenv("TEMP", dir)
-			t.Setenv("TMP", dir)
+			dir := os.TempDir()
 			oldRunning, oldSend := launcherIsDaemonRunning, launcherControlSendWithTimeout
 			oldExit, oldWait, oldStart := launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom
 			t.Cleanup(func() {
@@ -292,6 +289,13 @@ func isolateMaintenanceActivation(t *testing.T) {
 	t.Setenv("APPDATA", config)
 	t.Setenv("XDG_CONFIG_HOME", config)
 	t.Setenv("HOME", config)
+	lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMaintenanceUpgradeRefusesBeforeActivation(t *testing.T) {

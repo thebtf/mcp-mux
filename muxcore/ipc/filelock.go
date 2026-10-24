@@ -20,14 +20,20 @@ func (l *fileLock) Close() error {
 	return errors.Join(unlockNamespaceFile(file), file.Close())
 }
 
-// AcquireFileLock holds the existing persistent namespace lock until Close.
-// It never deletes/truncates the lock file and never waits while owning a gate.
+// AcquireFileLock holds the persistent namespace lock until Close, creating it
+// when absent. It never deletes/truncates it or waits while owning a gate.
 func AcquireFileLock(path string) (io.Closer, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	file, err := openNamespaceFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if err = lockNamespaceFile(file); err != nil {
+	return AcquireFileLockFromFile(file)
+}
+
+// AcquireFileLockFromFile consumes file, including on failure, and uses the
+// same namespace byte-range lock as AcquireFileLock. It never reopens the path.
+func AcquireFileLockFromFile(file *os.File) (io.Closer, error) {
+	if err := lockNamespaceFile(file); err != nil {
 		_ = file.Close()
 		return nil, err
 	}

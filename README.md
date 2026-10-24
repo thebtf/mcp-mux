@@ -510,12 +510,20 @@ the old lease. See the [storage phase contract](specs/002-upstream-maintenance-h
 Controlled engine installation, launcher swap, layout/bootstrap mutation, and
 active-pointer updates use the existing daemon namespace file lock. Hold-ledger
 mutations use the same lock, so a hold cannot race past an activation check.
-`daemon.CheckMaintenanceForActivation` reads persisted authority without changing
-it. Status and pure startup inspection neither acquire nor write that lock and
-never proactively start a daemon. Activation checks also consult live aware
-status; an offline or old endpoint is allowed only when persisted authority is
-proven clear under the lock. This is namespace coordination, not a host-wide
-file lock or a separate updater lease.
+`daemon.AcquireMaintenanceForActivation` opens the existing namespace lock
+read-only and retains it and native path guards through active-pointer publication;
+activation never creates a missing lock. `daemon.CheckMaintenanceForActivation`
+remains a read-only persisted check for callers already holding that lock. Status
+and startup inspection never acquire the byte-range lock or start a daemon.
+Activation also checks live aware status; offline or old endpoints require locked
+persisted-clear proof. On Windows, a writable endpoint directory is admitted only
+when its incoming binding cannot be replaced by untrusted users. Native no-follow
+openings and retained handles protect that binding; private authority DACLs stay
+strict. The endpoint, lock, store, scope and schema do not move. No host TEMP ACL
+change or production TMP override is required. This remains namespace coordination,
+not a host-wide file lock or a separate updater lease. Pending update bytes remain
+available until the active-pointer commit succeeds; existing sessions keep their
+current engine unless a separately requested supported restart runs.
 
 Old daemons return `maintenance_unsupported`, never a stop/kill/restart fallback.
 An aware daemon fences old managed shims' starts, but those shims have no promised

@@ -481,41 +481,30 @@ func installVersionedEngineUnderLock(launcherPath, pendingPath string, opts vers
 
 	crossPathUpdate := opts.UpdateLauncher && !samePath(pendingPath, launcherPath+"~")
 	var replacedLauncherPath string
-	if !opts.UpdateLauncher || sameFile(launcherPath, pendingPath) {
-		if !crossPathUpdate {
-			_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
+	if opts.UpdateLauncher && !sameFile(launcherPath, pendingPath) {
+		swapPath, stageErr := stageLauncherUpdate(launcherPath, pendingPath)
+		if stageErr != nil {
+			return "", installed, false, fmt.Errorf("stage launcher update on target volume: %w", stageErr)
 		}
-	} else {
-		swapPath := pendingPath
-		if crossPathUpdate {
-			swapPath, err = stageLauncherUpdate(launcherPath, pendingPath)
-			if err != nil {
-				return "", installed, false, fmt.Errorf("stage launcher update on target volume: %w", err)
-			}
-			defer func() { _ = os.Remove(swapPath) }()
-		}
+		defer func() { _ = os.Remove(swapPath) }()
 		oldPath, swapErr := upgrade.Swap(launcherPath, swapPath)
 		if swapErr != nil {
 			return "", installed, false, fmt.Errorf("update launcher binary: %w", swapErr)
 		}
-		if crossPathUpdate {
-			replacedLauncherPath = oldPath
-		} else {
-			_ = os.Remove(oldPath)
-			upgrade.CleanStale(launcherPath)
-		}
+		replacedLauncherPath = oldPath
 		launcherUpdated = true
 	}
 
 	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		return "", installed, launcherUpdated, err
 	}
-	if crossPathUpdate {
-		if replacedLauncherPath != "" {
-			_ = os.Remove(replacedLauncherPath)
+	if replacedLauncherPath != "" {
+		_ = os.Remove(replacedLauncherPath)
+		if !crossPathUpdate {
+			upgrade.CleanStale(launcherPath)
 		}
-		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
 	}
+	_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
 	return enginePath, installed, launcherUpdated, nil
 }
 

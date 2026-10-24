@@ -16,3 +16,7 @@ func lockNamespaceFile(file *os.File) error {
 	return err
 }
 func unlockNamespaceFile(file *os.File) error { return syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }
+
+func openNamespaceFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+}

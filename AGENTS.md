@@ -274,6 +274,13 @@ unsafe parent. Preserve raw endpoint-parent components while authenticating ever
 alias/target before canonicalization; private anchor/scope/members require native
 owner/mode/protected-DACL guards. Exact TrustedInstaller trust is ancestors-only.
 The endpoint/lock directory must survive every active fence; no cleanup authority.
+Windows writable ordinary endpoints require a nonreplaceable incoming binding,
+held no-delete directory handles and parent-relative no-follow child opens.
+Keep strict ancestors/private authority and existing trusted-alias policy; no
+group allowlist, namespace relocation or host/profile ACL repair. Activation uses
+`daemon.AcquireMaintenanceForActivation` with an existing read-only regular lock,
+the original byte-range primitive and write sharing for older writers. Retain its
+closer through live status and pointer commit; preserve pending bytes until commit.
 Released v0.30 had no store. Drain/clear older unreleased live candidates with the
 same binary/original environment before cutover; keep their files, no scan/migrate/
 registry/bypass. Safe verification-root approval is not a production TMP override
