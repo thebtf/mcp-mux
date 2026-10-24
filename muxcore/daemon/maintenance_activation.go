@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"errors"
+	"io"
 	"strings"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -25,6 +28,58 @@ func CheckMaintenanceForActivation(namespace, controlEndpoint string) error {
 	if err != nil {
 		return err
 	}
+	return maintenanceActivationError(ledger)
+}
+
+// AcquireMaintenanceForActivation acquires the original namespace lock and checks
+// its paired durable authority. Only exact lock absence in a private guarded
+// endpoint permits exclusive cold creation; a failed acquisition leaves that lock
+// in place for peers. On success, callers must also check live status and retain
+// the closer (including native path guards) through publication.
+func AcquireMaintenanceForActivation(namespace, controlEndpoint string) (io.Closer, error) {
+	namespace = strings.TrimSpace(namespace)
+	if namespace == "" {
+		namespace = "mcp-mux"
+	}
+	if controlEndpoint == "" {
+		controlEndpoint = serverid.DaemonControlPath("", namespace)
+	}
+	guard, canonical, err := openMaintenanceAuthority(namespace, controlEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	file, err := guard.openNamespaceLock()
+	if err != nil {
+		_ = guard.Close()
+		return nil, err
+	}
+	lock, err := ipc.AcquireFileLockFromFile(file)
+	if err != nil {
+		_ = guard.Close()
+		return nil, err
+	}
+	activation := &maintenanceActivationGuard{path: guard, lock: lock}
+	_, _, ledger, err := readMaintenanceAuthorityGuarded(namespace, canonical, guard)
+	if err == nil {
+		err = maintenanceActivationError(ledger)
+	}
+	if err != nil {
+		_ = activation.Close()
+		return nil, err
+	}
+	return activation, nil
+}
+
+type maintenanceActivationGuard struct {
+	path *maintenancePathGuard
+	lock io.Closer
+}
+
+func (g *maintenanceActivationGuard) Close() error {
+	return errors.Join(g.lock.Close(), g.path.Close())
+}
+
+func maintenanceActivationError(ledger *maintenanceLedger) error {
 	if ledger == nil || len(ledger.Leases) == 0 {
 		return nil
 	}

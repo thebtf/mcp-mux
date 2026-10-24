@@ -7,6 +7,31 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.33.4] - 2026-10-25
+
+### Fixed
+
+- Windows activation, cold maintenance recovery and ledger publication now
+  authenticate and retain the original endpoint binding instead of rejecting
+  every writable endpoint. Writable local NTFS endpoints require protected
+  incoming bindings, native no-follow child opens and an existing regular
+  namespace lock; private authority and ordinary ancestor checks remain strict.
+- Added `daemon.AcquireMaintenanceForActivation` for read-only existing-lock
+  acquisition through publication, plus exclusive guarded cold initialization
+  only in a private endpoint after exact native lock-child absence. An inherited
+  all-trusted Windows endpoint DACL is sufficient; no endpoint ACL is changed.
+  Permissive local TEMP remains existing-only. Cold initialization always checks
+  the original paired maintenance authority and never removes a created lock on
+  failure. Callers retain the lock through live status and publication. Namespace,
+  endpoint, authority location, scope and schema are unchanged.
+- Namespace-lock opens reject reparse/symlink and non-regular objects, preserve
+  old-writer contention, and validate native ownership. Unix lock handles require
+  current-user-owned `0600` files; Windows cold-created/winner locks require protected
+  private DACLs. No existing lock permissions are repaired or bytes truncated.
+- Update payloads, including explicit launcher-update input, are preserved until
+  active-pointer publication succeeds. Launcher replacement uses an adjacent
+  staged copy and retains its rollback file until that commit.
+
 ## [0.33.3] - 2026-10-24
 
 ### Added

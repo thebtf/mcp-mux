@@ -246,10 +246,7 @@ func TestMaintenanceLauncherRestartRefusalIsTerminal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateMaintenanceActivation(t)
-			dir := shortTempDir(t, "mr")
-			t.Setenv("TMPDIR", dir)
-			t.Setenv("TEMP", dir)
-			t.Setenv("TMP", dir)
+			dir := os.TempDir()
 			oldRunning, oldSend := launcherIsDaemonRunning, launcherControlSendWithTimeout
 			oldExit, oldWait, oldStart := launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom
 			t.Cleanup(func() {

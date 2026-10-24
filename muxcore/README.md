@@ -12,11 +12,14 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-The module version targeted by this documentation is `muxcore/v0.33.1`:
+The module version targeted by this documentation is `muxcore/v0.33.4`:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.33.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.33.4
 ```
+
+v0.33.4 fixes native maintenance admission and guarded cold-upgrade initialization
+without moving the existing namespace or weakening persisted maintenance fences.
 
 v0.33.1 fixes cancellation of active structured requests. v0.33.0 added
 exact-session lifecycle/authorization metadata and opt-in per-owner
@@ -1064,12 +1067,20 @@ canonicalization, including links before `..`. Trusted endpoint aliases remain
 supported; foreign-controlled aliases/targets and symlinked authority members
 fail closed. Unix private anchor/scope directories are current-user-owned0700
 and members0600; ancestry must pass ownership/writability checks. Windows private
-paths require protected DACLs and trusted ownership/access, with unsafe ancestor
-mutation/delete rights rejected. Exact OS TrustedInstaller ownership is trusted
-for ancestors only, not arbitrary services or private store members. Missing
-authority under an unsafe parent is not a clear-store result; cold read-only
-checks reject without creating or changing those paths. Use a safe persistent
-namespace directory rather than changing production TMP variables or weakening ACLs.
+paths require protected DACLs and trusted ownership/access. Ordinary ancestors
+remain strict. A writable ordinary endpoint is admitted only with a proven
+nonreplaceable incoming binding on local NTFS: untrusted parent create-directory
+rights cannot combine with child DELETE; DELETE_CHILD, WRITE_DAC, WRITE_OWNER,
+unknown ACEs and unsafe generic grants remain refusals. Directory handles stay
+open without delete sharing; child opens are parent-relative and no-follow. An
+existing regular namespace lock pins the nonempty endpoint and is itself opened
+no-follow, preserving write sharing and the original byte-range lock for older
+writers. Trusted aliases keep the original stricter policy. Exact OS
+TrustedInstaller ownership is ancestors-only. Missing authority is clear only
+after guarded lookup; malformed, missing-member and uncertain reads fail closed.
+No production TMP override, group allowlist or host/profile ACL repair is added.
+Running older binaries do not gain these no-follow checks in place; their existing
+maintenance-awareness and refusal boundaries still apply.
 
 The released v0.30 baseline had no maintenance store. The earlier user-config
 layout belonged only to unreleased private candidates, not a shipped migration
@@ -1080,12 +1091,30 @@ unknown old location as clear, and cannot justify bypass or authority deletion.
 
 Controlled installation, launcher swap, layout/bootstrap mutation, and active
 pointer changes serialize with hold-ledger mutation using the existing daemon
-namespace file lock. The shared `daemon.CheckMaintenanceForActivation` helper
-reads persisted authority without mutation. Status and pure startup inspection
-do not acquire/write that lock or proactively start a daemon. Activation also
-checks live aware status; offline/old endpoints permit it only when persisted
-authority is proven clear under the lock. This does not add an updater lease or
-host-wide executable-lock authority.
+namespace file lock. Use
+`daemon.AcquireMaintenanceForActivation(namespace, endpoint) (io.Closer, error)`
+to open the original existing lock read-only, acquire its existing byte-range lock,
+and check persisted authority. Only an exact native missing immediate lock child
+under the same held guard and a private final endpoint permits cold creation of
+that original lock. Creation is exclusive, parent-relative and no-follow, with
+private owner/access set atomically; an already-existing winner is opened and
+validated once. Unix validates every opened lock as current-user-owned `0600` and
+regular, retaining sticky-ancestor compatibility but requiring a private `0700`
+final endpoint for creation. A Windows endpoint may inherit its all-trusted DACL
+from the guarded parent; the endpoint DACL need not be protected. Cold-created
+and winner lock files require trusted ownership and protected private DACLs;
+ordinary existing locks retain old-writer write sharing. A permissive local TEMP
+endpoint never creates a missing lock. No lock is truncated, repaired or removed
+on failure, because another peer may already hold it.
+Retain the closer through live status validation and final publication. Cold
+creation never skips the original paired-store parser: HELD, prepared or malformed
+authority still refuses activation. The compatible `daemon.CheckMaintenanceForActivation`
+remains strictly read-only and requires an external namespace lock. Both use the
+same guarded reader as cold recovery; writers retain parent guards through
+publication without pinning old members across atomic replacement. Status and
+pure startup inspection never acquire the byte-range lock or proactively start a
+daemon. Offline/old endpoints still require locked persisted-clear proof. This adds
+neither an updater lease nor host-wide executable-lock authority.
 
 Run [production Scenario 11](../docs/PRODUCTION-TESTING-PLAYBOOK.md#scenario-11-upstream-maintenance-replacement)
 on Windows and Unix with the actual integrated binary. Focused maintenance

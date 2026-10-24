@@ -119,6 +119,45 @@ func TestInstallVersionedEngineSwitchesPointerAndKeepsOldVersion(t *testing.T) {
 	}
 }
 
+func TestInstallVersionedEngineRetainsPendingUntilPointerCommit(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		updateLauncher bool
+	}{
+		{name: "engine_only"},
+		{name: "explicit_launcher", updateLauncher: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			launcher := filepath.Join(t.TempDir(), launcherFileName())
+			pending := launcher + "~"
+			writeTestFile(t, launcher, "original launcher")
+			writeTestFile(t, pending, "new engine")
+			if err := os.MkdirAll(filepath.Join(activeEngineFile(launcher), "blocker"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			_, installed, launcherUpdated, err := installVersionedEngineWithOptions(launcher, pending, versionedEngineInstallOptions{UpdateLauncher: test.updateLauncher})
+			if err == nil || !installed || launcherUpdated != test.updateLauncher {
+				t.Fatalf("expected post-install pointer failure: installed=%t launcherUpdated=%t err=%v", installed, launcherUpdated, err)
+			}
+			if data, err := os.ReadFile(pending); err != nil || string(data) != "new engine" {
+				t.Fatalf("failed pointer commit consumed pending input: %v", err)
+			}
+			entries, err := os.ReadDir(activeEngineFile(launcher))
+			if err != nil || len(entries) != 1 || entries[0].Name() != "blocker" {
+				t.Fatalf("failed pointer commit replaced the blocked destination: %v", err)
+			}
+			lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
+			if err != nil {
+				t.Fatalf("failed activation retained the namespace lock: %v", err)
+			}
+			if err := lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestWriteActiveEngineStoresRelativePointer(t *testing.T) {
 	dir := t.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
@@ -314,9 +353,7 @@ func TestRestartDaemonAfterEngineSwitchNoDaemonIsNoop(t *testing.T) {
 
 func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 	isolateMaintenanceActivation(t)
-	dir := t.TempDir()
-	t.Setenv("TEMP", dir)
-	t.Setenv("TMP", dir)
+	dir := os.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
 
@@ -398,9 +435,7 @@ func TestRestartDaemonAfterEngineSwitchSendsSuccessorExe(t *testing.T) {
 
 func TestRestartDaemonAfterEngineSwitchDefersWhenLiveSessionsExist(t *testing.T) {
 	isolateMaintenanceActivation(t)
-	dir := t.TempDir()
-	t.Setenv("TEMP", dir)
-	t.Setenv("TMP", dir)
+	dir := os.TempDir()
 	launcherPath := filepath.Join(dir, "mcp-mux.exe")
 	enginePath := filepath.Join(versionStoreDir(launcherPath), "abc123", engineFileName())
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -195,14 +196,12 @@ func ensureDaemonWithinWithStarter(ctx context.Context, logger *log.Logger, budg
 	// Acquire lock to prevent multiple shims from starting daemon simultaneously.
 	// Lock file is NOT deleted — it persists for coordination across shims.
 	lockPath := serverid.DaemonLockPath("", engineName)
-	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open lock file: %w", err)
-	}
-	defer lock.Close()
-
 	lockStart := time.Now()
-	if err := lockFile(lock); err != nil {
+	lock, err := ipc.AcquireFileLock(lockPath)
+	if err != nil {
+		if !errors.Is(err, ipc.ErrFileLocked) {
+			return fmt.Errorf("acquire daemon namespace lock: %w", err)
+		}
 		// Another shim holds the lock (starting daemon) — wait longer for it.
 		// 15s covers: daemon startup + upstream spawn + init response.
 		logger.Printf("ensure_daemon substep=lock_attempt status=contended duration=%v err=%q",
@@ -218,7 +217,7 @@ func ensureDaemonWithinWithStarter(ctx context.Context, logger *log.Logger, budg
 			time.Since(waitStart))
 		return nil
 	}
-	defer unlockFile(lock)
+	defer lock.Close()
 	logger.Printf("ensure_daemon substep=lock_attempt status=acquired duration=%v",
 		time.Since(lockStart))
 

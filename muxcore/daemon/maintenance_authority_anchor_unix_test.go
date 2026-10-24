@@ -52,7 +52,7 @@ func TestMaintenanceAuthorityRejectsForeignUnixOwner(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("changing a fixture to a foreign UID requires root; non-root mode/symlink tests still run")
 	}
-	for _, member := range []string{"anchor", "scope", "ledger", "transaction"} {
+	for _, member := range []string{"anchor", "scope", "ledger", "transaction", "namespace-lock"} {
 		t.Run(member, func(t *testing.T) {
 			d, endpoint := maintenanceAnchorGuardFixture(t)
 			path := d.maintenancePath
@@ -63,11 +63,24 @@ func TestMaintenanceAuthorityRejectsForeignUnixOwner(t *testing.T) {
 				path = filepath.Dir(path)
 			case "transaction":
 				path = maintenanceTransactionPath(path)
+			case "namespace-lock":
+				path = d.maintenanceLockPath
 			}
 			if err := os.Chown(path, 65534, -1); err != nil {
 				t.Fatal(err)
 			}
-			maintenanceAnchorGuardRefuses(t, d, endpoint)
+			if member == "namespace-lock" {
+				activation, err := AcquireMaintenanceForActivation(d.namespace, endpoint)
+				if activation != nil {
+					_ = activation.Close()
+					t.Fatal("activation accepted a foreign-owned namespace lock")
+				}
+				if !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+					t.Fatalf("foreign namespace lock refusal=%v", err)
+				}
+			} else {
+				maintenanceAnchorGuardRefuses(t, d, endpoint)
+			}
 			info, err := os.Lstat(path)
 			if err != nil {
 				t.Fatal(err)
@@ -99,6 +112,90 @@ func TestMaintenanceAuthorityColdReadRejectsUnsafeUnixParentWithoutWrites(t *tes
 	}
 	if info, err := os.Stat(base); err != nil || info.Mode().Perm() != 0o777 {
 		t.Fatalf("read-only rejection changed parent permissions: %v", err)
+	}
+}
+
+func TestMaintenanceActivationUnixNamespaceLockType(t *testing.T) {
+	for _, kind := range []string{"directory", "regular", "public", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			base := maintenanceAnchorTempDir(t, "mux-lock-type-")
+			if err := secureMaintenancePath(base, true); err != nil {
+				t.Fatal(err)
+			}
+			const namespace = "activation-lock-type"
+			lockPath := serverid.DaemonLockPath(base, namespace)
+			const content = "existing namespace lock\n"
+			var err error
+			switch kind {
+			case "directory":
+				err = os.Mkdir(lockPath, 0o700)
+			case "symlink":
+				target := filepath.Join(base, "target")
+				if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				err = os.Symlink(target, lockPath)
+			default:
+				err = os.WriteFile(lockPath, []byte(content), 0o600)
+				if err == nil && kind == "public" {
+					err = os.Chmod(lockPath, 0o644)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			activation, err := AcquireMaintenanceForActivation(namespace, filepath.Join(base, "control.sock"))
+			if kind != "regular" {
+				if activation != nil {
+					_ = activation.Close()
+					t.Fatal("activation accepted an unsafe namespace lock")
+				}
+				if err == nil || kind != "symlink" && !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+					t.Fatalf("unsafe lock refusal=%v, want maintenance persistence failure or native no-follow refusal", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer activation.Close()
+				competing, lockErr := ipc.AcquireFileLock(lockPath)
+				if competing != nil {
+					_ = competing.Close()
+				}
+				if !errors.Is(lockErr, ipc.ErrFileLocked) {
+					t.Fatalf("regular writer did not contend with activation: %v", lockErr)
+				}
+				if err := activation.Close(); err != nil {
+					t.Fatal(err)
+				}
+				competing, lockErr = ipc.AcquireFileLock(lockPath)
+				if lockErr != nil {
+					t.Fatalf("activation retained the regular lock after Close: %v", lockErr)
+				}
+				if err := competing.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if data, err := os.ReadFile(lockPath); err != nil || string(data) != content {
+					t.Fatalf("activation changed existing lock bytes: %v", err)
+				}
+			}
+			entries, err := os.ReadDir(base)
+			wantEntries := 1
+			if kind == "symlink" {
+				wantEntries = 2
+			}
+			if err != nil || len(entries) != wantEntries || entries[0].Name() != filepath.Base(lockPath) {
+				t.Fatalf("activation mutated namespace authority: entries=%d err=%v", len(entries), err)
+			}
+			after, err := os.Lstat(lockPath)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("activation replaced the existing lock object: %v", err)
+			}
+		})
 	}
 }
 
@@ -217,4 +314,32 @@ func TestMaintenanceAuthorityPreservesTrustedEndpointAliasUnix(t *testing.T) {
 		}
 		maintenanceAnchorTrustedAliasPreserves(t, d, endpoint, filepath.Join(alias, filepath.Base(endpoint)))
 	})
+}
+
+func TestMaintenanceActivationUnixMissingLockRequiresPrivateEndpoint(t *testing.T) {
+	base := maintenanceAnchorTempDir(t, "mux-cold-public-")
+	if err := os.Chmod(base, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := filepath.Join(base, "control.sock")
+	activation, err := AcquireMaintenanceForActivation("cold-public", endpoint)
+	if activation != nil {
+		_ = activation.Close()
+		t.Fatal("activation created a lock under a shared sticky endpoint")
+	}
+	if !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+		t.Fatalf("shared endpoint refusal=%v", err)
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("shared endpoint refusal created namespace state: entries=%d err=%v", len(entries), err)
+	}
+	after, err := os.Stat(base)
+	if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+		t.Fatalf("shared endpoint refusal changed original directory: %v", err)
+	}
 }

@@ -125,7 +125,7 @@ command; payloads, `clientInfo`, stateless mode, and upstream flags cannot selec
 
 ## Upstream maintenance hold consumer contract
 
-The binary/library target is v0.32.0. Maintenance was introduced in v0.31.0 and
+The binary/library target is v0.33.4. Maintenance was introduced in v0.31.0 and
 requires aware binary/daemon/shim versions v0.31.0 or newer; it is optional for
 ordinary legacy `engine.New` consumers. Use the exact local status `server_id`, then the returned
 opaque `hold_id`:
@@ -274,6 +274,20 @@ unsafe parent. Preserve raw endpoint-parent components while authenticating ever
 alias/target before canonicalization; private anchor/scope/members require native
 owner/mode/protected-DACL guards. Exact TrustedInstaller trust is ancestors-only.
 The endpoint/lock directory must survive every active fence; no cleanup authority.
+Windows writable ordinary endpoints require a nonreplaceable incoming binding,
+held no-delete directory handles and parent-relative no-follow child opens.
+Keep strict ancestors/private authority and existing trusted-alias policy; no
+group allowlist, namespace relocation or host/profile ACL repair. Activation uses
+`daemon.AcquireMaintenanceForActivation` with an existing read-only regular lock,
+the original byte-range primitive and write sharing for older writers. Only exact
+native child-not-found under the same held guard and a private final endpoint
+permits exclusive no-follow creation of the original lock with private owner/mode
+or protected DACL. Open an already-created winner once and validate it; never
+unlink, truncate or repair a lock, including after failed activation. Untrusted
+local TEMP remains existing-only with zero missing-lock writes. Always read the
+original paired authority after locking; cold creation never means clear fences.
+CheckMaintenanceForActivation stays read-only. Retain the closer through live
+status and pointer commit; preserve pending bytes until commit.
 Released v0.30 had no store. Drain/clear older unreleased live candidates with the
 same binary/original environment before cutover; keep their files, no scan/migrate/
 registry/bypass. Safe verification-root approval is not a production TMP override
