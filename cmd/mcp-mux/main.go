@@ -124,7 +124,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       mcp-mux hold <exact-server-id> [--ttl 5m] [--drain-timeout 10s] [--json]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux resume <hold-id> [--json]")
 		fmt.Fprintln(os.Stderr, "       mcp-mux renew <hold-id> [--ttl 5m] [--json]")
-		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade")
+		fmt.Fprintln(os.Stderr, "       mcp-mux upgrade [--target-launcher EXISTING_PATH]")
 		os.Exit(1)
 	}
 	protocolEra, protocolWire := options.ProtocolEra, options.ProtocolWire

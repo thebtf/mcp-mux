@@ -1,16 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/thebtf/mcp-mux/muxcore/control"
+	"github.com/thebtf/mcp-mux/muxcore/ipc"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
 )
 
@@ -759,4 +762,345 @@ func TestRestartDaemonAfterEngineSwitchFallbackRequiresSameAwareGeneration(t *te
 			}
 		})
 	}
+}
+
+func targetLauncherUpgradeFixture(t *testing.T) (string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	updater := filepath.Join(root, "updater", launcherFileName())
+	target := filepath.Join(root, "installed", launcherFileName())
+	writeTestFile(t, updater, "current-aware updater")
+	writeTestFile(t, updater+"~", "candidate engine from updater")
+	writeTestFile(t, target, "old stable target")
+	writeTestFile(t, target+"~", "unrelated target-side pending update")
+	for _, launcher := range []string{updater, target} {
+		engine := writeContentAddressedTestEngine(t, launcher, "previous engine for "+filepath.Base(filepath.Dir(launcher)))
+		if err := writeActiveEngineUnderLock(launcher, engine); err != nil {
+			t.Fatalf("seed active pointer: %v", err)
+		}
+	}
+	return root, updater, target
+}
+
+func targetLauncherUpgradeSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	entries := make(map[string]string)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			entries[path] = "dir"
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		entries[path] = "file:" + string(content)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot upgrade fixture: %v", err)
+	}
+	return entries
+}
+
+func assertTargetLauncherUpgradeSnapshot(t *testing.T, root string, want map[string]string) {
+	t.Helper()
+	if got := targetLauncherUpgradeSnapshot(t, root); !reflect.DeepEqual(got, want) {
+		t.Fatalf("upgrade changed unexpected fixture paths or bytes:\ngot: %#v\nwant: %#v", got, want)
+	}
+}
+
+func stubTargetLauncherUpgradeLifecycle(t *testing.T) {
+	t.Helper()
+	oldRunning, oldSend := launcherIsDaemonRunning, launcherControlSendWithTimeout
+	oldExit, oldWait, oldStart := launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom
+	oldRestart := launcherRunRestartActive
+	t.Cleanup(func() {
+		launcherIsDaemonRunning, launcherControlSendWithTimeout = oldRunning, oldSend
+		launcherWaitForDaemonExit, launcherWaitForDaemon, launcherStartDaemonProcessFrom = oldExit, oldWait, oldStart
+		launcherRunRestartActive = oldRestart
+	})
+	launcherIsDaemonRunning = func(string) bool {
+		t.Fatal("upgrade unexpectedly inspected daemon liveness")
+		return false
+	}
+	launcherControlSendWithTimeout = func(string, control.Request, time.Duration) (*control.Response, error) {
+		t.Fatal("upgrade unexpectedly contacted daemon control")
+		return nil, nil
+	}
+	launcherWaitForDaemonExit = func(string, string) { t.Fatal("upgrade closed or waited for the existing daemon") }
+	launcherWaitForDaemon = func(string, time.Duration) error {
+		t.Fatal("upgrade waited for a successor daemon")
+		return nil
+	}
+	launcherStartDaemonProcessFrom = func(string, string) error {
+		t.Fatal("upgrade started a successor daemon")
+		return nil
+	}
+	launcherRunRestartActive = func(string, string, bool) int {
+		t.Fatal("upgrade re-executed the old target launcher")
+		return 1
+	}
+}
+
+func runTargetLauncherUpgrade(t *testing.T, updater string, args []string) (int, string) {
+	t.Helper()
+	output, err := os.CreateTemp(t.TempDir(), "upgrade-stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = output
+	defer func() {
+		os.Stderr = oldStderr
+		_ = output.Close()
+	}()
+	code := runLauncherUpgrade(updater, args)
+	data, err := os.ReadFile(output.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return code, string(data)
+}
+
+func TestRunLauncherUpgradeTargetLauncher(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		explicit bool
+		relative bool
+		restart  bool
+	}{
+		{name: "absolute-target", explicit: true},
+		{name: "relative-target", explicit: true, relative: true},
+		{name: "default-self"},
+		{name: "restart-preserves-live-transports", explicit: true, restart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			stubTargetLauncherUpgradeLifecycle(t)
+			root, updater, target := targetLauncherUpgradeFixture(t)
+			before := targetLauncherUpgradeSnapshot(t, root)
+			destination := updater
+			var args []string
+			if tc.explicit {
+				destination = target
+				targetArg := target
+				if tc.relative {
+					oldWd, err := os.Getwd()
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() {
+						if err := os.Chdir(oldWd); err != nil {
+							t.Fatalf("restore cwd: %v", err)
+						}
+					})
+					if err := os.Chdir(root); err != nil {
+						t.Fatal(err)
+					}
+					targetArg = filepath.Join("installed", launcherFileName())
+				}
+				args = append(args, "--target-launcher", targetArg)
+			}
+			if tc.restart {
+				args = append(args, "--restart")
+				launcherIsDaemonRunning = func(path string) bool {
+					if path != serverid.DaemonControlPath("", engineName) {
+						t.Fatalf("daemon control path = %q", path)
+					}
+					return true
+				}
+			}
+			hash, err := fileHash(updater + "~")
+			if err != nil {
+				t.Fatal(err)
+			}
+			enginePath := filepath.Join(versionStoreDir(destination), hash[:12], engineFileName())
+			pointer, err := filepath.Rel(versionStoreDir(destination), enginePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := make(map[string]string, len(before)+2)
+			for path, content := range before {
+				want[path] = content
+			}
+			delete(want, updater+"~")
+			want[filepath.Dir(enginePath)] = "dir"
+			want[enginePath] = "file:candidate engine from updater"
+			want[activeEngineFile(destination)] = "file:" + pointer + "\n"
+			statusCalls := 0
+			launcherControlSendWithTimeout = func(path string, req control.Request, _ time.Duration) (*control.Response, error) {
+				if path != serverid.DaemonControlPath("", engineName) || req.Cmd != "status" {
+					t.Fatalf("upgrade sent lifecycle mutation: path=%q cmd=%q", path, req.Cmd)
+				}
+				competingLock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
+				if competingLock != nil {
+					_ = competingLock.Close()
+				}
+				if !errors.Is(err, ipc.ErrFileLocked) {
+					t.Fatalf("upgrade status ran outside namespace mutation lock: %v", err)
+				}
+				statusCalls++
+				if statusCalls == 1 {
+					assertTargetLauncherUpgradeSnapshot(t, root, before)
+				} else {
+					assertTargetLauncherUpgradeSnapshot(t, root, want)
+				}
+				return &control.Response{OK: true, Data: []byte(`{"maintenance":[],"servers":[{"session_count":1}]}`)}, nil
+			}
+			code, output := runTargetLauncherUpgrade(t, updater, args)
+			if code != 0 {
+				t.Fatalf("runLauncherUpgrade(%v) code = %d, want 0:\n%s", args, code, output)
+			}
+			wantStatusCalls := 1
+			if tc.restart {
+				wantStatusCalls++
+				if !strings.Contains(output, "Daemon restart deferred") {
+					t.Fatalf("live restart did not report deferral:\n%s", output)
+				}
+			}
+			if statusCalls != wantStatusCalls {
+				t.Fatalf("status calls = %d, want %d", statusCalls, wantStatusCalls)
+			}
+			assertTargetLauncherUpgradeSnapshot(t, root, want)
+			active, ok := resolveActiveEngine(destination)
+			if !ok || !filepath.IsAbs(active) || !samePath(active, enginePath) {
+				t.Fatalf("active engine = %q ok=%v, want absolute target path %q", active, ok, enginePath)
+			}
+		})
+	}
+}
+
+func TestRunLauncherUpgradeTargetLauncherUpdatePreservesIndependentPending(t *testing.T) {
+	isolateMaintenanceActivation(t)
+	stubTargetLauncherUpgradeLifecycle(t)
+	_, updater, target := targetLauncherUpgradeFixture(t)
+	launcherControlSendWithTimeout = func(path string, req control.Request, _ time.Duration) (*control.Response, error) {
+		if path != serverid.DaemonControlPath("", engineName) || req.Cmd != "status" {
+			t.Fatalf("launcher update sent lifecycle mutation: path=%q cmd=%q", path, req.Cmd)
+		}
+		return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+	}
+	code, output := runTargetLauncherUpgrade(t, updater, []string{"--target-launcher", target, "--update-launcher"})
+	if code != 0 {
+		t.Fatalf("explicit target launcher update code = %d, want 0:\n%s", code, output)
+	}
+	if content, err := os.ReadFile(target); err != nil || string(content) != "candidate engine from updater" {
+		t.Fatalf("target launcher was not updated from updater pending: %q %v", content, err)
+	}
+	if content, err := os.ReadFile(target + "~"); err != nil || string(content) != "unrelated target-side pending update" {
+		t.Fatalf("independent target-side pending update changed: %q %v", content, err)
+	}
+	if content, err := os.ReadFile(updater); err != nil || string(content) != "current-aware updater" {
+		t.Fatalf("executing updater changed: %q %v", content, err)
+	}
+	if _, err := os.Stat(updater + "~"); !os.IsNotExist(err) {
+		t.Fatalf("selected updater pending was not consumed: %v", err)
+	}
+	active, ok := resolveActiveEngine(target)
+	if !ok {
+		t.Fatal("target active engine pointer was not written")
+	}
+	if content, err := os.ReadFile(active); err != nil || string(content) != "candidate engine from updater" {
+		t.Fatalf("target active engine was not installed from updater pending: %q %v", content, err)
+	}
+}
+
+func TestRunLauncherUpgradeTargetLauncherMaintenanceRefusal(t *testing.T) {
+	for _, name := range []string{"held", "namespace-lock"} {
+		t.Run(name, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			stubTargetLauncherUpgradeLifecycle(t)
+			root, updater, target := targetLauncherUpgradeFixture(t)
+			before := targetLauncherUpgradeSnapshot(t, root)
+			wantError := ipc.ErrFileLocked.Error()
+			statusCalls := 0
+			if name == "held" {
+				lease := control.MaintenanceResult{HoldID: "lease", ServerID: "owner", State: control.MaintenanceHeld, ExpiresAt: time.Now().Add(time.Minute).UTC(), DrainDeadline: time.Now().UTC(), TreesRetired: true}
+				data, err := json.Marshal(map[string]any{"maintenance": []control.MaintenanceResult{lease}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantError = string(control.ErrMaintenanceHeld.Code)
+				launcherControlSendWithTimeout = func(path string, req control.Request, _ time.Duration) (*control.Response, error) {
+					if path != serverid.DaemonControlPath("", engineName) || req.Cmd != "status" {
+						t.Fatalf("held upgrade sent lifecycle mutation: path=%q cmd=%q", path, req.Cmd)
+					}
+					competingLock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
+					if competingLock != nil {
+						_ = competingLock.Close()
+					}
+					if !errors.Is(err, ipc.ErrFileLocked) {
+						t.Fatalf("maintenance refusal ran outside namespace lock: %v", err)
+					}
+					assertTargetLauncherUpgradeSnapshot(t, root, before)
+					statusCalls++
+					return &control.Response{OK: true, Data: data}, nil
+				}
+			} else {
+				lock, err := ipc.AcquireFileLock(serverid.DaemonLockPath("", engineName))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = lock.Close() })
+			}
+			code, output := runTargetLauncherUpgrade(t, updater, []string{"--target-launcher", target, "--update-launcher", "--restart"})
+			if code != 1 || !strings.Contains(output, wantError) {
+				t.Fatalf("upgrade refusal code = %d, want 1 and %q:\n%s", code, wantError, output)
+			}
+			if name == "held" && statusCalls != 1 {
+				t.Fatalf("held status calls = %d, want 1", statusCalls)
+			}
+			assertTargetLauncherUpgradeSnapshot(t, root, before)
+		})
+	}
+}
+
+func TestRunLauncherUpgradeTargetLauncherRejectsInvalidBeforeMutation(t *testing.T) {
+	for _, name := range []string{"missing-value", "missing-file", "directory", "invalid-path"} {
+		t.Run(name, func(t *testing.T) {
+			isolateMaintenanceActivation(t)
+			stubTargetLauncherUpgradeLifecycle(t)
+			root, updater, target := targetLauncherUpgradeFixture(t)
+			args := []string{"--target-launcher"}
+			switch name {
+			case "missing-file":
+				args = append(args, filepath.Join(root, "missing", launcherFileName()))
+			case "directory":
+				args = append(args, filepath.Dir(target))
+			case "invalid-path":
+				args = append(args, target+"\x00")
+			}
+			before := targetLauncherUpgradeSnapshot(t, root)
+			code, output := runTargetLauncherUpgrade(t, updater, args)
+			if code == 0 || strings.Contains(output, "flag provided but not defined") {
+				t.Fatalf("target was not validated: code=%d:\n%s", code, output)
+			}
+			assertTargetLauncherUpgradeSnapshot(t, root, before)
+		})
+	}
+}
+
+func TestRunLauncherUpgradeTargetLauncherRequiresUpdaterPending(t *testing.T) {
+	isolateMaintenanceActivation(t)
+	stubTargetLauncherUpgradeLifecycle(t)
+	root, updater, target := targetLauncherUpgradeFixture(t)
+	if err := os.Remove(updater + "~"); err != nil {
+		t.Fatal(err)
+	}
+	before := targetLauncherUpgradeSnapshot(t, root)
+	launcherControlSendWithTimeout = func(path string, req control.Request, _ time.Duration) (*control.Response, error) {
+		if path != serverid.DaemonControlPath("", engineName) || req.Cmd != "status" {
+			t.Fatalf("missing source pending triggered lifecycle mutation: path=%q cmd=%q", path, req.Cmd)
+		}
+		return &control.Response{OK: true, Data: []byte(`{"maintenance":[]}`)}, nil
+	}
+	code, output := runTargetLauncherUpgrade(t, updater, []string{"--target-launcher", target})
+	if code != 1 || !strings.Contains(output, updater+"~") {
+		t.Fatalf("missing updater pending must not consume target pending: code=%d:\n%s", code, output)
+	}
+	assertTargetLauncherUpgradeSnapshot(t, root, before)
 }

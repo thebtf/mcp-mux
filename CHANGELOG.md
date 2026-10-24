@@ -7,6 +7,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.33.3] - 2026-10-24
+
+### Added
+
+- Added `upgrade --target-launcher EXISTING_PATH` so a current-aware updater
+  can install its adjacent `<updater>~` payload into another existing stable
+  launcher's version store and active pointer without executing or implicitly
+  replacing that launcher. Relative and absolute targets resolve to an existing
+  regular file before mutation. Existing namespace locking, maintenance refusal,
+  default self-update behavior, and safe restart/defer semantics are unchanged;
+  selecting a target alone does not switch the running daemon's loaded engine.
+- Explicit cross-path `--update-launcher` stages the payload on the target
+  volume before swapping, preserving independent target-side pending and backup
+  files. The selected source payload and returned rollback file remain available
+  if the update fails before the active-pointer commit. Default self-update
+  retains its existing direct-swap and cleanup path without an extra copy.
+
 ## [0.33.2] - 2026-10-24
 
 ### Fixed

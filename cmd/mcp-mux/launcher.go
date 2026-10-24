@@ -299,12 +299,34 @@ func launcherEnv(launcherPath string) []string {
 }
 
 func runLauncherUpgrade(launcherPath string, args []string) int {
+	pendingPath := launcherPath + "~"
 	upgradeFlags := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	upgradeFlags.SetOutput(os.Stderr)
 	restart := upgradeFlags.Bool("restart", false, "Safely restart daemon after active engine switch only when no live sessions are attached")
 	forceDaemonRestart := upgradeFlags.Bool("force-daemon-restart", false, "Maintenance: restart daemon even with live sessions; existing old transports may close")
 	updateLauncher := upgradeFlags.Bool("update-launcher", false, "Maintenance: replace the stable launcher binary from the staged update")
 	restartActive := upgradeFlags.String("restart-active", "", "internal: restart daemon after active engine switch")
+	upgradeFlags.Func("target-launcher", "Update an existing stable launcher installation; pending input remains adjacent to this updater", func(path string) error {
+		if path == "" {
+			return errors.New("target launcher path must not be empty")
+		}
+		targetPath, err := filepath.EvalSymlinks(path)
+		if err == nil {
+			targetPath, err = filepath.Abs(targetPath)
+		}
+		if err != nil {
+			return fmt.Errorf("resolve target launcher: %w", err)
+		}
+		info, err := os.Stat(targetPath)
+		if err != nil {
+			return fmt.Errorf("stat target launcher: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("target launcher must be an existing regular file: %s", targetPath)
+		}
+		launcherPath = targetPath
+		return nil
+	})
 	if err := upgradeFlags.Parse(args); err != nil {
 		return 2
 	}
@@ -335,7 +357,6 @@ func runLauncherUpgrade(launcherPath string, args []string) int {
 			_ = mutationLock.Close()
 		}
 	}()
-	pendingPath := launcherPath + "~"
 	enginePath, installed, launcherUpdated, err := installVersionedEngineUnderLock(launcherPath, pendingPath, versionedEngineInstallOptions{
 		UpdateLauncher: *updateLauncher,
 	})
@@ -458,24 +479,79 @@ func installVersionedEngineUnderLock(launcherPath, pendingPath string, opts vers
 		return "", false, false, fmt.Errorf("stat version path: %w", statErr)
 	}
 
-	if !opts.UpdateLauncher {
-		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
-	} else if sameFile(launcherPath, pendingPath) {
-		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
+	crossPathUpdate := opts.UpdateLauncher && !samePath(pendingPath, launcherPath+"~")
+	var replacedLauncherPath string
+	if !opts.UpdateLauncher || sameFile(launcherPath, pendingPath) {
+		if !crossPathUpdate {
+			_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
+		}
 	} else {
-		oldPath, swapErr := upgrade.Swap(launcherPath, pendingPath)
+		swapPath := pendingPath
+		if crossPathUpdate {
+			swapPath, err = stageLauncherUpdate(launcherPath, pendingPath)
+			if err != nil {
+				return "", installed, false, fmt.Errorf("stage launcher update on target volume: %w", err)
+			}
+			defer func() { _ = os.Remove(swapPath) }()
+		}
+		oldPath, swapErr := upgrade.Swap(launcherPath, swapPath)
 		if swapErr != nil {
 			return "", installed, false, fmt.Errorf("update launcher binary: %w", swapErr)
 		}
-		_ = os.Remove(oldPath)
-		upgrade.CleanStale(launcherPath)
+		if crossPathUpdate {
+			replacedLauncherPath = oldPath
+		} else {
+			_ = os.Remove(oldPath)
+			upgrade.CleanStale(launcherPath)
+		}
 		launcherUpdated = true
 	}
 
 	if err := writeActiveEngineUnderLock(launcherPath, enginePath); err != nil {
 		return "", installed, launcherUpdated, err
 	}
+	if crossPathUpdate {
+		if replacedLauncherPath != "" {
+			_ = os.Remove(replacedLauncherPath)
+		}
+		_ = removeWithRetry(pendingPath, 10, 50*time.Millisecond)
+	}
 	return enginePath, installed, launcherUpdated, nil
+}
+
+func stageLauncherUpdate(launcherPath, pendingPath string) (string, error) {
+	in, err := os.Open(pendingPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+
+	out, err := os.CreateTemp(filepath.Dir(launcherPath), "."+filepath.Base(launcherPath)+".update-*")
+	if err != nil {
+		return "", err
+	}
+	path := out.Name()
+	ok := false
+	defer func() {
+		_ = out.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := out.Chmod(0o755); err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		return "", err
+	}
+	if err := out.Sync(); err != nil {
+		return "", err
+	}
+	if err := out.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return path, nil
 }
 
 func copyFile(src, dst string, perm os.FileMode) error {

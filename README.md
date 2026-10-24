@@ -653,7 +653,7 @@ mcp-mux status
 mcp-mux stop [--drain-timeout 30s] [--force]
 
 # Versioned engine upgrade (see section below)
-mcp-mux upgrade
+mcp-mux upgrade [--target-launcher EXISTING_PATH]
 
 # Start a detached daemon process (normally auto-started by shims)
 mcp-mux daemon
@@ -714,6 +714,41 @@ mcp-mux upgrade
 
 The daemon keeps running with its current engine. New shim processes use the new
 active engine. The daemon updates on next natural restart.
+
+**Use a current-aware updater for another installed launcher:**
+
+`--target-launcher` accepts an absolute or relative path to an existing regular
+launcher file. Run the current-aware updater `A` from an owned artifact directory
+and stage the candidate engine next to it as `A~`:
+
+```sh
+# Updater A: ./.agent/artifacts/updater/mcp-mux.exe
+# Candidate payload A~: ./.agent/artifacts/updater/mcp-mux.exe~
+./.agent/artifacts/updater/mcp-mux.exe upgrade --target-launcher ./mcp-mux.exe
+```
+
+This installs the payload from `A~` into the target launcher's adjacent
+`mcp-mux.versions` store and switches that installation's `active.txt`. Ordinary
+invocation consumes only `A~`: the updater, stable target launcher, target-side
+pending file, and previous engine versions remain unchanged. The old target
+launcher is not executed to perform installation.
+
+Selecting a target does not mean the running daemon has loaded the new engine.
+Without `--restart`, the daemon and existing transports keep running unchanged.
+With `--restart`, the existing zero-live-session proof and restart/defer behavior
+still apply; the flag never implies `--force-daemon-restart` or
+`--update-launcher`. Replacing the stable launcher remains an explicit
+`--update-launcher` maintenance operation.
+
+For cross-path `--update-launcher`, a uniquely reserved staging file is copied
+and synced in the target directory before the existing rename swap. This also
+supports an updater on another filesystem or volume. Cleanup does not sweep
+independent target-side pending or backup files. The selected `A~` and any
+returned old-launcher file are retained until the active pointer commits.
+
+The target path selects an installation, not permission to mutate it. All
+activation writes still require the existing namespace lock and maintenance
+admission; this option does not change namespace context or bypass a hold.
 
 **When a same-protocol graceful restart is safe and actually runs, it preserves:**
 
