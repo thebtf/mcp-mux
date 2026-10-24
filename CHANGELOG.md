@@ -18,6 +18,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   acquisition through publication. Namespace-lock opens reject reparse points,
   preserve old-writer write sharing and use the same byte-range contention.
   Namespace, endpoint, authority location, scope and schema are unchanged.
+- Unix activation refuses directories and other non-regular namespace locks
+  before locking, preserving existing-only read-only access and normal writer
+  contention.
 - Update payloads, including explicit launcher-update input, are preserved until
   active-pointer publication succeeds. Launcher replacement uses an adjacent
   staged copy and retains its rollback file until that commit.

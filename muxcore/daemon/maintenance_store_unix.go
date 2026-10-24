@@ -91,7 +91,18 @@ func guardMaintenanceParent(path, lockName string) (*maintenancePathGuard, error
 func (g *maintenancePathGuard) Close() error { return nil }
 
 func (g *maintenancePathGuard) openNamespaceLock() (*os.File, error) {
-	return os.Open(g.lockPath)
+	file, err := os.Open(g.lockPath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = control.ErrMaintenancePersistenceFailed
+	}
+	if err != nil {
+		return nil, errors.Join(err, file.Close())
+	}
+	return file, nil
 }
 
 func (g *maintenancePathGuard) checkStorePaths(path string, create bool) (bool, error) {

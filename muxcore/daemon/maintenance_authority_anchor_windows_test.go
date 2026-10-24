@@ -59,9 +59,9 @@ func TestMaintenanceAuthorityRejectsUnsafeWindowsACLs(t *testing.T) {
 			path, grant := d.maintenancePath, "FA"
 			switch member {
 			case "parent":
-				path, grant = filepath.Dir(endpoint), "DC"
+				path, grant = filepath.Dir(endpoint), "0x40" // FILE_DELETE_CHILD; SDDL DC is directory-service 0x2.
 			case "ancestor":
-				path, grant = filepath.Dir(filepath.Dir(endpoint)), "DC"
+				path, grant = filepath.Dir(filepath.Dir(endpoint)), "0x40"
 			case "anchor":
 				path = filepath.Dir(filepath.Dir(path))
 			case "scope":
@@ -79,7 +79,7 @@ func TestMaintenanceAuthorityRejectsUnsafeWindowsACLs(t *testing.T) {
 }
 
 func TestMaintenanceAuthorityColdReadRejectsUnsafeWindowsParentWithoutWrites(t *testing.T) {
-	for _, grant := range []string{"DC", "WD", "WO"} {
+	for _, grant := range []string{"0x40", "WD", "WO"} {
 		t.Run(grant, func(t *testing.T) {
 			base := maintenanceAnchorTempDir(t, "mux-cold-")
 			before := maintenanceAnchorWindowsGrant(t, base, grant)
@@ -331,7 +331,7 @@ func TestMaintenanceActivationWindowsRejectsNamespaceLockReparse(t *testing.T) {
 }
 
 func TestMaintenanceActivationWindowsWritableEndpointKeepsFences(t *testing.T) {
-	for _, state := range []string{"held", "malformed-pair", "missing-transaction", "DC", "WD", "WO", "replaceable-parent"} {
+	for _, state := range []string{"held", "malformed-pair", "missing-transaction", "0x40", "WD", "WO", "replaceable-parent"} {
 		t.Run(state, func(t *testing.T) {
 			d, endpoint := maintenanceAnchorGuardFixture(t)
 			grant := "(A;OICI;0x1301bf;;;BU)"

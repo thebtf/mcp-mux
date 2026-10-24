@@ -102,6 +102,76 @@ func TestMaintenanceAuthorityColdReadRejectsUnsafeUnixParentWithoutWrites(t *tes
 	}
 }
 
+func TestMaintenanceActivationUnixNamespaceLockType(t *testing.T) {
+	for _, kind := range []string{"directory", "regular"} {
+		t.Run(kind, func(t *testing.T) {
+			base := maintenanceAnchorTempDir(t, "mux-lock-type-")
+			if err := secureMaintenancePath(base, true); err != nil {
+				t.Fatal(err)
+			}
+			const namespace = "activation-lock-type"
+			lockPath := serverid.DaemonLockPath(base, namespace)
+			const content = "existing namespace lock\n"
+			var err error
+			if kind == "directory" {
+				err = os.Mkdir(lockPath, 0o700)
+			} else {
+				err = os.WriteFile(lockPath, []byte(content), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			activation, err := AcquireMaintenanceForActivation(namespace, filepath.Join(base, "control.sock"))
+			if kind == "directory" {
+				if activation != nil {
+					_ = activation.Close()
+					t.Fatal("activation accepted a directory as the namespace lock")
+				}
+				if !errors.Is(err, control.ErrMaintenancePersistenceFailed) {
+					t.Fatalf("directory lock refusal=%v, want maintenance persistence failure", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer activation.Close()
+				competing, lockErr := ipc.AcquireFileLock(lockPath)
+				if competing != nil {
+					_ = competing.Close()
+				}
+				if !errors.Is(lockErr, ipc.ErrFileLocked) {
+					t.Fatalf("regular writer did not contend with activation: %v", lockErr)
+				}
+				if err := activation.Close(); err != nil {
+					t.Fatal(err)
+				}
+				competing, lockErr = ipc.AcquireFileLock(lockPath)
+				if lockErr != nil {
+					t.Fatalf("activation retained the regular lock after Close: %v", lockErr)
+				}
+				if err := competing.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if data, err := os.ReadFile(lockPath); err != nil || string(data) != content {
+					t.Fatalf("activation changed existing lock bytes: %v", err)
+				}
+			}
+			entries, err := os.ReadDir(base)
+			if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(lockPath) {
+				t.Fatalf("activation mutated namespace authority: entries=%d err=%v", len(entries), err)
+			}
+			after, err := os.Lstat(lockPath)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("activation replaced the existing lock object: %v", err)
+			}
+		})
+	}
+}
+
 func TestMaintenanceAuthorityRejectsForeignAliasRetarget(t *testing.T) {
 	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
 		t.Skip("genuine foreign-UID alias retarget requires Linux root credentials and /proc/self/fd")
