@@ -25,7 +25,8 @@ jobs:
           go vet ./...
           # Serialize packages because daemon and snapshot tests share the
           # TEMP-based snapshot path; coverage already uses the same guard.
-          go test -race -count=1 -timeout 180s -p=1 ./...
+          # Windows race tests have many individually bounded lifecycle waits.
+          go test -race -count=1 -timeout 300s -p=1 ./...
       - name: Select opt-in Windows maintenance proof
         id: maintenance-selection
         if: matrix.os == 'windows-latest' && github.event_name == 'pull_request'
