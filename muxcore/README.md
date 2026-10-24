@@ -26,6 +26,8 @@ remain compatible; a dependency bump alone does not migrate consumer quota track
 or enable bounds. R2 exact-context modern sharing, managed upstream maintenance,
 legacy defaults, and isolated R1 remain available as documented below.
 
+Legacy owner/template identity ignores terminal-only `WARP_FOCUS_URL`; endpoint/credential differences still partition, and modern R2 still compares the exact effective environment.
+
 ### v0.32.0 — R2 exact-context modern sharing
 
 The following optional APIs are introduced in v0.32.0. Legacy callers remain

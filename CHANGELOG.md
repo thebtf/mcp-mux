@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.33.2] - 2026-10-24
+
+### Fixed
+
+- Ignore the exact terminal launch-noise key `WARP_FOCUS_URL` in legacy
+  owner/template environment identity so otherwise compatible Warp sessions
+  reuse one owner. Endpoint, credential, and configuration differences still
+  partition owners; modern R2 exact-effective-environment admission is unchanged.
+
 ## [0.33.1] - 2026-10-23
 
 ### Fixed

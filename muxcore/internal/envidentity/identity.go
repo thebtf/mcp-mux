@@ -222,7 +222,7 @@ func IsTransient(key string) bool {
 		return true
 	case strings.HasPrefix(key, "WT_"):
 		return true
-	case key == "SESSIONNAME" || key == "WSLENV":
+	case key == "SESSIONNAME" || key == "WSLENV" || key == "WARP_FOCUS_URL":
 		return true
 	case key == "PWD" || key == "OLDPWD" || key == "INIT_CWD":
 		return true

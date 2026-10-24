@@ -123,3 +123,47 @@ func TestCompatibleRejectsChangedSecurityValuesButIgnoresTransientNoise(t *testi
 		t.Fatal("changed configuration remained compatible")
 	}
 }
+
+func TestWarpFocusURLLegacyIdentity(t *testing.T) {
+	base := map[string]string{
+		"GITHUB_TOKEN":               "fixture-token-a",
+		"CONFIG_PATH":                "/config/service.json",
+		"SERVICE_URL":                "https://api.example.test/a",
+		"WARP_SERVICE_URL":           "https://warp.example.test/a",
+		"WARP_API_KEY":               "fixture-warp-key-a",
+		"WARP_FOCUS_URL":             "warp://session/testA",
+		"WARP_TERMINAL_SESSION_UUID": "testA",
+	}
+	a := Build(base)
+	for _, tc := range []struct {
+		name      string
+		key       string
+		value     string
+		wantEqual bool
+	}{
+		{name: "terminal session", key: "WARP_FOCUS_URL", value: "warp://session/testB", wantEqual: true},
+		{name: "service URL", key: "SERVICE_URL", value: "https://api.example.test/b"},
+		{name: "credential", key: "GITHUB_TOKEN", value: "fixture-token-b"},
+		{name: "Warp service URL", key: "WARP_SERVICE_URL", value: "https://warp.example.test/b"},
+		{name: "Warp credential", key: "WARP_API_KEY", value: "fixture-warp-key-b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := make(map[string]string, len(base))
+			for key, value := range base {
+				changed[key] = value
+			}
+			changed["WARP_TERMINAL_SESSION_UUID"] = "testB"
+			changed[tc.key] = tc.value
+			b := Build(changed)
+			if got := a.Fingerprint == b.Fingerprint; got != tc.wantEqual {
+				t.Errorf("same identity digest = %v, want %v", got, tc.wantEqual)
+			}
+			if got := Equal(a, b, base, changed); got != tc.wantEqual {
+				t.Errorf("Equal = %v, want %v", got, tc.wantEqual)
+			}
+			if got := Compatible(base, changed); got != tc.wantEqual {
+				t.Errorf("Compatible = %v, want %v", got, tc.wantEqual)
+			}
+		})
+	}
+}

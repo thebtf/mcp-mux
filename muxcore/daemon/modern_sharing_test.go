@@ -40,7 +40,7 @@ func TestModernSharingDaemon_TwoHostPipesUseOneUpstreamPID(t *testing.T) {
 }
 
 func TestModernSharingDaemon_UnknownPartitionAndDifferentEffectiveEnvStayIsolated(t *testing.T) {
-	for _, boundary := range []string{"unknown partition", "AUTHORIZATION", "CLAUDE_CODE_ENTRYPOINT"} {
+	for _, boundary := range []string{"unknown partition", "AUTHORIZATION", "CLAUDE_CODE_ENTRYPOINT", "WARP_FOCUS_URL"} {
 		t.Run(boundary, func(t *testing.T) {
 			d, launchA := modernSharingDaemon(t)
 			launchB := make(map[string]any, len(launchA))
@@ -61,6 +61,10 @@ func TestModernSharingDaemon_UnknownPartitionAndDifferentEffectiveEnvStayIsolate
 				// compare all daemon-normalized effective environment entries.
 				envA[boundary] = "fixture-a"
 				envB[boundary] = "fixture-b"
+				if boundary == "WARP_FOCUS_URL" {
+					envA[boundary] = "warp://session/testA"
+					envB[boundary] = "warp://session/testB"
+				}
 				launchB["env"] = envB
 			}
 			a := spawnModernSharing(t, d, launchA, prepare)

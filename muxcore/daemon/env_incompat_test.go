@@ -176,6 +176,64 @@ func TestGlobalFirst_NonIdentityEnvNoiseSharedSingleOwner(t *testing.T) {
 	}
 }
 
+func TestGlobalFirst_WarpFocusURLLegacyOwnerReuse(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		key        string
+		value      string
+		wantOwners int
+	}{
+		{name: "terminal session", wantOwners: 1},
+		{name: "endpoint", key: "SERVICE_URL", value: "https://api.example.test/b", wantOwners: 2},
+		{name: "credential", key: "GITHUB_TOKEN", value: "fixture-token-b", wantOwners: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			d := testDaemon(t)
+			mockServer := mockServerAbsPath(t)
+			envA := map[string]string{
+				"GITHUB_TOKEN":               "fixture-token-a",
+				"CONFIG_PATH":                "/config/service.json",
+				"SERVICE_URL":                "https://api.example.test/a",
+				"WARP_FOCUS_URL":             "warp://session/testA",
+				"WARP_TERMINAL_SESSION_UUID": "testA",
+			}
+			envB := make(map[string]string, len(envA))
+			for key, value := range envA {
+				envB[key] = value
+			}
+			envB["WARP_FOCUS_URL"] = "warp://session/testB"
+			envB["WARP_TERMINAL_SESSION_UUID"] = "testB"
+			if tc.key != "" {
+				envB[tc.key] = tc.value
+			}
+			req := control.Request{
+				Cmd:     "spawn",
+				Command: "go",
+				Args:    []string{"run", mockServer},
+				Cwd:     cwd,
+				Env:     envA,
+			}
+			pathA, sidA, _, err := d.Spawn(req)
+			if err != nil {
+				t.Fatalf("Spawn A: %v", err)
+			}
+			req.Env = envB
+			pathB, sidB, _, err := d.Spawn(req)
+			if err != nil {
+				t.Fatalf("Spawn B: %v", err)
+			}
+			wantReuse := tc.wantOwners == 1
+			if (sidA == sidB) != wantReuse || (pathA == pathB) != wantReuse {
+				t.Errorf("owner reuse = %v, IPC reuse = %v, want %v", sidA == sidB, pathA == pathB, wantReuse)
+			}
+			if got := d.OwnerCount(); got != tc.wantOwners {
+				t.Errorf("OwnerCount = %d, want %d", got, tc.wantOwners)
+			}
+		})
+	}
+}
+
 // TestSemanticEnvHash_Deterministic asserts that the helper produces
 // identical hashes for identical inputs and different hashes for
 // different inputs on a semantically significant key.
