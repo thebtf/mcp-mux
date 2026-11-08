@@ -43,6 +43,7 @@ type Session struct {
 	closer       io.Closer   // underlying connection (net.Conn for IPC sessions, nil for stdio)
 	mu           sync.Mutex  // protects writer
 	notifCh      chan []byte // async notification send buffer (drained by drainNotifications goroutine)
+	notifMu      sync.Mutex  // serializes bounded enqueue with Close
 	done         chan struct{}
 	closed       atomic.Bool
 
@@ -175,11 +176,15 @@ func (s *Session) WriteMessage(id json.RawMessage, result interface{}) error {
 // Close marks the session as closed and disconnects the underlying connection.
 // For IPC sessions, this closes the net.Conn, causing shim's io.Copy to return.
 func (s *Session) Close() {
-	if s.closed.CompareAndSwap(false, true) {
-		close(s.done)
-		if s.closer != nil {
-			s.closer.Close()
-		}
+	s.notifMu.Lock()
+	if !s.closed.CompareAndSwap(false, true) {
+		s.notifMu.Unlock()
+		return
+	}
+	close(s.done)
+	s.notifMu.Unlock()
+	if s.closer != nil {
+		s.closer.Close()
 	}
 }
 
@@ -188,11 +193,11 @@ func (s *Session) IsClosed() bool {
 	return s.closed.Load()
 }
 
-// SendNotification queues a notification for async delivery. Never blocks the
-// caller — if the buffer is full, the oldest notification is dropped to make room.
-// This prevents the upstream reader goroutine from deadlocking when a session's
-// IPC write is slow (e.g., CC not reading fast enough).
+// SendNotification queues a notification for async delivery without waiting for
+// queue capacity or I/O. If full, it drops the oldest notification to make room.
 func (s *Session) SendNotification(data []byte) {
+	s.notifMu.Lock()
+	defer s.notifMu.Unlock()
 	if s.closed.Load() {
 		return
 	}
@@ -208,7 +213,30 @@ func (s *Session) SendNotification(data []byte) {
 		case <-s.notifCh:
 		default:
 		}
-		s.notifCh <- cp
+		select {
+		case s.notifCh <- cp:
+		default:
+		}
+	}
+}
+
+// EnqueueNotification accepts a copy without evicting queued notifications.
+// It fails if the session is closed or its bounded queue is full.
+func (s *Session) EnqueueNotification(data []byte) error {
+	s.notifMu.Lock()
+	defer s.notifMu.Unlock()
+	if s.closed.Load() {
+		return fmt.Errorf("session closed")
+	}
+	if len(s.notifCh) == cap(s.notifCh) {
+		return fmt.Errorf("session notification queue full")
+	}
+	cp := append([]byte(nil), data...)
+	select {
+	case s.notifCh <- cp:
+		return nil
+	default:
+		return fmt.Errorf("session notification queue full")
 	}
 }
 

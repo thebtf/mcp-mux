@@ -12,11 +12,15 @@ Claude/Codex config, use the top-level `mcp-mux` CLI instead.
 
 Pin a tagged muxcore module. Do not depend on `latest` for production
 consumers; muxcore is a runtime layer and downstream behavior changes matter.
-The module version targeted by this documentation is `muxcore/v0.33.1`:
+The module version targeted by this documentation is `muxcore/v0.34.0`:
 
 ```bash
-go get github.com/thebtf/mcp-mux/muxcore@v0.33.1
+go get github.com/thebtf/mcp-mux/muxcore@v0.34.0
 ```
+
+v0.34.0 adds exact-admission notifications for a shared legacy handler across
+owners; adopt the [session notifier contract](#v0340--exact-session-notifications)
+instead of retaining owner callbacks or scanning status.
 
 v0.33.1 fixes cancellation of active structured requests. v0.33.0 added
 exact-session lifecycle/authorization metadata and opt-in per-owner
@@ -508,6 +512,27 @@ Important rules:
 
 `ConnInfo` zero values are meaningful: `PeerPid == 0` and `PeerUid == 0` mean
 "unavailable", not PID 0 or root.
+
+### v0.34.0 — exact-session notifications
+
+For a daemon configured with a shared `SessionHandler`, implement
+`SessionNotifierAware.SetSessionNotifier` to receive one stable daemon-wide
+`SessionNotifier`. Use `SessionMeta.SessionID` from the metadata-aware
+lifecycle or request callbacks to associate a backend with an admission, then
+call `NotifySession(id, notification)`. Maintain that association yourself;
+the ID is not an authorization credential. Reconnect creates a new ID.
+
+The payload must be a JSON-RPC 2.0 notification. A successful call means it
+entered the selected active legacy session's bounded queue, not that the host
+received it. Unknown, closed, retired, or modern sessions and full queues
+return an error; `NotifySession` never evicts a queued notification. Later
+legacy `Notify` or `Broadcast` calls on the same session retain their existing
+drop-oldest behavior and can evict an accepted notification when the queue is full.
+Generic delivery to modern sessions is unavailable because it lacks causal correlation.
+Here modern means the explicitly selected 2026-07-28 protocol era/policy, not
+the use of `SessionHandlerWithSessionMeta`. A legacy session using that handler
+interface remains eligible for exact-session notification delivery.
+Existing `NotifierAware`, `Notify`, and `Broadcast` remain owner-local.
 
 ### v0.33.1 — active structured request cancellation
 

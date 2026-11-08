@@ -105,6 +105,8 @@ func newOwnerWithProcess(cfg OwnerConfig, payload HandoffPayload, proc *upstream
 		onPersistentResolved:            cfg.OnPersistentResolved,
 		onCacheReady:                    cfg.OnCacheReady,
 		onCacheInvalidated:              cfg.OnCacheInvalidated,
+		onSessionAdded:                  cfg.OnSessionAdded,
+		onSessionRemoved:                cfg.OnSessionRemoved,
 		authorizeSession:                cfg.AuthorizeSession,
 		authorizeSessionWithSessionMeta: cfg.AuthorizeSessionWithSessionMeta,
 		requestSlots:                    makeHandlerSlots(cfg.MaxConcurrentRequests),

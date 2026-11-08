@@ -125,7 +125,7 @@ command; payloads, `clientInfo`, stateless mode, and upstream flags cannot selec
 
 ## Upstream maintenance hold consumer contract
 
-The binary/library target is v0.32.0. Maintenance was introduced in v0.31.0 and
+The binary/library target is v0.34.0. Maintenance was introduced in v0.31.0 and
 requires aware binary/daemon/shim versions v0.31.0 or newer; it is optional for
 ordinary legacy `engine.New` consumers. Use the exact local status `server_id`, then the returned
 opaque `hold_id`:
@@ -297,6 +297,20 @@ Scenario 5b/8 and R1 parity gates, integration, and release. Smoke scratch/outpu
 evidence must be explicitly supplied beneath PRIMARY `.agent`, never a linked
 inner `.agent` or OS temp. No maintenance smoke is implicitly enrolled in the
 critical suite.
+
+## Local executable and MCP smoke tests
+
+Before a local executable/MCP smoke, use a fresh run directory beneath PRIMARY
+`.agent` and pass the runner's explicit runtime/output paths. Bind its sockets,
+namespace, child-only environment and staged binaries to that run; do not use
+the installed binary, production namespace or production files. Reuse existing
+runner parameters; add a scoped launch option only if the executable lacks one.
+Reuse existing MCP smoke runners, including Scenario 5b's built-in stdio client.
+For additional MCP host/stdio probes, use the existing `mcp-launcher` in the
+sibling checkout and resolve its actual path before launch; do not invent
+unsupported launcher parameters for established runners. An ordinary safely
+scoped native Windows run does not require Docker or hosted CI merely to avoid
+production overwrites. Source: operator correction, 2026-11-08.
 
 ## CONVENTIONS
 

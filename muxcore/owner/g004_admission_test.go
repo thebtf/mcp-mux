@@ -264,15 +264,15 @@ func TestG004AdmissionNotificationsDropAcrossSessions(t *testing.T) {
 					s = s2
 				}
 				g004AdmissionDispatch(t, o, s, `{"jsonrpc":"2.0","method":"notifications/g004"}`)
-				if got := o.nativeWork.Load(); got > 2 {
-					t.Fatalf("notification %d reserved %d native callbacks above owner cap 2", i, got)
+				if got := len(o.notificationSlots); got > 2 {
+					t.Fatalf("notification %d reserved %d slots above owner cap 2: native=%d", i, got, o.nativeWork.Load())
 				}
 				if i < 2 {
 					notifications.await(t)
 				}
 			}
-			if notifications.calls.Load() != 2 || notifications.peak.Load() != 2 || o.nativeWork.Load() != 2 || o.PendingRequests() != 1 {
-				t.Fatalf("independent request/notification caps: notifications=%d peak=%d native=%d pending=%d", notifications.calls.Load(), notifications.peak.Load(), o.nativeWork.Load(), o.PendingRequests())
+			if notifications.calls.Load() != 2 || notifications.peak.Load() != 2 || len(o.notificationSlots) != 2 || o.nativeWork.Load() < 2 || o.PendingRequests() != 1 {
+				t.Fatalf("independent request/notification caps: notifications=%d peak=%d slots=%d native=%d pending=%d", notifications.calls.Load(), notifications.peak.Load(), len(o.notificationSlots), o.nativeWork.Load(), o.PendingRequests())
 			}
 			if out1.String() != "" || out2.String() != "" {
 				t.Fatalf("notifications produced a reply while the only request remained blocked: %q / %q", out1.String(), out2.String())
@@ -410,16 +410,16 @@ func TestG004AdmissionCancellationRetainsSlotUntilActualReturn(t *testing.T) {
 				g004AdmissionDone(t, ctx.Done())
 				g004AdmissionDispatch(t, o, s2, raw)
 				if barrier.calls.Load() != 1 {
-					t.Fatal("requested cancellation released a running callback's slot")
+					t.Fatalf("requested cancellation released a running callback's slot: calls=%d peak=%d request_slots=%d notification_slots=%d native=%d pending=%d output=%q", barrier.calls.Load(), barrier.peak.Load(), len(o.requestSlots), len(o.notificationSlots), o.nativeWork.Load(), o.PendingRequests(), out2.String())
 				}
 				if notification {
-					if o.nativeWork.Load() != 1 || out2.String() != "" {
-						t.Fatal("cancelled notification lost native-work reservation or replied to overflow")
+					if len(o.notificationSlots) != 1 || o.nativeWork.Load() < 1 || o.PendingRequests() != 0 || out2.String() != "" {
+						t.Fatalf("cancelled notification lost reservation or replied to overflow: slots=%d native=%d pending=%d calls=%d peak=%d output=%q", len(o.notificationSlots), o.nativeWork.Load(), o.PendingRequests(), barrier.calls.Load(), barrier.peak.Load(), out2.String())
 					}
 				} else {
 					response := parseJSONRPCResponseLine(t, out2.String())
-					if o.PendingRequests() != 1 || string(response.ID) != "1" || response.Error == nil || response.Error.Code != -32004 {
-						t.Fatalf("cancelled request lost reservation or overflow disposition: pending=%d %s", o.PendingRequests(), out2.String())
+					if o.PendingRequests() != 1 || len(o.requestSlots) != 1 || string(response.ID) != "1" || response.Error == nil || response.Error.Code != -32004 {
+						t.Fatalf("cancelled request lost reservation or overflow disposition: pending=%d slots=%d native=%d output=%q", o.PendingRequests(), len(o.requestSlots), o.nativeWork.Load(), out2.String())
 					}
 				}
 				barrier.unblock()
@@ -468,8 +468,8 @@ func TestG004AdmissionMaintenanceWaitsForCancelledBodies(t *testing.T) {
 			s.Close()
 			g004AdmissionDone(t, requestCtx.Done())
 			g004AdmissionDone(t, notificationCtx.Done())
-			if o.PendingRequests() != 1 || o.nativeWork.Load() != 1 {
-				t.Fatalf("cancellation erased actual work: pending=%d native=%d", o.PendingRequests(), o.nativeWork.Load())
+			if o.PendingRequests() != 1 || len(o.notificationSlots) != 1 || o.nativeWork.Load() < 1 {
+				t.Fatalf("cancellation erased actual work: pending=%d notification_slots=%d native=%d", o.PendingRequests(), len(o.notificationSlots), o.nativeWork.Load())
 			}
 			assertBlocked := func() {
 				t.Helper()
@@ -486,8 +486,8 @@ func TestG004AdmissionMaintenanceWaitsForCancelledBodies(t *testing.T) {
 			assertBlocked()
 			requests.unblock()
 			g004AdmissionWait(t, func() bool { return o.PendingRequests() == 0 }, "request did not actually return")
-			if o.nativeWork.Load() != 1 {
-				t.Fatal("request completion released the still-running notification reservation")
+			if len(o.notificationSlots) != 1 || o.nativeWork.Load() < 1 {
+				t.Fatalf("request completion released the still-running notification reservation: slots=%d native=%d", len(o.notificationSlots), o.nativeWork.Load())
 			}
 			assertBlocked()
 			notifications.unblock()
@@ -522,8 +522,8 @@ func TestG004AdmissionNonpositiveLimitsPreserveLegacy(t *testing.T) {
 				g004AdmissionDispatch(t, o, s, `{"jsonrpc":"2.0","method":"notifications/g004"}`)
 				barrier.await(t)
 			}
-			if o.PendingRequests() != 3 || o.nativeWork.Load() != 3 || output.String() != "" {
-				t.Fatal("nonpositive limits changed unlimited legacy admission")
+			if o.PendingRequests() != 3 || o.nativeWork.Load() < 3 || barrier.calls.Load() != 6 || barrier.peak.Load() != 6 || output.String() != "" {
+				t.Fatalf("nonpositive limits changed unlimited legacy admission: pending=%d native=%d calls=%d peak=%d output=%q", o.PendingRequests(), o.nativeWork.Load(), barrier.calls.Load(), barrier.peak.Load(), output.String())
 			}
 			barrier.unblock()
 			g004AdmissionWait(t, func() bool { return o.PendingRequests() == 0 && o.nativeWork.Load() == 0 }, "unlimited callbacks did not settle")
@@ -583,11 +583,11 @@ func TestG004AdmissionConcurrentBurstCannotOverbook(t *testing.T) {
 					t.Fatalf("concurrent burst overbooked callbacks: calls=%d peak=%d", barrier.calls.Load(), barrier.peak.Load())
 				}
 				if notification {
-					if o.nativeWork.Load() != 2 || o.PendingRequests() != 0 || out1.String() != "" || out2.String() != "" {
-						t.Fatal("concurrent notifications exceeded the cap or produced replies")
+					if len(o.notificationSlots) != 2 || o.nativeWork.Load() < 2 || o.PendingRequests() != 0 || out1.String() != "" || out2.String() != "" {
+						t.Fatalf("concurrent notifications exceeded the cap or produced replies: slots=%d native=%d pending=%d calls=%d peak=%d out1=%q out2=%q", len(o.notificationSlots), o.nativeWork.Load(), o.PendingRequests(), barrier.calls.Load(), barrier.peak.Load(), out1.String(), out2.String())
 					}
-				} else if o.PendingRequests() != 2 || o.nativeWork.Load() != 0 {
-					t.Fatalf("concurrent request reservations: pending=%d native=%d", o.PendingRequests(), o.nativeWork.Load())
+				} else if o.PendingRequests() != 2 || len(o.requestSlots) != 2 || len(o.notificationSlots) != 0 {
+					t.Fatalf("concurrent request reservations: pending=%d request_slots=%d notification_slots=%d native=%d", o.PendingRequests(), len(o.requestSlots), len(o.notificationSlots), o.nativeWork.Load())
 				}
 				barrier.unblock()
 				g004AdmissionWait(t, func() bool { return o.PendingRequests() == 0 && o.nativeWork.Load() == 0 }, "concurrent callbacks did not settle")

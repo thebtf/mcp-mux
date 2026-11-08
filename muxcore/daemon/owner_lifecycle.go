@@ -280,6 +280,7 @@ func (d *Daemon) finalizeAndRemoveOwner(serverID string, expected *OwnerEntry, r
 			continue
 		}
 		current.removalInProgress = true
+		current.sessionRoutesRetired = true
 		current.removalDone = make(chan struct{})
 		current.terminationHint = terminationHintForRemoval(reason)
 		entry = current

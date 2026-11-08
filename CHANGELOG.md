@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-08
+
+### Added
+
+- Added daemon-wide `SessionNotifierAware` and `SessionNotifier` for bounded,
+  exact-admission notification delivery to legacy sessions. Modern sessions are
+  rejected; existing owner-local notification interfaces are unchanged.
+
+### Fixed
+
+- Serialize legacy drop-oldest notification sends with the new non-evicting
+  enqueue and session close. Mixed producers cannot block the upstream reader
+  after a slow host stops draining its bounded notification queue.
+
 ## [0.33.3] - 2026-10-24
 
 ### Added
@@ -779,7 +793,8 @@ operator exception; production consumer upgrades are not claimed.
   v1-to-v2 compatibility, rollback behavior, forbidden local workarounds, and
   the distinction between Serena dashboard configuration and process cleanup.
 
-[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.33.1...HEAD
+[Unreleased]: https://github.com/thebtf/mcp-mux/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/thebtf/mcp-mux/compare/v0.33.3...v0.34.0
 [0.33.1]: https://github.com/thebtf/mcp-mux/compare/v0.33.0...v0.33.1
 [0.33.0]: https://github.com/thebtf/mcp-mux/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/thebtf/mcp-mux/compare/v0.31.0...v0.32.0

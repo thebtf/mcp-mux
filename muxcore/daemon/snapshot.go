@@ -16,6 +16,7 @@ import (
 	"github.com/thebtf/mcp-mux/muxcore/era"
 	"github.com/thebtf/mcp-mux/muxcore/owner"
 	"github.com/thebtf/mcp-mux/muxcore/serverid"
+	"github.com/thebtf/mcp-mux/muxcore/session"
 	mcpsnapshot "github.com/thebtf/mcp-mux/muxcore/snapshot"
 	"github.com/thejerf/suture/v4"
 )
@@ -439,6 +440,10 @@ func (d *Daemon) makeSnapshotRestorePlan(ownerSnap mcpsnapshot.OwnerSnapshot) sn
 		OnCacheInvalidated:   d.invalidateOwnerTemplate,
 		Logger:               log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", shortServerID(ownerSnap.ServerID)), log.LstdFlags|log.Lmicroseconds),
 	}
+	if d.sessionRoutes != nil {
+		cfg.OnSessionAdded = d.registerSessionRoute
+		cfg.OnSessionRemoved = d.unregisterSessionRoute
+	}
 	if d.persistent || ownerSnap.Persistent {
 		cfg.MaterializationPolicy = owner.MaterializationPersistent
 	}
@@ -469,6 +474,16 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 		d.retireOldOwnerSockets(plan.cfg.IPCPath, plan.cfg.ControlPath)
 	}
 
+	// A restored listener can accept reconnects before its entry is published.
+	// Opted-in routes wait until publication or constructor failure settles.
+	var routeReady chan struct{}
+	if plan.cfg.OnSessionAdded != nil {
+		routeReady = make(chan struct{})
+		plan.cfg.OnSessionAdded = func(o *owner.Owner, s *session.Session) {
+			<-routeReady
+			d.registerSessionRoute(o, s)
+		}
+	}
 	var restoredOwner *owner.Owner
 	reattached := false
 	var err error
@@ -492,11 +507,18 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 		restoredOwner, err = owner.NewOwnerFromSnapshot(plan.cfg, snap)
 	}
 	if err != nil {
+		if routeReady != nil {
+			close(routeReady)
+		}
 		return nil, false, err
 	}
 
+	// The gate is closed below, after publication or before failure teardown.
 	ownerGeneration, err := generateGeneration("owner")
 	if err != nil {
+		if routeReady != nil {
+			close(routeReady)
+		}
 		restoredOwner.Shutdown()
 		d.logger.Printf("snapshot: failed to generate owner generation for %s: %v", shortServerID(snap.ServerID), err)
 		return nil, false, err
@@ -527,6 +549,9 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 	}
 	d.mu.Lock()
 	if _, exists := d.owners[snap.ServerID]; exists {
+		if routeReady != nil {
+			close(routeReady)
+		}
 		d.mu.Unlock()
 		if d.supervisor != nil {
 			d.supervisor.Remove(serviceToken)
@@ -536,6 +561,9 @@ func (d *Daemon) restoreSnapshotPlan(plan snapshotRestorePlan, handoff *HandoffU
 	}
 	d.owners[snap.ServerID] = entry
 	d.mu.Unlock()
+	if routeReady != nil {
+		close(routeReady)
+	}
 	restoredOwner.ResolvePersistent(effectivePersistent)
 	d.rehydrateRetryCounter(era.EraLegacy, snap.ServerID, snap.Command, snap.Args, snap.Cwd)
 	if publishTemplate && snap.CachedInit != "" && snap.CachedTools != "" {

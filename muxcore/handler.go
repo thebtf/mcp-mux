@@ -108,6 +108,21 @@ type NotifierAware interface {
 	SetNotifier(n Notifier)
 }
 
+// SessionNotifier routes a JSON-RPC notification to one admitted legacy session.
+// Success means the notification was queued, not that the host received it.
+// Session IDs are opaque routing identifiers, not authorization credentials.
+// Modern means the explicit 2026-07-28 protocol era/policy, not use of
+// SessionHandlerWithSessionMeta; legacy sessions may use metadata-aware handlers.
+type SessionNotifier interface {
+	NotifySession(sessionID string, notification []byte) error
+}
+
+// SessionNotifierAware receives one stable daemon-wide session router before
+// sessions dispatch. It is independent of the owner-local NotifierAware API.
+type SessionNotifierAware interface {
+	SetSessionNotifier(SessionNotifier)
+}
+
 // ProjectContextID returns a deterministic session identifier from the given CWD.
 // Uses WorktreeRoot to find the project root, then hashes it.
 func ProjectContextID(cwd string) string {
