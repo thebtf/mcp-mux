@@ -305,10 +305,12 @@ Before a local executable/MCP smoke, use a fresh run directory beneath PRIMARY
 namespace, child-only environment and staged binaries to that run; do not use
 the installed binary, production namespace or production files. Reuse existing
 runner parameters; add a scoped launch option only if the executable lacks one.
-Use the existing `mcp-launcher` in the sibling checkout for MCP host/stdio tests
-and resolve its actual path before launch. An ordinary safely scoped native
-Windows run does not require Docker or hosted CI merely to avoid production
-overwrites. Source: operator correction, 2026-11-08.
+Reuse existing MCP smoke runners, including Scenario 5b's built-in stdio client.
+For additional MCP host/stdio probes, use the existing `mcp-launcher` in the
+sibling checkout and resolve its actual path before launch; do not invent
+unsupported launcher parameters for established runners. An ordinary safely
+scoped native Windows run does not require Docker or hosted CI merely to avoid
+production overwrites. Source: operator correction, 2026-11-08.
 
 ## CONVENTIONS
 
