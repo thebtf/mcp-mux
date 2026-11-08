@@ -150,7 +150,7 @@ func notifierFrame(label string) string {
 func notifierNewDaemon(t *testing.T) (*Daemon, *sessionNotifierHandler) {
 	t.Helper()
 	h := &sessionNotifierHandler{connected: make(chan sessionNotifierAdmission, 16), disconnected: make(chan string, 16), requests: make(chan sessionNotifierAdmission, 16)}
-	d, err := New(Config{Name: "session-notifier-test", ControlPath: shortSocketPath(t, "session-notifier"), SessionHandler: h, SkipSnapshot: true, Logger: testLogger(t)})
+	d, err := New(Config{Name: "sn", ControlPath: shortSocketPath(t, "session-notifier"), SessionHandler: h, SkipSnapshot: true, Logger: testLogger(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
