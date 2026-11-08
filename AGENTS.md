@@ -125,7 +125,7 @@ command; payloads, `clientInfo`, stateless mode, and upstream flags cannot selec
 
 ## Upstream maintenance hold consumer contract
 
-The binary/library target is v0.32.0. Maintenance was introduced in v0.31.0 and
+The binary/library target is v0.34.0. Maintenance was introduced in v0.31.0 and
 requires aware binary/daemon/shim versions v0.31.0 or newer; it is optional for
 ordinary legacy `engine.New` consumers. Use the exact local status `server_id`, then the returned
 opaque `hold_id`:
