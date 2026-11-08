@@ -525,8 +525,10 @@ the ID is not an authorization credential. Reconnect creates a new ID.
 The payload must be a JSON-RPC 2.0 notification. A successful call means it
 entered the selected active legacy session's bounded queue, not that the host
 received it. Unknown, closed, retired, or modern sessions and full queues
-return an error; a full queue does not evict a queued notification. Generic
-delivery to modern sessions is unavailable because it lacks causal correlation.
+return an error; `NotifySession` never evicts a queued notification. Later
+legacy `Notify` or `Broadcast` calls on the same session retain their existing
+drop-oldest behavior and can evict an accepted notification when the queue is full.
+Generic delivery to modern sessions is unavailable because it lacks causal correlation.
 Here modern means the explicitly selected 2026-07-28 protocol era/policy, not
 the use of `SessionHandlerWithSessionMeta`. A legacy session using that handler
 interface remains eligible for exact-session notification delivery.
