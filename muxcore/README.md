@@ -546,6 +546,23 @@ a persisted identity; do not substitute `project.ID`, tenant, or peer PID for it
 Preauthorization metadata has no tenant/time stamp; `AuthAllow` later stamps
 `TenantID` and `AuthorizedAt` without changing `SessionID`.
 
+For a daemon configured with a shared `SessionHandler`, implement
+`SessionNotifierAware.SetSessionNotifier` to receive one stable daemon-wide
+`SessionNotifier`. Use `SessionMeta.SessionID` from the metadata-aware
+lifecycle or request callbacks to associate a backend with an admission, then
+call `NotifySession(id, notification)`. Maintain that association yourself;
+the ID is not an authorization credential. Reconnect creates a new ID.
+
+The payload must be a JSON-RPC 2.0 notification. A successful call means it
+entered the selected active legacy session's bounded queue, not that the host
+received it. Unknown, closed, retired, or modern sessions and full queues
+return an error; a full queue does not evict a queued notification. Generic
+delivery to modern sessions is unavailable because it lacks causal correlation.
+Here modern means the explicitly selected 2026-07-28 protocol era/policy, not
+the use of `SessionHandlerWithSessionMeta`. A legacy session using that handler
+interface remains eligible for exact-session notification delivery.
+Existing `NotifierAware`, `Notify`, and `Broadcast` remain owner-local.
+
 Add the upgraded lifecycle methods to your existing handler, retaining its
 request/notification implementations. In this integration fragment, `handler`
 is that server and its `quotas` field is your concurrency-safe product ledger,

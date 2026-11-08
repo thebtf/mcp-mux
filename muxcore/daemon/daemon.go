@@ -142,9 +142,10 @@ type OwnerEntry struct {
 	// after teardown has begun but before whole-tree finalization is proven.
 	// removalDone closes when that exact attempt settles so concurrent removers
 	// serialize instead of finalizing the same process authority twice.
-	removalInProgress bool
-	removalDone       chan struct{}
-	removalRetrying   bool
+	removalInProgress    bool
+	sessionRoutesRetired bool
+	removalDone          chan struct{}
+	removalRetrying      bool
 }
 
 const (
@@ -211,6 +212,7 @@ type Daemon struct {
 	maintenanceCommit   func([]byte) error
 	maintenanceFailed   bool
 	owners              map[string]*OwnerEntry
+	sessionRoutes       map[string]sessionRoute // guarded by mu
 	modernSharingKey    [32]byte
 	logger              *log.Logger
 	ctlSrv              *control.Server
@@ -616,6 +618,14 @@ func New(cfg Config) (*Daemon, error) {
 		supCancel()
 		return nil, control.ErrMaintenanceHeld
 	}
+	if aware, ok := cfg.SessionHandler.(muxcore.SessionNotifierAware); ok {
+		d.sessionRoutes = make(map[string]sessionRoute)
+		if err := injectSessionNotifier(aware, &sessionNotifier{daemon: d}); err != nil {
+			d.shuttingDown.Store(true)
+			supCancel()
+			return nil, err
+		}
+	}
 
 	// Create supervisor with exponential backoff on restart storms.
 	// Tuning rationale:
@@ -671,6 +681,7 @@ func New(cfg Config) (*Daemon, error) {
 		if err != nil {
 			// Cancel supervisor context to prevent leak of the context goroutine.
 			supCancel()
+			d.shuttingDown.Store(true)
 			return nil, fmt.Errorf("daemon: control server: %w", err)
 		}
 		d.ctlSrv = ctlSrv
@@ -691,6 +702,7 @@ func New(cfg Config) (*Daemon, error) {
 				d.ctlSrv.Close()
 			}
 			supCancel()
+			d.shuttingDown.Store(true)
 			return nil, fmt.Errorf("daemon: registry descriptor: %w", err)
 		}
 		d.registryDescriptorPath = path
@@ -1768,6 +1780,10 @@ func (d *Daemon) spawnOnce(reqPtr *control.Request, compatibility *modernCompati
 		OnCacheReady:         d.publishOwnerCache,
 		OnCacheInvalidated:   d.invalidateOwnerTemplate,
 		Logger:               log.New(d.logger.Writer(), fmt.Sprintf("[mcp-mux:%s] ", sid[:8]), log.LstdFlags|log.Lmicroseconds),
+	}
+	if d.sessionRoutes != nil {
+		ownerCfg.OnSessionAdded = d.registerSessionRoute
+		ownerCfg.OnSessionRemoved = d.unregisterSessionRoute
 	}
 	if protocolEra == era.EraModern20260728 {
 		ownerCfg.OnCacheReady = nil

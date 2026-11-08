@@ -214,6 +214,8 @@ type Owner struct {
 	onPersistentResolved func(*Owner, bool)
 	onCacheReady         func(*Owner, OwnerSnapshot) bool
 	onCacheInvalidated   func(*Owner)
+	onSessionAdded       func(*Owner, *Session)
+	onSessionRemoved     func(*Owner, *Session)
 
 	// authorizeSession is the optional pre-dispatch session-admission gate
 	// forwarded from engine.Config / daemon.Config / OwnerConfig. nil = no
@@ -365,6 +367,11 @@ type OwnerConfig struct {
 	// OnZeroSessions is called with the exact owner whose last session left.
 	// If nil, the owner does not auto-shutdown on zero sessions.
 	OnZeroSessions func(*Owner)
+
+	// OnSessionAdded and OnSessionRemoved observe admitted sessions outside owner
+	// and admission locks. They must not retain a removed session as live.
+	OnSessionAdded   func(*Owner, *Session)
+	OnSessionRemoved func(*Owner, *Session)
 
 	// OnUpstreamExit is called with the exact owner whose controller cannot
 	// recover the upstream. If nil, the owner auto-shuts down.
@@ -553,6 +560,8 @@ func NewOwnerFromSnapshot(cfg OwnerConfig, snap OwnerSnapshot) (*Owner, error) {
 		onPersistentResolved:            cfg.OnPersistentResolved,
 		onCacheReady:                    cfg.OnCacheReady,
 		onCacheInvalidated:              cfg.OnCacheInvalidated,
+		onSessionAdded:                  cfg.OnSessionAdded,
+		onSessionRemoved:                cfg.OnSessionRemoved,
 		authorizeSession:                cfg.AuthorizeSession,
 		authorizeSessionWithSessionMeta: cfg.AuthorizeSessionWithSessionMeta,
 		requestSlots:                    makeHandlerSlots(cfg.MaxConcurrentRequests),
@@ -734,6 +743,8 @@ func NewOwner(cfg OwnerConfig) (*Owner, error) {
 		onPersistentResolved:            cfg.OnPersistentResolved,
 		onCacheReady:                    cfg.OnCacheReady,
 		onCacheInvalidated:              cfg.OnCacheInvalidated,
+		onSessionAdded:                  cfg.OnSessionAdded,
+		onSessionRemoved:                cfg.OnSessionRemoved,
 		authorizeSession:                cfg.AuthorizeSession,
 		authorizeSessionWithSessionMeta: cfg.AuthorizeSessionWithSessionMeta,
 		requestSlots:                    makeHandlerSlots(cfg.MaxConcurrentRequests),
@@ -994,6 +1005,9 @@ func (o *Owner) addSessionLocked(s *Session) bool {
 }
 
 func (o *Owner) startRegisteredSession(s *Session) {
+	if o.onSessionAdded != nil {
+		o.onSessionAdded(o, s)
+	}
 	o.touchActivity()
 	o.logger.Printf("session %d connected (cwd: %q)", s.ID, s.Cwd)
 	// Publish legacy roots before the reader can dispatch its first frame.
@@ -2199,6 +2213,9 @@ func (o *Owner) removeSession(s *Session) {
 	}
 	o.mu.Unlock()
 	o.launchContextMu.Unlock()
+	if o.onSessionRemoved != nil {
+		o.onSessionRemoved(o, s)
+	}
 	if o.isModern() {
 		o.removeModernInflightForSession(s)
 	}

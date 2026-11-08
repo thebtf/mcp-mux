@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- Added daemon-wide `SessionNotifierAware` and `SessionNotifier` for bounded,
+  exact-admission notification delivery to legacy sessions. Modern sessions are
+  rejected; existing owner-local notification interfaces are unchanged.
+
 ## [0.33.3] - 2026-10-24
 
 ### Added
