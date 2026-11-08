@@ -298,6 +298,18 @@ evidence must be explicitly supplied beneath PRIMARY `.agent`, never a linked
 inner `.agent` or OS temp. No maintenance smoke is implicitly enrolled in the
 critical suite.
 
+## Local executable and MCP smoke tests
+
+Before a local executable/MCP smoke, use a fresh run directory beneath PRIMARY
+`.agent` and pass the runner's explicit runtime/output paths. Bind its sockets,
+namespace, child-only environment and staged binaries to that run; do not use
+the installed binary, production namespace or production files. Reuse existing
+runner parameters; add a scoped launch option only if the executable lacks one.
+Use the existing `mcp-launcher` in the sibling checkout for MCP host/stdio tests
+and resolve its actual path before launch. An ordinary safely scoped native
+Windows run does not require Docker or hosted CI merely to avoid production
+overwrites. Source: operator correction, 2026-11-08.
+
 ## CONVENTIONS
 
 - Investigation reports: `.agent/reports/YYYY-MM-DD-topic.md`
